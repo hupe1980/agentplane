@@ -1,7 +1,7 @@
 +++
 title = "Operations"
 description = "Deploying, high availability, retention, observability, and a runbook for every state a run can get stuck in."
-weight = 10
+weight = 16
 +++
 
 Running this for real: topologies, the store contract, the background sweep,
@@ -249,7 +249,7 @@ and are quoted with the command precisely because they are hardware-specific:
 
 **Two fsyncs per effect.** An effect crosses the protocol twice — `EffectStarted`
 before dispatch, its terminal record after — and both are durable commits at
-`Durability::Immediate`, because I2 says the announcement must survive the
+`Durability::Immediate`, because intent precedes action: the announcement must survive the
 process *before* anything reaches the world. The ~9 ms is that guarantee's
 price, not an inefficiency waiting to be tuned away. Batching the two would
 break the only thing standing between a crash and an unrecorded payment.
@@ -806,6 +806,20 @@ A gauge must never be read from a `limit`-bounded query. That is why `census`
 exists rather than `by_status(..).len()`: a paged count rises, flattens at the
 page size, and looks like a plateau exactly when it has become a backlog.
 
+**A counter cannot report a backlog, and the difference bites hardest on the one
+that matters.** `agentplane.quarantines` counts the *moment* a run is set aside.
+It is monotonic and it lives in the process, so after a restart it reads zero
+over a backlog of forty, and a backlog that stopped growing reads exactly like
+one that was cleared. The number to alert on is
+`agentplane.runs.quarantined` — the level, counted from the store's outcome index
+on every sweep, which is the same index `GET /runs?outcome=quarantined` pages.
+
+That level currently only rises, and the gauge's own description says so: this
+runtime has no verb that resolves a quarantine. A resume re-reaches the same
+conclusion, and a cancellation request against a quarantined run is recorded and
+not acted on. Alert on the level going up and treat every entry as work for a
+person; do not expect it to come down on its own.
+
 ### Two rules, both guarded
 
 **A dimension is a variant, never a rendered message.** `Display` on a budget
@@ -869,14 +883,23 @@ Every failure P7 exists to surface has its own event target:
 |---|---|
 | `agentplane.run.nondeterminism_detected` | Replay recomputed a different effect key |
 | `agentplane.run.quarantined` | A run was set aside for a human |
+| `agentplane.run.unreproducible` | A pinned read came back as different content — the durable record is not trustworthy |
+| `agentplane.run.recovered` | The sweep took over a run whose owner died holding it |
+| `agentplane.run.replanned` | A run changed its plan, and the successor names its parent |
 | `agentplane.effect.undecidable` | An outcome could not be determined and guessing was forbidden |
 | `agentplane.effect.reconciled` | A probe was asked whether a call landed |
 | `agentplane.budget.refused` | A limit refused an operation |
+| `agentplane.policy.denied` | The deployment's rules refused an action |
 | `agentplane.saga.compensated` | A completed step was undone |
 | `agentplane.saga.compensation_failed` | A compensation failed, leaving the run partly unwound |
 | `agentplane.event.dead_lettered` | An event aged out with nobody waiting — a correlation bug |
 | `agentplane.deadline.breached` | An obligation passed unmet |
 | `agentplane.timer.fired` | A sleeping run's instant arrived |
+
+That list is `telemetry::LOUD_EVENTS`, and this table is checked against it:
+`tests/guards/docs.rs` fails the build if the runtime promises an event this
+page does not name, because a table headed *every* is an alerting checklist and
+a short one is read as a complete one.
 
 `tests/guards/layering.rs` fails the build if any of those has no emitter, and
 `tests/process/telemetry.rs` asserts on what a subscriber actually received rather than
@@ -1214,7 +1237,7 @@ whether a run id exists by comparing a `400` against a `404`.
 
 | Route | The question it answers |
 |---|---|
-| `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined` |
+| `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
 | `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end? |
 | `GET /tasks` | What is waiting for me? |
 | `GET /tasks/{task}` | What is this proposal, and may I decide it? |

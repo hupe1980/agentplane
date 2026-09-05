@@ -735,6 +735,9 @@ impl JournalStore for BlindToKeys {
     ) -> Result<Vec<agentplane::RunId>, agentplane::core::StoreError> {
         self.0.runs_by_outcome(outcome, limit).await
     }
+    async fn count_by_outcome(&self, outcome: &str) -> Result<u64, agentplane::core::StoreError> {
+        self.0.count_by_outcome(outcome).await
+    }
     async fn recent_runs(
         &self,
         after: Option<(u64, agentplane::RunId)>,

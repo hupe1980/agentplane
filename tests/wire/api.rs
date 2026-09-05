@@ -24,7 +24,7 @@ use agentplane::core::{
     PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest, Priority, Skill,
     SkillDescriptor, SkillError, StepError, Tainted, TaskSpec,
 };
-use agentplane::journal::JournalStore;
+use agentplane::journal::{Append, JournalStore, RecordKind};
 use agentplane::runtime::{Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use axum::body::Body;
@@ -1855,5 +1855,132 @@ fn a_surface_over_no_planes_is_refused() {
         matches!(built, Err(ApiSetupError::NoPlanes)),
         "a surface that would authenticate every caller and then refuse them \
          all was accepted as configured"
+    );
+}
+
+// ── One derivation of "what happened to this run" ───────────────────────────
+
+/// A run that concluded `failed`, so its journal stays open for appending.
+async fn open_concluded_run() -> (
+    Arc<RedbStore>,
+    Arc<agentplane::runtime::Runtime>,
+    agentplane::core::RunId,
+) {
+    #[derive(Debug)]
+    struct Fails;
+
+    #[async_trait::async_trait]
+    impl Skill for Fails {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("fails").provides("demo.fails")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::fail(
+                "the counterparty ledger refused the transfer",
+            ))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .skill(Fails)
+        .build();
+    let out = rt
+        .run("demo.fails", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    (store, rt, out.run_id)
+}
+
+/// Append a conclusion this build did not write, as a foreign or older writer
+/// would have left it.
+async fn append_conclusion(
+    store: &Arc<RedbStore>,
+    run: agentplane::core::RunId,
+    outcome: &str,
+    exhaustion: Option<BudgetExceeded>,
+) {
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    let lease = journal
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    let head = journal.head(run).await.unwrap();
+    journal
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunConcluded {
+                    outcome: outcome.to_owned(),
+                    reason: Some("written by another build".into()),
+                    exhaustion,
+                    live_spend: agentplane::core::Spend::default(),
+                    chain_head: head.hash,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+}
+
+/// **An `exhausted` conclusion with no typed ceiling is not an exhaustion.**
+///
+/// I14 names the operator API as one of three surfaces where an exhausted run
+/// keeps the exact ceiling verdict. The runtime's own reader quarantines a
+/// conclusion that says `exhausted` and carries no verdict — there is nothing
+/// to raise and nothing to act on. The view had its own copy of that match and
+/// reported plain `exhausted` with the field simply absent, so automation
+/// deciding *which limit to raise* read `null` and an operator was told a
+/// ceiling stopped the run without being told which.
+#[tokio::test]
+async fn an_exhaustion_with_no_ceiling_is_not_reported_as_an_exhaustion() {
+    let (store, rt, run) = open_concluded_run().await;
+    append_conclusion(&store, run, "exhausted", None).await;
+
+    let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
+    let (status, body) = send(&router, get(&format!("/runs/{run}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["status"], "quarantined",
+        "an exhaustion with no ceiling verdict was reported as an ordinary \
+         exhaustion, so nothing says which limit to raise: {body}"
+    );
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("ceiling")),
+        "the view does not say what is wrong with the record: {body}"
+    );
+}
+
+/// **An outcome this build cannot interpret fails closed.**
+///
+/// The runtime's reader answers `quarantined` — "a conclusion this build cannot
+/// interpret is not permission to treat the run as ordinary". The view passed
+/// the string through as the status, so a word no code anywhere acts on arrived
+/// at an operator's dashboard looking like a state.
+#[tokio::test]
+async fn an_unrecognised_outcome_is_quarantined_rather_than_echoed() {
+    let (store, rt, run) = open_concluded_run().await;
+    append_conclusion(&store, run, "settled-ish", None).await;
+
+    let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
+    let (status, body) = send(&router, get(&format!("/runs/{run}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["status"], "quarantined",
+        "an outcome this build does not recognise was echoed as a status: {body}"
+    );
+    assert!(
+        body["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("settled-ish")),
+        "the refusal does not name the outcome it could not read: {body}"
     );
 }

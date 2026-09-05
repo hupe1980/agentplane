@@ -152,7 +152,7 @@ Misspell a ceiling and the file is rejected —
 ```text
 agentplane: manifest is not well-formed: document 1: unknown field `max_tokns`,
 expected one of `max_steps`, `max_effects`, `max_tokens`, `max_minor_units`,
-`max_replans`, `max_wallclock_secs`
+`max_replans`, `max_wallclock_secs`, `max_denials`, `max_parallel_steps`
 ```
 
 — because in a tolerant parser `max_tokns: 100` does not mean "a ceiling with

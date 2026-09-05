@@ -126,7 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "   answer:         {}",
         render(live.output.as_ref().map(agentplane::Tainted::peek))
     );
-    println!("   spend:          {} tokens", live.spend.tokens);
+    println!("   spend:          {} tokens", live.spend().tokens);
 
     // ── 2. Replay reads the journal, not the model ─────────────────────────
     let before = provider.calls();
@@ -179,7 +179,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "   spend:          {} tokens, on a call that returned nothing usable",
-        burned.spend.tokens
+        burned.spend().tokens
     );
     assert!(!matches!(burned.status, RunStatus::Succeeded));
     assert_eq!(

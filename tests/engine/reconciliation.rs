@@ -53,6 +53,9 @@ struct Payment {
     probes: Arc<AtomicUsize>,
     /// When set, the effect succeeds instead of timing out.
     succeeds: bool,
+    /// When set, the call reports metered consumption on the way to failing —
+    /// and the recovered result reports more.
+    metered: bool,
 }
 
 impl Payment {
@@ -62,7 +65,14 @@ impl Payment {
             calls: Arc::clone(calls),
             probes: Arc::clone(probes),
             succeeds: false,
+            metered: false,
         }
+    }
+
+    /// 70 units spent before the timeout, 30 more reported by the probe.
+    fn metered(mut self) -> Self {
+        self.metered = true;
+        self
     }
 }
 
@@ -86,10 +96,25 @@ impl Effect for Payment {
         RetryPolicy::attempts(2).with_backoff(Duration::from_millis(1), Duration::from_millis(2))
     }
 
+    fn spend(&self, _out: &Value) -> agentplane::core::Spend {
+        if self.metered {
+            agentplane::core::Spend::tokens(30)
+        } else {
+            agentplane::core::Spend::default()
+        }
+    }
+
     async fn perform(&self) -> Result<Value, EffectError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.succeeds {
             return Ok(json!({ "captured": true, "via": "perform" }));
+        }
+        if self.metered {
+            return Err(EffectError::Metered {
+                detail: "the stream died after 70".into(),
+                spend: agentplane::core::Spend::tokens(70),
+                disposition: Disposition::InDoubt,
+            });
         }
         Err(EffectError::Timeout {
             driver: "payments".into(),
@@ -502,5 +527,43 @@ async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
         matches!(out.status, RunStatus::Quarantined(_)),
         "an incomplete journal cannot be verified, got {:?}",
         out.status
+    );
+}
+
+/// **A reconciled attempt replays at what it actually spent.**
+///
+/// One announced attempt writes as many as three records — the announcement,
+/// the failure carrying what died mid-flight, and the probe's verdict carrying
+/// what the recovered call reports. The live pass adds every figure it is
+/// handed. A replay reads one slot per attempt, so the slot has to carry the
+/// sum: taking only the last record's figure replays the same run for less,
+/// and the run then stops somewhere its own history never did.
+#[tokio::test]
+async fn a_reconciled_attempt_replays_at_what_it_actually_spent() {
+    let (calls, probes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let skill = || Pay(Payment::new(Probe::SaysItLanded, &calls, &probes).metered());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(skill())
+        .build();
+
+    let live = rt
+        .run("demo.pay", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(live.status, RunStatus::Succeeded);
+    assert_eq!(
+        live.consumed.spend.tokens, 100,
+        "70 died with the stream and 30 came back with the probe"
+    );
+    assert_eq!(live.consumed.effects, 1, "one announced attempt, one slot");
+
+    let replayed = rt.replay(live.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(replayed.status, RunStatus::Succeeded);
+    assert_eq!(
+        (replayed.consumed.effects, replayed.consumed.spend),
+        (live.consumed.effects, live.consumed.spend),
+        "the replay billed a different tally than the run it replays"
     );
 }

@@ -28,6 +28,10 @@ fn contract() -> Contract {
         Capability::new("fetch"),
         Capability::new("validate"),
         Capability::new("post"),
+        Capability::new("tally"),
+        Capability::new("check.correctness"),
+        Capability::new("check.policy"),
+        Capability::new("check.arithmetic"),
     ])
 }
 
@@ -1004,44 +1008,55 @@ async fn a_concurrently_dispatched_run_replays_strictly() {
 // The argument: an agent at 61 % pass^1 is around 25 % at pass^8, so a
 // single execution of a high-stakes judgement is not adequate evidence. What a
 // panel must never do is resolve its own disagreement.
+//
+// A panel is a *subgraph*, not a field: k nodes depending on the subject, each
+// declaring `verifies`, and a terminal node depending on all of them that
+// tallies with `Quorum`. There is deliberately no `PlanNode::with_quorum` —
+// the runtime has no way to hand a node a lens, so the declaration would ride
+// inside the plan digest with its behaviour living nowhere.
 
-/// A panel needs something to judge.
+/// The graph already expresses a panel, and the contract already binds it.
 ///
-/// Declared on a node with no subject, a quorum repeats *the work* rather than
-/// reviewing it — and for a mutating step that means repeating it on the world.
+/// Each judge depends on the subject — a node with nothing to judge repeats
+/// *the work*, which for a mutating step means repeating it on the world — and
+/// the aggregator depends on every judge, so no verdict can be dropped by
+/// running the tally early.
 #[test]
-fn a_quorum_on_a_node_that_judges_nothing_is_refused() {
-    use agentplane::core::Quorum;
-
+fn a_panel_is_judges_over_a_subject_and_an_aggregator_over_the_judges() {
     let plan = PlanIR::new(vec![
+        PlanNode::new(0, "fetch").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "check.correctness")
+            .verifies()
+            .arg("subject", ArgSource::node(StepId(0))),
+        PlanNode::new(2, "check.policy")
+            .verifies()
+            .arg("subject", ArgSource::node(StepId(0))),
+        PlanNode::new(3, "check.arithmetic")
+            .verifies()
+            .arg("subject", ArgSource::node(StepId(0))),
+        PlanNode::new(4, "tally")
+            .arg("correctness", ArgSource::node(StepId(1)))
+            .arg("policy", ArgSource::node(StepId(2)))
+            .arg("arithmetic", ArgSource::node(StepId(3)))
+            .terminal(),
+    ]);
+    validate(&plan, &contract().require_verifier()).expect("a panel is an ordinary subgraph");
+
+    // And a judge with no subject is refused by the rule that already exists:
+    // it would be the work repeated rather than reviewed.
+    let no_subject = PlanIR::new(vec![
         PlanNode::new(0, "validate")
             .arg("input", ArgSource::run_input())
-            .with_quorum(Quorum::new(2, ["correctness", "policy", "arithmetic"]).unwrap())
+            .verifies()
             .terminal(),
     ]);
     assert!(
         matches!(
-            validate(&plan, &contract()).unwrap_err(),
-            PlanError::QuorumWithoutSubject { .. }
+            validate(&no_subject, &contract()).unwrap_err(),
+            PlanError::VerifierWithoutSubject { .. }
         ),
-        "a panel with nothing to judge repeats the work rather than reviewing it"
+        "a judge with nothing to judge repeats the work rather than reviewing it"
     );
-}
-
-/// With a subject it is a review, and permitted.
-#[test]
-fn a_quorum_over_a_predecessor_is_accepted() {
-    use agentplane::core::Quorum;
-
-    let plan = PlanIR::new(vec![
-        PlanNode::new(0, "fetch").arg("input", ArgSource::run_input()),
-        PlanNode::new(1, "validate")
-            .after(0)
-            .arg("subject", ArgSource::node(StepId(0)))
-            .with_quorum(Quorum::new(2, ["correctness", "policy", "arithmetic"]).unwrap())
-            .terminal(),
-    ]);
-    validate(&plan, &contract()).expect("a panel with a subject is fine");
 }
 
 /// The declaration itself is refused before a plan can carry it.

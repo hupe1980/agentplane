@@ -179,7 +179,7 @@ impl StandingAuthority {
                  is the thing an audit asks for first",
             ));
         }
-        if self.ceiling.is_zero() {
+        if self.ceiling.is_free() {
             return Err(AuthorityError::Malformed(
                 "the authority permits nothing — issue a ceiling, or do not issue it. \
                  Zero and unlimited are opposite readings of the same silence",

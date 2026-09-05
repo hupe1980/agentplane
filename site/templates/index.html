@@ -84,16 +84,23 @@
     Guarantees are only worth what their tests can falsify — so each one is
     broken on purpose, and the test written for it must fail.
   </p>
+  {#- Every figure here is checked against the tree by
+      `tests/guards/docs.rs::the_landing_pages_proof_figures_are_the_real_ones`.
+      They were 6 / 18 / 106 against a tree holding 7 / 26 / 644 — the one
+      section of this site claiming the project is falsifiable was itself the
+      part nothing falsified. -#}
   <dl class="stats">
-    <div><dt>6</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
-    <div><dt>18</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
-    <div><dt>106</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>7</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
+    <div><dt>26</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
+    <div><dt>644</dt><dd>code mutations, each naming the one test that must fail</dd></div>
     <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
   </dl>
   <p class="fine">
     This project shipped an unfalsifiable guarantee once: a refusal that was
     implemented, tested and green, where deleting it would have failed no test.
-    It was found by accident. The sweep exists so the next one is not.
+    It was found by accident. The sweep exists so the next one is not —
+    <a href="{{ get_url(path='@/docs/assurance.md') }}">how this is proven</a>
+    is the long answer.
   </p>
 </section>
 

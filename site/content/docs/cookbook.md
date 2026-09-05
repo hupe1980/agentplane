@@ -2338,9 +2338,31 @@ routes, and a union is the wildcard this allowlist refuses to have.
 
 ## ⚖️ Judge a high-stakes step more than once
 
+A panel is a subgraph: judges over the subject, an aggregator over the judges.
+
+```rust
+let plan = PlanIR::new(vec![
+    PlanNode::new(0, "settle.propose").arg("input", ArgSource::run_input()),
+    PlanNode::new(1, "check.correctness").verifies().arg("subject", ArgSource::node(StepId(0))),
+    PlanNode::new(2, "check.policy").verifies().arg("subject", ArgSource::node(StepId(0))),
+    PlanNode::new(3, "check.arithmetic").verifies().arg("subject", ArgSource::node(StepId(0))),
+    PlanNode::new(4, "settle.decide")
+        .arg("correctness", ArgSource::node(StepId(1)))
+        .arg("policy", ArgSource::node(StepId(2)))
+        .arg("arithmetic", ArgSource::node(StepId(3)))
+        .terminal(),
+]);
+```
+
+The aggregator tallies:
+
 ```rust
 let quorum = Quorum::new(2, ["correctness", "policy-conformance", "arithmetic"])?;
 ```
+
+`Runtime::builder(..).require_verifier()` makes carrying a judge a condition of
+admission — including for the successor a `Replanner` proposes, which is the
+plan you did not write.
 
 **The trap:** running the same judgement three times and taking the majority.
 Identical prompts against the same model share their blind spots, so they agree

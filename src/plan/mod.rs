@@ -44,6 +44,13 @@ impl Contract {
         self
     }
 
+    /// Bound how many nodes a plan may hold.
+    ///
+    /// A validator option, not a runtime one: a run's step ceiling is
+    /// [`Budget::max_steps`](crate::core::Budget::max_steps), which counts what
+    /// actually executes across every version of the plan, and two ceilings of
+    /// the same name would be two answers to one question. This is here for a
+    /// caller checking a plan it did not write before handing it over.
     #[must_use]
     pub fn max_steps(mut self, n: usize) -> Self {
         self.max_steps = Some(n);
@@ -239,15 +246,6 @@ fn check_verifiers(plan: &PlanIR, contract: &Contract) -> Result<(), PlanError> 
     for n in plan.nodes.iter().filter(|n| n.verifies) {
         if n.depends_on.is_empty() {
             return Err(PlanError::VerifierWithoutSubject { step: n.id });
-        }
-    }
-    // Same requirement, one step stronger. A quorum is several judgements of
-    // one piece of work; declared on a node with nothing to judge it is the
-    // *work* repeated, which for a mutating step means repeating it on the
-    // world. Caught at plan time, where the cost is a diagnostic.
-    for n in plan.nodes.iter().filter(|n| n.quorum.is_some()) {
-        if n.depends_on.is_empty() {
-            return Err(PlanError::QuorumWithoutSubject { step: n.id });
         }
     }
     if contract.require_verifier && !plan.nodes.iter().any(|n| n.verifies) {

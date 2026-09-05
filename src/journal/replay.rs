@@ -102,6 +102,35 @@ pub enum EffectReplay {
     },
 }
 
+impl EffectReplay {
+    /// What this state says the attempt cost so far.
+    ///
+    /// Zero for the states that describe an attempt nobody made: a refusal and
+    /// a denial both stop a call before it starts, and an announcement with no
+    /// terminal record has reported no figure yet.
+    #[must_use]
+    pub const fn spend(&self) -> crate::core::Spend {
+        match self {
+            Self::Done { spend, .. } | Self::Failed { spend, .. } => *spend,
+            Self::Refused { .. } | Self::Denied { .. } | Self::Orphan { .. } => {
+                crate::core::Spend::ZERO
+            }
+        }
+    }
+
+    /// Fold an earlier record's figure into this one.
+    ///
+    /// Named over the states that carry a figure rather than over all of them,
+    /// so a state that gains one later cannot silently keep discarding what it
+    /// supersedes.
+    fn add_spend(&mut self, extra: crate::core::Spend) {
+        match self {
+            Self::Done { spend, .. } | Self::Failed { spend, .. } => *spend += extra,
+            Self::Refused { .. } | Self::Denied { .. } | Self::Orphan { .. } => {}
+        }
+    }
+}
+
 /// One step's effects, in the order that step performed them.
 ///
 /// Owned by the step that is replaying it rather than borrowed from a shared
@@ -115,15 +144,25 @@ pub struct StepCursor {
 }
 
 impl StepCursor {
-    /// Overwrite the most recent slot for `key` with a terminal replay state.
+    /// Overwrite the most recent slot for `key` with a terminal replay state,
+    /// **carrying forward what the state it supersedes already cost**.
     ///
     /// Newest-first because a retried effect has one slot per attempt, and a
     /// terminal record always describes the latest one. One implementation
     /// rather than the same `iter_mut().rev().find(..)` at three call sites,
     /// where the fourth copy would be the one written subtly differently.
+    ///
+    /// The accumulation is what makes a reconciled attempt bill what it
+    /// actually cost. An attempt that spent before failing and was then
+    /// resolved by a probe wrote two records carrying two figures; the live
+    /// pass added both, and a slot that simply took the later record's figure
+    /// would replay the same run for less. A slot is one announced attempt,
+    /// and its spend is everything that attempt's records report.
     fn settle(&mut self, key: EffectKey, state: EffectReplay) {
         if let Some(slot) = self.effects.iter_mut().rev().find(|(k, _, _)| *k == key) {
+            let carried = slot.2.spend();
             slot.2 = state;
+            slot.2.add_spend(carried);
         }
     }
 
@@ -264,6 +303,9 @@ impl StepCursor {
                 // stands in.
                 declared: declared.unwrap_or_else(crate::core::DeclaredOutput::untrusted),
             },
+            // Zero, because what the failed attempt spent is on the slot
+            // already: `settle` carries it forward, and stating a figure here
+            // would add the attempt's cost to itself.
             (disposition, _) => EffectReplay::Failed {
                 error: "resolved by reconciliation".to_owned(),
                 disposition,

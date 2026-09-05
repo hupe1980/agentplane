@@ -379,6 +379,10 @@ impl JournalStore for Faulty {
         self.inner.runs_by_outcome(outcome, limit).await
     }
 
+    async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
+        self.inner.count_by_outcome(outcome).await
+    }
+
     async fn recent_runs(
         &self,
         after: Option<(u64, RunId)>,
@@ -511,6 +515,9 @@ mod tests {
             unreachable!("the test reads capabilities only")
         }
         async fn runs_by_outcome(&self, _: &str, _: usize) -> Result<Vec<RunId>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn count_by_outcome(&self, _: &str) -> Result<u64, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn admitted_as(&self, _: &str) -> Result<Option<RunId>, StoreError> {

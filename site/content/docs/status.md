@@ -1,7 +1,7 @@
 +++
 title = "Status"
 description = "What is pre-alpha, what to pin, what is deliberately not built, and how to check."
-weight = 12
+weight = 18
 +++
 
 `agentplane` is published on crates.io and pre-alpha. This page answers three questions an

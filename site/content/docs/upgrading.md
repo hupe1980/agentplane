@@ -1,7 +1,7 @@
 +++
 title = "Upgrading"
 description = "What breaks between pre-alpha releases, why, and the shortest correct fix for each."
-weight = 13
+weight = 19
 +++
 
 Pre-alpha means hard cuts rather than deprecation cycles, and a manifest or a
@@ -14,6 +14,106 @@ refusal. None of them changes what a running agent does silently, which is the
 property that makes a hard cut acceptable at this stage.
 
 ---
+
+## `PlanNode::with_quorum` is gone; a panel is a subgraph
+
+**Affected:** any plan that declared a quorum on a node.
+
+```rust
+// Before — declared, digest-covered, and never executed: the node ran once.
+PlanNode::new(1, "validate")
+    .arg("subject", ArgSource::node(StepId(0)))
+    .with_quorum(Quorum::new(2, ["correctness", "policy", "arithmetic"])?)
+
+// After — the judges and the aggregator the declaration was describing.
+PlanNode::new(1, "check.correctness").verifies().arg("subject", ArgSource::node(StepId(0))),
+PlanNode::new(2, "check.policy").verifies().arg("subject", ArgSource::node(StepId(0))),
+PlanNode::new(3, "check.arithmetic").verifies().arg("subject", ArgSource::node(StepId(0))),
+PlanNode::new(4, "decide")
+    .arg("correctness", ArgSource::node(StepId(1)))
+    .arg("policy", ArgSource::node(StepId(2)))
+    .arg("arithmetic", ArgSource::node(StepId(3)))
+    .terminal(),
+```
+
+The aggregator decides with `Quorum`, which is unchanged. Nothing is lost: the
+field was never executed, so a plan that carried one was already running its
+node once.
+
+`PlanError::QuorumWithoutSubject` is gone with it;
+`PlanError::VerifierWithoutSubject` is the rule that remains, and it says the
+same thing about the judges.
+
+## `max_wallclock_secs` now stops the run
+
+**Affected:** any manifest or `Budget` that declares it.
+
+It parsed, it refused a zero, it reached the ledger — and nothing ever read a
+clock into that ledger, so elapsed time stayed at zero and the ceiling could not
+fire. If you declared one, the run it governs will now end as `Exhausted` where
+it used to run on.
+
+The reading is journaled, one per step boundary, and only for a run that
+declared the ceiling. That last part has a consequence: such a history replays
+under a **raised** wall-clock ceiling and not under a build that removed it,
+because the recorded run performs a clock read the second build would not
+request. Every other ceiling can be changed in either direction between passes.
+
+If the ceiling was decorative — declared because it looked prudent, never sized
+against a real run — remove it rather than raise it. `budgets: {}` is how you
+say "no limit" where a reviewer can object to it.
+
+## `RunOutcome::spend` is now `RunOutcome::consumed`
+
+**Affected:** every caller reading what a run cost.
+
+```rust
+// Before
+println!("{} tokens", out.spend.tokens);
+
+// After
+println!("{} tokens", out.spend().tokens);   // the metered half, unchanged
+println!("{} effects", out.consumed.effects); // and the rest of the tally
+```
+
+The field carries the whole `Consumed` — steps, effects, spend, elapsed,
+refusals — rather than only the money, because that is what an operator needs
+after a run stops short: *which ceiling, and how close was it?* `spend()` is an
+accessor for the metered half, so the fix is two characters per call site.
+
+It is also the observable one property is asserted through: a strict replay must
+reach the *same tally*, not merely the same status. Nothing outcome-shaped can
+see a replay that bills an attempt twice, and a replay that bills an attempt
+twice stops a resumed run against a ceiling its history never reached.
+
+`Spend::is_zero` is gone. `Spend::is_free` was the same predicate under a second
+name, and `Spend::is_free_ref` is the by-reference form `skip_serializing_if`
+needs.
+
+## A ready set is admitted against what it has already handed out
+
+**Affected:** any plan with width, and any `Budget` sized against one.
+
+Nothing to change in your code — but a plan that ran more steps or more effects
+than its ceiling named will now stop where the ceiling says. `Budget::steps(2)`
+over a three-wide fan-out used to run three branches: a step is counted when it
+*finishes*, so a whole ready set asked the same question of the same unmoved
+figure and every branch was told yes. The same shape let `Budget::effects(2)`
+perform three concurrent effects.
+
+If a plan of yours depended on the old width, the ceiling it depended on was not
+the one it declared. Raise the ceiling, or declare the width:
+
+```yaml
+budgets:
+  max_steps: 8
+  max_parallel_steps: 2   # how many of a ready set run at once
+```
+
+`max_parallel_steps` is also what bounds how far a *metered* ceiling can be
+overshot: those are checked before an operation and billed after it, so each step
+in flight may be holding one operation's worth of unbilled spend. Omitted, the
+plan's own width is the bound.
 
 ## An MCP client is opened with `McpClient::connect`
 

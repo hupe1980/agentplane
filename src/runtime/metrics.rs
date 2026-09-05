@@ -147,9 +147,12 @@ pub const QUARANTINES: Instrument = Instrument {
     kind: Kind::Counter,
     unit: "1",
     dimension: None,
-    description: "Runs set aside for a human because an outcome could not be \
-                  determined and guessing was forbidden. Never self-healing: this \
-                  number only falls when someone acts.",
+    description: "How often a run was set aside for a human because an outcome \
+                  could not be determined and guessing was forbidden. A rate, not \
+                  a backlog: it counts the moment of quarantining and is \
+                  monotonic. For how many are set aside *now* — the number that \
+                  falls when somebody acts — alert on \
+                  `agentplane.runs.quarantined`.",
 };
 
 pub const UNDECIDABLE: Instrument = Instrument {
@@ -323,6 +326,21 @@ pub const OPEN_TASKS: Instrument = Instrument {
                   it does.",
 };
 
+pub const QUARANTINED_RUNS: Instrument = Instrument {
+    name: "agentplane.runs.quarantined",
+    kind: Kind::Gauge,
+    unit: "1",
+    dimension: None,
+    description: "Runs currently set aside for a human. The level behind the \
+                  quarantine counter, and the one worth alerting on: a counter \
+                  is monotonic and per-process, so after a restart it reads zero \
+                  over a backlog of forty, and a backlog that stopped growing \
+                  reads exactly like one that was cleared. Read from the store, \
+                  so it survives restarts and reports the standing total on \
+                  every sweep. It only ever rises today: this runtime offers no \
+                  verb that resolves a quarantine.",
+};
+
 /// Every instrument this crate emits.
 ///
 /// Guarded in `tests/guards/layering.rs`: an entry with no emitter fails the build.
@@ -350,6 +368,7 @@ pub const CATALOGUE: &[Instrument] = &[
     DUE_DEADLINES,
     PENDING_TIMERS,
     OPEN_TASKS,
+    QUARANTINED_RUNS,
 ];
 
 /// A point-in-time reading of everything a plane is holding.
@@ -363,14 +382,27 @@ pub const CATALOGUE: &[Instrument] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Census {
     pub open_cases: u64,
+    /// Runs resting on a `quarantined` conclusion.
+    ///
+    /// A *level*, deliberately, and the one gauge here that is not about work
+    /// waiting to be done: it is work waiting to be *judged*. The counter beside
+    /// it says how often quarantining happened, which cannot answer how many are
+    /// outstanding — the question an operator actually pages on, and the one a
+    /// per-process counter answers with zero after every restart.
+    ///
+    /// Stated rather than implied: **this number only rises.** Nothing in this
+    /// runtime resolves a quarantine — a resume re-reaches the same conclusion
+    /// and a cancellation request is recorded and not acted on — so the gauge
+    /// reports a backlog that is real and, for now, permanent. That is the
+    /// honest reading of the state, and the missing verb is on the roadmap
+    /// rather than hidden behind a number that looks drainable.
+    pub quarantined_runs: u64,
     /// Seconds since the longest-open case was opened, or `None` if none are open.
     pub oldest_case_age_secs: Option<u64>,
     pub due_deadlines: u64,
     pub pending_timers: u64,
     pub open_tasks: u64,
 }
-
-impl Census {}
 
 /// Seconds between two instants, floored at zero.
 ///
@@ -480,5 +512,6 @@ impl Meter {
         self.gauge(DUE_DEADLINES, c.due_deadlines);
         self.gauge(PENDING_TIMERS, c.pending_timers);
         self.gauge(OPEN_TASKS, c.open_tasks);
+        self.gauge(QUARANTINED_RUNS, c.quarantined_runs);
     }
 }

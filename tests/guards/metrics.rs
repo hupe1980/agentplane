@@ -546,3 +546,113 @@ async fn an_asked_for_tenant_label_is_the_planes_own() {
         samples.iter().map(|s| &s.tenant).collect::<Vec<_>>()
     );
 }
+
+// ── The backlog nothing but a person clears ─────────────────────────────────
+
+/// A mutating call that times out and nobody may guess about — the canonical
+/// route to a quarantine.
+#[derive(Debug, Clone)]
+struct Undecided;
+
+#[async_trait::async_trait]
+impl Effect for Undecided {
+    type Output = Value;
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("test.transfer", json!({ "ref": "AC-1" }))
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn recovery(&self) -> Recovery {
+        Recovery::RequiresOperator
+    }
+    fn retry(&self) -> RetryPolicy {
+        RetryPolicy::attempts(1)
+    }
+    async fn perform(&self) -> Result<Value, EffectError> {
+        Err(EffectError::Timeout {
+            driver: "ledger".into(),
+            waited_ms: 30_000,
+        })
+    }
+}
+
+/// A skill whose run ends set aside for a human.
+#[derive(Debug)]
+struct Undecidable;
+
+#[async_trait::async_trait]
+impl Skill for Undecidable {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("undecidable").provides("demo.undecidable")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let out = cx.effect(Undecided).await?;
+        Ok(Outcome::done(out))
+    }
+}
+
+/// **The quarantine backlog is a level, and the level is observed.**
+///
+/// The counter beside it says how *often* a run was set aside. That number is
+/// monotonic, so a backlog that stopped growing reads exactly like one that was
+/// cleared — which is the state an operator most needs told apart. The
+/// instrument's own description used to promise a number that "only falls when
+/// someone acts", which no counter can do.
+#[tokio::test]
+async fn the_quarantine_backlog_is_reported_as_a_level_not_only_as_a_rate() {
+    let db = store();
+    let rt = Runtime::builder(Arc::clone(&db) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&db) as Arc<dyn CaseStore>)
+        .skill(Undecidable)
+        .build();
+
+    assert_eq!(
+        rt.census(t(1_000)).await.unwrap().quarantined_runs,
+        0,
+        "a plane that has quarantined nothing must report nothing"
+    );
+
+    for _ in 0..3 {
+        let out = rt
+            .run("demo.undecidable", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+        assert!(matches!(
+            out.status,
+            agentplane::runtime::RunStatus::Quarantined(_)
+        ));
+    }
+
+    assert_eq!(
+        rt.census(t(2_000)).await.unwrap().quarantined_runs,
+        3,
+        "the level does not follow the backlog, so nothing says how many runs \
+         are waiting on a human"
+    );
+}
+
+/// The level counts the index, never a page of it.
+///
+/// The same failure the case gauge is guarded against, on the gauge where it
+/// would hurt most: a quarantine backlog that flattens at the page size looks
+/// like a plateau at the moment it stops being survivable.
+#[tokio::test]
+async fn the_quarantine_level_is_not_bounded_by_a_page_size() {
+    let db = store();
+    let rt = Runtime::builder(Arc::clone(&db) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&db) as Arc<dyn CaseStore>)
+        .skill(Undecidable)
+        .build();
+
+    for _ in 0..250 {
+        rt.run("demo.undecidable", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    }
+    assert_eq!(rt.census(t(2_000)).await.unwrap().quarantined_runs, 250);
+}

@@ -125,14 +125,31 @@ fn phase_str(p: crate::core::Phase) -> &'static str {
     }
 }
 
-fn phase_from(s: &str) -> crate::core::Phase {
-    match s {
+/// Refused rather than defaulted, exactly as the timer store and the
+/// shared-store backend refuse it.
+///
+/// A subscription's phase is which cursor the delivered event is journaled
+/// under, and forward and compensating effects must never share one. Read as
+/// `Forward` on damage, a compensating wait's answer lands on the forward
+/// cursor: the wait it was meant for is never satisfied and waits forever,
+/// while a strict replay finds a record on the forward cursor that this build
+/// never asked for and quarantines the run. Both are silent at the moment the
+/// column is misread.
+///
+/// It is also the only field of this row that was total. Every one beside it —
+/// the case id, the effect key — already answers `Corrupt`, so one decoder
+/// guessed while its neighbours refused.
+fn phase_from(s: &str) -> Result<crate::core::Phase, StoreError> {
+    Ok(match s {
+        "forward" => crate::core::Phase::Forward,
         "compensating" => crate::core::Phase::Compensating,
-        // Anything else is the forward pass. An unknown value can only come from
-        // a future version, and treating it as forward keeps the read total
-        // rather than failing a delivery on a column it does not know.
-        _ => crate::core::Phase::Forward,
-    }
+        other => {
+            return Err(StoreError::Corrupt {
+                seq: 0,
+                detail: format!("unknown subscription phase '{other}'"),
+            });
+        }
+    })
 }
 
 fn ts(t: Timestamp) -> i64 {
@@ -751,7 +768,7 @@ impl EventStore for RedbStore {
                                     }
                                 })?,
                                 step: crate::core::StepId(step),
-                                phase: phase_from(&phase),
+                                phase: phase_from(&phase)?,
                                 kind: kind.clone(),
                                 correlation,
                             })
@@ -866,7 +883,7 @@ impl EventStore for RedbStore {
                         detail: format!("bad effect key '{effect}': {e}"),
                     })?,
                     step: crate::core::StepId(step),
-                    phase: phase_from(&phase),
+                    phase: phase_from(&phase)?,
                     kind: kind.clone(),
                     correlation,
                 };
@@ -1243,7 +1260,7 @@ impl EventStore for RedbStore {
                         detail: format!("bad effect key '{effect}': {e}"),
                     })?,
                     step: crate::core::StepId(step),
-                    phase: phase_from(phase),
+                    phase: phase_from(phase)?,
                     kind: kind.to_owned(),
                     correlation: vec![CorrelationKey::new(ns.to_owned(), val.to_owned())],
                 });
@@ -1251,5 +1268,45 @@ impl EventStore for RedbStore {
             Ok(out)
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    /// Both phases round-trip; the pair cannot drift while this passes.
+    #[test]
+    fn every_written_phase_decodes_to_the_value_that_wrote_it() {
+        for phase in [
+            crate::core::Phase::Forward,
+            crate::core::Phase::Compensating,
+        ] {
+            assert_eq!(phase_from(phase_str(phase)).expect("round trip"), phase);
+        }
+    }
+
+    /// **A subscription phase this store cannot read is damage, not `Forward`.**
+    ///
+    /// The third copy of one decoder. The shared-store backend refused a bad
+    /// phase and the timer store was taught to; this one still answered
+    /// `Forward` for anything it did not recognise, with a comment defending
+    /// the totality — while the case id and effect key decoded three lines
+    /// away already answered `Corrupt`.
+    ///
+    /// What the default costs is specific: the phase selects the replay cursor
+    /// the delivery is journaled under, and forward and compensating effects
+    /// must never share one. A compensating wait whose phase is misread has its
+    /// answer filed on the forward cursor — so that wait is never satisfied and
+    /// the run waits forever, while a strict replay meets a record on the
+    /// forward cursor nothing requested and quarantines.
+    #[test]
+    fn an_unreadable_subscription_phase_is_refused_rather_than_defaulted() {
+        for bad in ["", "Forward", "compensating ", "backward"] {
+            assert!(
+                matches!(phase_from(bad).err(), Some(StoreError::Corrupt { .. })),
+                "phase '{bad}' decoded instead of refusing"
+            );
+        }
     }
 }

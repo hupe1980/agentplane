@@ -605,6 +605,10 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         ) -> Result<Vec<RunId>, StoreError> {
             self.0.runs_by_outcome(outcome, limit).await
         }
+
+        async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
+            self.0.count_by_outcome(outcome).await
+        }
         async fn recent_runs(
             &self,
             after: Option<(u64, RunId)>,
@@ -1513,6 +1517,10 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
             limit: usize,
         ) -> Result<Vec<RunId>, StoreError> {
             self.inner.runs_by_outcome(outcome, limit).await
+        }
+
+        async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
+            self.inner.count_by_outcome(outcome).await
         }
         async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
             self.inner.abandoned_runs(limit).await

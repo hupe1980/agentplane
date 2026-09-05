@@ -1978,6 +1978,16 @@ async fn a_replayed_atomic_member_is_not_applied_again() {
         "replay performed a member again: {:?}",
         world.entries()
     );
+    // And it bills what the live pass billed. An atomic member is admitted
+    // through the same gate as any other mutating effect, so it takes a slot
+    // against `max_effects` there; a replay that walked past its record without
+    // billing one would leave a group free on the second pass and charged on
+    // the first, which is the same tally divergence read from the other end.
+    assert_eq!(
+        (replayed.consumed.effects, replayed.consumed.spend),
+        (out.consumed.effects, out.consumed.spend),
+        "the replay billed a different tally than the group it replays"
+    );
 }
 
 /// A store that cannot lend a transaction refuses the member at registration.

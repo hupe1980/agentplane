@@ -1575,3 +1575,299 @@ fn every_documented_associated_function_exists() {
         missing.join("\n")
     );
 }
+
+/// **The figures the landing page offers as proof are the tree's own.**
+///
+/// The section is headed *"Why you should believe any of it"*, and it was the
+/// one part of this site nothing checked: it read 6 / 18 / 106 against a tree
+/// holding 7 / 26 / 644 — the code-mutation count off by six times. A claim
+/// about falsifiability that nothing falsifies is the shape this project
+/// catalogues, arriving on the page that exists to argue against it.
+///
+/// Counted from the artifacts rather than restated, so adding a spec or a
+/// mutation moves the page or fails the build.
+#[test]
+fn the_landing_pages_proof_figures_are_the_real_ones() {
+    let page = read("site/templates/index.html");
+
+    // `<div><dt>N</dt><dd>label…` — the figure and enough of the label to say
+    // which claim a mismatch is about.
+    let stated = |needle: &str| -> u64 {
+        let at = page
+            .find(needle)
+            .unwrap_or_else(|| panic!("the landing page no longer claims '{needle}'"));
+        let before = &page[..at];
+        let open = before
+            .rfind("<dt>")
+            .unwrap_or_else(|| panic!("no <dt> precedes '{needle}'"));
+        let close = before[open..]
+            .find("</dt>")
+            .unwrap_or_else(|| panic!("unterminated <dt> before '{needle}'"));
+        before[open + 4..open + close]
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("the figure before '{needle}' is not a number: {e}"))
+    };
+
+    let tla = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("spec"))
+        .expect("read spec/")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "tla"))
+        .count() as u64;
+
+    // One table entry per line, `    "Name": (` — the same shape both tables use
+    // and the same one `mutants.py --check` walks.
+    let rows = |table: &str| -> u64 {
+        read(table)
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                l.starts_with("    \"")
+                    && t.ends_with("\": (")
+                    && t.trim_start_matches('"')
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric)
+            })
+            .count() as u64
+    };
+
+    for (claim, stated, actual) in [
+        ("TLA+ specifications", stated("TLA+ specifications"), tla),
+        (
+            "deliberately broken specs",
+            stated("deliberately broken specs"),
+            rows("spec/mutations.py"),
+        ),
+        (
+            "code mutations",
+            stated("code mutations"),
+            rows("tools/mutants.py"),
+        ),
+    ] {
+        assert_eq!(
+            stated, actual,
+            "the landing page offers '{claim}' as evidence and says {stated}, \
+             but this tree holds {actual} — the page arguing that every \
+             guarantee is falsifiable is itself out of date"
+        );
+    }
+
+    // The one figure that is a property rather than a count.
+    assert_eq!(stated("unsafe blocks"), 0);
+    assert!(
+        read("Cargo.toml").contains("unsafe_code = \"forbid\""),
+        "the page claims `forbid(unsafe_code)` and the manifest does not set it"
+    );
+}
+
+/// **Every specification the tree holds is named where the README lists them.**
+///
+/// The list read "effect protocol, retry safety, sagas, fencing, authorization,
+/// delegation" while `spec/` held a seventh, `EffectGroup` — the one covering
+/// the transactional tier, which is the hardest thing here to believe without
+/// a proof and therefore the one worth naming. A hand-maintained list of files
+/// drifts in exactly this direction: adding the spec is deliberate, remembering
+/// the sentence is not.
+#[test]
+fn the_readme_names_every_specification_the_tree_holds() {
+    let readme = read("README.md").to_lowercase();
+    for entry in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("spec"))
+        .expect("read spec/")
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "tla") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .expect("a named spec")
+            .to_string_lossy()
+            .to_string();
+        // `EffectGroup` → ["effect", "group"], each of which must appear — the
+        // README writes them as prose ("effect groups", "sagas"), so the check
+        // is on the words rather than on the file name.
+        let words: Vec<String> = stem.chars().fold(Vec::<String>::new(), |mut acc, c| {
+            if c.is_uppercase() || acc.is_empty() {
+                acc.push(String::new());
+            }
+            acc.last_mut()
+                .expect("just pushed")
+                .push(c.to_ascii_lowercase());
+            acc
+        });
+        for word in &words {
+            assert!(
+                readme.contains(word.as_str()),
+                "spec/{stem}.tla is model-checked on every push and the README's \
+                 list of specifications never says '{word}' — a reader deciding \
+                 whether to trust this project is shown a shorter list than the \
+                 one CI runs"
+            );
+        }
+    }
+}
+
+/// **Every event the runtime promises is named on the operations page.**
+///
+/// The table is headed *"Every failure P7 exists to surface has its own event
+/// target"*, and it listed ten of the fourteen in `telemetry::LOUD_EVENTS`. The
+/// four it omitted were `run.unreproducible`, `run.recovered`, `run.replanned`
+/// and `policy.denied` — an integrity finding, a takeover, a plan change and
+/// every policy refusal.
+///
+/// A table headed *every* is an alerting checklist. An operator builds their
+/// dashboard from it once and never returns, so a short list is not a smaller
+/// table — it is four signals nobody is watching, and the page says they are
+/// all there.
+#[test]
+fn the_operations_page_names_every_event_the_runtime_promises() {
+    let page = read("site/content/docs/operations.md");
+    let telemetry = read("src/runtime/telemetry.rs");
+
+    // The constants named by `LOUD_EVENTS`, resolved to their string values.
+    let list = telemetry
+        .split("pub const LOUD_EVENTS")
+        .nth(1)
+        .expect("telemetry declares LOUD_EVENTS")
+        .split("];")
+        .next()
+        .expect("LOUD_EVENTS is terminated");
+
+    let mut checked = 0;
+    for ident in list
+        .lines()
+        .map(|l| l.trim().trim_end_matches(','))
+        .filter(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+    {
+        let decl = format!("pub const {ident}: &str = \"");
+        let target = telemetry
+            .split(&decl)
+            .nth(1)
+            .unwrap_or_else(|| panic!("LOUD_EVENTS names {ident}, which is not declared"))
+            .split('"')
+            .next()
+            .expect("a terminated string");
+        assert!(
+            page.contains(&format!("`{target}`")),
+            "the runtime promises the event `{target}` and the operations page's \
+             table of *every* event does not name it — an operator building \
+             alerts from that table is not watching it"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 14,
+        "only {checked} events were checked; the LOUD_EVENTS parse found too few \
+         to be reading the real list"
+    );
+}
+
+/// **Every documentation page is linked from the README.**
+///
+/// The README's table is how most readers reach the site at all, and a page
+/// absent from it is a page nobody arrives at — which is the same outcome as
+/// not having written it. Splitting one long page into six made the risk
+/// concrete: the table named the page that was split and none of the pages it
+/// became.
+///
+/// Checked in the direction that matters. A README link to a page that does not
+/// exist is caught by the site build; a page the README never mentions is
+/// caught by nothing else.
+#[test]
+fn the_readme_links_every_documentation_page() {
+    let readme = read("README.md");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("site/content/docs");
+    for entry in std::fs::read_dir(&root)
+        .expect("read site/content/docs")
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "md") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .expect("a named page")
+            .to_string_lossy()
+            .to_string();
+        if stem == "_index" {
+            continue;
+        }
+        assert!(
+            readme.contains(&format!("/docs/{stem}/")),
+            "site/content/docs/{stem}.md is published and the README's table of \
+             documentation never links it — a page no reader is routed to"
+        );
+    }
+}
+
+/// **The changelog uses the vocabulary it says it uses, and ships nothing it
+/// does not carry.**
+///
+/// `CHANGELOG.md` is in the crate's `include` list, so it travels to crates.io
+/// and docs.rs. Two things drifted there because nothing looked:
+///
+/// It accumulated **seven** ad-hoc entry categories beside the standard ones —
+/// `Audited`, `Audit notes`, `Audited clean`, `Assurance`, `Testing`,
+/// `Research`, `Known` — four of which were one idea under four names, in a
+/// project whose worst-named defect is a rule with two spellings.
+///
+/// And it cited internal design documents by section (`CONCEPT §6.3`, `§9.1`)
+/// nineteen times. Those files are deliberately not packaged, so a reader on
+/// docs.rs followed a reference to something they were never sent. The docs
+/// guard that forbids internal section numbers everywhere else exempts this
+/// file, which is precisely why they survived here and nowhere else.
+#[test]
+fn the_changelog_ships_only_what_the_reader_receives() {
+    // The four standard categories this file uses, plus the two it documents.
+    const ALLOWED: &[&str] = &[
+        "Added",
+        "Changed",
+        "Deprecated",
+        "Removed",
+        "Fixed",
+        "Security",
+        "Assurance",
+        "Known",
+    ];
+
+    let log = read("CHANGELOG.md");
+    for line in log.lines().filter(|l| l.starts_with("### ")) {
+        let category = line[4..].split(" — ").next().unwrap_or("").trim();
+        assert!(
+            ALLOWED.contains(&category),
+            "CHANGELOG.md uses the category '{category}', which the preamble does \
+             not declare — an eighth spelling is how one idea ends up under four \
+             names"
+        );
+    }
+
+    // An internal section reference, as distinct from a cited external one:
+    // `RFC 9110 §11.1` names a document the reader can fetch; a bare `§9.1`
+    // names one this crate does not ship.
+    for (n, line) in log.lines().enumerate() {
+        assert!(
+            !line.contains("CONCEPT"),
+            "CHANGELOG.md:{} cites an internal design document, and this file \
+             ships inside the crate: {line}",
+            n + 1
+        );
+        if let Some(at) = line.find('§') {
+            let cited_source = line[..at].contains("RFC") || line[..at].contains("specification");
+            assert!(
+                cited_source,
+                "CHANGELOG.md:{} cites a section of a document the reader was not \
+                 sent: {line}",
+                n + 1
+            );
+        }
+    }
+
+    assert!(
+        !log.contains("arxiv.org"),
+        "CHANGELOG.md cites a paper. Research is how a design got decided, not \
+         what a release changed — and the preamble says so."
+    );
+}

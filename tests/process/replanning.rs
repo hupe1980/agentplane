@@ -773,3 +773,53 @@ mod unwinding {
         );
     }
 }
+
+// ── The contract binds the successor too ────────────────────────────────────
+
+/// **A control that held for the first plan and not for its replacement is a
+/// control a replan removes.**
+///
+/// The plane's plan contract was derived from its registered capabilities and
+/// nothing else, so `require_verifier` — the one contract rule with no other
+/// spelling — could be reached by a caller validating its own graph and never
+/// by the runtime. That left the gap where it matters most: a successor is a
+/// graph proposed mid-run by a component the embedder did not write, and it was
+/// admitted against a weaker contract than the plan it replaces.
+#[tokio::test]
+async fn a_required_verifier_binds_the_successor_a_replanner_proposes() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .require_verifier()
+        .budget(Budget::default().replans(2))
+        .replanner(Arc::new(planner()))
+        .skill(AsksToReplan {
+            name: "cheap",
+            untrusted: false,
+        })
+        .skill(Plain("expensive"))
+        .build();
+
+    // The first plan carries a verifier, so admission is fine; the successor
+    // this planner proposes does not.
+    let with_verifier = PlanIR::new(vec![
+        PlanNode::new(0, "cheap").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "expensive")
+            .verifies()
+            .arg("subject", ArgSource::node(StepId(0)))
+            .terminal(),
+    ]);
+
+    let out = rt
+        .run_plan(with_verifier, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    match &out.status {
+        RunStatus::Failed(why) => assert!(
+            why.contains("verifier"),
+            "the successor was refused for some other reason: {why}"
+        ),
+        other => panic!("a successor with nothing checking the work ran: {other:?}"),
+    }
+}

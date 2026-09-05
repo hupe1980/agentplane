@@ -299,6 +299,34 @@ pub trait JournalStore: Send + Sync + Debug {
     /// If the store is unreachable.
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError>;
 
+    /// How many runs currently rest on this conclusion.
+    ///
+    /// The **level** behind [`runs_by_outcome`](Self::runs_by_outcome)'s page.
+    /// A quarantine counter tells an operator how often runs were set aside; it
+    /// cannot tell them how many are set aside *now*, because a counter is
+    /// monotonic and a backlog that stopped growing looks exactly like one that
+    /// was cleared. The number that falls when somebody acts has to be observed,
+    /// and this is what observes it.
+    ///
+    /// **Never served from a bounded listing.** `runs_by_outcome(..).len()`
+    /// would rise, flatten at the page size and read as a plateau at the moment
+    /// it became a backlog — the specific failure the census exists to avoid, so
+    /// this counts the index rather than a page of it.
+    ///
+    /// Reads the same derived index `runs_by_outcome` pages, so the two cannot
+    /// disagree about one plane: last conclusion wins, and a resumed run leaves
+    /// the count it was in.
+    ///
+    /// Intended for the conclusions that are backlogs — the ones nothing clears
+    /// but a person. Counting an outcome that every healthy run reaches is a
+    /// scan of the whole plane, and the caller is choosing to pay for it.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable, or the index holds a row it cannot read —
+    /// the same refusal as the listing, for the same reason.
+    async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError>;
+
     /// The run that holds this admission key, if one does.
     ///
     /// A **derived** index, as `runs_by_outcome` is: the key's home is the

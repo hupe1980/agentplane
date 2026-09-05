@@ -100,6 +100,20 @@ enum ReplayedWait {
     Repair,
 }
 
+/// What the journal says about an effect attempt a replay just met.
+///
+/// The dispatch loop's two halves meet here: `Live` is the only arm that lets
+/// an attempt reach the world, and it is reached only when history is used up.
+enum Replayed<T> {
+    /// History answers the effect: this output, under this declaration.
+    Answered(T, crate::core::DeclaredOutput),
+    /// History says the run went on. Loop again at this attempt number — the
+    /// same one for a refusal a raise re-admitted, the next for a retry.
+    Continue(u32),
+    /// History ends here, so this attempt dispatches.
+    Live,
+}
+
 /// How a step is being executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -1003,35 +1017,49 @@ impl<'a> StepCtx<'a> {
         self.ledger.lock().expect("budget mutex").consumed()
     }
 
-    /// Count one dispatched effect and add what it consumed.
+    /// Bill one announced attempt read back from the journal: its slot against
+    /// `max_effects`, and everything its records say it cost.
     ///
-    /// Called for failures as well as successes, with a zero spend, because a
-    /// call that failed still *happened*: it took a slot against `max_effects`,
-    /// and a budget that only counted successes could never bound a call that
-    /// fails every time. Replay bills the same way from the same records, so the
-    /// two paths reach the same verdict at the same point.
+    /// Called for failures as well as successes, because a call that failed
+    /// still *happened*: it took a slot, and a budget that only counted
+    /// successes could never bound a call that fails every time. The live path
+    /// takes the same slot at admission and adds the cost when the call
+    /// returns, so the two reach the same verdict at the same point — the
+    /// property this whole seam exists for, and the one that breaks the moment
+    /// one announcement costs two slots on one path and one on the other.
     ///
     /// A separate function so the guard's scope is a single statement and cannot
     /// accidentally span an await.
-    fn bill(&self, spend: crate::core::Spend) {
+    pub(crate) fn bill_replayed(&self, spend: crate::core::Spend) {
         self.ledger
             .lock()
             .expect("budget mutex")
-            .record_effect(spend);
+            .replay_effect(spend);
     }
 
-    /// [`bill`](Self::bill), for an effect this pass actually dispatched.
+    /// Take an effect's slot for an announcement no ceiling gates.
     ///
-    /// The distinction feeds the tenant's period ledger: replayed spend is
-    /// billed to the run's own budget so a resume exhausts where the original
-    /// did, but only live spend accrues at settlement — otherwise every
-    /// suspend/resume cycle re-accrues the prefix and every strict pass bills
-    /// history into today's period.
+    /// A compensating call and a durable wait are both exempt from admission
+    /// and neither is exempt from having happened: the journal holds an
+    /// announcement, so every later pass bills one, and a live pass that
+    /// billed none would exhaust later than its own replay.
+    pub(crate) fn count_unadmitted(&self) {
+        self.ledger.lock().expect("budget mutex").count_effect();
+    }
+
+    /// Add what a **freshly dispatched** attempt cost. Its slot was taken at
+    /// admission; only the figure was unknown until now.
+    ///
+    /// The live/replayed distinction feeds the tenant's period ledger:
+    /// replayed spend is billed to the run's own budget so a resume exhausts
+    /// where the original did, but only live spend accrues at settlement —
+    /// otherwise every suspend/resume cycle re-accrues the prefix and every
+    /// strict pass bills history into today's period.
     fn bill_live(&self, spend: crate::core::Spend) {
         self.ledger
             .lock()
             .expect("budget mutex")
-            .record_live_effect(spend);
+            .record_live_spend(spend);
     }
 
     /// A deterministic random source.
@@ -1216,71 +1244,24 @@ impl<'a> StepCtx<'a> {
 
             // ── Replay: is this attempt already in history? ────────────────
             if self.mode.is_replaying() {
-                match self.cursor.next(key)? {
-                    Some(EffectReplay::Done {
-                        output,
-                        spend,
-                        declared,
-                        ..
-                    }) => {
-                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        return Ok((serde_json::from_value(output)?, declared));
-                    }
-                    Some(
-                        refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. }),
-                    ) => {
-                        // Re-admitted refusals fall through to a live dispatch
-                        // of the same key; everything else re-raises inside.
-                        self.replayed_refusal(key, refusal).await?;
+                match self
+                    .replayed_attempt(
+                        &effect,
+                        &descriptor,
+                        ordinal,
+                        attempt,
+                        key,
+                        &recovery,
+                        &policy,
+                    )
+                    .await?
+                {
+                    Replayed::Answered(output, declared) => return Ok((output, declared)),
+                    Replayed::Continue(next) => {
+                        attempt = next;
                         continue;
                     }
-                    Some(EffectReplay::Failed {
-                        error,
-                        disposition,
-                        spend,
-                        permanent,
-                    }) => {
-                        attempt = self.replay_recorded_failure(
-                            &descriptor,
-                            ordinal,
-                            attempt,
-                            key,
-                            &recovery,
-                            &policy,
-                            &error,
-                            disposition,
-                            spend,
-                            permanent,
-                            // Recomputed from the code, like the recovery and
-                            // the policy: replay assumes the same program, and
-                            // the record's own `mutates` lives on the start
-                            // record the cursor has already collapsed.
-                            effect.mutates(),
-                        )?;
-                        continue;
-                    }
-                    Some(EffectReplay::Orphan {
-                        recovery: recorded, ..
-                    }) => {
-                        if let Some(output) = self
-                            .orphan_verdict(&effect, key, attempt, &recorded, &recovery, &policy)
-                            .await?
-                        {
-                            // Recovered by a probe this pass ran, so the
-                            // declaration this pass reads is the one its own
-                            // `EffectReconciled` record just carried.
-                            return Ok((output, crate::core::DeclaredOutput::of(&effect)));
-                        }
-                        attempt += 1;
-                        continue;
-                    }
-                    // History exhausted: this attempt runs live, unless a
-                    // strict pass is verifying — where reaching the end is
-                    // itself the finding.
-                    None if self.mode == Mode::Strict => {
-                        return Err(StepError::ReplayOverrun { actual: key });
-                    }
-                    None => {}
+                    Replayed::Live => {}
                 }
             }
 
@@ -1296,11 +1277,13 @@ impl<'a> StepCtx<'a> {
             // replay must reproduce whatever the original run did, or history
             // would change shape with the limit in force when you replayed it.
             //
-            // Compensation is exempt. Refusing to undo because the ceiling was
-            // reached is how a run ends with a charged card and no order — the
-            // ceiling exists to bound work, not to strand it half-done. The
-            // spend is still billed and journaled, so the overshoot is visible
-            // rather than silent.
+            // Compensation is exempt from the *verdict*, never from the
+            // accounting. Refusing to undo because the ceiling was reached is
+            // how a run ends with a charged card and no order — the ceiling
+            // exists to bound work, not to strand it half-done — but the undo
+            // still takes its slot and reports its spend, so the overshoot is
+            // visible rather than silent, and a pass replaying the
+            // announcement bills the same one.
             let ceilings = Some(DeclaredCeilings::of(&effect));
             self.gate(key, &descriptor, effect.mutates(), outbound, ceilings)
                 .await?;
@@ -1519,8 +1502,11 @@ impl<'a> StepCtx<'a> {
         if !self.writes_enabled() {
             return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
         }
-        // Scoped so the guard is gone before the await below.
-        let verdict = self.ledger.lock().expect("budget mutex").admit_effect();
+        // Asked without taking the slot: this is the question "does the
+        // ceiling now in force still refuse", and the dispatch that follows a
+        // yes goes through the ordinary gate, which is what takes the slot.
+        // Taking one here as well would charge the re-admitted effect twice.
+        let verdict = self.ledger.lock().expect("budget mutex").can_admit_effect();
         if verdict.is_err() {
             // The ledger now in force still refuses: the run concludes
             // exhausted again, and the standing refusal already says so — no
@@ -1562,6 +1548,11 @@ impl<'a> StepCtx<'a> {
 
         let (output, spend) = match &outcome {
             Reconciliation::Landed(value) => {
+                // Spend without a slot. A probe asks about the attempt that
+                // was already admitted and already counted; charging a second
+                // slot for the same call would make one announcement cost two
+                // — and the journal holds one announcement, so every replay
+                // bills one.
                 let spend = effect.spend(value);
                 self.bill_live(spend);
                 (Some(serde_json::to_value(value)?), spend)
@@ -1619,7 +1610,7 @@ impl<'a> StepCtx<'a> {
                 // wait's own kind, which `label_inbound` holds together.
                 declared: _,
             }) => {
-                self.bill(spend);
+                self.bill_replayed(spend);
                 Ok(Some(ReplayedWait::Recorded(Self::label_inbound(
                     output,
                     &spec.kind,
@@ -1641,7 +1632,8 @@ impl<'a> StepCtx<'a> {
                 resource,
                 reason,
             }),
-            Some(EffectReplay::Failed { error, .. }) => {
+            Some(EffectReplay::Failed { error, spend, .. }) => {
+                self.bill_replayed(spend);
                 Err(StepError::Effect(crate::core::EffectError::Rejected(error)))
             }
             // Announced, and *possibly* registered: a crash — or a transient
@@ -1655,6 +1647,11 @@ impl<'a> StepCtx<'a> {
             // the announcement that already exists. A strict pass dispatches
             // nothing and suspends as the record reads.
             Some(EffectReplay::Orphan { .. }) => {
+                // The announcement is on the record, so this pass bills it —
+                // including on the repair path, which re-enters the
+                // registration below with the announcement skipped and would
+                // otherwise be the one pass that waits for free.
+                self.bill_replayed(crate::core::Spend::default());
                 if self.mode == Mode::Resume {
                     Ok(Some(ReplayedWait::Repair))
                 } else {
@@ -1681,7 +1678,7 @@ impl<'a> StepCtx<'a> {
             outcome = "done",
         );
         self.meter.count(metrics::EFFECTS_REPLAYED, kind);
-        self.bill(spend);
+        self.bill_replayed(spend);
     }
 
     /// The reviewed grant for an effect, if the manifest names one.
@@ -1729,7 +1726,13 @@ impl<'a> StepCtx<'a> {
         // A compensating phase, or a group being taken back inside a forward
         // one. Both are undo, and both are exempt for the same reason: refusing
         // to undo is how a run ends with a charged card and no order.
+        //
+        // Exempt from the *verdict*, not from the count: the undo still
+        // announces an effect, so a replay of this history bills one and a
+        // live pass that billed none would exhaust later than its own replay.
+        // The overshoot stays visible rather than becoming invisible.
         if !self.phase.is_forward() || self.reversing {
+            self.count_unadmitted();
             return Ok(());
         }
         // First, because it is the cheapest and the most fundamental: an effect
@@ -2153,6 +2156,94 @@ impl<'a> StepCtx<'a> {
         Ok(outcome)
     }
 
+    /// Consume one attempt's history, if the journal holds it.
+    ///
+    /// Split out of the dispatch loop because that loop is the determinism
+    /// boundary and reads better as two halves — *what does history say*, then
+    /// *what does a live attempt do* — and because the replay half is where
+    /// every billing arm lives, which is the arithmetic a replayed run's verdict
+    /// depends on.
+    #[allow(clippy::too_many_arguments)]
+    async fn replayed_attempt<E: Effect>(
+        &mut self,
+        effect: &E,
+        descriptor: &EffectDescriptor,
+        ordinal: u32,
+        attempt: u32,
+        key: EffectKey,
+        recovery: &crate::core::Recovery,
+        policy: &crate::core::RetryPolicy,
+    ) -> Result<Replayed<E::Output>, StepError> {
+        match self.cursor.next(key)? {
+            Some(EffectReplay::Done {
+                output,
+                spend,
+                declared,
+                ..
+            }) => {
+                self.replayed_done(&descriptor.kind, attempt, spend);
+                Ok(Replayed::Answered(
+                    serde_json::from_value(output)?,
+                    declared,
+                ))
+            }
+            Some(refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. })) => {
+                // Re-admitted refusals fall through to a live dispatch of the
+                // same key; everything else re-raises inside.
+                self.replayed_refusal(key, refusal).await?;
+                Ok(Replayed::Continue(attempt))
+            }
+            Some(EffectReplay::Failed {
+                error,
+                disposition,
+                spend,
+                permanent,
+            }) => Ok(Replayed::Continue(self.replay_recorded_failure(
+                descriptor,
+                ordinal,
+                attempt,
+                key,
+                recovery,
+                policy,
+                &error,
+                disposition,
+                spend,
+                permanent,
+                // Recomputed from the code, like the recovery and the policy:
+                // replay assumes the same program, and the record's own
+                // `mutates` lives on the start record the cursor has already
+                // collapsed.
+                effect.mutates(),
+            )?)),
+            Some(EffectReplay::Orphan {
+                recovery: recorded, ..
+            }) => {
+                // An announcement with no terminal record is still an attempt
+                // this run made against the world, and every pass that reads it
+                // bills the one slot the live pass took when it admitted the
+                // attempt.
+                self.bill_replayed(crate::core::Spend::default());
+                if let Some(output) = self
+                    .orphan_verdict(effect, key, attempt, &recorded, recovery, policy)
+                    .await?
+                {
+                    // Recovered by a probe this pass ran, so the declaration
+                    // this pass reads is the one its own `EffectReconciled`
+                    // record just carried.
+                    return Ok(Replayed::Answered(
+                        output,
+                        crate::core::DeclaredOutput::of(effect),
+                    ));
+                }
+                Ok(Replayed::Continue(attempt + 1))
+            }
+            // History exhausted: this attempt runs live, unless a strict pass
+            // is verifying — where reaching the end is itself the finding.
+            None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun { actual: key }),
+            None => Ok(Replayed::Live),
+        }
+    }
+
     /// What to do about a failure the journal already holds.
     ///
     /// Returns the next attempt number to try. Errors if the recorded run
@@ -2171,9 +2262,11 @@ impl<'a> StepCtx<'a> {
         permanent: bool,
         mutates: bool,
     ) -> Result<u32, StepError> {
-        // Billed on replay exactly as it was live, or a run that exhausted its
-        // budget on failures would replay as healthy under the same limit.
-        self.bill(crate::core::Spend::default());
+        // Deliberately bills nothing. The recorded failure was billed by the
+        // caller, at the figure the record carries; a second billing here
+        // would charge one announced attempt two slots against `max_effects`,
+        // so a resumed run would exhaust a ceiling its live pass had room
+        // under — the exact divergence journaled spend exists to prevent.
 
         // Did the recorded run go on to retry? Ask history rather than infer:
         // if the next journaled effect is this one's attempt + 1, it retried.
@@ -2368,7 +2461,7 @@ impl<'a> StepCtx<'a> {
         if self.mode.is_replaying() {
             match self.cursor.next(key)? {
                 Some(EffectReplay::Done { spend, .. }) => {
-                    self.bill(spend);
+                    self.bill_replayed(spend);
                     return Ok(());
                 }
                 Some(EffectReplay::Refused { limit, used }) => {
@@ -2388,7 +2481,8 @@ impl<'a> StepCtx<'a> {
                         reason,
                     });
                 }
-                Some(EffectReplay::Failed { error, .. }) => {
+                Some(EffectReplay::Failed { error, spend, .. }) => {
+                    self.bill_replayed(spend);
                     return Err(StepError::Effect(crate::core::EffectError::Rejected(error)));
                 }
                 // Announced, and *possibly* armed: whether the arm landed is
@@ -2405,6 +2499,9 @@ impl<'a> StepCtx<'a> {
                 // so only a resume repairs — strict still suspends here, which
                 // is the honest reading of a journal that ends mid-wait.
                 Some(EffectReplay::Orphan { .. }) => {
+                    // Announced on the record, so this pass bills the wait —
+                    // the re-arm below writes no second announcement.
+                    self.bill_replayed(crate::core::Spend::default());
                     if self.mode == Mode::Resume {
                         timers
                             .arm(&crate::core::Timer {
@@ -2427,6 +2524,12 @@ impl<'a> StepCtx<'a> {
                 None => {}
             }
         }
+
+        // A wait is announced rather than dispatched, so no ceiling gates it —
+        // refusing one would strand a run mid-plan rather than stop work. It
+        // is still an operation the journal holds, so it takes its slot, and
+        // every pass that replays the announcement bills the same one.
+        self.count_unadmitted();
 
         // Announce before arming, so a crash between the two leaves an orphan
         // the resumed run recognises rather than a timer nobody is waiting on.
@@ -3112,7 +3215,7 @@ impl<'a> StepCtx<'a> {
         permanent: bool,
         mutates: bool,
     ) -> Result<u32, StepError> {
-        self.bill(spend);
+        self.bill_replayed(spend);
         self.recorded_failure(
             descriptor,
             ordinal,
@@ -4911,6 +5014,11 @@ impl StepCtx<'_> {
         // a repair pass the announcement is the one record that provably
         // survived — writing it again would report one wait as two.
         if !repair {
+            // Its slot, for the same reason a timer takes one: ungated because
+            // refusing a wait strands a run, counted because the journal holds
+            // the announcement and every replay of it bills one. A repair pass
+            // already billed it off the orphan record.
+            self.count_unadmitted();
             self.append_effect(
                 key,
                 RecordKind::EffectStarted {
@@ -5264,6 +5372,7 @@ impl Effect for Commission {
             }
         };
 
+        let spend = out.spend();
         let answer = out
             .output
             .ok_or_else(|| crate::core::EffectError::Interrupted {
@@ -5273,8 +5382,8 @@ impl Effect for Commission {
         Ok(Commissioned {
             sensitivity: answer.label().sensitivity,
             answer: answer.into_unlabelled(),
-            tokens: out.spend.tokens,
-            minor_units: out.spend.minor_units,
+            tokens: spend.tokens,
+            minor_units: spend.minor_units,
         })
     }
 }

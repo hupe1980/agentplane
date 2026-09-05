@@ -31,7 +31,7 @@ use crate::core::{
 };
 use crate::journal::{Append, JournalStore, RecordKind};
 
-use super::executor::{LEASE_TTL, Runtime};
+use super::executor::{LEASE_TTL, RunStatus, Runtime};
 use super::metrics::{self, Census};
 
 /// The source a human decision arrives under.
@@ -649,6 +649,13 @@ impl Runtime {
         if let Some(tasks) = self.tasks() {
             c.open_tasks = tasks.open_count().await?;
         }
+        // Not behind an `if let`: the journal is the one store every plane has,
+        // so a quarantine backlog is never the gauge that quietly reports zero
+        // because something was not wired.
+        c.quarantined_runs = self
+            .journal()
+            .count_by_outcome(RunStatus::Quarantined(String::new()).as_str())
+            .await?;
         Ok(c)
     }
 

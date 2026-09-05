@@ -264,7 +264,7 @@ fn status_of(c: &BatchCensus, source_exhausted: bool) -> BatchStatus {
 /// malformed item must not take down a settlement run for the other 99,999. The
 /// detail goes on the item record, and the item's own journal holds the rest.
 fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
-    let spend = out.spend;
+    let spend = out.spend();
     let item = match out.status {
         RunStatus::Succeeded => ItemOutcome::Succeeded,
         RunStatus::Suspended(r) => ItemOutcome::Suspended(r.to_string()),

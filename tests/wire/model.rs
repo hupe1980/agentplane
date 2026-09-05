@@ -326,7 +326,7 @@ async fn a_refusal_before_generation_costs_nothing() {
     let call = ModelCall::new(provider as Arc<dyn ModelProvider>, model(), json!({}));
     let err = call.perform().await.expect_err("refused");
 
-    assert!(err.spend().is_zero());
+    assert!(err.spend().is_free());
     assert_eq!(err.disposition(), Disposition::DidNotHappen);
 }
 
@@ -1137,7 +1137,8 @@ async fn a_provider_answer_that_defies_its_schema_is_a_metered_failure() {
         "the refusal does not name the schema: {detail}"
     );
     assert_eq!(
-        outcome.spend.tokens, 7,
+        outcome.spend().tokens,
+        7,
         "an unusable answer was billed as free; the provider bills for it"
     );
 
@@ -1154,7 +1155,8 @@ async fn a_provider_answer_that_defies_its_schema_is_a_metered_failure() {
         "the refusal does not say what was missing: {detail}"
     );
     assert_eq!(
-        outcome.spend.tokens, 7,
+        outcome.spend().tokens,
+        7,
         "a missing answer was billed as free"
     );
 }

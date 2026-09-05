@@ -1089,6 +1089,15 @@ pub struct Budgets {
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_denials: Option<u32>,
+    /// How many of a plan's ready steps may run at once.
+    ///
+    /// A plan with any width dispatches its ready set concurrently, and each
+    /// step in flight holds a connection, a share of the provider's rate limit
+    /// and one operation's worth of spend the metered ceilings above have
+    /// admitted and not yet billed. Omitted means the plan's own width is the
+    /// bound. Refused at `0`, which would dispatch nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_steps: Option<usize>,
 }
 
 /// One tool this agent may call, and on what terms.
@@ -2739,6 +2748,7 @@ impl Manifest {
             max_replans: b.max_replans,
             max_wallclock_secs: b.max_wallclock_secs,
             max_denials: b.max_denials,
+            max_parallel_steps: b.max_parallel_steps,
         }
     }
 }

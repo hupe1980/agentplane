@@ -15,9 +15,9 @@ use serde_json::Value;
 
 use crate::case::{CaseStore, EventStore, TaskStore, TimerStore};
 use crate::core::{
-    ArgSource, Budget, Calendar, Capability, CorrelationKey, Delivery, Digest, EffectDescriptor,
-    InboundEvent, Ledger, Outcome, Phase, PlanIR, PlanNode, PolicyBundleIdentity, RunId,
-    RuntimeError, Skill, SkillDescriptor, Spend, StepId, Tainted, WallClock,
+    ArgSource, Budget, Calendar, Capability, Consumed, CorrelationKey, Delivery, Digest,
+    EffectDescriptor, InboundEvent, Ledger, Outcome, Phase, PlanIR, PlanNode, PolicyBundleIdentity,
+    RunId, RuntimeError, Skill, SkillDescriptor, Spend, StepId, Tainted, WallClock,
 };
 use crate::journal::{Append, JournalStore, Record, RecordKind, ReplayCursor, StepCursor};
 use crate::runtime::BuildError;
@@ -141,13 +141,17 @@ pub const MIN_LEASE_TTL: Duration = Duration::from_secs(2);
 pub struct RunOutcome {
     pub run_id: RunId,
     pub status: RunStatus,
-    /// What this run consumed.
+    /// What this run consumed — steps, effects, spend, elapsed, refusals.
     ///
     /// Reported rather than left in the ledger because "what did the settlement
     /// run cost" has to be answerable per item, and a batch sums its items. A
     /// figure that only exists inside a dropped `Ledger` is a figure nobody can
     /// bill against.
-    pub spend: Spend,
+    ///
+    /// The whole tally rather than only the money: the counts are what a
+    /// ceiling is sized against, and an operator raising `max_effects` after a
+    /// run stopped short is asking exactly the question this answers.
+    pub consumed: Consumed,
     /// Terminal hash of the run's chain — what a signature would cover.
     pub chain_head: Digest,
     /// What the run produced, **with its label**.
@@ -163,6 +167,13 @@ pub struct RunOutcome {
 }
 
 impl RunOutcome {
+    /// What this run spent, in metered units — the money half of
+    /// [`consumed`](Self::consumed).
+    #[must_use]
+    pub const fn spend(&self) -> Spend {
+        self.consumed.spend
+    }
+
     /// Why this run ended — [`RunStatus::reason`] without the match.
     ///
     /// `None` for a success. The accessor is here as well as on the status
@@ -667,6 +678,8 @@ pub struct Runtime {
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
     budget: Budget,
+    /// Whether every plan this runtime admits must carry a verifier.
+    require_verifier: bool,
 
     cases: Option<Arc<dyn CaseStore>>,
     events: Option<Arc<dyn EventStore>>,
@@ -749,6 +762,7 @@ impl Runtime {
             quotas: None,
             quota: crate::quota::TenantQuota::default(),
             budget: Budget::unlimited(),
+            require_verifier: false,
             cases: None,
             events: None,
             tasks: None,
@@ -1540,7 +1554,7 @@ impl Runtime {
             run_id: run,
             status,
             chain_head,
-            spend: Spend::default(),
+            consumed: Consumed::default(),
             output: None,
         }))
     }
@@ -1574,7 +1588,7 @@ impl Runtime {
             status,
             chain_head,
             output: None,
-            spend: Spend::default(),
+            consumed: Consumed::default(),
         }))
     }
 
@@ -2160,15 +2174,8 @@ impl Runtime {
         let Some(last) = records.last() else {
             return Ok(None);
         };
-        let status = match last.kind() {
-            RecordKind::RunSuspended { reason } => RunStatus::Suspended(reason.clone()),
-            RecordKind::RunConcluded {
-                outcome,
-                reason,
-                exhaustion,
-                ..
-            } => recorded_status(outcome, reason.as_deref(), exhaustion.as_ref(), &records),
-            _ => return Ok(None),
+        let Some(status) = observed_status(&records) else {
+            return Ok(None);
         };
         Ok(Some(RunOutcome {
             run_id: run,
@@ -2177,7 +2184,7 @@ impl Runtime {
             // Reading a record performs nothing, so it consumes nothing — the
             // same answer the closed-run path gives, and for the same reason:
             // the spend belongs to the pass that did the work.
-            spend: Spend::default(),
+            consumed: Consumed::default(),
             // A step's result is reconstructed by replay rather than stored, so
             // there is none to hand back here. See `Admission::Replayed`.
             output: None,
@@ -2217,7 +2224,12 @@ impl Runtime {
 
     /// The contract this runtime enforces on every plan.
     pub(crate) fn contract(&self) -> crate::plan::Contract {
-        crate::plan::Contract::new(self.by_capability.keys().cloned())
+        let contract = crate::plan::Contract::new(self.by_capability.keys().cloned());
+        if self.require_verifier {
+            contract.require_verifier()
+        } else {
+            contract
+        }
     }
 
     async fn admit(
@@ -3304,6 +3316,7 @@ impl Runtime {
                         started: &started,
                         finished: &finished,
                         recorded_groups: &recorded_groups,
+                        parallelism: budget.parallelism(),
                     },
                 )
                 .await;
@@ -3348,7 +3361,7 @@ impl Runtime {
                                 None,
                                 writing,
                                 case_id,
-                                Spend::default(),
+                                Consumed::default(),
                                 Spend::default(),
                                 &quota,
                             )
@@ -3420,8 +3433,8 @@ impl Runtime {
         // ── Strict verification consumes everything, at the end ────────────
         //
         // The per-batch check above covers steps this build dispatched; this
-        // covers the ones it never asked for at all — a step a changed guard
-        // now skips, a compensation slice nothing requested. Either way the
+        // covers the ones it never asked for at all — a step a changed plan no
+        // longer reaches, a compensation slice nothing requested. Either way the
         // record holds work this build cannot account for, and "verified" must
         // not be the answer.
         if mode == Mode::Strict
@@ -3444,7 +3457,7 @@ impl Runtime {
                     None,
                     writing,
                     case_id,
-                    Spend::default(),
+                    Consumed::default(),
                     Spend::default(),
                     &quota,
                 )
@@ -3457,9 +3470,9 @@ impl Runtime {
         // the same shape as the `Span::enter()` bug: a guard whose
         // scope is wider than it looks, and invisible until something else
         // needs the lock.
-        let (spend, live_spend) = {
+        let (consumed, live_spend) = {
             let l = ledger.lock().expect("budget mutex");
-            (l.consumed().spend, l.live_spend())
+            (l.consumed(), l.live_spend())
         };
         self.conclude(
             run,
@@ -3468,36 +3481,68 @@ impl Runtime {
             run_output(&current, &outputs),
             writing,
             case_id,
-            spend,
+            consumed,
             live_spend,
             &quota,
         )
         .await
     }
 
-    /// Run a ready set concurrently.
+    /// Read the clock into the ledger, when a wall-clock ceiling is declared.
     ///
-    /// The ready set is every node whose predecessors are done and whose guards
-    /// hold, so nothing in it depends on anything else in it — running them one
-    /// at a time is a choice, and the wrong one when steps are waiting on models
-    /// and networks.
+    /// Separate so the guard's scope is two statements that cannot span the
+    /// await between them, and so the condition is asked once rather than
+    /// spelled at the caller.
+    async fn observe_clock(
+        cx: &mut StepCtx<'_>,
+        ledger: &Arc<std::sync::Mutex<Ledger>>,
+    ) -> Result<(), crate::core::StepError> {
+        if !ledger.lock().expect("budget mutex").tracks_wallclock() {
+            return Ok(());
+        }
+        let at = cx.now().await?;
+        ledger.lock().expect("budget mutex").observe_clock(at);
+        Ok(())
+    }
+
+    /// Run a ready set concurrently, at most `max_parallel_steps` at a time.
+    ///
+    /// The ready set is every node whose predecessors are done, so nothing in
+    /// it depends on anything else in it — running them one at a time is a
+    /// choice, and the wrong one when steps are waiting on models and networks.
     ///
     /// Each step takes its own slice of history, which is what makes this sound:
     /// a step touches only its own effects, so no shared mutable state is left
     /// between them, and the per-step replay cursor verifies each one's order
     /// independently of how the journal happened to interleave them.
+    ///
+    /// The width is bounded because it is not otherwise bounded by anything:
+    /// a fan-out is as wide as its author wrote it, and every step in flight
+    /// holds a connection, a provider's rate limit and one operation's worth
+    /// of spend the metered ceilings have checked and not yet billed. Ordered
+    /// rather than completion-ordered — `buffered`, not `buffer_unordered` —
+    /// so the outcomes still apply in ready order and a plan's dispatch is a
+    /// property of the plan rather than of which future finished first.
     async fn dispatch(
         &self,
         admitted: &[StepId],
         cursor: &mut ReplayCursor,
         batch: Batch<'_>,
     ) -> Vec<Dispatched> {
+        use futures_util::StreamExt;
+
         let slices: Vec<(StepId, StepCursor)> = admitted
             .iter()
             .map(|&s| (s, cursor.take(s, Phase::Forward)))
             .collect();
+        // Floored at one because a width of zero would poll nothing forever.
+        // A zero ceiling is refused at parse and at build, so this is the
+        // second half of a rule rather than the only half — and the failure it
+        // guards against is a hang, which is the one shape a later reader
+        // cannot diagnose from the outside.
+        let width = batch.parallelism.max(1);
 
-        futures_util::future::join_all(slices.into_iter().map(|(step, slice)| async move {
+        futures_util::stream::iter(slices.into_iter().map(|(step, slice)| async move {
             let node = batch
                 .ir
                 .node(step)
@@ -3532,6 +3577,8 @@ impl Runtime {
                 .await?;
             Ok((step, status, out, slice))
         }))
+        .buffered(width)
+        .collect()
         .await
     }
 
@@ -3752,7 +3799,11 @@ impl Runtime {
                 // the refusal it supersedes, so a strict replay of this
                 // history reads refusal-then-continuation as a decision
                 // somebody made rather than as divergence.
-                if let Err(exceeded) = ledger.lock().expect("budget mutex").admit_step() {
+                if let Err(exceeded) = ledger
+                    .lock()
+                    .expect("budget mutex")
+                    .admit_step(admitted.len())
+                {
                     return Ok((admitted, Some(exceeded)));
                 }
                 if journal.writing {
@@ -3779,7 +3830,10 @@ impl Runtime {
             let verdict = match mode {
                 Mode::Strict => Ok(()),
                 Mode::Resume if !cursor.exhausted(step, Phase::Forward) => Ok(()),
-                Mode::Live | Mode::Resume => ledger.lock().expect("budget mutex").admit_step(),
+                Mode::Live | Mode::Resume => ledger
+                    .lock()
+                    .expect("budget mutex")
+                    .admit_step(admitted.len()),
             };
 
             let Err(exceeded) = verdict else {
@@ -3876,7 +3930,7 @@ impl Runtime {
                     None,
                     writing,
                     case_id,
-                    Spend::default(),
+                    Consumed::default(),
                     Spend::default(),
                     quota,
                 )
@@ -3884,12 +3938,12 @@ impl Runtime {
         }
         // Scoped before the await — see `execute_inner` on why an inline guard
         // outlives the call it is passed to.
-        let (spend, live_spend) = {
+        let (consumed, live_spend) = {
             let l = ledger.lock().expect("budget mutex");
-            (l.consumed().spend, l.live_spend())
+            (l.consumed(), l.live_spend())
         };
         self.conclude(
-            run, epoch, unwound, output, writing, case_id, spend, live_spend, quota,
+            run, epoch, unwound, output, writing, case_id, consumed, live_spend, quota,
         )
         .await
     }
@@ -4573,7 +4627,21 @@ impl Runtime {
                 recorded_groups,
             }),
         );
-        let result = skill.invoke(&mut cx, step_input).await;
+        // The one place elapsed time is measured, and it is measured with a
+        // journaled clock read like every other observation — a wall-clock
+        // ceiling decided from an ambient clock would give a replayed run a
+        // different verdict every time it was looked at.
+        //
+        // Paid only by a run that asked for the ceiling, which is why the
+        // step's first effect is this one when a wall-clock budget is declared
+        // and the skill's own when it is not. The consequence is worth stating:
+        // that history can be replayed under a *raised* wall-clock ceiling, and
+        // not under a build that removed it, because the recorded run performs
+        // a read this one would not request.
+        let result = match Self::observe_clock(&mut cx, ledger).await {
+            Ok(()) => skill.invoke(&mut cx, step_input).await,
+            Err(e) => Err(crate::core::SkillError::Step(e)),
+        };
         let result = settle_abandoned_group(&mut cx, result).await;
         let wrote = cx.wrote_records();
         let cursor = cx.into_cursor();
@@ -4626,7 +4694,7 @@ impl Runtime {
         output: Option<Tainted<Value>>,
         writing: bool,
         case: Option<crate::core::CaseId>,
-        spend: Spend,
+        consumed: Consumed,
         live_spend: Spend,
         quota: &QuotaPass,
     ) -> Result<RunOutcome, RuntimeError> {
@@ -4777,7 +4845,7 @@ impl Runtime {
                 run_id: run,
                 status,
                 chain_head,
-                spend,
+                consumed,
                 output,
             });
         }
@@ -4786,7 +4854,7 @@ impl Runtime {
             run_id: run,
             status,
             chain_head,
-            spend,
+            consumed,
             // The caller is outside the lattice, so the label is dropped at the
             // boundary rather than inside the graph.
             output,
@@ -4990,6 +5058,8 @@ struct Batch<'a> {
     /// Group records the journal already holds, by writing step and phase.
     /// Empty on a live run.
     recorded_groups: &'a BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup>,
+    /// How many of this ready set may be in flight at once.
+    parallelism: usize,
 }
 
 /// What the journal proves about a run an unwind is deciding over.
@@ -5897,6 +5967,36 @@ fn parse_holder(run: &str) -> Result<RunId, RuntimeError> {
     })
 }
 
+/// What a run's history says its state is, if it says anything.
+///
+/// **One reader, for every surface that answers the question.** Idempotent
+/// admission, the operator API and the A2A projection are three views of one
+/// fact, and three copies of this match agree right up until somebody adds a
+/// record kind or a conclusion arrives that this build cannot read — after
+/// which a caller polling and the same caller streaming are told different
+/// things about one run, which is worse than either answer being wrong. The
+/// laxest copy is the one that decides what an operator sees, so there is one.
+///
+/// `None` means the run is still going: the last record is neither a suspension
+/// nor a conclusion. It is not this function's business whether that means
+/// *running* or *never existed* — an empty history answers `None` too, and the
+/// caller knows which it asked for.
+///
+/// **The last record, not any record.** A run that waited, was resumed and
+/// carried on has a suspension in its history and is not suspended now.
+pub(crate) fn observed_status(records: &[Record]) -> Option<RunStatus> {
+    Some(match records.last()?.kind() {
+        RecordKind::RunSuspended { reason } => RunStatus::Suspended(reason.clone()),
+        RecordKind::RunConcluded {
+            outcome,
+            reason,
+            exhaustion,
+            ..
+        } => recorded_status(outcome, reason.as_deref(), exhaustion.as_ref(), records),
+        _ => return None,
+    })
+}
+
 /// A sealed run's status, rebuilt from its recorded conclusion.
 ///
 /// Distinct from `resume_is_closed`, which asks the narrower *may this run be
@@ -6076,6 +6176,7 @@ pub struct RuntimeBuilder {
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
     budget: Budget,
+    require_verifier: bool,
     /// Typed tools whose coherence with every agent is checked at `build`.
     #[cfg(feature = "manifest")]
     toolbox: Option<crate::tools::ToolBox>,
@@ -6281,6 +6382,21 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Refuse a plan in which nothing checks the work.
+    ///
+    /// A node that declares [`verifies`](crate::core::PlanNode::verifies) must
+    /// already depend on what it checks; this makes carrying one a condition of
+    /// admission. It binds every plan this runtime validates, and the one that
+    /// matters is the one the embedder did not write: a
+    /// [`Replanner`](crate::plan::Replanner)'s successor is a graph proposed
+    /// mid-run, and a control that held for the first plan and not for its
+    /// replacement is a control a replan removes.
+    #[must_use]
+    pub fn require_verifier(mut self) -> Self {
+        self.require_verifier = true;
         self
     }
 
@@ -7453,6 +7569,7 @@ impl RuntimeBuilder {
             quotas: self.quotas,
             quota: self.quota,
             budget: self.budget,
+            require_verifier: self.require_verifier,
             cases: self.cases,
             events: self.events,
             tasks: self.tasks,

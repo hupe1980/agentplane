@@ -2638,6 +2638,36 @@ async fn sealed_runs_are_findable_by_how_they_ended(fresh: Factory<'_>, r: &mut 
             format!("runs_by_outcome(limit=1) failed: {e}"),
         ),
     }
+
+    // The **level**, and that it is not the page. A gauge served from a bounded
+    // listing rises, flattens at the page size and reads as a plateau exactly
+    // when the backlog becomes worth alerting on — so the count must answer
+    // over the whole index, and must agree with the listing that explains it.
+    match store.count_by_outcome("quarantined").await {
+        Ok(n) if n == quarantined.len() as u64 => {}
+        Ok(n) => r.record(
+            "outcome index",
+            format!(
+                "count_by_outcome counted {n} quarantined runs where the listing                  holds {} — the gauge and the page an operator opens from it                  disagree about one plane",
+                quarantined.len()
+            ),
+        ),
+        Err(e) => r.record("outcome index", format!("count_by_outcome failed: {e}")),
+    }
+
+    // An outcome nothing reached is zero, not an error: a plane that has never
+    // quarantined anything must be able to say so.
+    match store.count_by_outcome("no-such-outcome").await {
+        Ok(0) => {}
+        Ok(n) => r.record(
+            "outcome index",
+            format!("count_by_outcome invented {n} runs for an outcome nobody wrote"),
+        ),
+        Err(e) => r.record(
+            "outcome index",
+            format!("count_by_outcome on an unused outcome failed: {e}"),
+        ),
+    }
 }
 
 /// The outcome index follows the *last* conclusion, not the first.
@@ -2706,6 +2736,20 @@ async fn the_outcome_index_follows_the_last_conclusion(fresh: Factory<'_>, r: &m
             "the re-conclusion did not move the run into the succeeded listing".to_owned(),
         ),
         Err(e) => r.record("outcome index", format!("runs_by_outcome failed: {e}")),
+    }
+
+    // And the level moves with it. A count that kept the first conclusion would
+    // be a gauge that never falls — the same never-draining backlog as a stale
+    // page, reported as a number an operator alerts on.
+    match store.count_by_outcome("failed").await {
+        Ok(0) => {}
+        Ok(n) => r.record(
+            "outcome index",
+            format!(
+                "count_by_outcome still counts {n} failed runs after the only one                  succeeded — the level does not follow the last conclusion"
+            ),
+        ),
+        Err(e) => r.record("outcome index", format!("count_by_outcome failed: {e}")),
     }
 }
 

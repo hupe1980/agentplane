@@ -17,21 +17,63 @@
 //!
 //! A token or cost limit cannot be a hard ceiling, because an operation's cost
 //! is not known until it has run. What is enforced is: *once consumption has
-//! reached the limit, no further operation starts.* A run can therefore
-//! overshoot by at most one operation's cost.
+//! reached the limit, no further operation starts.* A run therefore overshoots
+//! a metered ceiling by at most one operation's cost **per step it has in
+//! flight** — a plan's ready set is dispatched concurrently, and every step in
+//! it may be holding a call the ledger has admitted and not yet billed.
+//! `max_parallel_steps` is what bounds that number; without it the bound is the
+//! plan's own width.
 //!
 //! That is stated rather than hidden because the alternative — pretending to a
 //! hard cap — is how somebody sizes a limit at exactly their ceiling and is
-//! surprised. Where a true ceiling matters, set `max_effects` too: counts *are*
-//! known in advance, so that limit is exact.
+//! surprised. Where a true ceiling matters, set `max_effects` too: a count is
+//! known in advance, so admission takes the slot as it checks it and that limit
+//! is exact however wide the plan runs.
+//!
+//! # One announcement, one slot, on every pass
+//!
+//! The ledger is the same on both sides of a replay, and that is arithmetic
+//! rather than intent. An attempt takes its slot when it is admitted and adds
+//! its cost when the call returns; the pass that reads that attempt back out of
+//! the journal takes one slot and adds everything the attempt's records report
+//! — including a figure a later record superseded, which the live pass had
+//! already added.
+//!
+//! An arm that bills twice, or one that drops a superseded figure, moves where
+//! a resumed run stops without changing anything a status assertion can see:
+//! the run concludes `Exhausted` against a ceiling its own history never
+//! reached, at a point no record contains. So the arms are held to one rule,
+//! and the rule is asserted as a tally rather than as an outcome.
 //!
 //! # Why wall-clock limits are opt-in
 //!
 //! Elapsed time cannot be checked without reading a clock, and a clock read is
 //! an effect. A wall-clock budget therefore costs one journaled effect per step
 //! boundary. That is cheap but not free, so it is only paid when asked for.
+//!
+//! The reading has to be journaled rather than ambient, and that is the whole
+//! reason it costs anything: a verdict taken from the wall would be a different
+//! verdict every time the run was looked at, and an exhausted run would replay
+//! as healthy. What follows from the opt-in is worth stating plainly — the
+//! step's first effect is this reading when a wall-clock ceiling is declared
+//! and the skill's own when it is not, so that history replays under a *raised*
+//! ceiling and not under a build that removed it.
+//!
+//! Elapsed time is the distance between the extremes of what the run has read,
+//! never between the first and last *arrival*: a ready set is dispatched
+//! concurrently, so arrival order belongs to the scheduler, and a ceiling that
+//! depended on it would fire on some passes over one history and not on others.
+//!
+//! The limit that follows from reading at *boundaries* is stated rather than
+//! implied: the ceiling stops the next step, so a single step that overruns it
+//! is not interrupted. Nothing here cancels work in flight — that would abort
+//! an effect mid-call and manufacture the unknown outcome the protocol exists
+//! to refuse. What bounds one call is the driver's own timeout; this bounds how
+//! long a *run* goes on making new ones.
 
 use serde::{Deserialize, Serialize};
+
+use crate::core::Timestamp;
 
 /// What one effect consumed.
 ///
@@ -68,17 +110,6 @@ pub struct Spend {
     pub minor_units: u64,
 }
 
-impl Spend {
-    /// Whether anything was consumed.
-    ///
-    /// By-reference because `skip_serializing_if` requires it: a zero spend is
-    /// the overwhelmingly common case and costs no bytes and no hash input.
-    #[must_use]
-    pub const fn is_zero(&self) -> bool {
-        self.tokens == 0 && self.minor_units == 0
-    }
-}
-
 // By-reference because `skip_serializing_if` requires it.
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u64(v: &u64) -> bool {
@@ -86,6 +117,12 @@ fn is_zero_u64(v: &u64) -> bool {
 }
 
 impl Spend {
+    /// Nothing consumed.
+    pub const ZERO: Self = Self {
+        tokens: 0,
+        minor_units: 0,
+    };
+
     #[must_use]
     pub const fn tokens(n: u64) -> Self {
         Self {
@@ -103,12 +140,17 @@ impl Spend {
     }
 
     /// By-reference form, for `skip_serializing_if`.
+    ///
+    /// One predicate under one name. Two spellings of "did this cost
+    /// anything" is two places for the answer to drift, and the by-reference
+    /// form exists only because `skip_serializing_if` hands out a reference.
     #[allow(clippy::trivially_copy_pass_by_ref)]
     #[must_use]
     pub const fn is_free_ref(v: &Self) -> bool {
         v.is_free()
     }
 
+    /// Whether this cost nothing at all.
     #[must_use]
     pub const fn is_free(self) -> bool {
         self.tokens == 0 && self.minor_units == 0
@@ -200,6 +242,21 @@ pub struct Budget {
     /// zero ceiling refuses the first step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wallclock_secs: Option<u64>,
+    /// How many of a plan's ready steps may run at once.
+    ///
+    /// A ready set is every node whose predecessors are done, so nothing in it
+    /// depends on anything else in it and running them concurrently is the
+    /// point of writing a graph rather than a list. What that width costs is
+    /// paid outside this process — connections, provider rate limits, and the
+    /// metered ceilings above, which are checked before an operation and
+    /// billed after it, so each step in flight may be holding one operation's
+    /// worth of unbilled spend.
+    ///
+    /// Absent means the plan's own width is the bound, which is the right
+    /// default for a graph the embedder wrote and the wrong one for a graph
+    /// anything else may widen. Zero permits no step at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_steps: Option<usize>,
     /// How many times the policy may refuse this run before it is stopped.
     ///
     /// **A run that keeps hitting the policy is probing it.** Refusals carry a
@@ -253,6 +310,9 @@ impl Budget {
         if matches!(self.max_wallclock_secs, Some(0)) {
             return Some("max_wallclock_secs");
         }
+        if matches!(self.max_parallel_steps, Some(0)) {
+            return Some("max_parallel_steps");
+        }
         None
     }
 
@@ -267,6 +327,7 @@ impl Budget {
             max_replans: None,
             max_wallclock_secs: None,
             max_denials: None,
+            max_parallel_steps: None,
         }
     }
 
@@ -311,6 +372,24 @@ impl Budget {
     pub const fn wallclock_secs(mut self, n: u64) -> Self {
         self.max_wallclock_secs = Some(n);
         self
+    }
+
+    /// Bound the width of a ready set. See
+    /// [`max_parallel_steps`](Self::max_parallel_steps).
+    #[must_use]
+    pub const fn parallel_steps(mut self, n: usize) -> Self {
+        self.max_parallel_steps = Some(n);
+        self
+    }
+
+    /// How many ready steps may be dispatched at once — the plan's own width
+    /// when nothing narrows it.
+    #[must_use]
+    pub const fn parallelism(&self) -> usize {
+        match self.max_parallel_steps {
+            Some(n) => n,
+            None => usize::MAX,
+        }
     }
 
     #[must_use]
@@ -419,6 +498,13 @@ impl BudgetExceeded {
 pub struct Ledger {
     budget: Budget,
     consumed: Consumed,
+    /// The extremes of every instant this run has read, when it reads any.
+    ///
+    /// `None` on a run with no wall-clock ceiling: the readings that would fill
+    /// these cost a journaled effect apiece, and a ceiling nobody declared is
+    /// not worth one per step.
+    first: Option<Timestamp>,
+    last: Option<Timestamp>,
     /// What *this pass* dispatched, as opposed to what it read back.
     ///
     /// The budget verdict runs on `consumed`, which bills replayed history
@@ -450,6 +536,8 @@ impl Ledger {
                 tokens: 0,
                 minor_units: 0,
             },
+            first: None,
+            last: None,
         }
     }
 
@@ -478,18 +566,49 @@ impl Ledger {
         self.budget.tracks_wallclock()
     }
 
-    /// Record measured elapsed time, from a journaled clock read.
-    pub const fn observe_elapsed(&mut self, secs: u64) {
-        self.consumed.elapsed_secs = secs;
+    /// Fold in a journaled clock reading.
+    ///
+    /// Elapsed time is the distance between the earliest and the latest instant
+    /// this run has read, and both are taken as extremes rather than as *first*
+    /// and *last seen* — a ready set is dispatched concurrently, so "the one
+    /// that arrived first" is a property of the scheduler, and a ceiling whose
+    /// verdict depends on that is a ceiling that fires on some runs of the same
+    /// history and not on others. Extremes are order-independent, so every pass
+    /// over the same readings computes the same elapsed figure.
+    ///
+    /// Saturating rather than signed: a clock that steps backwards between two
+    /// reads must not un-spend the time already elapsed.
+    pub fn observe_clock(&mut self, at: Timestamp) {
+        self.first = Some(match self.first {
+            Some(f) if f <= at => f,
+            _ => at,
+        });
+        self.last = Some(match self.last {
+            Some(l) if l >= at => l,
+            _ => at,
+        });
+        if let (Some(f), Some(l)) = (self.first, self.last) {
+            self.consumed.elapsed_secs =
+                u64::try_from((l.unix_timestamp() - f.unix_timestamp()).max(0)).unwrap_or(u64::MAX);
+        }
     }
 
-    /// Check whether another step may start.
+    /// Check whether another step may start, given `pending` already admitted
+    /// and not yet finished.
     ///
     /// Checked *before* dispatch: a step that would exceed the budget must not
     /// half-run and then be stopped.
-    pub fn admit_step(&self) -> Result<(), BudgetExceeded> {
+    ///
+    /// `pending` is what makes this hold for a plan with any width. A step is
+    /// counted when it finishes, so a whole ready set admitted against the
+    /// same figure is a whole ready set that passes — three branches admitted
+    /// under a ceiling of two, each check truthfully reporting nothing spent
+    /// yet. The caller admits a ready set one at a time and says how many of
+    /// them it has already taken, so the ceiling bounds the plan rather than
+    /// the sequential prefix of it.
+    pub fn admit_step(&self, pending: usize) -> Result<(), BudgetExceeded> {
         if let Some(max) = self.budget.max_steps
-            && self.consumed.steps >= max
+            && self.consumed.steps + pending >= max
         {
             return Err(BudgetExceeded::Steps { allowed: max });
         }
@@ -501,14 +620,41 @@ impl Ledger {
         self.consumed.steps += 1;
     }
 
-    /// Check whether another effect may be performed.
+    /// Check whether another effect may be performed, **and take its slot**.
     ///
     /// Before dispatch — after is too late, since the point of a budget is to
     /// stop the money leaving. Note the semantics for metered limits: an
     /// operation's cost is unknown until it runs, so this refuses once
-    /// consumption has *reached* the limit. A run overshoots by at most one
-    /// operation. `max_effects` is exact, because counts are known in advance.
-    pub fn admit_effect(&self) -> Result<(), BudgetExceeded> {
+    /// consumption has *reached* the limit. A run overshoots those by at most
+    /// one operation per step dispatched in parallel, which is what
+    /// [`Budget::max_parallel_steps`] bounds.
+    ///
+    /// `max_effects` is exact, and taking the slot here is what makes it so.
+    /// Checking without counting leaves a window between the verdict and the
+    /// announcement, and steps in one ready set run concurrently: at the last
+    /// remaining slot every one of them is told yes. Counting under the same
+    /// lock that checked means the second caller sees the first one's slot.
+    ///
+    /// # Errors
+    ///
+    /// The first ceiling this effect would cross. Nothing is counted when the
+    /// answer is a refusal.
+    pub fn admit_effect(&mut self) -> Result<(), BudgetExceeded> {
+        self.can_admit_effect()?;
+        self.consumed.effects += 1;
+        Ok(())
+    }
+
+    /// Whether another effect would be admitted, without taking its slot.
+    ///
+    /// For the one caller that asks the question early and dispatches through
+    /// [`admit_effect`](Self::admit_effect) afterwards: a resume re-asking
+    /// whether a journaled refusal still stands.
+    ///
+    /// # Errors
+    ///
+    /// The first ceiling the next effect would cross.
+    pub fn can_admit_effect(&self) -> Result<(), BudgetExceeded> {
         // Checked here as well as at the denial itself, and that is the half
         // that actually binds: a probing loop swallows the error it gets back,
         // so refusing the *next* attempt is what stops the probing rather than
@@ -541,28 +687,50 @@ impl Ledger {
         self.check_time()
     }
 
-    /// Add what an effect consumed. The figure comes from the journal, so this
-    /// is identical on replay.
+    /// Take an effect's slot without checking a ceiling.
     ///
-    /// For an effect the current pass actually dispatched, use
-    /// [`record_live_effect`](Self::record_live_effect) — this method is the
-    /// replay arm, and what it records is deliberately absent from
-    /// [`live_spend`](Self::live_spend).
-    pub fn record_effect(&mut self, spend: Spend) {
+    /// For the announcements no ceiling gates: a compensating call, which is
+    /// exempt because refusing to undo is how a run ends with a charged card
+    /// and no order, and a durable wait, which is registered rather than
+    /// dispatched. Both still happened, so both still count — the alternative
+    /// is a ceiling a run walks through by phrasing its work as an undo.
+    pub const fn count_effect(&mut self) {
         self.consumed.effects += 1;
+    }
+
+    /// Add what an announced attempt cost, without taking a slot.
+    ///
+    /// The slot was taken when the attempt was admitted, so this is the second
+    /// half of one billing: the cost is not known until the call returns, and
+    /// the count was.
+    pub fn record_spend(&mut self, spend: Spend) {
         self.consumed.spend += spend;
     }
 
-    /// Add what a **freshly dispatched** effect consumed.
+    /// [`record_spend`](Self::record_spend) for an attempt this pass actually
+    /// dispatched.
     ///
-    /// Identical to [`record_effect`](Self::record_effect) for the budget
-    /// verdict, and additionally counted toward [`live_spend`](Self::live_spend)
-    /// — the figure the tenant's period ledger accrues at settlement. Calling
-    /// this from a replay path would resurrect the double-billing it exists to
-    /// remove.
-    pub fn record_live_effect(&mut self, spend: Spend) {
-        self.record_effect(spend);
+    /// The distinction feeds the tenant's period ledger: replayed spend is
+    /// billed to the run's own budget so a resume exhausts where the original
+    /// did, but only live spend accrues at settlement — otherwise every
+    /// suspend/resume cycle re-accrues the prefix and every strict pass bills
+    /// history into today's period.
+    pub fn record_live_spend(&mut self, spend: Spend) {
+        self.record_spend(spend);
         self.live += spend;
+    }
+
+    /// Bill an announced attempt read back from the journal: one slot, and
+    /// everything its records say it cost.
+    ///
+    /// The mirror of [`admit_effect`](Self::admit_effect) plus
+    /// [`record_spend`](Self::record_spend), which is the pair the live path
+    /// performs — a replayed run must reach the same verdict at the same
+    /// point, and it can only do that if one announcement costs one slot on
+    /// both paths.
+    pub fn replay_effect(&mut self, spend: Spend) {
+        self.consumed.effects += 1;
+        self.consumed.spend += spend;
     }
 
     /// Count a policy refusal, and report if that was one too many.
@@ -631,20 +799,20 @@ mod tests {
         let mut l = Ledger::new(Budget::unlimited());
         for _ in 0..1000 {
             l.admit_effect().unwrap();
-            l.record_effect(Spend::tokens(10_000));
+            l.record_spend(Spend::tokens(10_000));
         }
-        l.admit_step().unwrap();
+        l.admit_step(0).unwrap();
     }
 
     #[test]
     fn the_step_limit_stops_the_next_step() {
         let mut l = Ledger::new(Budget::default().steps(2));
-        l.admit_step().unwrap();
+        l.admit_step(0).unwrap();
         l.record_step();
-        l.admit_step().unwrap();
+        l.admit_step(0).unwrap();
         l.record_step();
         assert!(matches!(
-            l.admit_step().unwrap_err(),
+            l.admit_step(0).unwrap_err(),
             BudgetExceeded::Steps { allowed: 2 }
         ));
     }
@@ -656,7 +824,7 @@ mod tests {
         let mut l = Ledger::new(Budget::default().effects(3));
         for _ in 0..3 {
             l.admit_effect().unwrap();
-            l.record_effect(Spend::default());
+            l.record_spend(Spend::default());
         }
         assert!(matches!(
             l.admit_effect().unwrap_err(),
@@ -671,7 +839,7 @@ mod tests {
     fn the_token_limit_reports_where_it_stood() {
         let mut l = Ledger::new(Budget::default().tokens(100));
         l.admit_effect().unwrap();
-        l.record_effect(Spend::tokens(150));
+        l.record_spend(Spend::tokens(150));
         match l.admit_effect().unwrap_err() {
             BudgetExceeded::Tokens { allowed, used } => {
                 assert_eq!(
@@ -688,9 +856,9 @@ mod tests {
     fn the_cost_limit_uses_integers() {
         let mut l = Ledger::new(Budget::default().minor_units(500));
         l.admit_effect().unwrap();
-        l.record_effect(Spend::money(499));
+        l.record_spend(Spend::money(499));
         l.admit_effect().expect("still under");
-        l.record_effect(Spend::money(2));
+        l.record_spend(Spend::money(2));
         assert!(matches!(
             l.admit_effect().unwrap_err(),
             BudgetExceeded::Money {
@@ -702,16 +870,28 @@ mod tests {
 
     #[test]
     fn elapsed_time_is_only_checked_when_asked_for() {
+        let base = Timestamp::from_unix_timestamp(1_700_000_000).expect("a valid instant");
+        let plus = |secs: i64| {
+            Timestamp::from_unix_timestamp(base.unix_timestamp() + secs).expect("a valid instant")
+        };
+
         let mut unbounded = Ledger::new(Budget::default().steps(10));
         assert!(!unbounded.tracks_wallclock());
-        unbounded.observe_elapsed(99_999);
-        unbounded.admit_step().expect("no wall-clock limit was set");
+        unbounded.observe_clock(base);
+        unbounded.observe_clock(plus(99_999));
+        unbounded
+            .admit_step(0)
+            .expect("no wall-clock limit was set");
 
         let mut bounded = Ledger::new(Budget::default().wallclock_secs(60));
         assert!(bounded.tracks_wallclock());
-        bounded.observe_elapsed(61);
+        // Deliberately out of order: a concurrent wave reads the clock in
+        // whatever order it happens to run, and the ceiling must not depend on
+        // which reading arrived first.
+        bounded.observe_clock(plus(61));
+        bounded.observe_clock(base);
         assert!(matches!(
-            bounded.admit_step().unwrap_err(),
+            bounded.admit_step(0).unwrap_err(),
             BudgetExceeded::Wallclock {
                 allowed: 60,
                 used: 61
@@ -778,7 +958,7 @@ mod tests {
                     stopped_at = Some(i);
                     break;
                 }
-                l.record_effect(*s);
+                l.record_spend(*s);
             }
             stopped_at
         };
@@ -865,9 +1045,9 @@ mod tests {
     fn a_metered_budget_overshoots_by_at_most_one_operation() {
         let mut l = Ledger::new(Budget::default().tokens(100));
         l.admit_effect().unwrap();
-        l.record_effect(Spend::tokens(99));
+        l.record_spend(Spend::tokens(99));
         l.admit_effect().expect("99 has not reached 100");
-        l.record_effect(Spend::tokens(1_000_000));
+        l.record_spend(Spend::tokens(1_000_000));
 
         assert!(l.admit_effect().is_err(), "but nothing further starts");
         assert_eq!(l.consumed().spend.tokens, 1_000_099);
@@ -878,9 +1058,9 @@ mod tests {
     fn an_effect_count_budget_is_exact() {
         let mut l = Ledger::new(Budget::default().effects(2));
         l.admit_effect().unwrap();
-        l.record_effect(Spend::tokens(1));
+        l.record_spend(Spend::tokens(1));
         l.admit_effect().unwrap();
-        l.record_effect(Spend::tokens(1));
+        l.record_spend(Spend::tokens(1));
         assert!(l.admit_effect().is_err());
         assert_eq!(l.consumed().effects, 2, "never more than asked for");
     }
@@ -931,7 +1111,7 @@ mod denial_tests {
         );
         assert!(
             matches!(
-                ledger.admit_step(),
+                ledger.admit_step(0),
                 Err(BudgetExceeded::Denials { allowed: 1 })
             ),
             "and the run must not be admitted to a further step"

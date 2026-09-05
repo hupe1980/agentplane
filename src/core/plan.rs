@@ -135,6 +135,17 @@ impl ArgSource {
 }
 
 /// One unit of work in a plan.
+///
+/// # A panel is several nodes, not a field on one
+///
+/// There is deliberately no `quorum` here. A panel is *k* judgements of one
+/// piece of work and an aggregator that tallies them — a shape the graph
+/// already expresses exactly: *k* nodes depending on the subject, each
+/// [`verifies`](Self::verifies), and a terminal node depending on all of them
+/// that decides with [`Quorum`](crate::core::Quorum). A field would be a second
+/// spelling of it, and one the runtime cannot execute: there is no way to hand
+/// a node a *lens*, so the declaration would ride inside the plan digest with
+/// its behaviour living nowhere.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanNode {
     pub id: StepId,
@@ -156,23 +167,20 @@ pub struct PlanNode {
     /// Whether this node checks another's work.
     ///
     /// Named so the contract can require one: nothing checking the work is a
-    /// fifth of observed multi-agent failures.
+    /// fifth of observed multi-agent failures. Structural rather than
+    /// advisory — a node claiming it verifies must depend on what it checks,
+    /// and [`RuntimeBuilder::require_verifier`] makes "every plan carries one"
+    /// a condition of admission, on a replanner's successor as much as on the
+    /// plan an embedder wrote.
+    ///
+    /// [`RuntimeBuilder::require_verifier`]: crate::runtime::RuntimeBuilder::require_verifier
     #[serde(default)]
     pub verifies: bool,
-    /// Judge this node's work more than once, from declared angles.
-    ///
-    /// For steps where a single execution is not adequate evidence — the
-    /// pass^k collapse. `None` is one judgement, which is the right default:
-    /// a panel on every node would pay the cost everywhere and mean nothing
-    /// anywhere.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub quorum: Option<crate::core::Quorum>,
 }
 
 impl PlanNode {
     pub fn new(id: u32, capability: impl Into<Capability>) -> Self {
         Self {
-            quorum: None,
             id: StepId(id),
             capability: capability.into(),
             depends_on: Vec::new(),
@@ -212,17 +220,6 @@ impl PlanNode {
     #[must_use]
     pub fn verifies(mut self) -> Self {
         self.verifies = true;
-        self
-    }
-
-    /// Judge this node from several declared angles, requiring agreement.
-    ///
-    /// For steps where one execution is not adequate evidence. Failure to reach
-    /// the quorum escalates; there is deliberately no way to resolve a split
-    /// panel to a majority — see [`Quorum`](crate::core::Quorum).
-    #[must_use]
-    pub fn with_quorum(mut self, quorum: crate::core::Quorum) -> Self {
-        self.quorum = Some(quorum);
         self
     }
 }
@@ -453,18 +450,6 @@ pub enum PlanError {
     /// A verifier that could not have seen the work it claims to check.
     #[error("step {step} verifies nothing: a verifier must depend on what it checks")]
     VerifierWithoutSubject { step: StepId },
-
-    /// A panel was declared on a node that judges nothing.
-    ///
-    /// A quorum is several judgements of *one piece of work*. On a node with no
-    /// subject it is several executions of the work itself, which is not a
-    /// second opinion — it is the same act performed repeatedly, and for a
-    /// mutating step it is the same act performed repeatedly *on the world*.
-    #[error(
-        "step {step} declares a quorum but judges nothing; a panel needs \
-         something to judge, or it is repetition rather than review"
-    )]
-    QuorumWithoutSubject { step: StepId },
 
     #[error("this plan requires a verifier node and has none")]
     VerifierRequired,

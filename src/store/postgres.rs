@@ -997,6 +997,25 @@ impl JournalStore for PostgresStore {
         Ok(usize::try_from(removed).unwrap_or(usize::MAX))
     }
 
+    async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        // `count(*)`, never `runs_by_outcome(..).len()`: a gauge served from a
+        // bounded listing rises, flattens at the page size and reads as a
+        // plateau at the moment it became a backlog.
+        let row = client
+            .query_one(
+                "SELECT count(*) FROM run_outcome WHERE tenant = $1 AND outcome = $2",
+                &[&self.tenant_name(), &outcome],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let n: i64 = row.get(0);
+        u64::try_from(n).map_err(|_| StoreError::Corrupt {
+            seq: 0,
+            detail: format!("run_outcome counted {n} rows, which is not a count"),
+        })
+    }
+
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let rows = client

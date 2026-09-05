@@ -1349,6 +1349,44 @@ impl JournalStore for RedbStore {
         .await
     }
 
+    async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
+        let tenant = self.tenant_name();
+        let outcome = outcome.to_owned();
+        let prefix = format!("{tenant}/");
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let idx = r.open_table(RUN_BY_OUTCOME).map_err(|e| be(&e))?;
+            let mut n: u64 = 0;
+            // The whole range, never a page of it: a gauge read from a bounded
+            // listing flattens at the page size exactly when it becomes a
+            // backlog.
+            for entry in idx
+                .range(
+                    (tenant.as_str(), outcome.as_str(), 0)
+                        ..=(tenant.as_str(), outcome.as_str(), u64::MAX),
+                )
+                .map_err(|e| be(&e))?
+            {
+                let (_, v) = entry.map_err(|e| be(&e))?;
+                // Counted only once it is proven to be this tenant's row. An
+                // entry the listing would refuse must not be quietly included
+                // in the number the listing is supposed to explain.
+                let key = v.value();
+                if key.strip_prefix(prefix.as_str()).is_none() {
+                    return Err(StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!(
+                            "run_by_outcome points at '{key}', which is outside tenant '{tenant}'"
+                        ),
+                    });
+                }
+                n += 1;
+            }
+            Ok(n)
+        })
+        .await
+    }
+
     async fn recent_runs(
         &self,
         after: Option<(u64, RunId)>,
@@ -1486,10 +1524,10 @@ mod tests {
     /// `origin` and `for_tenant` compose the same name whatever order they are
     /// called in, and calling either twice changes nothing.
     ///
-    /// The origin used to be baked into a field at `for_tenant` time, so
-    /// `for_tenant` twice double-qualified it and `origin` afterwards silently
-    /// dropped the tenant — either way a checkpoint published under a name no
-    /// verifier would ever see again.
+    /// Baking the origin into a field at `for_tenant` time is what breaks it:
+    /// `for_tenant` twice double-qualifies the name, and `origin` afterwards
+    /// silently drops the tenant — either way a checkpoint published under a
+    /// name no verifier would ever see again.
     #[tokio::test]
     async fn checkpoint_origin_is_order_insensitive_and_idempotent() {
         let tenant = crate::core::TenantId::new("acme").expect("tenant");

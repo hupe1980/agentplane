@@ -908,7 +908,17 @@ impl StepCtx<'_> {
                 // to the caller in the first place, because it cannot be seen
                 // before the frontier it commits with.
                 match self.cursor_next(key)? {
-                    Some(crate::journal::EffectReplay::Done { .. }) => continue,
+                    // Billed on the way past, like every other announced
+                    // attempt: the live pass takes this member's slot when the
+                    // gate below admits it, so a replay that skipped the count
+                    // would leave a group's members free on the second pass and
+                    // charged on the first. A ceiling that checks a write and
+                    // then counts it on neither path is a ceiling a group of
+                    // fifty members walks straight through.
+                    Some(crate::journal::EffectReplay::Done { spend, .. }) => {
+                        self.bill_replayed(spend);
+                        continue;
+                    }
                     // The same rule as the ordinary dispatch loop, through the
                     // same implementation: a gate must not re-decide a dispatch
                     // history already settled, so strict re-raises the verdict,

@@ -120,7 +120,9 @@ or is refused. Three properties make the whole map *intent by construction*:
 - **The runtime never reads it.** No key here reaches a gate, a grant, a prompt
   or a decision, and there is no accessor that turns one into behaviour. So no
   value here can become a security decision — which is what an advisory control
-  would be, and what [I12](@/docs/architecture.md) forbids.
+  would be, and this format has no advisory controls: a field named as a
+  security, governance, budget or oversight control is enforced by the runtime
+  or refused by the parser.
 - **The digest covers it.** Changing an owner changes the manifest digest, so it
   is a version bump with a reviewer on it. That is exactly what a governance
   process wants from an ownership record and what a wiki page cannot give it.
@@ -396,16 +398,25 @@ decision that has to be visible — declare `budgets: {}` to mean it.
 | `max_tokens` | tokens, across every model call in the run |
 | `max_minor_units` | money in **minor units** — cents, not euros. A float would make a budget that fails to bind by a rounding error, and it is **unsigned**, so a negative ceiling is a parse failure rather than a ceiling that un-spends itself |
 | `max_replans` | replans |
-| `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes |
+| `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes. Costs one journaled clock read per step boundary, paid only by a run that declares it — so this history replays under a raised ceiling and not under a build that removed it. It stops the *next* step: nothing here interrupts a call in flight |
 | `max_denials` | policy refusals, before the run is stopped |
+| `max_parallel_steps` | how many of a plan's ready steps run at once |
 
 Budgets bind the whole run including delegation: `commission` is an effect, so a
 sub-run's reported spend is billed to the run that ordered it.
 
-Every ceiling above except the last two is checked *before* the work and against
-**every** effect — a clock read and a tool call each cost one — so `0` is refused
-at parse: it does not mean "no spend", it means the run is refused its first
-operation of any kind, forever.
+Every ceiling above except `max_replans` and `max_denials` is checked *before*
+the work and against **every** effect — a clock read and a tool call each cost
+one — so `0` is refused at parse: it does not mean "no spend", it means the run
+is refused its first operation of any kind, forever.
+
+`max_parallel_steps` is the one that bounds *width* rather than total work. A
+plan's ready set runs concurrently, and each step in flight holds a connection, a
+share of the provider's rate limit, and one operation's worth of spend the
+metered ceilings have admitted and not yet billed — so this is also what bounds
+how far `max_tokens` and `max_minor_units` can be overshot. Omit it and the
+plan's own width is the bound, which is the right default for a graph you wrote
+and the wrong one for a graph anything else may widen.
 
 `max_replans` and `max_denials` are the exceptions, and `0` is accepted for
 both, because each counts an event that may never happen. `max_denials` is the

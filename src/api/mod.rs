@@ -126,8 +126,7 @@ use crate::core::{
     CaseId, CaseStatus, CloudEvent, Decision, Delivery, InboundEvent, PolicyDecision,
     PolicyRequest, RunId, Task, TaskId, TenantId,
 };
-use crate::journal::RecordKind;
-use crate::runtime::Runtime;
+use crate::runtime::{RunStatus, Runtime, observed_status};
 
 /// Who is on the other end of the request.
 ///
@@ -856,25 +855,38 @@ async fn run_view(
         .read(id, 1)
         .await
         .map_err(|_| store_failed())?;
-    let Some(last) = records.last() else {
+    // An empty history is a run nobody has heard of. Distinguished here rather
+    // than by the reader below, which answers `None` for *still running* too —
+    // and those get different HTTP answers.
+    if records.is_empty() {
         return Err(not_found("run"));
-    };
+    }
 
-    // Status is read from the **last** record, not from whether a suspension
-    // appears anywhere. A run that waited for an event, got it, and carried on
-    // has a `RunSuspended` in its history and is not suspended now; scanning for
-    // one would report every resumed run as stuck forever.
-    let (status, waiting_for, reason, exhaustion) = match last.kind() {
-        RecordKind::RunSuspended { reason } => {
-            ("suspended".to_owned(), Some(reason.to_string()), None, None)
-        }
-        RecordKind::RunConcluded {
-            outcome,
-            reason,
-            exhaustion,
-            ..
-        } => (outcome.clone(), None, reason.clone(), exhaustion.clone()),
-        _ => ("running".to_owned(), None, None, None),
+    // Read through the runtime's own reader rather than matched again here.
+    // This endpoint had its own copy of the match, and a copy is only as strong
+    // as its laxest arm: it echoed an outcome string this build cannot
+    // interpret straight into `status`, and reported a conclusion that says
+    // `exhausted` and carries no typed ceiling as an ordinary exhaustion — the
+    // one surface an operator uses to decide *which limit to raise*, answering
+    // with nothing to raise. Both fail closed at the source.
+    let observed = observed_status(&records);
+    let status = observed
+        .as_ref()
+        .map_or_else(|| "running".to_owned(), |s| s.as_str().to_owned());
+    // A suspension's sentence is *what it waits for*, which is a different
+    // question from why it ended — so it fills `waiting_for` and leaves
+    // `reason` empty, exactly as before.
+    let waiting_for = match &observed {
+        Some(RunStatus::Suspended(r)) => Some(r.to_string()),
+        _ => None,
+    };
+    let reason = match &observed {
+        Some(RunStatus::Suspended(_)) | None => None,
+        Some(s) => s.reason().map(std::borrow::Cow::into_owned),
+    };
+    let exhaustion = match &observed {
+        Some(RunStatus::Exhausted(limit)) => Some(limit.clone()),
+        _ => None,
     };
 
     // A conclusion is not necessarily a closure. Failed and exhausted runs

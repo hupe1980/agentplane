@@ -218,7 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = runtime_for(&store, &tight, &provider);
     let capped = rt.run("support.triage", Tainted::trusted(ticket)).await?;
     println!("\n2. one-token ceiling → {:?}", capped.status);
-    println!("   spend:          {} tokens", capped.spend.tokens);
+    println!("   spend:          {} tokens", capped.spend().tokens);
     println!(
         "   provider calls: {} of 2 — the second never started",
         provider.calls()

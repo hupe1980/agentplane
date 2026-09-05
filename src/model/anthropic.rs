@@ -1135,8 +1135,9 @@ mod tests {
     /// A system instruction has to leave as a top-level parameter.
     ///
     /// Anthropic rejects `role: "system"` inside `messages`, so this is the only
-    /// place it can go. It used to be dropped on the floor: the caller set it,
-    /// nothing complained, and the model was never told.
+    /// place it can go. A driver that does not lift it there drops it silently:
+    /// the caller sets an instruction, nothing complains, and the model is
+    /// never told.
     #[test]
     fn a_system_instruction_rides_beside_the_messages() {
         let body = driver().body(
@@ -1160,9 +1161,9 @@ mod tests {
 
     /// An instruction is not content.
     ///
-    /// Without `messages` to key on, the object used to be stringified whole and
-    /// handed to the model as the user's question — so the caller's instruction
-    /// arrived as part of the thing being asked about.
+    /// With no `messages` to key on, the obvious reading is to stringify the
+    /// whole object as the user's question — which hands the caller's
+    /// instruction to the model as part of the thing being asked about.
     #[test]
     fn a_system_instruction_is_not_shown_as_the_question() {
         let body = driver()
@@ -1220,10 +1221,10 @@ mod tests {
     /// Thinking + `tool_use` + no sibling text is a working tool turn.
     ///
     /// With extended thinking on, choosing a tool IS the answer: Anthropic
-    /// emits `thinking` and `tool_use` blocks with no text beside them. This
-    /// shape used to be classified `Unusable` for emptiness — and because the
-    /// error path carries no continuation, the signed thinking blocks were
-    /// dropped and the next turn was rejected by the provider. The assertion
+    /// emits `thinking` and `tool_use` blocks with no text beside them. Judged
+    /// on text alone the turn reads empty and classifies `Unusable` — and since
+    /// the error path carries no continuation, that drops the signed thinking
+    /// blocks and the provider rejects the next turn. The assertion
     /// on byte-for-byte equality is the load-bearing half: a driver that
     /// reconstructs the turn from the fields it understands cannot return the
     /// signature it never kept.

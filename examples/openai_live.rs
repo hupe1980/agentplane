@@ -148,7 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!(
         "spend    {} tokens, {} calls to OpenAI",
-        out.spend.tokens,
+        out.spend().tokens,
         calls.load(Ordering::SeqCst)
     );
     assert_eq!(out.status, RunStatus::Succeeded);

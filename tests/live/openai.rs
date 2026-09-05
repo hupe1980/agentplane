@@ -140,7 +140,7 @@ async fn a_real_completion_replays_without_calling_openai_again() {
     // A real provider charges for real tokens. A zero here would mean usage is
     // parsed from a field this driver is not reading.
     assert!(
-        out.spend.tokens > 0,
+        out.spend().tokens > 0,
         "the completion reported no tokens, so usage accounting is reading the \
          wrong field — and every budget built on it bounds nothing"
     );

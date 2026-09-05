@@ -1428,7 +1428,7 @@ impl Effect for ModelCall {
             // A failure that consumed nothing is an ordinary failure. One
             // that generated tokens has to carry them, or the ceiling that
             // exists to bound a runaway provider counts zero.
-            if spend.is_zero() {
+            if spend.is_free() {
                 match e.disposition() {
                     // A provider's refusal is an answer, not a fault: the
                     // request is *wrong* — unknown model, malformed schema,

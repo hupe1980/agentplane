@@ -1,7 +1,7 @@
 +++
 title = "Regulation"
 description = "EU AI Act obligation by obligation, mapped to mechanisms that exist — and an explicit list of the ones that do not."
-weight = 11
+weight = 17
 +++
 
 **agentplane is not compliant with anything, and cannot be.** Compliance attaches

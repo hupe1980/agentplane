@@ -234,6 +234,13 @@ impl JournalStore for SealedJournal {
         self.inner.runs_by_outcome(outcome, limit).await
     }
 
+    /// Delegated: an outcome is index metadata, never a sealed payload, so the
+    /// count is answerable with no key at all — the same property that lets an
+    /// auditor holding no keys still list a quarantine backlog.
+    async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
+        self.inner.count_by_outcome(outcome).await
+    }
+
     /// Delegated, and the key is **not** sealed on the way through: it is the
     /// counterparty's message identity rather than content, and the index has to
     /// be searchable by a value the caller holds in the clear.

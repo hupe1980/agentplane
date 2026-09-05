@@ -309,7 +309,7 @@ pub enum RecordKind {
         /// Usually nothing. Not nothing for a metered call that died partway —
         /// a model stream bills for what it generated — and recording it is what
         /// makes a replayed run reach the same budget verdict at the same point.
-        #[serde(default, skip_serializing_if = "Spend::is_zero")]
+        #[serde(default, skip_serializing_if = "Spend::is_free_ref")]
         spend: Spend,
         /// What the failure says about whether the call reached the outside
         /// world.

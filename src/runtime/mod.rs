@@ -23,6 +23,15 @@ pub use executor::Agent;
 /// decision — resume, sealing, and the A2A state mapping. Test-only.
 #[cfg(test)]
 pub(crate) use executor::every_status;
+/// The one reader of "what does this run's history say its state is", shared by
+/// every surface that answers the question. Crate-internal: the public form is
+/// [`Runtime::recorded_outcome`], which is what an embedder holds.
+///
+/// Gated on the one in-crate consumer, so a build without the HTTP surface does
+/// not carry a re-export nothing reaches — the compiler then answers *which
+/// surfaces exist in this build* rather than an `allow` hiding the question.
+#[cfg(feature = "http")]
+pub(crate) use executor::observed_status;
 pub use executor::{
     Admission, FullBackend, LEASE_TTL, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, RunFailure,
     RunOutcome, RunStatus, RunTerms, Runtime, RuntimeBuilder, SEALED_OUTCOMES, Spawned,

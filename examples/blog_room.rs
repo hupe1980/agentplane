@@ -223,14 +223,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the fact, so the room overshoots by at most one commission — which is what
     // `max_effects` is for.
     assert!(
-        post.spend.tokens > 0,
+        post.spend().tokens > 0,
         "the editor's ledger shows nothing, so its ceiling bounds only its own \
          idling and a `max_tokens` on a delegating agent stops nothing"
     );
     println!(
         "\n4. the editor's run carries {} tokens — the specialists' spend, billed \
          through the delegation effect",
-        post.spend.tokens
+        post.spend().tokens
     );
     println!(
         "   so its max_tokens bounds the room; max_effects ({}) bounds the overshoot",
@@ -292,7 +292,7 @@ async fn yaml_room(
     );
     assert_eq!(provider.calls() - before, 5);
     assert!(
-        desked.spend.tokens > 0,
+        desked.spend().tokens > 0,
         "the desk's ledger must carry the specialists' spend, exactly as the \
          coded editor's did"
     );

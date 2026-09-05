@@ -385,6 +385,7 @@ spec:
         ("max_tokens", "120000"),
         ("max_minor_units", "250"),
         ("max_wallclock_secs", "60"),
+        ("max_parallel_steps", "4"),
     ] {
         let err = Manifest::parse(&agent(&format!("{{ {field}: 0 }}")))
             .expect_err("a ceiling of zero was accepted, and it permits nothing at all");
@@ -6673,6 +6674,7 @@ fn a_zero_ceiling_is_refused_however_the_budget_arrives() {
             "max_tokens" => b.max_tokens = Some(n),
             "max_minor_units" => b.max_minor_units = Some(n),
             "max_wallclock_secs" => b.max_wallclock_secs = Some(n),
+            "max_parallel_steps" => b.max_parallel_steps = Some(small),
             other => panic!("no such ceiling: {other}"),
         }
         b
@@ -6684,6 +6686,7 @@ fn a_zero_ceiling_is_refused_however_the_budget_arrives() {
         ("max_tokens", 120_000),
         ("max_minor_units", 250),
         ("max_wallclock_secs", 60),
+        ("max_parallel_steps", 4),
     ] {
         let err = Runtime::builder(store())
             .budget(with_ceiling(name, 0))

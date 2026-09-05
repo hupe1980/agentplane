@@ -1,7 +1,7 @@
 +++
 title = "Security model"
 description = "The trust boundary, information-flow labels, delegation and egress — with an explicit account of what is not covered."
-weight = 8
+weight = 14
 +++
 
 What this runtime defends, how, and — the part most security documents omit —
@@ -109,14 +109,25 @@ person should look, and resolving it silently converts *we do not know* into
 *approved*.
 
 Those refusals bind a deserialized quorum as well, which is the case that
-matters: a quorum rides on a plan node, and plans are read back from a store, a
-journal, and a replanner parsing a model's proposal. A panel is exactly the
-control a hijacked plan wants weakened, and `need: 0` would otherwise report
-`Pass` having judged nothing.
+matters: a tally is decided from values a plan carried, and plans are read back
+from a store, a journal, and a replanner parsing a model's proposal. A panel is
+exactly the control a hijacked plan wants weakened, and `need: 0` would
+otherwise report `Pass` having judged nothing.
 
-The plan contract adds the structural half: a node declaring a quorum must
-depend on something. On a node with no subject a panel repeats *the work* rather
-than reviewing it — and for a mutating step, repeats it on the world.
+**A panel is a subgraph, not a field.** *k* nodes depending on the subject, each
+declaring `verifies`, and a terminal node depending on all of them that decides
+with `Quorum`. There is deliberately no `quorum` on a plan node: the runtime has
+no way to hand a node a *lens*, so such a field would ride inside the plan
+digest with its behaviour living nowhere — the reason `routed`/`router` are
+refused as topologies.
+
+The plan contract supplies the structural half either way: a node declaring
+`verifies` must depend on what it checks, because a judge with no subject
+repeats *the work* rather than reviewing it — and for a mutating step, repeats
+it on the world. `RuntimeBuilder::require_verifier()` makes carrying one a
+condition of admission, and it binds a replanner's successor as well as the plan
+the embedder wrote: a control that held for the first plan and not for its
+replacement is a control a replan removes.
 
 ### Where the plane may connect
 
@@ -1077,7 +1088,7 @@ produces a typed refusal. The client's DNS resolver judges **every name it
 resolves**, which covers the connections a pooled client opens after that
 pre-flight returned. An IP literal never reaches a resolver and loses nothing by
 it — it has one address, already judged, and cannot rebind. Both call one rule;
-see [one client, judged at connect](@/docs/architecture.md#one-client-judged-at-connect).
+see [one client, judged at connect](@/docs/interop.md#one-client-judged-at-connect).
 
 A registered receiver gets the same status and artifact `StreamResponse`
 objects as an SSE subscriber. Treating its URL as authorized for that task is
@@ -1173,7 +1184,7 @@ real deployment:
 
 So the grouping is the **publisher**. `context.agent.publisher` carries the
 `KeyId` that
-[`Registry::resolve_verified`](@/docs/architecture.md) returned beside the
+[`Registry::resolve_verified`](@/docs/registry.md) returned beside the
 manifest — it arrives *beside* the document rather than inside it, because a
 document cannot state who signed it. `Agent::published_by` carries it into the
 runtime; an agent registered without one reports `None`, which is a recorded fact

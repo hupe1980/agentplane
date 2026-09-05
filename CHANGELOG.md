@@ -1,34 +1,321 @@
 # Changelog
 
-Notable changes per release, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Notable changes per release, on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+with two departures, stated here rather than left for a reader to infer.
 
-**Pre-alpha, and versioned accordingly.** The crate *is* published — `0.x` bumps
-carry breaking changes without deprecation cycles, because a hard cut is cheaper
+**Each entry carries a headline**, not a bare category — *Fixed — a rate limit was
+retried as if nobody knew when to come back* rather than a bullet under `Fixed`.
+The categories are the standard ones; the sentence after the dash is what makes
+230 of them scannable.
+
+**Two categories are ours.** `Assurance` is a change to what the project can
+*prove* — a test that could not fail, a mutation that stopped killing, a surface
+walked adversarially and found sound. `Known` is a limitation shipped
+deliberately, with the reason. Neither is a code change and both belong to a
+reader deciding whether to depend on this.
+
+What is **not** here: literature reviews, competitor comparisons and citations.
+They are how a design got decided, not what a release changed, and a reader who
+already depends on a version is owed the second. This file ships inside the
+crate, so anything it points at has to be something the reader received.
+
+**Pre-alpha, and versioned accordingly.** The crate *is* published, so `0.x`
+bumps carry breaking changes without deprecation cycles — a hard cut is cheaper
 than a compatibility shim, and pre-1.0 is the window in which that is an honest
 trade rather than a broken promise. Every breaking entry says what to do about
-it, and [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/)
-carries the ones that need more than a sentence.
+it; [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) carries
+the ones needing more than a sentence. Every entry is written for somebody who
+already depends on a version, which is the one assumption this file may not drop.
 
-This line used to read *the crate is not published*, which stopped being true at
-the first release and stayed on the page — the shape this project catalogues as a
-premise that expired. It matters more here than most: an entry's audience is
-somebody who already depends on a version, so "nobody has yet depended on it" is
-exactly the assumption a changelog may not make.
-
-**This file carries the reasoning, not just the diff.** It used to share that job
-with a status page listing everything built — two hundred rows, nearly all of them
-phrased as *X used to do Y, now it does Z*, which is a change and not a status.
-Keeping one fact in two places is the defect this project treats most seriously
-elsewhere, so the list is gone and the entries below are where a mechanism's
-history lives. [Status](https://hupe1980.github.io/agentplane/docs/status/) now
-answers only what a status page can: what will move, what is deliberately absent,
-and how to check either. What *exists* is answered by the
+**This file carries the reasoning, not just the diff**, and it is the only place
+that does: a mechanism's history lives here and nowhere else, because keeping one
+fact in two places is the defect this project treats most seriously.
+[Status](https://hupe1980.github.io/agentplane/docs/status/) answers what will
+move and what is deliberately absent; what *exists* is answered by the
 [concepts](https://hupe1980.github.io/agentplane/docs/concepts/) page, the
 [API reference](https://docs.rs/agentplane), and the test suite.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rather
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
+
+## [0.28.0] — 2026-09-05
+
+### Changed — the architecture page is six pages
+
+It had grown to **29,745 words** on one URL: a reader had no way to navigate it,
+and a search engine had one page competing for every query the project answers,
+which is how a page about everything ranks for nothing. It is now a hub plus five
+pages, each with its own title, description and canonical URL:
+
+| Page | What it answers |
+|---|---|
+| Architecture | the determinism boundary, the module layout, where each mechanism lives |
+| The effect protocol | at-most-once outward calls, sagas, transactional groups, stopping a run |
+| The journal | what the chain, the signatures and the Merkle log prove — and refuse to |
+| Plans, cases and time | authorization graphs, cases, waits, timers, budgets, worklists, batches |
+| Models, agents and peers | everything the runtime calls that it does not own |
+| Publishing and pinning agents | the manifest as an artifact, and the registry that will not rewrite a version |
+
+The page's own "Testing" section became **How this is proven** — the
+specifications, the mutation sweep, and why a green suite is not the argument. It
+was the detail behind the landing page's credibility claim and it was buried at
+line 3,192 of the longest page on the site; the claim now links to it.
+
+Split by word count with the total asserted before and after, so no paragraph
+moved by accident. `tests/guards/docs.rs` gained a check that every published
+page is linked from the README — splitting one page into six is exactly how a
+page ends up published and unreachable.
+
+### Fixed — the page arguing the project is falsifiable was the part nothing falsified
+
+The landing page's *"Why you should believe any of it"* offers four figures. Three
+were wrong: **6** TLA+ specifications against seven in the tree, **18** broken
+specs against twenty-six, and **106** code mutations against six hundred and
+forty-four. The README's list of specifications named six of the seven, omitting
+`EffectGroup` — the transactional tier, which is the hardest claim here to
+believe without a proof and therefore the one worth naming.
+
+Both are now counted from the tree at test time rather than restated, so adding a
+specification or a mutation moves the page or fails the build.
+
+### Fixed — the table of *every* event listed ten of fourteen
+
+The operations page heads a table *"Every failure P7 exists to surface has its own
+event target"*. It omitted `run.unreproducible`, `run.recovered`, `run.replanned`
+and `policy.denied` — an integrity finding, a takeover, a plan change, and every
+policy refusal. A table headed *every* is an alerting checklist: an operator
+builds a dashboard from it once and does not come back, so a short list is not a
+smaller table, it is four signals nobody is watching. Checked against
+`telemetry::LOUD_EVENTS` now.
+
+Also removed two leaks of internal vocabulary — a page cited invariants by number
+("I12", "I2") and linked to a page that never defines them, so a reader following
+the link found nothing. Both now state the rule instead.
+
+### Fixed — the operator view had its own rule for what a run's history says
+
+`GET /runs/{run}` matched the last record itself instead of asking the runtime,
+and a second copy of a rule is only as strong as its laxest arm. Two of them
+were laxer:
+
+- **An `exhausted` conclusion carrying no typed ceiling was reported as an
+  ordinary exhaustion**, with the field simply absent. I14 names the operator API
+  as one of three surfaces where an exhausted run keeps the exact ceiling
+  verdict; the runtime's own reader quarantines that record precisely because
+  there is nothing to raise and nothing to act on. Automation asking *which limit
+  do I raise* read `null`.
+- **An outcome string this build cannot interpret was echoed straight into
+  `status`.** The reader beside it fails closed — "a conclusion this build cannot
+  interpret is not permission to treat the run as ordinary" — and so does the A2A
+  projection. The operator surface was the one that failed open.
+
+There is now one reader, `observed_status`, and idempotent admission, the
+operator view and the A2A projection answer from it. The A2A module had already
+written the rule down — *"three views of one fact, and three copies of this match
+would agree until somebody added a record kind"* — and the native surface was the
+copy nobody counted.
+
+### Fixed — a subscription phase this store could not read was answered `Forward`
+
+The third copy of one decoder. The shared-store backend refused an unreadable
+phase and the timer store was taught to in 0.21; the redb *event* store still
+answered `Forward` for anything it did not recognise, with a comment defending
+the totality — while the case id and effect key decoded three lines away already
+answered `Corrupt`. One decoder guessed while its neighbours refused.
+
+What the default costs is specific: the phase selects which replay cursor the
+delivered event is journaled under, and forward and compensating effects must
+never share one. A compensating wait whose phase is misread has its answer filed
+on the forward cursor, so that wait is never satisfied and the run waits forever,
+while a strict replay meets a record on the forward cursor nothing requested and
+quarantines. Both are silent at the moment the column is misread.
+
+### Added — `agentplane.runs.quarantined`, the level behind the quarantine counter
+
+`agentplane.quarantines` is a `Counter`, and its description promised *"this
+number only falls when someone acts"* — which no counter can do. It is monotonic
+and it lives in the process, so after a restart it reads zero over a backlog of
+forty, and a backlog that stopped growing reads exactly like one that was
+cleared. The description now says what a counter is; the number it was reaching
+for exists.
+
+The gauge is observed from the store, like every other gauge here, through a new
+`JournalStore::count_by_outcome` — never from `runs_by_outcome(..).len()`, because
+a gauge served from a bounded listing rises, flattens at the page size and reads
+as a plateau exactly when the backlog stops being survivable. It counts the same
+derived index the listing pages, so the number an operator alerts on and the page
+they open from it cannot disagree.
+
+`count_by_outcome` is a required trait method with no default: a default of zero
+is a gauge that reports "nothing is wrong" for every store whose author did not
+notice, which is the failure the whole instrument exists to remove.
+
+### Known — nothing resolves a quarantine, and the gauge says so
+
+Adding the level made the hole in front of it plain, so it is stated rather than
+papered over. The runtime's most serious conclusion is the one an operator cannot
+act on: a resume re-reaches the same conclusion, and `request_cancel` against a
+quarantined run records the stop, answers `recorded: true`, and is then ignored.
+So this gauge only ever rises, and its description says that outright rather than
+implying a number that drains.
+
+The missing verb is now a release blocker with its shape written down — including
+the two questions that make it a design rather than a change: what a `Landed`
+verdict from an offline operator derives its label from, and the fact that
+closing a quarantine takes it off the only listing that carries it, so the
+finding has to outlive the status first.
+
+### Fixed — a ceiling checked once per member of a ready set was a ceiling multiplied by that set's width
+
+A plan's ready set is dispatched concurrently, and both count-based ceilings
+were check-then-act against a figure that moves only when work *finishes*. So a
+whole wave asked the same question of the same unmoved number and every branch
+was told yes: `Budget::steps(2)` ran three branches of a three-wide fan-out, and
+`Budget::effects(2)` performed three concurrent effects. The count-based limits
+were documented as the exact ones — the escape hatch offered to anyone who needs
+a hard cap rather than the metered ceilings' approximation — so the field where
+it mattered most was the field it did not hold in.
+
+Every existing budget test used a linear plan and effects that succeed, which is
+why it survived: with a ready set of one there is no wave, and with no failures
+there is no second billing path.
+
+Two fixes, one rule — *the check and the deduction are the same act*:
+
+- `Ledger::admit_step` takes what the caller has already admitted in this wave,
+  so a ready set is admitted against a running figure rather than a stale one.
+- `Ledger::admit_effect` takes the slot in the same lock that checked for it, so
+  the window between a verdict and the announcement it authorises is gone.
+  `can_admit_effect` is the pure question, for the one caller that asks early and
+  dispatches through the ordinary gate afterwards.
+
+An announcement no ceiling gates — a compensating call, a durable wait — takes
+its slot through `Ledger::count_effect`. Exempt from the *verdict*, not from the
+count: a run must not walk through a ceiling by phrasing its work as an undo,
+and a pass replaying the announcement bills one either way.
+
+### Fixed — a replayed run reached a different tally than the run it replays
+
+The central claim of journaled spend is that a replay reaches the same verdict at
+the same point. Three arms of the replay loop broke the arithmetic that claim
+rests on, and none of them could be seen by an assertion about a run's *status*:
+
+- **A recorded failure was billed twice.** The arm that read it billed the
+  recorded figure, and the code deciding what the run did next billed a second
+  slot on top. A run that failed an attempt and retried consumed two operations
+  live and three on resume — so a run with room to spare concluded `Exhausted`
+  against a ceiling its own history never reached, at a point no record contains.
+- **A superseded record's figure was dropped.** One attempt can write three
+  records: the announcement, the failure carrying what died mid-flight, and a
+  probe's verdict carrying what the recovered call reports. The live pass adds
+  every figure it is handed; the replay slot took only the last one, so a
+  reconciled attempt replayed at a fraction of its cost. `StepCursor::settle`
+  now carries the superseded state's spend forward.
+- **A reconciliation was a second slot on one path and none on the other.** The
+  probe asks about an attempt already admitted and already counted, under the
+  same effect key; it now reports its spend without taking a second slot.
+
+Beside them, two announcements that were billed on replay and not live — an
+awaited event and a durable sleep — now take their slot where they are
+announced; and an **atomic group member**, which was gated against the ceiling
+and then counted by neither path, now takes one on both. A ceiling that checks a
+write and never counts it is a ceiling a group walks through.
+
+The rule is one sentence, and it is now the one the tests assert: **one
+announced attempt costs one slot and every figure its records carry, on the pass
+that announces it and on every pass that replays it.** Asserted as a *tally* —
+a strict replay's `RunOutcome::consumed` must equal the live run's — because an
+outcome-shaped assertion cannot see any of this.
+
+### Fixed — `max_wallclock_secs` had never been enforced
+
+A declared ceiling, refused at zero by both parsers, carried into `Budget`,
+compared by the ledger against `Consumed::elapsed_secs` — and nothing anywhere
+wrote that field. `Ledger::observe_elapsed` had no caller outside its own unit
+test, so elapsed time stayed at zero for the life of every run and the limit
+could not fire. A manifest field naming a control the runtime does not apply is
+the one release state the invariants refuse outright.
+
+Enforced now, the way the module docs had already argued for: one **journaled**
+clock read at each step boundary, taken only by a run that declared the ceiling.
+Journaled rather than ambient because a verdict read off the wall is a different
+verdict every time you look, and an exhausted run would replay as healthy.
+
+Two consequences worth knowing:
+
+- Elapsed time is the distance between the **extremes** of what a run has read,
+  not between the first and last arrival. A ready set is dispatched
+  concurrently, so arrival order belongs to the scheduler, and a ceiling that
+  depended on it would fire on some passes over one history and not others.
+- A step's first effect is that reading when a wall-clock ceiling is declared and
+  the skill's own when it is not, so such a history replays under a *raised*
+  ceiling and not under a build that removed it. Every other ceiling can be
+  changed in either direction between passes; this one can only go up.
+- It stops the **next** step. Nothing cancels work in flight — that would abort
+  an effect mid-call and manufacture the unknown outcome the protocol exists to
+  refuse — so a single step that overruns is not interrupted. What bounds one
+  call is the driver's own timeout.
+
+### Added — `spec.budgets.max_parallel_steps`
+
+How many of a plan's ready set may be dispatched at once. Absent, the bound is
+the plan's own width, which is the right default for a graph you wrote and the
+wrong one for a graph anything else may widen — and until now it was the only
+bound there was, in a runtime whose sibling subsystem (webhook delivery) has
+bounded its fan-out since 0.19.
+
+It is also what makes the *metered* ceilings' honest statement a bounded one.
+Those are checked before an operation and billed after it, so a run overshoots
+one by at most an operation's cost **per step in flight**; the documentation said
+"at most one operation" and was written when nothing ran two at once. Dispatch
+uses `buffered`, not `buffer_unordered`: narrowing a wave must not reorder it.
+
+### Removed — `PlanNode::quorum`; a panel is a subgraph
+
+A field declaring "judge this node's work more than once, from declared angles",
+validated for having a subject, covered by the plan digest — and never read by
+the executor. A node carrying it ran exactly once.
+
+It is removed rather than implemented, and the project's own rule decides it:
+`routed`/`router` are refused as topologies "because this runtime does not
+execute that choice, and accepting them would digest prose while behaviour lived
+elsewhere". The same applies here twice over. The runtime has no way to hand a
+node a *lens*, so there is nothing to execute; and the graph already expresses a
+panel exactly — *k* nodes depending on the subject, each declaring `verifies`,
+and a terminal node depending on all of them that decides with `Quorum`. A field
+would be a second spelling of a shape the plan already has.
+
+`core::Quorum` is unchanged and is what the aggregator tallies with. Its
+refusals are the load-bearing part and they bind a deserialized panel too:
+distinct lenses, majority thresholds, and no resolution for a split.
+
+### Added — `RuntimeBuilder::require_verifier()`
+
+`Contract::require_verifier` existed, `plan::validate` honoured it, and
+`PlanNode::verifies` was documented as being "named so the contract can require
+one" — and the runtime built its contract from its registered capabilities and
+nothing else, so the requirement could be reached only by a caller validating
+its own graph. That left the gap exactly where it matters: a **replanner's successor** is
+a plan proposed mid-run by a component the embedder did not write, and it was
+admitted against a weaker contract than the plan it replaces. A control that
+holds for the first plan and not for its replacement is a control a replan
+removes.
+
+`Contract::max_steps` stays a validator option and says so: a run's step ceiling
+is `Budget::max_steps`, which counts what actually executes across every version
+of the plan, and two ceilings of one name are two answers to one question.
+
+### Changed — `RunOutcome::spend` is now `RunOutcome::consumed`
+
+The whole tally — steps, effects, spend, elapsed, refusals — rather than only the
+money. It is the observable the parity property above is asserted through, and
+independently it is the answer to the question an operator asks after a run stops
+short: *which ceiling, and how close was it?* `RunOutcome::spend()` remains as an
+accessor for the metered half, so `out.spend.tokens` becomes `out.spend().tokens`.
+
+`Spend::is_zero` is gone; `Spend::is_free` (and `is_free_ref`, for
+`skip_serializing_if`) was the same predicate under a second name.
 
 ## [0.27.0] — 2026-09-03
 
@@ -578,34 +865,6 @@ Eight anchors, `APeerCallSkipsTheGrantScope` through
 `APeerNamedLikeAToolServerBuilds`; the `peer_call` example runs both planes
 in one process.
 
-### Audited — the identity tier against the field
-
-Two arXiv results were read against the design and cited (IDs verified
-against their abstract pages). *Authorization Propagation in Multi-Agent AI
-Systems* ([2605.05440](https://arxiv.org/abs/2605.05440)) arrives at an
-append-only, per-hop attenuating token chain binding identity, authority
-and audience — the shape `Delegation` already was on two of three axes, and
-now is on all three; its token-as-wire-format half is deliberately left to
-the authenticator. *Capability Gates Are Not Authorization*
-([2606.28679](https://arxiv.org/abs/2606.28679)) audits shipping frameworks
-and finds every one gates capabilities and none re-authorizes a call against
-the *caller's* authority — the confused deputy, which is precisely what a
-served plane binding its own chain to every peer's run was, and which no
-fixture could see because every fixture's chain was wider than every plan.
-
-The platforms were checked for the same question. LangGraph Platform's
-custom auth yields an identity plus permissions and scopes *resources* to
-their owner through metadata filters — who may read this thread — with no
-authority carried into what the run does. Amazon Bedrock AgentCore Identity
-is the nearest thing to an identity tier: workload identities, a token vault
-that hands an agent user-delegated OAuth tokens, per-request signature,
-expiry and scope validation, and an impersonation flow with an audit log.
-What neither carries is an attenuating chain *across* hops with the owner
-still named at the bottom — AgentCore's agent holds the user's token and
-acts as the user; a sub-agent it calls holds its own. That hop is where this
-runtime's `commission` and peer-call links now keep the owner, expiry and
-audience, and it is the distinction the changes above exist to hold.
-
 ### Removed — `DelegationScheme`
 
 A public seam with no caller: the runtime never invoked it, so implementing
@@ -692,61 +951,6 @@ value ran, and field disciplines that still judge it. The residue is the one
 every human-in-the-loop control carries: a reviewer can be talked into
 typing the attacker's value, and the journal's actor attribution is the
 accountability for that, not a prevention.
-
-### Audited — the taint/release design against CaMeL, FIDES, and the field
-
-Research round with three sweeps (CaMeL mechanics and follow-ups, competitor
-frameworks, fresh arXiv), every ID verified against its abstract page. The
-verdict validated the design rather than moving it, and the near-misses are
-now stated in CONCEPT rather than implied:
-
-- **The two-point trust lattice is the field's own operating point.** CaMeL
-  stores no trust bit at all — "trusted" is a per-sink judgment over a
-  provenance *set*, which is exactly `allowed_sources` over `provenance`;
-  the `Trusted`/`Untrusted` bit is the Biba low-water-mark summary kept
-  beside the set, not instead of it. FIDES proves its guarantees at binary
-  integrity. The 2026 negative result on *soft* provenance (weights strong
-  enough to resist poison also suppress legitimate evidence) stays the case
-  for hard labels.
-- **Journaled, evidence-bearing declassification has no counterpart in
-  CaMeL** — its policies allow or deny and leave no record of who decided
-  what on what basis. The typed release is ahead of, not behind, the
-  reference design.
-- **Explicit secrecy is now the *named* operating point** (CONCEPT §6.3):
-  labels enforce integrity non-interference at sinks and confidentiality
-  over explicit flows; the implicit flow through trusted code's own
-  branching (and through which tool a model asks for) is FIDES's published
-  trade-off, adopted with its name. CaMeL's strict mode — control-dependency
-  taint — is recorded as rejected: it is an interpreter's discipline, and
-  skills here are native code over straight-line declarative plans.
-- **Readers-set confidentiality** (CaMeL's second capability axis) is
-  recorded as rejected with its expiry condition: sink ceilings plus
-  destination-scoped releases express audience at the sink, per decision,
-  on the record; an audience set on *sources* becomes worth adopting only
-  when connectors supply per-value ACLs.
-- **The uniform refusal sentence turned out to be an answer, not a
-  courtesy**: the new causality-laundering attack class (denial-feedback
-  leakage, 2604.04035) is closed by construction because every policy
-  refusal reaches a model as one constant sentence — the remaining
-  refused/succeeded bit is CaMeL's own documented side channel, carried as
-  stated residue.
-- New corroborations cited: SPA (plan-first dual-lattice IFC with labelled
-  cross-query artifacts — independent convergence on this design's
-  coordinates), the Framing Gap (payload-blind mechanisms — closed
-  destination lists, planner/reader splits — are what hold at 0% while
-  every recognising defense fails), label-assignment attacks (the stamping
-  boundary is the TCB, the reason no wire format here deserializes a
-  caller-supplied label), and memory control-flow steering (the channel
-  `planned` refuses structurally).
-- **No shipping framework has comparable taint tracking.** The survey
-  (LangGraph, Strands, Pydantic AI, OpenAI Agents SDK, ADK, Microsoft Agent
-  Framework, LlamaFirewall, Invariant, NeMo, rig) found per-call filtering,
-  classifiers and approval hooks — value-level provenance across steps
-  exists only in research artifacts (Microsoft's Dromedary, marked not for
-  production). DX patterns worth weighing later were catalogued:
-  approve-with-edit (a human substituting a trusted value), conditional
-  approval decided on argument values, and MCP elicitation as a wire
-  carrier for value menus.
 
 ### Added — `one_of`: the declarative fragment of release
 
@@ -931,12 +1135,6 @@ axis, static tool surfaces over runtime discovery, and no sampling
 parameters in the portable request — both Anthropic and Google removed or
 deprecated exactly the knobs this seam never carried.
 
-External research on the examples half of the round confirmed the
-`planned` kind's shape against its newest successor (NOVA,
-[arXiv:2601.09923](https://arxiv.org/abs/2601.09923), which freezes a
-*branching* plan for computer-use agents and names value-steering as the
-residual attack — exactly the half this crate answers with provenance rules
-on protected sink fields).
 
 ### Fixed — `planned_run` no longer dodges the gate it exists to demonstrate
 
@@ -1102,8 +1300,8 @@ object**. One case's erasure tombstoned the other's data while discharging
 the first's request, and the drill read the survivor's loss as *erased by
 design*, the one verdict built not to page. Sealed deployments had a second
 face of it: the later case's write re-sealed the shared object under its own
-scope, so either case's key destruction stranded the other. This is the §9.1
-blob-path argument — "tenant leads the path, so one tenant's erasure cannot
+scope, so either case's key destruction stranded the other. This is the tenant-isolation
+argument — "tenant leads the path, so one tenant's erasure cannot
 destroy another's" — that was never applied one level down, at the unit
 erasure actually names.
 
@@ -1167,7 +1365,7 @@ recovery, exactly as after a crash).
 
 ### Fixed — a resumed atomic member consumes its recorded refusal
 
-`§4.3`'s rule — a gate must not re-decide a dispatch history already settled —
+The rule that a gate must not re-decide a dispatch history already settled
 was enforced on the ordinary dispatch loop and not on the atomic-member path,
 which consumed the recorded `PolicyDenied`/`BudgetRefused` from the cursor and
 then ran the gate *fresh*. A resume under a gate whose answer had changed
@@ -1602,8 +1800,7 @@ deciding it is exactly what did not happen — so enough escalated rows would
 eventually fill every batch and the `deny`/`proceed` policies of the tasks
 behind them would silently stop firing, plane-wide. Human review is a finite
 resource an escalation policy spends, and a queue an attacker can flood is an
-oversight control an attacker can switch off
-([2606.08919](https://arxiv.org/abs/2606.08919)).
+oversight control an attacker can switch off.
 
 ### Fixed — escalation now does what its name has always claimed
 
@@ -1732,7 +1929,7 @@ crash, in the subsystem whose entire purpose is not to lose one.
 The dangerous order is the one that reads better — primary fact before derived
 one, cause before consequence. `sweep_tasks` had it right by construction, since
 `overdue` keeps returning a task after it is escalated, and that accident is
-what made the asymmetry visible. The rule is now stated as CONCEPT shape **34**:
+what made the asymmetry visible. The rule:
 *the write that removes an item from the query driving the loop goes last.* It
 costs repeated work on a retry and nothing else, because every other write in
 these loops is already idempotent — which is what makes them safe on a timer to
@@ -2281,9 +2478,7 @@ protected-field rules govern everything the answer then reaches for. That is
 the property the memory-poisoning literature says decides the outcome:
 information flow carried *across* the write and back out of the read, rather
 than content inspected at either end, because the attacks that work carry no
-linguistic signal at all
-([2605.22842](https://arxiv.org/abs/2605.22842),
-[2606.04329](https://arxiv.org/abs/2606.04329)).
+linguistic signal at all.
 
 The `/memory` key is present even when nothing was recalled. A prompt whose
 shape depends on what the store happened to hold is one nobody can read against
@@ -2787,7 +2982,7 @@ recovered output. Replay reads them back. The field is required rather than
 defaulted, for the same reason `RunAdmitted.input_label` is: both halves of a
 missing answer read as *more permissive than the truth*.
 
-The general rule, now stated in CONCEPT §6.3, is worth more than the fix: a
+The general rule is worth more than the fix: a
 decision's inputs belong on the record wherever the decision is **reproduced**
 rather than re-made. The spend was already journaled on exactly this argument.
 The label was the half nobody had followed through.
@@ -3058,32 +3253,6 @@ now names which drivers ask and says plainly that this one does not.
 
 See [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) for each
 call-site change.
-
-### Research
-
-Two results read against the design this round, both recorded in CONCEPT §11.1
-because neither changes the mechanism and one of them is the strongest published
-argument against it.
-
-[2605.26497](https://arxiv.org/abs/2605.26497) builds an authorization graph
-from user intent in an isolated context, then compares execution provenance
-against it — catching the right tool called with a parameter sourced from
-somewhere the intent never named. That is the frozen plan beside
-`ProtectedField::from_sources`, derived independently, and it is recorded as
-corroboration rather than as something to import. The difference is which end
-the baseline comes from: theirs is inferred and can therefore detect a
-deviation, this one is reviewed and signed and can therefore refuse one.
-
-[2605.17634](https://arxiv.org/abs/2605.17634) argues data–instruction
-separation is fundamentally limited: an adversary can always construct a context
-in which a blocked flow reads as legitimate, and tightening the norms blocks
-legitimate flows instead. The dilemma binds defences whose norms are *inferred*
-from the interaction. This runtime never asks whether a flow is contextually
-appropriate — it asks whether this value's source was declared for this field,
-by a reviewer, before the data arrived, which no amount of persuasive context
-moves. The argument keeps its full force against the model-level half, which is
-why §6.4 claims containment and not immunity, and it sharpens the cost this
-design accepts: a declaration that is wrong blocks real work.
 
 ## [0.17.0] — 2026-08-15
 
@@ -3773,14 +3942,6 @@ whose only caller is a crash needs its negative test to *be* a crash.
   timer wrote the wake into the chain a second time. The retry is now a second
   *resume*, never a second record.
 
-### Audit notes
-
-- MCP 2026-07-28 and A2A 1.0.x remain the current baselines; no spec drift.
-- [2608.02645] (verified tool calls under non-atomic failures) recorded in
-  §11.1 as experimental corroboration of the reconciliation design, not a gap.
-
-[2608.02645]: https://arxiv.org/abs/2608.02645
-
 ## [0.15.0] — 2026-08-12
 
 Six things a regulated deployment ran into, and each is the same shape: a
@@ -4144,7 +4305,7 @@ the mirror-image case beside it.
   re-authorisation, decompression refusal, and the streamed byte ceiling —
   audited clean.
 
-### Audited clean — the first-contact surface, executed rather than read
+### Assurance — the first-contact surface, executed rather than read
 
 - Every example in the CI recipe runs green; the CLI's error paths were
   probed as a newcomer hits them — a typo'd manifest field names itself and
@@ -4208,7 +4369,7 @@ the mirror-image case beside it.
   nothing in common, and under READ COMMITTED each statement's count subquery
   reads its own snapshot. Falsified against a real server before the fix was
   trusted: **sixteen concurrent admissions put eight runs through a ceiling
-  of four.** The catalogued yields-under-load shape, on the §9.1 control
+  of four.** The catalogued yields-under-load shape, on the tenant-isolation control
   whose whole promise is surviving scale-out — and invisible to every
   sequential test, which is why the store had passed. The count and insert
   now decide under a per-tenant transaction-scoped advisory lock (other
@@ -4230,7 +4391,7 @@ the mirror-image case beside it.
   batch replays instead of re-performing; and the batch cursor is the
   contiguous terminal prefix, holding position behind a suspended item.
 
-### Audited clean — the push outbox and the card signatures, adversarially
+### Assurance — the push outbox and the card signatures, adversarially
 
 - **The A2A push worker held ten probes across both backends**: the cursor
   advances only after every payload of a record returned 2xx, monotonically
@@ -4275,7 +4436,7 @@ the mirror-image case beside it.
   schema, because a bound held only by what a provider did with a schema is
   a bound the next driver quietly loses.
 
-### Audited clean — the label lattice, adversarially
+### Assurance — the label lattice, adversarially
 
 - The information-flow core (`core/label.rs`) was walked with eleven
   adversarial probes and produced **no finding**, recorded because an audit
@@ -4331,7 +4492,7 @@ the mirror-image case beside it.
   dedup working exactly as designed), the resumed wait re-subscribed and
   asked `claim_for` — which filtered to *unclaimed* events, hiding the run's
   own message from it — and the run slept until its deadline breached. A
-  message that arrived in time, lost anyway, in the failure mode §5.2 exists
+  message that arrived in time, lost anyway, in the failure mode the worklist exists
   to prevent and the one that presents as a process silently never
   completing. The targeted path already had the answer: `deliver_to` grants a
   retried delivery idempotent re-matching for the claiming run. `claim_for`
@@ -4346,7 +4507,7 @@ the mirror-image case beside it.
   `source` from the authenticated caller, never the body; claim atomicity in
   both directions; and the buffer-before-match ordering. The `EventStore`
   trait docs understated the dedup identity as "by event id" — the exact
-  imprecision §5.2 warns about — and now state the pair and the reason.
+  imprecision the oversight model warns about — and now state the pair and the reason.
 
 ### Fixed — a revoked draw is an answer, and now the runtime treats it as one
 
@@ -4848,7 +5009,7 @@ the mirror-image case beside it.
   plane-wide, and tenant-safe export, restore and witness proofs do not exist*.
   Three of those four clauses no longer describe this system: "plane-wide"
   stopped being distinct from tenant-scoped when a plane became single-tenant;
-  witness proofs are tenant-scoped and §9.1's own table said so four lines
+  witness proofs are tenant-scoped and the operations table said so four lines
   above, marked **built**; and egress names hosts a deployment may reach rather
   than tenant state. What survives is export and restore, which do not exist in
   any form.
@@ -5121,7 +5282,7 @@ the mirror-image case beside it.
 - **`Duration::from_hours(24)` in a published snippet.** Still unstable, so the
   `cx.sleep` example on the architecture page did not compile.
 
-### Testing
+### Assurance
 
 - `RecordingPush`, the A2A push test double, now honours its own `validate`. It
   did not, so *the grant is re-checked at delivery* had no test that travelled

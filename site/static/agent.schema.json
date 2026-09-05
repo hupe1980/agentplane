@@ -54,6 +54,15 @@
             "null"
           ]
         },
+        "max_parallel_steps": {
+          "description": "How many of a plan's ready steps may run at once.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_replans": {
           "description": "How many times the run may change its plan.",
           "format": "uint32",

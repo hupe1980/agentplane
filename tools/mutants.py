@@ -62,22 +62,26 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "a_committed_but_lost_effect_record_is_not_performed_again",
         "replay re-performs a completed effect instead of reading it back",
-        """                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        return Ok((serde_json::from_value(output)?, declared));""",
-        """                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        let _ = (output, declared);""",
+        """                self.replayed_done(&descriptor.kind, attempt, spend);
+                Ok(Replayed::Answered(
+                    serde_json::from_value(output)?,
+                    declared,
+                ))""",
+        """                self.replayed_done(&descriptor.kind, attempt, spend);
+                let _ = (output, declared);
+                Ok(Replayed::Live)""",
     ),
     "MediaReplayRePerforms": (
         "src/runtime/ctx.rs",
         "strict_replay_does_not_read_media_blobs_or_call_the_model",
         "strict replay re-materializes a media blob and calls the model again",
-        """                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        return Ok((serde_json::from_value(output)?, declared));""",
-        """                        self.replayed_done(&descriptor.kind, attempt, spend);
-                        if descriptor.kind == "model.complete" {
-                            let _ = effect.perform().await;
-                        }
-                        return Ok((serde_json::from_value(output)?, declared));""",
+        """                self.replayed_done(&descriptor.kind, attempt, spend);
+                Ok(Replayed::Answered(""",
+        """                self.replayed_done(&descriptor.kind, attempt, spend);
+                if descriptor.kind == "model.complete" {
+                    let _ = effect.perform().await;
+                }
+                Ok(Replayed::Answered(""",
     ),
     "NoReplayCursor": (
         "src/journal/replay.rs",
@@ -404,8 +408,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "lowering_a_declared_sensitivity_does_not_declassify_history",
         "a replayed value is relabelled from today's catalogue instead of its record",
-        "                        return Ok((serde_json::from_value(output)?, declared));",
-        "                        return Ok((\n                            serde_json::from_value(output)?,\n                            crate::core::DeclaredOutput::of(&effect),\n                        ));",
+        "                Ok(Replayed::Answered(\n                    serde_json::from_value(output)?,\n                    declared,\n                ))",
+        "                Ok(Replayed::Answered(\n                    serde_json::from_value(output)?,\n                    crate::core::DeclaredOutput::of(effect),\n                ))",
     ),
     "EmbedHasNoCeiling": (
         "src/runtime/effects.rs",
@@ -980,11 +984,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """        if !self.writes_enabled() {
             return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
         }
-        // Scoped so the guard is gone before the await below.""",
+        // Asked without taking the slot""",
         """        if self.mode == Mode::Strict {
             return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
         }
-        // Scoped so the guard is gone before the await below.""",
+        // Asked without taking the slot""",
     ),
     "AReadmittedRefusalStillStopsAStrictReplay": (
         "src/journal/replay.rs",
@@ -2492,14 +2496,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             lenses: d.lenses,
         })""",
     ),
-    "AQuorumNeedsNoSubject": (
+    "AJudgeNeedsASubject": (
         "src/plan/mod.rs",
-        "a_quorum_on_a_node_that_judges_nothing_is_refused",
-        "a panel may be declared on a node that judges nothing, so it repeats "
-        "the work instead of reviewing it",
-        """    for n in plan.nodes.iter().filter(|n| n.quorum.is_some()) {
+        "a_panel_is_judges_over_a_subject_and_an_aggregator_over_the_judges",
+        "a judge may be declared on a node that checks nothing, so a panel "
+        "repeats the work instead of reviewing it — and for a mutating step, "
+        "repeats it on the world",
+        """    for n in plan.nodes.iter().filter(|n| n.verifies) {
         if n.depends_on.is_empty() {
-            return Err(PlanError::QuorumWithoutSubject { step: n.id });
+            return Err(PlanError::VerifierWithoutSubject { step: n.id });
         }
     }""",
         "",
@@ -4532,18 +4537,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the run view drops the seal's reason, so an operator asking what "
         "happened is answered 'failed' and sent into the journal for the one "
         "sentence the record already carries",
-        """        RecordKind::RunConcluded {
-            outcome,
-            reason,
-            exhaustion,
-            ..
-        } => (outcome.clone(), None, reason.clone(), exhaustion.clone()),""",
-        """        RecordKind::RunConcluded {
-            outcome,
-            reason: _,
-            exhaustion,
-            ..
-        } => (outcome.clone(), None, None, exhaustion.clone()),""",
+        """    let reason = match &observed {
+        Some(RunStatus::Suspended(_)) | None => None,
+        Some(s) => s.reason().map(std::borrow::Cow::into_owned),
+    };""",
+        """    let reason: Option<String> = None;""",
     ),
     "APushDeliveryAnnouncesOneMediaType": (
         "src/push/mod.rs",
@@ -5151,15 +5149,19 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                    t.state == TaskState::Claimed",
     ),
     "SuspensionScansHistory": (
-        "src/api/mod.rs",
+        "src/runtime/executor.rs",
         "a_resumed_run_is_not_still_reported_as_suspended",
-        "run status comes from any suspension in history, not from the last record",
-        "    let Some(last) = records.last() else {",
-        """    let Some(last) = records
+        "run status comes from any suspension in history, not from the last "
+        "record, so every run that ever waited reads as stuck forever — on the "
+        "operator view and on idempotent admission alike, which is the point of "
+        "there being one reader",
+        "    Some(match records.last()?.kind() {",
+        """    Some(match records
         .iter()
         .find(|r| matches!(r.kind(), RecordKind::RunSuspended { .. }))
-        .or_else(|| records.last())
-    else {""",
+        .or_else(|| records.last())?
+        .kind()
+    {""",
     ),
     "ADeclarativeAgentAnswersToTwoNames": (
         "src/manifest/mod.rs",
@@ -6364,8 +6366,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a_run_waiting_for_a_human_answers_its_own_redelivery",
         "a suspension stops counting as a resting point, so a redelivery of a run "
         "parked on a four-eyes decision opens a second approval",
-        """            RecordKind::RunSuspended { reason } => RunStatus::Suspended(reason.clone()),""",
-        """            RecordKind::RunSuspended { .. } => return Ok(None),""",
+        """        RecordKind::RunSuspended { reason } => RunStatus::Suspended(reason.clone()),""",
+        """        RecordKind::RunSuspended { .. } => return None,""",
     ),
     "EmptyAdmissionKeyAccepted": (
         "src/runtime/executor.rs",
@@ -6852,6 +6854,150 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "against a black box",
         """            for key in ["category", "explanation"] {""",
         """            for key in ["never-populated"] {""",
+    ),
+    # ── What the ledger counts ──────────────────────────────────────────────
+    "AReadyWaveOutrunsTheStepCeiling": (
+        "src/runtime/executor.rs",
+        "a_ready_wave_cannot_outrun_the_step_ceiling",
+        "step admission ignores what it has already handed out in this wave, so "
+        "a whole ready set asks the same unmoved figure and every branch is "
+        "admitted under a ceiling of two",
+        """                Mode::Live | Mode::Resume => ledger
+                    .lock()
+                    .expect("budget mutex")
+                    .admit_step(admitted.len()),""",
+        """                Mode::Live | Mode::Resume => ledger
+                    .lock()
+                    .expect("budget mutex")
+                    .admit_step(0),""",
+    ),
+    "AnAdmittedEffectTakesNoSlot": (
+        "src/core/budget.rs",
+        "the_last_effect_slot_is_taken_by_one_step_not_by_every_step_that_asks",
+        "admission checks the effect ceiling without taking the slot, so the "
+        "window between the verdict and the billing is one every concurrently "
+        "dispatched step passes through on the same last slot",
+        """        self.can_admit_effect()?;
+        self.consumed.effects += 1;
+        Ok(())""",
+        """        self.can_admit_effect()""",
+    ),
+    "ARecordedFailureCostsTwoSlots": (
+        "src/runtime/ctx.rs",
+        "a_recorded_failure_costs_the_one_slot_it_cost_live",
+        "a replayed failure is billed by the arm that reads it and again by the "
+        "code deciding what the run did next, so a resume exhausts a ceiling "
+        "its own history never reached, at a point no record contains",
+        """        // Deliberately bills nothing. The recorded failure was billed by the""",
+        """        self.bill_replayed(crate::core::Spend::default());
+        // Deliberately bills nothing. The recorded failure was billed by the""",
+    ),
+    "ASupersededFigureIsDiscarded": (
+        "src/journal/replay.rs",
+        "a_reconciled_attempt_replays_at_what_it_actually_spent",
+        "a terminal record overwrites the slot rather than adding to it, so a "
+        "reconciled attempt replays at the probe's figure alone and the run "
+        "stops somewhere its own history never did",
+        """            let carried = slot.2.spend();
+            slot.2 = state;
+            slot.2.add_spend(carried);""",
+        """            slot.2 = state;""",
+    ),
+    "AWideReadySetIsDispatchedWhole": (
+        "src/runtime/executor.rs",
+        "the_ready_set_is_dispatched_no_wider_than_declared",
+        "the declared parallelism is not applied to dispatch, so a fan-out is as "
+        "wide as its author wrote it and every metered ceiling is overshot by "
+        "that width",
+        "        .buffered(width)",
+        "        .buffered(width.max(usize::MAX))",
+    ),
+    "AWallClockCeilingIsNeverMeasured": (
+        "src/runtime/executor.rs",
+        "a_wall_clock_ceiling_stops_the_run",
+        "nothing reads a clock into the ledger, so elapsed time stays at zero "
+        "for the life of every run and a declared wall-clock ceiling can never "
+        "fire — a manifest field naming a control the runtime does not apply",
+        """        let at = cx.now().await?;
+        ledger.lock().expect("budget mutex").observe_clock(at);""",
+        """        let _ = cx;""",
+    ),
+    "ARequiredVerifierIsAdvisory": (
+        "src/runtime/executor.rs",
+        "a_required_verifier_binds_the_successor_a_replanner_proposes",
+        "the plane's plan contract drops the verifier requirement, so the one "
+        "contract rule with no other spelling binds a caller validating its own "
+        "graph and not the successor a replanner proposes mid-run",
+        """        if self.require_verifier {
+            contract.require_verifier()
+        } else {
+            contract
+        }""",
+        """        contract""",
+    ),
+    "AQuarantineLevelIsServedFromAPage": (
+        "src/store/redb.rs",
+        "the_quarantine_level_is_not_bounded_by_a_page_size",
+        "the quarantine gauge is read from a bounded listing, so it rises, "
+        "flattens at the page size and reads as a plateau exactly when the "
+        "backlog stops being survivable",
+        """                n += 1;
+            }
+            Ok(n)""",
+        """                n += 1;
+                if n >= 100 {
+                    break;
+                }
+            }
+            Ok(n)""",
+    ),
+    "ASubscriptionPhaseDefaultsToForward": (
+        "src/store/redb_events.rs",
+        "an_unreadable_subscription_phase_is_refused_rather_than_defaulted",
+        "a subscription phase this store cannot read is answered `Forward`, so "
+        "a compensating wait's delivery is journaled on the forward cursor — "
+        "the wait is never satisfied and a strict replay meets a record nothing "
+        "requested",
+        """        other => {
+            return Err(StoreError::Corrupt {
+                seq: 0,
+                detail: format!("unknown subscription phase '{other}'"),
+            });
+        }""",
+        """        other => {
+            let _ = other;
+            crate::core::Phase::Forward
+        }""",
+    ),
+    "TheOperatorViewHasItsOwnStatusRule": (
+        "src/api/mod.rs",
+        "an_unrecognised_outcome_is_quarantined_rather_than_echoed",
+        "the run view reads a conclusion with its own match instead of the "
+        "runtime's, so an outcome no code anywhere acts on is echoed to an "
+        "operator as though it were a state",
+        "    let observed = observed_status(&records);",
+        """    let observed = records.last().and_then(|r| match r.kind() {
+        crate::journal::RecordKind::RunConcluded { outcome, .. } => {
+            Some(RunStatus::Quarantined(outcome.clone()))
+        }
+        _ => None,
+    });
+    let observed = observed.map(|s| match s {
+        RunStatus::Quarantined(o) if o != "quarantined" => RunStatus::Failed(o),
+        other => other,
+    });""",
+    ),
+    "AnAtomicMemberIsFreeOnReplay": (
+        "src/runtime/group.rs",
+        "a_replayed_atomic_member_is_not_applied_again",
+        "a replayed atomic member is walked past without billing the slot the "
+        "gate took live, so a group is free on the second pass and charged on "
+        "the first",
+        """                    Some(crate::journal::EffectReplay::Done { spend, .. }) => {
+                        self.bill_replayed(spend);
+                        continue;
+                    }""",
+        """                    Some(crate::journal::EffectReplay::Done { .. }) => continue,""",
     ),
 }
 
