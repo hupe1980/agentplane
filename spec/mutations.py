@@ -245,6 +245,40 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
         """    /\\ ~SafeToRepeat(Current)
     /\\ status' = "quarantined\"""",
     ),
+    # A person answering a quarantine declares the run finished rather than
+    # supplying a fact about one call. It is the tempting shape — the operator
+    # knows the payment went through, so surely the run is done — and it closes
+    # a run over every step it never reached.
+    "AnAnswerDeclaresTheRunFinished": (
+        "RetrySafety",
+        "SuccessMeansComplete",
+        "a person answering a quarantine ends the run instead of supplying a fact",
+        """       \\/ /\\ ~DidLand(Current)
+          /\\ journal' = Append(journal, Entry(Current, attempt, "reconciled", "clean"))
+    /\\ status' = "running\"""",
+        """       \\/ /\\ ~DidLand(Current)
+          /\\ journal' = Append(journal, Entry(Current, attempt, "reconciled", "clean"))
+    /\\ status' = "succeeded\"""",
+    ),
+    # An answer that is not about the world. This is the residue the design
+    # states rather than removes: the runtime records who asserted what and
+    # cannot check it, so the exactly-once argument rests on the assertion being
+    # true. Breaking it here is what makes that dependency visible instead of
+    # assumed — an operator who says "it never landed" about a payment that did
+    # authorises a real repeat.
+    "AnAnswerNeedNotBeAboutTheWorld": (
+        "RetrySafety",
+        "ExactlyOnce",
+        "a person's answer is a preference rather than a fact about the world",
+        """    /\\ \\/ /\\ DidLand(Current)
+          /\\ journal' = Append(journal, Entry(Current, attempt, "reconciled", "landed"))
+       \\/ /\\ ~DidLand(Current)
+          /\\ journal' = Append(journal, Entry(Current, attempt, "reconciled", "clean"))
+    /\\ status' = "running\"""",
+        """    /\\ \\/ journal' = Append(journal, Entry(Current, attempt, "reconciled", "landed"))
+       \\/ journal' = Append(journal, Entry(Current, attempt, "reconciled", "clean"))
+    /\\ status' = "running\"""",
+    ),
     # Unwinding a run that holds an effect of unknown outcome. Tidying up looks
     # responsible and refunds money nobody took.
     "UnwindUnderDoubt": (

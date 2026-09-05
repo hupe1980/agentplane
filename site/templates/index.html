@@ -85,14 +85,14 @@
     broken on purpose, and the test written for it must fail.
   </p>
   {#- Every figure here is checked against the tree by
-      `tests/guards/docs.rs::the_landing_pages_proof_figures_are_the_real_ones`.
-      They were 6 / 18 / 106 against a tree holding 7 / 26 / 644 — the one
-      section of this site claiming the project is falsifiable was itself the
-      part nothing falsified. -#}
+      `tests/guards/docs.rs::the_landing_pages_proof_figures_are_the_real_ones`,
+      because the one section of this site claiming the project is falsifiable
+      must not be the part nothing falsifies. Do not update a number by hand
+      without running that guard: it counts the artifacts. -#}
   <dl class="stats">
     <div><dt>7</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
-    <div><dt>26</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
-    <div><dt>644</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>28</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
+    <div><dt>661</dt><dd>code mutations, each naming the one test that must fail</dd></div>
     <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
   </dl>
   <p class="fine">
@@ -126,6 +126,102 @@ assert_eq!(out.output, replayed.output);</code></pre>
     <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Read the guide</a>
     <a class="btn" href="{{ get_url(path='@/docs/cookbook.md') }}">Cookbook</a>
   </p>
+</section>
+
+<section class="demo">
+  <h2>What it looks like when it works</h2>
+  <p class="lede">
+    One command, no account, no key. It runs a pipeline, replays it, crashes it
+    mid-run, resumes it, and then replays it against a <em>changed</em> build.
+  </p>
+
+  <pre class="code"><code>cargo run --example durable_pipeline</code></pre>
+
+  <pre class="code"><code>1. live run      → Succeeded
+   external calls: 3
+
+2. strict replay → Succeeded
+   external calls: 3 <span class="c">(unchanged: true)</span>
+
+3. run crashed   → Failed("simulated crash after stage 0")
+   external calls: 1
+   resumed        → Succeeded
+   external calls: 3 <span class="c">— stage 0 was replayed, not repeated</span>
+
+4. changed build → Quarantined("non-determinism at seq 8: expected ek:cf87…")
+
+5. all journals verify — no record was altered after the fact</code></pre>
+
+  <p class="fine">
+    Line 2 is the one to read twice: replaying performed <em>nothing</em>. Line 3
+    is the one that pays for itself. Line 4 is a different build refusing to
+    rewrite history rather than quietly accepting it.
+  </p>
+</section>
+
+<section class="faq">
+  <h2>Questions people ask before adopting it</h2>
+
+  <details>
+    <summary>Does this replace Temporal, Restate or DBOS?</summary>
+    <p>No — it answers a different question, and the two compose. Durable
+      execution engines make a <em>workflow</em> survivable; the recovery unit
+      there is the activity the SDK happens to expose. Here the unit is the
+      <strong>effect</strong>, and the same gate that decides whether a call may
+      be repeated also decides whether it is authorized, what label its result
+      carries, and what evidence it leaves. Governance below framework code is
+      the part a durable backend cannot add later, because it has no declaration
+      to check an argument against.</p>
+  </details>
+
+  <details>
+    <summary>Do I need a database?</summary>
+    <p>No. The default backend is <a href="https://github.com/cberner/redb">redb</a>,
+      embedded and single-node — one file, no server. PostgreSQL implements the
+      same store contract and is what several plane instances share when fencing
+      and exactly-once have to be arbitrated by the database rather than by
+      hoping the writers agree. Both pass the same conformance battery.</p>
+  </details>
+
+  <details>
+    <summary>Is it production ready?</summary>
+    <p>No, and the honest reason is a format rather than a feature: the durable
+      record format is not frozen, so a shape change is a hard cut with no
+      migration. The crate is published and pre-alpha.
+      <a href="{{ get_url(path='@/docs/status.md') }}">Status</a> lists what is
+      built, what is deliberately absent, and the checkable conditions the
+      freeze is waiting on. The workable position today is to treat the export
+      as the long-term artifact and the store as disposable.</p>
+  </details>
+
+  <details>
+    <summary>What does “replay” actually do?</summary>
+    <p>It re-executes your logic and satisfies every effect from the journal.
+      No tool is called again, no clock is read again, no model is asked again.
+      A run that took forty minutes and €40 of inference replays offline, for
+      free, and reaches the same result — or reports precisely where this build
+      disagrees with the recorded one.</p>
+  </details>
+
+  <details>
+    <summary>Does it route or proxy model traffic?</summary>
+    <p>No. It ships drivers for a few providers because a runtime with none
+      cannot be tried, but the seam is the point: a `ModelProvider` you write is
+      a first-class citizen, and metering, retry classification and replay work
+      the same behind any of them. Routing and load-balancing belong to
+      something else.</p>
+  </details>
+
+  <details>
+    <summary>Does using it make a deployment EU AI Act compliant?</summary>
+    <p>No. Compliance is a property of a deployment and its documentation, not
+      of a dependency. What this provides is <em>technical means</em> — an
+      append-only record of what an agent did, human oversight that binds, and
+      erasure that survives the proof — mapped article by article, with the
+      obligations it does not touch named as plainly as the ones it does.
+      <a href="{{ get_url(path='@/docs/regulation.md') }}">The mapping</a> says
+      which is which.</p>
+  </details>
 </section>
 
 <section class="honest">

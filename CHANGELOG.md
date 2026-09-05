@@ -39,6 +39,295 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.29.0] — 2026-09-05
+
+### Added — the quarantine has verbs, and giving up leaves a record
+
+A quarantine is this runtime's most serious conclusion and, until now, the one
+an operator could not act on. Two places in the code said a human must resolve
+it; there was no verb with which they did. A resume re-reached the same doubt, a
+stop request was recorded, acknowledged and then ignored, and
+`agentplane.runs.quarantined` had to state in its own description that it only
+ever rises.
+
+The cause was one layer down, and both halves were right on their own: **a
+quarantined run sealed**. The store freezes a sealed chain and refuses further
+appends — so the one record that could answer the doubt was the one record the
+format would not accept. The remedy the design named was one the durable format
+forbade.
+
+**A quarantine no longer seals.** It is the runtime saying it does not know,
+which is a story that is not over, and a Merkle leaf claims a history is
+complete. It joins `failed` and `exhausted` as a conclusion that leaves the run
+open, and enters the log when it reaches a real ending.
+
+Three verbs, and they are deliberately three, because supplying a fact is not
+deciding a run and deciding a run is not declaring its outcome:
+
+```
+GET  /runs/{run}                → "undecided": [{ effect, step, phase, kind, doubt }]
+POST /runs/{run}/reconcile      → what actually happened to one effect
+POST /runs/{run}/reopen         → the doubt is answered; judge the run again
+POST /runs/{run}/abandon        → nobody will establish it; close it where it stands
+```
+
+`Runtime::undecided`, `reconcile_effect` and `decide_quarantine` are the library
+forms. Four rules are load-bearing:
+
+- **An assertion supplies a missing fact and never replaces a recorded one.**
+  Only an effect the run lists as undecided may be answered. Without that an
+  operator could talk a run out of compensating work standing in the world, and
+  the journal would show an orderly reconciliation while it happened.
+- **The value an operator supplies is untrusted, and not by their choice.**
+  Every other output here is labelled by the effect that produced it; there is
+  no effect in an offline verb, and the person typing the value is not the
+  provider that returned it. A run that needed that output trusted is refused at
+  its next gate and unwinds — the honest ending. The alternative makes the
+  3 a.m. resolution verb the one place in this design where a person
+  declassifies by typing.
+- **A person decides whether the run may be judged again, never what the outcome
+  is.** A reopened run re-derives its verdict from the history the person added
+  to, and quarantines again if the answer was wrong or incomplete. One decision
+  authorizes one pass: read as standing, it would be an unbounded feedback path
+  with a person in it.
+- **Abandoning unwinds nothing.** Impatience is not evidence, and compensating
+  around an unknown outcome is what quarantine exists to forbid. The run seals
+  as the new `RunStatus::Abandoned { actor, reason }`, which is not `Cancelled`
+  — a cancellation puts the world back and this leaves it exactly as the run
+  left it.
+
+Both decisions are journaled before they are acted on (`QuarantineDecided`), so
+a crash in between leaves the instruction standing and the next resume finishes
+it. An operator's reconciliation is the same `EffectReconciled` a probe writes,
+plus `asserted_by`: "the provider told us" and "somebody asserted it" are
+different evidence, and the chain keeps them apart.
+
+**The doubt outlives the run.** Abandoning takes it off the quarantine backlog,
+which was the only listing carrying it — so `agentplane audit` gained
+`Finding::EffectUndecided`, derived from the journal under a sealing conclusion
+and beyond the reach of any later status. The rule for *what is in doubt* is now
+one function read by three callers: the executor deciding whether an unwind is
+safe, the operator API answering what to look up, and the offline audit.
+
+Three new policy actions — `api:effect.reconcile`, `api:run.reopen`,
+`api:run.abandon`. Kept apart because the person who can look a charge up in a
+provider console is often not the person who decides what the run does next, and
+neither is necessarily the person who may write off an unexplained mutation.
+
+### Fixed — writing off an unexplained mutation announced nothing
+
+`abandon` is the gravest thing an operator can do here: it closes a run whose
+outcome nobody could establish, unwinds nothing, and leaves whatever the run put
+in the world standing. It emitted no event. The person who decided already
+knows, which is exactly why an alert matters — whoever answers for the mutation
+is somewhere else, and an intervention visible only to the person who made it is
+not oversight. `agentplane.run.abandoned`, in `LOUD_EVENTS` and in the
+operations page's table of *every* event, which the docs guard caught as soon as
+the target existed.
+
+### Added — the two backlogs an alert pointed at and nothing could open
+
+The same question that found the quarantine, asked of every listing this
+runtime maintains: *who reads it, and what do they call?* Two more came back
+with no answer.
+
+**Dead-lettered events.** A message that arrives, matches no waiter and ages out
+is retired to a list — the failure that otherwise presents as a process silently
+never completing. It was swept, indexed, counted and alerted on
+(`agentplane.event.dead_lettered`), and `EventStore::dead_letters` had no caller
+anywhere outside the tests. An operator holding the alert could learn *how many*
+and never *which*. `GET /dead-letters` now serves it under `api:deadletter.list`,
+carrying each message's identity, kind and correlation keys — the diagnosis is
+always *which key does not match what the run subscribed to* — and deliberately
+**not** the payload, which is the counterparty's content and, on a sealed plane,
+not readable without a key.
+
+**Parked webhook registrations.** A receiver that answers permanently, or stays
+silent past the retry ceiling, has its registration parked rather than deleted,
+because the cursor is the only record of how far it got. `PushStore`'s own docs
+call that *"the difference between a backlog an operator can act on and a
+warning line in yesterday's logs"* — and neither `parked` nor `unpark` had a
+caller. `GET /push` (`api:push.list`) lists them with the config redacted, and
+`POST /push/rearm` (`api:push.rearm`) resumes delivery at the first record the
+receiver never acknowledged. Re-arming something that was not parked answers
+`rearmed: false` rather than reporting success to somebody who would then wait
+for a sweep with nothing to do.
+
+The push store moves onto the plane for this — `RuntimeBuilder::push(store)`,
+the same handle the A2A server and the `Outbox` are given, tenant-checked at
+build like every other store. The durable half of push belongs to the plane
+because its failures do: the worker that parked a registration has nothing more
+to say about it.
+
+### Changed — `Runtime::request_cancel` refuses a quarantined run
+
+Cancelling promises to unwind and put the world back, which is the one thing a
+run holding an unknown outcome may not do. The request landed durably, answered
+`recorded: true`, and the resume walked straight past it: an operator who
+believes they stopped a run holding an unresolved payment is worse off than one
+who was told no. The refusal names the two verbs that do apply.
+
+### Changed — `export` and `audit` sweep quarantined runs by default
+
+`SEALED_OUTCOMES` is now `succeeded`, `cancelled`, `abandoned`, `swept`,
+`broke-glass`, and the offline verbs default to the new `OUTCOMES_OF_RECORD` —
+those plus `quarantined`. Sealing was never the right selector for *what an
+auditor came for*: a run set aside for a person is the plane's outstanding
+unresolved risk, and an artifact holding everything that finished and nothing
+that did not looks complete. Failed and exhausted runs stay out — a resume moves
+those on its own, so exporting one is a snapshot of a moving target.
+
+### Fixed — six sealing arms could gain a payload field and seal nothing
+
+`journal::payload::payloads` carries a comment insisting every field is named
+and no arm uses `..`, because an exhaustive match over *variants* asks the
+question when a record kind is added and stays silent when a **field** is added
+to one that exists. That was true of the control-plane arm and of
+`RunConcluded`, which is where the rule was learned — and false of the six arms
+that actually seal something: `RunAdmitted`, `PlanFrozen`, `EffectStarted`,
+`EffectDone`, `EffectFailed`, `EffectReconciled` and `GroupSettled` each ended
+in `..`. Those are the arms where the silence costs most, because a new payload
+field on one of them is by construction the caller's data. All named now.
+
+### Fixed — every emoji in a heading was naming that heading's URL
+
+Zola slugifies an emoji to its Unicode name, so `## 🎲 Disposition` published as
+`#5-game-die-disposition` and `## 📤 Emit an event per run` as
+`#outbox-tray-emit-an-event-per-run`. Eighty-three headings across six pages.
+Three consequences, and the third is what made it a defect rather than a
+blemish: the URL a reader copies reads as broken, a search result showing
+jump-to links displays the nonsense, and **the id is not stable** — it moves if
+the emoji changes or is dropped. Three hand-written links in this repository
+already pointed at anchors that had moved out from under them, which is how it
+was found.
+
+Every such heading now carries an explicit `{#id}` derived from its words. The
+emoji stays; only the anchor stops being derived from it. A guard fails the
+build on the next one, because this is a mistake whose symptom is invisible to
+the author.
+
+### Changed — the documentation is grouped, not a list of nineteen
+
+The hub and every sidebar are built from five declared groups — *Start here*,
+*Build*, *How it works*, *Trust*, *Operate* — rather than one flat weight order.
+Nineteen entries in a single column is a wall a reader scans instead of
+navigating, and the hub is the page most likely to be somebody's entry point.
+
+A guard holds each page's `extra.group` to the declared list: a page in a group
+nobody declared renders in no navigation at all, stays published and indexed,
+and its only symptom is nobody arriving.
+
+The landing page gained the two things it was missing: **what running it
+actually prints** — the crash-and-resume demo, where line 2 performs nothing and
+line 4 refuses to rewrite history — and an FAQ answering the six questions that
+decide adoption, including the two whose honest answer is *no*. Deliberately no
+`FAQPage` structured data: Google restricted that rich result to government and
+health sites in 2023, so the markup would be a second copy of every answer
+serving a feature that is not shown.
+
+`upgrading.md` says how to read itself, which eighty-six entries in one list
+badly needed: newest first, in the changelog's release order, so a reader starts
+at the top and stops at the first change they already have. Version headings
+were considered and rejected — the mapping could only be reconstructed for 44 %
+of entries, and a wrong version label is worse than none.
+
+Also: live crates.io and docs.rs badges and a documentation link on the README's
+first screen, `homepage` and `documentation` on the crate manifest, `theme-color`
+for both colour schemes, `twitter:image:alt`, and four meta descriptions trimmed
+under the length a search result shows.
+
+### Fixed — every record carried a schema version and no reader ever looked at it
+
+`RecordBody.v` is stamped on every append, hashed into the chain, and was read
+by nothing. The `Upcaster` seam it exists for had no caller anywhere in the
+crate — a trait, an `Identity` implementation and a careful refusal message,
+none of it on a path. The concepts document's claim that *"the seam is wired now
+anyway, because the first migration must not also be the first exercise"*
+described an intention.
+
+What that cost is not hypothetical, and it is the half nobody checks: **forward**
+reading. A journal written by a build one shape ahead deserialises perfectly
+into an older build's struct, with the fields it has never heard of dropped on
+the floor, and every authorization, retry and recovery decision downstream is
+then made over a record nobody fully read. Probed and confirmed before fixing:
+a record claiming `v: 2` with an unknown field parsed cleanly and was acted on.
+
+Both directions are refused now, and the **policy is the strict one on purpose**
+— which inverts the guess this project's own freeze-condition list had written
+down. Most wire formats tolerate unknown fields, and they carry *messages*. A
+record is **evidence**: dropping a field is reaching a verdict over something
+the reader did not see, and reporting it as an ordinary result.
+
+- A **bumped version** is refused unless an upcaster can reach this build's
+  shape. The version is compared on every read, not only when a parse fails,
+  because the dangerous case is the one that parses.
+- A **field nobody bumped for** is refused too — `deny_unknown_fields` on the
+  record vocabulary.
+
+Both are classified as build skew rather than damage. `StoreError::Corrupt`
+lifts to `RuntimeError::ChainBroken`, so a rolling deploy that put a writer
+ahead of its readers would have reached an operator as *the history has been
+altered* — the same defect the sealed envelope's format byte fixed for the
+confidentiality layer, arriving in the journal. `StoreError::UnknownRecordVersion`
+says what to do instead: deploy readers before writers.
+
+The seam is wired rather than described: `current_version` is consulted for
+every record read and `upcast` decides whether a differing one is readable at
+all. A test lifts a record written at a shape that does not parse into this
+build's struct, and asserts `raw` and `hash` are untouched — an upcast is a
+read-time view, and rehashing the lifted form would destroy tamper evidence for
+every record older than its reader.
+
+### Added — the durable formats are pinned to bytes, not to their own reader
+
+`tests/golden/records.jsonl` holds one canonical record per kind and its chain
+digest. `tests/golden/export.jsonl` holds a sealed export every build must still
+verify offline. Both discharge freeze conditions that had been open since the
+list was written, and both exist because a round trip proves only that a build
+agrees with itself: reordering two fields, adding a `skip_serializing_if` or
+renaming a serde attribute rehashes every record this project will ever write,
+passes every test, and reads in review as a tidy-up.
+
+Regenerating them is `AGENTPLANE_BLESS_GOLDEN=1`, deliberately a command
+somebody types. Until the freeze a shape change is a hard cut — every journal
+written by an older build stops being readable — so blessing the corpus is the
+moment that is decided.
+
+Stated rather than implied: these are this build checking itself, so they catch
+drift and cannot catch a shared misunderstanding. The vector that would is one a
+*second* implementation produced, which needs a written specification first.
+Both are still open, and the roadmap now names them as the whole of what
+condition 1 has left.
+
+### Assurance — a hand-written list of an enum's variants that nothing held to the enum
+
+`runtime::every_status` enumerates every `RunStatus` so three tests can decide,
+per variant, whether it seals, whether a resume may continue from it, and which
+A2A state it surfaces as. Its comment claimed "the count assertion in each
+consumer fails the day a variant is added". It does not: those assertions fire
+when somebody edits the *list*, which is the case that never needed a guard. A
+variant added to the enum and forgotten here is a variant all three tests
+silently stop asking about — proved by adding one and watching them pass.
+
+`every_run_status_variant_is_listed` now reads the enum's variants and the
+function's arms out of the source and holds them to each other, which is the
+only check available for a list a language cannot derive.
+
+`spec/RetrySafety.tla` gained the other half of the protocol. It modelled
+quarantine as terminal, which is not what the runtime does, so an `Answer` action
+writes a truthful reconciliation and returns the run to the executor — and the
+invariants that were already there did the work: `ExactlyOnce` holds across a
+person's answer, and `NoSuccessOnUnresolvedDoubt` accepts a run that succeeds
+past a doubt *somebody resolved* without accepting one that succeeds past a
+doubt nobody did. Two spec mutations pin it, and the second is the honest one:
+an answer that is a preference rather than a fact about the world breaks
+`ExactlyOnce`, which is where the residue lives — the runtime records who
+asserted what and cannot check it.
+
+Seventeen new code mutations (661 total) and two spec mutations (28), each
+`--verify`'d, plus a regression pass over the ten anchors this round's rewrites
+moved.
+
 ## [0.28.0] — 2026-09-05
 
 ### Changed — the architecture page is six pages

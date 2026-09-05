@@ -1,7 +1,10 @@
 +++
 title = "Your first agent"
-description = "A tutorial: build one support-triage agent from an empty file to a durable, tool-using, pinnable declaration — every step a command, every mistake a refusal that says what to do."
+description = "Build one support-triage agent from an empty file to a durable, tool-using, pinnable declaration — every step a command, every mistake a refusal."
 weight = 2
+
+[extra]
+group = "Start here"
 +++
 
 A tutorial, in the strict sense: you build **one** agent, from an empty file to
@@ -306,10 +309,10 @@ page walks it, including the one manifest line serving requires.
 **Grow it into a room.** Several manifests in one file, separated by `---`,
 give you a multi-agent room with no Rust anywhere —
 `examples/room.yaml` in the repository is a working one, and the
-[cookbook](@/docs/cookbook.md#handshake-consult-another-agent-from-a-file) explains the
+[cookbook](@/docs/cookbook.md#consult-another-agent-from-a-file) explains the
 `tool://agent/...` grant that lets one agent consult another.
 
 **Drop to Rust when a decision is code.** A skill with an `if` in it beats a
 prompt asking a model to pretend to be one. The
-[getting-started](@/docs/getting-started.md#3-write-a-skill-tools) page begins there,
+[getting-started](@/docs/getting-started.md#write-a-skill) page begins there,
 and `examples/` holds twenty-odd runnable answers to specific questions.

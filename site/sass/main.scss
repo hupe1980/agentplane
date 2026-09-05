@@ -74,6 +74,17 @@ section > h2 { font-size: clamp(1.5rem, 3.4vw, 2.05rem); margin: 0 0 1.1rem; }
 .grid h3 { margin: 0 0 .45rem; font-size: 1.06rem; }
 .grid p { margin: 0; color: var(--muted); font-size: .94rem; }
 
+/* The FAQ. `<details>` rather than a script: the answers are in the HTML for a
+   reader with no JavaScript and for a crawler, and the page still ships none.
+   No `FAQPage` structured data on purpose — Google restricted that rich result
+   to government and health sites in 2023, so the markup would be a second copy
+   of every answer serving a feature that is no longer shown. */
+.faq details { border: 1px solid var(--line); border-radius: 12px; background: var(--card);
+               padding: .9rem 1.15rem; margin: .6rem 0; max-width: var(--measure); }
+.faq summary { cursor: pointer; font-weight: 600; }
+.faq details[open] summary { margin-bottom: .6rem; }
+.faq p { margin: 0; color: var(--muted); font-size: .95rem; }
+
 .stats { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); margin: 1.6rem 0; }
 .stats > div { border: 1px solid var(--line); border-radius: 12px; padding: 1rem 1.1rem; background: var(--card); }
 .stats dt { font-size: 2.1rem; font-weight: 700; color: var(--accent); line-height: 1; }
@@ -82,8 +93,16 @@ section > h2 { font-size: clamp(1.5rem, 3.4vw, 2.05rem); margin: 0 0 1.1rem; }
 .cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); }
 .card { border: 1px solid var(--line); border-radius: 12px; padding: 1.15rem 1.25rem;
         background: var(--card); text-decoration: none; color: inherit; }
-.card h2 { margin: 0 0 .4rem; font-size: 1.08rem; color: var(--accent); }
+.card h2, .card h3 { margin: 0 0 .4rem; font-size: 1.08rem; color: var(--accent); }
 .card p { margin: 0; color: var(--muted); font-size: .93rem; }
+
+/* The documentation hub's groups. The heading is the reader's route in — it
+   answers "which of these five am I", which a flat list of nineteen cards
+   cannot — so it is set apart from the doc-body h2 rather than inheriting it. */
+.doc .group { margin: 2.2rem 0 0; }
+.doc .group > h2 { margin: 0 0 .9rem; padding: 0 0 .45rem; font-size: 1.05rem;
+                   text-transform: uppercase; letter-spacing: .09em;
+                   color: var(--muted); border-bottom: 1px solid var(--line); }
 
 .docs-layout { display: grid; grid-template-columns: 16rem minmax(0, 1fr); gap: 2.6rem; padding: 2rem 0 4rem; }
 .sidebar { position: sticky; top: 4.6rem; align-self: start; max-height: calc(100vh - 6rem); overflow-y: auto; font-size: .93rem; }

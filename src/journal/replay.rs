@@ -31,7 +31,8 @@
 use std::collections::BTreeMap;
 
 use crate::core::{
-    Disposition, EffectDescriptor, EffectKey, Phase, Recovery, Seq, StepError, StepId,
+    Disposition, Doubt, EffectDescriptor, EffectKey, Phase, Recovery, Seq, StepError, StepId,
+    Undecided,
 };
 
 use super::{Record, RecordKind};
@@ -471,6 +472,140 @@ impl ReplayCursor {
         self.by_step
             .get(&(step, phase))
             .and_then(StepCursor::first_unconsumed)
+    }
+}
+
+/// Every mutating effect this history cannot decide the outcome of.
+///
+/// The one implementation of *what is in doubt*, and it has three readers that
+/// would otherwise each have written their own: the executor deciding whether
+/// an unwind is safe, the operator API answering *what do I have to go and look
+/// up*, and an offline audit of a sealed history nothing may resume. A second
+/// copy of this rule would be a copy that is only as strong as its laxest arm.
+///
+/// Two shapes of doubt, and both count. An **orphan** — a mutating
+/// `EffectStarted` with no terminal record — is the crash shape: the request
+/// left and the process died before the answer could be written. A terminal
+/// **`InDoubt`** is the call concluding with a record that says the runtime
+/// does not know whether it reached the world. Tracking only the first is the
+/// easy mistake and the expensive one: a run whose last attempt failed in doubt
+/// would be cancellable, and the unwind would compensate every step around a
+/// call that may have landed.
+///
+/// A doubt is resolved by **evidence, not by time**: a later
+/// `EffectReconciled` that lands or clears it — whether a probe asked the
+/// provider or a person answered out of band — or, for an effect whose
+/// declaration made repeating safe, a later attempt of the same dispatch (same
+/// step, same descriptor) that completed, which under that declaration is the
+/// same single performance finally landing.
+///
+/// Non-mutating effects are absent by construction. A read that never came back
+/// is safe to repeat, so there is nothing for anyone to adjudicate; the question
+/// here is exclusively *did this change the outside world*.
+///
+/// Ordered by step, then by the order the doubts arose, so two readers of one
+/// history list them the same way.
+#[must_use]
+pub fn undecided_effects(records: &[Record]) -> Vec<Undecided> {
+    // `open` holds announcements not yet terminated; `doubts` holds attempts
+    // that terminated saying nothing was established. The descriptor rides
+    // along because a later landing of the *same dispatch* is what clears a
+    // doubt for a repeatable effect, and identity of dispatch is
+    // `(step, descriptor)` rather than the key, which folds in the attempt.
+    let mut open: BTreeMap<EffectKey, Pending> = BTreeMap::new();
+    let mut doubts: BTreeMap<EffectKey, Pending> = BTreeMap::new();
+    for r in records {
+        let Some(key) = r.effect_key() else { continue };
+        match r.kind() {
+            RecordKind::EffectStarted {
+                mutates: true,
+                descriptor,
+                ..
+            } => {
+                if let Some(step) = r.body.step {
+                    open.insert(
+                        key,
+                        Pending {
+                            step,
+                            phase: r.body.phase,
+                            descriptor: descriptor.clone(),
+                            seq: r.body.seq,
+                        },
+                    );
+                }
+            }
+            RecordKind::EffectDone { .. } => {
+                if let Some(settled) = open.remove(&key) {
+                    doubts.retain(|_, p| {
+                        !(p.step == settled.step && p.descriptor == settled.descriptor)
+                    });
+                }
+            }
+            RecordKind::EffectFailed { disposition, .. } => {
+                if let Some(pending) = open.remove(&key)
+                    && *disposition == Disposition::InDoubt
+                {
+                    doubts.insert(key, pending);
+                }
+            }
+            RecordKind::EffectReconciled { disposition, .. } => {
+                let settled = open.remove(&key);
+                match disposition {
+                    // Answered: it landed, or it never happened. Either way the
+                    // doubt is gone.
+                    Disposition::Landed | Disposition::DidNotHappen => {
+                        doubts.remove(&key);
+                    }
+                    // Asked, and still unknown.
+                    Disposition::InDoubt => {
+                        if let Some(pending) = settled {
+                            doubts.insert(key, pending);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out: Vec<(StepId, Seq, Undecided)> = open
+        .into_iter()
+        .map(|(effect, p)| p.into_undecided(effect, Doubt::Announced))
+        .chain(
+            doubts
+                .into_iter()
+                .map(|(effect, p)| p.into_undecided(effect, Doubt::Inconclusive)),
+        )
+        .collect();
+    out.sort_by_key(|(step, seq, _)| (*step, *seq));
+    out.into_iter().map(|(_, _, u)| u).collect()
+}
+
+/// An announcement awaiting a verdict, while the fold is still running.
+struct Pending {
+    step: StepId,
+    phase: Phase,
+    descriptor: EffectDescriptor,
+    seq: Seq,
+}
+
+impl Pending {
+    /// Paired with the position that orders it, which is deliberately not a
+    /// field of [`Undecided`]: a caller acting on a doubt names the effect by
+    /// key, and a sequence number beside it would be a second identity for one
+    /// thing.
+    fn into_undecided(self, effect: EffectKey, doubt: Doubt) -> (StepId, Seq, Undecided) {
+        (
+            self.step,
+            self.seq,
+            Undecided {
+                effect,
+                step: self.step,
+                phase: self.phase,
+                kind: self.descriptor.kind,
+                doubt,
+            },
+        )
     }
 }
 

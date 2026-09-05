@@ -269,6 +269,15 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
         RunStatus::Succeeded => ItemOutcome::Succeeded,
         RunStatus::Suspended(r) => ItemOutcome::Suspended(r.to_string()),
         RunStatus::Quarantined(why) => ItemOutcome::Quarantined(why),
+        // Also `Quarantined`, because this enum is deliberately coarse about
+        // *what a human must do next* and the answer here is the same one:
+        // hands off. An abandoned run may hold a mutation nobody could account
+        // for, so filing it under `Failed` — the outcome this batch's readers
+        // re-run — is the one mapping that could take money twice. The reason
+        // names who gave up and why, which is what tells the two apart.
+        RunStatus::Abandoned { actor, reason } => {
+            ItemOutcome::Quarantined(format!("abandoned by '{actor}': {reason}"))
+        }
         // `Replanning` is never observed by a caller — the executor resolves
         // it internally — but if one ever escaped it is an item that did not
         // settle, which is what `Failed` means here.

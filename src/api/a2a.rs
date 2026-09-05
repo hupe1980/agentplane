@@ -283,6 +283,12 @@ fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
         RunStatus::Failed(_)
         | RunStatus::Exhausted(_)
         | RunStatus::Quarantined(_)
+        // Not `Canceled`: A2A's cancellation means a client asked and the work
+        // stopped, which a peer reads as "nothing of mine is standing". An
+        // abandoned run is the opposite claim — something may well be standing
+        // and nobody could establish what — so it takes the state a peer
+        // investigates rather than the one they dismiss.
+        | RunStatus::Abandoned { .. }
         | RunStatus::Replanning(_) => TaskState::Failed,
     }
 }
@@ -3260,7 +3266,7 @@ mod state_agreement_tests {
         let statuses = crate::runtime::every_status();
         assert_eq!(
             statuses.len(),
-            7,
+            8,
             "a RunStatus variant was added or removed — decide which A2A state it \
              surfaces as, in `state_of` and in `sealed_state` both"
         );

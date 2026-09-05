@@ -54,7 +54,7 @@ pub struct AgentIdentity {
 /// Serialized as an internally-tagged enum so the payload stays inspectable in
 /// the database and in an audit export without this crate present.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "PascalCase")]
+#[serde(tag = "kind", rename_all = "PascalCase", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum RecordKind {
     /// A run was admitted: identity bound, budget reserved, input labeled.
@@ -429,6 +429,30 @@ pub enum RecordKind {
         detail: Option<String>,
     },
 
+    /// A person answered a quarantine.
+    ///
+    /// The runtime's most serious conclusion is the one it cannot reach by
+    /// itself, and this is the only record that answers it. It sits **in** the
+    /// chain rather than beside it, unlike a cancellation request: a stop is
+    /// asked for by somebody who is not the run's owner and may be racing a
+    /// live executor, whereas a quarantine is answered over a run that has
+    /// already stopped, so the answer is history and belongs where history is
+    /// kept.
+    ///
+    /// Written before the decision is acted on, so a crash in between leaves
+    /// the instruction standing rather than lost: the next resume finds it and
+    /// finishes the job.
+    QuarantineDecided {
+        /// Who decided. Required, and never derived from a session or a
+        /// default — the whole weight of this record is that a named person
+        /// took responsibility for a fact the runtime could not establish.
+        decider: String,
+        /// Why, in the words the next reader needs. What was checked, in which
+        /// system, and what it said.
+        reason: String,
+        decision: crate::core::QuarantineDecision,
+    },
+
     /// A completed step was undone because a later one failed.
     ///
     /// The declaration is on the record as well as the outcome, because "this
@@ -468,6 +492,21 @@ pub enum RecordKind {
         /// where a catalogue edit can rewrite the label.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         declared: Option<crate::core::DeclaredOutput>,
+        /// Who established this, when it was not the effect's own probe.
+        ///
+        /// Absent for a [`reconcile`](crate::core::Effect::reconcile) call: the
+        /// effect asked the provider that would know, which is the ordinary
+        /// path and is attributed by the run itself. Present when a person
+        /// answered out of band, because "the provider told us" and "somebody
+        /// asserted it" are different evidence and only one of them can be
+        /// confidently wrong about a thing it could not see.
+        ///
+        /// It is the field that makes an operator's answer auditable rather
+        /// than merely effective — without it, a resolution and a probe are
+        /// the same record and the question *who decided this run could carry
+        /// on* has no answer in the chain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asserted_by: Option<String>,
     },
 
     /// Policy approved a typed label improvement. The record binds the decision
@@ -605,6 +644,7 @@ impl RecordKind {
             Self::EffectFailed { .. } => "EffectFailed",
             Self::EffectReconciled { .. } => "EffectReconciled",
             Self::StepCompensated { .. } => "StepCompensated",
+            Self::QuarantineDecided { .. } => "QuarantineDecided",
             Self::GroupOpened { .. } => "GroupOpened",
             Self::GroupSettled { .. } => "GroupSettled",
             Self::BudgetRefused { .. } => "BudgetRefused",
@@ -637,6 +677,36 @@ impl RecordKind {
     pub fn version(&self) -> u16 {
         1
     }
+}
+
+/// Lift a record written at another shape into the one this build reads.
+///
+/// Separated from the read path because it is the cold half: it parses the
+/// bytes a second time, into an untyped value, so the upcaster sees the record
+/// as written rather than as this build's struct happened to receive it.
+fn lift(
+    upcaster: &dyn super::Upcaster,
+    raw: &[u8],
+    kind: &str,
+    version: u16,
+) -> Result<RecordBody, StoreError> {
+    let written: Value = serde_json::from_slice(raw)?;
+    let lifted = upcaster.upcast(kind, version, written)?;
+    serde_json::from_value(lifted).map_err(StoreError::Encoding)
+}
+
+/// What the bytes claim to be, without trusting them to be a record.
+///
+/// Both halves or nothing: a version with no kind names no shape, and a kind
+/// with no version is a record from before versions existed, which is not a
+/// shape any upcaster is asked to reach. Returning `None` sends the caller back
+/// to the parse error, which is the honest answer for bytes that are not a
+/// record at all.
+fn version_claimed(raw: &[u8]) -> Option<(String, u16)> {
+    let value: Value = serde_json::from_slice(raw).ok()?;
+    let kind = value.get("kind")?.as_str()?.to_owned();
+    let version = u16::try_from(value.get("v")?.as_u64()?).ok()?;
+    Some((kind, version))
 }
 
 /// The hashed portion of a record.
@@ -764,7 +834,48 @@ impl Record {
     }
 
     /// Reconstruct, carrying whatever signature the store kept.
+    ///
+    /// Reads under the [`Identity`](super::Identity) upcaster — this build's
+    /// shapes and no others. A store that carries a real upcaster calls
+    /// [`from_stored_with`](Self::from_stored_with) instead.
     pub fn from_stored_attested(
+        raw: Vec<u8>,
+        prev_hash: Digest,
+        hash: Digest,
+        attestation: Option<Attestation>,
+    ) -> Result<Self, StoreError> {
+        Self::from_stored_with(&super::Identity, raw, prev_hash, hash, attestation)
+    }
+
+    /// Reconstruct, lifting the record forward if it was written at an older
+    /// shape.
+    ///
+    /// **The version is checked on every read, not only when something looks
+    /// wrong.** A record carries `v`, and a reader that writes it and never
+    /// reads it back has a version field for decoration: a journal written by a
+    /// build one shape ahead parses cleanly here, with the fields this build
+    /// has never heard of dropped on the floor, and every decision downstream
+    /// is then made over a record nobody fully read. So the version is the
+    /// first thing asked about the parsed body, and the answer comes from the
+    /// [`Upcaster`](super::Upcaster) rather than from a constant — which is
+    /// what makes the seam a live path rather than a declaration waiting for
+    /// its first migration to also be its first exercise.
+    ///
+    /// **The hash stays over the bytes that were written.** An upcast produces
+    /// a body this build understands and leaves `raw` and `hash` alone, so
+    /// tamper evidence is unaffected by the reader's age — the rule
+    /// [`Upcaster`](super::Upcaster) states, enforced here by construction
+    /// because the lift happens after the link is verified and never touches
+    /// the bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] if the stored hash does not cover the bytes,
+    /// [`StoreError::UnknownRecordVersion`] if no upcaster can reach this
+    /// build's shape from the one on the record, and
+    /// [`StoreError::Encoding`] if the bytes are not a record at all.
+    pub fn from_stored_with(
+        upcaster: &dyn super::Upcaster,
         raw: Vec<u8>,
         prev_hash: Digest,
         hash: Digest,
@@ -784,7 +895,25 @@ impl Record {
                 ),
             });
         }
-        let body: RecordBody = serde_json::from_slice(&raw)?;
+        let body = match serde_json::from_slice::<RecordBody>(&raw) {
+            // The overwhelming case: one parse, one integer comparison, no
+            // allocation. Everything below is the cold path.
+            Ok(body) if body.v == upcaster.current_version(body.kind.kind_str()) => body,
+            // Parsed, and from another shape. The *raw* value is what the
+            // upcaster is handed — the parsed body has already lost whatever
+            // this build does not know, and lifting from it would lift a
+            // record with the interesting part missing.
+            Ok(body) => lift(upcaster, &raw, body.kind.kind_str(), body.v)?,
+            // Did not parse. Either it is not a record, or it is one whose
+            // shape moved — and those are different answers, so the version is
+            // read from the bytes before the parse failure is believed.
+            Err(parse) => match version_claimed(&raw) {
+                Some((kind, v)) if v != upcaster.current_version(&kind) => {
+                    lift(upcaster, &raw, &kind, v)?
+                }
+                _ => return Err(StoreError::Encoding(parse)),
+            },
+        };
         Ok(Self {
             body,
             prev_hash,

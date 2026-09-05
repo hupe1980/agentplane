@@ -250,6 +250,37 @@ pub enum Finding {
     )]
     GroupUnsettled { run: RunId, group: String },
 
+    /// A sealed conclusion over an effect whose outcome was never established.
+    ///
+    /// The finding that outlives the run. A quarantine is a *status*, and a
+    /// status is something a later action overwrites: abandoning the run takes
+    /// it off the quarantine backlog, which is the only listing that carried
+    /// it. What the run left in the world does not go away with the listing, so
+    /// the record of it is derived from the journal instead — where nothing an
+    /// operator does can take it off.
+    ///
+    /// Under a **sealing** conclusion only, and for the reason
+    /// [`GroupUnsettled`](Self::GroupUnsettled) is: an open run with an
+    /// undecided effect is the ordinary crash shape, healed by a resume or
+    /// answered by a person, and flagging it would teach the reader this
+    /// finding is weather.
+    ///
+    /// Mutating effects only. A read that never came back is safe to repeat and
+    /// changed nothing, so there is nothing here for an auditor to act on.
+    #[error(
+        "run {run} is sealed but effect {effect} (step {step}, {doubt}) never reached a known \
+         outcome — nothing may resume a sealed run, so whether the call changed the outside \
+         world is permanently undecided"
+    )]
+    EffectUndecided {
+        run: RunId,
+        step: crate::core::StepId,
+        effect: crate::core::EffectKey,
+        /// Whether the runtime never heard back, or heard back and was told
+        /// nothing — two different places for an investigator to start.
+        doubt: &'static str,
+    },
+
     /// The one that needs an outside artifact.
     #[error(
         "the log cannot prove it only grew since the checkpoint of size {old_size} — \
@@ -391,6 +422,40 @@ fn has_sealing_conclusion(records: &[Record]) -> bool {
             _ => None,
         })
         .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))
+}
+
+/// What this run left permanently undecided, if it may never resume.
+///
+/// Both findings share a scope and an argument, so they share a function. An
+/// **open** run's unsettled group or in-doubt effect is the ordinary crash
+/// shape — a resume settles the one, a person answers the other, and the run
+/// sits in a backlog somebody drains until then. Flagging those would teach the
+/// reader this finding is weather. Under a **sealing** conclusion nothing may
+/// resume, so whether the work was taken or taken back is unanswerable from a
+/// history that claims to be complete.
+///
+/// The doubt half reads
+/// [`undecided_effects`](crate::journal::undecided_effects) rather than
+/// restating it, so an offline audit and a live runtime cannot disagree about
+/// what is in doubt.
+fn permanently_undecided(run: RunId, records: &[Record]) -> Vec<Finding> {
+    if !has_sealing_conclusion(records) {
+        return Vec::new();
+    }
+    unsettled_groups(records)
+        .into_iter()
+        .map(|group| Finding::GroupUnsettled { run, group })
+        .chain(
+            crate::journal::undecided_effects(records)
+                .into_iter()
+                .map(|u| Finding::EffectUndecided {
+                    run,
+                    step: u.step,
+                    effect: u.effect,
+                    doubt: u.doubt.as_str(),
+                }),
+        )
+        .collect()
 }
 
 /// Groups opened and never settled, in the order opened.
@@ -668,15 +733,10 @@ pub async fn audit(
         // is the crash shape a resume repairs, and flagging it would teach
         // the reader this finding is weather. `Finding::GroupUnsettled`
         // carries the argument.
-        if has_sealing_conclusion(&records) {
-            let mut undecided = false;
-            for group in unsettled_groups(&records) {
-                undecided = true;
-                findings.push(Finding::GroupUnsettled { run, group });
-            }
-            if undecided {
-                continue;
-            }
+        let undecided = permanently_undecided(run, &records);
+        if !undecided.is_empty() {
+            findings.extend(undecided);
+            continue;
         }
 
         // Collected after the chain verified, so a reader is never shown a

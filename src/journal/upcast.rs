@@ -61,16 +61,10 @@ impl Upcaster for Identity {
             //
             // Above: a version this build has never heard of means somebody
             // deployed a writer ahead of its readers.
-            _ => Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!(
-                    "record {kind} is v{version}, and this build writes and reads v1 only. \
-                     Record shapes change by hard cut until the format freeze, so a journal \
-                     at another version is refused rather than read with fields quietly \
-                     defaulted — a false answer to an audit question is worse than a \
-                     refusal to answer. Start a fresh journal; if v{version} is the newer \
-                     one, deploy readers before writers"
-                ),
+            _ => Err(StoreError::UnknownRecordVersion {
+                kind: kind.to_owned(),
+                version,
+                reads: 1,
             }),
         }
     }
@@ -88,14 +82,30 @@ mod tests {
     /// default — so a resumed run reports, say, that no policy governed it. That
     /// is a false answer to an audit question, which is worse than a refusal to
     /// answer, and it is the reason nothing is lifted rather than refused.
+    ///
+    /// And it is refused as a **version** rather than as damage: the same
+    /// distinction the sealed envelope draws, for the same reason. A rolling
+    /// deploy reported as tampering spends the one alarm that has to stay
+    /// believable.
     #[test]
     fn a_journal_from_an_older_cut_is_refused_rather_than_misread() {
         let err = Identity
             .upcast("RunAdmitted", 0, json!({ "agent": "a", "input": null }))
             .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::UnknownRecordVersion {
+                    version: 0,
+                    reads: 1,
+                    ..
+                }
+            ),
+            "a version this build does not read is not damage: {err:?}"
+        );
         let text = err.to_string();
         assert!(
-            text.contains("fresh journal"),
+            text.contains("deploy readers before writers"),
             "the refusal must say what to do about it: {text}"
         );
     }
@@ -105,7 +115,10 @@ mod tests {
     #[test]
     fn future_versions_are_refused_not_guessed() {
         let err = Identity.upcast("EffectDone", 7, json!({})).unwrap_err();
-        assert!(matches!(err, StoreError::Corrupt { .. }));
+        assert!(matches!(
+            err,
+            StoreError::UnknownRecordVersion { version: 7, .. }
+        ));
     }
 
     #[test]

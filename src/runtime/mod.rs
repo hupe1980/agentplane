@@ -33,8 +33,8 @@ pub(crate) use executor::every_status;
 #[cfg(feature = "http")]
 pub(crate) use executor::observed_status;
 pub use executor::{
-    Admission, FullBackend, LEASE_TTL, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, RunFailure,
-    RunOutcome, RunStatus, RunTerms, Runtime, RuntimeBuilder, SEALED_OUTCOMES, Spawned,
+    Admission, FullBackend, LEASE_TTL, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, OUTCOMES_OF_RECORD,
+    RunFailure, RunOutcome, RunStatus, RunTerms, Runtime, RuntimeBuilder, SEALED_OUTCOMES, Spawned,
 };
 pub use group::{EffectGroup, Invariant};
 

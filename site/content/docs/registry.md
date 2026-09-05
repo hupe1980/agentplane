@@ -1,7 +1,10 @@
 +++
 title = "Publishing and pinning agents"
 description = "A content-addressed agent manifest, signed and published, and a registry that refuses to rewrite a version once it exists."
-weight = 11
+weight = 6
+
+[extra]
+group = "Build"
 +++
 
 An agent is a document with a digest. This page is how that document is

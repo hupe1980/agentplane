@@ -1,7 +1,10 @@
 +++
 title = "Upgrading"
-description = "What breaks between pre-alpha releases, why, and the shortest correct fix for each."
+description = "Every breaking change between agentplane pre-alpha releases, why it was made, and the shortest correct fix — newest first."
 weight = 19
+
+[extra]
+group = "Operate"
 +++
 
 Pre-alpha means hard cuts rather than deprecation cycles, and a manifest or a
@@ -12,6 +15,65 @@ engineer costs an afternoon, which is one afternoon more than the change saved.
 Every entry here is a **parse-time, build-time, read-time or replay-time**
 refusal. None of them changes what a running agent does silently, which is the
 property that makes a hard cut acceptable at this stage.
+
+**How to read it.** Entries are newest first, in the same order the
+[changelog](https://github.com/hupe1980/agentplane/blob/main/CHANGELOG.md)
+releases them. Start at the top and stop at the first change you already have —
+everything above that point is what moved since you last looked. The changelog
+is where the version each landed in is recorded; repeating it here would be the
+same fact in two places, and the copy that drifts is always the second one.
+
+---
+
+## A quarantined run no longer seals, and `RunStatus` has an eighth variant
+
+**Affected:** anything that matches `RunStatus` exhaustively, reads
+`RunStatus::seals`, reads `SEALED_OUTCOMES`, or treats
+`GET /runs/{id}.sealed` as "has a conclusion".
+
+A quarantine is the runtime saying it does not know, and sealing one published a
+Merkle leaf claiming the history was complete. The practical half is what forced
+the change: a sealed chain refuses appends, so the format locked out the one
+record that answers the doubt — and the code's own promise that *a human must
+resolve it before it can run again* named a resolution nothing could perform.
+
+Three consequences:
+
+```rust
+// Before
+RunStatus::seals()      // Succeeded | Quarantined | Cancelled
+SEALED_OUTCOMES         // ["succeeded", "quarantined", "cancelled", "swept", "broke-glass"]
+
+// After
+RunStatus::seals()      // Succeeded | Cancelled | Abandoned
+SEALED_OUTCOMES         // ["succeeded", "cancelled", "abandoned", "swept", "broke-glass"]
+OUTCOMES_OF_RECORD      // the above plus "quarantined" — what an offline verb sweeps
+```
+
+**`RunStatus::Abandoned { actor, reason }`** is new: an operator closed a run
+whose outcome could never be established. It is not `Cancelled`, and the
+difference is the one that matters to whoever reads it next — **nothing was
+unwound**. Add an arm; a `_` arm that treats it as a cancellation will tell an
+operator the world was put back when it was not.
+
+**`agentplane export` and `agentplane audit` now sweep `OUTCOMES_OF_RECORD`**
+rather than `SEALED_OUTCOMES` when `--outcome` is not given, so quarantined runs
+stay in the artifact. If you passed `--outcome` explicitly, nothing changes.
+
+**`Runtime::request_cancel` refuses a quarantined run** with a message naming
+the two verbs that do apply. Before, it recorded the request, answered
+`recorded: true`, and the resume ignored it. Call `decide_quarantine`
+(`POST /runs/{id}/reopen` or `/abandon`) instead — see
+[Answering a quarantine](@/docs/operations.md#answering-a-quarantine).
+
+**Three new policy actions** — `api:effect.reconcile`, `api:run.reopen`,
+`api:run.abandon`. Under a default-deny engine an ungranted verb is refused to
+everybody, so enumerate `action::ALL` when writing rules rather than reading the
+route table.
+
+The journal gains `QuarantineDecided` and `EffectReconciled.asserted_by`. Both
+are hard cuts on a pre-freeze format: a journal written by an older build is
+refused rather than lifted, as always.
 
 ---
 
@@ -1898,7 +1960,7 @@ It moved because the cursor discipline has nothing to do with A2A. It lived
 inside the A2A server because A2A was the first caller, which made the one
 mechanism an operator most wants reachable only by speaking somebody else's
 protocol and only for a caller-supplied URL. See
-[emit an event per run](@/docs/cookbook.md#outbox-tray-emit-an-event-per-run-without-an-outbox-table).
+[emit an event per run](@/docs/cookbook.md#emit-an-event-per-run-without-an-outbox-table).
 
 ---
 

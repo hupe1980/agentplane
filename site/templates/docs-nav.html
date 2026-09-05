@@ -1,0 +1,29 @@
+{#- The documentation sidebar: grouped, because nineteen entries in one list is
+    a wall a reader scans rather than navigates. `current` is the permalink of
+    the page being rendered, or unset on the hub.
+
+    Filtered with an `if` inside the loop rather than a `filter` call: this
+    Tera has no such filter, and a template that only builds on one Zola
+    version is a site that stops building on an upgrade. -#}
+{%- set docs = get_section(path="docs/_index.md") %}
+{%- set here = current | default(value="") %}
+{%- for group in config.extra.doc_groups %}
+  <p class="side-title">{{ group }}</p>
+  <nav aria-label="{{ group }}">
+    <ol>
+    {%- for p in docs.pages %}
+      {%- if p.extra.group == group %}
+      <li><a href="{{ p.permalink }}"{% if p.permalink == here %} aria-current="page"{% endif %}>{{ p.title }}</a></li>
+      {%- endif %}
+    {%- endfor %}
+    </ol>
+  </nav>
+{%- endfor %}
+<p class="side-title">Elsewhere</p>
+<nav aria-label="Elsewhere">
+  <ol>
+    <li><a href="{{ config.extra.docsrs }}">API reference</a></li>
+    <li><a href="{{ config.extra.repo }}">Source</a></li>
+    <li><a href="{{ config.extra.repo }}/blob/main/CHANGELOG.md">Changelog</a></li>
+  </ol>
+</nav>

@@ -238,6 +238,46 @@ pub enum RuntimeError {
         remaining_secs: u64,
     },
 
+    /// An operator's answer was offered to a run that is not asking a question.
+    ///
+    /// Reopening and abandoning are answers to a **quarantine** specifically,
+    /// and a run in any other state has either not stopped, stopped for a
+    /// reason a resume already addresses, or ended. Refused by name rather than
+    /// recorded and ignored: an intervention that is acknowledged and then not
+    /// acted on is worse than one that is declined, because the operator stops
+    /// looking.
+    #[error(
+        "run {run} is '{status}', not quarantined — only a run the runtime could not decide can \
+         be reopened or abandoned"
+    )]
+    NotQuarantined { run: String, status: String },
+
+    /// An assertion was offered about an effect whose outcome is already known.
+    ///
+    /// A person may supply the fact the journal lacks; they may not replace one
+    /// it holds. Overwriting a recorded landing with "it did not happen" would
+    /// let an operator talk a run out of compensating work that stands in the
+    /// world — with the record showing an orderly reconciliation.
+    #[error(
+        "effect {effect} in run {run} is not in doubt — its outcome is on the record, and an \
+         assertion may supply a missing fact but never replace a recorded one"
+    )]
+    NotUndecided { run: String, effect: String },
+
+    /// Something that unwinds was asked for on a run that must not unwind.
+    ///
+    /// Cancelling promises to reverse what the run did and put the world back,
+    /// which is exactly what a run holding an unknown outcome may not do. Its
+    /// own variant rather than a generic refusal, because the operator's next
+    /// move is named in it and a caller matching on the class should be able to
+    /// route them there.
+    #[error(
+        "run {run} is quarantined, and cancelling unwinds — which is exactly what a run holding \
+         an unknown outcome must not do. Answer the doubt and reopen it, or abandon it, which \
+         closes it without unwinding"
+    )]
+    CannotUnwind { run: String },
+
     #[error(transparent)]
     Store(#[from] StoreError),
 
@@ -1119,6 +1159,32 @@ pub enum StoreError {
 
     #[error("corrupt record at seq {seq}: {detail}")]
     Corrupt { seq: Seq, detail: String },
+
+    /// A record was written at a schema version this build does not read.
+    ///
+    /// **Not corruption, and the difference is what an operator does next.**
+    /// The bytes are intact and they hash to what the chain says; what is
+    /// missing is a reader that knows the shape. Classified apart from
+    /// [`Corrupt`](Self::Corrupt) for the reason
+    /// [`KeyError::UnknownFormat`](crate::keyring::KeyError::UnknownFormat) is:
+    /// a rolling deploy that put a writer ahead of its readers would otherwise
+    /// reach a human as *the history has been altered*, which is the one alarm
+    /// that must stay believable.
+    ///
+    /// It fails closed all the same. A record whose version this build cannot
+    /// account for is refused rather than read with the fields it does not know
+    /// taking their serde defaults — a false answer to an audit question is
+    /// worse than a refusal to answer.
+    #[error(
+        "record {kind} is v{version} and this build reads v{reads} — the bytes are intact and \
+         hash as written; what is missing is a reader that knows the shape. If v{version} is the \
+         newer one, deploy readers before writers"
+    )]
+    UnknownRecordVersion {
+        kind: String,
+        version: u16,
+        reads: u16,
+    },
 
     #[error(transparent)]
     Encoding(#[from] serde_json::Error),

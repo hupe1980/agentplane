@@ -1,6 +1,6 @@
 +++
 title = "agentplane"
-description = "A durable, replayable, policy-governed agent runtime in Rust. Crash mid-run and resume; replay a run exactly; prove afterwards what happened — and that the record was not edited."
+description = "A durable, replayable, policy-governed agent runtime in Rust. Crash mid-run and resume, replay a run performing nothing, and prove afterwards what happened."
 template = "index.html"
 
 [extra]

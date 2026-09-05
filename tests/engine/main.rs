@@ -19,6 +19,7 @@ mod cancellation;
 mod compensation;
 mod durability;
 mod faults;
+mod quarantine;
 mod reconciliation;
 mod recovery;
 mod resume_gates;

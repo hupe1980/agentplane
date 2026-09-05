@@ -1,7 +1,10 @@
 +++
 title = "The journal"
 description = "An append-only, hash-chained journal with per-record signatures and a per-plane Merkle log — what it proves, and the claims it refuses to make."
-weight = 8
+weight = 10
+
+[extra]
+group = "How it works"
 +++
 
 The journal is the product. Recovery, audit, cost accounting and regression
@@ -36,14 +39,61 @@ the typed `BudgetExceeded` verdict as well as its human reason, so idempotent
 redelivery returns `RunStatus::Exhausted` with the exact ceiling and counters;
 no projection parses prose back into control flow.
 
+### A reader knows what it is reading, or refuses {#unknown-fields}
+
+Every record carries a schema version, and it is compared on **every** read —
+not only when a parse fails, because the dangerous case is the one that parses.
+A journal written one shape ahead deserialises perfectly into an older build's
+struct, with the fields that build has never heard of dropped on the floor, and
+every decision downstream is then made over a record nobody fully read.
+
+Both directions are refused, and the policy is the strict one on purpose:
+
+- **A bumped version** is refused unless an [upcaster](https://docs.rs/agentplane/latest/agentplane/journal/trait.Upcaster.html)
+  can reach this build's shape from the one on the record. The seam is
+  consulted on every read rather than waiting for its first migration to also
+  be its first exercise.
+- **A field nobody bumped for** is refused too. Most wire formats tolerate
+  unknown fields, and they are carrying *messages*. A record is **evidence**:
+  its fields are the inputs to authorization, retry and recovery decisions, so
+  a reader that drops one reaches a verdict over evidence it did not see and
+  reports it as an ordinary result.
+
+Both are classified as a **build skew, never as damage**. A rolling deploy that
+put a writer ahead of its readers reaching an operator as *the history has been
+altered* would spend the one alarm that has to stay believable. The refusal says
+what to do instead: deploy readers before writers.
+
+An upcast is a **read-time view**. The bytes the chain commits to are the ones
+that were written, so tamper evidence does not depend on the age of the reader —
+and a build that lifts an old record still verifies its link from the original
+bytes alone.
+
+### The bytes are frozen
+
+`tests/golden/records.jsonl` holds one canonical record per kind and its chain
+digest; `tests/golden/export.jsonl` holds a sealed export every build must still
+verify offline. Reordering two fields or adding a `skip_serializing_if` rehashes
+every record this project will ever write and reads in review as a tidy-up — so
+it is a failing test, and re-blessing the corpus is a command somebody types
+rather than something a formatter does.
+
 A conclusion is not always a closure. Only conclusions nothing may resume —
-`succeeded`, `quarantined`, `cancelled` — **seal**: the journal freezes (the
+`succeeded`, `cancelled`, `abandoned` — **seal**: the journal freezes (the
 store refuses further appends as a constraint, not a convention) and the run
-enters the Merkle log below. `failed` and `exhausted` leave the run open,
-because both are conclusions a resume can honestly answer — completed effects
-are read back from history rather than performed again — and a leaf published
-for a run its own resume may grow would be a checkpoint attesting a prefix of
-a moving history. One chain can therefore carry more than one `RunConcluded`
+enters the Merkle log below. `failed`, `exhausted` and `quarantined` leave the
+run open, because each has a party who can honestly answer it — a resume reads
+completed effects back rather than performing them again, a raised ceiling
+continues an exhaustion, and a person answers a doubt — and a leaf published for
+a run its own resume may grow would be a checkpoint attesting a prefix of a
+moving history.
+
+A **quarantine** is the case worth stating, because sealing one looks right and
+is not. It is the runtime saying it does not know: the story is not over, and a
+Merkle leaf claims a history is complete. The practical half is sharper — a
+sealed chain refuses appends, so freezing it locked out the one record that
+answers the doubt, and the design's own promise that a person resolves a
+quarantine named a remedy the durable format forbade. One chain can therefore carry more than one `RunConcluded`
 record, and the *last* one is the run's answer; the outcome index the
 operator queries derives from it in the same transaction, so a failed run
 that is resumed and succeeds moves between listings rather than being listed

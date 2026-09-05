@@ -2,6 +2,9 @@
 title = "Security model"
 description = "The trust boundary, information-flow labels, delegation and egress — with an explicit account of what is not covered."
 weight = 14
+
+[extra]
+group = "Trust"
 +++
 
 What this runtime defends, how, and — the part most security documents omit —

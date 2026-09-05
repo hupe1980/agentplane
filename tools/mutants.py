@@ -1244,10 +1244,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "nothing may resume it, so whether the members were taken or taken "
         "back is permanently undecided, under a conclusion that claims the "
         "history is complete",
-        """        if has_sealing_conclusion(&records) {
-            let mut undecided = false;""",
-        """        if has_sealing_conclusion(&records) && records.is_empty() {
-            let mut undecided = false;""",
+        """    if !has_sealing_conclusion(records) {
+        return Vec::new();
+    }""",
+        """    if !records.is_empty() {
+        return Vec::new();
+    }""",
     ),
     "AnOpenRunsCrashShapeFlagsAsAFinding": (
         "src/audit.rs",
@@ -1256,10 +1258,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "repairs — is flagged beside the sealed one, a false alarm on every "
         "healthy resumable run, which is how the true alarm stops being "
         "believed",
-        """        if has_sealing_conclusion(&records) {
-            let mut undecided = false;""",
-        """        if !records.is_empty() {
-            let mut undecided = false;""",
+        """    if !has_sealing_conclusion(records) {
+        return Vec::new();
+    }""",
+        """    if records.is_empty() {
+        return Vec::new();
+    }""",
     ),
     "TheAuditIgnoresThePriorCheckpoint": (
         "src/audit.rs",
@@ -5297,10 +5301,13 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "every later checkpoint attests — the failure the 'a conclusion is not "
         "a closure' work removed for `failed`, reachable again the moment the "
         "sealing set and the resumable set disagree",
-        '        "quarantined" => Some(RunStatus::Quarantined(\n'
-        '            "recorded as quarantined; a human must resolve it before it can run again".into(),\n'
-        "        )),",
-        '        "quarantined" => None,',
+        '        "abandoned" => Some(RunStatus::Abandoned {\n'
+        '            actor: recorded_decider(records).unwrap_or_else(|| "unknown".into()),\n'
+        '            reason: "recorded as abandoned; its outcome was never established and nothing was \\\n'
+        '                     unwound"\n'
+        "                .into(),\n"
+        "        }),",
+        '        "abandoned" => None,',
     ),
     "TheLiveAnswerHasItsOwnStateMapping": (
         "src/api/a2a.rs",
@@ -5834,7 +5841,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "dropped are quarantined ones, exactly the runs an auditor came for",
         """pub const SEALED_OUTCOMES: &[&str] = &[
     "succeeded",
-    "quarantined",""",
+    "cancelled",""",
         """pub const SEALED_OUTCOMES: &[&str] = &[
     "succeeded",""",
     ),
@@ -5940,11 +5947,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the history past the leaf a checkpoint attests",
         """        matches!(
             self,
-            Self::Succeeded | Self::Quarantined(_) | Self::Cancelled { .. }
+            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. }
         )""",
         """        matches!(
             self,
-            Self::Succeeded | Self::Quarantined(_) | Self::Cancelled { .. } | Self::Failed(_)
+            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. } | Self::Failed(_)
         )""",
     ),
     "UnknownOutcomeResumes": (
@@ -6998,6 +7005,198 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                         continue;
                     }""",
         """                    Some(crate::journal::EffectReplay::Done { .. }) => continue,""",
+    ),
+    "AQuarantineSealsTheJournal": (
+        "src/runtime/executor.rs",
+        "a_quarantined_run_is_open_and_seals_only_when_it_truly_ends",
+        "a quarantine freezes the journal and publishes a Merkle leaf, so the "
+        "one record that answers it can never be appended — the format makes "
+        "'a human must resolve it before it can run again' impossible",
+        """            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. }""",
+        """            Self::Succeeded
+                | Self::Cancelled { .. }
+                | Self::Abandoned { .. }
+                | Self::Quarantined(_)""",
+    ),
+    "AQuarantineNeedsNoAnswerToResume": (
+        "src/runtime/executor.rs",
+        "an_assertion_alone_does_not_reopen_the_run",
+        "an unanswered quarantine resumes on its own, so the conclusion that "
+        "exists to stop and be looked at is buried in a retry loop instead — "
+        "which is how an undecidable situation becomes an unnoticed one",
+        """        "quarantined" => quarantine_decision(records).is_none().then(|| {""",
+        """        "quarantined" => None.map(|()| {""",
+    ),
+    "AReopenIsAStandingLicence": (
+        "src/runtime/executor.rs",
+        "reopening_without_answering_the_doubt_quarantines_again",
+        "one person's judgement is read as standing rather than spent by the "
+        "pass it authorized, so every later resume of a run that quarantined "
+        "again carries on unasked — a feedback path with no bound, repeating "
+        "external side effects",
+        """        .take_while(|r| !matches!(r.kind(), RecordKind::RunConcluded { .. }))""",
+        """        .take_while(|_| true)""",
+    ),
+    "AnAbandonmentIsRecordedAndIgnored": (
+        "src/runtime/executor.rs",
+        "abandoning_leaves_the_world_exactly_as_the_run_left_it",
+        "an operator's decision to close an unanswerable run is journaled and "
+        "then never acted on, so the run stays in the quarantine backlog while "
+        "the operator has been told it was handled — the exact shape the "
+        "ignored cancellation request had",
+        """    let (decision, record) = quarantine_decision(records)?;""",
+        """    let (decision, record) = quarantine_decision(records).filter(|_| false)?;""",
+    ),
+    "AQuarantinedRunAcceptsACancellation": (
+        "src/runtime/executor.rs",
+        "cancelling_a_quarantined_run_is_refused_and_names_the_two_verbs",
+        "a stop request against a quarantined run is recorded and acknowledged "
+        "and then walked past, so an operator believes they stopped a run that "
+        "is holding an unresolved payment",
+        """        if recorded_conclusion(&records).as_deref() == Some("quarantined") {""",
+        """        if false {""",
+    ),
+    "AnAssertionOverwritesARecordedOutcome": (
+        "src/runtime/executor.rs",
+        "an_assertion_cannot_overwrite_an_outcome_the_journal_holds",
+        "a person may replace an outcome the journal already holds, so an "
+        "operator can talk a run out of compensating work that is standing in "
+        "the world and the record shows an orderly reconciliation",
+        """        let Some(undecided) = crate::journal::undecided_effects(&records)
+            .into_iter()
+            .find(|u| u.effect == effect)
+        else {""",
+        """        let Some(undecided) = crate::journal::undecided_effects(&records)
+            .into_iter()
+            .next()
+        else {""",
+    ),
+    "AnAssertedValueIsTrusted": (
+        "src/runtime/executor.rs",
+        "an_asserted_result_names_its_author_and_is_not_trusted",
+        "a value an operator typed carries the lattice bottom, so the 3 a.m. "
+        "resolution verb is the one place in this design where a person "
+        "declassifies by typing",
+        """                declared: output
+                    .is_some()
+                    .then(crate::core::DeclaredOutput::untrusted),""",
+        """                declared: output
+                    .is_some()
+                    .then(crate::core::DeclaredOutput::trusted),""",
+    ),
+    "AnAssertionIsUnattributed": (
+        "src/runtime/executor.rs",
+        "an_asserted_result_names_its_author_and_is_not_trusted",
+        "a person's assertion is journaled as if the effect's own probe had "
+        "answered, so 'the provider told us' and 'somebody asserted it' are "
+        "the same record and nobody can tell which decided a run could carry on",
+        """                asserted_by: Some(asserted_by.to_owned()),""",
+        """                asserted_by: None,""",
+    ),
+    "AnAbandonedDoubtIsNotAFinding": (
+        "src/audit.rs",
+        "an_abandoned_doubt_is_reportable_from_the_journal_forever",
+        "closing a run takes its unresolved effect off the only listing that "
+        "carried it and nothing replaces it, so what the run left in the world "
+        "is undiscoverable the moment somebody stops looking",
+        """            crate::journal::undecided_effects(records)
+                .into_iter()
+                .map(|u| Finding::EffectUndecided {""",
+        """            Vec::<crate::core::Undecided>::new()
+                .into_iter()
+                .map(|u| Finding::EffectUndecided {""",
+    ),
+    "AnAbandonmentIsSilent": (
+        "src/runtime/executor.rs",
+        "abandoning_a_quarantined_run_emits_its_event",
+        "writing off a run that left something unexplained in the world "
+        "announces nothing, so the only party who learns of it is the one who "
+        "decided it — an intervention visible only to whoever made it",
+        """        RunStatus::Abandoned { actor, reason } => {
+            tracing::error!(target: telemetry::ABANDONED, %run, %actor, %reason);
+        }""",
+        """        RunStatus::Abandoned { .. } => {}""",
+    ),
+    "AVersionIsWrittenAndNeverRead": (
+        "src/journal/record.rs",
+        "a_record_from_a_shape_this_build_does_not_know_is_refused",
+        "a record's schema version is written on every append and never read "
+        "back, so a journal written one shape ahead parses cleanly with the "
+        "fields this build has never heard of dropped on the floor",
+        """            Ok(body) if body.v == upcaster.current_version(body.kind.kind_str()) => body,""",
+        """            Ok(body) => body,
+            #[allow(unreachable_patterns)]""",
+    ),
+    "AVersionSkewIsReportedAsTampering": (
+        "src/journal/upcast.rs",
+        "a_version_skew_is_not_reported_as_tampering",
+        "a rolling deploy that put a writer ahead of its readers reaches an "
+        "operator as 'the history has been altered' — spending the one alarm "
+        "that has to stay believable on a deployment ordering mistake",
+        """            _ => Err(StoreError::UnknownRecordVersion {
+                kind: kind.to_owned(),
+                version,
+                reads: 1,
+            }),""",
+        """            _ => Err(StoreError::Corrupt {
+                seq: 0,
+                detail: format!("record {kind} is v{version}"),
+            }),""",
+    ),
+    "AnUndeclaredFieldIsDroppedOnTheFloor": (
+        "src/journal/record.rs",
+        "a_field_this_build_does_not_know_is_refused",
+        "a record carrying a field this build does not know is read anyway, "
+        "with the unknown part discarded, so an authorization or recovery "
+        "verdict is reached over evidence the reader never saw",
+        """#[serde(tag = "kind", rename_all = "PascalCase", deny_unknown_fields)]""",
+        """#[serde(tag = "kind", rename_all = "PascalCase")]""",
+    ),
+    "ARecordFieldMovesWithoutNotice": (
+        "src/journal/record.rs",
+        "every_record_kind_hashes_to_its_golden_vector",
+        "the wire order of a record's fields changes, which rehashes every "
+        "record this build will ever write and breaks every journal ever "
+        "written — and reads in review as a tidy-up",
+        """    pub epoch: Epoch,
+    pub v: u16,""",
+        """    pub v: u16,
+    pub epoch: Epoch,""",
+    ),
+    "ADeadLetterListingShowsThePayload": (
+        "src/api/mod.rs",
+        "a_dead_letter_is_readable_and_carries_no_payload",
+        "the diagnostic listing hands back the counterparty's message body — a "
+        "confidentiality decision nobody took, and on a sealed plane one that "
+        "shows ciphertext to some deployments and plaintext to others",
+        """            reason: letter.reason.clone(),
+        }""",
+        """            reason: letter.event.payload.to_string(),
+        }""",
+    ),
+    "ARearmIsReportedAsDoneWhateverHappened": (
+        "src/api/mod.rs",
+        "a_parked_registration_is_listed_and_re_armed",
+        "re-arming a registration that was never parked answers the operator "
+        "'done', so they wait for a sweep that has nothing to do",
+        """    Ok(Json(json!({ "rearmed": rearmed })))""",
+        """    Ok(Json(json!({ "rearmed": true, "_": rearmed })))""",
+    ),
+    "TheOfflineSweepSkipsTheQuarantineBacklog": (
+        "src/runtime/executor.rs",
+        "the_offline_sweep_covers_every_ending_and_the_quarantine_backlog",
+        "the export's default sweep omits quarantined runs, so the artifact an "
+        "auditor is handed holds everything that finished and nothing that did "
+        "not — and looks complete",
+        """pub const OUTCOMES_OF_RECORD: &[&str] = &[
+    "succeeded",
+    "cancelled",
+    "abandoned",
+    "quarantined",""",
+        """pub const OUTCOMES_OF_RECORD: &[&str] = &[
+    "succeeded",
+    "cancelled",
+    "abandoned",""",
     ),
 }
 

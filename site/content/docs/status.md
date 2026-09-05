@@ -1,7 +1,10 @@
 +++
 title = "Status"
-description = "What is pre-alpha, what to pin, what is deliberately not built, and how to check."
+description = "What is pre-alpha in agentplane, which surfaces to pin, what is deliberately not built, the format-freeze conditions, and how to check any of it yourself."
 weight = 18
+
+[extra]
+group = "Operate"
 +++
 
 `agentplane` is published on crates.io and pre-alpha. This page answers three questions an
@@ -18,7 +21,7 @@ describes and cannot rot unnoticed. What exists is answered by
 [concepts](@/docs/concepts.md), the [API reference](https://docs.rs/agentplane),
 and the test suite.
 
-## ⬜ Deliberately not built
+## ⬜ Deliberately not built {#deliberately-not-built}
 
 Each row says *why* it is deferred, because the distinction a status page exists
 to make is "deliberately deferred" from "never thought about".
@@ -27,7 +30,7 @@ to make is "deliberately deferred" from "never thought about".
 |---|---|
 | ⬜ | **Symbolic policy analysis, and a schema to prove against** — Cedar can *prove* properties of a policy set rather than test them, which is the only thing that catches the failure this project has hit twice: Cedar is **total**, so a `when` clause reading an attribute that does not exist makes the rule silently vanish rather than error. A worked taint gate on this site denied every mutating call in a tool loop and its unit tests passed, because a hand-written context is a context assembled to suit the rule; `check_never_errors` is the proof obligation that would have caught it. **The mechanics are all available; the blocker is a schema.** The prover is `cedar-policy-symcc`, a *separate crate* at 0.6.0 — not a missing feature of `cedar-policy`, which is at 4.12.0 and is the latest — and the cvc5 solver it needs is a released binary that installs and runs fine. What is missing is one level deeper: symbolic analysis proves against a **schema**, this crate ships none, and a universal one **is not expressible** — `context.args` is caller data of arbitrary shape, Cedar records are closed, and open records (`additionalAttributes`) require Cedar's *experimental* `partial-validate` feature, which is not something to enable on the authorization dependency. What is expressible is a schema per deployment, for the effects that deployment actually calls — and even that is not the small generator it sounds like. Cedar attaches one context type per **action**, and `effect:perform` spans every effect kind, so `context.args` would need a union type Cedar does not have. A generator therefore requires one of two designs, each with a real cost: split the action vocabulary per effect kind using Cedar action groups — but group membership lives in the schema, so `action in` rules would mean different things on a plane with no schema loaded; or merge every declared argument shape into one all-optional record — which collapses the moment any effect carries arbitrary JSON, and a model call's prompt is arbitrary JSON. The generator is deferred until that vocabulary decision is taken deliberately, not because emitting a schema is hard |
 | ⬜ | **Cross-run mutual exclusion over a declared resource** — an effect group enforces its footprint *within* a run. Two runs grouping over the same resource are ordered by the resources themselves, not by the plane |
-| ⬜ | **The rest of format freeze** — canonicalization is versioned at the run, so a rule change reads as *unverifiable* rather than as a divergence, and it is a complete RFC 8785 implementation held to the standard's own number vectors. What remains is the rest of the ceremony, enumerated as checkable conditions in [Format freeze](#format-freeze) below rather than as a paragraph: golden vectors for the journal and export formats, an unknown-field policy, migration and rollback procedures, and an algorithm-agility plan for every durable or signed format |
+| ⬜ | **The rest of format freeze** — the mechanics are built: canonicalization is versioned at the run, every durable format leads with a version its reader compares, the record vocabulary and a sealed export are pinned to checked-in bytes, and the unknown-field policy is decided and enforced. What remains is a **written specification** somebody could implement from without reading the Rust, and a vector produced by a second implementation — enumerated as checkable conditions in [Format freeze](#format-freeze) below |
 | ⬜ | **A measured containment claim** — the runtime claims injection *containment*, not immunity, and that is a falsifiable claim with no external measurement attached to it. A static attack set would manufacture exactly the confidence this project refuses; an adaptive evaluation is what would count, and none has been run against this runtime. The methodology exists in published form: the first adaptive evaluation of the out-of-band defence family this design belongs to ([2606.26479](https://arxiv.org/abs/2606.26479)) confirms that the family had only ever been validated statically — and reports deterministic enforcement holding under its one adaptive template, a data point its authors weight as small-scale. What remains is running one against this runtime, over A2A, graded from the journal |
 | ⬜ | **A rate-limit wait that outlives a worker** — a peer's `Retry-After` is read, honoured and bounded by `RetryPolicy::max_advice` (60 s), which is also the bound on how long one effect holds a worker. A genuinely longer throttle costs attempts rather than a row. Suspending the run instead is the doctrinally clean answer and the one Temporal reaches, and it is a **durable-format** question rather than an implementation one: the replay cursor is strictly ordered, so a wait that suspends must be journaled beside the failure that caused it and consumed in order on the way back — a field on `EffectFailed` and a rule for reading it. Deferred until format freeze rather than half-built. The workaround is a skill that catches the failure and calls `cx.sleep()`, which is durable |
 | ⬜ | **A curated event type between the journal and the wire** — deliberately absent, and the question is settled rather than open. The durable, resumable output stream embedders want already exists: `Runtime::journal()` plus `JournalStore::read(run, from)` is a seq-cursored, reconnect-safe read that any instance can serve — the exact mechanism A2A streaming is built on, and the A2A server is itself an embedder of it. A third, curated vocabulary between the records and the wire would drift from both, which is the second-truth problem arriving as ergonomics. Live in-process deltas stay advisory (`ModelCall::streaming_to`): no delta is journaled and strict replay emits none, because a durable delta stream is a second truth beside the one terminal `Completion` |
@@ -47,14 +50,19 @@ every row below is met, and each row is checkable rather than a matter of
 judgement. An adopter tracking this page can see how far along it is without
 asking.
 
+✅ met · 🟨 half, and the remaining half is named · ⬜ open. A half is a row
+whose *mechanics* are built and whose remaining work is a document or an
+exercise — stated as its own state rather than rounded to either neighbour,
+because rounding up is how a condition list stops being checkable.
+
 | # | Condition | State |
 |---|---|---|
 | 1 | **Canonicalization is versioned and vector-checked.** A rule change must read as *unverifiable* rather than as a divergence | ✅ done — versioned at the run, a complete RFC 8785 implementation held to the standard's own number vectors |
-| 2 | **Golden corpora for the journal record format.** A fixed set of records, byte-for-byte, that every future build must still read and still hash identically | ⬜ open |
-| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate, so its vectors are the ones another implementation is checked against | ⬜ open |
-| 4 | **A stated unknown-field policy per durable format.** Today it is `deny_unknown_fields` everywhere, which is right for a *security* document and wrong for a *record* a newer writer may have extended | ⬜ open |
-| 5 | **Upcasters exercised end-to-end, not only unit-tested.** The machinery exists; what is missing is a corpus of genuinely old records it is run against | ⬜ open |
-| 6 | **A migration and rollback procedure**, written down and rehearsed — including the answer to *a v2 writer wrote records this v1 reader must read* | ⬜ open |
+| 2 | **Golden corpora for the journal record format.** A fixed set of records, byte-for-byte, that every future build must still read and still hash identically | ✅ done — one canonical record per kind and its chain digest in `tests/golden/records.jsonl`, with a guard holding the corpus to the record vocabulary so a new kind cannot ship unpinned |
+| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | 🟨 half — a sealed export is checked in and every build must still verify it offline (`tests/golden/export.jsonl`). What is missing is the half that needs a *second* implementation: a vector this crate did not produce, which needs the written specification condition 1's prose does not yet cover |
+| 4 | **A stated unknown-field policy per durable format.** | ✅ done, and the answer is the strict one in both directions — a record is *evidence*, not a message, and its fields are the inputs to authorization and recovery decisions, so a reader that drops one reaches a verdict over evidence it did not see. A bumped version is refused unless an upcaster can reach this build's shape; an unknown field at a known version is refused too. Both are classified as build skew rather than damage, and the deployment order they imply is written down beside them |
+| 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — the seam is consulted for the current version on *every* record read, and a test lifts a record written at a shape that does not parse into this build's struct at all, asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump; the mechanism no longer waits for it |
+| 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down, including the answer to *a v2 writer wrote records this v1 reader must read*: it does not, it refuses by version and says so, and the deployment order that avoids it is readers-before-writers. Rollback is bounded by a *time window* rather than a version, because records written after the new writer was enabled strand an older reader. What is missing is the rehearsal, which belongs with the disaster-recovery drill |
 | 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ⬜ open |
 | 8 | **The deferred format questions are settled**, because each one moves a record: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open |
 
@@ -74,7 +82,7 @@ already work, and the reason a format change is a rebuild rather than a loss.
 That is a real answer, not a promise: an export taken today is verifiable today
 by a party who has never run this crate.
 
-## 📌 What to pin, and what will move
+## 📌 What to pin, and what will move {#what-to-pin-and-what-will-move}
 
 Pre-alpha means every one of these can change. It does not mean they are all
 equally likely to, and an adopter deciding what to build against deserves the
@@ -100,7 +108,7 @@ remaining design pressure is.
 | **A2A / MCP wire behaviour** | tracks the specs | exact released versions, not a compatibility range — see the open protocol-support question in the design decisions above |
 | **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
 
-## 🔍 How to check any of this
+## 🔍 How to check any of this {#how-to-check-any-of-this}
 
 Nothing on this page is a promise; all of it is checkable.
 

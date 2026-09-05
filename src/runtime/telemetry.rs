@@ -122,6 +122,19 @@ pub const OUTCOME: &str = "agentplane.outcome";
 pub const NONDETERMINISM: &str = "agentplane.run.nondeterminism_detected";
 /// A run was set aside for a human.
 pub const QUARANTINED: &str = "agentplane.run.quarantined";
+/// A person closed a run whose outcome could never be established.
+///
+/// The end of the road for a quarantine nobody could answer, and it fires
+/// **because nothing was unwound**: what the run left in the world stays there,
+/// and the doubt is permanent. The person who decided that already knows; this
+/// is for everybody else — the party who answers for an unexplained mutation is
+/// rarely the operator holding the pager at 3 a.m., and an intervention visible
+/// only to whoever made it is not oversight.
+///
+/// The lasting record is the `agentplane audit` finding, which is derived from
+/// the journal and outlives every status. This is the notification that the
+/// finding now exists.
+pub const ABANDONED: &str = "agentplane.run.abandoned";
 /// A run concluded `failed`, with the reason it gives an operator.
 ///
 /// A failure is an ordinary conclusion here rather than an incident — it stays
@@ -168,6 +181,7 @@ pub const REPLANNED: &str = "agentplane.run.replanned";
 pub const LOUD_EVENTS: &[&str] = &[
     NONDETERMINISM,
     QUARANTINED,
+    ABANDONED,
     UNDECIDABLE,
     UNREPRODUCIBLE,
     RECONCILED,

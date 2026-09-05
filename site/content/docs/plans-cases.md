@@ -1,7 +1,10 @@
 +++
 title = "Plans, cases and time"
 description = "Frozen authorization graphs, month-long cases, durable waits and timers, budgets that bind, human tasks and batch runs."
-weight = 9
+weight = 11
+
+[extra]
+group = "How it works"
 +++
 
 A run is minutes; a business process is months. This page covers the graph a
@@ -353,7 +356,10 @@ and only the second is safe to act on.
 A non-empty dead-letter list means a correlation key is wrong somewhere: the
 message arrived, was held, and no run ever asked for it. That is worth paging
 on — it is the failure that otherwise presents as a process silently never
-completing.
+completing. `GET /dead-letters` is what the page leads to: it names each message
+and the keys it was filed under, so the mismatch is visible beside what the run
+subscribed to. The body is deliberately not there — the diagnosis is in the
+keys, and the payload is the counterparty's.
 
 Delivery is deduplicated by event id, so a counterparty that retries — and they
 all retry — does not deliver twice. Claiming happens inside the transaction that

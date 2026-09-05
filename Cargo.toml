@@ -1,11 +1,13 @@
 [package]
 name         = "agentplane"
-version      = "0.28.0"
+version      = "0.29.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
 description  = "Durable, replayable agent runtime — the journal is the plan of record"
 repository   = "https://github.com/hupe1980/agentplane"
+homepage     = "https://hupe1980.github.io/agentplane/"
+documentation = "https://docs.rs/agentplane"
 readme       = "README.md"
 keywords     = ["agent", "durable-execution", "replay", "runtime", "llm"]
 categories   = ["asynchronous", "data-structures"]
@@ -321,6 +323,11 @@ required-features = ["redb"]
 # ceiling (still refused, not duplicated), readmitted under a raise, verified.
 [[example]]
 name              = "budget_pause"
+required-features = ["redb"]
+
+# The conclusion an operator could not act on, and the two verbs that answer it.
+[[example]]
+name              = "answered_doubt"
 required-features = ["redb"]
 
 # Two brakes: cancel one run (it unwinds, and the journal names who asked) and

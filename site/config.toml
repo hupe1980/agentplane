@@ -43,3 +43,11 @@ repo = "https://github.com/hupe1980/agentplane"
 crate = "https://crates.io/crates/agentplane"
 docsrs = "https://docs.rs/agentplane"
 tagline = "The journal is the plan of record."
+
+# The order documentation sections appear in, on the hub and in every sidebar.
+# Kept here rather than derived from the pages so the *sequence* is a decision
+# somebody made — sorting groups alphabetically would open the documentation
+# with "Build" and bury "Start here" in the middle. `tests/guards/docs.rs`
+# holds this list and the pages' `extra.group` to each other, so a page with a
+# group nobody declared is a page that has vanished from the navigation.
+doc_groups = ["Start here", "Build", "How it works", "Trust", "Operate"]

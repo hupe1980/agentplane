@@ -1,7 +1,10 @@
 +++
 title = "Models, agents and peers"
 description = "Calling models, other agents and A2A peers: governed egress, MCP tools, media fetching, and exactly what crosses the wire."
-weight = 10
+weight = 12
+
+[extra]
+group = "How it works"
 +++
 
 Everything this runtime calls that it does not own. The rule is the same at

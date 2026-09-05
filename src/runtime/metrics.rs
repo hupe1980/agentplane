@@ -337,8 +337,10 @@ pub const QUARANTINED_RUNS: Instrument = Instrument {
                   over a backlog of forty, and a backlog that stopped growing \
                   reads exactly like one that was cleared. Read from the store, \
                   so it survives restarts and reports the standing total on \
-                  every sweep. It only ever rises today: this runtime offers no \
-                  verb that resolves a quarantine.",
+                  every sweep. It falls when a person answers one: a reopened \
+                  run leaves this count for whatever it reaches next, and an \
+                  abandoned one leaves it for `abandoned` — where the doubt \
+                  survives as an audit finding rather than as a number.",
 };
 
 /// Every instrument this crate emits.
@@ -390,12 +392,13 @@ pub struct Census {
     /// outstanding — the question an operator actually pages on, and the one a
     /// per-process counter answers with zero after every restart.
     ///
-    /// Stated rather than implied: **this number only rises.** Nothing in this
-    /// runtime resolves a quarantine — a resume re-reaches the same conclusion
-    /// and a cancellation request is recorded and not acted on — so the gauge
-    /// reports a backlog that is real and, for now, permanent. That is the
-    /// honest reading of the state, and the missing verb is on the roadmap
-    /// rather than hidden behind a number that looks drainable.
+    /// It drains, and only by a person deciding:
+    /// [`decide_quarantine`](crate::runtime::Runtime::decide_quarantine) either
+    /// hands the run back to be judged again or closes it as `abandoned`. What
+    /// it must not be read as is a measure of *risk retired* — an abandoned run
+    /// leaves this count while whatever it left in the world stays exactly
+    /// where it was, which is why the doubt is delivered as an audit finding
+    /// derived from the journal rather than as a status somebody can clear.
     pub quarantined_runs: u64,
     /// Seconds since the longest-open case was opened, or `None` if none are open.
     pub oldest_case_age_secs: Option<u64>,

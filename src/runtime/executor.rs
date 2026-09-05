@@ -16,8 +16,8 @@ use serde_json::Value;
 use crate::case::{CaseStore, EventStore, TaskStore, TimerStore};
 use crate::core::{
     ArgSource, Budget, Calendar, Capability, Consumed, CorrelationKey, Delivery, Digest,
-    EffectDescriptor, InboundEvent, Ledger, Outcome, Phase, PlanIR, PlanNode, PolicyBundleIdentity,
-    RunId, RuntimeError, Skill, SkillDescriptor, Spend, StepId, Tainted, WallClock,
+    InboundEvent, Ledger, Outcome, Phase, PlanIR, PlanNode, PolicyBundleIdentity, RunId,
+    RuntimeError, Skill, SkillDescriptor, Spend, StepId, Tainted, WallClock,
 };
 use crate::journal::{Append, JournalStore, Record, RecordKind, ReplayCursor, StepCursor};
 use crate::runtime::BuildError;
@@ -318,6 +318,12 @@ impl std::fmt::Display for RunFailure {
             RunStatus::Cancelled { actor, reason } => {
                 write!(f, "{actor} cancelled it — {reason}")
             }
+            RunStatus::Abandoned { actor, reason } => {
+                write!(
+                    f,
+                    "{actor} abandoned it, unresolved and not unwound — {reason}"
+                )
+            }
         }
     }
 }
@@ -363,6 +369,23 @@ pub enum RunStatus {
         actor: String,
         reason: String,
     },
+    /// An operator closed a run whose outcome could never be established.
+    ///
+    /// The end of the road for a quarantine nobody can answer. Distinct from
+    /// `Cancelled` in the one way that matters to whoever reads it next:
+    /// **nothing was unwound**. A cancellation puts the world back; this leaves
+    /// it exactly as the run left it, because compensating around an unknown
+    /// outcome is the single thing quarantine exists to forbid, and an
+    /// operator's patience running out is not new evidence.
+    ///
+    /// So the doubt does not go away when the run does. It stops being a
+    /// *status* — which is a mutable thing a later action can overwrite — and
+    /// becomes an `agentplane audit` finding, which is derived from the journal
+    /// and outlives every status the run will ever have.
+    Abandoned {
+        actor: String,
+        reason: String,
+    },
 }
 
 impl RunStatus {
@@ -386,10 +409,11 @@ impl RunStatus {
         use std::borrow::Cow;
         match self {
             Self::Succeeded => None,
-            Self::Failed(reason) | Self::Quarantined(reason) | Self::Replanning(reason) => {
-                Some(Cow::Borrowed(reason.as_str()))
-            }
-            Self::Cancelled { reason, .. } => Some(Cow::Borrowed(reason.as_str())),
+            Self::Failed(reason)
+            | Self::Quarantined(reason)
+            | Self::Replanning(reason)
+            | Self::Cancelled { reason, .. }
+            | Self::Abandoned { reason, .. } => Some(Cow::Borrowed(reason.as_str())),
             Self::Suspended(reason) => Some(Cow::Owned(reason.to_string())),
             Self::Exhausted(exceeded) => Some(Cow::Owned(exceeded.to_string())),
         }
@@ -418,6 +442,7 @@ impl RunStatus {
             Self::Quarantined(_) => "quarantined",
             Self::Replanning(_) => "replanning",
             Self::Cancelled { .. } => "cancelled",
+            Self::Abandoned { .. } => "abandoned",
         }
     }
 
@@ -438,6 +463,17 @@ impl RunStatus {
     /// history that kept moving, and the store's refusal of appends after a
     /// seal would turn every legitimate resume into an error.
     ///
+    /// **A quarantine does not seal**, and that follows from the same rule
+    /// rather than being an exception to it. A quarantine is the runtime saying
+    /// it does not know, which is a story that is not over; a Merkle leaf is a
+    /// claim that a history is complete. Sealing one published a proof of
+    /// completeness over an admittedly incomplete record, and — the practical
+    /// half — froze the journal against the one record that answers it, so
+    /// "a human must resolve it before it can run again" named a resolution the
+    /// format made impossible. It enters the log when it reaches a real ending,
+    /// including [`Abandoned`](Self::Abandoned), which is a person deciding
+    /// there will never be one.
+    ///
     /// This is the **one** implementation of that rule. `resume_is_closed`
     /// refuses exactly the outcomes this method seals — a test pins the
     /// agreement — because two copies of one rule agree everywhere except the
@@ -446,7 +482,7 @@ impl RunStatus {
     pub fn seals(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Quarantined(_) | Self::Cancelled { .. }
+            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. }
         )
     }
 }
@@ -469,8 +505,32 @@ impl RunStatus {
 /// variant, which the literals in a binary could never be held to.
 pub const SEALED_OUTCOMES: &[&str] = &[
     "succeeded",
-    "quarantined",
     "cancelled",
+    "abandoned",
+    super::sweeper::SWEEP_OUTCOME,
+    BREAK_GLASS_OUTCOME,
+];
+
+/// What an offline verb sweeps when the operator names no outcome.
+///
+/// Every ending — [`SEALED_OUTCOMES`] — **plus `quarantined`**, which is not an
+/// ending and is exactly why it belongs: a run set aside for a person is the
+/// plane's outstanding unresolved risk, and an artifact holding everything that
+/// finished and nothing that did not is not the one an auditor came for. It is
+/// also the outcome most likely to be the reason they came.
+///
+/// Failed and exhausted runs are deliberately absent, and the distinction is
+/// not sealing but *whether anything is waiting on a person*. Those two are
+/// work in progress that a resume moves on its own; a quarantine moves only
+/// when somebody decides, so it can sit for weeks and still be current.
+///
+/// A test holds this to [`SEALED_OUTCOMES`] rather than restating it, so a new
+/// ending is swept here the day it exists.
+pub const OUTCOMES_OF_RECORD: &[&str] = &[
+    "succeeded",
+    "cancelled",
+    "abandoned",
+    "quarantined",
     super::sweeper::SWEEP_OUTCOME,
     BREAK_GLASS_OUTCOME,
 ];
@@ -686,6 +746,14 @@ pub struct Runtime {
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    /// Where webhook registrations and their cursors live.
+    ///
+    /// Held by the plane rather than only by whoever delivers, because the
+    /// registrations that stop being delivered are a **backlog**, and a backlog
+    /// is answered by an operator on the plane's own surface — not by the
+    /// worker that gave up on it.
+    #[cfg(feature = "push")]
+    push: Option<Arc<dyn crate::push::PushStore>>,
     /// Where data keys live, when payload bytes are sealed.
     #[cfg(feature = "keyring")]
     keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
@@ -768,6 +836,8 @@ impl Runtime {
             tasks: None,
             timers: None,
             blobs: None,
+            #[cfg(feature = "push")]
+            push: None,
             #[cfg(feature = "keyring")]
             keyring: None,
             #[cfg(feature = "manifest")]
@@ -934,6 +1004,45 @@ impl Runtime {
         self.batches.as_ref()
     }
 
+    #[cfg(feature = "push")]
+    #[must_use]
+    pub fn push(&self) -> Option<&Arc<dyn crate::push::PushStore>> {
+        self.push.as_ref()
+    }
+
+    /// Re-arm a webhook registration a delivery worker gave up on.
+    ///
+    /// A parked registration is not delivered and not deleted: it keeps its
+    /// cursor, so re-arming resumes at the first record the receiver never
+    /// acknowledged rather than at the head of the run. That is the whole
+    /// reason parking exists, and the reason this verb is on the plane — a
+    /// backlog nobody can empty is a warning line in yesterday's logs.
+    ///
+    /// The clock is read here rather than taken from the caller, unlike the
+    /// delivery worker's: a worker's schedule has to be assertable in a test,
+    /// and an operator asking for *now* means now.
+    ///
+    /// Returns whether a parked registration was found. `false` is an answer —
+    /// already live, or never existed — and is told rather than swallowed,
+    /// because an operator left waiting for a sweep with nothing to do has no
+    /// way to tell the difference.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::PlanContract`] if this plane has no push store, and
+    /// [`RuntimeError::Store`] if it is unreachable.
+    #[cfg(feature = "push")]
+    pub async fn rearm_push(&self, task: RunId, id: &str) -> Result<bool, RuntimeError> {
+        let push = self
+            .push
+            .as_ref()
+            .ok_or_else(|| RuntimeError::PlanContract("this plane has no push store".into()))?;
+        let at = now_for_admission().unix_timestamp().max(0).unsigned_abs();
+        push.unpark(task, id, at)
+            .await
+            .map_err(RuntimeError::from_store)
+    }
+
     /// Ask a run to stop, and drive the stop if nothing else will.
     ///
     /// The request is durable before this returns, so an operator who gets an
@@ -967,17 +1076,32 @@ impl Runtime {
         // request standing against an id that does not exist, and the operator's
         // retry then comes back "somebody else already asked" — which is a
         // confusing way to say "you mistyped".
-        if self
+        let records = self
             .store
-            .head(run)
+            .read(run, 1)
             .await
-            .map_err(RuntimeError::from_store)?
-            .seq
-            == 0
-        {
+            .map_err(RuntimeError::from_store)?;
+        if records.is_empty() {
             return Err(RuntimeError::Store(crate::core::StoreError::NotFound(
                 run.to_string(),
             )));
+        }
+
+        // A quarantine is refused here rather than recorded and ignored. The
+        // stop this verb promises is *unwind and put the world back*, and that
+        // is the one thing a quarantined run may not do — so the request landed
+        // durably, answered the operator `recorded: true`, and the resume then
+        // walked straight past it. An operator who believes they stopped a run
+        // holding an unresolved payment is worse off than one who was told no.
+        //
+        // Read from the recorded conclusion, not from a live status: a run that
+        // quarantines *after* this call is a genuine race the standing request
+        // loses, and that is correct — the request was made about a run nobody
+        // had given up on.
+        if recorded_conclusion(&records).as_deref() == Some("quarantined") {
+            return Err(RuntimeError::CannotUnwind {
+                run: run.to_string(),
+            });
         }
 
         let fresh = self
@@ -1011,6 +1135,278 @@ impl Runtime {
             }
         }
         Ok(fresh)
+    }
+
+    /// Answer a quarantine, and let the runtime decide the run again.
+    ///
+    /// A quarantine is this runtime saying it does not know, and the one
+    /// conclusion it cannot reach past on its own. Everything else that stops a
+    /// run has a party who can move it — a resume for a crash, a raised ceiling
+    /// for an exhaustion, a reviewer for a suspension. This is the party for
+    /// this one.
+    ///
+    /// # What this does and does not decide
+    ///
+    /// The person decides *whether the run may be judged again*, or that it
+    /// never will be. They do not decide the outcome. A
+    /// [`Reopen`](crate::core::QuarantineDecision::Reopen) hands the run back
+    /// to the executor, which re-derives its verdict from a history that now
+    /// holds whatever the person established with
+    /// [`reconcile_effect`](Self::reconcile_effect) — and quarantines it again,
+    /// on the record, if the answer was wrong or incomplete. An
+    /// [`Abandon`](crate::core::QuarantineDecision::Abandon) closes it where it
+    /// stands, unwinding nothing.
+    ///
+    /// The decision is journaled **before** it is acted on, so a crash between
+    /// the two leaves the instruction standing rather than lost: the next
+    /// resume finds it and finishes the job.
+    ///
+    /// Returns the outcome of the pass this drove — so an operator who reopens
+    /// a run learns immediately whether it got any further, rather than having
+    /// to go and look.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::NotQuarantined`] if the run's last conclusion is
+    /// anything else, [`RuntimeError::LeaseHeld`] if somebody is executing it,
+    /// and [`RuntimeError`] for a store failure or a refused resume.
+    ///
+    /// # Panics
+    ///
+    /// Never: the `expect` covers a lease this function has just acquired.
+    pub async fn decide_quarantine(
+        &self,
+        run: RunId,
+        decider: &str,
+        reason: &str,
+        decision: crate::core::QuarantineDecision,
+    ) -> Result<RunOutcome, RuntimeError> {
+        // Both are required and neither is defaulted. The whole weight of this
+        // record is that a named person took responsibility for a fact the
+        // runtime could not establish, and "unknown decided this for no stated
+        // reason" is a record that documents nothing while looking like
+        // process.
+        if decider.trim().is_empty() || reason.trim().is_empty() {
+            return Err(RuntimeError::PlanContract(
+                "answering a quarantine needs a decider and a reason — who looked, and what they \
+                 found"
+                    .to_owned(),
+            ));
+        }
+
+        let lease = self
+            .store
+            .acquire(run, &self.owner, self.lease_ttl)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let appended = self
+            .record_decision(run, &lease, decider, reason, decision)
+            .await;
+        if let Err(e) = appended {
+            // The lease was claimed by this call and never handed to a resume,
+            // so it is this call's to give back. Leaving it would strand the
+            // run for a TTL and hand it to the recovery sweep, which would
+            // "recover" a run nobody was running.
+            let _ = self.store.release_lease(run, lease.epoch).await;
+            return Err(e);
+        }
+        // Handed over rather than released and re-taken: the same window a wake
+        // path closes. Both decisions travel this path — an abandonment is
+        // concluded inside the resume, from the record just written.
+        self.resume_holding(run, lease).await
+    }
+
+    /// Append the decision, once the run is known to be asking for one.
+    async fn record_decision(
+        &self,
+        run: RunId,
+        lease: &crate::journal::Lease,
+        decider: &str,
+        reason: &str,
+        decision: crate::core::QuarantineDecision,
+    ) -> Result<(), RuntimeError> {
+        let records = self
+            .store
+            .read(run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        if records.is_empty() {
+            return Err(RuntimeError::Store(crate::core::StoreError::NotFound(
+                run.to_string(),
+            )));
+        }
+        let status = recorded_conclusion(&records);
+        if status.as_deref() != Some("quarantined") {
+            return Err(RuntimeError::NotQuarantined {
+                run: run.to_string(),
+                status: status.unwrap_or_else(|| "still running".to_owned()),
+            });
+        }
+        let mut append = Append::new(
+            run,
+            RecordKind::QuarantineDecided {
+                decider: decider.to_owned(),
+                reason: reason.to_owned(),
+                decision,
+            },
+        );
+        if let Some(case) = records.iter().find_map(|r| r.body.case) {
+            append = append.case(case);
+        }
+        self.store
+            .append(lease.epoch, vec![append])
+            .await
+            .map_err(RuntimeError::from_store)?;
+        Ok(())
+    }
+
+    /// Supply, out of band, the outcome of an effect the journal cannot decide.
+    ///
+    /// The manual twin of [`Effect::reconcile`](crate::core::Effect::reconcile),
+    /// and it produces the same record for the same reason: an operator who
+    /// looks the charge up in the provider's console is answering exactly the
+    /// question a probe asks, so the answer belongs in the place a probe's
+    /// answer goes, where replay reads it back and nothing re-derives it.
+    ///
+    /// What separates the two is on the record too. A probe's verdict is
+    /// attributed to the run; this one names the person, because "the provider
+    /// told us" and "somebody asserted it" are different evidence.
+    ///
+    /// **It supplies a missing fact and never replaces a recorded one.** Only
+    /// an effect [`undecided_effects`](crate::journal::undecided_effects) names
+    /// may be answered. Without that rule an operator could talk a run out of
+    /// compensating work that is standing in the world, and the journal would
+    /// show an orderly reconciliation while it happened.
+    ///
+    /// This changes no status by itself: the run stays quarantined until
+    /// [`decide_quarantine`](Self::decide_quarantine) hands it back. Several
+    /// doubts can be answered before the run is judged again, and answering one
+    /// of three is not a decision.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::NotUndecided`] if that effect's outcome is already on
+    /// the record, [`RuntimeError::LeaseHeld`] if somebody is executing the
+    /// run, and [`RuntimeError`] for a store failure.
+    pub async fn reconcile_effect(
+        &self,
+        run: RunId,
+        effect: crate::core::EffectKey,
+        assertion: crate::core::Assertion,
+        asserted_by: &str,
+        note: &str,
+    ) -> Result<(), RuntimeError> {
+        if asserted_by.trim().is_empty() || note.trim().is_empty() {
+            return Err(RuntimeError::PlanContract(
+                "an assertion about an effect needs a name and a note — who established this, and \
+                 how"
+                .to_owned(),
+            ));
+        }
+        let lease = self
+            .store
+            .acquire(run, &self.owner, self.lease_ttl)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let result = self
+            .record_assertion(run, &lease, effect, assertion, asserted_by, note)
+            .await;
+        // Always given back: this verb never executes the run, so the lease is
+        // held only for the width of one append.
+        let _ = self.store.release_lease(run, lease.epoch).await;
+        result
+    }
+
+    async fn record_assertion(
+        &self,
+        run: RunId,
+        lease: &crate::journal::Lease,
+        effect: crate::core::EffectKey,
+        assertion: crate::core::Assertion,
+        asserted_by: &str,
+        note: &str,
+    ) -> Result<(), RuntimeError> {
+        let records = self
+            .store
+            .read(run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        if records.is_empty() {
+            return Err(RuntimeError::Store(crate::core::StoreError::NotFound(
+                run.to_string(),
+            )));
+        }
+        let Some(undecided) = crate::journal::undecided_effects(&records)
+            .into_iter()
+            .find(|u| u.effect == effect)
+        else {
+            return Err(RuntimeError::NotUndecided {
+                run: run.to_string(),
+                effect: effect.to_string(),
+            });
+        };
+
+        let output = match &assertion {
+            crate::core::Assertion::Landed(value) => Some(value.clone()),
+            crate::core::Assertion::DidNotHappen => None,
+        };
+        let mut append = Append::new(
+            run,
+            RecordKind::EffectReconciled {
+                disposition: assertion.disposition(),
+                // Stated on the record rather than left to a reader's default.
+                // A durable format that does not say what it means is one a
+                // later build guesses about, and the guess here is the label on
+                // a value the run is about to act on.
+                declared: output
+                    .is_some()
+                    .then(crate::core::DeclaredOutput::untrusted),
+                output,
+                // A person's assertion costs nothing. What the call itself
+                // consumed, if it consumed anything, is already on the record
+                // of the attempt this answers.
+                spend: Spend::ZERO,
+                detail: Some(note.to_owned()),
+                asserted_by: Some(asserted_by.to_owned()),
+            },
+        )
+        .step(undecided.step)
+        .phase(undecided.phase)
+        .effect(effect);
+        if let Some(case) = records.iter().find_map(|r| r.body.case) {
+            append = append.case(case);
+        }
+        self.store
+            .append(lease.epoch, vec![append])
+            .await
+            .map_err(RuntimeError::from_store)?;
+        tracing::info!(
+            target: telemetry::RECONCILED,
+            %run,
+            step = %undecided.step,
+            verdict = ?assertion.disposition(),
+            actor = %asserted_by,
+        );
+        self.meter
+            .count(metrics::RECONCILIATIONS, assertion.disposition().as_str());
+        Ok(())
+    }
+
+    /// Every mutating effect this run's journal cannot decide the outcome of.
+    ///
+    /// What an operator holding a quarantine has to go and look up, and the
+    /// keys they quote back to [`reconcile_effect`](Self::reconcile_effect).
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    pub async fn undecided(&self, run: RunId) -> Result<Vec<crate::core::Undecided>, RuntimeError> {
+        let records = self
+            .store
+            .read(run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        Ok(crate::journal::undecided_effects(&records))
     }
 
     /// The stop request standing against a run, if any.
@@ -1590,6 +1986,38 @@ impl Runtime {
             output: None,
             consumed: Consumed::default(),
         }))
+    }
+
+    /// Finish an abandonment a decision asked for and a crash interrupted.
+    ///
+    /// The instruction is journaled before it is acted on, so this is what
+    /// makes the ending arrive whatever happened in between — and it is the
+    /// same path the verb itself takes, rather than a repair beside it.
+    ///
+    /// Nothing is unwound and no step runs: the run seals holding whatever it
+    /// left in the world, which is the whole content of the decision.
+    async fn abandon_if_decided(
+        &self,
+        run: RunId,
+        records: &[Record],
+        lease: &crate::journal::Lease,
+    ) -> Result<Option<RunOutcome>, RuntimeError> {
+        let Some(status) = pending_abandonment(records) else {
+            return Ok(None);
+        };
+        self.conclude(
+            run,
+            lease.epoch,
+            status,
+            None,
+            true,
+            self.recorded_case(records).map(|c| c.id()),
+            Consumed::default(),
+            Spend::ZERO,
+            &QuotaPass::disabled(),
+        )
+        .await
+        .map(Some)
     }
 
     /// Open the quota identity of the live tail a resume is about to execute.
@@ -3026,26 +3454,20 @@ impl Runtime {
             return Ok(outcome);
         }
 
-        // A run whose journal holds compensation-phase records is not
-        // resumable once it stands concluded. The unwind *reversed* work — a
-        // hold released, a refund issued — and a resume that replays the
-        // forward history and continues would conclude success over a world
-        // where the work was undone: the journal would say "done" about
-        // effects its own later records say were taken back. Scoped to runs
-        // with a standing conclusion, deliberately: a run that is mid-unwind
-        // (a compensation suspended for four eyes, a crash between reversals)
-        // has concluded nothing, and resuming it is how the unwind finishes.
+        // Placed *before* the compensation guard below on purpose: a run that
+        // quarantined partway through an unwind is exactly the one an operator
+        // has no other way to close, and it must not be the one this refuses to
+        // close.
         if mode == Mode::Resume
-            && let Some(outcome) = recorded_conclusion(&records)
-            && records
-                .iter()
-                .any(|r| matches!(r.kind(), RecordKind::StepCompensated { .. }))
+            && let Some(outcome) = self
+                .abandon_if_decided(run, &records, lease.expect("resume holds a lease"))
+                .await?
         {
-            return Err(RuntimeError::PlanContract(format!(
-                "run {run} concluded '{outcome}' after compensating completed steps — \
-                 the work was reversed, and resuming over undone work would report \
-                 success about a world where it no longer stands. Start a fresh run"
-            )));
+            return Ok(outcome);
+        }
+
+        if mode == Mode::Resume {
+            refuse_resume_over_undone_work(run, &records)?;
         }
 
         // Resume can dispatch new effects after it reaches the end of history.
@@ -3955,7 +4377,12 @@ impl Runtime {
     /// * **Quarantined.** The run holds an effect whose outcome is unknown, and
     ///   you cannot safely undo around one: compensating a payment that may
     ///   never have gone out creates a refund for money nobody took. Everything
-    ///   stays exactly where it is until a human decides. This is the rule that
+    ///   stays exactly where it is until a person supplies the fact the journal
+    ///   lacks — [`Runtime::reconcile_effect`](super::Runtime::reconcile_effect)
+    ///   and [`decide_quarantine`](super::Runtime::decide_quarantine) — and
+    ///   giving up
+    ///   ([`Abandon`](crate::core::QuarantineDecision::Abandon)) still unwinds
+    ///   nothing, because impatience is not evidence. This is the rule that
     ///   separates a saga that is honest about distributed systems from one that
     ///   tidies up and hopes.
     /// * **Suspended.** The run is healthy and waiting. Nothing has failed.
@@ -4420,98 +4847,27 @@ impl Runtime {
         out
     }
 
-    /// A mutating effect that was announced and never concluded, if there is one.
+    /// The lowest step holding an effect this journal cannot decide, if any.
     ///
-    /// An `EffectStarted` with no terminal record is the undecidable case: the
-    /// call may have landed, may not have, and the journal cannot say. Ordinarily
-    /// the run is already `Quarantined` when this is true, and a quarantined run
-    /// never unwinds.
+    /// Ordinarily the run is already `Quarantined` when this is true, and a
+    /// quarantined run never unwinds. Cancellation opens a second door into the
+    /// unwind, and it has to be shut the same way — otherwise an operator's
+    /// stop compensates every step *around* the one nobody can account for,
+    /// which is precisely the refund for money nobody took, arriving through a
+    /// control meant to make things safer.
     ///
-    /// Cancellation opens a second door into the unwind, and it has to be shut
-    /// the same way. Otherwise an operator's stop compensates every step
-    /// *around* the one nobody can account for — which is precisely the refund
-    /// for money nobody took that `NoUnwindUnderDoubt` exists to forbid, arriving
-    /// through a control meant to make things safer.
+    /// The rule itself is [`undecided_effects`](crate::journal::undecided_effects),
+    /// shared with the operator API and the offline audit. This adds only the
+    /// question the unwind asks of it: *how far back does the doubt reach*.
     async fn undecided_effect(&self, run: RunId) -> Result<Option<StepId>, RuntimeError> {
         let records = self
             .store
             .read(run, 1)
             .await
             .map_err(RuntimeError::from_store)?;
-
-        // Two shapes of doubt, and both must stop an unwind.
-        //
-        // An **orphan**: a mutating `EffectStarted` with no terminal record —
-        // the crash shape. And a **terminal `InDoubt`**: the call *concluded*,
-        // with a record saying the runtime does not know whether it reached
-        // the world. The second was invisible here for as long as only orphans
-        // were tracked, and the consequence was concrete: a run whose last
-        // attempt failed in doubt was cancelled, and the unwind compensated
-        // every step around a call that may have landed — the refund for money
-        // nobody took, issued through the control added to prevent it.
-        //
-        // A doubt is resolved by evidence, not by time: a later
-        // `EffectReconciled` that lands or clears it, or — for an effect whose
-        // declaration made repeating safe — a later attempt of the same
-        // dispatch (same step, same descriptor) that completed, which under
-        // that declaration is the same single performance finally landing.
-        let mut open: BTreeMap<crate::core::EffectKey, (StepId, EffectDescriptor)> =
-            BTreeMap::new();
-        let mut doubts: BTreeMap<crate::core::EffectKey, (StepId, EffectDescriptor)> =
-            BTreeMap::new();
-        for r in &records {
-            let Some(key) = r.effect_key() else { continue };
-            match r.kind() {
-                RecordKind::EffectStarted {
-                    mutates: true,
-                    descriptor,
-                    ..
-                } => {
-                    if let Some(step) = r.body.step {
-                        open.insert(key, (step, descriptor.clone()));
-                    }
-                }
-                RecordKind::EffectDone { .. } => {
-                    if let Some((step, descriptor)) = open.remove(&key) {
-                        // A completed attempt settles any doubted earlier
-                        // attempt of the same dispatch: the effect declared
-                        // repetition safe (or it would never have been
-                        // retried through doubt), so the landing is the one
-                        // performance resolving.
-                        doubts.retain(|_, (s, d)| !(*s == step && *d == descriptor));
-                    }
-                }
-                RecordKind::EffectFailed { disposition, .. } => {
-                    if let Some((step, descriptor)) = open.remove(&key)
-                        && *disposition == crate::core::Disposition::InDoubt
-                    {
-                        doubts.insert(key, (step, descriptor));
-                    }
-                }
-                RecordKind::EffectReconciled { disposition, .. } => {
-                    let settled = open.remove(&key);
-                    match disposition {
-                        // The probe answered: it landed, or it never happened.
-                        // Either way the doubt is resolved.
-                        crate::core::Disposition::Landed
-                        | crate::core::Disposition::DidNotHappen => {
-                            doubts.remove(&key);
-                        }
-                        // Asked, and still unknown.
-                        crate::core::Disposition::InDoubt => {
-                            if let Some(entry) = settled {
-                                doubts.insert(key, entry);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok(open
-            .values()
-            .map(|(step, _)| *step)
-            .chain(doubts.values().map(|(step, _)| *step))
+        Ok(crate::journal::undecided_effects(&records)
+            .into_iter()
+            .map(|u| u.step)
             .min())
     }
 
@@ -4939,6 +5295,11 @@ fn announce(meter: &super::metrics::Meter, run: RunId, status: &RunStatus) {
             tracing::error!(target: telemetry::QUARANTINED, %run, reason = %why);
             meter.count(metrics::QUARANTINES, "");
         }
+        // Loud, though a person asked for it. The operator who decided already
+        // knows; this reaches whoever answers for what the run left standing.
+        RunStatus::Abandoned { actor, reason } => {
+            tracing::error!(target: telemetry::ABANDONED, %run, %actor, %reason);
+        }
         RunStatus::Exhausted(limit) => {
             tracing::warn!(target: telemetry::BUDGET_REFUSED, %run, %limit);
         }
@@ -5001,7 +5362,9 @@ fn severity(status: &RunStatus) -> u8 {
         RunStatus::Quarantined(_) => 3,
         // A stop ranks with a failure, not above it: both end the run, both
         // unwind, and when they arrive together the run is over either way.
-        RunStatus::Cancelled { .. } | RunStatus::Failed(_) => 2,
+        // Abandonment is not produced by a step and never competes here; it is
+        // named so a new stop reason cannot be given a rank by omission.
+        RunStatus::Cancelled { .. } | RunStatus::Abandoned { .. } | RunStatus::Failed(_) => 2,
         RunStatus::Exhausted(_) => 1,
         // A replan request is the weakest signal in a batch: a sibling that
         // failed outright has already decided the run, and re-planning around a
@@ -5844,14 +6207,23 @@ struct Execution<'a> {
 
 /// The recorded status of a run that must not be resumed.
 ///
-/// Only two outcomes close a run to recovery:
+/// The outcomes that close a run to recovery:
 ///
 /// * **Succeeded** — there is nothing outstanding. Re-executing would repeat
 ///   work that is not an effect (a case-state write, say), which is the same
 ///   class of bug the effect protocol prevents, arriving through a side door.
-/// * **Quarantined** — a human has to look first. Resuming would re-hit
-///   whatever could not be decided, and burying that in a retry loop is exactly
-///   how an undecidable situation becomes an unnoticed one.
+/// * **Cancelled** — a stopped run stays stopped, or the next inbound event
+///   resumes it and it carries on doing the thing somebody intervened to
+///   prevent.
+/// * **Abandoned** — a person already decided there will never be an answer.
+/// * **Quarantined, until a person answers it.** Resuming an unanswered
+///   quarantine would re-hit whatever could not be decided, and burying that in
+///   a retry loop is exactly how an undecidable situation becomes an unnoticed
+///   one. A recorded [`QuarantineDecided`](RecordKind::QuarantineDecided)
+///   lifts it — the *precondition* is that a named person looked, and the
+///   verdict is still the runtime's: a reopened run re-decides from a history
+///   that now holds whatever they established, and reaches the same quarantine
+///   again if they were wrong or incomplete.
 ///
 /// A **failed** run is deliberately *not* terminal here: a process that died
 /// mid-flight records a failure, and recovering it is the entire point.
@@ -5880,9 +6252,19 @@ fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
 
     match outcome {
         "succeeded" => Some(RunStatus::Succeeded),
-        "quarantined" => Some(RunStatus::Quarantined(
-            "recorded as quarantined; a human must resolve it before it can run again".into(),
-        )),
+        "quarantined" => quarantine_decision(records).is_none().then(|| {
+            RunStatus::Quarantined(
+                "recorded as quarantined; a named person has to answer it before it can run \
+                 again — reopen it once the doubt is resolved, or abandon it"
+                    .into(),
+            )
+        }),
+        "abandoned" => Some(RunStatus::Abandoned {
+            actor: recorded_decider(records).unwrap_or_else(|| "unknown".into()),
+            reason: "recorded as abandoned; its outcome was never established and nothing was \
+                     unwound"
+                .into(),
+        }),
         // A stopped run stays stopped. Otherwise the next inbound event resumes
         // it and it carries on doing the thing somebody intervened to prevent —
         // and the intervention would look, from the journal, like it worked.
@@ -5913,6 +6295,74 @@ fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
         other => Some(RunStatus::Quarantined(format!(
             "recorded as '{other}', which this build does not recognise as resumable"
         ))),
+    }
+}
+
+/// Refuse a resume that would report success over work its own history reversed.
+///
+/// A run whose journal holds compensation-phase records is not resumable once it
+/// stands concluded. The unwind *reversed* work — a hold released, a refund
+/// issued — and a resume that replays the forward history and continues would
+/// conclude success over a world where the work was undone: the journal would
+/// say "done" about effects its own later records say were taken back.
+///
+/// Scoped to runs with a standing conclusion, deliberately: a run that is
+/// mid-unwind (a compensation suspended for four eyes, a crash between
+/// reversals) has concluded nothing, and resuming it is how the unwind finishes.
+fn refuse_resume_over_undone_work(run: RunId, records: &[Record]) -> Result<(), RuntimeError> {
+    let Some(outcome) = recorded_conclusion(records) else {
+        return Ok(());
+    };
+    if !records
+        .iter()
+        .any(|r| matches!(r.kind(), RecordKind::StepCompensated { .. }))
+    {
+        return Ok(());
+    }
+    Err(RuntimeError::PlanContract(format!(
+        "run {run} concluded '{outcome}' after compensating completed steps — the work was \
+         reversed, and resuming over undone work would report success about a world where it no \
+         longer stands. Start a fresh run"
+    )))
+}
+
+/// The person's answer standing against this run's quarantine, if there is one.
+///
+/// Scoped to what follows the **last** conclusion, so an answer is spent by the
+/// pass it authorized. A reopened run that quarantines again is quarantined
+/// again: the earlier decision was made about a history that has since moved,
+/// and reading it as standing would turn one person's judgement into a
+/// permanent licence to retry.
+fn quarantine_decision(records: &[Record]) -> Option<(crate::core::QuarantineDecision, &Record)> {
+    records
+        .iter()
+        .rev()
+        .take_while(|r| !matches!(r.kind(), RecordKind::RunConcluded { .. }))
+        .find_map(|r| match r.kind() {
+            RecordKind::QuarantineDecided { decision, .. } => Some((*decision, r)),
+            _ => None,
+        })
+}
+
+/// The abandonment this run's history asks for but has not yet recorded.
+///
+/// A decision is written before it is acted on, so a crash in between leaves
+/// the instruction standing rather than lost. This is what the next resume
+/// reads to finish the job — and it is why abandonment is not simply performed
+/// inline by the verb that requests it.
+fn pending_abandonment(records: &[Record]) -> Option<RunStatus> {
+    let (decision, record) = quarantine_decision(records)?;
+    if decision != crate::core::QuarantineDecision::Abandon {
+        return None;
+    }
+    match record.kind() {
+        RecordKind::QuarantineDecided {
+            decider, reason, ..
+        } => Some(RunStatus::Abandoned {
+            actor: decider.clone(),
+            reason: reason.clone(),
+        }),
+        _ => None,
     }
 }
 
@@ -6034,6 +6484,10 @@ fn recorded_status(
             actor: recorded_canceller(records).unwrap_or_else(|| "unknown".into()),
             reason: said(),
         },
+        "abandoned" => RunStatus::Abandoned {
+            actor: recorded_decider(records).unwrap_or_else(|| "unknown".into()),
+            reason: said(),
+        },
         // Fail closed, as the resume path does: a conclusion this build cannot
         // interpret is not permission to treat the run as ordinary.
         other => RunStatus::Quarantined(format!(
@@ -6050,6 +6504,18 @@ fn recorded_status(
 fn recorded_canceller(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|r| match r.kind() {
         RecordKind::RunCancelled { actor, .. } => Some(actor.clone()),
+        _ => None,
+    })
+}
+
+/// Who answered the quarantine, read back from the chain.
+///
+/// The twin of `recorded_canceller`, and read for the same reason: an
+/// abandonment's `RunConcluded` carries the *reason* a person gave, and the
+/// person is on the decision record that asked for it.
+fn recorded_decider(records: &[Record]) -> Option<String> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::QuarantineDecided { decider, .. } => Some(decider.clone()),
         _ => None,
     })
 }
@@ -6194,6 +6660,8 @@ pub struct RuntimeBuilder {
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    #[cfg(feature = "push")]
+    push: Option<Arc<dyn crate::push::PushStore>>,
     #[cfg(feature = "keyring")]
     keyring: Option<Arc<dyn crate::keyring::KeyRing>>,
     batches: Option<Arc<dyn crate::batch::BatchStore>>,
@@ -6423,6 +6891,23 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn outbox(mut self, outbox: Arc<crate::push::Outbox>) -> Self {
         self.outbox = Some(outbox);
+        self
+    }
+
+    /// Attach the webhook registration store.
+    ///
+    /// The same handle the A2A server and the [`Outbox`](crate::push::Outbox)
+    /// are given: this is the *durable* half of push, and it belongs to the
+    /// plane because its failures do. A receiver that answers permanently, or
+    /// stays silent past the retry ceiling, has its registration
+    /// [parked](crate::push::PushStore::park) rather than deleted — the cursor
+    /// is the only record of how far that receiver got — and a parked row is a
+    /// backlog an operator reads and re-arms on the operator API. Without this
+    /// the plane serves the delivery and cannot answer for it.
+    #[cfg(feature = "push")]
+    #[must_use]
+    pub fn push(mut self, push: Arc<dyn crate::push::PushStore>) -> Self {
+        self.push = Some(push);
         self
     }
 
@@ -7230,8 +7715,16 @@ impl RuntimeBuilder {
         // Before `seal_stores`, necessarily: sealing wraps each handle in one
         // scoped to the *plane's* tenant, after which every store agrees with
         // the plane and the question cannot be asked.
+        // Both halves of push, because either can be wired to another
+        // tenant's rows and the consequence is the same: registrations,
+        // cursors and credentials filed under a scope this plane's erasure
+        // never names.
         #[cfg(feature = "push")]
-        let push = self.outbox.as_ref().map(|o| o.store_tenant());
+        let push = self
+            .push
+            .as_ref()
+            .map(|s| s.tenant())
+            .or_else(|| self.outbox.as_ref().map(|o| o.store_tenant()));
         #[cfg(not(feature = "push"))]
         let push: Option<&str> = None;
         check_same_tenant(
@@ -7582,6 +8075,8 @@ impl RuntimeBuilder {
             identity: self.identity,
             replanner: self.replanner,
             calendar: self.calendar.unwrap_or_else(|| Arc::new(WallClock)),
+            #[cfg(feature = "push")]
+            push: self.push,
             #[cfg(feature = "push")]
             outbox: self.outbox,
             #[cfg(feature = "manifest")]
@@ -8072,10 +8567,17 @@ impl Runtime {
 /// Every `RunStatus`, so adding one forces a decision everywhere one is owed.
 ///
 /// Written out rather than derived, because Rust cannot enumerate a
-/// data-carrying enum — and a list is honest about that: the count assertion in
-/// each consumer fails the day a variant is added, which is exactly when
-/// somebody must decide whether it seals, whether it may resume, and which A2A
-/// state it surfaces as.
+/// data-carrying enum. What keeps it honest is **not** the count assertions in
+/// its consumers: those fire when somebody edits this list, which is the case
+/// that needs no help. A variant added to the enum and forgotten here changes
+/// nothing they can see, and every agreement test then walks a list that no
+/// longer describes the type — passing over the one variant nobody decided
+/// about.
+///
+/// `every_run_status_variant_is_listed` in `tests/guards` is what closes that:
+/// it reads the enum's variants and this function's arms out of the source and
+/// holds them to each other, which is the only check available for a list a
+/// language cannot derive.
 ///
 /// Crate-visible so those consumers share **one** list. Two copies would be two
 /// places to remember, and the second would be the one that went stale — which
@@ -8097,6 +8599,10 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
         RunStatus::Cancelled {
             actor: "ops".into(),
             reason: "stop".into(),
+        },
+        RunStatus::Abandoned {
+            actor: "ops".into(),
+            reason: "nobody could establish what happened".into(),
         },
     ]
 }
@@ -8130,7 +8636,7 @@ mod resume_agreement_tests {
         let statuses = every_status();
         assert_eq!(
             statuses.len(),
-            7,
+            8,
             "a RunStatus variant was added or removed — decide whether it seals \
              and whether a resume may continue from it, then update this list"
         );
@@ -8192,6 +8698,35 @@ mod resume_agreement_tests {
                 super::SEALED_OUTCOMES.contains(&special),
                 "'{special}' is sealed at birth by the sweeper or a break-glass \
                  crossing and must be exportable"
+            );
+        }
+    }
+
+    /// The offline sweep covers every ending, plus the backlog that is not one.
+    ///
+    /// Held to `SEALED_OUTCOMES` rather than restated, because the failure this
+    /// prevents is silent in exactly the artifact nobody re-reads: an ending
+    /// added to the runtime and not to the export drops those runs from the
+    /// file an auditor is handed, and the file looks complete.
+    #[test]
+    fn the_offline_sweep_covers_every_ending_and_the_quarantine_backlog() {
+        for outcome in super::SEALED_OUTCOMES {
+            assert!(
+                super::OUTCOMES_OF_RECORD.contains(outcome),
+                "'{outcome}' is an ending this plane can reach and the export's \
+                 default sweep would silently omit it"
+            );
+        }
+        assert!(
+            super::OUTCOMES_OF_RECORD.contains(&"quarantined"),
+            "a quarantine is the plane's outstanding unresolved risk and the one \
+             thing an auditor is most likely to have come for"
+        );
+        for open in ["failed", "exhausted", "suspended"] {
+            assert!(
+                !super::OUTCOMES_OF_RECORD.contains(&open),
+                "'{open}' is work in progress that a resume moves on its own — \
+                 exporting it is a snapshot of a moving target, not a record"
             );
         }
     }

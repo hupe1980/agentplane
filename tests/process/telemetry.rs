@@ -319,6 +319,53 @@ async fn an_undecidable_outcome_emits_its_event() {
     );
 }
 
+/// **Writing off an unexplained mutation is announced too.**
+///
+/// A person decided it, so an alert cannot tell them anything they do not know
+/// — and they are not the audience. Whoever answers for what the run left
+/// standing is somewhere else, and an intervention visible only to the person
+/// who made it is not oversight. The lasting record is the `agentplane audit`
+/// finding; this is the notification that one now exists.
+#[tokio::test]
+async fn abandoning_a_quarantined_run_emits_its_event() {
+    let rec = Recorder::default();
+    let (_s, rt) = runtime(Scripted {
+        mutates: true,
+        recovery: Recovery::RequiresOperator,
+        fails: Some("timeout"),
+    });
+
+    let _ambient = crate::ambient_subscriber();
+    let out = rt
+        .run("demo.one", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(out.status, RunStatus::Quarantined(_)));
+
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let closed = rt
+        .decide_quarantine(
+            out.run_id,
+            "ada",
+            "two weeks of provider tickets; nobody can say",
+            agentplane::core::QuarantineDecision::Abandon,
+        )
+        .await
+        .unwrap();
+    drop(guard);
+    assert!(matches!(
+        closed.status,
+        agentplane::runtime::RunStatus::Abandoned { .. }
+    ));
+
+    let events = rec.events();
+    assert!(
+        events.iter().any(|e| e == telemetry::ABANDONED),
+        "expected `{}`, got {events:?}",
+        telemetry::ABANDONED
+    );
+}
+
 /// A budget refusal is announced.
 #[tokio::test]
 async fn a_budget_refusal_emits_its_event() {

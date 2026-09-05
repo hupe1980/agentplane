@@ -1016,6 +1016,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         spend: agentplane::core::Spend::default(),
                         detail: None,
                         declared: Some(agentplane::core::DeclaredOutput::untrusted()),
+                        asserted_by: None,
                     },
                 )
                 .case(case),

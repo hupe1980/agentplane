@@ -1487,6 +1487,10 @@ fn every_conclusion_but_success_carries_a_reason() {
             until: agentplane::core::Timestamp::from_unix_timestamp(1_800_000_000).unwrap(),
         }),
         RunStatus::Exhausted(BudgetExceeded::Steps { allowed: 3 }),
+        RunStatus::Abandoned {
+            actor: "ops".into(),
+            reason: "the provider has no record either way".into(),
+        },
     ];
 
     for status in statuses {
@@ -1501,6 +1505,7 @@ fn every_conclusion_but_success_carries_a_reason() {
             | RunStatus::Quarantined(_)
             | RunStatus::Replanning(_)
             | RunStatus::Cancelled { .. }
+            | RunStatus::Abandoned { .. }
             | RunStatus::Suspended(_)
             | RunStatus::Exhausted(_) => {
                 let text = reason.unwrap_or_else(|| {

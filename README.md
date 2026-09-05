@@ -2,9 +2,16 @@
 
 **A durable, replayable, policy-governed runtime for AI agents — in Rust.** 🦀
 
+[![crates.io](https://img.shields.io/crates/v/agentplane.svg)](https://crates.io/crates/agentplane)
+[![API docs](https://img.shields.io/docsrs/agentplane)](https://docs.rs/agentplane)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#-license)
 [![Status](https://img.shields.io/badge/status-pre--alpha-orange)](#-status)
 [![MSRV](https://img.shields.io/badge/rustc-1.94.1%2B-lightgrey)](#-status)
+
+**[Documentation](https://hupe1980.github.io/agentplane/docs/) ·
+[Getting started](https://hupe1980.github.io/agentplane/docs/getting-started/) ·
+[API reference](https://docs.rs/agentplane) ·
+[What is built](https://hupe1980.github.io/agentplane/docs/status/)**
 
 Not a prompt framework. Not an agent library. The layer *beneath* those — the
 thing that makes an agent's actions survivable, auditable, and governable when it
@@ -62,6 +69,9 @@ cargo run --example effect_group       # calls that take together, or not at all
 cargo run --example memory_run         # private/team memory, provenance, recall
 cargo run --example budget_pause       # a ceiling pauses the run; a raise
                                         # resumes it, on the record, nothing repeated
+cargo run --example answered_doubt     # a call nobody can account for: a person
+                                        # supplies the fact, the runtime keeps the
+                                        # verdict, and giving up leaves a finding
 cargo run --example operator_stop      # cancel a run and it unwinds; halt a
                                         # tenant, an agent or one revision, and
                                         # nothing new starts
@@ -202,9 +212,16 @@ agentplane serve examples/served.yaml \
 
 Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too —
 the worklist and task decisions, plus the backlogs an on-call person asks for by
-question rather than by id: what is quarantined, what is escalated, and what
-obligations were missed ([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for))
-— on their **own** listener, off
+question rather than by id: what is quarantined, what is escalated, which
+obligations were missed, which messages reached nobody, and which webhook
+receivers stopped accepting ([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for)).
+Each backlog has a verb that empties it, including the hard one: a run stopped
+on an effect nobody can account for names the call, takes a person's answer
+about what actually happened, and is then judged again by the runtime — or
+written off, in which case what it left standing becomes an audit finding rather
+than leaving with the status
+([answering a quarantine](https://hupe1980.github.io/agentplane/docs/operations/#answering-a-quarantine)).
+On their **own** listener, off
 unless asked for, and separated from the peer surface by *policy* (`peer` reaches
 `a2a:*`, `operator` reaches `api:*`) rather than by the port. A served plane also
 sweeps deadlines, task expiry, dead letters, due timers **and abandoned runs**

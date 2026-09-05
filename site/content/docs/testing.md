@@ -1,7 +1,10 @@
 +++
 title = "Testing agents"
 description = "A fake provider, deterministic fault injection, a store conformance battery, and the assertion that proves replay actually replayed."
-weight = 12
+weight = 7
+
+[extra]
+group = "Build"
 +++
 
 Most agent frameworks are hard to test for one reason: the interesting behaviour

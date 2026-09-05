@@ -209,6 +209,7 @@ examples:
     cargo run --example media_run --features redb,testkit,media
     cargo run --example memory_run
     cargo run --example budget_pause
+    cargo run --example answered_doubt
     cargo run --example operator_stop
     cargo run --example recovered_run
     cargo run --example manifest_run --features redb,testkit,manifest

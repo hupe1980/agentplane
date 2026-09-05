@@ -176,8 +176,10 @@ fn fixture_with(policy: &Arc<Recording>) -> Fixture {
         .events(store.clone() as Arc<dyn EventStore>)
         .tasks(store.clone() as Arc<dyn TaskStore>)
         .policy(policy.clone() as Arc<dyn PolicyEngine>)
-        .skill(ProposesRefund)
-        .build();
+        .skill(ProposesRefund);
+    #[cfg(feature = "push")]
+    let rt = rt.push(store.clone() as Arc<dyn agentplane::push::PushStore>);
+    let rt = rt.build();
     Fixture { store, rt }
 }
 
@@ -735,13 +737,32 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
     let task = f.pending_task().await;
     let router = f.router();
 
-    for req in [
+    let mut requests = vec![
         get("/runs?outcome=quarantined", None),
         get("/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV", None),
         post(
             "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/cancel",
             None,
             &json!({ "reason": "stop" }),
+        ),
+        post(
+            "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/reopen",
+            None,
+            &json!({ "reason": "checked the provider" }),
+        ),
+        post(
+            "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/abandon",
+            None,
+            &json!({ "reason": "nobody can tell" }),
+        ),
+        post(
+            "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/reconcile",
+            None,
+            &json!({
+                "effect": "0".repeat(64),
+                "disposition": "did_not_happen",
+                "note": "the provider has no record"
+            }),
         ),
         get("/tasks", None),
         get(&format!("/tasks/{task}"), None),
@@ -758,7 +779,17 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
             None,
             &json!({ "id": "e", "kind": "k", "correlation": [], "payload": {} }),
         ),
-    ] {
+        get("/dead-letters", None),
+    ];
+    // Served only when the feature that carries webhook delivery is compiled
+    // in, so the walk asks about them only then — a 404 for a route that does
+    // not exist is not a gate refusing anybody.
+    #[cfg(feature = "push")]
+    requests.extend([
+        get("/push", None),
+        post("/push/rearm", None, &json!({ "run": "r", "id": "d" })),
+    ]);
+    for req in requests {
         let uri = req.uri().to_string();
         let (status, _) = send(&router, req).await;
         assert_eq!(
@@ -787,12 +818,31 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
     let f = fixture_with(&policy);
     let router = f.router();
 
-    for req in [
+    let mut requests = vec![
         get("/runs/not-an-id", Some("bob")),
         post(
             "/runs/not-an-id/cancel",
             Some("bob"),
             &json!({ "reason": "stop" }),
+        ),
+        post(
+            "/runs/not-an-id/reopen",
+            Some("bob"),
+            &json!({ "reason": "checked the provider" }),
+        ),
+        post(
+            "/runs/not-an-id/abandon",
+            Some("bob"),
+            &json!({ "reason": "nobody can tell" }),
+        ),
+        post(
+            "/runs/not-an-id/reconcile",
+            Some("bob"),
+            &json!({
+                "effect": "0".repeat(64),
+                "disposition": "did_not_happen",
+                "note": "the provider has no record"
+            }),
         ),
         get("/tasks", Some("bob")),
         get("/tasks/not-an-id", Some("bob")),
@@ -822,7 +872,18 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         get("/runs", Some("bob")),
         get("/cases", Some("bob")),
         get("/obligations", Some("bob")),
-    ] {
+        get("/dead-letters", Some("bob")),
+    ];
+    #[cfg(feature = "push")]
+    requests.extend([
+        get("/push", Some("bob")),
+        post(
+            "/push/rearm",
+            Some("bob"),
+            &json!({ "run": "not-an-id", "id": "d" }),
+        ),
+    ]);
+    for req in requests {
         let uri = req.uri().to_string();
         let (status, body) = send(&router, req).await;
         assert_eq!(
@@ -1085,6 +1146,126 @@ async fn an_unknown_run_is_not_confused_with_a_malformed_one() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ── The backlogs an alert points at ─────────────────────────────────────────
+
+/// A dead letter is readable by the person the alert reaches.
+///
+/// `agentplane.event.dead_lettered` says *how many* messages arrived and found
+/// nobody; the index behind it named them and nothing served it, so an operator
+/// holding the alert had to open the database. A count with no listing behind
+/// it is detection without delivery.
+///
+/// And the listing is the *diagnosis*, not the message: a dead letter means a
+/// correlation key does not match what a run subscribed to, so the keys are
+/// what it carries — and the counterparty's payload is what it does not.
+#[tokio::test]
+async fn a_dead_letter_is_readable_and_carries_no_payload() {
+    use agentplane::core::{InboundEvent, Timestamp};
+
+    let f = fixture();
+    let events = f.store.clone() as Arc<dyn EventStore>;
+    let arrived = Timestamp::from_unix_timestamp(1_700_000_000).unwrap();
+    let event = InboundEvent {
+        source: "acme.erp".into(),
+        id: "MSG-1".into(),
+        kind: "acknowledgement.received".into(),
+        correlation: vec![CorrelationKey::new("document", "INV-9")],
+        payload: json!({ "iban": "DE02120300000000202051" }),
+    };
+    events.buffer(&event, arrived).await.unwrap();
+    let retired = events
+        .sweep_unclaimed(
+            Timestamp::from_unix_timestamp(1_700_000_600).unwrap(),
+            "no run claimed this event within the grace window",
+        )
+        .await
+        .unwrap();
+    assert_eq!(retired, 1);
+
+    let (status, body) = send(&f.router(), get("/dead-letters", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let letter = &body["dead_letters"][0];
+    assert_eq!(letter["source"], "acme.erp");
+    assert_eq!(letter["id"], "MSG-1");
+    assert_eq!(letter["correlation"][0]["value"], "INV-9");
+    assert!(
+        letter["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "an operator needs the sweep's own words: {letter}"
+    );
+    assert_eq!(body["truncated"], false);
+    assert!(
+        !body.to_string().contains("DE02120300000000202051"),
+        "the counterparty's payload has no business on a diagnostic listing: {body}"
+    );
+}
+
+/// A parked webhook registration is listed, and re-arming one is answered
+/// honestly.
+///
+/// Parking exists so the cursor survives a receiver that stopped accepting
+/// deliveries — its own docs call that "the difference between a backlog an
+/// operator can act on and a warning line in yesterday's logs", and until this
+/// route neither the listing nor the re-arm had a caller anywhere.
+#[cfg(feature = "push")]
+#[tokio::test]
+async fn a_parked_registration_is_listed_and_re_armed() {
+    use agentplane::core::Secret;
+    use agentplane::push::{PushConfig, PushStore};
+
+    let f = fixture();
+    let push = f.store.clone() as Arc<dyn PushStore>;
+    let run = agentplane::core::RunId::generate();
+    let config = PushConfig {
+        id: "receiver-1".into(),
+        task: run,
+        url: "https://receiver.example/hook".into(),
+        token: Some(Secret::new("a-correlation-secret")),
+        authentication: None,
+    };
+    push.put(&config, 1).await.unwrap();
+    push.park(run, "receiver-1", "410 Gone").await.unwrap();
+
+    let router = f.router();
+    let (status, body) = send(&router, get("/push", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["parked"][0]["config"]["id"], "receiver-1");
+    assert_eq!(body["parked"][0]["last_error"], "410 Gone");
+    assert!(
+        !body.to_string().contains("a-correlation-secret"),
+        "a listing is not where a receiver's token is handed back: {body}"
+    );
+
+    let (status, body) = send(
+        &router,
+        post(
+            "/push/rearm",
+            Some("bob"),
+            &json!({ "run": run.to_string(), "id": "receiver-1" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rearmed"], true, "{body}");
+    assert!(
+        push.parked(10).await.unwrap().is_empty(),
+        "re-arming has to take it off the backlog it was on"
+    );
+
+    // Already live: an answer, not a silence. An operator told nothing waits
+    // for a sweep that has nothing to do.
+    let (status, body) = send(
+        &router,
+        post(
+            "/push/rearm",
+            Some("bob"),
+            &json!({ "run": run.to_string(), "id": "receiver-1" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rearmed"], false, "{body}");
 }
 
 /// A mistyped id is a 404, a state refusal a 409 — never one status for both.

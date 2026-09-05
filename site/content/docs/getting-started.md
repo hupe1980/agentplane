@@ -2,6 +2,9 @@
 title = "Getting started"
 description = "Fifteen minutes from nothing to a run that survives a crash, replays exactly, and refuses to rewrite its own history."
 weight = 1
+
+[extra]
+group = "Start here"
 +++
 
 Fifteen minutes from nothing to a run that survives a crash, replays exactly, and
@@ -13,7 +16,7 @@ does not build, that is a bug worth reporting.
 
 ---
 
-## 1. See it work first 👀
+## 1. See it work first 👀 {#see-it-work-first}
 
 Before writing anything, run the thing that demonstrates the whole claim:
 
@@ -49,7 +52,7 @@ Read those five lines slowly, because they are the product:
   not silently accepted, and it is not a crash to recover from. Changing code and
   crashing are different things, and only one of them is recoverable.
 
-## 2. Add the crate 📦
+## 2. Add the crate 📦 {#add-the-crate}
 
 ```sh
 cargo add agentplane
@@ -354,7 +357,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `keyring-vault` | a key ring that is somebody else: HashiCorp Vault's transit engine over its HTTP API, so the wrapping key never leaves Vault |
 | `testkit` | fault injection, store conformance, and a fake model provider that can stream — so an observer is testable without a key or a network |
 
-## 3. Write a skill 🛠️
+## 3. Write a skill 🛠️ {#write-a-skill}
 
 A skill is one unit of work. It gets a `StepCtx`, which is how it reaches
 anything non-deterministic.
@@ -409,7 +412,7 @@ the lattice is a decision that gets journaled. See
 lint. Anything non-deterministic goes through `cx`, which journals it — and that
 is exactly what makes replay possible.
 
-## 4. Run it ▶️
+## 4. Run it ▶️ {#run-it}
 
 ```rust
 // Everything below is already in scope from the prelude imported above.
@@ -466,7 +469,7 @@ would have been written, and never shown to anyone — you would have got
 This exact skill and run is on disk as a runnable file — `cargo run --example
 hello_skill` — so the shape above is something you execute, not only read.
 
-## 5. Do something to the outside world 🌍
+## 5. Do something to the outside world 🌍 {#do-something-to-the-outside-world}
 
 The point of the journal is effects. Here is a tool call:
 
@@ -527,7 +530,7 @@ let args = cx.release(
 This asks policy under `data:release`, retains provenance, and journals the
 releaser, scope, destination, basis and evidence. It never returns a bare value.
 
-## 6. Wait for a human ⏸️
+## 6. Wait for a human ⏸️ {#wait-for-a-human}
 
 ```rust
 let decision = cx.task(
@@ -542,7 +545,7 @@ The run **suspends**. Its frame goes to disk and the task is dropped — a
 suspended run costs bytes, not a thread, so a plane can hold 10⁵ of them waiting
 for approval. When someone decides, the run resumes exactly where it was.
 
-## 7. Test it 🧪
+## 7. Test it 🧪 {#test-it}
 
 The `testkit` feature gives you a model provider with no model behind it, so a
 test can exercise the whole path with no key and no network:
@@ -574,7 +577,7 @@ Chunking keeps the separator on the preceding chunk, so concatenating every delt
 reproduces the completion byte for byte — the property an observer appending into
 a buffer depends on, and the one an assertion on chunk *count* would miss.
 
-## Where next 🧭
+## Where next 🧭 {#where-next}
 
 Pick the example for the question you have; none needs credentials or network:
 
@@ -612,12 +615,21 @@ Pick the example for the question you have; none needs credentials or network:
 | 🔐 | [Security model](@/docs/security.md) — the trust boundary and its limits |
 | ⚙️ | [Operations](@/docs/operations.md) — running it for real |
 
-## Troubleshooting 🔧
+## Troubleshooting 🔧 {#troubleshooting}
 
 **`Quarantined("non-determinism at seq …")`** — the code changed since the
 journal was written, and replay found a different effect than history records.
 That is the mechanism working. Use `Mode::Resume` for crash recovery of the
 *same* build; a changed build replaying old history is divergence, not recovery.
+
+**`Quarantined(…)` on an effect nobody can account for** — a call was announced
+and the runtime never learned whether it landed, so nothing unwinds. A resume
+will reach the same conclusion, because the missing piece is a *fact*, not a
+retry. `GET /runs/{id}` lists the effects in doubt; look one up in the system
+that would know, record the answer, and hand the run back — or write it off, in
+which case what it left standing becomes an audit finding rather than
+disappearing with the status. The whole protocol is
+[Answering a quarantine](@/docs/operations.md#answering-a-quarantine).
 
 **`StepError::Denied`** — the policy engine refused. The journal has the reason;
 what the *model* is told is one uniform sentence on purpose, because a precise

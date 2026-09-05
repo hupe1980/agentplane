@@ -1580,6 +1580,10 @@ impl<'a> StepCtx<'a> {
                 output,
                 spend,
                 detail,
+                // The effect asked its own provider. Nobody asserted anything,
+                // and naming the run here would attribute a machine's answer to
+                // a person.
+                asserted_by: None,
             },
         )
         .await?;
@@ -2822,8 +2826,9 @@ impl<'a> StepCtx<'a> {
         // and they compose — a sealed record is still a record, and a key ring
         // is still an operational dependency, so a deployment may want both.
         // Checked here, before the announcement, so the refusal costs nothing —
-        // and absent by default, because every deployment before this field had
-        // no ceiling and silence must not start refusing their traffic.
+        // and absent by default, because silence is not a ceiling: a
+        // deployment that never declared one must not have its traffic refused
+        // by an option it did not ask for.
         //
         // Judged over the **base** label, not the effective one: what may be
         // written down is a storage question, and a release is for a

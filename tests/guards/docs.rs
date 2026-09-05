@@ -1803,6 +1803,137 @@ fn the_readme_links_every_documentation_page() {
     }
 }
 
+/// **Every published page belongs to a navigation group somebody declared.**
+///
+/// The sidebar and the documentation hub are built by walking
+/// `config.extra.doc_groups` and printing the pages that name each one. A page
+/// whose `extra.group` is missing, or is a group not on that list, is rendered
+/// by neither — it stays published, indexed and reachable by URL, and vanishes
+/// from every route a reader actually takes.
+///
+/// That is the failure mode of *any* grouped navigation, and it is silent: the
+/// page builds, the link checker is happy, and the only symptom is nobody
+/// arriving.
+#[test]
+fn every_documentation_page_is_in_the_navigation() {
+    let config = read("site/config.toml");
+    let groups: Vec<String> = config
+        .lines()
+        .find_map(|l| l.strip_prefix("doc_groups = ["))
+        .expect("site/config.toml declares doc_groups")
+        .trim_end_matches(']')
+        .split(',')
+        .map(|g| g.trim().trim_matches('"').to_owned())
+        .collect();
+    assert!(groups.len() > 2, "got {groups:?}");
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("site/content/docs");
+    let mut pages = 0usize;
+    for path in std::fs::read_dir(&root)
+        .expect("read site/content/docs")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "md"))
+    {
+        let stem = path.file_stem().expect("a named page").to_string_lossy();
+        if stem == "_index" {
+            continue;
+        }
+        pages += 1;
+        let text = std::fs::read_to_string(&path).expect("a page");
+        let declared = text
+            .lines()
+            .find_map(|l| l.strip_prefix("group = "))
+            .map(|g| g.trim().trim_matches('"').to_owned());
+        let Some(group) = declared else {
+            panic!(
+                "site/content/docs/{stem}.md declares no `extra.group`, so it appears in \
+                 neither the sidebar nor the documentation hub — published and unreachable \
+                 by every route a reader takes"
+            );
+        };
+        assert!(
+            groups.contains(&group),
+            "site/content/docs/{stem}.md is in group '{group}', which \
+             `config.extra.doc_groups` does not list ({groups:?}) — the page renders in \
+             no navigation at all"
+        );
+    }
+    assert!(pages > 10, "found only {pages} pages — wrong tree");
+}
+
+/// **A heading with an emoji in it names its own anchor.**
+///
+/// Zola slugifies an emoji to its Unicode name, so `## 🎲 Disposition` becomes
+/// `#5-game-die-disposition` and `## 📤 Emit an event` becomes
+/// `#outbox-tray-emit-an-event`. Three consequences, and the third is what
+/// makes this a guard rather than a preference:
+///
+/// * The URL a reader copies out of the address bar reads as broken.
+/// * A search engine shows anchor links as jump-to targets, so the nonsense is
+///   what a result page displays.
+/// * **It is not stable.** The id changes if the emoji changes, if the emoji is
+///   dropped, or if Zola's table is updated — and three hand-written links in
+///   this repository already pointed at anchors that had moved out from under
+///   them, which is how this was found.
+///
+/// The fix is one the author sees while writing: give the heading an explicit
+/// `{#id}`. The emoji stays; only the anchor stops being derived from it.
+#[test]
+fn every_emoji_heading_names_its_own_anchor() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("site/content");
+    let mut derived = Vec::new();
+    let mut checked = 0usize;
+
+    for path in walk_markdown(&root) {
+        let text = std::fs::read_to_string(&path).expect("a page");
+        for (n, line) in text.lines().enumerate() {
+            let Some(rest) = line.strip_prefix("##") else {
+                continue;
+            };
+            checked += 1;
+            // Anything outside the Basic Multilingual Plane, plus the ranges
+            // that carry the symbols and dingbats a heading actually uses.
+            let has_emoji = rest.chars().any(|c| {
+                matches!(c, '\u{2190}'..='\u{27bf}' | '\u{2b00}'..='\u{2bff}' | '\u{fe0f}')
+                    || c as u32 >= 0x1_f000
+            });
+            if has_emoji && !line.contains("{#") {
+                derived.push(format!("{}:{}  {}", path.display(), n + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        checked > 100,
+        "found only {checked} headings — the guard is reading the wrong tree \
+         rather than passing"
+    );
+    assert!(
+        derived.is_empty(),
+        "these headings let Zola name their anchor from an emoji, which produces \
+         an unguessable id that changes when the emoji does:\n  {}",
+        derived.join("\n  ")
+    );
+}
+
+/// Every markdown page under a directory, recursively.
+fn walk_markdown(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(walk_markdown(&path));
+        } else if path.extension().is_some_and(|x| x == "md") {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// **The changelog uses the vocabulary it says it uses, and ships nothing it
 /// does not carry.**
 ///

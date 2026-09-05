@@ -1,7 +1,10 @@
 +++
 title = "Architecture"
 description = "The determinism boundary, module layout, replay modes and canonical bytes — how the pieces of the agent runtime fit together."
-weight = 6
+weight = 8
+
+[extra]
+group = "How it works"
 +++
 
 How the runtime is put together, and where each mechanism lives.
@@ -153,14 +156,19 @@ two graphs that meet only in the checks this crate happens to have written.
 `Strict` performs nothing and therefore neither loads nor compares policy, which
 keeps offline verification independent of historical evaluator availability.
 
-**A succeeded or quarantined run is closed to resume.** Succeeded means nothing
-is outstanding, and re-executing would repeat work that is not an effect — a
-case-state write, say — which is the same class of bug the effect protocol
-prevents, arriving through a side door: the replay cursor is exhausted from the
-first instruction, so every step looks live. Quarantined means a human has to
-look first; resuming would re-hit whatever could not be decided, and burying that
-in a retry loop is how an undecidable situation becomes an unnoticed one. A
-*failed* run is deliberately still resumable — that is what crash recovery is.
+**A succeeded run is closed to resume**, and so is a cancelled or abandoned one.
+Succeeded means nothing is outstanding, and re-executing would repeat work that
+is not an effect — a case-state write, say — which is the same class of bug the
+effect protocol prevents, arriving through a side door: the replay cursor is
+exhausted from the first instruction, so every step looks live. A *failed* run
+is deliberately still resumable — that is what crash recovery is.
+
+**A quarantined run is closed until a person answers it.** Resuming an
+unanswered one would re-hit whatever could not be decided, and burying that in a
+retry loop is how an undecidable situation becomes an unnoticed one. What lifts
+it is a journaled decision by a named person, and the verdict is still the
+runtime's: a reopened run re-derives its outcome from a history that now holds
+whatever they established, and quarantines again if it does not settle.
 
 That is the desired outcome, not a limitation. Continuing would graft new
 behaviour onto a history that never produced it, and the resulting audit trail

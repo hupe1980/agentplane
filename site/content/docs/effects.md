@@ -1,7 +1,10 @@
 +++
 title = "The effect protocol"
 description = "At-most-once outward calls: intent before action, unknown outcomes that stay unknown, sagas, transactional effect groups, and what stopping a run does."
-weight = 7
+weight = 9
+
+[extra]
+group = "How it works"
 +++
 
 Every outward call — a model completion, a tool call, a clock read, a payment —
@@ -235,9 +238,14 @@ payment that may never have gone out creates a refund for money nobody took, and
 undoing everything *except* the one thing nobody can account for leaves a worse
 mess than stopping. So a quarantined run compensates nothing. A suspended run
 does not unwind either — it is healthy and waiting. Cancellation obeys the same
-rule from the other direction: a cancel refuses to unwind through recorded
-doubt, because "stop" must not manufacture a reversal for work nobody can
-account for.
+rule from the other direction: a cancel against a quarantined run is *refused*,
+because "stop" promises to put the world back and that is the one thing this run
+may not do.
+
+Which is why a quarantine has verbs of its own. A person supplies the fact the
+journal lacks, the runtime still supplies the verdict, and giving up is a
+recorded ending that unwinds nothing — see
+[Answering a quarantine](@/docs/operations.md#answering-a-quarantine).
 
 What *does* unwind: `Failed`, and `Cancelled`. **Exhaustion does not** — it is
 a pause, not a fault. The run did what it was told, and what it was told

@@ -1,7 +1,10 @@
 +++
 title = "Operations"
 description = "Deploying, high availability, retention, observability, and a runbook for every state a run can get stuck in."
-weight = 16
+weight = 17
+
+[extra]
+group = "Operate"
 +++
 
 Running this for real: topologies, the store contract, the background sweep,
@@ -395,9 +398,11 @@ curl -H "$AUTH" 'https://plane/runs?outcome=quarantined'   # history you cannot 
 curl -H "$AUTH" 'https://plane/cases?status=escalated'     # matters somebody must pick up
 curl -H "$AUTH" 'https://plane/obligations'                # windows we missed
 curl -H "$AUTH" 'https://plane/tasks'                      # decisions waiting on me
+curl -H "$AUTH" 'https://plane/dead-letters'               # messages that reached nobody
+curl -H "$AUTH" 'https://plane/push'                       # receivers that stopped accepting
 ```
 
-All four page the same way: `truncated` says whether there is more, and the
+All six page the same way: `truncated` says whether there is more, and the
 order puts the item you are most likely to want first — newest for runs and
 cases, longest-overdue for obligations. **Ascending order is not an option** for
 a bounded query: it is a page that stops changing, so a plane whose backlog
@@ -408,8 +413,10 @@ is the one that never appears.
 in the same transaction, so it rebuilds from the chain and is never an
 authority. **The last conclusion wins** — a failed run moves to `succeeded` when
 a resume concludes it, so the failed backlog drains. Failure does not seal: a
-failed or exhausted run stays open and resumable, and only succeeded,
-quarantined and cancelled freeze the journal.
+failed, exhausted or quarantined run stays open, and only succeeded, cancelled
+and abandoned freeze the journal. A quarantine is a pause rather than an
+ending — the runtime is saying it does not know — and freezing its chain would
+lock out the one record that answers it.
 
 The single-run view's `sealed` field is backed by Merkle inclusion, not by the
 presence of `RunConcluded`. That distinction is observable: a failed run has a
@@ -428,8 +435,22 @@ answered. It reads the obligation's own row rather than the case's status, so it
 still answers after the matter is closed — closure is when people stop looking,
 which is when the record has to stand on its own.
 
-**Grant the read verbs explicitly.** `api:run.list`, `api:case.list` and
-`api:obligation.list` are what an on-call person needs, and an allowlist built
+`/dead-letters` and `/push` are the two backlogs that are **diagnoses rather
+than work items**, and both carry less than the store holds. A dead letter means
+a correlation key does not match what a run subscribed to, so the listing gives
+the identity and the keys and *not* the message body — that is the
+counterparty's content, and on a sealed plane it is not even readable without a
+key. A parked registration gives its config
+[redacted](https://docs.rs/agentplane/latest/agentplane/push/struct.PushConfig.html#method.redacted),
+because the token a receiver registered is its own correlation secret and a
+listing is not where it is handed back. `POST /push/rearm` answers
+`rearmed: false` when nothing was parked under that name — already live, or
+never there — rather than reporting success to somebody who would then wait for
+a sweep with nothing to do.
+
+**Grant the read verbs explicitly.** `api:run.list`, `api:case.list`,
+`api:obligation.list`, `api:deadletter.list` and `api:push.list` are what an
+on-call person needs, and an allowlist built
 from route names alone will miss them; under a default-deny engine an ungranted
 verb means the backlog is refused to everybody. Enumerate `action::ALL` when
 writing rules rather than reading the route table. `api:obligation.list` is
@@ -437,6 +458,112 @@ separate from `api:case.list` so a compliance function can be given *what did we
 miss* without the contents of every matter, and `api:task.takeover` is separate
 from `api:task.claim` so displacing an absent colleague can go to a queue lead
 without going to every reviewer.
+
+### Answering a quarantine {#answering-a-quarantine}
+
+A quarantine is the runtime saying **it does not know**. An effect was
+announced, the process died or the provider went quiet, and whether the call
+reached the world is unanswerable from the journal — so nothing unwinds,
+because compensating around an unknown outcome is a refund for money nobody
+took.
+
+That is the one conclusion a resume cannot clear, and the only backlog whose
+level moves because a *person* moved it. Three verbs, and they are deliberately
+three: supplying a fact is not deciding a run, and deciding a run is not
+declaring its outcome.
+
+**1 — Find out what is in doubt.** The run view names the call, not just the
+situation:
+
+```sh
+curl -H "$AUTH" https://plane/runs/$RUN
+```
+
+```json
+{
+  "run": "run_01K…", "status": "quarantined",
+  "reason": "the provider could not establish whether the call landed",
+  "undecided": [
+    { "effect": "9f2c…", "step": 1, "phase": "forward",
+      "kind": "tool://payments/charge", "doubt": "inconclusive" }
+  ]
+}
+```
+
+`doubt` says where to start looking. `announced` means the runtime never heard
+back — the crash shape, nothing known beyond the fact that the request left.
+`inconclusive` means something *did* report and could not tell, so there is a
+message to read and a provider that has already been asked once.
+
+**2 — Say what actually happened.** Look the call up in the system that would
+know, and record the answer:
+
+```sh
+curl -H "$AUTH" -X POST https://plane/runs/$RUN/reconcile -d '{
+  "effect": "9f2c…",
+  "disposition": "landed",
+  "output": { "charge_id": "ch_9RtQ", "captured": true },
+  "note": "charge ch_9RtQ exists in the provider console, created 12:41Z"
+}'
+```
+
+`did_not_happen` needs no output and leaves the effect safe to perform again.
+`landed` carries the result the run reads back. Three rules are worth knowing
+before you use it:
+
+- **It supplies a missing fact and never replaces a recorded one.** Only an
+  effect listed under `undecided` may be answered. Anything else is a `409` —
+  otherwise an operator could talk a run out of compensating work that is
+  standing in the world, and the journal would show an orderly reconciliation
+  while it happened.
+- **Your name is on it.** The record is the same `EffectReconciled` a probe
+  writes, plus `asserted_by`. "The provider told us" and "somebody asserted it"
+  are different evidence and the chain keeps them apart.
+- **The value you supply is untrusted.** Every other output in this runtime is
+  labelled by the effect that produced it; there is no effect here, and you are
+  not the provider that returned it. So it takes the conservative point of the
+  lattice, and a run that needed that output to be trusted will be refused at
+  its next gate and unwind. That is the honest ending — the alternative would
+  make this the one place in the design where a person declassifies by typing.
+
+**3 — Hand it back, or write it off.**
+
+```sh
+curl -H "$AUTH" -X POST https://plane/runs/$RUN/reopen  -d '{"reason":"charge confirmed in provider ledger"}'
+curl -H "$AUTH" -X POST https://plane/runs/$RUN/abandon -d '{"reason":"two weeks of provider tickets; nobody can say"}'
+```
+
+`reopen` does not declare an outcome. It hands the run back to the runtime,
+which re-derives its verdict from a history that now holds what you
+established — and quarantines it again, on the record, if the answer was wrong
+or incomplete. The response is what the run actually reached, so you learn
+immediately rather than polling. One decision authorizes one pass: a run that
+quarantines again needs a fresh one.
+
+`abandon` closes it where it stands. **Nothing is unwound** — the world keeps
+whatever the run left in it, because unwinding around an unknown outcome is
+exactly what quarantine exists to forbid and impatience is not evidence. The
+run seals as `abandoned` and leaves the quarantine backlog.
+
+**The doubt does not leave with it.** Abandoning takes the run off the only
+listing that carried it, so what it left standing becomes an `agentplane audit`
+finding derived from the journal, where no later action can clear it:
+
+```text
+run run_01K… is sealed but effect 9f2c… (step 1, inconclusive) never reached a
+known outcome — nothing may resume a sealed run, so whether the call changed the
+outside world is permanently undecided
+```
+
+Cancelling a quarantined run is **refused**, not recorded. `cancel` promises to
+unwind and put the world back, which is the one thing a run holding an unknown
+outcome may not do; the refusal names these two verbs instead.
+
+Three verbs, three policy actions: `api:effect.reconcile`, `api:run.reopen`,
+`api:run.abandon`. Keep them apart in your rules. The person who can look a
+charge up in a provider console is often not the person who decides what the run
+does next, and neither of them is necessarily the person who may write off an
+unexplained mutation.
 
 ### Retention for the admission index
 
@@ -814,11 +941,12 @@ one that was cleared. The number to alert on is
 `agentplane.runs.quarantined` — the level, counted from the store's outcome index
 on every sweep, which is the same index `GET /runs?outcome=quarantined` pages.
 
-That level currently only rises, and the gauge's own description says so: this
-runtime has no verb that resolves a quarantine. A resume re-reaches the same
-conclusion, and a cancellation request against a quarantined run is recorded and
-not acted on. Alert on the level going up and treat every entry as work for a
-person; do not expect it to come down on its own.
+It falls when somebody answers one — see
+[Answering a quarantine](#answering-a-quarantine). What it must not be read as
+is *risk retired*: an abandoned run leaves this count while whatever it left in
+the world stays exactly where it was, which is why the doubt is delivered as an
+`agentplane audit` finding derived from the journal rather than as a status
+somebody can clear.
 
 ### Two rules, both guarded
 
@@ -883,6 +1011,7 @@ Every failure P7 exists to surface has its own event target:
 |---|---|
 | `agentplane.run.nondeterminism_detected` | Replay recomputed a different effect key |
 | `agentplane.run.quarantined` | A run was set aside for a human |
+| `agentplane.run.abandoned` | A person closed a run whose outcome could never be established — nothing was unwound, and the doubt is now an audit finding |
 | `agentplane.run.unreproducible` | A pinned read came back as different content — the durable record is not trustworthy |
 | `agentplane.run.recovered` | The sweep took over a run whose owner died holding it |
 | `agentplane.run.replanned` | A run changed its plan, and the successor names its parent |
@@ -1249,7 +1378,13 @@ whether a run id exists by comparing a `400` against a `404`.
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
 | `GET /obligations` | What did we miss? Longest-overdue first, and it outlives the case's closure |
 | `POST /runs/{run}/cancel` | Stop it — `202`, because the run stops at its next boundary |
+| `POST /runs/{run}/reconcile` | I looked it up: here is what actually happened to that effect |
+| `POST /runs/{run}/reopen` | The doubt is answered — judge the run again |
+| `POST /runs/{run}/abandon` | Nobody will ever establish what happened; close it where it stands |
 | `POST /events` | This message arrived; wake whoever wanted it |
+| `GET /dead-letters` | Which messages arrived and reached nobody — the keys they were filed under, so the mismatch is visible |
+| `GET /push` | Which webhook receivers a delivery worker gave up on, and what they said last |
+| `POST /push/rearm` | That one is fixed — resume at the record it never acknowledged |
 
 **`POST /events` speaks CloudEvents, and its own shape.** A bus posts a
 [CloudEvents](https://github.com/cloudevents/spec) 1.0 message in either content
@@ -1425,7 +1560,7 @@ they cannot see. `tests/guards/layering.rs` holds it at both ends — a compile-
 assertion that every public runtime future is `Send`, and a scan that fails any
 bare `dyn Fn` field in `src/runtime/`.
 
-## 🗄️ Retention and erasure
+## 🗄️ Retention and erasure {#retention-and-erasure}
 
 A full-fidelity journal is simultaneously an asset and a GDPR liability. The
 **window** is yours to choose — a retention period is a legal decision and a
@@ -1517,12 +1652,13 @@ an address and an IBAN are a few hundred bytes and fit comfortably.
 [Erasure](@/docs/erasure.md) has the full table of what lands where;
 [regulation](@/docs/regulation.md) says the same in the obligations' own terms.
 
-## 🚑 Runbook
+## 🚑 Runbook {#runbook}
 
 | Symptom | Where to look |
 |---|---|
 | A run is `Quarantined` | It holds an effect whose outcome is unknown, or replay diverged. The record names the step. It will not be unwound automatically, and that is deliberate — reversing everything *except* the thing nobody can account for is worse than stopping |
 | A run seems stuck | It is almost certainly suspended on an event, a timer, or a human. `GET /runs/{id}` reports *why* rather than only *that* |
-| An event was dead-lettered | Nothing was waiting for it, and the grace window elapsed. The reason is on the record — usually a correlation key that does not match what the run subscribed to |
+| An event was dead-lettered | Nothing was waiting for it, and the grace window elapsed. `GET /dead-letters` names it and the keys it was filed under — the mismatch is usually visible by reading them next to what the run subscribed to |
+| A webhook receiver stopped answering | Its registration is *parked*, not deleted: the cursor survives so nothing is lost. `GET /push` says which and what it answered last; `POST /push/rearm` resumes at the first record it never acknowledged |
 | Budget exhausted | A ceiling doing its job, not a fault. The status carries the limit **and** where consumption actually reached, so it says what to raise it to |
 | `LeaseHeld` vs `Fenced` | Opposite responses. `LeaseHeld` means another instance is alive and you should wait; `Fenced` means this writer is stale and must drop the run, never retry |

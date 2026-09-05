@@ -81,6 +81,14 @@ ReconciledAs(e, a, d) ==
 Probed(e, a) ==
     \E d \in {"landed", "clean", "indoubt"} : ReconciledAs(e, a, d)
 
+(* Whether this attempt's outcome is established, by whatever asked. A probe's *)
+(* verdict and a person's assertion are the same record and the same fact; the *)
+(* runtime does not treat one as better evidence than the other, because the   *)
+(* thing that makes either usable is that it is written down.                  *)
+Resolved(e, a) ==
+    \/ ReconciledAs(e, a, "landed")
+    \/ ReconciledAs(e, a, "clean")
+
 (* Ground truth: did this effect actually take effect outside? The RUNTIME     *)
 (* cannot read this — only the probe can, and only because the provider knows. *)
 DidLand(e) == \E i \in 1 .. Len(world) : world[i] = e
@@ -231,11 +239,42 @@ Quarantine ==
     /\ status = "running"
     /\ inflight = NoEffect
     /\ FailedWith(Current, attempt, "indoubt")
+    /\ ~Resolved(Current, attempt)
     /\ ~SafeToRepeat(Current)
     /\ \/ Current \notin Reconcilable
        \/ ReconciledAs(Current, attempt, "indoubt")
     /\ status' = "quarantined"
     /\ UNCHANGED <<journal, world, pos, attempt, inflight>>
+
+(* A person answers what the runtime could not, and the run is judged again.  *)
+(*                                                                            *)
+(* Escalation is where every durable system stops, and stopping there makes   *)
+(* the escalation a backlog nothing drains. What a person adds is a *fact*    *)
+(* about one attempt — they looked the call up in the system that would know  *)
+(* — and it is written as the same reconciliation record a probe writes,      *)
+(* because it answers the same question. Nothing here sets `status` to        *)
+(* "succeeded": the person supplies evidence and the run is re-derived from   *)
+(* it, which is why this returns to "running" rather than to an ending.       *)
+(*                                                                            *)
+(* Modelled as **truthful**: the assertion agrees with `world`, because the   *)
+(* claim under test is that a correct answer cannot cause a double-apply, not *)
+(* that a wrong one is harmless. A person who misreads a console is the       *)
+(* residue this design states rather than removes, and a model of a lying     *)
+(* operator would have nothing left to prove.                                 *)
+(*                                                                            *)
+(* Quarantine is therefore not terminal, and `Terminal` still names it: an    *)
+(* answer may never come, and a spec that forced one would model an operator  *)
+(* who is always available.                                                   *)
+Answer ==
+    /\ status = "quarantined"
+    /\ inflight = NoEffect
+    /\ ~Resolved(Current, attempt)
+    /\ \/ /\ DidLand(Current)
+          /\ journal' = Append(journal, Entry(Current, attempt, "reconciled", "landed"))
+       \/ /\ ~DidLand(Current)
+          /\ journal' = Append(journal, Entry(Current, attempt, "reconciled", "clean"))
+    /\ status' = "running"
+    /\ UNCHANGED <<world, pos, attempt, inflight>>
 
 (* Out of attempts after a probe established nothing landed. *)
 GiveUpAfterProbe ==
@@ -284,6 +323,7 @@ Next ==
     \/ CompleteFromProbe
     \/ RetryAfterProbe
     \/ Quarantine
+    \/ Answer
     \/ GiveUp
     \/ GiveUpAfterProbe
     \/ Finish

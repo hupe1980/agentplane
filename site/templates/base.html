@@ -37,6 +37,7 @@
 <meta property="og:locale" content="en">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="{{ get_url(path='og.png') }}">
+<meta name="twitter:image:alt" content="agentplane — the journal is the plan of record. A durable, replayable, policy-governed agent runtime in Rust.">
 <meta name="twitter:title" content="{{ head_title }}">
 <meta name="twitter:description" content="{{ page_desc }}">
 
@@ -44,7 +45,10 @@
 <link rel="stylesheet" href="{{ get_url(path='giallo-light.css') }}" media="(prefers-color-scheme: light)">
 <link rel="stylesheet" href="{{ get_url(path='giallo-dark.css') }}" media="(prefers-color-scheme: dark)">
 <link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
-<meta name="theme-color" content="#0d1117">
+{#- Both schemes: a single dark value paints the browser chrome black around a
+    light page on every phone that honours it. -#}
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)">
 
 <script type="application/ld+json">
 {
@@ -111,7 +115,7 @@
   </form>
 
   <nav aria-label="Main">
-    <a href="{{ get_url(path='@/docs/getting-started.md') }}">Docs</a>
+    <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
     <a href="{{ get_url(path='@/docs/architecture.md') }}">Architecture</a>
     <a href="{{ get_url(path='@/docs/status.md') }}">Status</a>
     <a href="{{ config.extra.docsrs }}">API</a>

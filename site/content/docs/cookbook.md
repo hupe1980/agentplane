@@ -2,6 +2,9 @@
 title = "Cookbook"
 description = "Task-shaped recipes: build an agent, keep large bytes out of the chain, require a human, undo work when a later step fails."
 weight = 4
+
+[extra]
+group = "Build"
 +++
 
 Task-shaped recipes. Each one states the trap it avoids, because most of these
@@ -13,7 +16,7 @@ For the vocabulary — effect, disposition, label — see
 
 ---
 
-## 🧬 Build an agent
+## 🧬 Build an agent {#build-an-agent}
 
 An agent here is not a class you subclass. It is **skills** (what it can do), a
 **plan** (which capability runs when), and a **policy** (what it may do) — held
@@ -291,7 +294,7 @@ types require a versioned `MediaValidator` such as a malware scanner.
 
 ---
 
-## 📄 Write an agent with no Rust at all
+## 📄 Write an agent with no Rust at all {#write-an-agent-with-no-rust-at-all}
 
 If the agent is a prompt, a model and a result shape, the code adds nothing a
 reviewer can check — and it costs something they would want: the digest then
@@ -386,7 +389,7 @@ still Rust because it delegates.
 
 ---
 
-## 🎫 Work with labelled values
+## 🎫 Work with labelled values {#work-with-labelled-values}
 
 `Tainted<T>` is the type every value in a skill arrives in. Reading is free;
 the gate is at sinks, so there is no unwrap:
@@ -423,7 +426,7 @@ happening. Trusted means *from the operator, the manifest, or the run's own
 trusted input*; raising anything else is `cx.release`, which asks policy and
 leaves a record.
 
-## 🔩 Reach a system this crate has never heard of
+## 🔩 Reach a system this crate has never heard of {#reach-a-system-this-crate-has-never-heard-of}
 
 Tools, models and peers are effects with drivers written for them. Everything
 else is an `Effect` you write — the extension seam:
@@ -517,7 +520,7 @@ journaled clock, `cx.rng()` is seeded per step and reproduces on replay, and
 `SystemTime::now()` and a thread RNG are lint errors here, because a replay
 that recomputed them would disagree with the history it claims to reproduce.
 
-## 🤖 Call a model
+## 🤖 Call a model {#call-a-model}
 
 ```rust
 use agentplane::model::{ModelCall, ModelProvider};
@@ -537,7 +540,7 @@ reading nothing.
 The drivers stream by default precisely so a severed call can report what it
 burned. You do not have to do anything to get that.
 
-## 📐 Ask for structured output
+## 📐 Ask for structured output {#ask-for-structured-output}
 
 ```rust
 let prompt = Tainted::trusted(prompt);
@@ -559,7 +562,7 @@ let provider = Anthropic::new(key)?
     .structured_via_for("claude-legacy-1", SchemaMode::ForcedTool);
 ```
 
-## 🧰 Define a tool once
+## 🧰 Define a tool once {#define-a-tool-once}
 
 A tool is one type. Its arguments are its fields and its schema comes from those
 fields, so the model is shown exactly what the body deserializes. The description
@@ -663,7 +666,7 @@ the first.
 **The trap:** believing the type is the security boundary. It is not — it is the
 *shape*. The manifest still declares what this deployment permits.
 
-## 📜 Govern a skill you *did* write
+## 📜 Govern a skill you *did* write {#govern-a-skill-you-did-write}
 
 The other tier. When the agent does real work — a solver, a database, something a
 model cannot be — the behaviour is a `Skill`, and the manifest governs its
@@ -761,7 +764,7 @@ reviewer can object.
 
 ---
 
-## 🗃️ Keep state across runs, not inside one
+## 🗃️ Keep state across runs, not inside one {#keep-state-across-runs-not-inside-one}
 
 A month-long process is a **case** plus short runs. Start a run correlated by
 business key, and it joins the existing case or opens one:
@@ -787,7 +790,7 @@ update it exists to prevent. Re-read and decide again; do not retry the same
 write. Closing releases the correlation keys, so a closed case stops
 collecting new matter.
 
-## 🏷️ Send untrusted content without giving it authority
+## 🏷️ Send untrusted content without giving it authority {#send-untrusted-content-without-giving-it-authority}
 
 Protect the fields that choose *what the world will do* rather than requiring
 every descriptive byte to be trusted:
@@ -837,7 +840,7 @@ scope, field, destination, basis and evidence. Provenance is retained, unrelated
 fields are unchanged, and the result remains `Tainted<Value>`. Run the complete
 success/refusal/release trail with `cargo run --example governed_transfer`.
 
-## 🎛️ Let an untrusted choice pick from a menu — no code, no release
+## 🎛️ Let an untrusted choice pick from a menu — no code, no release {#let-an-untrusted-choice-pick-from-a-menu-no-code-no-release}
 
 When every acceptable value is known at review time, no release is needed at
 all: enumerate them, and an untrusted influence may choose *among* them and
@@ -867,7 +870,7 @@ instead (`allowed_sources: ["tool://agent/validate.recipient"]`) and let that
 specialist canonicalise, check, and `release` with evidence: the manifest
 declares the bounds, code makes the judgment.
 
-## 🔔 Wire durable A2A push
+## 🔔 Wire durable A2A push {#wire-durable-a2a-push}
 
 Push is a deployment capability, not merely a Cargo feature. Supply the same
 tenant-scoped durable store used by the runtime and a transport with an explicit
@@ -918,7 +921,7 @@ read them with `PushStore::parked` and re-arm with `PushStore::unpark`.
 
 ---
 
-## 📦 Keep large bytes out of the chain
+## 📦 Keep large bytes out of the chain {#keep-large-bytes-out-of-the-chain}
 
 The journal refuses a record over 1 MiB, because an append-only hash chain can
 never take it back. Bytes that big go in a content-addressed store, and the
@@ -997,7 +1000,7 @@ fits, so keep identifiers out of records deliberately.
 
 ---
 
-## 📌 Pin a version so nobody can swap it
+## 📌 Pin a version so nobody can swap it {#pin-a-version-so-nobody-can-swap-it}
 
 ```rust
 use agentplane::manifest::{MemoryRegistry, Registry};
@@ -1050,7 +1053,7 @@ for a durable or remote implementation; no such implementation ships today.
 
 ---
 
-## 🗂️ Keep the inventory where the agents are
+## 🗂️ Keep the inventory where the agents are {#keep-the-inventory-where-the-agents-are}
 
 `MemoryRegistry` proves the rules and dies with the process. *Which agents
 does this organisation run* — the first question a governance function asks —
@@ -1084,7 +1087,7 @@ Registries are **tenant-scoped**, like every other table: `metadata.name` is
 whatever an author typed, so two tenants choosing one name is ordinary rather
 than exotic.
 
-## 🏷️ Put the registry entry in the manifest
+## 🏷️ Put the registry entry in the manifest {#put-the-registry-entry-in-the-manifest}
 
 A governance catalogue wants business owner, technical owner, risk class and a
 ticket. A document closed by `deny_unknown_fields` cannot hold them as fields,
@@ -1114,7 +1117,7 @@ control; `agentplane.hupe1980.github.io/` is reserved for the same reason. A
 blank value is refused too — a key that answers nothing reads, to a reviewer,
 like a question that was answered.
 
-## 🧯 Build a plane from a manifest you did not write
+## 🧯 Build a plane from a manifest you did not write {#build-a-plane-from-a-manifest-you-did-not-write}
 
 `build()` panics on a wiring mistake, and for a binary wiring its own skills that
 is right: every refusal is a bug in code the author is looking at, and
@@ -1150,7 +1153,7 @@ capability nothing provides, two agents claiming one capability, two skills
 sharing a name, a catalogue laxer than a reviewed grant, a declarative agent
 naming an unregistered provider, or a plane whose store serves another tenant.
 
-## 📚 Embed a directory of manifests
+## 📚 Embed a directory of manifests {#embed-a-directory-of-manifests}
 
 One file per agent, embedded in the binary, keyed by what each document declares:
 
@@ -1189,7 +1192,7 @@ rather than on what is in the source a reviewer reads.
 
 ---
 
-## ✨ Use Google Gemini
+## ✨ Use Google Gemini {#use-google-gemini}
 
 ```rust
 let gemini = Gemini::from_env()?                      // GEMINI_API_KEY, or GOOGLE_API_KEY
@@ -1233,7 +1236,7 @@ effect identity is one a replay cannot account for.
 
 ---
 
-## 🏠 Run a Hugging Face model locally
+## 🏠 Run a Hugging Face model locally {#run-a-hugging-face-model-locally}
 
 The de-facto wire of self-hosted inference is the `OpenAI`-compatible
 `/v1/chat/completions` endpoint — TGI (Hugging Face's own server), vLLM,
@@ -1287,7 +1290,7 @@ rather than silently dropped: `reasoning_effort` (no neutral spelling on this
 wire) and governed media (a per-server dialect). Against `api.openai.com`
 itself, use the `openai` driver — Responses is the current primitive there.
 
-## 🔁 Act on an at-least-once message exactly once
+## 🔁 Act on an at-least-once message exactly once {#act-on-an-at-least-once-message-exactly-once}
 
 ```rust
 match rt.run_correlated_once(
@@ -1350,7 +1353,7 @@ default: other runtimes bound this window automatically (Restate expires a key a
 day after completion, Temporal's is its namespace retention), and both are making
 the same trade in the direction that can surprise you.
 
-## ⏸️ Wait for a reply that may arrive first
+## ⏸️ Wait for a reply that may arrive first {#wait-for-a-reply-that-may-arrive-first}
 
 ```rust
 let ack = cx.await_event(
@@ -1372,7 +1375,7 @@ rather than rolling your own.
 Every wait must name a deadline. An unbounded wait is a plan-contract violation,
 which is how "the process just stalled" stops being a category of incident.
 
-## 👤 Require a human, with four eyes
+## 👤 Require a human, with four eyes {#require-a-human-with-four-eyes}
 
 ```rust
 let decision = cx.task(
@@ -1393,7 +1396,7 @@ a *second* opt-in (`allow_unattended()`). One enum variant among four is too eas
 to pick off a list, and "the human didn't answer so we did it anyway" should be
 greppable.
 
-## 🔍 Show a reviewer the consequences, not the instruction
+## 🔍 Show a reviewer the consequences, not the instruction {#show-a-reviewer-the-consequences-not-the-instruction}
 
 `requires_approval: true` shows the exact call — which for
 `transfer(to: "GB-4471", amount: 12000)` is the whole change. It stops being so
@@ -1439,7 +1442,7 @@ does not grant (a call with no declared safety, ceiling or field rules).
 Refusing the call because its preview was unavailable would turn a read-only
 convenience into a second thing that can stop a payment.
 
-## 🔔 Tell a desk without stopping the run
+## 🔔 Tell a desk without stopping the run {#tell-a-desk-without-stopping-the-run}
 
 `cx.task` asks and blocks, which is right when the answer decides what happens
 next and wrong when nothing does. An agent that has *finished*, whose finding a
@@ -1482,7 +1485,7 @@ reviewer *is* is the review.
 block that performs nothing while reading in review as a human control, and it is
 refused at parse.
 
-## 😴 Sleep for five working days
+## 😴 Sleep for five working days {#sleep-for-five-working-days}
 
 ```rust
 let at = cx.deadline("klaerung", &DeadlineSpec::new("working-days", json!({"n": 5})), None).await?;
@@ -1500,7 +1503,7 @@ is journaled, so it is the fact forever.
 Domain knowledge lives in your `Calendar` implementation. The engine does not
 know what a working day is.
 
-## ↩️ Undo work when a later step fails
+## ↩️ Undo work when a later step fails {#undo-work-when-a-later-step-fails}
 
 ```rust
 // Declare what a step's place in the unwind is.
@@ -1530,7 +1533,7 @@ replay makes zero calls:
 cargo run --example saga_checkout
 ```
 
-## 🧬 Undo work when a *call* fails, not a whole step
+## 🧬 Undo work when a *call* fails, not a whole step {#undo-work-when-a-call-fails-not-a-whole-step}
 
 A step-level compensation is handed the step's **output**, and a step that failed
 does not have one. So a step that reserved inventory, authorised a card and then
@@ -1584,7 +1587,7 @@ metered like any other call and a replay does not perform them twice. Doubt
 reverses nothing: a member whose outcome cannot be established quarantines the
 run rather than unwinding around it.
 
-## 🧱 Commit a member *with* the journal
+## 🧱 Commit a member *with* the journal {#commit-a-member-with-the-journal}
 
 If the table lives in the same Postgres as the journal, do not compensate — be
 atomic:
@@ -1626,7 +1629,7 @@ notion of a foreign table, so it lends no transaction and the member is refused
 at registration. That is a capability being absent, and it is refused where
 refusing costs nothing rather than after the eager members have run.
 
-## 🤝 Consult another agent, from a file
+## 🤝 Consult another agent, from a file {#consult-another-agent-from-a-file}
 
 A grant spelled `tool://agent/<capability>` offers another agent's capability
 to a tool-calling model — so a multi-agent room needs no Rust at all:
@@ -1686,7 +1689,7 @@ both agents need `max_sensitivity_egress: internal` or the room refuses its
 own point. `requires_approval: true` works exactly as on any grant — a person
 sees the capability and the arguments before any specialist runs.
 
-## 🌐 Call another *plane's* agent, from a file or a skill
+## 🌐 Call another *plane's* agent, from a file or a skill {#call-another-plane-s-agent-from-a-file-or-a-skill}
 
 A peer is a server name a grant can carry. Register it on the plane — where
 it is, what it is granted, which credential reaches it — and a manifest grants
@@ -1767,7 +1770,7 @@ The `peer_call` example runs both planes in one process: a served reviewer on
 a loopback port and a desk that consults it, then a strict replay of the desk's
 run that the reviewer never hears about.
 
-## 🗺️ Plan once, then execute without the model
+## 🗺️ Plan once, then execute without the model {#plan-once-then-execute-without-the-model}
 
 When the task's shape is known up front and the data the tools return is
 hostile, `kind: planned` beats the loop: one privileged call fixes the steps
@@ -1804,7 +1807,7 @@ planner-invented recipient stop at the field rule.
 planner reads the input to write the plan, so hand hostile content to a tool
 or a `parse` step instead, or use `tool-calling`.
 
-## 🧱 Where are the built-in tools?
+## 🧱 Where are the built-in tools? {#where-are-the-built-in-tools}
 
 There are none, and the reason is worth two paragraphs because every other
 framework ships some.
@@ -1832,7 +1835,7 @@ What you get instead: `execution.kind` is the built-in *behaviour* —
 the part that runs outside the journal — and a typed `Tool` is about fifteen
 lines.
 
-## 🛠️ Call a tool from a skill you wrote
+## 🛠️ Call a tool from a skill you wrote {#call-a-tool-from-a-skill-you-wrote}
 
 Use `cx.call_tool`. It dispatches over the **plane's own** catalogue — the one
 `try_build` already checked against every agent's declaration:
@@ -1860,7 +1863,7 @@ for a test — derive it with `ToolCatalog::from_manifest(&m)`, which reads the
 reach off the declaration instead of restating it. See
 `examples/governed_transfer.rs`.
 
-## 🔌 Call tools on an MCP server you already run
+## 🔌 Call tools on an MCP server you already run {#call-tools-on-an-mcp-server-you-already-run}
 
 The tool tier is not "your tools, MCP-shaped". `tools::McpClient` is a real MCP
 client: point it at a running server and its tools become callable under the
@@ -1991,7 +1994,7 @@ operator's catalogue cannot be called however the server advertises it, and that
 is the property. Auto-import would let a server widen its own authority — which
 is exactly what `Advertised` versus `ToolSafety` exists to prevent.
 
-## 🧾 When the two parties really do differ
+## 🧾 When the two parties really do differ {#when-the-two-parties-really-do-differ}
 
 `.toolbox(..)` covers the common case, where the tools a binary implements are
 the tools its agents declare. The two-party split is still there when it is
@@ -2018,7 +2021,7 @@ replace the other's grants and nothing would say which won.
 one of two: the manifest is inside the agent's digest, the catalogue is the
 deployment's. A tool absent from *either* is not callable.
 
-## ⚖️ Turn on a policy engine
+## ⚖️ Turn on a policy engine {#turn-on-a-policy-engine}
 
 The policy text is in [security](@/docs/security.md); this is the wiring, which
 nothing else showed.
@@ -2055,7 +2058,7 @@ Three things bite:
   `Authenticator` — and its `owner`/`subject`/`scope` are merged into those
   requests for every run that caller starts.
 
-## 📡 Host an agent as an A2A peer
+## 📡 Host an agent as an A2A peer {#host-an-agent-as-an-a2a-peer}
 
 ```sh
 agentplane serve examples/served.yaml \
@@ -2103,7 +2106,7 @@ message after the instant is refused with the expiry named. Leave both out and
 the caller has no chain: its runs act under whatever the plane was built with,
 which for `serve` is none.
 
-## 📤 Emit an event per run, without an outbox table
+## 📤 Emit an event per run, without an outbox table {#emit-an-event-per-run-without-an-outbox-table}
 
 A2A push is **caller-shaped**: the URL comes from whoever created the task, which
 is why three controls sit around it. The shape a service wants beside it is the
@@ -2181,7 +2184,7 @@ refuses a caller-supplied `pushNotificationConfig.id` that begins with it,
 because operator destinations are exempt from the URL controls precisely on the
 grounds that there is no caller involved.
 
-## ✍️ Sign the body a destination receives
+## ✍️ Sign the body a destination receives {#sign-the-body-a-destination-receives}
 
 A bearer header proves the *sender* held a token — a claim about the connection,
 not about the bytes — and that token transits every hop between here and the
@@ -2237,7 +2240,7 @@ reaches either. The rotation half pairs the same way: `also_signed_with`
 panics, `try_also_signed_with` reports — including a rotation secret configured
 with no primary, which is refused as the wiring mistake it is.
 
-## 🔎 Verify a webhook you receive
+## 🔎 Verify a webhook you receive {#verify-a-webhook-you-receive}
 
 ```rust
 let verifier = WebhookVerifier::new(&Secret::new(std::env::var("BUS_SIGNING_KEY")?))?;
@@ -2277,7 +2280,7 @@ process the body anyway. They are told apart because an operator needs to know
 which is happening: a drifting clock and a replayed capture both present as
 `Stale`.
 
-## 🔐 Restrict where the plane may connect
+## 🔐 Restrict where the plane may connect {#restrict-where-the-plane-may-connect}
 
 ```rust
 let egress = Egress::new().allow("api.anthropic.com");
@@ -2336,7 +2339,7 @@ a control that fails open when an implementer forgets — the same reason
 carry the call: one answer for a whole router would have to be the union of its
 routes, and a union is the wildcard this allowlist refuses to have.
 
-## ⚖️ Judge a high-stakes step more than once
+## ⚖️ Judge a high-stakes step more than once {#judge-a-high-stakes-step-more-than-once}
 
 A panel is a subgraph: judges over the subject, an aggregator over the judges.
 
@@ -2373,7 +2376,7 @@ must be *distinct*, and a repeated lens is refused at construction.
 that could not agree is the strongest signal a person should look, and resolving
 it silently converts *we do not know* into *approved*.
 
-## 🧪 Test a skill without a model
+## 🧪 Test a skill without a model {#test-a-skill-without-a-model}
 
 ```rust
 use agentplane::testkit::FakeProvider;
@@ -2397,7 +2400,7 @@ It refuses to answer as a real provider (`fake/gpt-5`, not
 effect key and a fake cassette that reads as a real one corrupts the corpus later
 changes are measured against.
 
-## 💥 Test what a crash does
+## 💥 Test what a crash does {#test-what-a-crash-does}
 
 ```rust
 use agentplane::testkit::{Fault, Faulty, Schedule};
@@ -2412,7 +2415,7 @@ while the caller was told it failed. History is then *ahead* of what the process
 believes it wrote, and blindly retrying the append is how a chain acquires two
 records claiming one position.
 
-## 🗄️ Bring your own store
+## 🗄️ Bring your own store {#bring-your-own-store}
 
 Implement `JournalStore`, then run the contract against it:
 
@@ -2427,7 +2430,7 @@ while writing it, so the invariant they misread is by construction the one with
 no test. The battery states the contract once and runs against every backend,
 including a racing check no sequential test can replace.
 
-## 💳 Bound what one authorization is good for
+## 💳 Bound what one authorization is good for {#bound-what-one-authorization-is-good-for}
 
 Three ceilings exist and they answer different questions. A `Budget` bounds
 **one run**. A `TenantQuota` bounds **one tenant over a billing period**. Neither
@@ -2511,7 +2514,7 @@ impossible.
 
 ---
 
-## 🧠 Give an agent a memory
+## 🧠 Give an agent a memory {#give-an-agent-a-memory}
 
 ```rust
 let store = Arc::new(RedbStore::open("plane.redb")?);
@@ -2882,7 +2885,7 @@ that. If summaries were made from the memory, see the next recipe — erasure ha
 to reach them too. A forgotten id remains reserved forever; generate a new id
 for new content rather than recycling an old journal identity.
 
-## ☁️ Use Amazon Bedrock Converse
+## ☁️ Use Amazon Bedrock Converse {#use-amazon-bedrock-converse}
 
 Enable the separate `bedrock` feature, then load AWS's standard credential
 chain and an explicit region:
@@ -2975,7 +2978,7 @@ thinking/signature blocks. A custom loop must pass that value through
 `ModelCall::with_continuation` beside `continuing(exchanges)`; otherwise a
 reasoning-enabled continuation fails closed.
 
-## 🗜️ Compact a memory without laundering it
+## 🗜️ Compact a memory without laundering it {#compact-a-memory-without-laundering-it}
 
 Summarising is itself a memory write, so it goes through the effect protocol
 rather than around it:
@@ -3018,7 +3021,7 @@ it; `derivatives(id)` shows you what that would remove before you commit to it.
 Correction retains that lineage, so a later erasure can still find summaries
 even though the source content has already gone.
 
-## 🏢 Serve several tenants from one process
+## 🏢 Serve several tenants from one process {#serve-several-tenants-from-one-process}
 
 One plane per tenant, all over one database. Each store handle is scoped, and the
 plane is built with the tenant that handle serves:
@@ -3074,7 +3077,7 @@ tenant has no plane is refused rather than served by a default.
 moment a second instance starts — and it fails open, so nothing tells you. The
 accounting belongs in the store, which is why `quota` takes one.
 
-## 🗝️ Erase a customer's data everywhere
+## 🗝️ Erase a customer's data everywhere {#erase-a-customer-s-data-everywhere}
 
 Deleting from the live store leaves every backup. Seal instead: one key ring on
 the builder seals the journal, the case store, the worklist, the event buffer
@@ -3110,7 +3113,7 @@ matches it, so an unclaimed one belongs to no case at all. Check
 [erasure and keys](@/docs/erasure.md#what-lands-where-and-what-can-be-erased)
 row by row before deciding what may enter a run.
 
-## 🔎 Audit a store you do not trust
+## 🔎 Audit a store you do not trust {#audit-a-store-you-do-not-trust}
 
 ```rust
 let report = agentplane::audit::audit(&store, &runs, &Evidence {

@@ -1,7 +1,10 @@
 +++
 title = "Regulation"
 description = "EU AI Act obligation by obligation, mapped to mechanisms that exist — and an explicit list of the ones that do not."
-weight = 17
+weight = 16
+
+[extra]
+group = "Trust"
 +++
 
 **agentplane is not compliant with anything, and cannot be.** Compliance attaches
@@ -20,7 +23,7 @@ is a sales document.
 
 ---
 
-## 📅 Where the EU AI Act actually stands
+## 📅 Where the EU AI Act actually stands {#where-the-eu-ai-act-actually-stands}
 
 The Digital Omnibus on AI was adopted by Parliament on **16 June 2026** and the
 Council on **29 June 2026**, entering into force that July. It moved the
@@ -42,7 +45,7 @@ the Omnibus; only the calendar moved.
 
 ---
 
-## ✅ What the runtime gives you
+## ✅ What the runtime gives you {#what-the-runtime-gives-you}
 
 ### Art. 12 — automatic recording, enabling traceability
 
@@ -211,7 +214,7 @@ case and its adapter is single-node by contract — so wrap it explicitly.
 
 ---
 
-## ❌ What it does not give you
+## ❌ What it does not give you {#what-it-does-not-give-you}
 
 | Obligation | Why not |
 |---|---|
@@ -222,7 +225,7 @@ case and its adapter is single-node by contract — so wrap it explicitly.
 
 ---
 
-## 🧭 Other frameworks
+## 🧭 Other frameworks {#other-frameworks}
 
 **ISO/IEC 42001** and the **NIST AI RMF** consume the same artifacts — the
 journal answers "what happened and can you prove it" regardless of which
@@ -231,7 +234,7 @@ export is the integration: JSON Lines goes into whatever collects evidence.
 
 ---
 
-## 🙋 If you are evaluating this for a regulated deployment
+## 🙋 If you are evaluating this for a regulated deployment {#if-you-are-evaluating-this-for-a-regulated-deployment}
 
 Three questions worth asking of any tool in this space, including this one:
 

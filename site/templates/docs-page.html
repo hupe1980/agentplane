@@ -3,22 +3,8 @@
 <div class="docs-layout">
 
   <aside class="sidebar" aria-label="Documentation">
-    {% set docs = get_section(path="docs/_index.md") %}
-    <p class="side-title">Documentation</p>
-    <nav>
-      <ol>
-      {% for p in docs.pages %}
-        <li><a href="{{ p.permalink }}" {% if p.permalink == page.permalink %}aria-current="page"{% endif %}>{{ p.title }}</a></li>
-      {% endfor %}
-      </ol>
-    </nav>
-    <p class="side-title">Elsewhere</p>
-    <nav>
-      <ol>
-        <li><a href="{{ config.extra.docsrs }}">API reference</a></li>
-        <li><a href="{{ config.extra.repo }}">Source</a></li>
-      </ol>
-    </nav>
+    {% set current = page.permalink %}
+    {% include "docs-nav.html" %}
   </aside>
 
   <article class="doc">

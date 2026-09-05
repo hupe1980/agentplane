@@ -2,6 +2,9 @@
 title = "Concepts"
 description = "Runs and cases, effects and dispositions, labels and typed release — the vocabulary everything else is built from."
 weight = 3
+
+[extra]
+group = "Start here"
 +++
 
 The vocabulary. Nine ideas, then the two surfaces you program against —
@@ -10,7 +13,7 @@ the rest of the documentation stops needing footnotes.
 
 ---
 
-## 1. ⚡ Effect
+## 1. ⚡ Effect {#effect}
 
 Anything the deterministic zone cannot reproduce by thinking: a model call, a
 tool call, the clock, randomness, a case-state read, resolving a deadline.
@@ -38,7 +41,7 @@ that reaches the outside world by another route — a socket opened by a native
 skill, a clock read that slipped past the lint — is outside every guarantee
 below.
 
-## 2. 🚧 The determinism boundary
+## 2. 🚧 The determinism boundary {#the-determinism-boundary}
 
 Two zones. Above it: plan traversal, guards, retry decisions, budget arithmetic,
 policy evaluation, label joins. All of it must produce **the identical sequence
@@ -55,7 +58,7 @@ Three mechanisms enforce it, because convention is not enforcement:
    index, not a code path. Application logic can be bypassed by the next caller;
    a constraint cannot.
 
-## 3. 🧾 The journal
+## 3. 🧾 The journal {#the-journal}
 
 Append-only, hash-chained, one row per record. `hash = H(prev_hash ‖ record)`.
 
@@ -67,7 +70,7 @@ That fusion is the design's central bet: **an audit trail that is also the
 recovery mechanism cannot quietly rot**, because the system stops working with
 it. Compliance-only logging always rots, and nobody notices for a year.
 
-## 4. 🗂️ Run vs case
+## 4. 🗂️ Run vs case {#run-vs-case}
 
 A **run** is one goal, one plan, one lifetime — minutes. A **case** is a business
 process — a clearing dispute, a supplier switch — spanning weeks and many runs,
@@ -160,7 +163,7 @@ A duplicate whose original is parked on a human decision is told *this is alread
 waiting for you*: a suspension is a resting point, not a gap to fill with a second
 identical approval.
 
-## 5. 🎲 Disposition
+## 5. 🎲 Disposition {#disposition}
 
 When an outward call fails, one question decides everything: **did it reach the
 other side?**
@@ -180,7 +183,7 @@ useless.
 `InDoubt` is undecidable from the journal alone, and no amount of retrying makes
 it decidable. That is what `Recovery` is for.
 
-## 6. 🔁 Recovery
+## 6. 🔁 Recovery {#recovery}
 
 What the *effect* says should happen when its outcome is unknown:
 
@@ -201,7 +204,7 @@ reference. A probe turns an undecidable outcome into a decided one.
 forgets to describe itself gets the conservative treatment, not the convenient
 one.
 
-## 7. 🧬 Effect group
+## 7. 🧬 Effect group {#effect-group}
 
 The unit between an effect and a step: several calls that take together, or not
 at all.
@@ -239,7 +242,7 @@ reverses what an abandoned handle left standing, because a group that commits by
 being forgotten would make the most consequential outcome the one you get by
 writing nothing.
 
-## 8. 🏷️ Labels
+## 8. 🏷️ Labels {#labels}
 
 Every payload is opaque to the engine and never *unlabeled*:
 
@@ -282,7 +285,7 @@ policy authorizes `data:release`; the journal records the decision. The
 returned value remains labeled, keeps its provenance, and arrives at every
 other sink exactly as untrusted as before.
 
-## 9. 📐 The plan is an authorization graph
+## 9. 📐 The plan is an authorization graph {#the-plan-is-an-authorization-graph}
 
 A plan is compiled from **trusted input only**, frozen, content-addressed, and
 journaled. Because it is built before any untrusted data is ingested, injected
@@ -454,7 +457,7 @@ is one nobody can review. Everything else in this page applies unchanged —
 every turn, tool call and parse is an ordinary journaled effect, so a strict
 replay reassembles the whole thing without calling anyone.
 
-## The pattern underneath all of them 🔍
+## The pattern underneath all of them 🔍 {#the-pattern-underneath-all-of-them}
 
 Nearly every decision here has the same shape: **make the dangerous thing
 unrepresentable, rather than detectable.**
@@ -482,7 +485,7 @@ than a value. If you write a validated type in your own code, do the same.
 When you meet an API here that seems to make something inconvenient, that is
 usually why.
 
-## Where next 🧭
+## Where next 🧭 {#where-next}
 
 | | |
 |---|---|

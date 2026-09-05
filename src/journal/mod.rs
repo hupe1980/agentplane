@@ -22,7 +22,7 @@ mod witness_http;
 pub use atomic::{AtomicJournal, AtomicResource, AtomicTx, AtomicWork, SqlValue};
 pub use note::{NoteSignature, SignedNote, key_id};
 pub use record::{AgentIdentity, Append, Record, RecordBody, RecordKind};
-pub use replay::{EffectReplay, ReplayCursor, StepCursor};
+pub use replay::{EffectReplay, ReplayCursor, StepCursor, undecided_effects};
 pub use store::{Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease};
 pub use upcast::{Identity, Upcaster};
 pub use witness::{

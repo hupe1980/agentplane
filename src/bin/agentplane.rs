@@ -23,36 +23,29 @@
 //! everything the agent does is in the file, so there is no accompanying program
 //! that could diverge from it.
 //!
-//! # Why the arguments are *not* parsed by hand any more
+//! # Why the arguments are parsed by a derive
 //!
-//! They were, and the reason was written down: *the surface is three verbs and
-//! five flags, and a dependency that grows feature flags and a derive macro to
-//! express that is a poor trade*. That was true. It stopped being true without
-//! anybody noticing — `serve` and its wiring took the binary to **four verbs and
-//! fourteen flags**, and the comment justifying the decision went on describing
-//! the surface it was written against.
-//!
-//! The cost was not tidiness. A hand-rolled parser reads one flag table for
-//! every verb, so a flag belonging to one was **silently accepted** by another:
+//! A hand-rolled parser reads one flag table for every verb, so a flag
+//! belonging to one is **silently accepted** by another:
 //!
 //! ```sh
 //! agentplane run agent.yaml --push-host evil.example.com --tokens /nonexistent
-//! # ran happily; both flags did nothing, and one of them is a security control
+//! # both flags do nothing, and one of them is a security control
 //! ```
 //!
-//! That is a declaration that does nothing, at the command line, and
-//! I12 says a declared control must be enforced or rejected by the parser. What
-//! a derive buys is that the bad state stops being representable: a flag lives on
-//! its subcommand's struct, and `run --push-host` fails to parse by
-//! construction — `--strict` belongs to `replay` and fails to parse on `run`
-//! the same way. `--help` is generated from the structs that enforce the flags
-//! rather than being prose that can describe an option nobody implemented.
+//! That is a declaration that does nothing, at the command line, and a declared
+//! control must be enforced or rejected by the parser rather than accepted and
+//! ignored. A derive makes the bad state unrepresentable: a flag lives on its
+//! subcommand's struct, so `run --push-host` fails to parse by construction, and
+//! `--strict` belongs to `replay` and fails on `run` the same way. `--help` is
+//! generated from the structs that enforce the flags rather than being prose
+//! that can describe an option nobody implemented.
 //!
-//! It costs 9 crates on `cli` and **nothing on the library**, which is what
-//! settled it: `cli` produces a binary and already carries three hundred.
-//! Re-derive with `cargo tree --no-default-features --features cli -e normal
-//! --prefix none | sort -u | wc -l` — a number in a comment nobody can check is
-//! exactly how the sentence above this one went stale.
+//! It costs crates on `cli` and **nothing on the library**, which is what
+//! settles the trade: `cli` produces a binary and already carries hundreds.
+//! Count them with `cargo tree --no-default-features --features cli -e normal
+//! --prefix none | sort -u | wc -l` rather than reading a figure here — a number
+//! in a comment is one nobody re-derives.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -578,12 +571,12 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
         let cases: Arc<dyn agentplane::case::CaseStore> = redb;
 
         // The library's own list, not literals restated here: the store indexes
-        // runs *by* outcome and has no "all runs" query, so an export has to
-        // name every sealed outcome — and a copy of that list in a binary is
-        // where a new sealing outcome would be silently dropped from exactly
-        // the artifact an auditor asks for.
+        // runs *by* outcome and has no "all runs" query, so an offline verb has
+        // to name every outcome it wants — and a copy of that list in a binary
+        // is where a new one would be silently dropped from exactly the
+        // artifact an auditor asks for.
         let wanted: Vec<String> = if opts.outcome.is_empty() {
-            agentplane::runtime::SEALED_OUTCOMES
+            agentplane::runtime::OUTCOMES_OF_RECORD
                 .iter()
                 .map(|s| (*s).to_owned())
                 .collect()
@@ -1265,6 +1258,13 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         builder = builder
             .policy(Arc::new(policy) as Arc<dyn agentplane::core::PolicyEngine>)
             .agent(agentplane::runtime::Agent::new(manifest));
+        // The same handle `wire_push` gives the A2A server below. The plane
+        // holds it because the registrations that stop being delivered are a
+        // backlog, and the operator surface is where a backlog is answered —
+        // the delivery worker that parked one has nothing more to say about it.
+        if !opts.push_host.is_empty() {
+            builder = builder.push(Arc::clone(&store) as Arc<dyn agentplane::push::PushStore>);
+        }
         let runtime = builder.try_build().map_err(|e| e.to_string())?;
 
         let security = agentplane::peers::CardSecurity::bearer("bearer", Vec::<String>::new());

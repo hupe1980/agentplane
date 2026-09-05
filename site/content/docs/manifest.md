@@ -3,6 +3,9 @@ title = "Manifest reference"
 description = "Every field an agent declaration may carry, what enforces it, and what an absent value means."
 weight = 5
 aliases = ["/reference/manifest/", "/docs/reference/manifest/"]
+
+[extra]
+group = "Build"
 +++
 
 An agent declaration is a YAML file. It is **content-addressed**, so editing it

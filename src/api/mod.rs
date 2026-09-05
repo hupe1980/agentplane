@@ -123,8 +123,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::{
-    CaseId, CaseStatus, CloudEvent, Decision, Delivery, InboundEvent, PolicyDecision,
-    PolicyRequest, RunId, Task, TaskId, TenantId,
+    Assertion, CaseId, CaseStatus, CloudEvent, Decision, Delivery, InboundEvent, PolicyDecision,
+    PolicyRequest, QuarantineDecision, RunId, Task, TaskId, TenantId,
 };
 use crate::runtime::{RunStatus, Runtime, observed_status};
 
@@ -274,6 +274,54 @@ pub struct CancelRequest {
     pub reason: String,
 }
 
+/// Naming one webhook registration.
+///
+/// The pair is the registration's identity: `run` is the task it follows and
+/// `id` is the config the receiver registered under it.
+#[cfg(feature = "push")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RearmRequest {
+    pub run: String,
+    pub id: String,
+}
+
+/// Answering a quarantine.
+///
+/// One field, and it is required for the same reason a cancellation's is —
+/// harder here, because the reason *is* the evidence. A run reopened with no
+/// stated finding is somebody clicking retry on a payment that may already have
+/// gone out; the sentence is what makes it a judgement instead.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineRequest {
+    /// What was checked, in which system, and what it said.
+    pub reason: String,
+}
+
+/// Asserting what happened to one effect the runtime could not decide.
+///
+/// The effect is named in the body rather than the path: a key is a 64-character
+/// digest, and a path segment that long turns every operator's copy-paste into a
+/// URL-encoding question for no gain.
+///
+/// `output` is present exactly for `landed` and refused otherwise, so a request
+/// cannot quietly assert a landing and supply nothing for the run to read back —
+/// nor supply a value under a verdict that says the call never took.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReconcileRequest {
+    /// The effect key, as `GET /runs/{run}` lists it under `undecided`.
+    pub effect: String,
+    /// `landed` or `did_not_happen`.
+    pub disposition: String,
+    /// The result the run reads back. Required for `landed`, refused otherwise.
+    #[serde(default)]
+    pub output: Option<Value>,
+    /// How this was established — which console, which reference, what it said.
+    pub note: String,
+}
+
 /// What a decision looks like on the wire.
 ///
 /// Note what is absent: **no actor, no roles**. Both come from the
@@ -332,6 +380,71 @@ pub struct RunView {
     pub records: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub case: Option<String>,
+    /// Effects whose outcome this journal cannot establish.
+    ///
+    /// The field that makes a quarantine actionable. "Quarantined — an effect
+    /// was announced and never terminated" names a situation; this names the
+    /// call, the step and the key, which is what an operator needs to go and
+    /// look it up and what they quote back to `POST /runs/{run}/reconcile`.
+    ///
+    /// Usually empty, and empty on a healthy run — so it costs nothing to carry
+    /// on every read and there is no second endpoint to remember.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub undecided: Vec<crate::core::Undecided>,
+}
+
+/// A message that arrived and reached nobody.
+///
+/// **The payload is not here.** A dead letter is diagnosed from its identity
+/// and its correlation keys — the question is always *which key does not match
+/// what a run subscribed to* — and the body is a counterparty's content that
+/// this route has no reason to hand out. On a sealed plane it is not even
+/// readable without a key, and a listing that silently showed ciphertext to
+/// some deployments and plaintext to others would be worse than one that shows
+/// neither.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeadLetterView {
+    /// Who sent it, and the id they gave it. Together these are the dedup
+    /// identity, so they are what a counterparty is asked about.
+    pub source: String,
+    pub id: String,
+    pub kind: String,
+    /// The keys it was filed under — the answer, nine times in ten.
+    pub correlation: Vec<crate::core::CorrelationKey>,
+    pub received_at: String,
+    /// Why it was retired, in the sweep's words.
+    pub reason: String,
+}
+
+impl DeadLetterView {
+    fn of(letter: &crate::core::DeadLetter) -> Self {
+        Self {
+            source: letter.event.source.clone(),
+            id: letter.event.id.clone(),
+            kind: letter.event.kind.clone(),
+            correlation: letter.event.correlation.clone(),
+            received_at: letter.received_at.to_string(),
+            reason: letter.reason.clone(),
+        }
+    }
+}
+
+/// A webhook registration a delivery worker gave up on.
+///
+/// `config` is [redacted](crate::push::PushConfig::redacted): the bearer the
+/// receiver registered is its own correlation secret, and a listing is not a
+/// place to hand it back.
+#[cfg(feature = "push")]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ParkedPushView {
+    pub config: Value,
+    /// The first record this receiver has not acknowledged. Re-arming resumes
+    /// here, which is the reason a parked row is kept rather than deleted.
+    pub next_seq: u64,
+    pub attempts: u32,
+    /// What the receiver said last, which is what an operator fixes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// A task as an operator sees it.
@@ -664,10 +777,13 @@ impl Api {
     /// unauthenticated one to forget about and no "internal" path that skips
     /// either gate — `tests/wire/api.rs` walks the route table and asserts it.
     pub fn router(self) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/runs", get(runs_by_outcome))
             .route("/runs/{run}", get(run_view))
             .route("/runs/{run}/cancel", post(cancel_run))
+            .route("/runs/{run}/reopen", post(reopen_run))
+            .route("/runs/{run}/abandon", post(abandon_run))
+            .route("/runs/{run}/reconcile", post(reconcile_effect))
             .route("/tasks", get(worklist))
             .route("/tasks/{task}", get(task_view))
             .route("/tasks/{task}/claim", post(claim))
@@ -678,7 +794,12 @@ impl Api {
             .route("/obligations", get(breached_obligations))
             .route("/cases/{case}", get(case_view))
             .route("/events", post(deliver))
-            .with_state(self)
+            .route("/dead-letters", get(dead_letters));
+        #[cfg(feature = "push")]
+        let router = router
+            .route("/push", get(parked_push))
+            .route("/push/rearm", post(rearm_push));
+        router.with_state(self)
     }
 
     /// Authenticate, resolve the tenant's plane, then authorize.
@@ -748,6 +869,21 @@ pub mod action {
     pub const RUN_READ: &str = "api:run.read";
     pub const RUN_LIST: &str = "api:run.list";
     pub const RUN_CANCEL: &str = "api:run.cancel";
+    /// Handing a quarantined run back to be judged again. Its own verb rather
+    /// than a widened `run.cancel`: cancelling asks for work to be *undone*,
+    /// and this asks for it to be *continued* — opposite intents, and a
+    /// deployment that grants one has said nothing about the other.
+    pub const RUN_REOPEN: &str = "api:run.reopen";
+    /// Closing a quarantined run whose outcome will never be established. The
+    /// gravest verb on this surface and deliberately the narrowest: it ends a
+    /// run without unwinding, so whatever it left in the world stays there, and
+    /// the authority to write that off is not the authority to retry.
+    pub const RUN_ABANDON: &str = "api:run.abandon";
+    /// Asserting, out of band, what happened to one effect in doubt. Separate
+    /// from both of the above because it is *evidence* rather than a decision —
+    /// the person who can look a charge up in the provider's console is often
+    /// not the person who decides what the run does next.
+    pub const EFFECT_RECONCILE: &str = "api:effect.reconcile";
     pub const TASK_LIST: &str = "api:task.list";
     pub const TASK_READ: &str = "api:task.read";
     pub const TASK_CLAIM: &str = "api:task.claim";
@@ -764,6 +900,19 @@ pub mod action {
     /// compliance function that has no reason to read matter state.
     pub const OBLIGATION_LIST: &str = "api:obligation.list";
     pub const EVENT_DELIVER: &str = "api:event.deliver";
+    /// Reading the messages that arrived and reached nobody. Its own verb
+    /// because the audience is whoever owns the *integration* — a dead letter
+    /// means a correlation key does not match what a run subscribed to, which
+    /// is a question about the emitter, not about any matter's contents.
+    pub const DEADLETTER_LIST: &str = "api:deadletter.list";
+    /// Reading the webhook registrations a delivery worker gave up on.
+    #[cfg(feature = "push")]
+    pub const PUSH_LIST: &str = "api:push.list";
+    /// Re-arming one. Separate from reading it because it resumes outbound
+    /// traffic to a third party's endpoint, which is a decision rather than a
+    /// look.
+    #[cfg(feature = "push")]
+    pub const PUSH_REARM: &str = "api:push.rearm";
 
     /// Every action this surface can ask about.
     ///
@@ -781,6 +930,9 @@ pub mod action {
         RUN_READ,
         RUN_LIST,
         RUN_CANCEL,
+        RUN_REOPEN,
+        RUN_ABANDON,
+        EFFECT_RECONCILE,
         TASK_TAKEOVER,
         TASK_LIST,
         TASK_READ,
@@ -791,6 +943,11 @@ pub mod action {
         CASE_LIST,
         OBLIGATION_LIST,
         EVENT_DELIVER,
+        DEADLETTER_LIST,
+        #[cfg(feature = "push")]
+        PUSH_LIST,
+        #[cfg(feature = "push")]
+        PUSH_REARM,
     ];
 }
 
@@ -923,6 +1080,7 @@ async fn run_view(
         cancellation_requested_by,
         records: records.len() as u64,
         case,
+        undecided: crate::journal::undecided_effects(&records),
     }))
 }
 
@@ -974,6 +1132,127 @@ async fn cancel_run(
     ))
 }
 
+/// Hand a quarantined run back to the runtime to be judged again.
+///
+/// `200`, not `202`: this drives the pass itself and answers with what the run
+/// reached. An operator who reopens a run wants to know whether it got any
+/// further, and a `202` would send them back to poll the very endpoint that
+/// told them nothing was wrong.
+async fn reopen_run(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Path(run): Path<String>,
+    Json(body): Json<QuarantineRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api.gate(&headers, action::RUN_REOPEN, &run).await?;
+    decide_quarantine(&s, &run, &body.reason, QuarantineDecision::Reopen).await
+}
+
+/// Close a quarantined run whose outcome will never be established.
+///
+/// Nothing is unwound — see [`QuarantineDecision::Abandon`]. What the run left
+/// in the world stays there, and the doubt leaves the quarantine backlog for an
+/// `agentplane audit` finding that no later action can clear.
+async fn abandon_run(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Path(run): Path<String>,
+    Json(body): Json<QuarantineRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api.gate(&headers, action::RUN_ABANDON, &run).await?;
+    decide_quarantine(&s, &run, &body.reason, QuarantineDecision::Abandon).await
+}
+
+/// The half the two decisions share, which is everything but the verb.
+async fn decide_quarantine(
+    s: &Session,
+    run: &str,
+    reason: &str,
+    decision: QuarantineDecision,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let id = RunId::parse(run).map_err(|_| bad("run"))?;
+    // The decider is the authenticated caller; `QuarantineRequest` has no field
+    // for one. Same rule as deciding a task or stopping a run.
+    let outcome = s
+        .plane
+        .decide_quarantine(id, &s.caller.actor, reason, decision)
+        .await
+        .map_err(quarantine_error)?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "decided_by": s.caller.actor,
+            "decision": decision.as_str(),
+            // What the run reached, which for a reopen is the whole answer: it
+            // may have finished, failed, suspended, or come straight back to
+            // the same quarantine on a doubt nobody answered.
+            "status": outcome.status.as_str(),
+            "reason": outcome.status.reason(),
+        })),
+    ))
+}
+
+/// Assert, out of band, what happened to one effect the runtime could not decide.
+///
+/// Records the fact and changes no status: the run stays quarantined until
+/// somebody reopens or abandons it. That is deliberate — several doubts can be
+/// answered before the run is judged again, and answering one of three is not a
+/// decision.
+async fn reconcile_effect(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Path(run): Path<String>,
+    Json(body): Json<ReconcileRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api.gate(&headers, action::EFFECT_RECONCILE, &run).await?;
+    let id = RunId::parse(&run).map_err(|_| bad("run"))?;
+    let effect = crate::core::EffectKey::from_hex(&body.effect).map_err(|_| bad("effect"))?;
+
+    // Paired here rather than in serde, so the refusal says which half is
+    // wrong. A `landed` with no output is a run told to read back nothing; a
+    // `did_not_happen` carrying one is a request whose two halves disagree, and
+    // silently dropping the value would honour the half the sender did not mean.
+    let assertion = match (body.disposition.as_str(), body.output) {
+        ("landed", Some(output)) => Assertion::Landed(output),
+        ("landed", None) => {
+            return Err(bad(
+                "output: a landed verdict is the result the run reads back",
+            ));
+        }
+        ("did_not_happen", None) => Assertion::DidNotHappen,
+        ("did_not_happen", Some(_)) => {
+            return Err(bad("output: a call that never took returned nothing"));
+        }
+        _ => return Err(bad("disposition: expected 'landed' or 'did_not_happen'")),
+    };
+
+    s.plane
+        .reconcile_effect(id, effect, assertion, &s.caller.actor, &body.note)
+        .await
+        .map_err(quarantine_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "asserted_by": s.caller.actor,
+            "effect": body.effect,
+        })),
+    ))
+}
+
+/// Classify a resolution failure, rather than collapsing it.
+///
+/// A mistyped run id is a 404 and a store outage a 500; answering either as 409
+/// tells the operator the run refused them, which sends them to read a state
+/// that does not exist or teaches them a retryable outage is permanent.
+fn quarantine_error(e: crate::core::RuntimeError) -> ApiError {
+    match e {
+        crate::core::RuntimeError::Store(crate::core::StoreError::NotFound(_)) => not_found("run"),
+        crate::core::RuntimeError::Store(_) => store_failed(),
+        other => ApiError(StatusCode::CONFLICT, other.to_string()),
+    }
+}
+
 /// Runs that ended a given way — in practice, *what is quarantined right now*.
 ///
 /// A quarantine is the most serious conclusion this runtime reaches, and a
@@ -981,9 +1260,11 @@ async fn cancel_run(
 /// run started with `spawn` returns before its status exists, so for those there
 /// is nothing else to read.
 ///
-/// One of four backlogs, and each is delivered by its own route because each has
+/// One of the backlogs, and each is delivered by its own route because each has
 /// a different party to reach: [`cases_by_status`], [`breached_obligations`],
-/// [`worklist`].
+/// [`worklist`], [`dead_letters`]. Counting them here would be a number that
+/// goes stale the next time one is added, which is how a doc comment starts
+/// lying about the thing it sits on.
 async fn runs_by_outcome(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -1308,6 +1589,97 @@ async fn breached_obligations(
             .collect::<Vec<_>>(),
         "truncated": truncated,
     })))
+}
+
+/// Messages that arrived, matched no waiter, and aged out.
+///
+/// `agentplane.event.dead_lettered` says *how many*; this says *which*. A count
+/// with no listing behind it sends an operator to the database, which is the
+/// same as not telling them.
+///
+/// A non-empty list means a correlation key is wrong somewhere. That failure
+/// otherwise presents as a process silently never completing, which is the
+/// most expensive shape a bug can take here.
+async fn dead_letters(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::DEADLETTER_LIST, "*").await?;
+    let events = s.plane.events().ok_or_else(|| unavailable("event"))?;
+
+    // One more than the page, for the reason every sibling listing takes one
+    // more: a backlog of 140 shown as 100 reads as a backlog of 100.
+    let mut found = events
+        .dead_letters(api.limit + 1)
+        .await
+        .map_err(|_| store_failed())?;
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "dead_letters": found.iter().map(DeadLetterView::of).collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
+/// Webhook registrations a delivery worker gave up on.
+///
+/// Parked rather than deleted, because the cursor is the only record of how far
+/// a receiver got. That makes it a backlog, and this is the door: the count in
+/// `PushSweepReport::parked` says how many receivers stopped accepting
+/// deliveries, and an operator who has fixed one re-arms it at
+/// `POST /push/rearm`.
+#[cfg(feature = "push")]
+async fn parked_push(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::PUSH_LIST, "*").await?;
+    let push = s.plane.push().ok_or_else(|| unavailable("push"))?;
+
+    let mut found = push
+        .parked(api.limit + 1)
+        .await
+        .map_err(|_| store_failed())?;
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "parked": found
+            .iter()
+            .map(|r| ParkedPushView {
+                config: r.config.redacted(),
+                next_seq: r.next_seq,
+                attempts: r.attempts,
+                last_error: r.last_error.clone(),
+            })
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
+/// Re-arm one, once its receiver is answering again.
+///
+/// Delivery resumes at the first record the receiver never acknowledged rather
+/// than at the head of the run — the cursor is untouched, which is why parking
+/// is not deletion.
+///
+/// `rearmed: false` means no *parked* registration by that name: already live,
+/// or never there. Told plainly rather than swallowed, because an operator left
+/// waiting for a sweep with nothing to do cannot tell the difference.
+#[cfg(feature = "push")]
+async fn rearm_push(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<RearmRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::PUSH_REARM, &body.run).await?;
+    let run = RunId::parse(&body.run).map_err(|_| bad("run"))?;
+
+    let rearmed = s
+        .plane
+        .rearm_push(run, &body.id)
+        .await
+        .map_err(|e| match e {
+            crate::core::RuntimeError::Store(_) => store_failed(),
+            other => ApiError(StatusCode::CONFLICT, other.to_string()),
+        })?;
+
+    Ok(Json(json!({ "rearmed": rearmed })))
 }
 
 async fn case_view(

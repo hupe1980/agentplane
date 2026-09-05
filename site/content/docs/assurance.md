@@ -1,7 +1,10 @@
 +++
 title = "How this is proven"
-description = "Model-checked TLA+ specifications, mutation-tested specs, every crash point without a fault injector, and a mutation sweep that breaks each guarantee on purpose."
+description = "Model-checked TLA+ specifications, every crash point without a fault injector, and a mutation sweep that breaks each guarantee on purpose."
 weight = 13
+
+[extra]
+group = "Trust"
 +++
 
 A green test suite is not an argument. A guarantee is only worth what its
@@ -37,9 +40,39 @@ it must fail.
 | `tests/wire/api.rs` | That the HTTP surface cannot be told who is acting, that both gates run on every route, and that four-eyes survives the hop |
 | `tests/trust/attestation.rs` | That a *valid* chain rewritten by somebody who could hash but not sign is still caught |
 | `tests/engine/cancellation.rs` | That a stop unwinds what the run did, refuses to unwind around an unknown outcome, and names who asked |
+| `tests/engine/quarantine.rs` | That a person can answer a doubt and the runtime still decides the run — and that giving up leaves the doubt reportable |
 | `tests/wire/drivers.rs` | The two wire drivers' failure mappings — whether a peer acted, and whether a model call was billed |
+| `tests/trust/format.rs` | The durable formats against frozen bytes — every record kind's canonical form and digest, a sealed export a future build must still verify, and what a reader does with a shape it does not know |
 | `tests/guards/layering.rs` | Architectural invariants — core purity, lint config, canonical JSON, spec/code correspondence |
 | `spec/` | TLA+ models of the effect protocol, retry safety, sagas, and fencing, plus the mutants that prove those models constrain anything |
+
+### A format checks itself against its own bytes, not against its own reader
+
+Two of the entries above are checked-in artifacts rather than assertions:
+`tests/golden/records.jsonl` (one canonical record per kind, with its chain
+digest) and `tests/golden/export.jsonl` (a sealed export). They exist because a
+test that serialises and then deserialises proves only that the build agrees
+with itself, and the failure they catch is the one that passes every such test:
+a field reordered, a `skip_serializing_if` added, a serde attribute renamed —
+each rehashing every record this project will ever write, each reading in
+review as a tidy-up.
+
+Regenerating them is a separate command:
+
+```sh
+AGENTPLANE_BLESS_GOLDEN=1 cargo test --test trust format::
+```
+
+Deliberately not a `--fix`, and deliberately not automatic. Until the format
+freeze a shape change is a **hard cut** — every journal written by an older
+build stops being readable — so blessing the corpus is the moment somebody
+decides that, and it should cost a decision.
+
+What this does **not** buy is stated rather than implied: the vectors are this
+build checking itself, so they catch drift and cannot catch a shared
+misunderstanding. The outside authority that would is a vector produced by a
+second implementation, which needs a written specification first — both are
+[open freeze conditions](@/docs/status.md#format-freeze).
 
 ### The size a proof starts from is stated, never inferred
 

@@ -82,13 +82,12 @@ pub struct ToolId {
 
 /// The scheme a manifest grant is written in.
 ///
-/// Deliberately transport-neutral, and it did not start that way. Grants were
-/// spelled `mcp://server/tool` — including for tools compiled into this binary,
-/// which never touch MCP. A manifest is a **review artifact** and an Agent Card
-/// republishes its tool references, so that scheme was asserting a supply-chain
-/// fact the document cannot know, to readers who have no way to check it. A
-/// false statement in a reviewed file is the defect this crate refuses
-/// everywhere else.
+/// Deliberately transport-neutral. Naming the transport — `mcp://server/tool`
+/// for a tool compiled into this binary, which never touches MCP — would assert
+/// a supply-chain fact the document cannot know, to readers who have no way to
+/// check it. A manifest is a **review artifact** and an Agent Card republishes
+/// its tool references, so a false statement in it is the defect this crate
+/// refuses everywhere else.
 ///
 /// A reference names *which tool*. Which transport reaches its server is a
 /// **deployment** decision, made by [`ToolRouter`] — and keeping it there is
@@ -753,9 +752,9 @@ impl ToolCatalog {
 /// nobody registered is [`ToolError::Unreachable`] — the honest answer, since
 /// there is no transport that could carry the call.
 ///
-/// It is also what lets a plane use more than one kind of tool at once. A
+/// It is also what lets a plane use more than one kind of tool at once: a
 /// [`ToolBox`] of typed in-process tools and an MCP server are two transports,
-/// and before this a plane could have exactly one of them.
+/// and a plane routes to both by the server a reference names.
 #[derive(Debug, Default)]
 pub struct ToolRouter {
     routes: BTreeMap<String, Arc<dyn ToolClient>>,

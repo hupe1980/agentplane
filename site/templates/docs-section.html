@@ -2,26 +2,30 @@
 {% block content %}
 <div class="docs-layout">
   <aside class="sidebar" aria-label="Documentation">
-    <p class="side-title">Documentation</p>
-    <nav><ol>
-    {% for p in section.pages %}
-      <li><a href="{{ p.permalink }}">{{ p.title }}</a></li>
-    {% endfor %}
-    </ol></nav>
+    {% include "docs-nav.html" %}
   </aside>
+
   <article class="doc">
     <header>
       <h1>{{ section.title }}</h1>
       <p class="lede">{{ section.description }}</p>
     </header>
-    <div class="cards">
-    {% for p in section.pages %}
-      <a class="card" href="{{ p.permalink }}">
-        <h2>{{ p.title }}</h2>
-        <p>{{ p.description }}</p>
-      </a>
+
+    {% for group in config.extra.doc_groups %}
+    <section class="group">
+      <h2>{{ group }}</h2>
+      <div class="cards">
+      {%- for p in section.pages %}
+      {%- if p.extra.group == group %}
+        <a class="card" href="{{ p.permalink }}">
+          <h3>{{ p.title }}</h3>
+          <p>{{ p.description }}</p>
+        </a>
+      {%- endif %}
+      {%- endfor %}
+      </div>
+    </section>
     {% endfor %}
-    </div>
   </article>
 </div>
 {% endblock content %}

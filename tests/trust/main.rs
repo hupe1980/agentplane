@@ -21,6 +21,7 @@ mod budgets;
 mod cedar;
 mod drill;
 mod export;
+mod format;
 mod identity;
 #[cfg(feature = "keyring")]
 mod keyring;

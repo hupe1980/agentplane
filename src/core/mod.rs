@@ -14,6 +14,7 @@ mod calendar;
 pub mod canon;
 mod case;
 mod cloudevent;
+mod doubt;
 mod effect;
 pub(crate) mod error;
 mod event;
@@ -53,6 +54,7 @@ pub use case::{
     Case, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineSpec, DeadlineState,
     SweptAction,
 };
+pub use doubt::{Assertion, Doubt, QuarantineDecision, Undecided};
 pub use effect::{
     AnyEffect, DeclaredOutput, Effect, EffectDescriptor, GroupOutcome, Reconciliation, Recovery,
 };

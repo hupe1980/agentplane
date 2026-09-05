@@ -129,10 +129,33 @@ pub(crate) enum SealedField<'a> {
 /// indexes on any field below — routing lives in `seq`, `run`, `case`,
 /// `effect_key`, the variant, and `RunConcluded.outcome`, all of which stay
 /// clear.
+///
+/// **No arm uses `..`, including the ones that do seal something.** An
+/// exhaustive match over *variants* asks the question when a record kind is
+/// added and stays silent when a **field** is added to a kind that already
+/// exists — which compiles, passes every test, and seals nothing. The sealing
+/// arms are the ones where that silence costs the most, because a new payload
+/// field on `EffectDone` or `EffectReconciled` is by construction the caller's
+/// data. Naming every field is what makes the compiler ask the second
+/// question.
+// One match, and it may not be split. `too_many_lines` asks for the arms to be
+// moved into helpers, and every way of doing that puts a `_ =>` or an `other =>`
+// in front of them — after which a record kind added later takes the wildcard
+// and is written in the clear. The length is the enumeration; the enumeration is
+// the control.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
     use super::RecordKind as K;
     match kind {
-        K::RunAdmitted { input, .. } => vec![SealedField::Value(input)],
+        K::RunAdmitted {
+            input,
+            capability: _,
+            governed_by: _,
+            input_label: _,
+            policy_bundle: _,
+            canon: _,
+            idempotency_key: _,
+        } => vec![SealedField::Value(input)],
         // The frozen plan is sealed because it can *embed* the caller's data,
         // not merely reference it: a `planned` agent's planner reads the
         // (trusted) input to write the plan, and any constant it binds —
@@ -142,9 +165,21 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // value by a runtime that holds the key; with the key erased the run's
         // data is gone and its replay legitimately goes with it, exactly as it
         // does for `RunAdmitted.input`.
-        K::PlanFrozen { plan, .. } => vec![SealedField::Value(plan)],
-        K::EffectStarted { descriptor, .. } => vec![SealedField::Value(&mut descriptor.args)],
-        K::EffectDone { output, .. } => vec![SealedField::Value(output)],
+        K::PlanFrozen { plan, steps: _ } => vec![SealedField::Value(plan)],
+        K::EffectStarted {
+            descriptor,
+            recovery: _,
+            mutates: _,
+            attempt: _,
+            backoff_ms: _,
+            outbound_label: _,
+        } => vec![SealedField::Value(&mut descriptor.args)],
+        K::EffectDone {
+            output,
+            source: _,
+            spend: _,
+            declared: _,
+        } => vec![SealedField::Value(output)],
         // A reconciled effect's recovered result is the same object an
         // `EffectDone.output` is — caller data a probe happened to fetch —
         // and its `detail` is the same free text an `EffectFailed.error` is:
@@ -152,7 +187,18 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // it was asked about. `disposition` stays clear, and so does the
         // detail's *presence* — recovery routes on whether the probe spoke,
         // never on what it said, so the Option survives while the words seal.
-        K::EffectReconciled { output, detail, .. } => output
+        K::EffectReconciled {
+            output,
+            detail,
+            disposition: _,
+            spend: _,
+            declared: _,
+            // An operator's name is control-plane, exactly as a canceller's is:
+            // recovery routes on *whether* a person answered, and a name that
+            // needed a key to read would make an unopenable journal unable to
+            // say who decided a run could carry on.
+            asserted_by: _,
+        } => output
             .as_mut()
             .map(SealedField::Value)
             .into_iter()
@@ -162,7 +208,11 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // reason in the skill author's words over the caller's values — "hold
         // h-73 does not cover order for alice@…" — while `outcome` is the
         // routing fact and stays clear.
-        K::GroupSettled { detail, .. } => {
+        K::GroupSettled {
+            detail,
+            group: _,
+            outcome: _,
+        } => {
             detail.as_mut().map(SealedField::Text).into_iter().collect()
         }
         // The message is free text a provider or tool wrote — it quotes the
@@ -170,7 +220,12 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // `permanent` MUST stay clear: retry and reconciliation route on them,
         // and a recovery that needed a key to decide whether a call reached
         // the world would fail closed into an outage.
-        K::EffectFailed { error, .. } => vec![SealedField::Text(error)],
+        K::EffectFailed {
+            error,
+            spend: _,
+            disposition: _,
+            permanent: _,
+        } => vec![SealedField::Text(error)],
         // Reasoning recorded beside the effects it explains — model output
         // over the caller's data, and nothing routes on it.
         K::Note { text } => vec![SealedField::Text(text)],
@@ -187,19 +242,8 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
 
         // Control-plane: names, states, digests, counts. Sealing them would
         // cost the readability that makes an unopenable journal still useful,
-        // and buy nothing — none of them carries the caller's data.
-        //
-        // **Every field is named, and none of these arms uses `..`.** An
-        // exhaustive match over *variants* asks the question when a record kind
-        // is added and stays silent when a **field** is added to one that
-        // already exists — which compiles, passes every test, and seals
-        // nothing. Naming each field is what makes the compiler ask the second
-        // question too, and it is the question that was missed: a run's
-        // conclusion gained a reason, and the arm above is where that field's
-        // answer now lives.
-        // One arm, because the answer is one answer. The fields are still all
-        // named: that is what makes a field added later a build error rather
-        // than a silent no.
+        // and buy nothing — none of them carries the caller's data. One arm,
+        // because the answer is one answer.
         K::QuotaPassStarted {
             period: _,
             release_slot: _,
@@ -255,6 +299,13 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         | K::RunCancelled {
             actor: _,
             reason: _,
+        }
+        // An operator's own words about a run, like a cancellation's — the
+        // record of a judgement, not the caller's data it was made about.
+        | K::QuarantineDecided {
+            decider: _,
+            reason: _,
+            decision: _,
         }
         | K::BreakGlass {
             actor: _,

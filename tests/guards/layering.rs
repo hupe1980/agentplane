@@ -1599,6 +1599,67 @@ fn every_api_route_is_covered_by_the_unauthenticated_test() {
     );
 }
 
+/// Every `RunStatus` variant is in the list the agreement tests walk.
+///
+/// `runtime::every_status` is a hand-written enumeration of a data-carrying
+/// enum, which Rust cannot derive. Three tests walk it to decide, per variant,
+/// whether it seals, whether a resume may continue from it, and which A2A state
+/// it surfaces as — and every one of them walks the *list*, so a variant added
+/// to the enum and forgotten in the list is a variant those tests silently stop
+/// asking about. Their own length assertions do not help: they fire when
+/// somebody edits the list, which is the case that never needed a guard.
+///
+/// That is not hypothetical. The list carried a comment claiming "the count
+/// assertion in each consumer fails the day a variant is added"; a variant was
+/// added and all three passed unchanged.
+///
+/// Source-level, because there is nothing else to hold the two to each other:
+/// the enum and the function live in one file, and the variant a `match` arm
+/// names is the only machine-readable link between them.
+#[test]
+fn every_run_status_variant_is_listed() {
+    let src = read("src/runtime/executor.rs");
+
+    let start = src
+        .find("pub enum RunStatus {")
+        .expect("the RunStatus enum");
+    let end = src[start..].find("\n}\n").expect("end of enum") + start;
+    // A variant declaration is the only thing at four-space indent inside the
+    // enum that begins with a capital: fields sit two levels in, and every
+    // doc line and attribute is skipped by the first character test.
+    let declared: Vec<String> = src[start..end]
+        .lines()
+        .filter_map(|line| {
+            let code = line.strip_prefix("    ")?;
+            let name: String = code
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!name.is_empty() && name.starts_with(char::is_uppercase)).then_some(name)
+        })
+        .collect();
+    assert!(
+        declared.len() > 3,
+        "found {declared:?} — the guard is reading the wrong span rather than passing"
+    );
+
+    let listed = src
+        .split("pub(crate) fn every_status()")
+        .nth(1)
+        .expect("the every_status list");
+    let listed = &listed[..listed.find("\n}\n").expect("end of every_status")];
+
+    for variant in &declared {
+        assert!(
+            listed.contains(&format!("RunStatus::{variant}")),
+            "`RunStatus::{variant}` is not in `every_status`, so nothing decides \
+             whether it seals, whether a resume may continue from it, or which \
+             A2A state it surfaces as — three tests walk that list and would \
+             pass without ever asking"
+        );
+    }
+}
+
 /// A journaled record names only `core` vocabulary.
 ///
 /// The journal is the durable contract. Every type inside a `RecordKind` is a
