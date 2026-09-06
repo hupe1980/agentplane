@@ -210,6 +210,7 @@ fn a_case_and_its_deadlines_carry_no_component_array() {
         calendar_digest: agentplane::core::Digest::of(b"cal"),
         warn_at: Some(at()),
         state: agentplane::core::DeadlineState::Pending,
+        acknowledged: None,
     };
     assert_no_component_array("Deadline", &deadline);
 }

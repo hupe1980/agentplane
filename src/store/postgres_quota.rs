@@ -10,15 +10,7 @@ use async_trait::async_trait;
 use crate::core::{RunId, Spend, StoreError, Timestamp};
 use crate::quota::{Halt, HaltScope, QuotaError, QuotaSettlement, QuotaStore};
 
-use super::postgres::{PostgresStore, amount_of, sql_amount};
-
-fn be(e: &tokio_postgres::Error) -> StoreError {
-    StoreError::Backend(e.to_string())
-}
-
-fn pool_err(e: &impl std::fmt::Display) -> StoreError {
-    StoreError::Backend(e.to_string())
-}
+use super::postgres::{PostgresStore, amount_of, be, pool_err, sql_amount};
 
 #[async_trait]
 impl QuotaStore for PostgresStore {

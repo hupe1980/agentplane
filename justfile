@@ -81,6 +81,24 @@ test:
 anchors:
     python3 tools/mutants.py --check
 
+# The second implementation, run against the checked-in export.
+#
+# `tools/verify_export.py` is written from the published record-format
+# specification and reads no Rust. Three checks, and the last is the one that
+# keeps the others honest:
+#
+#   --canon-check  re-derives all 27 record vectors from their parsed values,
+#                  so the bytes are *produced* by a second implementation and
+#                  not merely accepted by one
+#   (no flag)      verifies the sealed export, chain, log, cases and frame
+#   --self-test    damages that export six ways and asserts each is reported —
+#                  a reader that answers "0 findings" for everything agrees
+#                  with this crate perfectly and is worth nothing
+verify-golden:
+    python3 tools/verify_export.py tests/golden/records.jsonl --canon-check
+    python3 tools/verify_export.py tests/golden/export.jsonl
+    python3 tools/verify_export.py tests/golden/export.jsonl --self-test
+
 # ── Feature configurations ──────────────────────────────────────────────────
 #
 # Not redundant with `test`. `--all-features` enables `cedar`, which
@@ -382,7 +400,7 @@ audit:
 seams: test-mcp test-http test-attestation test-drivers
 
 # everything CI runs, minus the two slow layers
-ci: lint features anchors audit test test-default test-minimal seams examples cli-smoke doc-examples docs site-check package
+ci: lint features anchors verify-golden audit test test-default test-minimal seams examples cli-smoke doc-examples docs site-check package
 
 # everything, including the slow layers — what a release must pass
 ci-full: ci specs mutants

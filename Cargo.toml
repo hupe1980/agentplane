@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.29.0"
+version      = "0.30.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -51,7 +51,7 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # The agent declaration: tool grants, budgets, egress ceiling, injection
 # pattern. Off by default — the runtime is usable wired by builder calls; the
 # manifest is what makes those declarations reviewable.
-manifest = ["dep:serde_yaml_ng", "dep:base64", "dep:jsonschema"]
+manifest = ["dep:serde_yaml_ng", "dep:jsonschema"]
 # Everything the `agentplane` binary needs. `signing` is here for the audit
 # verbs: an `audit`/`verify` that could not check a signature would send the
 # independent party back to writing Rust.
@@ -62,7 +62,7 @@ opendal = ["dep:opendal"]
 # Envelope encryption for payload bytes, and the erasure it makes provable:
 # destroying the wrapping key reaches every copy at once, which deleting a row
 # cannot do.
-keyring = ["dep:chacha20poly1305", "dep:base64"]
+keyring = ["dep:chacha20poly1305"]
 # A key ring that is somebody else — Vault's transit engine. The wrapping key
 # never leaves it, so erasure is something this crate asks for and cannot undo.
 keyring-vault = ["keyring", "dep:reqwest"]
@@ -101,7 +101,7 @@ a2a = ["dep:reqwest"]
 a2a-server = ["http", "manifest", "push", "dep:async-stream"]
 # Webhook delivery for A2A push notifications: a durable config store plus
 # SSRF-guarded outbound POSTs.
-push = ["dep:reqwest", "dep:hmac", "dep:base64"]
+push = ["dep:reqwest", "dep:hmac"]
 # One concrete Ed25519 signer. The seam — `Signer`, `Verifier`, the attestation
 # on every record — is unconditional.
 signing = ["dep:ed25519-dalek"]
@@ -110,15 +110,21 @@ signing = ["dep:ed25519-dalek"]
 providers = ["dep:reqwest", "dep:jsonschema"]
 # Amazon Bedrock's Converse API. Separate from `providers` because the AWS SDK
 # graph is substantial and OpenAI/Anthropic users should not pay for it.
-bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types", "dep:base64", "dep:jsonschema"]
+bedrock = ["dep:aws-config", "dep:aws-sdk-bedrockruntime", "dep:aws-smithy-types", "dep:jsonschema"]
 # Governed remote-media ingestion. Separate because dereferencing an untrusted
 # URL is its own security boundary: every DNS answer and redirect is checked
 # and pinned before bytes enter blob storage.
-media = ["dep:base64", "dep:reqwest", "tokio/net"]
+media = ["dep:reqwest", "tokio/net"]
 
 [dependencies]
 async-trait = "0.1"
-base64 = { version = "0.22", optional = true }
+# One base64 implementation, unconditional. The alternative is a hand-rolled
+# codec in the modules that parse a checkpoint note without a feature flag —
+# and a second decoder is a second answer to "is this the canonical spelling",
+# which is the whole guarantee where a signature covers the text.
+# `crate::core::b64` names the two dialects this crate speaks; nothing else
+# reaches for the engine.
+base64 = "0.22"
 serde       = { version = "1", features = ["derive"] }
 # NOTE: this crate must not ask for `preserve_order`, but it can no longer
 # assume nobody does — cargo unifies features across the graph and cedar-policy

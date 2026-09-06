@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(replay(&spends), Some(3));
     }
 
-    /// Literal vectors because this enum is now part of the durable conclusion
+    /// Literal vectors because this enum is part of the durable conclusion
     /// format. A serialize-then-deserialize test proves only that two copies of
     /// the same mistake agree.
     #[test]

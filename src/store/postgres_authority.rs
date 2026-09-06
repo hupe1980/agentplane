@@ -20,7 +20,7 @@ use crate::authority::{
 };
 use crate::core::{EffectKey, Spend, StoreError, Timestamp};
 
-use super::postgres::{PostgresStore, amount_of, sql_amount};
+use super::postgres::{PostgresStore, amount_of, be, sql_amount};
 
 /// Terms, balance and receipts, keyed by tenant throughout.
 ///
@@ -75,10 +75,6 @@ CREATE TABLE IF NOT EXISTS authority_receipt (
     PRIMARY KEY (tenant, authority, dispatch)
 );
 ";
-
-fn be(e: &tokio_postgres::Error) -> StoreError {
-    StoreError::Backend(e.to_string())
-}
 
 fn unavailable(e: &impl std::fmt::Display) -> AuthorityError {
     AuthorityError::Unavailable(e.to_string())

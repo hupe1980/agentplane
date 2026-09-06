@@ -59,7 +59,426 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     an_imported_case_is_reachable_by_every_read_path(store, r).await;
     concurrent_attaches_all_land_and_land_once(store, r).await;
     a_breached_obligation_is_listable_and_survives_closure(store, r).await;
+    an_acknowledged_breach_leaves_the_listing(store, r).await;
+    a_breach_cannot_be_transitioned_away(store, r).await;
+    an_obligation_cannot_be_registered_on_a_closed_case(store, r).await;
+    a_reopened_case_correlates_again(store, r).await;
     a_cases_blob_list_holds_only_its_own(store, r).await;
+}
+
+/// The obligation listing drains, and only by somebody answering it.
+///
+/// Four halves, because the first two alone are satisfied by a store that
+/// simply forgets: the breach must leave the listing when acknowledged, the
+/// **account must still be readable** on the obligation, the first account must
+/// stand against a second, and an obligation that has not been breached must
+/// refuse one.
+///
+/// The reason this is contract rather than convenience: the listing is ordered
+/// longest-overdue first and bounded by a page. A store that never removes an
+/// entry shows the same head forever, so every breach after the page boundary
+/// is unreachable — and the entries an operator could still act on are exactly
+/// the ones they never see. The gauge beside it has the same defect in the
+/// other direction: a level that cannot fall says only that this deployment has
+/// ever missed something.
+async fn an_acknowledged_breach_leaves_the_listing(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("BRE-ACK"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    let deadline = |name: &str| crate::core::Deadline {
+        case,
+        name: name.to_owned(),
+        resolved_at: ts(9_000),
+        calendar_digest: crate::core::Digest::of(b"cal"),
+        warn_at: None,
+        state: crate::core::DeadlineState::Pending,
+        acknowledged: None,
+    };
+    if store
+        .register_deadline(&deadline("answered"))
+        .await
+        .is_err()
+        || store.register_deadline(&deadline("pending")).await.is_err()
+    {
+        r.record("breach account", "register_deadline failed");
+        return;
+    }
+    let _ = store
+        .set_deadline_state(case, "answered", crate::core::DeadlineState::Breached)
+        .await;
+
+    // An account before the breach would take an obligation off the listing
+    // while it was still going to be missed.
+    let note = crate::core::BreachNote {
+        by: "compliance@example.test".to_owned(),
+        note: "filed under Q3 exceptions".to_owned(),
+        at: ts(9_500),
+    };
+    match store.acknowledge_breach(case, "pending", &note).await {
+        Err(StoreError::NotBreached { .. }) => {}
+        Ok(_) => r.record(
+            "breach account",
+            "an obligation that has not been breached accepted an account, which takes it off the \
+             listing before it was ever due",
+        ),
+        Err(other) => r.record(
+            "breach account",
+            format!("an account before the breach must refuse as `NotBreached`, not `{other}`"),
+        ),
+    }
+
+    let before = store.census(ts(9_600)).await.map_or(0, |c| c.breached);
+    match store.acknowledge_breach(case, "answered", &note).await {
+        Ok(true) => {}
+        Ok(false) => {
+            r.record(
+                "breach account",
+                "the first account reported that somebody had already answered",
+            );
+            return;
+        }
+        Err(e) => {
+            r.record("breach account", format!("acknowledge_breach failed: {e}"));
+            return;
+        }
+    }
+
+    match store.breached(1_000).await {
+        Ok(list) => {
+            if list.iter().any(|d| d.case == case && d.name == "answered") {
+                r.record(
+                    "breach account",
+                    "an acknowledged breach stayed on the listing. Ordered longest-overdue first, \
+                     an entry nothing removes occupies the page forever and every later breach is \
+                     unreachable",
+                );
+            }
+        }
+        Err(e) => r.record("breach account", format!("breached() failed with {e}")),
+    }
+
+    the_fact_survives_the_answer(store, case, &note, r).await;
+
+    match store.census(ts(9_600)).await {
+        Ok(c) if c.breached + 1 == before => {}
+        Ok(c) => r.record(
+            "breach account",
+            format!(
+                "the unaccounted-breach gauge went {before} -> {} across one \
+                 acknowledgement. A gauge that does not fall when somebody acts \
+                 cannot say whether there is work outstanding",
+                c.breached
+            ),
+        ),
+        Err(e) => r.record("breach account", format!("census() failed with {e}")),
+    }
+
+    the_first_account_stands(store, case, &note, r).await;
+}
+
+/// The breach outlives the account of it, and so does the account.
+///
+/// Checked separately from the listing, because a store that dropped the state
+/// on acknowledgement would satisfy *left the listing* exactly — by forgetting
+/// what happened. What ends is the question, not the fact.
+async fn the_fact_survives_the_answer(
+    store: &Arc<dyn CaseStore>,
+    case: CaseId,
+    note: &crate::core::BreachNote,
+    r: &mut Report,
+) {
+    match store.deadlines(case).await {
+        Ok(list) => match list.iter().find(|d| d.name == "answered") {
+            Some(d) if d.state != crate::core::DeadlineState::Breached => r.record(
+                "breach account",
+                "acknowledging a breach changed its state. What ends is the question, not the \
+                 fact — an obligation that was missed stays missed",
+            ),
+            Some(d) => match &d.acknowledged {
+                None => r.record(
+                    "breach account",
+                    "the account was not readable back, so who answered for a missed obligation \
+                     is a fact the store took and did not keep",
+                ),
+                Some(a) if a.by != note.by || a.note != note.note || a.at != note.at => r.record(
+                    "breach account",
+                    "the account read back different from the one recorded",
+                ),
+                Some(_) => {}
+            },
+            None => r.record("breach account", "the obligation disappeared"),
+        },
+        Err(e) => r.record("breach account", format!("deadlines() failed with {e}")),
+    }
+}
+
+/// The second account is refused the *rewrite*, not the call.
+///
+/// Acknowledging twice is a retry — a delivery that timed out after the write
+/// landed looks exactly like one that never landed — so it must succeed and say
+/// which happened. What it must not do is change who looked or when: the record
+/// of who answered is the answer.
+async fn the_first_account_stands(
+    store: &Arc<dyn CaseStore>,
+    case: CaseId,
+    first: &crate::core::BreachNote,
+    r: &mut Report,
+) {
+    let later = crate::core::BreachNote {
+        by: "someone-else@example.test".to_owned(),
+        note: "second".to_owned(),
+        at: ts(9_900),
+    };
+    match store.acknowledge_breach(case, "answered", &later).await {
+        Ok(false) => {}
+        Ok(true) => r.record(
+            "breach account",
+            "a second account reported itself as the one recorded",
+        ),
+        Err(e) => r.record(
+            "breach account",
+            format!("acknowledging twice must be idempotent, not `{e}`"),
+        ),
+    }
+    if let Ok(list) = store.deadlines(case).await
+        && let Some(d) = list.iter().find(|d| d.name == "answered")
+        && d.acknowledged.as_ref().is_some_and(|a| a.by != first.by)
+    {
+        r.record(
+            "breach account",
+            "a second account overwrote the first. The record of who answered is \
+             the answer, so a retry must not rewrite it",
+        );
+    }
+}
+
+/// How an obligation ended is not editable.
+///
+/// The state column is the only record that a window closed unmet, and
+/// `set_deadline_state` is reachable from a skill — `cx.meet_deadline` is the
+/// same write. A run that answered late would otherwise take the miss off the
+/// operator's listing and out of the row in one call, leaving no account of it
+/// anywhere: not a stale row, an erased one. Answering late is a fact to record
+/// beside the breach.
+///
+/// The positive half is checked with it, because a store that refused *every*
+/// transition would satisfy the negative one exactly: re-applying the state
+/// already held must still succeed, since every writer here is a sweep or a
+/// resumed run and both repeat their own last write by design.
+async fn a_breach_cannot_be_transitioned_away(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("BRE-FINAL"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    let deadline = crate::core::Deadline {
+        case,
+        name: "final".into(),
+        resolved_at: ts(9_000),
+        calendar_digest: crate::core::Digest::of(b"cal"),
+        warn_at: None,
+        state: crate::core::DeadlineState::Pending,
+        acknowledged: None,
+    };
+    if store.register_deadline(&deadline).await.is_err() {
+        r.record("obligation lifecycle", "register_deadline failed");
+        return;
+    }
+    if store
+        .set_deadline_state(case, "final", crate::core::DeadlineState::Breached)
+        .await
+        .is_err()
+    {
+        r.record(
+            "obligation lifecycle",
+            "a pending obligation must be breachable",
+        );
+        return;
+    }
+    // Idempotent re-application, which a sweep repeating its own last write
+    // relies on.
+    if let Err(e) = store
+        .set_deadline_state(case, "final", crate::core::DeadlineState::Breached)
+        .await
+    {
+        r.record(
+            "obligation lifecycle",
+            format!(
+                "re-applying the state already held was refused as `{e}` — a sweep repeating its \
+                 own write is a retry, not an edit"
+            ),
+        );
+    }
+    for to in [
+        crate::core::DeadlineState::Met,
+        crate::core::DeadlineState::Cancelled,
+        crate::core::DeadlineState::Pending,
+    ] {
+        match store.set_deadline_state(case, "final", to).await {
+            Err(StoreError::DeadlineFinal { .. }) => {}
+            Ok(()) => {
+                r.record(
+                    "obligation lifecycle",
+                    format!(
+                        "a breached obligation became `{}`. The state column is the only record \
+                         that the window closed unmet, so this does not leave a stale row — it \
+                         erases one",
+                        to.as_str()
+                    ),
+                );
+                return;
+            }
+            Err(other) => r.record(
+                "obligation lifecycle",
+                format!(
+                    "moving a breached obligation must refuse as `DeadlineFinal`, not as \
+                     `{other}`"
+                ),
+            ),
+        }
+    }
+}
+
+/// A closed case may not acquire a new obligation.
+///
+/// Closure refuses an outstanding obligation, and on its own that is a check at
+/// one instant rather than a property of the store. This is the write that
+/// walks past it: register an obligation afterwards and the sweep breaches it
+/// and escalates, so a matter audited as settled acquires a duty and misses it
+/// with no run and no operator involved.
+///
+/// Both backends must refuse, and the refusal must be typed — a closed case
+/// reported as a backend fault is indistinguishable from a store that was
+/// briefly down, which is the reading that turns enforcement into an outage.
+async fn an_obligation_cannot_be_registered_on_a_closed_case(
+    store: &Arc<dyn CaseStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("INV-CLOSED"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    if store.close(case).await.is_err() {
+        r.record("closure", "a case with no obligations must be closable");
+        return;
+    }
+    let late = crate::core::Deadline {
+        case,
+        name: "late".into(),
+        resolved_at: ts(9_000),
+        calendar_digest: crate::core::Digest::of(b"cal"),
+        warn_at: None,
+        state: crate::core::DeadlineState::Pending,
+        acknowledged: None,
+    };
+    match store.register_deadline(&late).await {
+        Err(StoreError::CaseClosed { .. }) => {}
+        Ok(()) => r.record(
+            "closure",
+            "an obligation was registered on a closed case. Closure refusing an outstanding \
+             obligation is a precondition, not an invariant, unless this write refuses too — the \
+             sweep will breach this one and escalate a matter nobody is watching",
+        ),
+        Err(other) => r.record(
+            "closure",
+            format!(
+                "registering on a closed case must refuse as `CaseClosed`, not as `{other}` — a \
+                 business refusal wearing a fault's type makes an outage read as enforcement"
+            ),
+        ),
+    }
+}
+
+/// A case that leaves `Closed` can correlate again.
+///
+/// Closure releases the correlation keys so a genuinely new matter about the
+/// same entity opens a fresh case. Read backwards, that is a rule with a second
+/// half: a case reopened by any route — a run's `set_case_status`, the sweep
+/// escalating over an expired task — must take the free ones back, or it comes
+/// back as a matter no inbound message can ever reach. Live-looking and
+/// unreachable is the drift `close` exists to prevent, in the other direction.
+///
+/// The negative half is the load-bearing one: a key another case has since
+/// claimed stays with that case. A reopening that took one back would silently
+/// redirect a live matter's traffic.
+async fn a_reopened_case_correlates_again(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let free = keys("REOPEN-FREE");
+    let taken = vec![
+        CorrelationKey::new("doc", "REOPEN-FREE"),
+        CorrelationKey::new("doc", "REOPEN-TAKEN"),
+    ];
+    let Ok(opened) = store.correlate_or_open("matter", &taken, ts(1_000)).await else {
+        return;
+    };
+    let case = opened.case_id();
+    if store.close(case).await.is_err() {
+        r.record("reopening", "a case with no obligations must be closable");
+        return;
+    }
+    // A new matter claims one of the two keys while the first is closed.
+    let Ok(successor) = store
+        .correlate_or_open(
+            "matter",
+            &[CorrelationKey::new("doc", "REOPEN-TAKEN")],
+            ts(2_000),
+        )
+        .await
+    else {
+        r.record("reopening", "a released key must be claimable");
+        return;
+    };
+    if successor.case_id() == case {
+        r.record("reopening", "closing did not release the keys");
+        return;
+    }
+
+    if store
+        .set_status(case, crate::core::CaseStatus::Escalated)
+        .await
+        .is_err()
+    {
+        r.record("reopening", "set_status off Closed failed");
+        return;
+    }
+    match store.correlate(&free).await {
+        Ok(Some(found)) if found == case => {}
+        Ok(other) => r.record(
+            "reopening",
+            format!(
+                "a reopened case did not take back its free correlation key (correlate answered \
+                 {other:?}). It is open, it looks live, and no inbound message can ever reach it"
+            ),
+        ),
+        Err(e) => r.record("reopening", format!("correlate failed with {e}")),
+    }
+    match store
+        .correlate(&[CorrelationKey::new("doc", "REOPEN-TAKEN")])
+        .await
+    {
+        Ok(Some(found)) if found == successor.case_id() => {}
+        Ok(other) => r.record(
+            "reopening",
+            format!(
+                "reopening took back a key another open case holds (correlate answered \
+                 {other:?}). The identifier belongs to whichever matter is open for it now, and \
+                 stealing it redirects that matter's traffic"
+            ),
+        ),
+        Err(e) => r.record("reopening", format!("correlate failed with {e}")),
+    }
 }
 
 /// A case's blob list is its own, and the negative half is the load-bearing one.
@@ -154,6 +573,7 @@ async fn a_breached_obligation_is_listable_and_survives_closure(
         calendar_digest: crate::core::Digest::of(b"cal"),
         warn_at: None,
         state: crate::core::DeadlineState::Pending,
+        acknowledged: None,
     };
     if store.register_deadline(&deadline("missed")).await.is_err()
         || store.register_deadline(&deadline("kept")).await.is_err()
@@ -423,6 +843,7 @@ async fn an_imported_case_is_reachable_by_every_read_path(
         calendar_digest: Digest::of(b"cal"),
         warn_at: Some(ts(8_000)),
         state: DeadlineState::Pending,
+        acknowledged: None,
     };
     let blob = Digest::of(b"artifact");
     if store
@@ -793,6 +1214,7 @@ async fn closing_via_set_status_also_releases_the_keys(store: &Arc<dyn CaseStore
         calendar_digest: crate::core::Digest::of(b"cal"),
         warn_at: None,
         state: crate::core::DeadlineState::Pending,
+        acknowledged: None,
     };
     if store.register_deadline(&deadline).await.is_err() {
         r.record("closure", "register_deadline failed");
@@ -867,6 +1289,7 @@ async fn an_unmet_obligation_blocks_closure(store: &Arc<dyn CaseStore>, r: &mut 
         calendar_digest: crate::core::Digest::of(b"cal"),
         warn_at: None,
         state: crate::core::DeadlineState::Pending,
+        acknowledged: None,
     };
     if store.register_deadline(&deadline).await.is_err() {
         r.record("closure", "register_deadline failed");
@@ -1684,6 +2107,7 @@ pub async fn check_tasks(store: &Arc<dyn TaskStore>, r: &mut Report) {
     ineligibility_outranks_contention(store, r).await;
     only_the_holder_releases(store, r).await;
     the_backlog_counts_work_somebody_is_holding(store, r).await;
+    a_claimed_task_is_offered_to_nobody_else(store, r).await;
     a_take_over_names_its_holder_and_keeps_the_exclusions(store, r).await;
     an_expired_task_is_not_resurrected_by_a_claim(store, r).await;
     a_state_write_to_a_missing_task_is_not_found(store, r).await;
@@ -1910,6 +2334,55 @@ async fn the_backlog_counts_work_somebody_is_holding(store: &Arc<dyn TaskStore>,
                 "the backlog went from {claimed} to {done} when a task was completed; it must fall by exactly one. A count that never moves is a dashboard that cannot show the queue draining"
             ),
         );
+    }
+}
+
+/// The queue offers a task nobody holds.
+///
+/// The exact complement of [`the_backlog_counts_work_somebody_is_holding`], and
+/// the two are only meaningful together: a claimed task stays in the *backlog*
+/// because it is still a decision the plane is waiting on, and leaves the
+/// *queue* because it is nobody else's to take. A backend where those two are
+/// one predicate shows a held task to a second reviewer, who opens it, reads
+/// the case, decides — and is refused at the claim, having done the work.
+async fn a_claimed_task_is_offered_to_nobody_else(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let roles = vec!["ops".to_owned()];
+    let t = task(74, None);
+    let Ok(opened) = store.open(&t).await else {
+        r.record("queue", "open failed");
+        return;
+    };
+    let offered = |page: &[Task]| page.iter().any(|q| q.id == opened.id);
+
+    match store.queue(&roles, 64).await {
+        Ok(page) if offered(&page) => {}
+        Ok(_) => {
+            r.record(
+                "queue",
+                "an open task is not in the queue, so the check below would pass \
+                 on a queue that is simply empty",
+            );
+            return;
+        }
+        Err(error) => {
+            r.record("queue", format!("the queue could not be read: {error}"));
+            return;
+        }
+    }
+
+    if store.claim(opened.id, "reviewer", &roles).await.is_err() {
+        r.record("queue", "the task could not be claimed");
+        return;
+    }
+    match store.queue(&roles, 64).await {
+        Ok(page) if offered(&page) => r.record(
+            "queue",
+            "a claimed task is still offered by the queue, so a second reviewer \
+             is shown a decision somebody already holds and finds out at the claim",
+        ),
+        Ok(_) => {}
+        Err(error) => r.record("queue", format!("the queue could not be read: {error}")),
     }
 }
 
@@ -2372,6 +2845,32 @@ pub async fn check_batches(store: &Arc<dyn BatchStore>, r: &mut Report) {
                 "the cursor must stop before the first unfinished item, got {c:?} — a \
                  resume that steps over one reports the batch complete with work \
                  outstanding"
+            ),
+        ),
+        Err(e) => r.record("cursor", format!("cursor failed: {e}")),
+    }
+
+    // The half a store gets wrong by asking *which outcomes are open* rather
+    // than which are terminal. A suspended item has an outcome, so a predicate
+    // written as a list of the non-terminal spellings passes the check above
+    // and steps over this one — the batch then reports complete while an item
+    // is still waiting on an event, a person or a raised ceiling.
+    r.checked += 1;
+    let _ = store
+        .record(
+            id,
+            "item-002",
+            &ItemOutcome::Suspended("waiting".to_owned()),
+            Spend::default(),
+        )
+        .await;
+    match store.cursor(id).await {
+        Ok(c) if c.as_deref() == Some("item-001") => {}
+        Ok(c) => r.record(
+            "cursor",
+            format!(
+                "a suspended item was treated as settled and the cursor moved to \
+                 {c:?} — a resume steps over work that never finished"
             ),
         ),
         Err(e) => r.record("cursor", format!("cursor failed: {e}")),

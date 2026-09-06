@@ -6,7 +6,11 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use crate::case::TimerStore;
 use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp};
 
-use super::redb::{MAX_STR, RedbStore, be, begin_write};
+use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
+
+fn phase_from(s: &str) -> Result<Phase, StoreError> {
+    decoded("step phase", s, Phase::parse(s))
+}
 
 /// `(tenant, run_id, effect_key) -> (case_id, has_case, step, phase, fire_at,
 /// claimed_at, has_claim)`.
@@ -37,30 +41,6 @@ const TIMERS_DUE: TableDefinition<(&str, i64, &str, &str), ()> = TableDefinition
 /// wake-up is recorded under a fixed effect key, so a second write is the same
 /// write.
 const CLAIM_LEASE: i64 = 60;
-
-fn phase_str(p: Phase) -> &'static str {
-    match p {
-        Phase::Forward => "forward",
-        Phase::Compensating => "compensating",
-    }
-}
-
-/// A row this store cannot read is not a row with a default value: `phase`
-/// tells a step's forward pass from its compensating one, and an unreadable
-/// value answered `Forward` hands the unwind logic a compensating record
-/// wearing the wrong half of the saga.
-fn phase_from(s: &str) -> Result<Phase, StoreError> {
-    Ok(match s {
-        "forward" => Phase::Forward,
-        "compensating" => Phase::Compensating,
-        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown timer phase '{other}'"),
-            });
-        }
-    })
-}
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
     w.open_table(TIMERS).map_err(|e| be(&e))?;
@@ -115,7 +95,7 @@ impl TimerStore for RedbStore {
         let case = timer.case.map(|c| c.to_string()).unwrap_or_default();
         let has_case = u8::from(timer.case.is_some());
         let step = timer.step.0;
-        let phase = phase_str(timer.phase);
+        let phase = timer.phase.as_str();
         let fire_at = timer.fire_at.unix_timestamp();
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -335,7 +315,7 @@ mod codec_tests {
     #[test]
     fn every_written_phase_decodes_to_the_value_that_wrote_it() {
         for phase in [Phase::Forward, Phase::Compensating] {
-            assert_eq!(phase_from(phase_str(phase)).expect("round trip"), phase);
+            assert_eq!(phase_from(phase.as_str()).expect("round trip"), phase);
         }
     }
 

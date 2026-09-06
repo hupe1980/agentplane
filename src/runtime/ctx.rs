@@ -4660,6 +4660,7 @@ impl StepCtx<'_> {
                 .and_then(|d| time::Duration::try_from(d).ok())
                 .and_then(|d| resolved.at.checked_sub(d)),
             state: DeadlineState::Pending,
+            acknowledged: None,
         };
 
         // Idempotent by primary key, so a resumed run re-registering the same

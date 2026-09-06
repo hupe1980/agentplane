@@ -29,12 +29,12 @@ use crate::batch::{BatchCensus, BatchStore, ItemOutcome, ItemRecord};
 use crate::case::{BufferedEvent, ClaimError, TargetedDelivery};
 use crate::case::{CaseCensus, CaseStore, Correlation, EventStore, TaskStore, TimerStore};
 use crate::core::{
-    BatchId, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, DeadLetter, Deadline,
-    DeadlineState, Digest, EffectKey, InboundEvent, OnExpiry, Priority, RunId, Spend, StoreError,
-    Subscription, Task, TaskId, TaskState, Timer, Timestamp,
+    BatchId, BreachNote, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, DeadLetter,
+    Deadline, DeadlineState, Digest, EffectKey, InboundEvent, OnExpiry, Priority, RunId, Spend,
+    StoreError, Subscription, Task, TaskId, TaskState, Timer, Timestamp,
 };
 
-use super::postgres::{PostgresStore, amount_of, sql_amount};
+use super::postgres::{PostgresStore, amount_of, be, pool_err, sql_amount};
 
 pub(super) const CASE_SCHEMA: &str = "
 -- Every table here leads with the tenant, for the reason the journal schema
@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS case_deadlines (
     calendar_digest BYTEA  NOT NULL,
     warn_at         BIGINT,
     state           TEXT   NOT NULL,
+    -- Who accounted for the breach, once somebody has. Absent on every other
+    -- state; `acknowledged_at` is what says the other two mean anything.
+    acknowledged_at   BIGINT,
+    acknowledged_by   TEXT,
+    acknowledged_note TEXT,
     PRIMARY KEY (tenant, case_id, name),
     FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
@@ -127,6 +132,14 @@ CREATE TABLE IF NOT EXISTS case_deadlines (
 -- The sweep's read: outstanding obligations by due instant.
 CREATE INDEX IF NOT EXISTS case_deadlines_due
     ON case_deadlines (tenant, state, resolved_at);
+
+-- The obligation listing and its gauge: breaches nobody has accounted for,
+-- longest-overdue first. Partial, because an acknowledged breach is never
+-- selected and a deployment's whole history of them should not be paged
+-- through to answer what is still open.
+CREATE INDEX IF NOT EXISTS case_deadlines_unaccounted
+    ON case_deadlines (tenant, resolved_at)
+    WHERE state = 'breached' AND acknowledged_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS inbound_events (
     -- The dedup identity is (source, id), CloudEvents' uniqueness pair. Keying
@@ -236,19 +249,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority        TEXT   NOT NULL,
     state           TEXT   NOT NULL,
     on_expiry       TEXT   NOT NULL,
+    -- `Priority::rank`, stored rather than expressed in SQL. Queue order is one
+    -- rule; a `CASE priority WHEN …` here would be a second copy of the
+    -- priority vocabulary, in a dialect the compiler cannot check, whose
+    -- fallback arm sorts an unranked priority last — in the one index whose
+    -- whole job is order.
+    priority_rank   SMALLINT NOT NULL,
     created_at      BIGINT NOT NULL,
     due_at          BIGINT,
     PRIMARY KEY (tenant, task_id)
 );
 
 -- The queue's read: pending work, most urgent first and oldest within a rank.
--- The rank expression is verbatim the ORDER BY in `queue` — an expression
--- index serves a query only when the expressions match exactly.
 CREATE INDEX IF NOT EXISTS tasks_queue_rank
-    ON tasks (tenant, state,
-              (CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
-                             WHEN 'normal' THEN 2 ELSE 3 END),
-              created_at);
+    ON tasks (tenant, state, priority_rank, created_at);
 
 -- The overdue sweep's read. Partial: most tasks have no window to close.
 CREATE INDEX IF NOT EXISTS tasks_due
@@ -357,14 +371,6 @@ CREATE TABLE IF NOT EXISTS quota_settled (
 );
 ";
 
-fn be(e: &tokio_postgres::Error) -> StoreError {
-    StoreError::Backend(e.to_string())
-}
-
-fn pool_err(e: &impl std::fmt::Display) -> StoreError {
-    StoreError::Backend(e.to_string())
-}
-
 fn corrupt(what: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt {
         seq: 0,
@@ -372,91 +378,70 @@ fn corrupt(what: &str, e: impl std::fmt::Display) -> StoreError {
     }
 }
 
+/// Read a stored column through the type's own vocabulary.
+///
+/// Every decoder below goes through the core type's `parse` rather than a match
+/// of its own — see [`CaseStatus::parse`] for why nothing else may spell a
+/// stored vocabulary, and why a reader that defaults is worse than one that
+/// refuses. The whole point of `phase` is telling a step's forward pass from
+/// its compensating one, so a silent `Forward` hands the unwind logic a
+/// compensating record wearing the wrong half of the saga; `Deny` and `Normal`
+/// are safe values, and that is precisely what makes them the wrong answer — a
+/// fail-closed default is still a fact this store invented about a row it could
+/// not read. Every call site already returns `StoreError`, so refusing costs
+/// nothing but the `?`.
+fn decoded<T>(what: &str, raw: &str, parsed: Option<T>) -> Result<T, StoreError> {
+    parsed.ok_or_else(|| corrupt(&format!("unknown {what}"), raw))
+}
+
 fn status_from(s: &str) -> Result<CaseStatus, StoreError> {
-    Ok(match s {
-        "open" => CaseStatus::Open,
-        "awaiting_external" => CaseStatus::AwaitingExternal,
-        "awaiting_human" => CaseStatus::AwaitingHuman,
-        "escalated" => CaseStatus::Escalated,
-        "closed" => CaseStatus::Closed,
-        other => return Err(corrupt("unknown case status", other)),
-    })
+    decoded("case status", s, CaseStatus::parse(s))
 }
 
 fn deadline_state_from(s: &str) -> Result<DeadlineState, StoreError> {
-    Ok(match s {
-        "pending" => DeadlineState::Pending,
-        "warned" => DeadlineState::Warned,
-        "breached" => DeadlineState::Breached,
-        "met" => DeadlineState::Met,
-        "cancelled" => DeadlineState::Cancelled,
-        other => return Err(corrupt("unknown deadline state", other)),
-    })
+    decoded("deadline state", s, DeadlineState::parse(s))
 }
 
 fn task_state_from(s: &str) -> Result<TaskState, StoreError> {
-    Ok(match s {
-        "open" => TaskState::Open,
-        "claimed" => TaskState::Claimed,
-        "completed" => TaskState::Completed,
-        "expired" => TaskState::Expired,
-        "escalated" => TaskState::Escalated,
-        other => return Err(corrupt("unknown task state", other)),
-    })
+    decoded("task state", s, TaskState::parse(s))
 }
 
-// The three decoders below refuse an unrecognised string, like the three
-// above them. A decoder that answers with a default cannot report that the
-// row was damaged, so the damage arrives as a *decision*: the whole point of
-// `phase` is telling a step's forward pass from its compensating one, and a
-// silent `Forward` hands the unwind logic a compensating record wearing the
-// wrong half of the saga. `Deny` and `Normal` are safe values and that is
-// precisely what makes them the wrong answer here — a fail-closed default is
-// still a fact this store invented about a row it could not read.
-//
-// Every call site already returns `StoreError`, so refusing costs nothing but
-// the `?`.
-
 fn priority_from(s: &str) -> Result<Priority, StoreError> {
-    Ok(match s {
-        "low" => Priority::Low,
-        "normal" => Priority::Normal,
-        "high" => Priority::High,
-        "urgent" => Priority::Urgent,
-        other => return Err(corrupt("unknown task priority", other)),
-    })
+    decoded("task priority", s, Priority::parse(s))
 }
 
 fn expiry_from(s: &str) -> Result<OnExpiry, StoreError> {
-    Ok(match s {
-        "deny" => OnExpiry::Deny,
-        "escalate" => OnExpiry::Escalate,
-        "proceed" => OnExpiry::Proceed,
-        other => return Err(corrupt("unknown expiry policy", other)),
-    })
-}
-
-fn expiry_str(e: OnExpiry) -> &'static str {
-    match e {
-        OnExpiry::Deny => "deny",
-        OnExpiry::Escalate => "escalate",
-        OnExpiry::Proceed => "proceed",
-    }
-}
-
-fn phase_str(p: crate::core::Phase) -> &'static str {
-    match p {
-        crate::core::Phase::Forward => "forward",
-        crate::core::Phase::Compensating => "compensating",
-    }
+    decoded("expiry policy", s, OnExpiry::parse(s))
 }
 
 fn phase_from(s: &str) -> Result<crate::core::Phase, StoreError> {
-    Ok(match s {
-        "forward" => crate::core::Phase::Forward,
-        "compensating" => crate::core::Phase::Compensating,
-        other => return Err(corrupt("unknown step phase", other)),
-    })
+    decoded("step phase", s, crate::core::Phase::parse(s))
+}
+
+/// The stored spellings of every state a typed predicate admits.
+///
+/// A membership test in SQL takes its list from the rule rather than repeating
+/// it. A literal `IN ('open','claimed','escalated')` is the vocabulary spelled
+/// again in a dialect no compiler checks, and it keeps working when a variant
+/// is added — by leaving the new state out of the worklist, the backlog count
+/// and the expiry sweep at once, which is a task that exists and is in no index.
+fn task_states(admits: fn(TaskState) -> bool) -> Vec<&'static str> {
+    TaskState::ALL
+        .iter()
+        .copied()
+        .filter(|s| admits(*s))
+        .map(TaskState::as_str)
+        .collect()
+}
+
+/// The obligation half of [`task_states`].
+fn deadline_states(admits: fn(DeadlineState) -> bool) -> Vec<&'static str> {
+    DeadlineState::ALL
+        .iter()
+        .copied()
+        .filter(|s| admits(*s))
+        .map(DeadlineState::as_str)
+        .collect()
 }
 
 impl PostgresStore {
@@ -734,8 +719,9 @@ impl CaseStore for PostgresStore {
         for deadline in deadlines {
             tx.execute(
                 "INSERT INTO case_deadlines
-                    (tenant, case_id, name, resolved_at, calendar_digest, warn_at, state)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    (tenant, case_id, name, resolved_at, calendar_digest, warn_at, state,
+                     acknowledged_at, acknowledged_by, acknowledged_note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 &[
                     &tenant,
                     &key,
@@ -744,6 +730,12 @@ impl CaseStore for PostgresStore {
                     &deadline.calendar_digest.as_bytes().to_vec(),
                     &deadline.warn_at.map(time::OffsetDateTime::unix_timestamp),
                     &deadline.state.as_str(),
+                    &deadline
+                        .acknowledged
+                        .as_ref()
+                        .map(|a| a.at.unix_timestamp()),
+                    &deadline.acknowledged.as_ref().map(|a| a.by.clone()),
+                    &deadline.acknowledged.as_ref().map(|a| a.note.clone()),
                 ],
             )
             .await
@@ -932,17 +924,48 @@ impl CaseStore for PostgresStore {
         if status == CaseStatus::Closed {
             return self.close(case).await;
         }
-        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        let n = client
-            .execute(
-                "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
-                &[&case.to_string(), &status.as_str(), &self.tenant_name()],
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        // Read the prior status under the row lock, so *which transition this is*
+        // is decided against the row this transaction is about to write.
+        let was: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM cases WHERE case_id = $1 AND tenant = $2 FOR UPDATE",
+                &[&case.to_string(), &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .map(|r| r.get(0));
+        let Some(was) = was else {
+            return Err(StoreError::NotFound(case.to_string()));
+        };
+        tx.execute(
+            "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
+            &[&case.to_string(), &status.as_str(), &self.tenant_name()],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+
+        // Leaving `Closed` takes back the correlation keys closure released, or
+        // the matter comes back live-looking and unreachable. `open = FALSE`
+        // rows another case has since claimed are left alone: the identifier
+        // belongs to whichever matter is open for it now.
+        if was == CaseStatus::Closed.as_str() {
+            tx.execute(
+                "UPDATE case_correlation SET open = TRUE
+                  WHERE case_id = $1 AND tenant = $2
+                    AND NOT EXISTS (
+                          SELECT 1 FROM case_correlation other
+                           WHERE other.tenant = case_correlation.tenant
+                             AND other.namespace = case_correlation.namespace
+                             AND other.value = case_correlation.value
+                             AND other.open)",
+                &[&case.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
-        if n == 0 {
-            return Err(StoreError::NotFound(case.to_string()));
         }
+        tx.commit().await.map_err(|e| be(&e))?;
         Ok(())
     }
 
@@ -950,13 +973,35 @@ impl CaseStore for PostgresStore {
         let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let tx = client.transaction().await.map_err(|e| be(&e))?;
 
+        // The case row's lock, taken **before** the count and held to commit.
+        // Without it this is a check and `register_deadline` is a write that
+        // walks past it: at READ COMMITTED each statement reads its own
+        // snapshot, so a registration in flight is invisible here and this
+        // closure is invisible there, and both commit — leaving a case closed
+        // and owing. `register_deadline` takes the same lock, which is what
+        // makes the two decide one at a time.
+        let locked = tx
+            .query_opt(
+                "SELECT status FROM cases WHERE case_id = $1 AND tenant = $2 FOR UPDATE",
+                &[&case.to_string(), &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound(case.to_string()));
+        }
+
         // An unmet obligation survives closure, because closure is the moment
         // people stop looking.
         let open: i64 = tx
             .query_one(
                 "SELECT COUNT(*) FROM case_deadlines
-                  WHERE case_id = $1 AND tenant = $2 AND state IN ('pending', 'warned')",
-                &[&case.to_string(), &self.tenant_name()],
+                  WHERE case_id = $1 AND tenant = $2 AND state = ANY($3::text[])",
+                &[
+                    &case.to_string(),
+                    &self.tenant_name(),
+                    &deadline_states(DeadlineState::is_open),
+                ],
             )
             .await
             .map_err(|e| be(&e))?
@@ -998,25 +1043,52 @@ impl CaseStore for PostgresStore {
     }
 
     async fn register_deadline(&self, d: &Deadline) -> Result<(), StoreError> {
-        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        client
-            .execute(
-                "INSERT INTO case_deadlines
-                   (case_id, name, resolved_at, calendar_digest, warn_at, state, tenant)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
-                 ON CONFLICT (tenant, case_id, name) DO NOTHING",
-                &[
-                    &d.case.to_string(),
-                    &d.name,
-                    &d.resolved_at.unix_timestamp(),
-                    &d.calendar_digest.as_bytes().to_vec(),
-                    &d.warn_at.map(Timestamp::unix_timestamp),
-                    &d.state.as_str(),
-                    &self.tenant_name(),
-                ],
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+
+        // The same row lock `close` takes, for the same reason: these two are
+        // the pair that has to be serialized, and the anomaly they would
+        // otherwise produce — both committing on each other's pre-state — is a
+        // case closed with an obligation it will go on to miss.
+        let status: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM cases WHERE case_id = $1 AND tenant = $2 FOR UPDATE",
+                &[&d.case.to_string(), &self.tenant_name()],
             )
             .await
-            .map_err(|e| be(&e))?;
+            .map_err(|e| be(&e))?
+            .map(|r| r.get(0));
+        let Some(status) = status else {
+            return Err(StoreError::NotFound(d.case.to_string()));
+        };
+        if status == CaseStatus::Closed.as_str() {
+            return Err(StoreError::CaseClosed {
+                case: d.case.to_string(),
+            });
+        }
+
+        tx.execute(
+            "INSERT INTO case_deadlines
+                   (case_id, name, resolved_at, calendar_digest, warn_at, state, tenant,
+                    acknowledged_at, acknowledged_by, acknowledged_note)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (tenant, case_id, name) DO NOTHING",
+            &[
+                &d.case.to_string(),
+                &d.name,
+                &d.resolved_at.unix_timestamp(),
+                &d.calendar_digest.as_bytes().to_vec(),
+                &d.warn_at.map(Timestamp::unix_timestamp),
+                &d.state.as_str(),
+                &self.tenant_name(),
+                &d.acknowledged.as_ref().map(|a| a.at.unix_timestamp()),
+                &d.acknowledged.as_ref().map(|a| a.by.clone()),
+                &d.acknowledged.as_ref().map(|a| a.note.clone()),
+            ],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        tx.commit().await.map_err(|e| be(&e))?;
         Ok(())
     }
 
@@ -1024,7 +1096,8 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
+                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state,
+                        acknowledged_at, acknowledged_by, acknowledged_note
                    FROM case_deadlines
                   WHERE case_id = $1 AND tenant = $2 ORDER BY resolved_at ASC",
                 &[&case.to_string(), &self.tenant_name()],
@@ -1040,12 +1113,38 @@ impl CaseStore for PostgresStore {
         name: &str,
         state: DeadlineState,
     ) -> Result<(), StoreError> {
-        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+
+        // How an obligation ended is not editable, and the row's lock is what
+        // decides that against the row this transaction writes rather than
+        // against one a concurrent sweep has already moved.
+        let current: Option<String> = tx
+            .query_opt(
+                "SELECT state FROM case_deadlines
+                  WHERE case_id = $1 AND name = $2 AND tenant = $3 FOR UPDATE",
+                &[&case.to_string(), &name.to_owned(), &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .map(|r| r.get(0));
+        if let Some(from) = current {
+            let parsed = deadline_state_from(&from)?;
+            if !parsed.may_become(state) {
+                return Err(StoreError::DeadlineFinal {
+                    case: case.to_string(),
+                    obligation: name.to_owned(),
+                    from,
+                    to: state.as_str().to_owned(),
+                });
+            }
+        }
+
         // The row count is read: a transition for an obligation that does not
         // exist reported success, while the redb backend answers `NotFound` —
         // and the sweep that believes it breached a deadline nobody registered
         // has written its decision into nothing.
-        let n = client
+        let n = tx
             .execute(
                 "UPDATE case_deadlines SET state = $3
                   WHERE case_id = $1 AND name = $2 AND tenant = $4",
@@ -1061,6 +1160,7 @@ impl CaseStore for PostgresStore {
         if n == 0 {
             return Err(StoreError::NotFound(format!("{case}/{name}")));
         }
+        tx.commit().await.map_err(|e| be(&e))?;
         Ok(())
     }
 
@@ -1068,15 +1168,17 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
+                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state,
+                        acknowledged_at, acknowledged_by, acknowledged_note
                    FROM case_deadlines
-                  WHERE tenant = $3 AND state IN ('pending', 'warned')
+                  WHERE tenant = $3 AND state = ANY($4::text[])
                     AND (resolved_at <= $1 OR (warn_at IS NOT NULL AND warn_at <= $1))
                   ORDER BY resolved_at ASC LIMIT $2",
                 &[
                     &now.unix_timestamp(),
                     &i64::try_from(limit).unwrap_or(i64::MAX),
                     &self.tenant_name(),
+                    &deadline_states(DeadlineState::is_open),
                 ],
             )
             .await
@@ -1091,9 +1193,10 @@ impl CaseStore for PostgresStore {
         // against now.
         let rows = client
             .query(
-                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state
+                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state,
+                        acknowledged_at, acknowledged_by, acknowledged_note
                    FROM case_deadlines
-                  WHERE tenant = $2 AND state = 'breached'
+                  WHERE tenant = $2 AND state = 'breached' AND acknowledged_at IS NULL
                   ORDER BY resolved_at ASC LIMIT $1",
                 &[
                     &i64::try_from(limit).unwrap_or(i64::MAX),
@@ -1103,6 +1206,56 @@ impl CaseStore for PostgresStore {
             .await
             .map_err(|e| be(&e))?;
         rows.iter().map(deadline_from).collect()
+    }
+
+    async fn acknowledge_breach(
+        &self,
+        case: CaseId,
+        name: &str,
+        note: &BreachNote,
+    ) -> Result<bool, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let row = tx
+            .query_opt(
+                "SELECT state, acknowledged_at FROM case_deadlines
+                  WHERE case_id = $1 AND name = $2 AND tenant = $3 FOR UPDATE",
+                &[&case.to_string(), &name.to_owned(), &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(format!("{case}/{name}")));
+        };
+        let state: String = row.get(0);
+        if state != DeadlineState::Breached.as_str() {
+            return Err(StoreError::NotBreached {
+                case: case.to_string(),
+                obligation: name.to_owned(),
+                state,
+            });
+        }
+        // The first account stands: a retry must not rewrite who looked or when.
+        if row.get::<_, Option<i64>>(1).is_some() {
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE case_deadlines
+                SET acknowledged_at = $4, acknowledged_by = $5, acknowledged_note = $6
+              WHERE case_id = $1 AND name = $2 AND tenant = $3",
+            &[
+                &case.to_string(),
+                &name.to_owned(),
+                &self.tenant_name(),
+                &note.at.unix_timestamp(),
+                &note.by,
+                &note.note,
+            ],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(true)
     }
 
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError> {
@@ -1135,8 +1288,8 @@ impl CaseStore for PostgresStore {
         let row = client
             .query_one(
                 "SELECT COUNT(*), MIN(opened_at) FROM cases
-                  WHERE tenant = $1 AND status <> 'closed'",
-                &[&self.tenant_name()],
+                  WHERE tenant = $1 AND status <> $2::text",
+                &[&self.tenant_name(), &CaseStatus::Closed.as_str()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1145,8 +1298,22 @@ impl CaseStore for PostgresStore {
         let due: i64 = client
             .query_one(
                 "SELECT COUNT(*) FROM case_deadlines
-                  WHERE tenant = $2 AND state IN ('pending', 'warned') AND resolved_at <= $1",
-                &[&now.unix_timestamp(), &self.tenant_name()],
+                  WHERE tenant = $2 AND state = ANY($3::text[]) AND resolved_at <= $1",
+                &[
+                    &now.unix_timestamp(),
+                    &self.tenant_name(),
+                    &deadline_states(DeadlineState::is_open),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .get(0);
+
+        let breached: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM case_deadlines
+                  WHERE tenant = $1 AND state = 'breached' AND acknowledged_at IS NULL",
+                &[&self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?
@@ -1161,6 +1328,7 @@ impl CaseStore for PostgresStore {
                 )
             }),
             due: u64::try_from(due).unwrap_or(0),
+            breached: u64::try_from(breached).unwrap_or(0),
         })
     }
 }
@@ -1184,7 +1352,33 @@ fn deadline_from(row: &tokio_postgres::Row) -> Result<Deadline, StoreError> {
             .transpose()
             .map_err(|e| corrupt("unrepresentable warn_at", e))?,
         state: deadline_state_from(&state)?,
+        acknowledged: acknowledged_from(row)?,
     })
+}
+
+/// The account's three columns, read as one optional fact.
+///
+/// Fallible rather than defaulting: a row whose `acknowledged_at` is set and
+/// whose `acknowledged_by` is not is a corrupt row, and reading it as *nobody
+/// has looked* would put a breach back on a listing somebody had already
+/// answered — or, the other way, hide one nobody had.
+fn acknowledged_from(row: &tokio_postgres::Row) -> Result<Option<BreachNote>, StoreError> {
+    let at: Option<i64> = row.get(6);
+    let by: Option<String> = row.get(7);
+    let note: Option<String> = row.get(8);
+    match (at, by, note) {
+        (None, None, None) => Ok(None),
+        (Some(at), Some(by), Some(note)) => Ok(Some(BreachNote {
+            by,
+            note,
+            at: Timestamp::from_unix_timestamp(at)
+                .map_err(|e| corrupt("unrepresentable acknowledged_at", e))?,
+        })),
+        _ => Err(corrupt(
+            "breach acknowledgement",
+            "only some of its columns are set",
+        )),
+    }
 }
 
 #[async_trait]
@@ -1260,7 +1454,7 @@ impl EventStore for PostgresStore {
                     &sub.effect.to_hex(),
                     &sub.case.map(|c| c.to_string()),
                     &i64::from(sub.step.0),
-                    &phase_str(sub.phase),
+                    &crate::core::Phase::as_str(sub.phase),
                     &sub.kind,
                     &k.namespace,
                     &k.value,
@@ -1803,7 +1997,7 @@ impl TimerStore for PostgresStore {
                     &timer.effect.to_hex(),
                     &timer.case.map(|c| c.to_string()),
                     &i64::from(timer.step.0),
-                    &phase_str(timer.phase),
+                    &crate::core::Phase::as_str(timer.phase),
                     &timer.fire_at.unix_timestamp(),
                     &self.tenant_name(),
                 ],
@@ -1941,8 +2135,9 @@ impl TaskStore for PostgresStore {
             .execute(
                 "INSERT INTO tasks (task_id, run_id, case_id, kind, justification,
                                     candidate_roles, escalate_to, excluded_actors, assignee,
-                                    priority, state, on_expiry, created_at, due_at, tenant)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+                                    priority, state, on_expiry, priority_rank, created_at,
+                                    due_at, tenant)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
                  ON CONFLICT (tenant, task_id) DO NOTHING",
                 &[
                     &task.id.to_hex(),
@@ -1956,7 +2151,8 @@ impl TaskStore for PostgresStore {
                     &task.assignee,
                     &task.priority.as_str(),
                     &task.state.as_str(),
-                    &expiry_str(task.on_expiry),
+                    &OnExpiry::as_str(task.on_expiry),
+                    &i16::from(task.priority.rank()),
                     &task.created_at.unix_timestamp(),
                     &task.due_at.map(Timestamp::unix_timestamp),
                     &self.tenant_name(),
@@ -2035,12 +2231,18 @@ impl TaskStore for PostgresStore {
         // arm, and an expired task matches neither state predicate.
         let updated = client
             .execute(
-                "UPDATE tasks SET assignee = $2, state = 'claimed'
+                "UPDATE tasks SET assignee = $2, state = $5
                   WHERE task_id = $1 AND tenant = $3
-                    AND ((state IN ('open', 'escalated')
+                    AND ((state = ANY($4::text[])
                           AND (assignee IS NULL OR assignee = $2))
-                         OR (state = 'claimed' AND assignee = $2))",
-                &[&id.to_hex(), &actor.to_owned(), &self.tenant_name()],
+                         OR (state = $5 AND assignee = $2))",
+                &[
+                    &id.to_hex(),
+                    &actor.to_owned(),
+                    &self.tenant_name(),
+                    &task_states(TaskState::is_queued),
+                    &TaskState::Claimed.as_str(),
+                ],
             )
             .await
             .map_err(|e| ClaimError::Store(be(&e)))?;
@@ -2210,10 +2412,16 @@ impl TaskStore for PostgresStore {
         updated.escalate();
         let n = client
             .execute(
-                "UPDATE tasks SET state = 'escalated', assignee = NULL, candidate_roles = $2
+                "UPDATE tasks SET state = $5, assignee = NULL, candidate_roles = $2
                   WHERE task_id = $1 AND tenant = $3
-                    AND state IN ('open','claimed','escalated')",
-                &[&id.to_hex(), &updated.candidate_roles, &tenant],
+                    AND state = ANY($4::text[])",
+                &[
+                    &id.to_hex(),
+                    &updated.candidate_roles,
+                    &tenant,
+                    &task_states(TaskState::is_pending),
+                    &TaskState::Escalated.as_str(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -2233,22 +2441,19 @@ impl TaskStore for PostgresStore {
         // alone made the limit a filter on the wrong axis: an urgent task
         // behind a page of older normal ones was simply absent from the page,
         // which for a worklist means the most important decision is the one
-        // nobody is shown. The CASE expression must stay identical to the one
-        // in the `tasks_queue_rank` index, or the index stops serving this
-        // read.
+        // nobody is shown.
         let rows = client
             .query(
                 &format!(
                     "SELECT {TASK_COLS} FROM tasks
-                      WHERE tenant = $2 AND state IN ('open', 'escalated')
-                      ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
-                                             WHEN 'normal' THEN 2 ELSE 3 END,
-                               created_at ASC
+                      WHERE tenant = $2 AND state = ANY($3::text[])
+                      ORDER BY priority_rank ASC, created_at ASC
                       LIMIT $1"
                 ),
                 &[
                     &i64::try_from(limit).unwrap_or(i64::MAX),
                     &self.tenant_name(),
+                    &task_states(TaskState::is_queued),
                 ],
             )
             .await
@@ -2282,8 +2487,8 @@ impl TaskStore for PostgresStore {
         let n: i64 = client
             .query_one(
                 "SELECT COUNT(*) FROM tasks
-                  WHERE tenant = $1 AND state IN ('open','claimed','escalated')",
-                &[&self.tenant_name()],
+                  WHERE tenant = $1 AND state = ANY($2::text[])",
+                &[&self.tenant_name(), &task_states(TaskState::is_pending)],
             )
             .await
             .map_err(|e| be(&e))?
@@ -2301,7 +2506,7 @@ impl TaskStore for PostgresStore {
             .query(
                 &format!(
                     "SELECT {TASK_COLS} FROM tasks
-                      WHERE tenant = $3 AND state IN ('open','claimed')
+                      WHERE tenant = $3 AND state = ANY($4::text[])
                         AND due_at IS NOT NULL AND due_at <= $1
                       ORDER BY due_at ASC LIMIT $2"
                 ),
@@ -2309,6 +2514,7 @@ impl TaskStore for PostgresStore {
                     &now.unix_timestamp(),
                     &i64::try_from(limit).unwrap_or(i64::MAX),
                     &self.tenant_name(),
+                    &task_states(TaskState::awaits_expiry),
                 ],
             )
             .await
@@ -2482,13 +2688,14 @@ impl BatchStore for PostgresStore {
         outcome: &ItemOutcome,
         spend: Spend,
     ) -> Result<(), StoreError> {
-        let (state, detail) = match outcome {
-            ItemOutcome::Succeeded => ("succeeded", None),
-            ItemOutcome::Failed(d) => ("failed", Some(d.clone())),
-            ItemOutcome::Quarantined(d) => ("quarantined", Some(d.clone())),
-            ItemOutcome::Suspended(d) => ("suspended", Some(d.clone())),
-            ItemOutcome::Exhausted(d) => ("exhausted", Some(d.clone())),
+        let detail = match outcome {
+            ItemOutcome::Succeeded => None,
+            ItemOutcome::Failed(d)
+            | ItemOutcome::Quarantined(d)
+            | ItemOutcome::Suspended(d)
+            | ItemOutcome::Exhausted(d) => Some(d.clone()),
         };
+        let state = outcome.as_str();
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let updated = client
             .execute(
@@ -2523,9 +2730,12 @@ impl BatchStore for PostgresStore {
             .query_one(
                 "SELECT MIN(item_key) FROM batch_items
                   WHERE batch_id = $1 AND tenant = $2
-                    AND (outcome IS NULL OR outcome = 'suspended'
-                         OR outcome = 'exhausted')",
-                &[&batch.to_string(), &self.tenant_name()],
+                    AND (outcome IS NULL OR NOT (outcome = ANY($3::text[])))",
+                &[
+                    &batch.to_string(),
+                    &self.tenant_name(),
+                    &ItemOutcome::terminal_tags(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?
@@ -2572,18 +2782,24 @@ impl BatchStore for PostgresStore {
             let minor: i64 = row.get(3);
             let n = amount_of(n);
             match outcome.as_deref() {
-                Some("succeeded") => c.succeeded = n,
-                Some("failed") => c.failed = n,
-                Some("quarantined") => c.quarantined = n,
-                Some("suspended") => c.suspended = n,
-                Some("exhausted") => c.exhausted = n,
+                // Bucketed off the *parsed* outcome, so an outcome added later
+                // is a compiler error here rather than a row in no bucket.
+                Some(tag) => {
+                    match decoded("item outcome", tag, ItemOutcome::parse(tag, String::new()))? {
+                        ItemOutcome::Succeeded => c.succeeded = n,
+                        ItemOutcome::Failed(_) => c.failed = n,
+                        ItemOutcome::Quarantined(_) => c.quarantined = n,
+                        ItemOutcome::Suspended(_) => c.suspended = n,
+                        ItemOutcome::Exhausted(_) => c.exhausted = n,
+                    }
+                }
                 // Reserved, no outcome recorded.
                 None => c.in_flight = n,
-                // Damage, not a bucket — see `outcome_from`.
-                Some(other) => return Err(corrupt("unknown item outcome", other)),
             }
-            c.spend.tokens += amount_of(tokens);
-            c.spend.minor_units += amount_of(minor);
+            c.spend += Spend {
+                tokens: amount_of(tokens),
+                minor_units: amount_of(minor),
+            };
         }
         Ok(c)
     }
@@ -2632,14 +2848,7 @@ fn outcome_from(
     let Some(state) = state else {
         return Ok(None);
     };
-    Ok(Some(match state.as_str() {
-        "succeeded" => ItemOutcome::Succeeded,
-        "failed" => ItemOutcome::Failed(d),
-        "quarantined" => ItemOutcome::Quarantined(d),
-        "suspended" => ItemOutcome::Suspended(d),
-        "exhausted" => ItemOutcome::Exhausted(d),
-        other => return Err(corrupt("unknown item outcome", other)),
-    }))
+    decoded("item outcome", &state, ItemOutcome::parse(&state, d)).map(Some)
 }
 
 fn item_from(row: &tokio_postgres::Row, key: &str) -> Result<ItemRecord, StoreError> {
@@ -2668,10 +2877,16 @@ mod codec_tests {
     fn every_written_string_decodes_to_the_value_that_wrote_it() {
         use crate::core::Phase;
         for phase in [Phase::Forward, Phase::Compensating] {
-            assert_eq!(phase_from(phase_str(phase)).expect("round trip"), phase);
+            assert_eq!(
+                phase_from(crate::core::Phase::as_str(phase)).expect("round trip"),
+                phase
+            );
         }
         for expiry in [OnExpiry::Deny, OnExpiry::Escalate, OnExpiry::Proceed] {
-            assert_eq!(expiry_from(expiry_str(expiry)).expect("round trip"), expiry);
+            assert_eq!(
+                expiry_from(OnExpiry::as_str(expiry)).expect("round trip"),
+                expiry
+            );
         }
         for priority in [
             Priority::Low,

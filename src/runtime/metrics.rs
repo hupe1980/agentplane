@@ -307,6 +307,18 @@ pub const DUE_DEADLINES: Instrument = Instrument {
     description: "Obligations at or past their instant and not yet resolved.",
 };
 
+pub const UNACCOUNTED_BREACHES: Instrument = Instrument {
+    name: "agentplane.obligations.breached",
+    kind: Kind::Gauge,
+    unit: "1",
+    dimension: None,
+    description: "Missed obligations nobody has accounted for. A gauge and not a \
+                  counter: it falls when an operator acknowledges one, so an alert \
+                  on it means there is unattended work rather than that this \
+                  deployment has ever missed something — and only the first is \
+                  actionable.",
+};
+
 pub const PENDING_TIMERS: Instrument = Instrument {
     name: "agentplane.timers.pending",
     kind: Kind::Gauge,
@@ -368,6 +380,7 @@ pub const CATALOGUE: &[Instrument] = &[
     OPEN_CASES,
     OLDEST_CASE_AGE,
     DUE_DEADLINES,
+    UNACCOUNTED_BREACHES,
     PENDING_TIMERS,
     OPEN_TASKS,
     QUARANTINED_RUNS,
@@ -403,6 +416,9 @@ pub struct Census {
     /// Seconds since the longest-open case was opened, or `None` if none are open.
     pub oldest_case_age_secs: Option<u64>,
     pub due_deadlines: u64,
+    /// Breaches nobody has accounted for. Drains through
+    /// [`CaseStore::acknowledge_breach`](crate::case::CaseStore::acknowledge_breach).
+    pub unaccounted_breaches: u64,
     pub pending_timers: u64,
     pub open_tasks: u64,
 }
@@ -513,6 +529,7 @@ impl Meter {
             self.gauge(OLDEST_CASE_AGE, age);
         }
         self.gauge(DUE_DEADLINES, c.due_deadlines);
+        self.gauge(UNACCOUNTED_BREACHES, c.unaccounted_breaches);
         self.gauge(PENDING_TIMERS, c.pending_timers);
         self.gauge(OPEN_TASKS, c.open_tasks);
         self.gauge(QUARANTINED_RUNS, c.quarantined_runs);

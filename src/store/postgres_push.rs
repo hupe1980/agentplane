@@ -8,11 +8,7 @@ use crate::push::{
     PushStore,
 };
 
-use super::postgres::{PostgresStore, amount_of};
-
-fn be(error: &tokio_postgres::Error) -> StoreError {
-    StoreError::Backend(error.to_string())
-}
+use super::postgres::{PostgresStore, amount_of, be};
 
 /// One due row into a registration, shared by [`PushStore::due`] and
 /// [`PushStore::due_in`] so the two reads cannot decode one schema two ways.

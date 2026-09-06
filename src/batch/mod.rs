@@ -161,9 +161,53 @@ impl ItemOutcome {
         }
     }
 
+    /// Every outcome, each carrying `detail`.
+    ///
+    /// The list [`parse`](Self::parse) is written over, and the list a store
+    /// derives its terminal set from — so a query asking *what is still open*
+    /// answers from the type rather than from a list of strings beside it.
+    #[must_use]
+    pub fn all(detail: String) -> [Self; 5] {
+        [
+            Self::Succeeded,
+            Self::Failed(detail.clone()),
+            Self::Quarantined(detail.clone()),
+            Self::Suspended(detail.clone()),
+            Self::Exhausted(detail),
+        ]
+    }
+
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`all`](Self::all) for the reason [`CaseStatus::parse`] is.
+    ///
+    /// `None` is damage rather than absence: an item whose outcome cannot be
+    /// read has not *failed to run*, and a census filing it as in-flight keeps
+    /// the batch `Running` forever over a row nobody can explain.
+    ///
+    /// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
+    #[must_use]
+    pub fn parse(tag: &str, detail: String) -> Option<Self> {
+        Self::all(detail).into_iter().find(|o| o.as_str() == tag)
+    }
+
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
         !matches!(self, Self::Suspended(_) | Self::Exhausted(_))
+    }
+
+    /// The stored spellings of every outcome that ends an item.
+    ///
+    /// What a store asks for when it wants the complement: an item is open
+    /// while it has no outcome or an outcome outside this set, so a
+    /// non-terminal variant added later is open by construction rather than by
+    /// somebody remembering to widen a list of strings.
+    #[must_use]
+    pub fn terminal_tags() -> Vec<&'static str> {
+        Self::all(String::new())
+            .iter()
+            .filter(|o| o.is_terminal())
+            .map(Self::as_str)
+            .collect()
     }
 }
 

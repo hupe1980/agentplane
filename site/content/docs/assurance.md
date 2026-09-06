@@ -53,9 +53,17 @@ Two of the entries above are checked-in artifacts rather than assertions:
 digest) and `tests/golden/export.jsonl` (a sealed export). They exist because a
 test that serialises and then deserialises proves only that the build agrees
 with itself, and the failure they catch is the one that passes every such test:
-a field reordered, a `skip_serializing_if` added, a serde attribute renamed —
-each rehashing every record this project will ever write, each reading in
-review as a tidy-up.
+a serde attribute renamed, a `skip_serializing_if` added, the canonicalization
+rule changed — each rehashing every record this project will ever write, each
+reading in review as a tidy-up.
+
+**Both are sealed through the production path**, never re-derived. A vector
+generator that serialises the value *equivalently* pins the equivalence rather
+than the format: canonical form sorts object members, so a corpus built with
+`serde_json` directly is sensitive to struct declaration order — which the chain
+does not depend on — and blind to the canonicalization rule, which is the whole
+of what it does depend on. The bytes come off `Record::seal`, the one function
+every backend appends through, so there is no equivalent way to produce them.
 
 Regenerating them is a separate command:
 
@@ -68,11 +76,40 @@ freeze a shape change is a **hard cut** — every journal written by an older
 build stops being readable — so blessing the corpus is the moment somebody
 decides that, and it should cost a decision.
 
-What this does **not** buy is stated rather than implied: the vectors are this
-build checking itself, so they catch drift and cannot catch a shared
-misunderstanding. The outside authority that would is a vector produced by a
-second implementation, which needs a written specification first — both are
-[open freeze conditions](@/docs/status.md#format-freeze).
+### The corpus is read by something that is not this crate
+
+Vectors a project generates and then checks are that project agreeing with
+itself. They catch drift; they cannot catch a shared misunderstanding, because
+there is only one understanding present.
+
+`tools/verify_export.py` is the second one. It is written from the
+[published record format](@/docs/format.md) and reads none of this crate's
+Rust, which is a property a guard enforces rather than a promise — a verifier
+that consulted `src/` would be a paraphrase of the implementation and would
+agree with it by construction. It runs in the gate, and it does three things:
+
+```sh
+just verify-golden
+```
+
+- **`--canon-check`** re-derives all 27 record vectors from their *parsed
+  values* — an independent canonicalizer, an independent chain digest. This is
+  the half that **produces** bytes rather than accepting them, and it is
+  non-circular: the input is what each record means, the output is what the
+  format says it must look like. It also holds both implementations to RFC
+  8785's own number vectors, the one part of canonicalization no record reaches.
+- The default pass **verifies the sealed export**: chains, log positions, the
+  Merkle root, the case layer, the frame.
+- **`--self-test`** damages that export six ways — an edited readable body, a
+  flipped wire byte, a record removed from the middle, a rewritten log leaf,
+  the case layer dropped, the trailer cut off — and asserts each one is
+  reported. A second reader that answers *0 findings* for everything agrees
+  with this crate perfectly and is worth nothing.
+
+What it still does not buy: it is one reader, written by the same project, from
+a specification that project also wrote. A genuinely independent implementation
+by somebody else remains the strongest evidence available, and this is the next
+best thing rather than a substitute for it.
 
 ### The size a proof starts from is stated, never inferred
 

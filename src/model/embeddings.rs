@@ -240,10 +240,13 @@ impl Embedder for OpenAiEmbedder {
             .await
             .map_err(|e| StoreError::Backend(format!("{url}: {e}")))?;
         let status = response.status();
-        let text_body = response
-            .text()
-            .await
-            .map_err(|e| StoreError::Backend(format!("{url}: unreadable reply: {e}")))?;
+        // An embedding is one vector — a few tens of kilobytes — so the small
+        // ceiling is generous here, and reading to end-of-stream would let the
+        // endpoint decide how much memory its reply costs.
+        let text_body =
+            crate::netguard::intake::read_text(response, crate::netguard::intake::METADATA)
+                .await
+                .map_err(|e| StoreError::Backend(format!("{url}: unreadable reply: {e}")))?;
         if !status.is_success() {
             // The body, not only the code: an embeddings 400 is almost always
             // "that model does not exist" or "input too long", and a bare status
@@ -666,10 +669,13 @@ impl Embedder for GeminiEmbedder {
             .await
             .map_err(|e| StoreError::Backend(format!("{url}: {e}")))?;
         let status = response.status();
-        let text_body = response
-            .text()
-            .await
-            .map_err(|e| StoreError::Backend(format!("{url}: unreadable reply: {e}")))?;
+        // An embedding is one vector — a few tens of kilobytes — so the small
+        // ceiling is generous here, and reading to end-of-stream would let the
+        // endpoint decide how much memory its reply costs.
+        let text_body =
+            crate::netguard::intake::read_text(response, crate::netguard::intake::METADATA)
+                .await
+                .map_err(|e| StoreError::Backend(format!("{url}: unreadable reply: {e}")))?;
         if !status.is_success() {
             return Err(StoreError::Backend(format!(
                 "{url}: embedContent returned {status}: {text_body}"

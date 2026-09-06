@@ -847,14 +847,21 @@ impl OpenAi {
         model: &ModelId,
         schema: Option<&Value>,
     ) -> Result<Completion, ModelError> {
-        let parsed: ApiResponse = response.json().await.map_err(|e| ModelError::Unusable {
-            model: model.clone(),
-            // A 200 whose body will not parse still generated: those tokens are
-            // spent whatever shape came back. Reporting zero here is the one
-            // place this path knowingly under-counts, bounded by one response.
-            usage: Usage::default(),
-            detail: format!("the response body did not parse: {e}"),
-        })?;
+        // Read under this plane's ceiling rather than to end-of-stream: a
+        // provider is a counterparty, and a counterparty must not decide how
+        // much of this process's memory its answer costs.
+        let body = crate::netguard::intake::read(response, crate::netguard::intake::ANSWER)
+            .await
+            .map_err(|e| super::wire::classify_intake(model, Usage::default(), &e))?;
+        let parsed: ApiResponse =
+            serde_json::from_slice(&body).map_err(|e| ModelError::Unusable {
+                // A 200 whose body will not parse still generated: those tokens are
+                // spent whatever shape came back. Reporting zero here is the one
+                // place this path knowingly under-counts, bounded by one response.
+                model: model.clone(),
+                usage: Usage::default(),
+                detail: format!("the response body did not parse: {e}"),
+            })?;
         self.interpret(&parsed, model, schema)
     }
 
@@ -880,12 +887,28 @@ impl OpenAi {
         let mut decoder = sse::Decoder::new();
         let mut acc = openai_stream::Accumulator::new();
         let mut body = response.bytes_stream();
+        // The same ceiling the buffered path applies, to the same bytes.
+        // `sse::Decoder` already bounds one event, which is the unterminated
+        // line; this bounds the *number* of them. A stream of well-formed
+        // hundred-byte deltas passes every check the decoder makes and grows
+        // the accumulator until the process dies.
+        let mut meter = crate::netguard::intake::Meter::new(crate::netguard::intake::ANSWER);
 
         while let Some(chunk) = body.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(e) => return Err(severed(model, &acc, &e.to_string())),
             };
+            // Charged before the chunk is kept: what the ceiling bounds is
+            // what this process holds, not what it has already held. The
+            // refusal is `Unusable` rather than `severed` — it is this
+            // plane's rather than the provider's, and the call generated.
+            // This wire reports no usage until the end, so the figure is
+            // zero here for the same reason `severed` reports `Unaccounted`:
+            // what is unknown is the amount, not whether it happened.
+            if let Err(e) = meter.charge(chunk.len()) {
+                return Err(super::wire::classify_intake(model, Usage::default(), &e));
+            }
             // A decode failure ends the stream exactly as a dead connection
             // does, and is classified by the same ladder rather than pinned to
             // one rung.
@@ -1025,7 +1048,14 @@ impl ModelProvider for OpenAi {
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
-            let detail = response.text().await.unwrap_or_default();
+            // Bounded, and the ceiling is the small one: this body is read
+            // only to say *why* the call failed, so an endpoint answering a
+            // failure with a gigabyte gets an unexplained failure rather than
+            // this process's memory.
+            let detail =
+                crate::netguard::intake::read_text(response, crate::netguard::intake::METADATA)
+                    .await
+                    .unwrap_or_default();
             return Err(classify_status(model, status.as_u16(), &headers, &detail));
         }
 

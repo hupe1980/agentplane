@@ -301,6 +301,15 @@ impl CaseStore for SealedCases {
         self.inner.breached(limit).await
     }
 
+    async fn acknowledge_breach(
+        &self,
+        case: CaseId,
+        name: &str,
+        note: &crate::core::BreachNote,
+    ) -> Result<bool, StoreError> {
+        self.inner.acknowledge_breach(case, name, note).await
+    }
+
     async fn census(&self, now: Timestamp) -> Result<crate::case::CaseCensus, StoreError> {
         self.inner.census(now).await
     }

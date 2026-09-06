@@ -20,10 +20,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
-use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, LOCATION,
-};
+use reqwest::header::{ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, LOCATION};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -579,18 +576,6 @@ impl GovernedMedia {
                 response.status()
             )));
         }
-        if let Some(length) = response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-            && length > self.policy.max_bytes as u64
-        {
-            return Err(MediaError::Refused(format!(
-                "media Content-Length {length} exceeds {} bytes",
-                self.policy.max_bytes
-            )));
-        }
         // Every `Content-Encoding` line, not the first: a response carrying
         // `identity` on one line and `gzip` on another is one whose body is
         // coded, and a check that reads only the first line waves it through.
@@ -616,21 +601,20 @@ impl GovernedMedia {
             )));
         }
 
-        let mut bytes = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| MediaError::Interrupted(error.to_string()))?;
-            let next = bytes.len().checked_add(chunk.len()).ok_or_else(|| {
-                MediaError::Refused("media response length overflowed".to_owned())
+        // The shared ceiling, with this policy's own number. Media is the one
+        // surface whose payload size is the subject rather than the overhead, so
+        // it keeps a configurable limit — but the rule that applies it lives in
+        // one place, checked against a declared length before a byte is read and
+        // against the accumulated bytes while reading.
+        let bytes = crate::netguard::intake::read(response, self.policy.max_bytes)
+            .await
+            .map_err(|e| {
+                if e.is_refusal() {
+                    MediaError::Refused(format!("media body: {e}"))
+                } else {
+                    MediaError::Interrupted(e.to_string())
+                }
             })?;
-            if next > self.policy.max_bytes {
-                return Err(MediaError::Refused(format!(
-                    "media body exceeds {} bytes",
-                    self.policy.max_bytes
-                )));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
         if bytes.is_empty() {
             return Err(MediaError::Refused(
                 "media response body is empty".to_owned(),
@@ -1375,7 +1359,7 @@ mod tests {
         let declared: reqwest::Response = http::Response::builder()
             .status(200)
             .header(CONTENT_TYPE, "image/png")
-            .header(CONTENT_LENGTH, "9")
+            .header(reqwest::header::CONTENT_LENGTH, "9")
             .body(Vec::new())
             .unwrap()
             .into();
@@ -1532,15 +1516,14 @@ mod block_shape_tests {
     #[cfg(feature = "bedrock")]
     #[test]
     fn the_bedrock_driver_accepts_the_bedrock_builders_own_block() {
-        use base64::Engine as _;
         let model = crate::model::ModelId::new("bedrock", "test");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(b"png");
+        let encoded = crate::core::b64::encode(b"png");
 
         let block = materialized(&fetched("image/png").bedrock_image(), &encoded);
         crate::model::bedrock::content_from_prompt_json(&block, &model)
             .expect("the driver must accept the block its own builder produced");
 
-        let pdf = base64::engine::general_purpose::STANDARD.encode(b"pdf");
+        let pdf = crate::core::b64::encode(b"pdf");
         let doc = materialized(&fetched("application/pdf").bedrock_document(), &pdf);
         crate::model::bedrock::content_from_prompt_json(&doc, &model)
             .expect("the driver must accept the document its own builder produced");

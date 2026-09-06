@@ -863,7 +863,13 @@ impl Gemini {
         model: &ModelId,
         schema: Option<&Value>,
     ) -> Result<Completion, ModelError> {
-        let parsed: Value = response.json().await.map_err(|e| ModelError::Unusable {
+        // Read under this plane's ceiling rather than to end-of-stream: a
+        // provider is a counterparty, and a counterparty must not decide how
+        // much of this process's memory its answer costs.
+        let body = crate::netguard::intake::read(response, crate::netguard::intake::ANSWER)
+            .await
+            .map_err(|e| super::wire::classify_intake(model, Usage::default(), &e))?;
+        let parsed: Value = serde_json::from_slice(&body).map_err(|e| ModelError::Unusable {
             model: model.clone(),
             usage: Usage::default(),
             detail: format!("the response did not parse: {e}"),
@@ -883,12 +889,28 @@ impl Gemini {
         let mut decoder = sse::Decoder::new();
         let mut acc = gemini_stream::Accumulator::new();
         let mut body = response.bytes_stream();
+        // The same ceiling the buffered path applies, to the same bytes.
+        // `sse::Decoder` already bounds one event, which is the unterminated
+        // line; this bounds the *number* of them. A stream of well-formed
+        // hundred-byte deltas passes every check the decoder makes and grows
+        // the accumulator until the process dies.
+        let mut meter = crate::netguard::intake::Meter::new(crate::netguard::intake::ANSWER);
 
         while let Some(chunk) = body.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
                 Err(e) => return Err(severed(model, &acc, &e.to_string())),
             };
+            // Charged before the chunk is kept: what the ceiling bounds is
+            // what this process holds, not what it has already held. The
+            // refusal is `Unusable` rather than `severed` — it is this
+            // plane's rather than the provider's, and the call generated.
+            // This wire reports no usage until the end, so the figure is
+            // zero here for the same reason `severed` reports `Unaccounted`:
+            // what is unknown is the amount, not whether it happened.
+            if let Err(e) = meter.charge(chunk.len()) {
+                return Err(super::wire::classify_intake(model, Usage::default(), &e));
+            }
             let events = decoder
                 .push(&chunk)
                 .map_err(|error| severed(model, &acc, &error.to_string()))?;
@@ -1127,7 +1149,14 @@ impl ModelProvider for Gemini {
         let status = response.status();
         if !status.is_success() {
             let headers = response.headers().clone();
-            let text = response.text().await.unwrap_or_default();
+            // Bounded, and the ceiling is the small one: this body is read
+            // only to say *why* the call failed, so an endpoint answering a
+            // failure with a gigabyte gets an unexplained failure rather than
+            // this process's memory.
+            let text =
+                crate::netguard::intake::read_text(response, crate::netguard::intake::METADATA)
+                    .await
+                    .unwrap_or_default();
             return Err(with_retry_info(
                 classify_status(model, status.as_u16(), &headers, &text),
                 &text,

@@ -73,6 +73,38 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     crate::core::retry_after_seconds(headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?)
 }
 
+/// Classify a failure to read a provider's answer.
+///
+/// One table, because the two arms are not the same claim and four drivers
+/// would otherwise each decide. A **size refusal is this plane's**: the call
+/// generated, so it is billed and `Landed`, and repeating it reaches the same
+/// wall — that is [`ModelError::Unusable`], the same variant a 200 whose body
+/// will not parse already produces, and for the same reason. A **transport
+/// failure is the provider's or the network's**, and goes down the ladder every
+/// driver already has for a call that died mid-answer.
+///
+/// `usage` is what the wire had already reported when the read stopped, and it
+/// is the caller's to supply because only the caller knows. Zero on the buffered
+/// path, which knowingly under-counts exactly as the parse-failure arm beside it
+/// does. On the streamed path it is Anthropic's accumulator figure — that wire
+/// reports usage incrementally — and zero for the other three, which report it
+/// only at the end, for the same reason a severed stream there is `Unaccounted`:
+/// what is unknown is the amount, not whether it happened.
+pub fn classify_intake(
+    model: &ModelId,
+    usage: crate::model::Usage,
+    e: &crate::netguard::intake::IntakeError,
+) -> ModelError {
+    if let Some(transport) = e.transport() {
+        return classify_transport(model, transport);
+    }
+    ModelError::Unusable {
+        model: model.clone(),
+        usage,
+        detail: e.to_string(),
+    }
+}
+
 /// Classify a transport failure.
 ///
 /// The distinction that matters is whether anything was written. A connection

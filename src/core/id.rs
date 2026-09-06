@@ -282,6 +282,31 @@ impl Phase {
         matches!(self, Self::Forward)
     }
 
+    /// The spelling every store writes.
+    ///
+    /// One, because three stores keep a phase column and a phase that reads
+    /// back as the other half of the saga hands the unwind logic a compensating
+    /// record wearing the forward pass's name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Forward => "forward",
+            Self::Compensating => "compensating",
+        }
+    }
+
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`ALL`](Self::ALL) for the reason [`CaseStatus::parse`] is.
+    ///
+    /// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    /// Both passes.
+    pub const ALL: [Self; 2] = [Self::Forward, Self::Compensating];
+
     /// By-reference form, for `skip_serializing_if`.
     #[allow(clippy::trivially_copy_pass_by_ref)]
     #[must_use]

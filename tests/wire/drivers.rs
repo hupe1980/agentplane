@@ -2007,6 +2007,130 @@ data: {{\"type\":\"message_stop\"}}
     );
 }
 
+/// Serves a body larger than any ceiling, in chunks, without declaring a length.
+///
+/// The declared-length half is the easy one and the header is the claim of the
+/// party under suspicion; this is the case that matters. `Transfer-Encoding:
+/// chunked` with no `Content-Length` is what a hostile endpoint sends, and it is
+/// also what any streaming provider sends.
+///
+/// The SSE variant emits **well-formed** delta events rather than one enormous
+/// line, because `sse::Decoder` already refuses a line past a megabyte. Every
+/// event here is small, valid, and passes every check that decoder makes; what
+/// grows without bound is the number of them and the accumulator holding their
+/// text. A stub that sent one huge line would exercise the control that already
+/// existed and prove nothing about the one under test.
+async fn serve_oversized(total: usize, sse: bool) -> String {
+    let chunk = if sse {
+        let event = "event: content_block_delta\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":\
+             {\"type\":\"text_delta\",\"text\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}\n\n";
+        bytes::Bytes::from(event.repeat(512))
+    } else {
+        bytes::Bytes::from(vec![b'x'; 64 * 1024])
+    };
+    let body = move || {
+        let chunk = chunk.clone();
+        futures_util::stream::unfold(0usize, move |sent| {
+            let chunk = chunk.clone();
+            async move {
+                if sent >= total {
+                    return None;
+                }
+                let next = sent + chunk.len();
+                Some((Ok::<bytes::Bytes, std::io::Error>(chunk), next))
+            }
+        })
+    };
+    let handler = move || {
+        let body = body();
+        async move {
+            use axum::response::IntoResponse;
+            let content_type = if sse {
+                "text/event-stream"
+            } else {
+                "application/json"
+            };
+            (
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                axum::body::Body::from_stream(body),
+            )
+                .into_response()
+        }
+    };
+    let app = Router::new()
+        .route("/v1/messages", post(handler.clone()))
+        .route("/v1/responses", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    format!("http://{addr}")
+}
+
+/// A provider does not get to decide how much memory its answer costs.
+///
+/// Every outbound call here carries a timeout, so the *time* an answer may take
+/// was already bounded. The bytes were not: `Response::json()` reads to
+/// end-of-stream, and an endpoint on the same host can deliver a gigabyte long
+/// before any timeout fires. One OOM takes down every run on the instance, and
+/// the survivors take those runs over into a process that dies the same way.
+///
+/// Asserted on the *reason*, not on the variant. Without the ceiling this is
+/// still `Unusable` — twenty megabytes of `x` is not JSON either — so a test
+/// that checked the variant alone would pass with the control removed.
+#[tokio::test]
+async fn an_oversized_answer_is_refused_rather_than_read() {
+    let url = serve_oversized(24 * 1024 * 1024, false).await;
+    let provider = Anthropic::new("k").unwrap().base(url).buffered();
+    let prompt = json!("hi");
+    let err = provider
+        .complete(ask(&model(), &prompt))
+        .await
+        .expect_err("an answer past the ceiling is not read");
+
+    match &err {
+        ModelError::Unusable { detail, .. } => assert!(
+            detail.contains("grew past"),
+            "the refusal must be the ceiling firing, not the parse failing \
+             afterwards — otherwise this passes with the ceiling removed: {detail}"
+        ),
+        other => panic!("an oversized answer must be Unusable: {other}"),
+    }
+    assert_eq!(
+        err.disposition(),
+        Disposition::Landed,
+        "it generated before we stopped reading; asking again buys a second bill"
+    );
+}
+
+/// The same ceiling, on the path that already looked covered.
+///
+/// `sse::Decoder` bounds one event, so the unterminated line was already
+/// refused. Nothing bounded how many events arrived — and a stream of
+/// well-formed hundred-byte deltas passes every check that decoder makes while
+/// the accumulator holding their text grows until the process dies. A control
+/// over the part that was easy to see is what makes the rest read as covered.
+#[tokio::test]
+async fn an_oversized_stream_is_refused_rather_than_accumulated() {
+    let url = serve_oversized(24 * 1024 * 1024, true).await;
+    let provider = Anthropic::new("k").unwrap().base(url);
+    let prompt = json!("hi");
+    let err = provider
+        .complete(ask(&model(), &prompt))
+        .await
+        .expect_err("a stream past the ceiling is not accumulated");
+
+    match &err {
+        ModelError::Unusable { detail, .. } => assert!(
+            detail.contains("grew past"),
+            "the refusal must name the ceiling: {detail}"
+        ),
+        other => panic!("an oversized stream must be Unusable, not {other}"),
+    }
+}
+
 /// **The property the whole streaming path exists for.**
 ///
 /// A connection that dies after generating must report what it burned. Before

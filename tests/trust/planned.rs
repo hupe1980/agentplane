@@ -858,6 +858,14 @@ async fn break_glass_is_recorded_in_the_crossed_tenants_journal() {
 /// Both directions, because either alone passes for the wrong reason: a `cross`
 /// that always failed would satisfy "no crossing goes unrecorded", and one that
 /// never recorded would satisfy "the operator gets their plane".
+///
+/// Gated on `http`, which is the feature carrying `agentplane::api`. Without the
+/// gate this one test decides whether the **whole** `trust` binary compiles, and
+/// it does so invisibly: `--all-features` builds it, so every ordinary run is
+/// green while `cargo test --features redb,testkit,manifest --test trust` — and
+/// the mutation sweep, which derives exactly that set — cannot build the target
+/// at all.
+#[cfg(feature = "http")]
 #[tokio::test]
 async fn crossing_to_another_tenant_records_before_it_serves() {
     use agentplane::api::{Caller, Planes};

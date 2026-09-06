@@ -27,17 +27,14 @@
 //!
 //! # Which is why a leaf hash is its own type
 //!
-//! "Not optional" was, for a while, exactly optional: [`leaf_hash`] took a
-//! `Digest` and returned one, and [`root`] took `Digest`s meaning
-//! *already-hashed leaves* — so skipping the call produced a tree with no leaf
-//! separation, a plausible root, and nothing to notice. Every caller in this
-//! crate happened to get it right, which is the shape of defect this project
-//! treats most seriously: a property the runtime **relies on** rather than
-//! **checks**, on a seam published for other people to use.
+//! A [`root`] taking bare `Digest`s would let a caller skip the leaf prefix and
+//! get a plausible root over an undifferentiated tree, with nothing to notice —
+//! a property the runtime **relies on** rather than **checks**, on a seam
+//! published for other people to use.
 //!
-//! [`LeafHash`] closes it where the evidence is strongest — construction.
-//! There is one way to make one, it applies the prefix, and a tree built from
-//! raw digests does not compile. The prefix bytes are checked by the RFC 6962
+//! [`LeafHash`] closes it where the evidence is strongest: construction. There
+//! is one way to make one, it applies the prefix, and a tree built from raw
+//! digests does not compile. The prefix bytes are checked by the RFC 6962
 //! vectors below; what the type adds is that they cannot be skipped.
 
 use crate::core::Digest;
@@ -47,9 +44,8 @@ use crate::core::Digest;
 /// Distinct from [`Digest`] on purpose. Both are thirty-two bytes and the
 /// compiler is the only thing that can tell "the digest of a sealed run" from
 /// "that digest, hashed as a leaf" — and the difference is the whole
-/// second-preimage defence. A function taking `Digest` for a leaf is a
-/// function whose contract lives in its documentation, which is where this one
-/// lived until a reader pointed out that nothing enforced it.
+/// second-preimage defence. A function taking `Digest` for a leaf is a function
+/// whose contract lives in its documentation, where nothing enforces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LeafHash(Digest);
 

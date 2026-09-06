@@ -1,7 +1,7 @@
 +++
 title = "Operations"
 description = "Deploying, high availability, retention, observability, and a runbook for every state a run can get stuck in."
-weight = 17
+weight = 18
 
 [extra]
 group = "Operate"
@@ -404,10 +404,13 @@ curl -H "$AUTH" 'https://plane/push'                       # receivers that stop
 
 All six page the same way: `truncated` says whether there is more, and the
 order puts the item you are most likely to want first — newest for runs and
-cases, longest-overdue for obligations. **Ascending order is not an option** for
-a bounded query: it is a page that stops changing, so a plane whose backlog
-exceeds one page returns the same rows forever and the thing that just happened
-is the one that never appears.
+cases, longest-overdue for obligations. **Ascending order is only safe on a
+listing that drains.** A bounded query taken oldest-first is a page that stops
+changing: if nothing ever leaves it, a plane whose backlog exceeds one page
+returns the same rows forever and the thing that just happened is the one that
+never appears. Obligations are ordered that way because acknowledging a breach
+removes it — the head of that page is not permanent, and `POST
+/obligations/acknowledge` is what moves it.
 
 `/runs` reads an index **derived** from the `RunConcluded` record inside `append`,
 in the same transaction, so it rebuilds from the chain and is never an
@@ -435,6 +438,18 @@ answered. It reads the obligation's own row rather than the case's status, so it
 still answers after the matter is closed — closure is when people stop looking,
 which is when the record has to stand on its own.
 
+**It lists breaches nobody has accounted for, and that qualifier is what makes
+it a backlog rather than a ledger.** `POST /obligations/acknowledge` names the
+case and the obligation and records who looked, taken from the authenticated
+caller rather than the body. The obligation stays `Breached` — what ends is the
+question, not the fact — and the account is readable afterwards on
+`GET /cases/{case}`. The call is idempotent and says which happened: `recorded`
+is `false` when somebody had already answered, because the first account stands
+and a retry must not rewrite who looked or when.
+
+Alert on `agentplane.obligations.breached`, which is the same figure as a level
+rather than a page.
+
 `/dead-letters` and `/push` are the two backlogs that are **diagnoses rather
 than work items**, and both carry less than the store holds. A dead letter means
 a correlation key does not match what a run subscribed to, so the listing gives
@@ -450,7 +465,10 @@ a sweep with nothing to do.
 
 **Grant the read verbs explicitly.** `api:run.list`, `api:case.list`,
 `api:obligation.list`, `api:deadletter.list` and `api:push.list` are what an
-on-call person needs, and an allowlist built
+on-call person needs, plus `api:obligation.acknowledge` for whoever answers a
+breach — separate from reading the list, because the party allowed to see what a
+deployment missed is not automatically the party allowed to declare it
+answered. An allowlist built
 from route names alone will miss them; under a default-deny engine an ungranted
 verb means the backlog is refused to everybody. Enumerate `action::ALL` when
 writing rules rather than reading the route table. `api:obligation.list` is
@@ -1376,7 +1394,8 @@ whether a run id exists by comparing a `400` against a `404`.
 | `POST /tasks/{task}/decide` | Approve or reject, as myself |
 | `GET /cases?status=…` | What is escalated and has not been cleared? Newest first; defaults to `escalated` |
 | `GET /cases/{case}` | What has happened on this matter, and by when must it end? |
-| `GET /obligations` | What did we miss? Longest-overdue first, and it outlives the case's closure |
+| `GET /obligations` | What did we miss and has nobody accounted for? Longest-overdue first, and it outlives the case's closure |
+| `POST /obligations/acknowledge` | I have looked at that one — take it off the list, keep the record |
 | `POST /runs/{run}/cancel` | Stop it — `202`, because the run stops at its next boundary |
 | `POST /runs/{run}/reconcile` | I looked it up: here is what actually happened to that effect |
 | `POST /runs/{run}/reopen` | The doubt is answered — judge the run again |

@@ -1,7 +1,7 @@
 +++
 title = "Upgrading"
 description = "Every breaking change between agentplane pre-alpha releases, why it was made, and the shortest correct fix — newest first."
-weight = 19
+weight = 20
 
 [extra]
 group = "Operate"
@@ -22,6 +22,136 @@ releases them. Start at the top and stop at the first change you already have �
 everything above that point is what moved since you last looked. The changelog
 is where the version each landed in is recorded; repeating it here would be the
 same fact in two places, and the copy that drifts is always the second one.
+
+---
+
+## Stored states are spelled once, by the type
+
+**Affected:** anything matching on the string form of `CaseStatus`,
+`DeadlineState`, `TaskState`, `Priority`, `OnExpiry`, `Phase` or `ItemOutcome`;
+any PostgreSQL store built before this change.
+
+Each of these had an `as_str` the compiler checks and readers that were
+`match`es over `&str` with a catch-all, so adding a variant compiled everywhere
+and silently changed what the queue, the sweep and the backlog saw. The reader
+is now the writer read backwards.
+
+- **`T::ALL` and `T::parse(&str) -> Option<T>` exist on all six.** `parse` is
+  written over `ALL`, so the two directions cannot drift. If you were matching
+  on strings, call `parse` and treat `None` as damage rather than as a default.
+- **`Phase::as_str` is new.** Anything writing `"forward"` / `"compensating"`
+  by hand should use it.
+- **`Priority::rank() -> u8` is the queue's sort key**, most urgent lowest and
+  exhaustive over the type. A ranking with a fallback arm sorts an unranked
+  priority last, which is the failure this replaces.
+- **`TaskState::is_queued()` and `TaskState::awaits_expiry()` are new**, beside
+  the existing `is_pending()`, which is now `const`. `is_queued` is what the
+  worklist offers; `awaits_expiry` is what the expiry sweep still owes
+  something. They are deliberately three different questions.
+- **`ItemOutcome::all(detail)`, `parse(tag, detail)` and `terminal_tags()` are
+  new.** Its variants carry a detail string, so the list is a function rather
+  than a `const`. A store deciding whether an item is still open should ask
+  `is_terminal` rather than listing the non-terminal spellings.
+- **The PostgreSQL `tasks` table gains `priority_rank SMALLINT NOT NULL`** and
+  its queue index drops the `CASE priority WHEN …` expression it carried.
+  **Recreate the store**; there is no migration.
+
+## `base64` is no longer an optional dependency
+
+**Affected:** nobody's code — stated because a dependency graph changed.
+
+The crate held two hand-written base64 codecs, one strict and one lax, because
+the `base64` crate was behind five feature flags and the module that parses a
+`tlog-checkpoint` note is behind none. It is unconditional now, and
+`core::b64` is the one place that picks a dialect. `keyring`, `manifest`,
+`push`, `media` and `bedrock` no longer list `dep:base64`.
+
+---
+
+## `CaseStore` gains `acknowledge_breach`, and `Deadline` gains `acknowledged`
+
+**Affected:** anything implementing `CaseStore`, constructing a `Deadline`
+literal, reading `CaseCensus`, or reading `runtime::metrics::Census`.
+
+`GET /obligations` was ordered longest-overdue first, bounded by a page, and had
+no verb that took an entry off it — so past one page of breaches the head was
+permanent and every later miss was unreachable. The listing now returns breaches
+nobody has accounted for, and `POST /obligations/acknowledge` is what removes
+one.
+
+- **`CaseStore::acknowledge_breach(case, name, &BreachNote) -> Result<bool, _>`
+  is required.** Returns whether *this* call recorded it: the first account
+  stands and a retry must not rewrite who looked or when. Refuse an obligation
+  that is not `Breached` with `StoreError::NotBreached`, and one that does not
+  exist with `StoreError::NotFound`.
+- **`Deadline` gains `acknowledged: Option<BreachNote>`.** Struct literals need
+  the field; `None` is right for anything being registered. Only a restore
+  (`import_case`) carries a populated one.
+- **`CaseCensus` gains `breached`** and **`Census` gains
+  `unaccounted_breaches`** — the gauge behind `agentplane.obligations.breached`.
+  Required rather than defaulted: a default of zero is a gauge reporting that
+  nothing is wrong.
+- **Grant `api:obligation.acknowledge`.** Under a deny-by-default engine an
+  ungranted verb is a backlog nobody can clear. It is separate from
+  `api:obligation.list` because the party allowed to see what a deployment
+  missed is not automatically the party allowed to declare it answered.
+
+Both shipped stores gain an index (`case_deadlines_unaccounted` on redb, a
+partial index plus three nullable columns on PostgreSQL). Recreate the store;
+there is no migration before format freeze.
+
+---
+
+## `met`, `breached` and `cancelled` are terminal obligation states
+
+**Affected:** anything calling `cx.meet_deadline` or `cx.cancel_deadline` on a
+matter whose window may already have closed, and any `CaseStore`
+implementation.
+
+`set_deadline_state` accepted every transition, so answering late moved a
+`breached` obligation to `met` — erasing the only record that the window closed
+unmet and taking the miss off the obligation listing in the same call. It now
+answers `StoreError::DeadlineFinal`.
+
+Re-applying the state already held still succeeds: a sweep repeating its own
+last write is a retry, not an edit. Implementations must allow that and refuse
+the rest; the shared relation is `DeadlineState::may_become`, so a backend
+should call it rather than re-derive it.
+
+Record a late answer as an account of the breach — `POST
+/obligations/acknowledge` takes a note, and *responded two days after the
+window* belongs beside the fact rather than instead of it.
+
+---
+
+## Registering an obligation on a closed case is refused
+
+**Affected:** anything calling `CaseStore::register_deadline`, or a skill
+calling `cx.deadline(..)` on a matter that may have been closed underneath it.
+
+`close` refuses while an obligation is outstanding — and nothing enforced that
+afterwards, so a pending obligation could be added to a case already closed and
+the sweep would breach it and escalate a matter audited as settled. The write
+now answers `StoreError::CaseClosed`.
+
+The reachable shape is a run suspended on a wait whose case is closed while it
+sleeps. If your skill can be in that position, handle the refusal: reopening is
+`set_case_status(CaseStatus::Open)`, which is deliberately an explicit act
+rather than something the store does on your behalf.
+
+---
+
+## Leaving `Closed` re-claims a case's correlation keys
+
+**Affected:** deployments that reopen matters — a skill calling
+`cx.set_case_status(..)`, or any plane whose sweep escalates cases.
+
+Closing releases the correlation keys; leaving `Closed` now takes back every key
+still free. Nothing to change at a call site — this is behaviour a reopened case
+should always have had. What is worth knowing: a key another case has claimed in
+the meantime **stays with that case**, so a reopened matter can come back
+correlating on fewer keys than it closed with. That is the accurate state rather
+than a silent redirect of a live matter's traffic.
 
 ---
 

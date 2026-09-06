@@ -219,7 +219,9 @@ the interface URL *the card advertised*, carrying this run's payload and a
 bearer credential. A card is a description and never a grant, so a forged one
 cannot widen authority — but it can name an address, and these are the two
 places an address becomes a connection. Each resolves the host, checks every
-answer against `netguard`, refuses redirects, and bounds the whole request. The
+answer against `netguard`, refuses redirects, bounds the whole request, and
+bounds the answer — a timeout says how long the far side may take and nothing
+about how much it may send. The
 address check is the client's own DNS resolver, so it holds for **every**
 connection the client opens rather than for the one request a pin was computed
 for — which is what makes it real against DNS rebinding and what lets one
@@ -363,9 +365,20 @@ the invariant for the one route nobody would think to check.
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
 | `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused |
-| `ListTasks` | newest-first, cursor-paginated and per-task-authorized tasks with context/status/time filters, bounded history, and optional artifacts. A content filter's cost is bounded (`filter_scan_budget`, default 1024 candidate reads): the spec's `totalSize` is the exact pre-pagination count, so an unbounded filter would let one field buy a scan of every run the tenant ever wrote — over budget is a refusal naming `statusTimestampAfter` as the lever that narrows from the index, never a quietly truncated total. Artifact inclusion is budgeted too — reassembling artifacts replays each task's run, so a page past the budget returns the remaining tasks without artifacts and marks each with `io.agentplane.a2a/artifactsOmitted` in `Task.metadata`, because a bounded result must not be shaped like a complete one; `GetTask` on the marked id recovers them, and a sealed-run cache keeps the reassembly from being paid twice |
+| `ListTasks` | newest-first, cursor-paginated and per-task-authorized, with context/status/time filters, bounded history and optional artifacts — both bounded, see below |
 | the push-notification configs | durable create/get/list/delete when wired; the protocol-specific refusal otherwise |
 | anything else | `-32601`, method not found |
+
+**`ListTasks` bounds both of its expensive answers, and says when a bound
+bit.** A content filter is bounded by `filter_scan_budget` (default 1024
+candidate reads), because the spec's `totalSize` is the exact pre-pagination
+count and an unbounded filter would let one field buy a scan of every run the
+tenant ever wrote. Over budget is a refusal naming `statusTimestampAfter` as the
+lever that narrows from the index, never a quietly truncated total. Artifacts
+are bounded too — reassembling them replays each task's run — so a page past the
+budget returns the remaining tasks without artifacts and marks each with
+`io.agentplane.a2a/artifactsOmitted` in `Task.metadata`. `GetTask` on a marked
+id recovers them. A bounded result must not be shaped like a complete one.
 
 **One task has one state, whichever surface reports it.** `GetTask`, the row a
 task occupies in `ListTasks`, and the snapshot a subscription opens with are
@@ -621,6 +634,13 @@ printed.
 The IP classification is [`netguard`](@/docs/architecture.md#module-layout), shared with governed
 media. Two implementations of one rule diverge, and the one that diverges is
 whichever nobody probed at the boundary.
+
+So is the ceiling on what comes *back*. A peer's answer is read under
+`intake::ANSWER` and a discovered card under `intake::METADATA` — a timeout
+bounds how long a peer may take and says nothing about how much it may send, and
+reading to end-of-stream lets the counterparty decide how much of this process's
+memory its reply costs. See
+[how much may come back](@/docs/security.md#how-much-may-come-back).
 
 #### The stream is a view of the journal, not an event bus
 

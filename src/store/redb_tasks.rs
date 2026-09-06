@@ -54,34 +54,6 @@ fn ts(t: Timestamp) -> i64 {
     t.unix_timestamp()
 }
 
-/// Queue order, most urgent first.
-fn priority_rank(s: &str) -> u8 {
-    match s {
-        "urgent" => 0,
-        "high" => 1,
-        "normal" => 2,
-        _ => 3,
-    }
-}
-
-/// Whether a task is still waiting on somebody.
-fn is_queued(state: &str) -> bool {
-    matches!(state, "open" | "escalated")
-}
-
-fn is_pending(state: &str) -> bool {
-    matches!(state, "open" | "claimed" | "escalated")
-}
-
-/// Whether the expiry sweep still owes this task anything.
-///
-/// Narrower than [`is_pending`]: an escalated task is still claimable, but its
-/// expiry policy has already fired — see [`TaskStore::overdue`] for what
-/// keeping it in the scan starves.
-fn awaits_expiry(state: &str) -> bool {
-    matches!(state, "open" | "claimed")
-}
-
 /// Move a task between the derived indexes, in the transaction that writes it.
 fn reindex(
     w: &redb::WriteTransaction,
@@ -90,14 +62,14 @@ fn reindex(
     was: &Task,
     now_state: TaskState,
 ) -> Result<(), StoreError> {
-    let (before, after) = (was.state.as_str(), now_state.as_str());
+    let (before, after) = (was.state, now_state);
     if before == after {
         return Ok(());
     }
-    let rank = priority_rank(was.priority.as_str());
+    let rank = was.priority.rank();
     let created = ts(was.created_at);
     let mut queue = w.open_table(QUEUE).map_err(|e| be(&e))?;
-    match (is_queued(before), is_queued(after)) {
+    match (before.is_queued(), after.is_queued()) {
         (true, false) => {
             queue
                 .remove((tenant, rank, created, id))
@@ -113,7 +85,7 @@ fn reindex(
     drop(queue);
 
     let mut pending = w.open_table(PENDING).map_err(|e| be(&e))?;
-    match (is_pending(before), is_pending(after)) {
+    match (before.is_pending(), after.is_pending()) {
         (true, false) => {
             pending.remove((tenant, id)).map_err(|e| be(&e))?;
         }
@@ -126,7 +98,7 @@ fn reindex(
 
     if let Some(due) = was.due_at {
         let mut overdue = w.open_table(OVERDUE).map_err(|e| be(&e))?;
-        match (awaits_expiry(before), awaits_expiry(after)) {
+        match (before.awaits_expiry(), after.awaits_expiry()) {
             (true, false) => {
                 overdue.remove((tenant, ts(due), id)).map_err(|e| be(&e))?;
             }
@@ -189,11 +161,11 @@ impl TaskStore for RedbStore {
         let tenant = self.tenant_name();
         let id = task.id.to_hex();
         let encoded = serde_json::to_string(task)?;
-        let (rank, created) = (priority_rank(task.priority.as_str()), ts(task.created_at));
+        let (rank, created) = (task.priority.rank(), ts(task.created_at));
         let (queued, pending, expirable) = (
-            is_queued(task.state.as_str()),
-            is_pending(task.state.as_str()),
-            awaits_expiry(task.state.as_str()),
+            task.state.is_queued(),
+            task.state.is_pending(),
+            task.state.awaits_expiry(),
         );
         let due = task.due_at.map(ts);
         let case = task.case.map(|c| c.to_string());

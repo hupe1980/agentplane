@@ -236,11 +236,11 @@ struct ForgetArgs {
 
 /// The live half of the case-layer drill, as a verb.
 ///
-/// `Runtime::drill` existed and could only be reached by writing Rust, which
-/// is the dependency the declarative tier exists to remove — a deployment
-/// that is only a YAML file had no way to rehearse its own recovery. The verb
-/// opens the same store file the other journal verbs do; the case layer lives
-/// in it, so `--store` is the whole wiring.
+/// `Runtime::drill` reachable without writing Rust, which is the dependency the
+/// declarative tier exists to remove: a deployment that is only a YAML file
+/// still has to be able to rehearse its own recovery. The verb opens the same
+/// store file the other journal verbs do; the case layer lives in it, so
+/// `--store` is the whole wiring.
 ///
 /// What this verb does NOT check: blob bytes and sealed-state keys. A redb
 /// file holds no blob store, and this binary has no key-ring wiring — both

@@ -37,8 +37,6 @@
 //! paths. I-JSON draws interoperability at the same line, so a value that big
 //! belongs in a string.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -180,7 +178,7 @@ pub fn signing_input(card: &AgentCard, protected_b64: &str) -> Result<Vec<u8>, C
     let mut input = Vec::with_capacity(protected_b64.len() + 1 + payload.len() * 2);
     input.extend_from_slice(protected_b64.as_bytes());
     input.push(b'.');
-    input.extend_from_slice(B64.encode(&payload).as_bytes());
+    input.extend_from_slice(crate::core::b64::encode_url(&payload).as_bytes());
     Ok(input)
 }
 
@@ -209,13 +207,14 @@ impl AgentCard {
         // makes signing the same card twice produce the same header, which it
         // would not if `serde_json` were preserving insertion order (a
         // dependency can turn that on, and one does).
-        let protected_b64 = B64.encode(crate::core::canon::value_bytes(&protected));
+        let protected_b64 =
+            crate::core::b64::encode_url(crate::core::canon::value_bytes(&protected));
 
         // Signed over the card *without* its signatures, which is what
         // `signing_input` removes — so signing twice produces two signatures
         // over the same bytes rather than one over the other.
         let input = signing_input(self, &protected_b64)?;
-        let signature = B64.encode(signer.sign_bytes(&input));
+        let signature = crate::core::b64::encode_url(signer.sign_bytes(&input));
 
         self.signatures.push(CardSignature {
             protected: protected_b64,
@@ -239,9 +238,8 @@ impl AgentCard {
 
         let mut wrong_alg = None;
         for sig in &self.signatures {
-            let header = B64
-                .decode(&sig.protected)
-                .map_err(|_| CardSignatureError::Malformed)?;
+            let header = crate::core::b64::decode_url(&sig.protected)
+                .ok_or(CardSignatureError::Malformed)?;
             let header: Value = serde_json::from_slice(&header)
                 .map_err(|e| CardSignatureError::BadHeader(e.to_string()))?;
 
@@ -261,7 +259,7 @@ impl AgentCard {
             };
 
             let input = signing_input(self, &sig.protected)?;
-            let Ok(raw) = B64.decode(&sig.signature) else {
+            let Some(raw) = crate::core::b64::decode_url(&sig.signature) else {
                 return Err(CardSignatureError::Malformed);
             };
             if verifier.verify_bytes(kid, &input, &raw) {

@@ -322,6 +322,26 @@ pub struct ReconcileRequest {
     pub note: String,
 }
 
+/// An account of a missed obligation, on the wire.
+///
+/// Note what is absent, for the reason every other decision type here omits it:
+/// **no actor**. Who looked comes from the [`Authenticator`], so an account
+/// cannot name somebody the caller is not — and an account of a missed
+/// obligation that named whoever the request said it was would be no account
+/// at all.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcknowledgeRequest {
+    /// The matter the obligation belongs to.
+    pub case: String,
+    /// The obligation's name, unique within that case.
+    pub obligation: String,
+    /// What the reader has to say. May be empty: somebody who has looked and
+    /// has nothing to add has still answered the question the listing asked.
+    #[serde(default)]
+    pub note: String,
+}
+
 /// What a decision looks like on the wire.
 ///
 /// Note what is absent: **no actor, no roles**. Both come from the
@@ -792,6 +812,7 @@ impl Api {
             .route("/tasks/{task}/decide", post(decide))
             .route("/cases", get(cases_by_status))
             .route("/obligations", get(breached_obligations))
+            .route("/obligations/acknowledge", post(acknowledge_obligation))
             .route("/cases/{case}", get(case_view))
             .route("/events", post(deliver))
             .route("/dead-letters", get(dead_letters));
@@ -899,6 +920,10 @@ pub mod action {
     /// `case.list`, because the party who must answer for a breach is a
     /// compliance function that has no reason to read matter state.
     pub const OBLIGATION_LIST: &str = "api:obligation.list";
+    /// Accounting for one. Separate from reading the list because it is what
+    /// takes an entry off it, and the party allowed to see what a deployment
+    /// missed is not automatically the party allowed to declare it answered.
+    pub const OBLIGATION_ACKNOWLEDGE: &str = "api:obligation.acknowledge";
     pub const EVENT_DELIVER: &str = "api:event.deliver";
     /// Reading the messages that arrived and reached nobody. Its own verb
     /// because the audience is whoever owns the *integration* — a dead letter
@@ -942,6 +967,7 @@ pub mod action {
         CASE_READ,
         CASE_LIST,
         OBLIGATION_LIST,
+        OBLIGATION_ACKNOWLEDGE,
         EVENT_DELIVER,
         DEADLETTER_LIST,
         #[cfg(feature = "push")]
@@ -1525,7 +1551,9 @@ async fn cases_by_status(
     headers: HeaderMap,
     Query(q): Query<StatusQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let asked = q.status.unwrap_or_else(|| "escalated".to_owned());
+    let asked = q
+        .status
+        .unwrap_or_else(|| CaseStatus::Escalated.as_str().to_owned());
     let s = api.gate(&headers, action::CASE_LIST, &asked).await?;
     let status = CaseStatus::parse(&asked).ok_or_else(|| bad("status"))?;
     let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
@@ -1617,6 +1645,72 @@ async fn dead_letters(State(api): State<Api>, headers: HeaderMap) -> Result<Json
         "dead_letters": found.iter().map(DeadLetterView::of).collect::<Vec<_>>(),
         "truncated": truncated,
     })))
+}
+
+/// Account for a missed obligation, taking it off the listing.
+///
+/// The verb that empties this backlog. Without one the listing is a level that
+/// only rises: ordered longest-overdue first and bounded by a page, its head
+/// becomes permanent and every breach after it — including the ones somebody
+/// could still act on — is unreachable.
+///
+/// Idempotent by design, and it says which happened: `recorded` is false when
+/// somebody had already answered, because the first account stands and a retry
+/// must not rewrite who looked or when.
+async fn acknowledge_obligation(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<AcknowledgeRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api
+        .gate(&headers, action::OBLIGATION_ACKNOWLEDGE, &body.case)
+        .await?;
+    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+    let case = crate::core::CaseId::parse(&body.case).map_err(|_| bad("case"))?;
+
+    let note = crate::core::BreachNote {
+        by: s.caller.actor.clone(),
+        note: body.note,
+        at: now_for_account(),
+    };
+    let recorded = cases
+        .acknowledge_breach(case, &body.obligation, &note)
+        .await
+        .map_err(acknowledge_refused)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "acknowledged_by": note.by,
+            "obligation": body.obligation,
+            "recorded": recorded,
+        })),
+    ))
+}
+
+/// When an operator's account was recorded.
+///
+/// An ambient clock read, and legitimately one: this stamps an operator's action
+/// on a case row and never enters a run's history, so nothing replays it. The
+/// deterministic zone still reaches a clock only through `StepCtx`, which
+/// journals what it read — the same distinction admission's own stamp draws.
+#[allow(clippy::disallowed_methods)]
+fn now_for_account() -> crate::core::Timestamp {
+    crate::core::Timestamp::now_utc()
+}
+
+/// Tell the three refusals apart, because they call for three different next
+/// steps: a name that matches nothing, an obligation that has not been missed,
+/// and a store that could not be reached.
+fn acknowledge_refused(e: crate::core::StoreError) -> ApiError {
+    use crate::core::StoreError;
+    match e {
+        StoreError::NotFound(what) => {
+            ApiError(StatusCode::NOT_FOUND, format!("no such obligation: {what}"))
+        }
+        StoreError::NotBreached { .. } => ApiError(StatusCode::CONFLICT, e.to_string()),
+        _ => store_failed(),
+    }
 }
 
 /// Webhook registrations a delivery worker gave up on.

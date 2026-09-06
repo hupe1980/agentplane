@@ -85,9 +85,9 @@ pub struct Header {
     pub checkpoint: Checkpoint,
     /// Which canonicalization rule produced the digests in these records.
     ///
-    /// Carried because it has already changed once. A digest is meaningless
-    /// without the rule that computed it, and an export outlives the build that
-    /// wrote it.
+    /// A digest is meaningless without the rule that computed it, and an
+    /// export outlives the build that wrote it — so the rule travels with the
+    /// digests rather than being whatever the reader happens to implement.
     pub canon: u16,
 }
 

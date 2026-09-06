@@ -351,8 +351,35 @@ impl PostgresStore {
     }
 }
 
-fn be(e: &tokio_postgres::Error) -> StoreError {
-    StoreError::Backend(e.to_string())
+/// What a PostgreSQL failure actually said.
+///
+/// `tokio_postgres::Error` displays as `db error` and keeps everything an
+/// operator needs one level down: the server's message, its SQLSTATE, and its
+/// detail line. Reported as it displays, every PostgreSQL fault this crate can
+/// hit arrives on a pager as three characters that separate a connection reset
+/// from a query this build sends that the schema will never accept in exactly
+/// no way.
+///
+/// One spelling, used by every module that touches this pool: a per-module copy
+/// is a per-module decision about how much of the server's answer survives, and
+/// the module that decides *none of it* is the one nobody notices.
+pub(super) fn detail(error: &tokio_postgres::Error) -> String {
+    if let Some(db) = error.as_db_error() {
+        let extra = db.detail().map_or(String::new(), |d| format!(": {d}"));
+        return format!("{} ({}{})", db.message(), db.code().code(), extra);
+    }
+    let mut out = error.to_string();
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(next) = cause {
+        use std::fmt::Write as _;
+        let _ = write!(out, ": {next}");
+        cause = next.source();
+    }
+    out
+}
+
+pub(super) fn be(error: &tokio_postgres::Error) -> StoreError {
+    StoreError::Backend(detail(error))
 }
 
 /// Classify a failed `COMMIT`, for every journal write that commits one.
@@ -381,7 +408,7 @@ fn commit_refused_or_in_doubt(e: &tokio_postgres::Error) -> StoreError {
     }
 }
 
-fn pool_err(e: &impl std::fmt::Display) -> StoreError {
+pub(super) fn pool_err(e: &impl std::fmt::Display) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 

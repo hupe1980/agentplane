@@ -56,7 +56,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -2704,14 +2703,12 @@ async fn list_tasks(
 
 fn encode_task_cursor(cursor: &TaskCursor) -> Result<String, RpcError> {
     crate::core::canon::to_bytes(cursor)
-        .map(|bytes| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        .map(crate::core::b64::encode_url)
         .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task cursor could not be encoded"))
 }
 
 fn decode_task_cursor(token: &str) -> Result<TaskCursor, RpcError> {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token)
-        .ok()
+    crate::core::b64::decode_url(token)
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "pageToken is not a valid task cursor"))
 }

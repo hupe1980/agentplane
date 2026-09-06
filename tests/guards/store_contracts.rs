@@ -195,18 +195,29 @@ mod embedded {
             .open(&task(2, Priority::Normal, 1_002))
             .await
             .expect("open");
+        // Older than the urgent one and one rank below it, so the page's first
+        // two entries separate *adjacent* ranks. A page proving only that
+        // urgent beats normal passes on a rank table where two neighbours
+        // share a number.
+        let old_high = task(4, Priority::High, 1_500);
+        store.open(&old_high).await.expect("open");
         let young_urgent = task(3, Priority::Urgent, 2_000);
         store.open(&young_urgent).await.expect("open");
 
-        let page = store.queue(&[], 2).await.expect("queue");
-        assert_eq!(page.len(), 2);
+        let page = store.queue(&[], 3).await.expect("queue");
+        assert_eq!(page.len(), 3);
         assert_eq!(
             page[0].id, young_urgent.id,
             "an urgent task behind older normal ones must lead the page, not \
              fall off it"
         );
         assert_eq!(
-            page[1].id, old_normal.id,
+            page[1].id, old_high.id,
+            "high outranks normal, and every adjacent pair of ranks must be \
+             one the queue can tell apart"
+        );
+        assert_eq!(
+            page[2].id, old_normal.id,
             "within what the page has room for, oldest first"
         );
     }
@@ -607,16 +618,22 @@ mod shared {
             .open(&task(3, Priority::Normal, 1_002))
             .await
             .expect("open");
+        let old_high = task(5, Priority::High, 1_500);
+        store.open(&old_high).await.expect("open");
         let young_urgent = task(4, Priority::Urgent, 2_000);
         store.open(&young_urgent).await.expect("open");
 
-        let page = store.queue(&[], 2).await.expect("queue");
-        assert_eq!(page.len(), 2);
+        let page = store.queue(&[], 3).await.expect("queue");
+        assert_eq!(page.len(), 3);
         assert_eq!(
             page[0].id, young_urgent.id,
             "an urgent task behind older normal ones must lead the page"
         );
-        assert_eq!(page[1].id, old_normal.id, "then oldest first");
+        assert_eq!(
+            page[1].id, old_high.id,
+            "and every adjacent pair of ranks must be one the queue can tell apart"
+        );
+        assert_eq!(page[2].id, old_normal.id, "then oldest first");
     }
 
     /// The event-side alignments: waiter election by lowest effect key, and

@@ -19,7 +19,6 @@ use aws_sdk_bedrockruntime::types::{
     ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::{Blob, Document, Number};
-use base64::Engine as _;
 use serde_json::{Value, json};
 
 use super::{
@@ -52,11 +51,8 @@ fn decoded_media(
         .get("data")
         .and_then(Value::as_str)
         .ok_or_else(|| Bedrock::refused(model, "Bedrock media block has no inline base64 data"))?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(|error| {
-            Bedrock::refused(model, format!("invalid Bedrock media base64: {error}"))
-        })?;
+    let bytes = crate::core::b64::decode(data)
+        .ok_or_else(|| Bedrock::refused(model, "Bedrock media data is not canonical base64"))?;
     Ok((media_type.to_owned(), bytes))
 }
 
@@ -1400,7 +1396,7 @@ fn content_to_json(
         ContentBlock::ReasoningContent(ReasoningContentBlock::RedactedContent(bytes)) => {
             Ok(json!({
                 "type": "redacted_reasoning",
-                "data": base64::engine::general_purpose::STANDARD.encode(bytes.as_ref()),
+                "data": crate::core::b64::encode(bytes.as_ref()),
             }))
         }
         _ => Err(ModelError::Unusable {
@@ -1468,9 +1464,9 @@ fn content_from_json(value: &Value, model: &ModelId) -> Result<ContentBlock, Mod
                 .get("data")
                 .and_then(Value::as_str)
                 .ok_or_else(|| Bedrock::refused(model, "redacted reasoning has no data"))?;
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|error| Bedrock::refused(model, error.to_string()))?;
+            let bytes = crate::core::b64::decode(encoded).ok_or_else(|| {
+                Bedrock::refused(model, "redacted reasoning data is not canonical base64")
+            })?;
             Ok(ContentBlock::ReasoningContent(
                 ReasoningContentBlock::RedactedContent(Blob::new(bytes)),
             ))
@@ -1684,7 +1680,7 @@ mod tests {
             &json!({
                 "type": "image",
                 "media_type": "image/png",
-                "data": base64::engine::general_purpose::STANDARD.encode(b"png")
+                "data": crate::core::b64::encode(b"png")
             }),
             &model,
         )
@@ -1698,7 +1694,7 @@ mod tests {
             &json!({
                 "type": "document",
                 "media_type": "application/pdf",
-                "data": base64::engine::general_purpose::STANDARD.encode(b"pdf")
+                "data": crate::core::b64::encode(b"pdf")
             }),
             &model,
         )

@@ -2136,3 +2136,121 @@ fn the_changelog_ships_only_what_the_reader_receives() {
          what a release changed — and the preamble says so."
     );
 }
+
+/// The published format specification names every record kind that exists.
+///
+/// The one document an outside implementation reads. A kind missing from it is
+/// a record a second implementation will meet and have no rule for — and the
+/// failure is silent on this side, because every test here is written against
+/// the vocabulary this build already has.
+///
+/// The constants are checked in the same pass: a specification that states the
+/// wrong domain string, prefix byte or ceiling is worse than one that omits
+/// them, because a reader implements what it says and gets signatures that
+/// verify against nothing.
+#[test]
+fn the_format_specification_is_in_step_with_the_code() {
+    let spec = read("site/content/docs/format.md");
+
+    let source = read("src/journal/record.rs");
+    let start = source
+        .find("pub enum RecordKind {")
+        .expect("the RecordKind enum");
+    let end = source[start..].find("\n}\n").expect("end of enum") + start;
+    let kinds: Vec<String> = source[start..end]
+        .lines()
+        .filter_map(|line| {
+            let code = line.strip_prefix("    ")?;
+            let ident: String = code
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (!ident.is_empty() && ident.starts_with(char::is_uppercase)).then_some(ident)
+        })
+        .collect();
+    assert!(
+        kinds.len() > 20,
+        "found {kinds:?} — the guard is reading the wrong span rather than passing"
+    );
+    for kind in &kinds {
+        assert!(
+            spec.contains(&format!("`{kind}`")),
+            "`{kind}` is a record kind and the published format specification never \
+             names it — a second implementation meets a record it has no rule for"
+        );
+    }
+
+    // Values a reader implements verbatim. Each is quoted from the code it
+    // must agree with, so a change to either side fails here rather than in
+    // somebody else's verifier.
+    for (what, needle) in [
+        (
+            "the record signing domain",
+            agentplane::core::DOMAIN_RECORD.to_owned(),
+        ),
+        (
+            "the record size ceiling",
+            format!(
+                "{} MiB",
+                agentplane::journal::Record::MAX_RECORD_BYTES / (1 << 20)
+            ),
+        ),
+        (
+            "the canonicalization version",
+            format!("`canon` version **{}**", agentplane::core::canon::VERSION),
+        ),
+        (
+            "the export format version",
+            format!("\"version\":{}", agentplane::export::FORMAT_VERSION),
+        ),
+    ] {
+        assert!(
+            spec.contains(&needle),
+            "the format specification does not state {what} as the code has it ({needle:?})"
+        );
+    }
+}
+
+/// The second implementation is in the gate, and independent of the first.
+///
+/// Two properties, and the second is what makes it evidence. A verifier
+/// nothing runs is a file; and a verifier that consults this crate's source to
+/// decide what a rule means has stopped being a second reader of the
+/// specification and become a paraphrase of the implementation — at which
+/// point it agrees with the first one by construction and catches nothing.
+#[test]
+fn the_second_implementation_is_run_and_stays_independent() {
+    let verifier = read("tools/verify_export.py");
+    let justfile = read("justfile");
+
+    let chain = justfile
+        .lines()
+        .find(|line| line.starts_with("ci:"))
+        .expect("the ci recipe");
+    assert!(
+        chain.contains("verify-golden"),
+        "`verify-golden` is not in the local gate's chain, so the only reader of the \
+         format specification that is not this crate runs nowhere"
+    );
+
+    for check in ["--canon-check", "--self-test"] {
+        assert!(
+            justfile.contains(check),
+            "the gate never passes {check}, so part of what the second implementation \
+             proves is not being asked for: `--canon-check` is the half that *produces* \
+             bytes rather than accepting them, and `--self-test` is the half that proves \
+             this reader can still fail"
+        );
+    }
+
+    // Independence, mechanically: the whole point is that it derives the format
+    // from the published prose. A path into `src/` would make it a paraphrase.
+    for borrowed in ["src/", "agentplane::", "cargo ", "target/"] {
+        assert!(
+            !verifier.contains(borrowed),
+            "tools/verify_export.py mentions {borrowed:?} — a verifier that reads this \
+             crate is not a second implementation of the specification, it is a copy \
+             of the first one"
+        );
+    }
+}

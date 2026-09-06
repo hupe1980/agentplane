@@ -59,50 +59,34 @@ pub fn is_sealed(value: &Value) -> bool {
 /// marker is deliberately not something prose would open with.
 #[must_use]
 pub fn is_sealed_text(text: &str) -> bool {
-    use base64::Engine;
     text.strip_prefix(SEALED)
         .and_then(|rest| rest.strip_prefix(':'))
-        .is_some_and(|encoded| {
-            base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .is_ok()
-        })
+        .is_some_and(|encoded| crate::core::b64::decode(encoded).is_some())
 }
 
 /// Wrap an envelope as the JSON a record carries in place of its payload.
 pub(crate) fn wrap(envelope: &[u8]) -> Value {
-    use base64::Engine;
-    json!({ SEALED: base64::engine::general_purpose::STANDARD.encode(envelope) })
+    json!({ SEALED: crate::core::b64::encode(envelope) })
 }
 
 /// The envelope inside a sealed payload, if this is one.
 pub(crate) fn unwrap(value: &Value) -> Option<Vec<u8>> {
-    use base64::Engine;
     if !is_sealed(value) {
         return None;
     }
     let encoded = value.as_object()?.get(SEALED)?.as_str()?;
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .ok()
+    crate::core::b64::decode(encoded)
 }
 
 /// Wrap an envelope as the string a record carries in place of a text field.
 pub(crate) fn wrap_text(envelope: &[u8]) -> String {
-    use base64::Engine;
-    format!(
-        "{SEALED}:{}",
-        base64::engine::general_purpose::STANDARD.encode(envelope)
-    )
+    format!("{SEALED}:{}", crate::core::b64::encode(envelope))
 }
 
 /// The envelope inside a sealed text field, if this is one.
 pub(crate) fn unwrap_text(text: &str) -> Option<Vec<u8>> {
-    use base64::Engine;
     let encoded = text.strip_prefix(SEALED)?.strip_prefix(':')?;
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .ok()
+    crate::core::b64::decode(encoded)
 }
 
 /// One sealable field of a record, by the shape its schema gives it.

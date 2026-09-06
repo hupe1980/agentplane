@@ -143,10 +143,63 @@ impl TaskState {
         }
     }
 
-    /// Whether the task is still somebody's to act on.
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`ALL`](Self::ALL) for the reason [`CaseStatus::parse`] is.
+    ///
+    /// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
     #[must_use]
-    pub fn is_pending(self) -> bool {
-        matches!(self, Self::Open | Self::Claimed | Self::Escalated)
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    /// Every state a task can be in.
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Claimed,
+        Self::Completed,
+        Self::Expired,
+        Self::Escalated,
+    ];
+
+    /// Whether the task is still somebody's to act on.
+    ///
+    /// Wider than [`is_queued`](Self::is_queued): a claimed task has left the
+    /// queue and is still a decision the plane is waiting on, so a backlog that
+    /// shrank the moment a reviewer opened something would report progress that
+    /// had not happened.
+    #[must_use]
+    pub const fn is_pending(self) -> bool {
+        match self {
+            Self::Open | Self::Claimed | Self::Escalated => true,
+            Self::Completed | Self::Expired => false,
+        }
+    }
+
+    /// Whether the task is offered to a candidate who has not claimed it.
+    ///
+    /// An escalated task is queued again: escalation releases the claim and
+    /// widens the audience, which is only a remedy if somebody can then see it.
+    #[must_use]
+    pub const fn is_queued(self) -> bool {
+        match self {
+            Self::Open | Self::Escalated => true,
+            Self::Claimed | Self::Completed | Self::Expired => false,
+        }
+    }
+
+    /// Whether the expiry sweep still owes this task anything.
+    ///
+    /// Narrower than [`is_pending`](Self::is_pending): an escalated task is
+    /// still claimable, but its expiry policy has already fired — see
+    /// [`TaskStore::overdue`] for what keeping it in that scan starves.
+    ///
+    /// [`TaskStore::overdue`]: crate::case::TaskStore::overdue
+    #[must_use]
+    pub const fn awaits_expiry(self) -> bool {
+        match self {
+            Self::Open | Self::Claimed => true,
+            Self::Completed | Self::Expired | Self::Escalated => false,
+        }
     }
 }
 
@@ -167,6 +220,36 @@ impl Priority {
             Self::Normal => "normal",
             Self::High => "high",
             Self::Urgent => "urgent",
+        }
+    }
+
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`ALL`](Self::ALL) for the reason [`CaseStatus::parse`] is.
+    ///
+    /// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    /// Every priority, most urgent last — the order [`rank`](Self::rank)
+    /// inverts.
+    pub const ALL: [Self; 4] = [Self::Low, Self::Normal, Self::High, Self::Urgent];
+
+    /// Queue order, most urgent first, as the sort key a worklist index holds.
+    ///
+    /// Exhaustive rather than a table with a fallback. A rank is a *position*,
+    /// and the position a fallback hands an unnamed priority is the end of the
+    /// queue — so the failure of forgetting to rank a new one is that the most
+    /// urgent work sorts last, silently, in the one index whose whole job is
+    /// order.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Urgent => 0,
+            Self::High => 1,
+            Self::Normal => 2,
+            Self::Low => 3,
         }
     }
 }
@@ -194,6 +277,29 @@ pub enum OnExpiry {
     /// this is an explicit, greppable act rather than an enum variant someone
     /// picked because it was in the list.
     Proceed,
+}
+
+impl OnExpiry {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Escalate => "escalate",
+            Self::Proceed => "proceed",
+        }
+    }
+
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`ALL`](Self::ALL) for the reason [`CaseStatus::parse`] is.
+    ///
+    /// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    /// Every declared answer to an unanswered window.
+    pub const ALL: [Self; 3] = [Self::Deny, Self::Escalate, Self::Proceed];
 }
 
 /// What a reviewer needs in order to disagree.

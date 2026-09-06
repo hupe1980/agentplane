@@ -1,7 +1,7 @@
 +++
 title = "Security model"
 description = "The trust boundary, information-flow labels, delegation and egress — with an explicit account of what is not covered."
-weight = 14
+weight = 15
 
 [extra]
 group = "Trust"
@@ -181,6 +181,39 @@ transport answer *reaches nobody* by saying nothing.
 `Local` claims that no host of *this plane's* choosing is contacted. It does not
 claim the far side reaches nothing — a child process can open its own socket,
 which is the same residual a compromised allowlisted endpoint carries.
+
+#### How much may come back {#how-much-may-come-back}
+
+The table above answers *where may we connect*. It does not answer the question
+a counterparty decides on its own: **how many bytes come back**. Every outbound
+call carries a timeout, which bounds how long an answer may take and says
+nothing about how much arrives inside it — a fast endpoint delivers a gigabyte
+long before one fires, and one OOM takes down every run on the instance.
+
+[`netguard::intake`](https://docs.rs/agentplane/latest/agentplane/netguard/intake/)
+is that ceiling, applied twice per call: against the declared `Content-Length`
+before a byte is read, then against the accumulated bytes. The second is the one
+that matters — the header is a claim by the party under suspicion.
+
+| What is being read | Ceiling |
+|---|---|
+| A model completion, a peer's reply | `intake::ANSWER`, 16 MiB |
+| An Agent Card, a checkpoint note, a wrapped key, an error body read to explain a failure | `intake::METADATA`, 1 MiB |
+| Governed media | the fetch policy's own `max_bytes`, because there the payload size is the subject rather than the overhead |
+
+The first two are constants rather than knobs: a ceiling nobody can raise is a
+ceiling nobody quietly raises to whatever the last failure needed.
+
+A refusal is `ModelError::Unusable` — the call **generated**, so it is billed
+and `Landed`, and repeating it reaches the same wall. Deliberately not the
+`Interrupted`/`Unavailable` ladder a severed connection takes: that would be
+this plane's own ceiling wearing the provider's fault.
+
+**Two responses this crate never holds**, named rather than left to be inferred:
+MCP over stdio or streamable HTTP, whose framing belongs to `rmcp`; and Bedrock,
+for the same reason it takes no `Egress`. The helper is public because the
+shipped drivers are not the only drivers, and the version of this control that
+gets written by hand is the unbounded one.
 
 #### Is MCP-over-HTTP outside `netguard`? Yes, and here is why
 
@@ -1544,8 +1577,8 @@ wrongly:
 |---|---|
 | **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. This runtime does not claim to sandbox native code: untrusted executables belong behind a governed MCP/A2A/tool boundary and an OS process or container boundary |
 | **An operator who holds the signing key** | Signatures bind authorship, not existence. Whoever controls the workload identity can produce a perfectly signed alternative history |
-| **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, including refusal of a second history at the same size. `HttpWitness` speaks C2SP `tlog-witness` — a shrunken log (400), a stale cursor (409) and a failed proof (422) each map to their own outcome, and only the first and last are integrity findings; a `200` counts only once its cosignature verifies as a C2SP `cosignature/v1` statement — the timestamped construction real witnesses sign, under a key id derived with the cosignature algorithm — over the note that was submitted. What is absent is not code but a **counterparty**: until a second party runs a witness for your log, a witness you host yourself does not protect auditors from you |
+| **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, and `HttpWitness` speaks C2SP `tlog-witness` — the [wire and its outcomes](@/docs/journal.md#the-audit-an-outsider-runs). What is absent is not code but a **counterparty**: until a second party runs a witness for your log, a witness you host yourself does not protect auditors from you |
 | **Revocation** | A delegation is valid until it expires; there is no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |
-| **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL before a request is built. The Bedrock driver cannot: it is handed a built AWS client whose endpoint the SDK will not disclose, so the only host it could check is one derived from the region, and an endpoint override makes that a fiction. A control that looks like one and is not is worse than an absent one, so it is absent and named here. Constrain it where the SDK does — a VPC endpoint, an egress proxy, or IAM. The region *is* on the record, read from the client and part of effect identity |
+| **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL; the Bedrock driver takes no `Egress`, because the AWS SDK will not disclose the endpoint it dialled. What stands in its place is the deployment's own network policy, and the driver's documentation says so rather than leaving a missing method to be inferred |

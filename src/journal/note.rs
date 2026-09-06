@@ -266,87 +266,9 @@ impl SignedNote {
     }
 }
 
+pub(crate) use crate::core::b64::decode as unb64;
 /// RFC 4648 §4, the encoding the note format specifies.
-pub(crate) fn b64(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(A[(n >> 18) as usize & 63] as char);
-        out.push(A[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            A[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            A[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Strict RFC 4648 standard-alphabet decoding — the only decoder in this crate.
 ///
-/// One decoder, and a strict one, because laxity here is not the harmless kind.
-/// **The signature covers the text**, so if two spellings of a checkpoint
-/// decode to one checkpoint then an operator holds two artifacts that verify,
-/// name the same history, and are not the same bytes — a split view assembled
-/// out of encoding slack rather than out of a rewritten log.
-///
-/// The three ways a decoder leaks spellings, all refused below: a `=` anywhere
-/// but the trailing pad, a length that is not a whole number of quads, and
-/// non-zero bits below the last whole byte.
-pub(crate) fn unb64(s: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => u32::from(c - b'A'),
-            b'a'..=b'z' => u32::from(c - b'a') + 26,
-            b'0'..=b'9' => u32::from(c - b'0') + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        })
-    };
-    let raw = s.as_bytes();
-    // Padded to a multiple of four, always. RFC 4648 makes padding optional
-    // only where a spec says so, and the note format does not — an unpadded
-    // tail is a second spelling of one value.
-    if raw.is_empty() || !raw.len().is_multiple_of(4) {
-        return None;
-    }
-    let pad = raw.iter().rev().take_while(|c| **c == b'=').count();
-    // Padding is a suffix, and at most two characters: three would mean a quad
-    // carrying no data at all.
-    if pad > 2 || raw[..raw.len() - pad].contains(&b'=') {
-        return None;
-    }
-
-    let mut out = Vec::with_capacity(raw.len() / 4 * 3 - pad);
-    for chunk in raw.chunks(4) {
-        let live = chunk.iter().take_while(|c| **c != b'=').count();
-        let mut n = 0u32;
-        for (i, c) in chunk[..live].iter().enumerate() {
-            n |= val(*c)? << (18 - 6 * i);
-        }
-        let take = live * 6 / 8;
-        for i in 0..take {
-            out.push(((n >> (16 - 8 * i)) & 0xff) as u8);
-        }
-        // The bits below the last whole byte are padding bits and the spec says
-        // they are zero. A decoder that ignores them accepts `AB==` and `AC==`
-        // as the same one byte, which is the malleability this file cannot
-        // afford.
-        if n & ((1 << (24 - take * 8)) - 1) != 0 {
-            return None;
-        }
-    }
-    Some(out)
-}
+/// One dialect, one decoder, and a canonical one — see [`crate::core::b64`] for
+/// why laxity is not the harmless kind where a signature covers the text.
+pub(crate) use crate::core::b64::encode as b64;

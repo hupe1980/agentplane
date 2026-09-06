@@ -294,11 +294,17 @@ fn every_record_kind_hashes_to_its_golden_vector() {
         .into_iter()
         .map(|kind| {
             let name = kind.kind_str().to_owned();
-            let raw = serde_json::to_vec(&body(kind)).expect("a record serialises");
+            // Sealed, never re-serialized. `Record::seal` is the one function
+            // every backend appends through, so these bytes and this digest
+            // are what a store holds — and a vector derived any other way
+            // pins a shape the runtime does not write, which is a corpus that
+            // agrees with itself about a format nobody uses.
+            let sealed = Record::seal(body(kind), Digest::ZERO).expect("a record seals");
             let line = json!({
                 "kind": name,
-                "hash": Digest::chain(Digest::ZERO, &raw).to_hex(),
-                "raw": String::from_utf8(raw).expect("canonical records are UTF-8"),
+                "hash": sealed.hash.to_hex(),
+                "raw": String::from_utf8(sealed.raw().to_vec())
+                    .expect("canonical records are UTF-8"),
             });
             serde_json::to_string(&line).expect("a vector serialises")
         })
@@ -599,11 +605,18 @@ fn a_frozen_export_still_verifies_offline() {
     );
 }
 
-/// One sealed run, written from fixed bytes so the file is reproducible.
+/// One sealed run **and one case**, written from fixed bytes so the file is
+/// reproducible.
 ///
 /// Deliberately not produced by running a skill: a run id is a ULID and a plan
 /// is compiled, so an export taken from a live run differs on every regeneration
 /// and a real change would arrive buried in noise.
+///
+/// The case layer is in the fixture because the format calls it mandatory. A
+/// vector that carries only journal lines leaves the case block, its deadlines,
+/// its blob digests and the cross-layer settlement — a record naming a matter
+/// the file must also carry — with no checked-in bytes at all, in either this
+/// implementation or a second one.
 fn frozen_export() -> Vec<u8> {
     use agentplane::journal::{Append, JournalStore};
     use std::sync::Arc;
@@ -613,9 +626,39 @@ fn frozen_export() -> Vec<u8> {
         .build()
         .expect("a runtime");
     runtime.block_on(async {
-        let store: Arc<dyn JournalStore> =
-            Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+        let redb = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+        let store: Arc<dyn JournalStore> = redb.clone();
+        let cases: Arc<dyn agentplane::case::CaseStore> = redb;
         let run = run();
+        let case = agentplane::core::CaseId::parse("case_01ARZ3NDEKTSV4RRFFQ69G5FAV")
+            .expect("a fixed case id");
+        let at = agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000)
+            .expect("a fixed instant");
+        cases
+            .import_case(
+                &agentplane::core::Case {
+                    id: case,
+                    kind: "billing.settlement".into(),
+                    status: agentplane::core::CaseStatus::Open,
+                    correlation: vec![agentplane::core::CorrelationKey::new("batch", "B-7")],
+                    state: json!({ "stage": "settling" }),
+                    version: agentplane::core::CaseVersion::INITIAL,
+                    opened_at: at,
+                    runs: vec![run],
+                },
+                &[agentplane::core::Deadline {
+                    case,
+                    name: "acknowledge".into(),
+                    resolved_at: at,
+                    calendar_digest: Digest::of(b"golden-calendar"),
+                    warn_at: None,
+                    state: agentplane::core::DeadlineState::Pending,
+                    acknowledged: None,
+                }],
+                &[Digest::of(b"golden-artifact")],
+            )
+            .await
+            .expect("import the case");
         let lease = store
             .acquire(run, "golden", std::time::Duration::from_secs(60))
             .await
@@ -636,13 +679,17 @@ fn frozen_export() -> Vec<u8> {
                             idempotency_key: None,
                         },
                     ),
+                    // Stamped with the case, so the file exercises the
+                    // cross-layer settlement: a record naming a matter the
+                    // export must also carry.
                     Append::new(
                         run,
                         RecordKind::StepStarted {
                             skill: "orders.book".into(),
                         },
                     )
-                    .step(StepId(0)),
+                    .step(StepId(0))
+                    .case(case),
                 ],
             )
             .await
@@ -670,7 +717,7 @@ fn frozen_export() -> Vec<u8> {
             .expect("seal");
 
         let mut out = Vec::new();
-        agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        agentplane::export::to_jsonl(&store, Some(&cases), &[run], &mut out)
             .await
             .expect("export");
         out

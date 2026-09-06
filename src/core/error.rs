@@ -1086,6 +1086,57 @@ pub enum StoreError {
     )]
     ObligationsOutstanding { case: String, outstanding: usize },
 
+    /// A write was refused because the matter is closed.
+    ///
+    /// *A closed case owes nothing* is a property of the store, not of the order
+    /// two callers ran in: closure refuses an outstanding obligation, and this
+    /// refuses the write that would add one afterwards. Without both halves the
+    /// sweep breaches the late obligation and escalates, so a matter audited as
+    /// settled acquires a duty and misses it with no run and no operator
+    /// involved.
+    ///
+    /// Reopening is the caller's to do, and deliberately explicit: a store that
+    /// reopened the case for them would decide on somebody's behalf that an
+    /// audited closure did not stand.
+    #[error(
+        "case {case} is closed; reopen it before registering an obligation, because \
+         closure is when people stop looking"
+    )]
+    CaseClosed { case: String },
+
+    /// An obligation was moved out of a state it may not leave.
+    ///
+    /// Met, breached and withdrawn are the three ways an obligation ends, and
+    /// the second has to be terminal: the state column is the only record that
+    /// a window closed unmet, and moving it to `met` would take the miss off
+    /// the obligation listing and out of the row at once. Answering late is a
+    /// fact to record beside the breach — an acknowledgement carries the note —
+    /// not a way to unsay it.
+    #[error(
+        "obligation '{obligation}' on case {case} is {from} and may not become \
+         {to}; how an obligation ended is not editable, so record a late answer \
+         as an account of the breach rather than as a state"
+    )]
+    DeadlineFinal {
+        case: String,
+        obligation: String,
+        from: String,
+        to: String,
+    },
+
+    /// An account was offered for an obligation that was not breached.
+    ///
+    /// Accounting for a breach is only meaningful once there is one. Accepting
+    /// it earlier would let a pending obligation be taken off the listing
+    /// before it was ever due — which is the listing's whole purpose, answered
+    /// in advance.
+    #[error("obligation '{obligation}' on case {case} is {state}, not breached")]
+    NotBreached {
+        case: String,
+        obligation: String,
+        state: String,
+    },
+
     /// The writer did not present the current lease epoch. A stale writer has
     /// been taken over; a future epoch was never acquired. Neither owns the run,
     /// and neither may retry blindly.

@@ -11,14 +11,14 @@
 //! sorted order — *unless* the `preserve_order` feature is on, in which case it
 //! is an `IndexMap` and preserves insertion order instead.
 //!
-//! This crate never enables that feature, and for a long time that was the whole
-//! argument. It was not good enough. Cargo unifies features across the entire
-//! dependency graph, so **any** dependency that wants `preserve_order` turns it
-//! on for this crate too. Enabling the `cedar` feature did exactly that:
-//! `cedar-policy` pulls it in, and with it every effect key in the system would
-//! have started depending on the order a caller happened to build a JSON object.
-//! Two runs performing the same call would derive different keys — replay
-//! divergence at best, and a second real payment at worst.
+//! This crate never enables that feature, and that is not enough on its own.
+//! Cargo unifies features across the entire dependency graph, so **any**
+//! dependency that wants `preserve_order` turns it on for this crate too — the
+//! `cedar` feature does, because `cedar-policy` pulls it in. Under an ordered
+//! `Map` every effect key in the system would depend on the order a caller
+//! happened to build a JSON object, so two runs performing the same call would
+//! derive different keys: replay divergence at best, and a second real payment
+//! at worst.
 //!
 //! So the invariant is not left to a feature flag a stranger controls.
 //! Canonical form is produced here, explicitly: object keys are sorted at
@@ -28,9 +28,8 @@
 //! # Keys sort by UTF-16 code unit, per RFC 8785
 //!
 //! Not by Rust's `str` ordering, which compares UTF-8 bytes. The two agree
-//! throughout the Basic Multilingual Plane and disagree above it, so every ASCII
-//! test passes under either — which is what made the UTF-8 version survive as
-//! long as it did.
+//! throughout the Basic Multilingual Plane and disagree above it, so an
+//! ASCII-only test suite passes under either and cannot tell them apart.
 //!
 //! It stopped being an internal detail once a signed Agent Card left the
 //! process. That signature is over bytes canonicalized per RFC 8785 and checked

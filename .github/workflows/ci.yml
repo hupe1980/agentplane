@@ -83,19 +83,19 @@ jobs:
   # `MUTANTS_SHARD=k/n` takes a contiguous slice of the list, which the harness
   # emits grouped by the **feature set** each mutation is checked under. That
   # set is what decides the build: cargo keeps one set of artifacts per feature
-  # combination, so a shard that walks all thirteen of this table's combinations
-  # builds thirteen dependency graphs, while a shard that walks two builds two.
-  # It keeps them all on disk too, and thirteen combinations of this crate's
-  # graph is about as much space as a runner has. Where the artifacts are
-  # already cached the grouping buys no per-mutation time — that cost is the
-  # library rebuild and the test-binary relink — so what it buys is the disk
-  # and a coherent sweep against a cold target. The slices stay equal in length
-  # either way.
+  # combination, so a shard that walks every combination in this table builds
+  # every dependency graph, while a shard that walks two builds two. It keeps
+  # them all on disk too, and that many combinations of this crate's graph is
+  # about as much space as a runner has.
   #
-  # Ten rather than six is where the wall-clock comes from: a shard's cost is
-  # mostly its mutation count, sixty-four of them run in about fourteen minutes
-  # where a hundred and six took twenty-two, and ten keeps this matrix plus the
-  # other jobs inside a twenty-job concurrency budget.
+  # The slices are equal in **seconds, not in count**. A mutation checked by a
+  # library unit test builds `--all-features --lib` and costs six times one
+  # checked in an integration binary, so ten equal counts are ten very unequal
+  # jobs — and a matrix finishes when its slowest job does. `tools/mutants.py`
+  # carries the measured per-target costs and cuts the sorted list on them.
+  #
+  # Ten rather than six keeps this matrix plus the other jobs inside a
+  # twenty-job concurrency budget.
   #
   # Each shard is its own checkout, which is what makes this safe — the sweep
   # rewrites source in place and refuses to run twice against one tree.

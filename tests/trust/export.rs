@@ -1238,6 +1238,7 @@ async fn the_case_layer_survives_export_and_restore() {
             calendar_digest: Digest::of(b"cal"),
             warn_at: None,
             state: DeadlineState::Pending,
+            acknowledged: None,
         })
         .await
         .expect("deadline");

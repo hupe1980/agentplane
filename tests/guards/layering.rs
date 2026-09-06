@@ -1660,6 +1660,196 @@ fn every_run_status_variant_is_listed() {
     }
 }
 
+/// Every variant of a durably-spelled enum is in that enum's `ALL`.
+///
+/// `ALL` is what `parse` is written over, so a variant missing from it is a
+/// value the crate writes and refuses to read back. Nothing else can catch it:
+/// `as_str` gains its arm because the compiler insists, the array's length
+/// assertion is written beside the array by the same hand, and a round-trip
+/// test iterating `ALL` cannot miss what `ALL` omits. So the declaration is
+/// read out of the source and compared against the list.
+#[test]
+fn every_durably_spelled_variant_is_in_its_all() {
+    // (file, enum, how many variants a healthy read finds at least)
+    let vocabularies = [
+        ("src/core/case.rs", "CaseStatus"),
+        ("src/core/case.rs", "DeadlineState"),
+        ("src/core/task.rs", "TaskState"),
+        ("src/core/task.rs", "Priority"),
+        ("src/core/task.rs", "OnExpiry"),
+        ("src/core/id.rs", "Phase"),
+        ("src/batch/mod.rs", "ItemOutcome"),
+    ];
+    for (file, name) in vocabularies {
+        let src = read(file);
+        let start = src
+            .find(&format!("pub enum {name} {{"))
+            .unwrap_or_else(|| panic!("the {name} enum in {file}"));
+        let end = src[start..].find("\n}\n").expect("end of enum") + start;
+        // A variant declaration is the only thing at four-space indent inside
+        // the enum that begins with a capital: fields sit two levels in, and
+        // every doc line and attribute is skipped by the first character test.
+        let declared: Vec<String> = src[start..end]
+            .lines()
+            .filter_map(|line| {
+                let code = line.strip_prefix("    ")?;
+                let ident: String = code
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                (!ident.is_empty() && ident.starts_with(char::is_uppercase)).then_some(ident)
+            })
+            .collect();
+        assert!(
+            declared.len() > 1,
+            "found {declared:?} for {name} — the guard is reading the wrong span \
+             rather than passing"
+        );
+
+        // Scoped to the type's own `impl`, because two vocabularies in one
+        // file can have the same number of variants and a file-wide search
+        // would check one of them twice.
+        let block = src
+            .find(&format!("impl {name} {{"))
+            .unwrap_or_else(|| panic!("the {name} impl in {file}"));
+        let block_end = src[block..].find("\n}\n").expect("end of impl") + block;
+        // Matches `pub const ALL: [Self; N]` and the `pub fn all(..) -> [Self; N]`
+        // a payload-carrying variant forces, since neither can be `const`
+        // together with a `String`.
+        let listed = src[block..block_end]
+            .split(&format!("[Self; {}]", declared.len()))
+            .nth(1)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} has no list of every variant, or its length is not \
+                     {} — the array and the enum disagree about how many states \
+                     there are",
+                    declared.len()
+                )
+            });
+        let listed = &listed[..=listed.find(']').expect("end of the list")];
+        for variant in &declared {
+            assert!(
+                listed.contains(&format!("Self::{variant}")),
+                "`{name}::{variant}` is missing from {name}'s list of every \
+                 variant, so `{name}::parse` never yields it — the crate writes \
+                 that spelling and reads it back as a corrupt row"
+            );
+        }
+    }
+}
+
+/// Every stored spelling reads back as the value that wrote it.
+///
+/// The law the pair exists for, asserted over `ALL` so it covers what the
+/// source guard above proves complete. Unknown text is `None`, never a
+/// default: a reader that answers with a safe value cannot report that the
+/// row was damaged, so the damage arrives as a decision.
+#[test]
+fn every_stored_spelling_round_trips_and_nothing_else_parses() {
+    use agentplane::core::{CaseStatus, DeadlineState, OnExpiry, Phase, Priority, TaskState};
+
+    macro_rules! law {
+        ($ty:ty) => {{
+            for value in <$ty>::ALL {
+                assert_eq!(
+                    <$ty>::parse(value.as_str()),
+                    Some(value),
+                    "{} does not read back the spelling it wrote",
+                    stringify!($ty)
+                );
+            }
+            for text in ["", " open", "OPEN", "unheard-of"] {
+                assert!(
+                    <$ty>::parse(text).is_none(),
+                    "{} parsed {text:?}, so a damaged column reads as a decision",
+                    stringify!($ty)
+                );
+            }
+        }};
+    }
+
+    law!(CaseStatus);
+    law!(DeadlineState);
+    law!(TaskState);
+    law!(Priority);
+    law!(OnExpiry);
+    law!(Phase);
+}
+
+/// Queue order is a total order over the priorities, most urgent first.
+///
+/// A rank is a *position*, so two priorities sharing one is not a tie — it is
+/// the index the worklist reads losing the ability to tell them apart, in the
+/// one structure whose whole job is order.
+#[test]
+fn every_priority_has_its_own_rank_and_urgent_leads() {
+    use agentplane::core::Priority;
+
+    let mut ranks: Vec<u8> = Priority::ALL.iter().map(|p| p.rank()).collect();
+    ranks.sort_unstable();
+    ranks.dedup();
+    assert_eq!(
+        ranks.len(),
+        Priority::ALL.len(),
+        "two priorities share a rank, so the queue cannot order them"
+    );
+    assert_eq!(
+        Priority::Urgent.rank(),
+        0,
+        "the queue is served ascending by rank, so the most urgent must be lowest"
+    );
+    assert!(
+        Priority::Urgent.rank() < Priority::High.rank()
+            && Priority::High.rank() < Priority::Normal.rank()
+            && Priority::Normal.rank() < Priority::Low.rank(),
+        "rank must invert the declared urgency"
+    );
+}
+
+/// Nothing but the vocabulary spells a stored state.
+///
+/// A `WHERE state IN ('open','claimed')` is the enum written again in a dialect
+/// no compiler checks. Where SQL genuinely cannot take a parameter — a partial
+/// index predicate must be immutable — the literal stays, and this holds it to
+/// a spelling some `as_str` still produces.
+#[test]
+fn every_state_literal_in_sql_is_one_the_vocabulary_still_spells() {
+    use agentplane::core::{CaseStatus, DeadlineState, OnExpiry, Priority, TaskState};
+
+    let mut known: Vec<&'static str> = Vec::new();
+    known.extend(CaseStatus::ALL.iter().map(|v| v.as_str()));
+    known.extend(DeadlineState::ALL.iter().map(|v| v.as_str()));
+    known.extend(TaskState::ALL.iter().map(|v| v.as_str()));
+    known.extend(Priority::ALL.iter().map(|v| v.as_str()));
+    known.extend(OnExpiry::ALL.iter().map(|v| v.as_str()));
+
+    let src = read("src/store/postgres_cases.rs");
+    // Only the columns whose values are a vocabulary. A literal elsewhere in
+    // one of these statements — a table name, a JSON key — is not a state.
+    let mut checked = 0usize;
+    for (index, _) in src
+        .match_indices("state = '")
+        .chain(src.match_indices("status = '"))
+    {
+        let rest = &src[index..];
+        let value = rest
+            .split_once('\'')
+            .and_then(|(_, tail)| tail.split_once('\''))
+            .map(|(value, _)| value)
+            .expect("a closed literal");
+        assert!(
+            known.contains(&value),
+            "`{value}` is spelled in SQL and is not a state any `as_str` produces"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no state literal was found at all — the guard is reading nothing rather than passing"
+    );
+}
+
 /// A journaled record names only `core` vocabulary.
 ///
 /// The journal is the durable contract. Every type inside a `RecordKind` is a

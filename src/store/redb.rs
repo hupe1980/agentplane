@@ -607,6 +607,23 @@ pub(super) fn be<E: std::fmt::Display>(e: &E) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// Read a stored column through the type's own vocabulary.
+///
+/// Every string column this backend keeps is decoded through the core type's
+/// `parse` rather than through a match of its own — see [`CaseStatus::parse`]
+/// for why nothing else may spell a stored vocabulary. An unrecognised value is
+/// damage, and damage is reported rather than defaulted: a decoder that answers
+/// with a safe value hands its caller a fact this store invented about a row it
+/// could not read.
+///
+/// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
+pub(super) fn decoded<T>(what: &str, raw: &str, parsed: Option<T>) -> Result<T, StoreError> {
+    parsed.ok_or_else(|| StoreError::Corrupt {
+        seq: 0,
+        detail: format!("unknown {what} '{raw}'"),
+    })
+}
+
 /// Wall-clock read for lease expiry.
 ///
 /// Lease timing is infrastructure, not run logic: it never enters the journal's

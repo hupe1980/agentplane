@@ -2648,7 +2648,8 @@ async fn sealed_runs_are_findable_by_how_they_ended(fresh: Factory<'_>, r: &mut 
         Ok(n) => r.record(
             "outcome index",
             format!(
-                "count_by_outcome counted {n} quarantined runs where the listing                  holds {} — the gauge and the page an operator opens from it                  disagree about one plane",
+                "count_by_outcome counted {n} quarantined runs where the listing holds {} — the \
+                 gauge and the page an operator opens from it disagree about one plane",
                 quarantined.len()
             ),
         ),
@@ -2746,7 +2747,8 @@ async fn the_outcome_index_follows_the_last_conclusion(fresh: Factory<'_>, r: &m
         Ok(n) => r.record(
             "outcome index",
             format!(
-                "count_by_outcome still counts {n} failed runs after the only one                  succeeded — the level does not follow the last conclusion"
+                "count_by_outcome still counts {n} failed runs after the only one succeeded — the \
+                 level does not follow the last conclusion"
             ),
         ),
         Err(e) => r.record("outcome index", format!("count_by_outcome failed: {e}")),

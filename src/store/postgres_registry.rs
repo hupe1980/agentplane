@@ -32,7 +32,7 @@ use crate::manifest::{Manifest, Registry, RegistryError};
 use super::postgres::PostgresStore;
 
 fn be(e: &tokio_postgres::Error) -> RegistryError {
-    RegistryError::Backend(e.to_string())
+    RegistryError::Backend(super::postgres::detail(e))
 }
 
 fn pool_err(e: &impl std::fmt::Display) -> RegistryError {

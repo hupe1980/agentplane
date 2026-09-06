@@ -39,6 +39,526 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.30.0] — 2026-09-06
+
+### Added — a second implementation reads the format specification and derives the same bytes
+
+`tools/verify_export.py` is written from the
+[published record format](https://hupe1980.github.io/agentplane/docs/format/)
+and reads none of this crate's Rust. That independence is a guard rather than a
+promise: a verifier that consulted `src/` would be a paraphrase of the
+implementation and would agree with it by construction.
+
+`just verify-golden` runs it, in the gate, and it does three things:
+
+- **`--canon-check` re-derives all 27 record vectors from their parsed values.**
+  Its own canonicalizer — UTF-16 member ordering, the ECMAScript number rules,
+  exact integers — and its own chain digest. This is the half that *produces*
+  bytes rather than accepting them, and it is non-circular: the input is what
+  each record means, the output is what the format says it must look like.
+- The default pass **verifies the sealed export**: per-record chain links,
+  `seq` contiguity, the run label on each record's own body, log positions, the
+  Merkle root, the case layer, the frame.
+- **`--self-test` damages that export six ways** — an edited readable body, a
+  flipped wire byte, a record removed from the middle, a rewritten log leaf, the
+  case layer dropped, the trailer cut off — and asserts each is reported. A
+  second reader that answers *0 findings* for everything agrees with this crate
+  perfectly and is worth nothing.
+
+`--canon-check` also holds both implementations to **RFC 8785's own 17 number
+vectors**, which is the one part of canonicalization no record vector reaches:
+none carries a double, so the ECMAScript number rules had no coverage on either
+side. They agree, including at the four boundaries a naive implementation gets
+wrong — where positional notation gives way to exponential in each direction,
+the smallest subnormal, and negative zero.
+
+**It would have caught this release's corpus defect on its first run**: against
+the pre-fix `records.jsonl`, all 27 vectors disagree, because that file was in
+struct-declaration order and canonical form sorts.
+
+This is the last thing the durable-format freeze was waiting on, and the
+release blocker is discharged. What it still does not buy is stated on the
+[assurance page](https://hupe1980.github.io/agentplane/docs/assurance/): one
+reader, written by the same project, from a specification that project also
+wrote. Somebody else's implementation remains the strongest evidence available.
+
+### Fixed — the format specification was not implementable as written
+
+Writing the second implementation is what found these; every one is a place an
+independent reader had to guess, or would have guessed wrong.
+
+- **The export's dispatch rule contradicted itself.** "Every line carries a
+  `kind` member naming its type", two paragraphs above "no `kind` member of its
+  own at the top level" for record lines. The rule is now stated once: a
+  top-level `kind` means a framing line, its absence means a record belonging to
+  the run block above, and a record's own kind is one level down in its body.
+- **The record line's members were never named.** `seq`, `body`, `prev_hash`,
+  `hash`, `attestation`, `raw` were inferable only from the verification
+  algorithm. Each line type now has a member table.
+- **The case block's members were never given at all.** An implementer had to
+  guess that a case's identifier is `case.id` — and that it is the bare ULID,
+  which is what makes the cross-layer check a string comparison.
+- **The trailer's `unreadable` entries had no stated shape.**
+- **A run at or beyond the checkpoint's size was described wrongly.** The text
+  said *report it, do not fail on it*, which specifies a laxer verifier than the
+  reference: an honest export downgrades such a run to open rather than stamping
+  a position the checkpoint does not commit to, so an out-of-range index is a
+  file disagreeing with its own header. The three ways a log's set can fail to
+  be checkable are now separate findings, because a tree built over duplicated
+  positions compares garbage and reports the wrong defect.
+- **The specification omitted the step that decides what verification is
+  worth.** Rebuilding the Merkle root and comparing it with the checkpoint in
+  the file's *own header* proves the file is internally consistent — which is
+  exactly what an editor who dropped a run and rewrote the header achieves. The
+  rebuild is evidence about **deletion** only when the checkpoint came from
+  outside the file. A verifier given none has not checked for deletion and must
+  say so rather than report a pass. Both implementations now do.
+
+### Fixed — the export corpus had no case layer
+
+The format calls the case layer mandatory: a reader that tolerated its absence
+could not tell *this plane has no cases* from *the case layer was dropped from
+this file*. The one checked-in export was written with no case store, so the
+case block, its deadlines, its blob digests and the cross-layer settlement — a
+record naming a matter the file must also carry — had no vector in any
+implementation. The frozen export now carries a case, an obligation, a blob
+digest, and a record stamped with that case.
+
+### Fixed — the record format's own conformance corpus pinned bytes nothing writes
+
+`tests/golden/records.jsonl` is the conformance corpus the format freeze rests
+on: one record per kind, byte for byte, with its chain digest. It was generated with `serde_json::to_vec`. The runtime seals with
+`canon::to_bytes`.
+
+Those are different bytes. `serde_json` writes members in struct-declaration
+order; canonical form sorts them by UTF-16 code unit, recursively. So every
+`raw` in the corpus was a shape no journal contains, and every `hash` was the
+chain digest of bytes no store holds:
+
+```
+corpus  {"seq":7,"run":"01ARZ...","case":"01ARZ...","step":1,"phase":"compensating",...}
+sealed  {"case":"01ARZ...","epoch":3,"kind":"Note","phase":"compensating","run":"01ARZ...",...}
+```
+
+**The consequence is worse than a wrong vector.** Canonical form is
+order-independent, so the corpus was pinning a property the format does not
+have — and was blind to the property it does: a change to the canonicalization
+rule, which is the single thing `canon::VERSION` exists to make visible, did
+not fail it. A test that cannot fail, on the evidence a format freeze rests on.
+
+Two things said so and were not read together. The **export** corpus goes
+through the real seal, so `tests/golden/export.jsonl` already held canonical
+bytes — the two checked-in corpora disagreed about the shape of the same record
+kind. And the mutation guarding the corpus claimed that reordering a struct's
+fields "rehashes every record this build will ever write", which is false:
+sorting makes declaration order invisible to the chain.
+
+The corpus is now produced by `Record::seal` — the one function every backend
+appends through — so the bytes and the digest are what a store holds, and
+deriving them any other way is not expressible. `ARecordFieldMovesWithoutNotice`
+is replaced by `ARecordFieldIsQuietlyRenamed`, which is a real format change,
+and by `TheChainHashesUncanonicalBytes`, which is the mutation that was
+surviving: it seals over `serde_json`'s output instead of canonical bytes and
+is now killed by the corrected corpus.
+
+**Every vector in `records.jsonl` changed.** No journal moved — the runtime
+always wrote canonical bytes — but a build comparing against the old file will
+see 27 mismatches, which is the file being right rather than the format moving.
+
+### Added — the record format has a specification
+
+[Record format](https://hupe1980.github.io/agentplane/docs/format/) is the
+normative wire specification: canonical JSON and its one departure from RFC
+8785, the record envelope and its unknown-member rule, the chain, the
+attestation domain, the RFC 6962 log and its checkpoint note, the sealed
+envelope's byte layout, the export file, and the algorithm for verifying one.
+
+It exists because audit rests on the party under examination not being the only
+party able to examine — and an auditor who has to read somebody's Rust to check
+their evidence has not escaped that dependency. A format described only by the
+code that produces it has one implementation and no specification.
+
+Scoped deliberately: verification is payload-agnostic, so the document
+specifies the envelope, the chain, the log and the file completely and treats
+record payloads as opaque JSON. The twenty-seven kind names are listed; their
+member sets are the golden corpus's job, because prose restating them is the
+same facts in two places.
+
+`the_format_specification_is_in_step_with_the_code` holds the page to the
+record vocabulary parsed out of `RecordKind`, and to four constants a reader
+implements verbatim — the signing domain, the record size ceiling, the
+canonicalization version and the export version. A specification that states
+the wrong domain string is worse than one that omits it, because a reader
+implements what it says and gets signatures that verify against nothing.
+
+This is the written-specification half of what the durable-format freeze is
+waiting on. What remains is a vector produced by a second implementation:
+this build's corpora catch drift and cannot catch a shared misunderstanding,
+and the specification is what makes a second reader possible.
+
+### Fixed — a state the compiler made sure to write, and nothing made sure to read
+
+Every enum this runtime stores as a string has an `as_str` the compiler checks:
+add a variant and the encoder does not build until it has an arm. Everything
+that read those strings back was a `match` over `&str` with a catch-all, which
+keeps building forever. The two halves are the same rule, written six times, and
+only one of them was ever going to notice a change.
+
+`CaseStatus::parse` already said so, in a doc comment, and is built over
+`CaseStatus::ALL` for exactly this reason. Both store backends hand-wrote the
+match it exists to forbid.
+
+What the fallback arms actually did:
+
+- **`Priority` ranked by a table with an `_ => 3`.** A rank is a *position*, and
+  the position a fallback hands an unnamed priority is the end of the queue. A
+  priority added later would sort behind every routine task, in the one index
+  whose whole job is order, with nothing to fail. The same expression was
+  spelled again in PostgreSQL as `CASE priority WHEN 'urgent' THEN 0 … ELSE 3`,
+  in an index and in an `ORDER BY` that had to stay character-identical or the
+  index stopped serving the read.
+- **`is_queued`, `is_pending` and `awaits_expiry` matched strings.** A new
+  `TaskState` would be in no index at all: absent from the worklist, from the
+  backlog count and from the expiry sweep together — a task that exists and that
+  nothing can find. `is_pending` was also a second copy of `TaskState::is_pending`.
+- **Six decoders refused what their own writer emits.** `status_from`,
+  `deadline_state_from`, `task_state_from`, `priority_from`, `expiry_from` and
+  three separate copies of `phase_from` each enumerated the vocabulary again.
+- **`Phase` had no canonical spelling at all** — three stores and the executor's
+  span each wrote `"forward"` / `"compensating"` by hand.
+- **`ItemOutcome` was spelled five times**: an encoder and a decoder in each
+  store, plus a census tally matching outcome strings into named counters. And
+  the batch resume cursor asked *which outcomes are still open* — a positive
+  list of the two non-terminal spellings, in Rust and again in SQL. A
+  non-terminal outcome added later would be stepped over, and the batch would
+  report complete with an item still waiting on an event, a person or a raised
+  ceiling.
+
+Now: `as_str` + `ALL` + `parse` on `CaseStatus`, `DeadlineState`, `TaskState`,
+`Priority`, `OnExpiry` and `Phase`, with `parse` written over `ALL` so the two
+directions cannot disagree, and the same pair on `ItemOutcome` (`all(detail)`,
+because its variants carry one). `Priority::rank`, `TaskState::is_queued` and
+`TaskState::awaits_expiry` are exhaustive matches on the type. Every store
+decoder is `T::parse(…)` under one `decoded` helper per backend, and both batch
+censuses bucket off the *parsed* outcome, so an outcome added later is a
+compiler error at the tally rather than a row that lands in no bucket. The
+PostgreSQL queries take their state lists from the predicate — `state = ANY($n)`
+over `TaskState::ALL` filtered by the rule, and the resume cursor's terminal set
+from `ItemOutcome::is_terminal` — rather than repeating them in a dialect no
+compiler checks; the priority rank is a stored `SMALLINT` column written from
+`Priority::rank`.
+
+Two guards hold it. `every_durably_spelled_variant_is_in_its_all` reads the
+variant list **out of the source**, because `ALL` is hand-written and a length
+assertion beside the array cannot detect what the array omits; and
+`every_state_literal_in_sql_is_one_the_vocabulary_still_spells` holds the
+literals SQL genuinely cannot parameterize — a partial index predicate must be
+immutable — to a spelling some `as_str` still produces.
+
+**Breaking.** `Phase::as_str`, `Priority::rank`, `TaskState::is_queued`,
+`TaskState::awaits_expiry`, `ItemOutcome::{all, parse, terminal_tags}`, and
+`ALL`/`parse` on six types are new public items; `TaskState::is_pending` is now
+`const`. The PostgreSQL `tasks` table gains a
+`priority_rank` column and its queue index no longer carries a `CASE`
+expression — recreate the store rather than migrating.
+
+### Fixed — "the only decoder in this crate" was one of two
+
+`journal::note::unb64` decodes the base64 in a `tlog-checkpoint` note, and its
+doc comment says why it is strict: the signature covers the *text*, so two
+spellings that decode to one checkpoint are two artifacts that both verify, name
+the same history, and are not the same bytes. It also said it was the only
+decoder in the crate.
+
+`keyring::vault` had a second one, hand-written and lax — it stripped `=`
+wherever it appeared, accepted an unpadded tail, and ignored the bits below the
+last whole byte. It reads Vault's key material.
+
+There is now one base64 implementation. `base64` is an unconditional dependency
+rather than one five features each opted into, and `core::b64` names the two
+dialects this crate actually speaks: the RFC 4648 standard alphabet, padded,
+for journal payloads, sealed envelopes, media bytes, webhook signatures and
+Vault; and the URL-safe alphabet, unpadded, for the JOSE forms — a JWS-signed
+Agent Card and an A2A task cursor.
+Both decoders are canonical. Two hand-rolled codecs are gone, and so are
+twenty-nine call sites choosing an engine.
+
+### Fixed — every PostgreSQL fault reported itself as `db error`
+
+`tokio_postgres::Error` displays as the three characters `db error` and keeps
+the message, the SQLSTATE and the server's detail line one level down. Six of
+the seven modules that touch the pool wrapped it with `e.to_string()`, so a
+constraint violation, a type mismatch and a connection reset all reached an
+operator as the same word — and reached this project's own test output as the
+same word, which is how the round that found it noticed.
+
+The seventh module had written the good version. One `be`, shared by all seven,
+reporting `message (SQLSTATE: detail)` for a server error and the full source
+chain for anything else.
+
+### Fixed — an obligation nobody could read stopped being outstanding
+
+`close` refuses while an obligation is outstanding, and the predicate deciding
+that read the stored spelling: `matches!(state, "pending" | "warned")`. A state
+string that will not parse is damage, and damage answered *not outstanding* — so
+a row nothing could read left the obligation index and stopped blocking closure,
+which is the one thing the case layer is built to refuse. It now fails closed,
+matching `DeadlineState::may_become`, which already refuses a transition it
+cannot name.
+
+### Fixed — a counterparty could decide how much memory its answer cost
+
+Every outbound call in this crate carries a timeout, so the *time* an answer may
+take was bounded. The bytes were not. `Response::json()`, `text()` and `bytes()`
+read to end-of-stream, so a model endpoint, an A2A peer, a witness or a key
+service could make this process allocate without limit by answering — and
+deliver the bytes fast enough that no timeout ever fired. One OOM takes down
+every run on the instance, and the survivors take those runs over into a process
+that dies the same way.
+
+This crate's premise is that the model, the tools and the peers are untrusted.
+Under that premise an accident and an attack are the same case: a tool server
+answering a directory listing with a gigabyte is doing what a hostile one would
+do.
+
+**Governed media had this control and nothing else did** — hand-written in one
+module while every sibling read to EOF. The rule now lives in
+`netguard::intake` and media calls it, so there is one implementation to get
+right and one to probe. It is applied twice per call: against the declared
+`Content-Length` before a byte is read, and against the accumulated bytes while
+reading. The second is the one that matters, because the header is a claim by
+the party under suspicion.
+
+Two ceilings, both constants: `intake::ANSWER` (16 MiB) for an answer carrying
+work — a completion, a peer's reply — and `intake::METADATA` (1 MiB) for a
+description of something: an Agent Card, a checkpoint note, a wrapped key, an
+error body read only to say why a call failed. Media keeps its own configurable
+`max_bytes`, because there the payload size is the subject rather than the
+overhead.
+
+**The streamed path had half of it, which is the interesting half.**
+`sse::Decoder` already bounded a single event, so the unterminated line was
+refused — and nothing bounded how *many* events arrived. A stream of well-formed
+hundred-byte deltas passes every check that decoder makes while the accumulator
+holding their text grows until the process dies. A ceiling on the part that was
+easy to see is what made the rest read as covered.
+
+A refusal is `ModelError::Unusable`: the call generated, so it is billed and
+`Landed`, and repeating it reaches the same wall. Deliberately not the
+`Interrupted`/`Unavailable` ladder a severed connection takes — that would be
+this plane's own ceiling wearing the provider's fault.
+
+**`netguard::intake` is public**, because the shipped drivers are not the only
+drivers and the version of this control that gets written by hand is the
+unbounded one. The cost is stated rather than hidden: its signatures name
+`reqwest` types, so this crate's HTTP client is part of its public surface on
+the features that link one.
+
+### Known — two response bodies this crate never holds
+
+`netguard::intake` bounds every response this crate reads. Two it does not read,
+named here rather than left to be inferred from a missing call:
+
+- **MCP over stdio or streamable HTTP.** Framing and buffering belong to `rmcp`;
+  this crate hands that transport a child process or a URL and never sees the
+  bytes. A server emitting one unterminated gigabyte-long line is bounded by
+  nothing here.
+- **Bedrock**, for the same reason it takes no `Egress`: the AWS SDK owns that
+  response.
+
+### Added — the obligation backlog has a verb, and a level that falls
+
+`GET /obligations` answered *what did we miss* and nothing ever took an entry
+off it. It is ordered longest-overdue first — the right order, because the
+oldest miss is the one to look at — and bounded by a page, and those two are
+fatal together: once a deployment has more breaches than a page, the head is
+permanent and every breach after it is unreachable. Including breaches whose
+case had since been closed and had its payloads erased by a retention pass,
+which sat at the front in perpetuity. `truncated: true` was honest and did not
+help; it was the same `true` forever.
+
+The operator guide had already written the rule down, one paragraph above the
+exception:
+
+> **Ascending order is not an option** for a bounded query: it is a page that
+> stops changing, so a plane whose backlog exceeds one page returns the same
+> rows forever and the thing that just happened is the one that never appears.
+
+An ascending page is safe when entries leave and there is a verb that removes
+one. Now there is:
+
+```
+POST /obligations/acknowledge   {"case": "...", "obligation": "...", "note": "..."}
+```
+
+**The obligation stays `Breached`.** What ends is the question, not the fact:
+the listing that asks *has anybody looked at this* stops returning it, the
+account is readable afterwards on `GET /cases/{case}`, and who looked comes from
+the authenticated caller rather than the request body — an account of a missed
+obligation that named whoever the caller said they were would be no account at
+all. The call is idempotent and says which happened: `recorded` is `false` when
+somebody had already answered, because the first account stands and a retry must
+not rewrite who looked or when.
+
+`agentplane.obligations.breached` is the same figure as a level, so an alert
+means *there is unattended work* rather than *this deployment has ever missed
+something* — only the first is actionable, and a monotonic instrument cannot
+express it.
+
+**Breaking, on four types.** `CaseStore` gains `acknowledge_breach(case, name,
+&BreachNote) -> Result<bool, _>`, which every implementation must provide;
+`breached` now returns unaccounted breaches only. `Deadline` gains
+`acknowledged: Option<BreachNote>`, so struct literals need the field — `None`
+for anything being registered. `CaseCensus` gains `breached` and
+`runtime::metrics::Census` gains `unaccounted_breaches`; both are required
+rather than defaulted, for the reason `count_by_outcome` is: a default of zero
+is a gauge reporting that nothing is wrong on every store whose author did not
+notice. Grant `api:obligation.acknowledge` — under a deny-by-default engine an
+ungranted verb is a backlog nobody can clear. The redb backend gains a
+`case_deadlines_unaccounted` index and the PostgreSQL one a partial index and
+three nullable columns; recreate the store rather than migrating.
+
+### Fixed — a closed case could still acquire an obligation to miss
+
+`close` refuses while an obligation is outstanding, and that is the check the
+whole case layer is built around: closure is when people stop looking, so an
+unmet regulatory window must not vanish behind a tidy status. Nothing enforced
+it afterwards. `register_deadline` would add a pending obligation to a case
+already closed — and then the sweep breaches it and escalates, so a matter
+audited as settled acquires a duty and misses it with no run and no operator
+involved.
+
+Reachable without contriving anything: a run suspended on a wait, its case
+closed while it slept, resuming to register the obligation its next step needs.
+
+Registering on a closed case is now `StoreError::CaseClosed`, typed rather than
+a backend fault so a store that is merely unreachable cannot read as the rule
+firing. The remedy is deliberately an explicit act — reopen the case, then
+register — because a store that reopened it silently would decide on somebody's
+behalf that an audited closure did not stand.
+
+**The concurrency half was fixed with it, and only shows on PostgreSQL.** Once
+both verbs check, they are a write-skew pair: each reads what the other is about
+to change. redb serializes them for nothing because it admits one writer. At
+READ COMMITTED both transactions commit on each other's pre-state, so `close`
+now takes the case row's lock *before* it counts and `register_deadline` takes
+the same lock before it inserts. The conformance battery pins the sequential
+half on both backends.
+
+### Fixed — a missed window could be edited away by answering late
+
+`set_deadline_state` accepted any transition, and `cx.meet_deadline` is that
+write. So a run that answered after the window closed moved a `breached`
+obligation to `met` — and the state column is the only record that the window
+closed unmet. Not a stale row: an erased one, and the miss left the obligation
+listing in the same call.
+
+Met, breached and withdrawn are the three ways an obligation ends, and all three
+are now terminal. Re-applying the state already held still succeeds, because
+every writer here is a sweep or a resumed run and both repeat their own last
+write by design; anything else is `StoreError::DeadlineFinal`.
+
+**What to do if you answered late**: record it as an account of the breach.
+`POST /obligations/acknowledge` takes a note, which is where *responded two days
+after the window* belongs — beside the fact, not instead of it.
+
+### Fixed — a reopened matter came back unreachable
+
+Closing a case releases its correlation keys, so a genuinely new message about
+the same entity opens a fresh matter rather than reanimating a concluded one.
+Read backwards, that rule has a second half nothing implemented: a case that
+*leaves* `Closed` never took the keys back. It came back open, live-looking, and
+correlating to nothing — no inbound event could ever reach it again.
+
+Nobody had to ask for it. The sweep escalates a case when a task it was waiting
+on expires, and `set_case_status` is on every skill's context, so a matter could
+be reopened by a timer and be unreachable from that moment.
+
+`set_status` off `Closed` now re-claims every key still free. A key another case
+has since claimed **stays with that case**: the identifier belongs to whichever
+matter is open for it now, and a reopening that took one back would silently
+redirect that matter's traffic. The negative half is the one the battery pins.
+
+### Fixed — a third of the mutation sweep silently ran the whole test suite
+
+The `mutants` matrix had one shard at 44 minutes where the rest finished inside
+15. Two causes, and the first is the interesting one.
+
+**`tests/trust/planned.rs` used `agentplane::api` with no `http` gate.** The
+file's `#![cfg]` names `redb`, `testkit` and `manifest`, so the feature set the
+sweep derives for the `trust` target — from the target's own sources, because a
+second list of feature sets is a second thing to keep in step — did not include
+`http`, and the target **did not compile**. The sweep never said so: when the
+named test does not fail it falls back to `cargo test --all-features
+--no-fail-fast`, which builds everything, runs the whole suite, watches the
+named test fail there, and reports `KILLED`. The right verdict, arrived at
+eight times the cost, for **196 of 661 mutations**. Measured: 150 s per
+mutation before, 19 s after.
+
+The tool now says so. A compile error pointing into `tests/` is a fault in the
+derived feature set rather than a verdict about the mutation, and it is reported
+as one instead of being absorbed by a fallback that happens to work.
+
+**Shards were balanced by count.** A mutation checked by a library unit test
+builds `--all-features --lib` and costs 160 s; one checked in the `trust` binary
+costs 19 s. Ten equal counts are ten very unequal jobs, and a matrix finishes
+when its slowest one does. `tools/mutants.py` now carries the measured
+per-target cost and cuts the sorted list on seconds, keeping the feature-set
+grouping that gives each shard its build locality. Worst shard 10,390 → 3,564
+cost units, against an unchanged mean.
+
+Together: the whole sweep costs **42 % less**, and its critical path — the only
+number a matrix job actually has — drops **66 %**.
+
+Not done, and worth stating because it was asked: **no mutations were removed.**
+The table holds 676 mutations naming 579 distinct tests; the repeats are
+conformance batteries where one test legitimately catches fifteen different
+store defects. Nothing here is padding, and deleting a mutation to make CI
+faster trades a guarantee's only falsifier for wall clock — which is the one
+trade this project does not make.
+
+### Assurance — the rest of the same survey, and what it found sound
+
+Stated because half-checking a survey is worse than not checking it: every
+other place this crate turns a value into a string was walked with the same
+question, and these are right as they stand.
+
+- **`RunStatus`** has two hand-written readers, in the resume path and in the
+  run view. Both **fail closed**: an outcome this build does not recognise
+  becomes `Quarantined` rather than a default, because continuing a run whose
+  recorded ending cannot be interpreted grafts new behaviour onto a history
+  that says it ended.
+- **`HaltScope`** keeps one `key`/`parse` pair on the type, and `None` is
+  documented as corruption rather than as a scope to skip — a halt an instance
+  cannot read is one it must not run through.
+- **`McpTaskState`** and the A2A state mapping enumerate somebody else's
+  protocol vocabulary and refuse the rest, which is the correct shape for a
+  reader whose writer is a counterparty rather than this crate.
+- **`PushNamespace`** is a predicate over a registration id, not a stored
+  string.
+
+### Assurance — the queue was never asked to tell two ranks apart
+
+Both backends' queue-order tests put an urgent task behind older *normal* ones,
+two ranks apart. A rank table where two neighbours collide serves that page
+correctly, so the assertion that the worklist orders by priority could not see
+the defect the round was fixing. Both now include a `High` task older than the
+urgent one, so the page's first two entries separate adjacent ranks.
+
+The batch battery checked that the resume cursor stops before an item with *no*
+outcome, and never before a **suspended** one — so the whole question of which
+outcomes are terminal was unpinned, in a doc comment that states the rule
+("an item still running or suspended holds the cursor behind it, or a resume
+steps over work outstanding"). It now records a suspension and asserts the
+cursor did not move.
+
+The conformance battery gained `a_claimed_task_is_offered_to_nobody_else`, the
+exact complement of the backlog check beside it: a claimed task stays in the
+*backlog*, because it is still a decision the plane is waiting on, and leaves
+the *queue*, because it is nobody else's to take. Those two are one predicate on
+a backend that gets it wrong, and only the first half was pinned — so a queue
+offering held work to a second reviewer passed both batteries.
+
 ## [0.29.0] — 2026-09-05
 
 ### Added — the quarantine has verbs, and giving up leaves a record

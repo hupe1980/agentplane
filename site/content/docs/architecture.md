@@ -82,7 +82,8 @@ src/
   policy/    authorization-engine adapters; the seam itself is core::policy
   memory/    what an agent remembers between runs: versioned items, journaled
              retrieval, and labels taken from provenance rather than content
-  netguard/  which IP addresses this plane will connect to — one rule, shared
+  netguard/  what an outbound call may do to this process: which IP addresses
+             it may reach, and how many bytes an answer may cost — one rule each,
              by governed media, webhook delivery and both A2A URL legs, applied
              at connect time so a pooled client stays guarded
   push/      Durable outbound delivery: the journal-as-outbox cursor loop, A2A

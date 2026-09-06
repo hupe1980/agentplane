@@ -324,7 +324,7 @@ confidence.
 | Field | Default | Notes |
 |---|---|---|
 | `max_sensitivity_egress` | unbounded | `public`, `internal`, `confidential`, `secret`. Combined with each sink's own ceiling at dispatch; the **stricter** wins. |
-| `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records**. Egress asks *may this leave*; this asks *may this be written down forever*, and a record is never removed from an append-only chain. Refused at dispatch, before anything is recorded. It is the *refuse it* answer to that question; `.keyring(..)` is the *seal it* answer, and a deployment may take either or both → [erasure and keys](@/docs/erasure.md). |
+| `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records**. Egress asks *may this leave*; this asks *may this be written down forever*. Refused at dispatch, before anything is recorded — the *refuse it* answer, where `.keyring(..)` is the *seal it* one → [erasure and keys](@/docs/erasure.md). |
 | `max_delegation_depth` | role-dependent | Checked against the configured identity *and* against every delegating sink, including in-plane `commission`. |
 
 ## `spec.capabilities`
@@ -435,13 +435,32 @@ exactly like one that replans without bound.
 
 | Field | Default | Notes |
 |---|---|---|
-| `ref` | **required** | `tool://server/name`. Transport-neutral: what `server` is — an MCP connection, tools compiled into the binary, `agent` for an agent on this plane, or the id of a registered A2A peer — is a deployment decision made at build, so one manifest runs against an in-process double in a test and a real server in production. A peer grant dispatches through `StepCtx::call_peer`: a delegating hop that extends the run's chain, counts against `max_delegation_depth`, and is held to this grant's fields and ceiling. |
+| `ref` | **required** | `tool://server/name`, transport-neutral — see [what `server` may be](#tool-refs) below. |
 | `mutates` | `true` | Whether calling it changes the world. The cautious default. |
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
 | `description` | **required** | What the model is told. Required for a `tool-calling` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
 | `arguments` | derived | JSON Schema. Omit it for a typed `Tool`: the schema comes from the Rust argument type, and stating it twice is refused because a second copy can only drift. |
-| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. A decision's `amendment` is the call: an approving reviewer's substitute arguments dispatch in the model's place, schema-checked and judged by every sink gate as the reviewer's own trusted value (provenance `task:agent.approve_call`). Needs `spec.oversight` (which supplies approvers, the obligation bounding the wait, and what happens when it closes) and a declarative kind that calls tools — `tool-calling` or `planned`; refused without either. |
+| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` and a kind that calls tools (`tool-calling` or `planned`); refused without either. See [approve with an amendment](#amendment). |
 | `protected_fields` | none | See below. |
+
+### Approving with an amendment {#amendment}
+
+A decision's `amendment` **is** the call. An approving reviewer's substitute
+arguments dispatch in the model's place, schema-checked and judged by every sink
+gate as the reviewer's own trusted value, with provenance
+`task:agent.approve_call`. `spec.oversight` supplies the approvers, the
+obligation bounding the wait, and what happens when it closes.
+
+### What `server` may be {#tool-refs}
+
+A `ref` names a tool, not a transport. `server` may be an MCP connection, tools
+compiled into the binary, `agent` for an agent on this plane, or the id of a
+registered A2A peer — a deployment decision made at build, so one manifest runs
+against an in-process double in a test and a real server in production.
+
+A peer grant dispatches through `StepCtx::call_peer`: a delegating hop that
+extends the run's chain, counts against `max_delegation_depth`, and is held to
+this grant's fields and ceiling.
 
 ### `protected_fields`
 
@@ -546,13 +565,22 @@ human is in the loop when none is.
 
 | Field | Default | Notes |
 |---|---|---|
-| `approval` | **required** | `required` gates every answer. `tools-only` gates only the grants that set `requires_approval`, leaving the answer unattended — the shape most deployments want, since gating a tool-calling agent's *answer* is a review that arrives after the tool already ran. Under `tools-only`, **every mutating grant must declare `requires_approval`** — refused at parse otherwise, because a mode that gates tool calls while a call that changes the world needs nobody is a declared control nothing enforces; read-only grants stay ungated. `none` gates nothing and leaves the deciding to `triage`. None is a predicate: *"require approval when severity is high"* changes what the agent **does**, and that is one step from an `if`. |
+| `approval` | **required** | `required` gates every answer; `tools-only` gates only the grants that set `requires_approval`; `none` gates nothing and leaves the deciding to `triage`. See below |
 | `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
-| `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name — a file-only agent writes no code, so naming an obligation nothing registers made oversight fail outright. `kind` and `params` go to the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says and this crate never guesses. |
+| `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name. `kind` and `params` reach the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says. |
 | `on_expiry` | deny | What happens when the window closes. `deny` refuses the answer. `escalate` widens the audience and keeps waiting: the `escalate_to` roles join the reviewers, the stale claim is cleared, and the task leaves the expiry scan — it is answered by a person or answered never. `proceed` acts unattended. |
-| `escalate_to` | — | Roles added to the audience when a task escalates. **Required by `on_expiry: escalate`** — widening is escalation's one enforceable meaning, so the declaration must say who is added — and refused beside any other policy, where it would be a list nothing reads. `escalate` also requires bounded audiences everywhere it applies: an empty `approvers` or triage `audience` already means *anyone*, which no list can widen. |
+| `escalate_to` | — | Roles added to the audience when a task escalates. **Required by `on_expiry: escalate`**, because widening is escalation's one enforceable meaning; refused beside any other policy. `escalate` also needs bounded audiences: an empty `approvers` already means *anyone*, which no list can widen. |
 | `allow_unattended` | `false` | Explicit consent required for `on_expiry: proceed`, so acting with no human is a greppable decision somebody made rather than an enum variant they picked off a list. |
 | `triage` | none | Tasks opened **beside** a completed answer. See below. |
+
+**`tools-only` is the shape most deployments want**, because gating a
+tool-calling agent's *answer* is a review that arrives after the tool already
+ran. Under it, **every mutating grant must declare `requires_approval`** —
+refused at parse otherwise, since a mode that gates tool calls while a call that
+changes the world needs nobody is a declared control nothing enforces.
+Read-only grants stay ungated. None of the three modes is a predicate:
+*"require approval when severity is high"* changes what the agent **does**, and
+that is one step from an `if`.
 
 The agent registers the obligation, opens a task carrying its **actual answer**,
 and returns only on approval. It applies to **both** execution kinds — a

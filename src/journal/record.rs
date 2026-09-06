@@ -61,10 +61,11 @@ pub enum RecordKind {
     RunAdmitted {
         /// The capability this run was asked for.
         ///
-        /// Named for what it is. It held the plan's first capability under the
-        /// field name `agent`, which read as an identity and was not one — the
-        /// stringly-typed mistake, in the one record where "who did this" is the
-        /// question being asked.
+        /// A capability, and named as one. *Who* ran is
+        /// [`governed_by`](#variant.RunAdmitted.field.governed_by) and the
+        /// `IdentityBound` record beside it — this is *what was asked*, and in
+        /// the one record where "who did this" is the question, the two must
+        /// not answer to the same field name.
         capability: String,
         /// Which declared agent governed this run, if a declared one did.
         ///

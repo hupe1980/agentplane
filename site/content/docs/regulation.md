@@ -1,7 +1,7 @@
 +++
 title = "Regulation"
 description = "EU AI Act obligation by obligation, mapped to mechanisms that exist — and an explicit list of the ones that do not."
-weight = 16
+weight = 17
 
 [extra]
 group = "Trust"
@@ -86,6 +86,7 @@ about you. See [status](@/docs/status.md).
 | The ability to **stop** | Cooperative cancellation: the run unwinds what it did as a saga, and the record names who asked |
 | Refusing to guess | A run that cannot account for an outcome is `Quarantined` rather than unwound — reversing everything except the one thing nobody can account for is how a system refunds money nobody took |
 | Declared, not remembered | `spec.oversight` puts approval in the reviewable file (`manifest`), so a declarative agent's answer waits for a person by declaration rather than because a developer coded the call. Declaring it where nothing would apply it is refused, so the file cannot claim a human is in the loop when none is |
+| A missed window reaches somebody who can answer it | Breaches are listed in their own right, outlive the case's closure, and leave the listing only when a person accounts for one — `POST /obligations/acknowledge`, recording who looked. The obligation stays `Breached`: what ends is the question, not the fact |
 
 ### Art. 13 — a machine-readable description of the agent
 
@@ -118,7 +119,7 @@ a retention policy nothing enforces is a document.
 
 | Requirement | Mechanism |
 |---|---|
-| Rehearse recovery | `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores — re-hashing bytes, proving sealed state opens, and telling *intact* from *erased by design* from *lost*. `agentplane serve --drill-every 86400` runs it on a timer and logs a finding at `error` with the report attached; `agentplane drill` runs one pass and fails only on loss, never on honest erasure |
+| Rehearse recovery | `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores, telling *intact* from *erased by design* from *lost*. `agentplane serve --drill-every 86400` runs it on a timer; `agentplane drill` runs one pass |
 | Prove a copy without this crate | `agentplane verify history.jsonl --checkpoint cp.note` recomputes an export from its own bytes; `restore` rebuilds a store and proves it by its own checkpoint |
 | Enforce a retention window | `Runtime::retain(older_than, at, reason)` erases every **closed** case opened before the window: blob tombstones, and the case's key scope destroyed, which reaches every replica and backup at once. `agentplane retain --older-than-days N --reason ... --dry-run` lists what that pass would erase, through the same selection rule, from a binary that wires no store able to erase |
 | Know what retention did *not* reach | Every pass returns `not_erasable`, and it is the half that matters: without a key ring, journal payloads stay verbatim. A count with no coverage statement beside it is how a deployment comes to believe an obligation is discharged |

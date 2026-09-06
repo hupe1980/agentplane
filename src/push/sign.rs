@@ -65,12 +65,12 @@
 //!
 //! [Standard Webhooks]: https://www.standardwebhooks.com/
 
-use base64::Engine as _;
 use hmac::{KeyInit, Mac, SimpleHmac};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::core::Secret;
+use crate::core::secret::constant_time_eq;
 
 /// A signing secret this deployment wrote about itself that cannot be used.
 ///
@@ -325,9 +325,7 @@ impl BodySigning {
     fn key_bytes(secret: &Secret) -> Result<Zeroizing<Vec<u8>>, SigningKeyError> {
         let raw = secret.expose();
         let key = Zeroizing::new(match raw.strip_prefix(SYMMETRIC_KEY_PREFIX) {
-            Some(encoded) => base64::engine::general_purpose::STANDARD
-                .decode(encoded)
-                .map_err(|_| SigningKeyError::NotBase64)?,
+            Some(encoded) => crate::core::b64::decode(encoded).ok_or(SigningKeyError::NotBase64)?,
             None => raw.as_bytes().to_vec(),
         });
         if key.len() < MIN_KEY_BYTES {
@@ -353,10 +351,7 @@ impl BodySigning {
             .iter()
             .map(|key| {
                 let mac = hmac_sha256(key, &content);
-                format!(
-                    "v1,{}",
-                    base64::engine::general_purpose::STANDARD.encode(mac)
-                )
+                format!("v1,{}", crate::core::b64::encode(mac))
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -562,24 +557,6 @@ impl WebhookVerifier {
             timestamp: at,
         })
     }
-}
-
-/// Compare without short-circuiting on the first differing byte.
-///
-/// A MAC compared with `==` leaks how many leading bytes an attacker guessed,
-/// turning a forgery from infeasible into a byte-at-a-time search. Same
-/// reasoning as [`Secret`]'s equality.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    // Length is not secret — it is fixed by the scheme, and visible on the
-    // wire — but the contents must not short-circuit.
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 #[cfg(test)]

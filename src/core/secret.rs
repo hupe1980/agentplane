@@ -72,18 +72,29 @@ impl fmt::Debug for Secret {
 /// reason about which paths those are.
 impl PartialEq for Secret {
     fn eq(&self, other: &Self) -> bool {
-        let (a, b) = (self.0.as_bytes(), other.0.as_bytes());
-        // Length is not secret — it leaks through the ciphertext of any
-        // transport anyway — but the *contents* must not short-circuit.
-        if a.len() != b.len() {
-            return false;
-        }
-        let mut diff = 0u8;
-        for (x, y) in a.iter().zip(b.iter()) {
-            diff |= x ^ y;
-        }
-        diff == 0
+        constant_time_eq(self.0.as_bytes(), other.0.as_bytes())
     }
+}
+
+/// Compare without short-circuiting on the first differing byte.
+///
+/// One implementation, because this is the whole of the defence: a secret or a
+/// MAC compared with `==` leaks how many leading bytes the caller guessed,
+/// which turns a forgery from infeasible into a byte-at-a-time search. A second
+/// copy is a second thing to get right, and the one that is wrong is the one
+/// nobody looked at.
+///
+/// Length is not secret — it is fixed by the scheme and visible through the
+/// ciphertext of any transport — but the contents must not short-circuit.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 impl Eq for Secret {}

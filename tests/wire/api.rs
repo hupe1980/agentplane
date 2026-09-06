@@ -806,6 +806,11 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
             &json!({ "id": "e", "kind": "k", "correlation": [], "payload": {} }),
         ),
         get("/dead-letters", None),
+        post(
+            "/obligations/acknowledge",
+            None,
+            &json!({ "case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "obligation": "ack" }),
+        ),
     ];
     requests.extend(push_routes(None));
     for req in requests {
@@ -891,6 +896,11 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         get("/runs", Some("bob")),
         get("/cases", Some("bob")),
         get("/obligations", Some("bob")),
+        post(
+            "/obligations/acknowledge",
+            Some("bob"),
+            &json!({ "case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "obligation": "ack" }),
+        ),
         get("/dead-letters", Some("bob")),
     ];
     requests.extend(push_routes(Some("bob")));
@@ -1861,6 +1871,7 @@ async fn a_missed_obligation_is_listable_after_its_case_is_closed() {
             calendar_digest: Digest::of(b"cal"),
             warn_at: None,
             state: DeadlineState::Pending,
+            acknowledged: None,
         })
         .await
         .expect("register");

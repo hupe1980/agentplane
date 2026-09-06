@@ -11,7 +11,7 @@ use tokio_postgres::Row;
 use crate::core::StoreError;
 use crate::memory::{MemoryItem, MemoryStore, Recall};
 
-use super::postgres::PostgresStore;
+use super::postgres::{PostgresStore, be};
 
 pub(super) const MEMORY_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS memory_items (
@@ -89,17 +89,6 @@ CREATE INDEX IF NOT EXISTS memory_expiry
     ON memory_items (tenant, expires_at, id)
     WHERE current AND expires_at IS NOT NULL;
 ";
-
-fn be(error: &tokio_postgres::Error) -> StoreError {
-    if let Some(db) = error.as_db_error() {
-        let detail = db
-            .detail()
-            .map_or(String::new(), |detail| format!(": {detail}"));
-        StoreError::Backend(format!("{} ({}{})", db.message(), db.code().code(), detail))
-    } else {
-        StoreError::Backend(error.to_string())
-    }
-}
 
 fn decode(row: &Row) -> Result<MemoryItem, StoreError> {
     serde_json::from_value(row.get("item")).map_err(|error| StoreError::Backend(error.to_string()))

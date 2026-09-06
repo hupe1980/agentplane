@@ -9,6 +9,7 @@
 //! eventual crate split mechanical rather than archaeological.
 
 mod attest;
+pub(crate) mod b64;
 mod budget;
 mod calendar;
 pub mod canon;
@@ -25,7 +26,7 @@ pub mod merkle;
 mod plan;
 mod policy;
 mod retry;
-mod secret;
+pub(crate) mod secret;
 mod skill;
 mod task;
 mod tenant;
@@ -51,8 +52,8 @@ mod provenance;
 pub use provenance::{NS as PROVENANCE_NS, Provenance};
 
 pub use case::{
-    Case, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineSpec, DeadlineState,
-    SweptAction,
+    BreachNote, Case, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineSpec,
+    DeadlineState, SweptAction,
 };
 pub use doubt::{Assertion, Doubt, QuarantineDecision, Undecided};
 pub use effect::{

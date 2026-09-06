@@ -43,6 +43,7 @@ function's name and `--verify` what it finds.
 
 from __future__ import annotations
 
+import functools
 import os
 import pathlib
 import re
@@ -1411,11 +1412,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                current = current.clone();",
     ),
     "MediaStreamLimitIgnored": (
-        "src/media/mod.rs",
+        "src/netguard/intake.rs",
         "declared_and_streamed_body_sizes_are_both_bounded",
-        "a chunked response can cross the media byte ceiling after its headers passed",
-        "            if next > self.policy.max_bytes {",
-        "            if false {",
+        "a chunked response can cross the media byte ceiling after its headers "
+        "passed. On the shared rule since media stopped carrying its own copy: "
+        "this and `AnOversizedAnswerIsRead` are the same line answering to two "
+        "batteries, which is what collapsing two implementations into one is for",
+        "        if self.seen > self.limit {",
+        "        if self.seen > usize::MAX {",
     ),
     "MediaSignatureIgnored": (
         "src/media/mod.rs",
@@ -2088,14 +2092,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "const EM_DASH: char = '-';",
     ),
     "ANotePayloadIsUrlSafeBase64": (
-        "src/journal/note.rs",
+        "src/core/b64.rs",
         "the_note_payload_is_rfc4648_base64",
-        "the note payload is encoded with the URL-safe alphabet, which differs "
-        "from the specified one in exactly two positions — so most checkpoints "
-        "encode identically and the ones that do not are rejected by every "
-        "verifier",
-        "0123456789+/",
-        "0123456789-_",
+        "the standard dialect is encoded with the URL-safe alphabet, which "
+        "differs from the specified one in exactly two positions — so most "
+        "checkpoints encode identically and the ones that do not are rejected "
+        "by every verifier",
+        "    base64::engine::general_purpose::STANDARD.encode(bytes)",
+        "    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)",
     ),
     "ANoteBodyAbsorbsItsSeparator": (
         "src/journal/note.rs",
@@ -3699,8 +3703,81 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the breach listing answers empty, so a missed obligation is reachable "
         "only through the case that produced it — and `close` retires that "
         "handle at the moment people stop looking",
-        "                if row.4 == DeadlineState::Breached.as_str() {",
-        "                if row.4 == DeadlineState::Pending.as_str() {",
+        "    state == DeadlineState::Breached.as_str() && has_ack == 0",
+        "    state == DeadlineState::Pending.as_str() && has_ack == 0",
+    ),
+    "AnAcknowledgedBreachStaysListed": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "an answered breach stays on the listing, so the page is ordered "
+        "oldest-first over entries nothing removes — its head is permanent and "
+        "every later breach is unreachable",
+        "    state == DeadlineState::Breached.as_str() && has_ack == 0",
+        "    state == DeadlineState::Breached.as_str()",
+    ),
+    "AnObligationLandsOnAClosedCase": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "an obligation is registered on a closed case, so `close` refusing an "
+        "outstanding one is a check at an instant rather than a property of the "
+        "store — the sweep breaches the late obligation and escalates a matter "
+        "audited as settled",
+        "                    .is_some_and(|v| v.value().1 == CaseStatus::Closed.as_str());",
+        "                    .is_some_and(|v| v.value().1 == CaseStatus::AwaitingExternal.as_str());",
+    ),
+    "AReopenedCaseStaysUncorrelatable": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a case that leaves `Closed` does not take back its correlation keys, "
+        "so it comes back live-looking and unreachable — no inbound message can "
+        "ever correlate to the matter the sweep just reopened",
+        "                if was == CaseStatus::Closed.as_str() {",
+        "                if was == CaseStatus::Escalated.as_str() {",
+    ),
+    "AnOversizedAnswerIsRead": (
+        "src/netguard/intake.rs",
+        "an_oversized_answer_is_refused_rather_than_read",
+        "an answer is read to end-of-stream, so a model endpoint, a peer, a "
+        "witness or a key service decides how much of this process's memory its "
+        "reply costs — and one OOM takes down every run on the instance",
+        "        if self.seen > self.limit {",
+        "        if self.seen > usize::MAX {",
+    ),
+    "ADeclaredOversizeIsRead": (
+        "src/netguard/intake.rs",
+        "a_declared_oversize_is_refused_before_a_byte_is_read",
+        "a counterparty that says how big its answer will be is read anyway, so "
+        "the cheap refusal never fires and the honest large answer costs a full "
+        "read before it is rejected",
+        "    if let Some(declared) = declared\n        && declared > limit as u64",
+        "    if let Some(declared) = declared\n        && declared > u64::MAX",
+    ),
+    "AnOversizedStreamIsAccumulated": (
+        "src/model/anthropic.rs",
+        "an_oversized_stream_is_refused_rather_than_accumulated",
+        "a stream is accumulated without a ceiling: `sse::Decoder` bounds one "
+        "event, so well-formed hundred-byte deltas pass every check it makes "
+        "while the accumulator grows until the process dies",
+        "            if let Err(e) = meter.charge(chunk.len()) {",
+        "            if let Err(e) = meter.charge(0) {",
+    ),
+    "ABreachIsEditedAway": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "an obligation can be moved out of `breached`, so a run answering late "
+        "takes the miss off the operator's listing and out of the row at once — "
+        "the only record that the window closed unmet, erased rather than stale",
+        "                if !from.may_become(state) {",
+        "                if false {",
+    ),
+    "APostgresObligationLandsOnAClosedCase": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        "the SQL backend accepts an obligation on a closed case; the redb "
+        "mutation cannot reach this copy of the rule, and a rule enforced by "
+        "one backend of two is a deployment-shaped hole",
+        "        if status == CaseStatus::Closed.as_str() {",
+        "        if status == CaseStatus::AwaitingExternal.as_str() {",
     ),
     "ACappedSweepLooksOrdinary": (
         "src/runtime/sweeper.rs",
@@ -4789,8 +4866,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the signature is made over a hash of the JWS signing input rather than "
         "the input itself, which verifies here and nowhere else — every "
         "conforming verifier rejects it",
-        "        let signature = B64.encode(signer.sign_bytes(&input));",
-        "        let signature =\n            B64.encode(signer.sign_bytes(crate::core::Digest::of(&input).as_bytes()));",
+        "        let signature = crate::core::b64::encode_url(signer.sign_bytes(&input));",
+        "        let signature = crate::core::b64::encode_url(\n            signer.sign_bytes(crate::core::Digest::of(&input).as_bytes()),\n        );",
     ),
     "CanonicalOrderIsUtf8NotUtf16": (
         "src/core/canon.rs",
@@ -5460,31 +5537,34 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """        if false {""",
     ),
     "ABase64PaddingBitsAreIgnored": (
-        "src/journal/note.rs",
+        "src/core/b64.rs",
         "a_checkpoint_has_exactly_one_spelling",
         "the unused trailing bits of a base64 tail are not required to be "
         "zero, so every 32-byte root has sixteen spellings — each a distinct "
         "note text, each signable, all naming one history",
-        """        if n & ((1 << (24 - take * 8)) - 1) != 0 {
-            return None;
-        }""",
-        """        if false {
-            return None;
-        }""",
+        "    base64::engine::general_purpose::STANDARD.decode(text).ok()",
+        """    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
+            .with_decode_allow_trailing_bits(true),
+    )
+    .decode(text)
+    .ok()""",
     ),
     "ABase64PayloadNeedNotBePadded": (
-        "src/journal/note.rs",
+        "src/core/b64.rs",
         "a_checkpoint_has_exactly_one_spelling",
-        "base64 input is decoded without checking that it is a whole number "
-        "of quads and that `=` appears only as a trailing pad, so a stray "
-        "character is silently dropped and interior padding truncates the "
-        "value — two ways for one root to have two texts",
-        """    if raw.is_empty() || !raw.len().is_multiple_of(4) {
-        return None;
-    }""",
-        """    if raw.is_empty() {
-        return None;
-    }""",
+        "base64 input is decoded without requiring canonical padding, so an "
+        "unpadded tail is a second spelling of one value — one root with two "
+        "note texts, both signable",
+        "    base64::engine::general_purpose::STANDARD.decode(text).ok()",
+        """    base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    )
+    .decode(text)
+    .ok()""",
     ),
     "AKeyNameIsFreeText": (
         "src/journal/note.rs",
@@ -6324,8 +6404,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "refusing, so a compensating record comes back wearing the forward "
         "half of the saga and the unwind logic acts on a value the store "
         "invented for a row nobody could read",
-        """        other => return Err(corrupt("unknown step phase", other)),""",
-        """        _other => crate::core::Phase::Forward,""",
+        """    decoded("step phase", s, crate::core::Phase::parse(s))""",
+        """    Ok(crate::core::Phase::parse(s).unwrap_or_default())""",
     ),
     "AFailedEffectIsAlwaysFree": (
         "src/core/error.rs",
@@ -6405,20 +6485,104 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                 }""",
         """                let _ = &mut admissions;""",
     ),
+    # ── The stored vocabulary ──────────────────────────────────────────────
+    "ANonTerminalOutcomeCloses": (
+        "src/store/redb_batches.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "an item with any recorded outcome is treated as settled, so the resume "
+        "cursor steps over a suspended one and the batch reports complete with "
+        "work still waiting on an event, a person or a raised ceiling",
+        """    has_outcome != 1 || ItemOutcome::parse(outcome, String::new()).is_none_or(|o| !o.is_terminal())""",
+        """    has_outcome != 1""",
+    ),
+    "PostgresCursorStepsOverAnUnsettledItem": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        "the shared store's resume cursor counts every outcome as terminal, so "
+        "a suspended item is stepped over and the batch resumes past work that "
+        "never settled — the failure a hand-listed terminal set produces",
+        """                    &ItemOutcome::terminal_tags(),""",
+        """                    &ItemOutcome::all(String::new())
+                        .iter()
+                        .map(ItemOutcome::as_str)
+                        .collect::<Vec<_>>(),""",
+    ),
+    "APriorityRankHasATie": (
+        "src/core/task.rs",
+        "the_queue_serves_priority_before_age",
+        "two priorities share a rank, so the worklist index cannot order them "
+        "and an urgent decision sorts among the routine ones — the failure a "
+        "table with a fallback arm produces the day a priority is added",
+        """            Self::Urgent => 0,
+            Self::High => 1,""",
+        """            Self::Urgent => 1,
+            Self::High => 1,""",
+    ),
+    "AQueuedTaskIsAnyPendingOne": (
+        "src/core/task.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a claimed task is offered to the queue again, so two reviewers are "
+        "shown one decision and the second finds it already held",
+        """    pub const fn is_queued(self) -> bool {
+        match self {
+            Self::Open | Self::Escalated => true,
+            Self::Claimed | Self::Completed | Self::Expired => false,
+        }
+    }""",
+        """    pub const fn is_queued(self) -> bool {
+        self.is_pending()
+    }""",
+    ),
+    "AnUnreadableObligationLeavesTheIndex": (
+        "src/store/redb_cases.rs",
+        "an_unreadable_obligation_is_still_outstanding",
+        "an obligation whose state will not parse is treated as settled, so a "
+        "damaged row drops out of the sweep and out of what `close` counts — "
+        "and a matter is audited as closed with a duty nobody can see",
+        """    DeadlineState::parse(state).is_none_or(DeadlineState::is_open)""",
+        """    DeadlineState::parse(state).is_some_and(DeadlineState::is_open)""",
+    ),
+    "AStoredStatusIsMatchedByHand": (
+        "src/core/case.rs",
+        "every_stored_spelling_round_trips_and_nothing_else_parses",
+        "the reader is a hand-written match beside the writer rather than the "
+        "writer read backwards, so a variant added later is a spelling the "
+        "crate emits and refuses — the second implementation `parse` exists to "
+        "make impossible",
+        """    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    /// Every status, so a caller can enumerate them without matching.""",
+        """    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "open" => Some(Self::Open),
+            "awaiting_external" => Some(Self::AwaitingExternal),
+            "awaiting_human" => Some(Self::AwaitingHuman),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+
+    /// Every status, so a caller can enumerate them without matching.""",
+    ),
     # ── The oversight surface ───────────────────────────────────────────────
     "AnEscalatedTaskNeverLeavesTheOverdueScan": (
-        "src/store/redb_tasks.rs",
+        "src/core/task.rs",
         "redb_satisfies_the_case_layer_contracts",
         "the overdue scan keeps returning escalated tasks, whose expiry policy "
         "has already fired; they accumulate at the head of the bounded "
         "oldest-first batch until it holds nothing else, and the deny/proceed "
         "policies of every task behind them silently stop firing",
-        """fn awaits_expiry(state: &str) -> bool {
-    matches!(state, "open" | "claimed")
-}""",
-        """fn awaits_expiry(state: &str) -> bool {
-    is_pending(state)
-}""",
+        """    pub const fn awaits_expiry(self) -> bool {
+        match self {
+            Self::Open | Self::Claimed => true,
+            Self::Completed | Self::Expired | Self::Escalated => false,
+        }
+    }""",
+        """    pub const fn awaits_expiry(self) -> bool {
+        self.is_pending()
+    }""",
     ),
     "PostgresKeepsEscalatedTasksOverdue": (
         "src/store/postgres_cases.rs",
@@ -6426,12 +6590,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the shared-store overdue scan keeps returning escalated tasks — the "
         "same starvation as the embedded store's, on the backend the redb "
         "mutation cannot reach",
-        """                    "SELECT {TASK_COLS} FROM tasks
-                      WHERE tenant = $3 AND state IN ('open','claimed')
-                        AND due_at IS NOT NULL AND due_at <= $1""",
-        """                    "SELECT {TASK_COLS} FROM tasks
-                      WHERE tenant = $3 AND state IN ('open','claimed','escalated')
-                        AND due_at IS NOT NULL AND due_at <= $1""",
+        """                    &task_states(TaskState::awaits_expiry),""",
+        """                    &task_states(TaskState::is_pending),""",
     ),
     "EscalationKeepsTheStaleReservation": (
         "src/core/task.rs",
@@ -6520,17 +6680,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an outcome string the store cannot read decodes as 'no outcome yet', "
         "so a damaged row reads as an item that never ran and the census "
         "carries it as in-flight forever",
-        """        "exhausted" => ItemOutcome::Exhausted(d),
-        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown item outcome '{other}'"),
-            });
-        }
-    }))""",
-        """        "exhausted" => ItemOutcome::Exhausted(d),
-        _ => return Ok(None),
-    }))""",
+        """    decoded("item outcome", s, ItemOutcome::parse(s, detail.to_owned())).map(Some)""",
+        """    Ok(ItemOutcome::parse(s, detail.to_owned()))""",
     ),
     "ADamagedTimerPhaseDecodesAsForward": (
         "src/store/redb_timers.rs",
@@ -6539,13 +6690,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "unwind logic a compensating record wearing the wrong half of the "
         "saga — the refusal the shared-store backend already makes, absent "
         "from the embedded one",
-        """        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown timer phase '{other}'"),
-            });
-        }""",
-        """        _ => Phase::Forward,""",
+        """    decoded("step phase", s, Phase::parse(s))""",
+        """    Ok(Phase::parse(s).unwrap_or_default())""",
     ),
     "AnUnknownBatchReportsAsRunning": (
         "src/runtime/batch.rs",
@@ -6965,16 +7111,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a compensating wait's delivery is journaled on the forward cursor — "
         "the wait is never satisfied and a strict replay meets a record nothing "
         "requested",
-        """        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown subscription phase '{other}'"),
-            });
-        }""",
-        """        other => {
-            let _ = other;
-            crate::core::Phase::Forward
-        }""",
+        """    decoded("step phase", s, crate::core::Phase::parse(s))""",
+        """    Ok(crate::core::Phase::parse(s).unwrap_or_default())""",
     ),
     "TheOperatorViewHasItsOwnStatusRule": (
         "src/api/mod.rs",
@@ -7152,16 +7290,28 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """#[serde(tag = "kind", rename_all = "PascalCase", deny_unknown_fields)]""",
         """#[serde(tag = "kind", rename_all = "PascalCase")]""",
     ),
-    "ARecordFieldMovesWithoutNotice": (
+    "ARecordFieldIsQuietlyRenamed": (
         "src/journal/record.rs",
         "every_record_kind_hashes_to_its_golden_vector",
-        "the wire order of a record's fields changes, which rehashes every "
-        "record this build will ever write and breaks every journal ever "
-        "written — and reads in review as a tidy-up",
-        """    pub epoch: Epoch,
-    pub v: u16,""",
-        """    pub v: u16,
+        "a record's field is renamed on the wire, which rehashes every record "
+        "this build will ever write and breaks every journal ever written — "
+        "and reads in review as a tidy-up. Field *order* is deliberately not "
+        "this mutation: canonical form sorts keys, so reordering the struct is "
+        "invisible to the format and a corpus that caught it was pinning "
+        "something the chain does not depend on",
+        """    pub epoch: Epoch,""",
+        """    #[serde(rename = "ep")]
     pub epoch: Epoch,""",
+    ),
+    "TheChainHashesUncanonicalBytes": (
+        "src/journal/record.rs",
+        "every_record_kind_hashes_to_its_golden_vector",
+        "a record is sealed over `serde_json`'s output rather than canonical "
+        "bytes, so the hash depends on the order the struct happens to declare "
+        "its fields and on whichever `Map` implementation the dependency graph "
+        "unified to — the two things `canon` exists to take out of the format",
+        """        let raw = canon::to_bytes(&body)?;""",
+        """        let raw = serde_json::to_vec(&body)?;""",
     ),
     "ADeadLetterListingShowsThePayload": (
         "src/api/mod.rs",
@@ -7373,21 +7523,80 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
     return None
 
 
+# Seconds one mutation costs, by the test target its check builds, measured warm
+# on one machine. `None` is a library unit test, which runs `--all-features
+# --lib` and therefore pays for the largest build this crate has.
+#
+# **These only affect balance.** A stale number makes a shard uneven, which is
+# what an unweighted split guarantees anyway; it can never make a sweep skip a
+# mutation or reach a wrong verdict. Re-measure with
+# `/usr/bin/time -p python3 tools/mutants.py <name> --verify` on one mutation
+# per target, warm.
+#
+# The spread is the reason this table exists at all: an equal *count* of
+# mutations is not an equal amount of work, and splitting ten ways by count put
+# every library unit test in two shards that then ran three times as long as the
+# rest — a matrix finishes when its slowest job does.
+_SECONDS_BY_TARGET: dict[str | None, int] = {
+    None: 160,  # --all-features --lib
+    "wire": 54,
+    "guards": 45,
+    "process": 45,
+    "engine": 27,
+    "trust": 19,
+    "live": 30,
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _cost(row) -> int:
+    """What one mutation's check costs, for balancing only.
+
+    Takes a row in either shape the two callers hold — a bare name from
+    [`check`], or the `(name, entry)` pair the sweep sorts — so the partition
+    `check` proves is the partition the sweep performs. Two shard functions is
+    the one way this could be wrong and still look right.
+
+    Cached because [`_locate`] reads every source file in the repository and
+    `check` shards the table six different ways: uncached, proving the partition
+    costs more than the sweep it is protecting.
+    """
+    name = row if isinstance(row, str) else row[0]
+    found = _locate(MUTANTS[name][1])
+    if not found:
+        return 1
+    return _SECONDS_BY_TARGET.get(found[0], 60)
+
+
 def _shard(rows: list, shard: int, total: int) -> list:
     """One slice of `rows`, as `--shard k/n` selects it.
 
     Contiguous, because `rows` arrives grouped by the feature set each mutation
     builds under and the point of a slice is to stay inside as few of those
-    groups as possible. Equal in length to within one, which is the balance
-    left to want once build locality is what a shard's cost is made of.
+    groups as possible.
+
+    Split by **cost rather than by count**. A mutation checked by a library unit
+    test costs six times one checked in the `trust` binary, so ten equal counts
+    are not ten equal jobs; the slices below are equal in seconds and therefore
+    unequal in length, which is the right way round when what is being divided
+    is time.
 
     Shared with [`check`] rather than written twice: a slice that dropped a
     mutation would leave it in no shard at all, and a sweep that skipped a
     guarantee prints the same summary as one that checked it.
     """
-    lo = round((shard - 1) * len(rows) / total)
-    hi = round(shard * len(rows) / total)
-    return rows[lo:hi]
+    weights = [_cost(row) for row in rows]
+    budget = sum(weights)
+    lo = hi = acc = 0
+    for i, w in enumerate(weights):
+        if acc < budget * (shard - 1) / total:
+            lo = hi = i + 1
+        if acc < budget * shard / total:
+            hi = i + 1
+        acc += w
+    # The last shard takes whatever rounding left behind, so the slices always
+    # partition the table however the weights fall.
+    return rows[lo:] if shard == total else rows[lo:hi]
 
 
 def _build_key(test: str) -> tuple[str, str]:
@@ -7491,6 +7700,22 @@ def verify(name: str) -> int:
         return 2
     try:
         out = run([*selector, test])
+        if _target_did_not_build(out):
+            # The derived feature set does not build the target, which is a
+            # defect in this tool or in the test file — never a verdict about
+            # the mutation. Said out loud, because the fallback below *works*:
+            # `--all-features` builds everything, the named test fails, and the
+            # sweep reports KILLED having paid for the whole suite. Thirty per
+            # cent of this table did exactly that, correctly and eight times
+            # over, and the only symptom was a slow CI shard.
+            print(
+                f"{name}: ERROR — `--features {features} --test {target}` does not "
+                f"build. The feature set is derived from the target's own sources, "
+                f"so a test using a gated module without naming the feature makes "
+                f"the whole target unbuildable here while `--all-features` hides it."
+            )
+            print("\n".join(out.splitlines()[-6:]))
+            return 2
         if not _named_test_failed(out, test):
             # Slow path, and only here: the named test held, so the question is
             # now whether *anything* did.
@@ -7520,6 +7745,21 @@ def verify(name: str) -> int:
     print(f"{name}: SURVIVED — nothing failed, so this guarantee has no test "
           f"that can falsify it ({path})")
     return 1
+
+
+def _target_did_not_build(out: str) -> bool:
+    """Whether the *target* failed to compile, as opposed to the mutation.
+
+    The distinction is the whole point. A mutation that breaks the file is a
+    badly written mutation and already has a verdict; a target that cannot be
+    built under the feature set derived for it is a tooling fault that produces
+    the *right* answer down a path that costs eight times as much. Told apart by
+    where the error is: a mutation edits `src/`, so an error pointing into
+    `tests/` is not about it.
+    """
+    if "could not compile" not in out:
+        return False
+    return bool(re.search(r"^\s*-->\s*tests/", out, re.M))
 
 
 def _named_test_failed(out: str, test: str) -> bool:

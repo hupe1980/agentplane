@@ -215,12 +215,17 @@ the worklist and task decisions, plus the backlogs an on-call person asks for by
 question rather than by id: what is quarantined, what is escalated, which
 obligations were missed, which messages reached nobody, and which webhook
 receivers stopped accepting ([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for)).
-Each backlog has a verb that empties it, including the hard one: a run stopped
-on an effect nobody can account for names the call, takes a person's answer
-about what actually happened, and is then judged again by the runtime — or
-written off, in which case what it left standing becomes an audit finding rather
-than leaving with the status
+Every backlog that is *work* has a verb that empties it, including the hard one:
+a run stopped on an effect nobody can account for names the call, takes a
+person's answer about what actually happened, and is then judged again by the
+runtime — or written off, in which case what it left standing becomes an audit
+finding rather than leaving with the status
 ([answering a quarantine](https://hupe1980.github.io/agentplane/docs/operations/#answering-a-quarantine)).
+A missed obligation is answered the same way, by an account that names who
+looked. The one listing with no verb is dead letters, and it is a *diagnosis*
+rather than a queue — the fix is a correlation key in somebody's emitter — so it
+is ordered newest-first, which is what a page onto a list nothing removes from
+has to be.
 On their **own** listener, off
 unless asked for, and separated from the peer surface by *policy* (`peer` reaches
 `a2a:*`, `operator` reaches `api:*`) rather than by the port. A served plane also
@@ -245,15 +250,15 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | | |
 |---|---|
 | 🧾 | **A journal you can audit** — append-only, hash-chained, per-record signatures naming the workload that wrote them, and a per-plane Merkle log so deleting a whole run is detectable |
-| ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect; a suspended run costs a row on disk, not a task. Recovery is *initiated*, not merely possible: the sweep finds every run whose owner died holding it — an expired, unreleased lease — and resumes it, journaling the takeover in its own sealed run |
-| 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never has to migrate an in-flight workflow. Inbound messages arrive at-least-once, so admission takes an idempotency key and claims it in the same transaction that writes the run's first record: a redelivery is answered with the original run — including when that run is parked on a human decision — rather than opening a second identical approval |
+| ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect. Recovery is *initiated*, not merely possible: a sweep finds every run whose owner died holding it and takes it over |
+| 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never migrates an in-flight workflow. Admission claims an idempotency key in the transaction that writes the first record, so a redelivery is answered with the original run |
 | 🛡️ | **Policy before live dispatch** — a total, I/O-free gate; denials are journaled, strict replay never re-judges history, and plan authority is checked before step 1 |
-| 🏷️ | **Field-level information flow** — exact outbound arguments are bound to hierarchical provenance; recipient, amount, path, URL and other authority-bearing fields can require trusted or named sources while ordinary content remains untrusted |
-| 💸 | **Budgets and tenant quotas that bind** — a failed model call is billed for what it burned, because the provider bills for it too, and a replayed run reaches the same tally at the same point: one announced attempt costs one slot and every figure its records carry, whichever pass is reading them. Counts are exact under a plan of any width — a ready set is admitted against what admission has already handed out, and an effect's slot is taken by the same lock that checked for it, so a wave cannot spend a ceiling three times. Tenant spend is settled exactly once per live pass: a durable journal marker supplies recovery intent, and an idempotent store receipt makes a lost acknowledgement retryable without charging twice |
-| 🧬 | **Effects that take together, or not at all** — a group declares the resources it touches and refuses any member outside them. Each reversible member records the concrete call that undoes it, built from what that call *actually returned* rather than reconstructed later from state that has moved — the gap a per-step saga leaves, since `compensate` is handed the output of a step that failed and therefore has none. `commit` is the frontier: invariants are checked there because it is the last instant at which failing them is free, and only then are **deferred** members released. That is what makes an irreversible send safe — an aborted group never sends it, which beats sending and apologising. Doubt reverses nothing |
-| 👤 | **Human oversight on the *call*, not a summary of it** — `requires_approval: true` on a tool grant opens a task carrying the exact tool and arguments about to be dispatched, and nothing happens until somebody approves. A reviewer may also answer *with* the arguments — an approval's amendment dispatches in the model's place, as the reviewer's own trusted value. Where one call changes many things at once, a grant may name a read-only `preview`: the runtime dispatches it with the same arguments and puts the answer in the reviewer's evidence, so *four thousand records* reaches the screen instead of `older_than: "2024-01-01"`. Gating the agent's answer instead is a review that arrives after the money moved. Durable worklists, four-eyes, declared expiry behaviour, and an operator who can *stop* a run and have it unwind — or stop one agent, or one reviewed revision, without stopping the plane |
-| 🔑 | **Erasure that reaches the backups** — deleting clears the live store; the backup taken an hour earlier still has everything, and backups are offsite and often immutable *by design*. So payload bytes are sealed under a per-case data key wrapped by a key the crate never holds: erasing a case **destroys the key**, and every copy becomes unreadable at once — including the ones nobody can reach. Sealed bytes are rotation-immutable, because the chain commits to them, so the erasure scope *is* the rotation unit. **And the journal too**: `SealedJournal::wrap(store, keys, tenant)` seals run input, prompts and tool-call arguments, effect outputs, failure messages, notes and frozen plans under the same per-case scope. Only the *payload* is sealed, so exactly-once and every index keep working with no key; and the chain commits to the **ciphertext**, so an auditor holding no keys still verifies the history of a run whose data is gone → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
-| 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety* rather than only its boundary, **and** the run is journaled and deterministically replayable. Declarative formats give you the first; durable platforms give you the second; the pairing is what makes the evidence about something you can actually read |
+| 🏷️ | **Field-level information flow** — outbound arguments carry hierarchical provenance, so an authority-bearing field can require a trusted or named source while ordinary content stays untrusted |
+| 💸 | **Budgets and tenant quotas that bind** — a failed model call is billed for what it burned, because the provider bills for it too, and a replayed run reaches the same tally at the same point → [budgets](https://hupe1980.github.io/agentplane/docs/plans-cases/#budgets) |
+| 🧬 | **Effects that take together, or not at all** — each reversible member records the concrete call that undoes it, built from what that call *actually returned*; an irreversible send is **deferred** to commit, so an aborted group never sends it → [effects](https://hupe1980.github.io/agentplane/docs/effects/) |
+| 👤 | **Human oversight on the *call*, not a summary of it** — a task carries the exact tool and arguments about to be dispatched, and a read-only `preview` puts *four thousand records* on the reviewer's screen instead of `older_than: "2024-01-01"` → [worklists](https://hupe1980.github.io/agentplane/docs/plans-cases/#human-tasks) |
+| 🔑 | **Erasure that reaches the backups** — payload bytes are sealed under a per-case key the crate never holds, so erasing a case destroys the key and the backup taken an hour ago becomes unreadable too. The chain commits to the **ciphertext**, so an auditor holding no keys still verifies the run → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
+| 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety*, and the run is journaled and deterministically replayable |
 
 Ten rows, not the inventory. The full surface — the export/audit/restore
 toolchain, a durable manifest registry with an enumerable inventory, typed
@@ -285,6 +290,7 @@ What is deliberately **not** built, and what will move →
 | 📄 | [Manifest reference](https://hupe1980.github.io/agentplane/docs/manifest/) — every field, what enforces it, and what an absent value means; the [published JSON Schema](https://hupe1980.github.io/agentplane/agent.schema.json) gives editors autocomplete and inline errors via one modeline |
 | 🧪 | [Testing agents](https://hupe1980.github.io/agentplane/docs/testing/) — the fake provider, fault injection, and proving a replay actually replayed |
 | 🔬 | [How this is proven](https://hupe1980.github.io/agentplane/docs/assurance/) — model-checked specifications, mutation-tested specs, and every guarantee broken on purpose |
+| 📐 | [Record format](https://hupe1980.github.io/agentplane/docs/format/) — the normative wire specification: canonical JSON, the chain, the Merkle log, the export file. Enough to verify a history without this crate |
 | 🔐 | [Security model](https://hupe1980.github.io/agentplane/docs/security/) — the trust boundary, and what it does not cover |
 | 🗝️ | [Erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) — erasure that reaches backups, key rotation and revocation, and how tenants are kept apart |
 | ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability |
@@ -300,7 +306,7 @@ Each layer answers a question the others structurally cannot.
 
 ```sh
 just              # list every check
-just ci           # lint · 3 feature configs · examples · docs · packaging
+just ci           # lint · every feature alone · tests · examples · docs · packaging
 just ci-full      # the above, plus TLA+ specs and the full mutation sweep
 
 python3 tools/mutants.py <name> --verify   # break one guarantee, run its test
@@ -313,6 +319,17 @@ effect protocol, effect groups, retry safety, sagas, fencing, authorization,
 delegation. And because a spec whose invariants cannot be violated proves
 nothing, each is re-checked against deliberately broken copies of itself; every
 mutant must be caught by the *specific* invariant written for it.
+
+**📐 A second reader of the record format.** The
+[format specification](https://hupe1980.github.io/agentplane/docs/format/) is
+normative prose, and `tools/verify_export.py` is written from it and reads none
+of this crate's Rust — enforced by a guard, because a verifier that consulted
+`src/` would agree with the implementation by construction. `just verify-golden`
+runs it: it **re-derives** all 27 record vectors from their parsed values with
+its own canonicalizer and chain digest, verifies the sealed export end to end,
+and then damages that export six ways and asserts each is reported. Vectors a
+project generates and then checks are that project agreeing with itself; this
+is the part that is not.
 
 **🧾 Conformance by the protocol's own kit.** `just test-a2a-tck` runs the
 official [a2a-tck](https://github.com/a2aproject/a2a-tck) against this crate's
@@ -346,28 +363,25 @@ deleting it would have failed no test, because the fixtures laundered the taint
 before it reached the check. It was found by accident. The sweep is so the next
 one is not.
 
-It runs on **every push**, sharded six ways. It was gated to pull requests, on
-the reasoning that a push to `main` had already passed it — true of a repository
-that merges, and this one has never opened a pull request, so the gate switched
-the sweep off rather than making it cheaper. Three mutations then rotted into
-code that no longer *compiled*, leaving three guarantees unfalsifiable with
-every check green. `just anchors` reported all three present, correctly: it
-checks that a mutation still **matches** the code it names, which is text and
-not types.
+It runs on **every push**, sharded ten ways. `MUTANTS_SHARD=k/n` takes a
+contiguous slice of a list grouped by the feature set each mutation builds
+under, cut on **measured seconds rather than count** — a mutation checked by a
+library unit test costs six times one checked in an integration binary, and a
+matrix finishes when its slowest job does. Each shard needs its own checkout:
+the sweep rewrites source in place.
 
-`MUTANTS_SHARD=k/n` takes a round-robin slice — round-robin because the table
-groups mutations by subject, so a contiguous split would hand one shard every
-expensive target. Each line carries a `[current/total]` progress counter, and
-each shard needs its own checkout: the sweep rewrites source in place.
+`just anchors` is the cheap half, and it checks text rather than types: a
+mutation still *matching* the code it names does not prove its replacement still
+compiles. That is what `--verify` is for.
 
 ## 🚫 Non-goals
 
 | agentplane does **not** | Use instead |
 |---|---|
 | Ship a prompt library or IDE | Your prompts; agentplane pins the manifest that governs them by digest |
-| Route or proxy model traffic | LiteLLM, Bifrost — **the drivers themselves ship**: OpenAI Responses, Anthropic Messages and Bedrock Converse are here, with streaming, structured output, reasoning continuation and per-provider failure mappings. What is out of scope is *choosing between them at runtime* |
+| Route or proxy model traffic | LiteLLM, Bifrost. **The drivers themselves ship** — what is out of scope is *choosing between them at runtime* |
 | Implement a vector database | LanceDB / pgvector behind the `SemanticRetriever` seam; embedding is a journaled effect so the query vector is history rather than a recomputation |
-| Ship a built-in tool catalogue | Write a typed `Tool`, or wire an MCP server. The tools other frameworks ship — web search, code interpreter — are mostly **provider-hosted**: they run during generation, so the call is not announced, authorized, metered or replayable. That is a world-visible action outside the journal, which is the one thing this runtime is for. Governed URL fetching is the `media` feature; untrusted code belongs behind a process boundary |
+| Ship a built-in tool catalogue | Write a typed `Tool`, or wire an MCP server. The tools other frameworks ship are mostly **provider-hosted** — they run during generation, so the call is never announced, authorized, metered or replayable |
 | Replace a deterministic protocol engine | Keep it; agentplane sits *beside* it, never inside it |
 | Require Kubernetes | One static binary |
 | Train, fine-tune, or serve models | Permanently out of scope |

@@ -1,4 +1,10 @@
-//! Which IP addresses this plane will connect to.
+//! What an outbound call may do to this process.
+//!
+//! Two halves, and they answer different questions about the same call. This
+//! module decides **which IP addresses this plane will connect to**;
+//! [`intake`] decides **how many bytes an answer may cost**. A counterparty
+//! that cannot make this process connect inward can still make it allocate
+//! without limit, and neither control substitutes for the other.
 //!
 //! Three features dereference a URL somebody else influenced: governed media
 //! fetches one a model was handed, a push notification posts to one a peer
@@ -52,6 +58,18 @@
 mod resolver;
 #[cfg(any(feature = "push", feature = "a2a"))]
 pub(crate) use resolver::{Reach, guarded_client, judge};
+
+// The other half of the outbound edge. Gated on the reqwest-bearing features
+// rather than on a transport of its own: it reads a `reqwest::Response` and
+// every feature listed here is one that holds one.
+#[cfg(any(
+    feature = "providers",
+    feature = "a2a",
+    feature = "media",
+    feature = "witness-http",
+    feature = "keyring-vault",
+))]
+pub mod intake;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

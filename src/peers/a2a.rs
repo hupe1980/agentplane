@@ -448,8 +448,16 @@ impl A2aClient {
             .await
             .map_err(|error| classify_transport(peer, &error))?;
         let status = response.status();
-        let parsed: Result<RpcResponse, _> = response.json().await;
-        let Ok(rpc) = parsed else {
+        // Under this plane's ceiling rather than to end-of-stream. A peer is an
+        // untrusted counterparty by construction, and an answer big enough to
+        // exhaust this process is one it can send. An artifact past the ceiling
+        // is a file, and a file belongs in a blob store addressed by digest
+        // rather than inlined into a response about to become a journal record.
+        let body = crate::netguard::intake::read(response, crate::netguard::intake::ANSWER).await;
+        let Ok(body) = body else {
+            return Err(classify_status(peer, status));
+        };
+        let Ok(rpc) = serde_json::from_slice::<RpcResponse>(&body) else {
             return Err(classify_status(peer, status));
         };
         if !status.is_success() && rpc.jsonrpc.is_none() {

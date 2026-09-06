@@ -538,6 +538,7 @@ async fn the_sweep_surfaces_due_and_approaching_obligations() {
         calendar_digest: Digest::of(b"c"),
         warn_at: None,
         state: DeadlineState::Pending,
+        acknowledged: None,
     };
     let future = agentplane::core::Deadline {
         case,
@@ -546,6 +547,7 @@ async fn the_sweep_surfaces_due_and_approaching_obligations() {
         calendar_digest: Digest::of(b"c"),
         warn_at: None,
         state: DeadlineState::Pending,
+        acknowledged: None,
     };
     store.register_deadline(&overdue).await.unwrap();
     store.register_deadline(&future).await.unwrap();
@@ -919,14 +921,27 @@ impl Skill for Closes {
 /// no record, *who closed this and when* is not answerable from the one place
 /// that is supposed to answer it.
 ///
-/// Observed rather than counted: the case is deliberately reopened after the
-/// live run, so a replay that re-performed the write would close it again and
-/// the assertion sees the state of the world rather than a call count.
+/// The status half is **observed rather than counted**: the case is deliberately
+/// reopened after the live run, so a replay that re-performed the write would
+/// close it again and the assertion sees the state of the world.
+///
+/// The obligation half has to be counted, and that is a fact about the design
+/// rather than a weaker test. How an obligation ended is not editable, so there
+/// is no world-state an operator could leave behind for a re-performed
+/// transition to disturb — `met` re-applied is `met`. The store double counts
+/// the call instead.
 #[tokio::test]
 async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let transitions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted: Arc<dyn CaseStore> = Arc::new(InstrumentedCases {
+        inner: Arc::clone(&store) as Arc<dyn CaseStore>,
+        registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        transitions: Arc::clone(&transitions),
+        escalation_fails: false,
+    });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .cases(Arc::clone(&counted))
         .calendar(Arc::new(WorkingDays) as Arc<dyn Calendar>)
         .skill(Closes)
         .build();
@@ -978,22 +993,18 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
 
     // The world moves on: an operator reopens the case.
     cases.set_status(case, CaseStatus::Open).await.unwrap();
-    let deadline_before = cases
-        .deadlines(case)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|d| d.name == "respond-by")
-        .expect("the deadline exists")
-        .state;
-    cases
-        .set_deadline_state(case, "respond-by", DeadlineState::Pending)
-        .await
-        .unwrap();
-    assert_eq!(deadline_before, DeadlineState::Met);
+    let before = transitions.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(before, 1, "the live run met the obligation exactly once");
 
     let replayed = rt.replay(out.run_id, Mode::Strict).await.unwrap();
     assert_eq!(replayed.status, RunStatus::Succeeded);
+    assert_eq!(
+        transitions.load(std::sync::atomic::Ordering::SeqCst),
+        before,
+        "strict replay transitioned the obligation again — a verification pass \
+         is a pure read, and one that writes to the case layer mutates it every \
+         time somebody runs a regression check"
+    );
 
     assert_eq!(
         cases.case(case).await.unwrap().expect("case").status,
@@ -1010,8 +1021,8 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
             .find(|d| d.name == "respond-by")
             .expect("the deadline exists")
             .state,
-        DeadlineState::Pending,
-        "strict replay transitioned the deadline again"
+        DeadlineState::Met,
+        "the obligation the run met must still read as met"
     );
 }
 
@@ -1045,6 +1056,7 @@ async fn a_sweep_that_hits_its_cap_says_so() {
                 calendar_digest: Digest::of(b"test-calendar"),
                 warn_at: None,
                 state: DeadlineState::Pending,
+                acknowledged: None,
             })
             .await
             .unwrap();
@@ -1109,6 +1121,7 @@ async fn a_sweep_records_what_it_did_in_a_sealed_run() {
             calendar_digest: Digest::of(b"test-calendar"),
             warn_at: None,
             state: DeadlineState::Pending,
+            acknowledged: None,
         })
         .await
         .unwrap();
@@ -1207,6 +1220,7 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
             calendar_digest: Digest::of(b"test-calendar"),
             warn_at: None,
             state: DeadlineState::Pending,
+            acknowledged: None,
         })
         .await
         .unwrap();
@@ -1271,6 +1285,7 @@ async fn a_sweep_decision_that_cannot_be_recorded_is_not_applied() {
             calendar_digest: Digest::of(b"test-calendar"),
             warn_at: None,
             state: DeadlineState::Pending,
+            acknowledged: None,
         })
         .await
         .unwrap();
@@ -1373,6 +1388,7 @@ async fn sweep_evidence_survives_a_later_phase_failure() {
             calendar_digest: Digest::of(b"test-calendar"),
             warn_at: None,
             state: DeadlineState::Pending,
+            acknowledged: None,
         })
         .await
         .unwrap();
@@ -1453,6 +1469,7 @@ async fn a_case_s_history_includes_a_sweep_that_escalated_it() {
                 calendar_digest: Digest::of(b"test-calendar"),
                 warn_at: None,
                 state: DeadlineState::Pending,
+                acknowledged: None,
             })
             .await
             .unwrap();
@@ -1679,6 +1696,9 @@ async fn case_of_reads_the_binding_off_the_run() {
 struct InstrumentedCases {
     inner: Arc<dyn CaseStore>,
     registered: Arc<std::sync::atomic::AtomicUsize>,
+    /// Obligation transitions attempted, so a replay that re-performs one is
+    /// visible even where the transition itself is idempotent.
+    transitions: Arc<std::sync::atomic::AtomicUsize>,
     /// Makes `set_status` fail, standing in for the process dying at that exact
     /// point in the sweep.
     escalation_fails: bool,
@@ -1795,6 +1815,8 @@ impl CaseStore for InstrumentedCases {
         name: &str,
         state: agentplane::core::DeadlineState,
     ) -> Result<(), agentplane::core::StoreError> {
+        self.transitions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.set_deadline_state(case, name, state).await
     }
     async fn breached(
@@ -1802,6 +1824,14 @@ impl CaseStore for InstrumentedCases {
         limit: usize,
     ) -> Result<Vec<agentplane::core::Deadline>, agentplane::core::StoreError> {
         self.inner.breached(limit).await
+    }
+    async fn acknowledge_breach(
+        &self,
+        case: agentplane::core::CaseId,
+        name: &str,
+        note: &agentplane::core::BreachNote,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.acknowledge_breach(case, name, note).await
     }
     async fn due(
         &self,
@@ -1841,6 +1871,7 @@ async fn strict_replay_does_not_re_register_an_obligation() {
     let cases: Arc<dyn CaseStore> = Arc::new(InstrumentedCases {
         inner: store.clone() as Arc<dyn CaseStore>,
         registered: Arc::clone(&registered),
+        transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         escalation_fails: false,
     });
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
@@ -1914,6 +1945,7 @@ async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding
                     calendar_digest: Digest::of(b"test-calendar"),
                     warn_at: None,
                     state: DeadlineState::Pending,
+                    acknowledged: None,
                 })
                 .await
                 .unwrap();
@@ -1927,6 +1959,7 @@ async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding
     let crashing: Arc<dyn CaseStore> = Arc::new(InstrumentedCases {
         inner: Arc::clone(&store) as Arc<dyn CaseStore>,
         registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         escalation_fails: true,
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)

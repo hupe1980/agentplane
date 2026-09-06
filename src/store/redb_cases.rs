@@ -21,11 +21,11 @@ use serde_json::Value;
 
 use crate::case::{CaseCensus, CaseStore, Correlation};
 use crate::core::{
-    Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState, Digest, RunId,
-    StoreError, Timestamp,
+    BreachNote, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState,
+    Digest, RunId, StoreError, Timestamp,
 };
 
-use super::redb::{MAX_STR, RedbStore, be, begin_write};
+use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
 
 /// What a case row holds: `kind`, `status`, `state`, `version`, `opened_at`.
 type CaseRow<'a> = (&'a str, &'a str, &'a str, u64, i64);
@@ -59,9 +59,12 @@ const CASE_RUNS: TableDefinition<(&str, &str, u64), &str> = TableDefinition::new
 const CASE_RUN_SEEN: TableDefinition<(&str, &str, &str), u64> =
     TableDefinition::new("case_run_seen");
 
-/// `(case_id, name) -> (resolved_at, calendar_digest, warn_at, has_warn, state)`.
-/// `(resolved_at, calendar_digest, warn_at, has_warn, state)`.
-type DeadlineRow<'a> = (i64, &'a [u8], i64, u8, &'a str);
+/// `(tenant, case_id, name)` -> the obligation, and whoever has accounted for it.
+///
+/// The account rides on the obligation's own row rather than a second table:
+/// they are written in one transaction and read in one place, so there is no
+/// pair to disagree about whether a breach is still on the listing.
+type DeadlineRow<'a> = (i64, &'a [u8], i64, u8, &'a str, u8, i64, &'a str, &'a str);
 
 const DEADLINES: TableDefinition<(&str, &str, &str), DeadlineRow<'static>> =
     TableDefinition::new("case_deadlines");
@@ -74,6 +77,17 @@ const DEADLINES: TableDefinition<(&str, &str, &str), DeadlineRow<'static>> =
 /// exists to surface early.
 const DEADLINES_DUE: TableDefinition<(&str, i64, &str, &str), i64> =
     TableDefinition::new("case_deadlines_due");
+
+/// `(resolved_at, case_id, name) -> ()`, breached and unaccounted for.
+///
+/// An index rather than a filter over the primary, on the same terms
+/// [`DEADLINES_DUE`] earns its upkeep: the obligation gauge reads it every
+/// sweep tick, and a gauge computed by scanning every obligation a deployment
+/// has ever registered gets slower exactly as the deployment gets busier. It is
+/// written in the transaction that writes the state it reflects, so the two
+/// cannot disagree.
+const DEADLINES_UNACCOUNTED: TableDefinition<(&str, i64, &str, &str), ()> =
+    TableDefinition::new("case_deadlines_unaccounted");
 
 /// `(opened_at, case_id) -> ()`, cases that are not closed.
 ///
@@ -98,41 +112,111 @@ fn from_ts(v: i64) -> Result<Timestamp, StoreError> {
 }
 
 fn status_from(s: &str) -> Result<CaseStatus, StoreError> {
-    Ok(match s {
-        "open" => CaseStatus::Open,
-        "awaiting_external" => CaseStatus::AwaitingExternal,
-        "awaiting_human" => CaseStatus::AwaitingHuman,
-        "escalated" => CaseStatus::Escalated,
-        "closed" => CaseStatus::Closed,
-        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown case status '{other}'"),
-            });
-        }
-    })
+    decoded("case status", s, CaseStatus::parse(s))
 }
 
 fn deadline_state_from(s: &str) -> Result<DeadlineState, StoreError> {
-    Ok(match s {
-        "pending" => DeadlineState::Pending,
-        "warned" => DeadlineState::Warned,
-        "breached" => DeadlineState::Breached,
-        "met" => DeadlineState::Met,
-        "cancelled" => DeadlineState::Cancelled,
-        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown deadline state '{other}'"),
-            });
-        }
-    })
+    decoded("deadline state", s, DeadlineState::parse(s))
 }
 
 /// Whether an obligation is still outstanding, and therefore indexed for the
 /// sweep and blocking closure.
+///
+/// Takes the stored spelling because every caller holds a row, not a decoded
+/// obligation; the rule itself is [`DeadlineState::is_open`], and an
+/// unrecognised state is outstanding — an index that quietly dropped a row it
+/// could not read would let a damaged obligation pass `close`.
 fn is_outstanding(state: &str) -> bool {
-    matches!(state, "pending" | "warned")
+    DeadlineState::parse(state).is_none_or(DeadlineState::is_open)
+}
+
+/// Whether a stored obligation is a breach nobody has accounted for.
+///
+/// The membership rule for [`DEADLINES_UNACCOUNTED`], written once so the
+/// listing, the gauge and the four writers cannot each decide it.
+fn unaccounted(state: &str, has_ack: u8) -> bool {
+    state == DeadlineState::Breached.as_str() && has_ack == 0
+}
+
+/// Keep [`DEADLINES_UNACCOUNTED`] in step with one obligation's row, inside the
+/// transaction that writes it.
+fn reindex_unaccounted(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    case: &str,
+    name: &str,
+    resolved: i64,
+    was: bool,
+    now: bool,
+) -> Result<(), StoreError> {
+    if was == now {
+        return Ok(());
+    }
+    let mut t = w.open_table(DEADLINES_UNACCOUNTED).map_err(|e| be(&e))?;
+    if now {
+        t.insert((tenant, resolved, case, name), ())
+            .map_err(|e| be(&e))?;
+    } else {
+        t.remove((tenant, resolved, case, name))
+            .map_err(|e| be(&e))?;
+    }
+    Ok(())
+}
+
+/// Re-claim a reopened case's correlation keys.
+///
+/// [`close`] releases them so a genuinely new matter about the same entity opens
+/// a fresh case; a case that leaves `Closed` has to take back the ones still
+/// free, or it comes back as a matter no inbound message can ever correlate to
+/// — live-looking and unreachable, which is the drift `close` exists to
+/// prevent, read backwards.
+///
+/// A key another case has since claimed is **left where it is**. The identifier
+/// belongs to whichever matter is open for it now, and a reopening that took one
+/// back would silently redirect that matter's traffic.
+///
+/// [`close`]: crate::case::CaseStore::close
+fn reclaim_correlation(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    case: &str,
+) -> Result<(), StoreError> {
+    let mut mine: Vec<(String, String)> = Vec::new();
+    {
+        let corr_all = w.open_table(CORR_ALL).map_err(|e| be(&e))?;
+        for e in corr_all
+            .range((tenant, case, "", "")..=(tenant, case, MAX_STR, MAX_STR))
+            .map_err(|e| be(&e))?
+        {
+            let (k, _) = e.map_err(|e| be(&e))?;
+            let (_, _, ns, v) = k.value();
+            mine.push((ns.to_owned(), v.to_owned()));
+        }
+    }
+    let mut corr_open = w.open_table(CORR_OPEN).map_err(|e| be(&e))?;
+    for (ns, v) in mine {
+        if corr_open
+            .get((tenant, ns.as_str(), v.as_str()))
+            .map_err(|e| be(&e))?
+            .is_none()
+        {
+            corr_open
+                .insert((tenant, ns.as_str(), v.as_str()), case)
+                .map_err(|e| be(&e))?;
+        }
+    }
+    Ok(())
+}
+
+/// The account's four columns, present or absent.
+///
+/// One encoder so the four writers of a deadline row cannot spell absence four
+/// ways — `has_ack` is what says whether the rest mean anything, exactly as
+/// `has_warn` does for `warn_at`.
+fn ack_columns(note: Option<&BreachNote>) -> (u8, i64, &str, &str) {
+    note.map_or((0, 0, "", ""), |n| {
+        (1, ts(n.at), n.by.as_str(), n.note.as_str())
+    })
 }
 
 /// When an obligation first needs attention.
@@ -148,7 +232,7 @@ fn parse_case_id(id: &str) -> Result<CaseId, StoreError> {
 }
 
 fn build_deadline(case: &str, name: &str, row: DeadlineRow<'_>) -> Result<Deadline, StoreError> {
-    let (resolved_at, digest, warn_at, has_warn, state) = row;
+    let (resolved_at, digest, warn_at, has_warn, state, has_ack, ack_at, by, note) = row;
     let bytes: [u8; 32] = digest.try_into().map_err(|_| StoreError::Corrupt {
         seq: 0,
         detail: "stored calendar digest is not 32 bytes".into(),
@@ -164,6 +248,15 @@ fn build_deadline(case: &str, name: &str, row: DeadlineRow<'_>) -> Result<Deadli
             None
         },
         state: deadline_state_from(state)?,
+        acknowledged: if has_ack == 1 {
+            Some(BreachNote {
+                by: by.to_owned(),
+                note: note.to_owned(),
+                at: from_ts(ack_at)?,
+            })
+        } else {
+            None
+        },
     })
 }
 
@@ -176,6 +269,7 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(CASES).map_err(|e| be(&e))?;
     w.open_table(CORR_OPEN).map_err(|e| be(&e))?;
     w.open_table(CORR_ALL).map_err(|e| be(&e))?;
+    w.open_table(DEADLINES_UNACCOUNTED).map_err(|e| be(&e))?;
     w.open_table(CASE_RUNS).map_err(|e| be(&e))?;
     w.open_table(CASE_BLOBS).map_err(|e| be(&e))?;
     w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
@@ -537,6 +631,7 @@ impl CaseStore for RedbStore {
                     let warn = deadline.warn_at.map(ts);
                     let digest = deadline.calendar_digest.as_bytes().to_vec();
                     let state = deadline.state.as_str();
+                    let (has_ack, ack_at, by, note) = ack_columns(deadline.acknowledged.as_ref());
                     d.insert(
                         (tenant.as_str(), key.as_str(), deadline.name.as_str()),
                         (
@@ -545,6 +640,10 @@ impl CaseStore for RedbStore {
                             warn.unwrap_or(0),
                             u8::from(warn.is_some()),
                             state,
+                            has_ack,
+                            ack_at,
+                            by,
+                            note,
                         ),
                     )
                     .map_err(|e| be(&e))?;
@@ -560,6 +659,15 @@ impl CaseStore for RedbStore {
                         )
                         .map_err(|e| be(&e))?;
                     }
+                    reindex_unaccounted(
+                        &w,
+                        &tenant,
+                        &key,
+                        &deadline.name,
+                        resolved,
+                        false,
+                        unaccounted(state, has_ack),
+                    )?;
                 }
 
                 // Blob links. The export carries digests without their link
@@ -802,7 +910,11 @@ impl CaseStore for RedbStore {
                         (kind.as_str(), status.as_str(), state.as_str(), ver, at),
                     )
                     .map_err(|e| be(&e))?;
+                drop(cases);
                 reindex_status(&w, &tenant, &key, &was, status.as_str(), at)?;
+                if was == CaseStatus::Closed.as_str() {
+                    reclaim_correlation(&w, &tenant, &key)?;
+                }
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
@@ -858,10 +970,16 @@ impl CaseStore for RedbStore {
                 cases
                     .insert(
                         (tenant.as_str(), key.as_str()),
-                        (kind.as_str(), "closed", state.as_str(), ver, at),
+                        (
+                            kind.as_str(),
+                            CaseStatus::Closed.as_str(),
+                            state.as_str(),
+                            ver,
+                            at,
+                        ),
                     )
                     .map_err(|e| be(&e))?;
-                reindex_status(&w, &tenant, &key, &was, "closed", at)?;
+                reindex_status(&w, &tenant, &key, &was, CaseStatus::Closed.as_str(), at)?;
 
                 // Release the correlation keys so a genuinely new matter about
                 // the same entity opens a fresh case rather than reanimating
@@ -908,9 +1026,23 @@ impl CaseStore for RedbStore {
         let warn = deadline.warn_at.map(ts);
         let digest = deadline.calendar_digest.as_bytes().to_vec();
         let state = deadline.state.as_str();
+        let ack = deadline.acknowledged.clone();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
+                // Read inside the write transaction, which is what makes this
+                // and `close` decide one at a time: redb admits one writer, so
+                // the status this reads cannot change before the insert lands.
+                let closed = w
+                    .open_table(CASES)
+                    .map_err(|e| be(&e))?
+                    .get((tenant.as_str(), case.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_some_and(|v| v.value().1 == CaseStatus::Closed.as_str());
+                if closed {
+                    return Err(StoreError::CaseClosed { case });
+                }
+                let (has_ack, ack_at, by, note) = ack_columns(ack.as_ref());
                 let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
                 // First registration wins, as `ON CONFLICT DO NOTHING` did.
                 if d.get((tenant.as_str(), case.as_str(), name.as_str()))
@@ -925,6 +1057,10 @@ impl CaseStore for RedbStore {
                             warn.unwrap_or(0),
                             u8::from(warn.is_some()),
                             state,
+                            has_ack,
+                            ack_at,
+                            by,
+                            note,
                         ),
                     )
                     .map_err(|e| be(&e))?;
@@ -942,6 +1078,16 @@ impl CaseStore for RedbStore {
                             )
                             .map_err(|e| be(&e))?;
                     }
+                    drop(d);
+                    reindex_unaccounted(
+                        &w,
+                        &tenant,
+                        &case,
+                        &name,
+                        resolved,
+                        false,
+                        unaccounted(state, has_ack),
+                    )?;
                 }
             }
             w.commit().map_err(|e| be(&e))?;
@@ -989,16 +1135,50 @@ impl CaseStore for RedbStore {
                     .get((tenant.as_str(), key.as_str(), name.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| {
-                        let (res, dig, warn, has, st) = v.value();
-                        (res, dig.to_vec(), warn, has, st.to_owned())
+                        let (res, dig, warn, has, st, has_ack, at, by, note) = v.value();
+                        (
+                            res,
+                            dig.to_vec(),
+                            warn,
+                            has,
+                            st.to_owned(),
+                            has_ack,
+                            at,
+                            by.to_owned(),
+                            note.to_owned(),
+                        )
                     })
                 else {
                     return Err(StoreError::NotFound(format!("{key}/{name}")));
                 };
-                let (resolved, digest, warn, has_warn, was) = row;
+                let (resolved, digest, warn, has_warn, was, has_ack, ack_at, by, note) = row;
+
+                // How an obligation ended is not editable. `cx.meet_deadline`
+                // reaches this from a skill, so without the check a run that
+                // answered late would take the miss off the operator's listing
+                // and out of the row at once.
+                let from = deadline_state_from(&was)?;
+                if !from.may_become(state) {
+                    return Err(StoreError::DeadlineFinal {
+                        case: key,
+                        obligation: name,
+                        from: was,
+                        to: to.to_owned(),
+                    });
+                }
                 d.insert(
                     (tenant.as_str(), key.as_str(), name.as_str()),
-                    (resolved, digest.as_slice(), warn, has_warn, to),
+                    (
+                        resolved,
+                        digest.as_slice(),
+                        warn,
+                        has_warn,
+                        to,
+                        has_ack,
+                        ack_at,
+                        by.as_str(),
+                        note.as_str(),
+                    ),
                 )
                 .map_err(|e| be(&e))?;
 
@@ -1021,6 +1201,17 @@ impl CaseStore for RedbStore {
                     }
                     _ => {}
                 }
+                drop(due);
+                drop(d);
+                reindex_unaccounted(
+                    &w,
+                    &tenant,
+                    &key,
+                    &name,
+                    resolved,
+                    unaccounted(&was, has_ack),
+                    unaccounted(to, has_ack),
+                )?;
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
@@ -1068,6 +1259,19 @@ impl CaseStore for RedbStore {
                 }
             }
 
+            let idx = r.open_table(DEADLINES_UNACCOUNTED).map_err(|e| be(&e))?;
+            let mut breached = 0u64;
+            for e in idx
+                .range(
+                    (tenant.as_str(), i64::MIN, "", "")
+                        ..=(tenant.as_str(), i64::MAX, MAX_STR, MAX_STR),
+                )
+                .map_err(|e| be(&e))?
+            {
+                e.map_err(|e| be(&e))?;
+                breached += 1;
+            }
+
             Ok(CaseCensus {
                 open,
                 oldest_age_secs: oldest.map(|o| {
@@ -1077,6 +1281,7 @@ impl CaseStore for RedbStore {
                     )
                 }),
                 due,
+                breached,
             })
         })
         .await
@@ -1118,28 +1323,117 @@ impl CaseStore for RedbStore {
         let tenant = self.tenant_name();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
+            let idx = r.open_table(DEADLINES_UNACCOUNTED).map_err(|e| be(&e))?;
             let d = r.open_table(DEADLINES).map_err(|e| be(&e))?;
             let mut out = Vec::new();
-            // The primary, not an index. `DEADLINES_DUE` earns its upkeep by
-            // being scanned every tick; this answers an operator, and a second
-            // copy of the state cannot drift from itself if it does not exist.
-            for e in d
-                .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+            // Ascending by the missed instant, so a truncated answer is the
+            // longest-overdue obligations rather than whichever the key order
+            // reached first — and the truncation is honest, because an
+            // acknowledged breach is not in this index to occupy the page.
+            for e in idx
+                .range(
+                    (tenant.as_str(), i64::MIN, "", "")
+                        ..=(tenant.as_str(), i64::MAX, MAX_STR, MAX_STR),
+                )
                 .map_err(|e| be(&e))?
             {
-                let (k, v) = e.map_err(|e| be(&e))?;
-                let (_, case, name) = k.value();
-                let row = v.value();
-                if row.4 == DeadlineState::Breached.as_str() {
-                    out.push(build_deadline(case, name, row)?);
+                if out.len() >= limit {
+                    break;
                 }
+                let (k, _) = e.map_err(|e| be(&e))?;
+                let (_, _, case, name) = k.value();
+                let Some(row) = d.get((tenant.as_str(), case, name)).map_err(|e| be(&e))? else {
+                    continue;
+                };
+                out.push(build_deadline(case, name, row.value())?);
             }
-            // Sorted before the limit bites, so a truncated answer is the
-            // longest-overdue obligations and not whichever the key order
-            // reached first.
-            out.sort_by_key(|d| d.resolved_at);
-            out.truncate(limit);
             Ok(out)
+        })
+        .await
+    }
+
+    async fn acknowledge_breach(
+        &self,
+        case: CaseId,
+        name: &str,
+        note: &BreachNote,
+    ) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let (key, name) = (case.to_string(), name.to_owned());
+        let note = note.clone();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let recorded = {
+                let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
+                let Some(row) = d
+                    .get((tenant.as_str(), key.as_str(), name.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (res, dig, warn, has, st, has_ack, at, by, n) = v.value();
+                        (
+                            res,
+                            dig.to_vec(),
+                            warn,
+                            has,
+                            st.to_owned(),
+                            has_ack,
+                            at,
+                            by.to_owned(),
+                            n.to_owned(),
+                        )
+                    })
+                else {
+                    return Err(StoreError::NotFound(format!("{key}/{name}")));
+                };
+                let (resolved, digest, warn, has_warn, state, has_ack, ack_at, by, prior) = row;
+                if state != DeadlineState::Breached.as_str() {
+                    return Err(StoreError::NotBreached {
+                        case: key,
+                        obligation: name,
+                        state,
+                    });
+                }
+                // The first account stands. A retry must not rewrite who looked
+                // or when, for the reason an erasure's reason is not rewritable:
+                // the record of who answered is the answer.
+                if has_ack == 1 {
+                    let _ = (ack_at, by, prior);
+                    return Ok(false);
+                }
+                let (now_ack, ack_at, by, n) = ack_columns(Some(&note));
+                d.insert(
+                    (tenant.as_str(), key.as_str(), name.as_str()),
+                    (
+                        resolved,
+                        digest.as_slice(),
+                        warn,
+                        has_warn,
+                        state.as_str(),
+                        now_ack,
+                        ack_at,
+                        by,
+                        n,
+                    ),
+                )
+                .map_err(|e| be(&e))?;
+                drop(d);
+                // Both ends through the same predicate. Spelling them as `true,
+                // false` here would be the membership rule written a second
+                // time, and the copy that drifts is whichever the listing does
+                // not read.
+                reindex_unaccounted(
+                    &w,
+                    &tenant,
+                    &key,
+                    &name,
+                    resolved,
+                    unaccounted(&state, has_ack),
+                    unaccounted(&state, now_ack),
+                )?;
+                true
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(recorded)
         })
         .await
     }
@@ -1204,7 +1498,8 @@ fn reindex_status(
         .map_err(|e| be(&e))?;
 
     let mut open = w.open_table(CASES_OPEN).map_err(|e| be(&e))?;
-    match (was == "closed", now == "closed") {
+    let closed = CaseStatus::Closed.as_str();
+    match (was == closed, now == closed) {
         (false, true) => {
             open.remove((tenant, opened_at, case)).map_err(|e| be(&e))?;
         }
@@ -1215,4 +1510,59 @@ fn reindex_status(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+
+    /// Every string this store writes is one it reads back as the same value.
+    #[test]
+    fn every_written_string_decodes_to_the_value_that_wrote_it() {
+        for status in CaseStatus::ALL {
+            assert_eq!(status_from(status.as_str()).expect("round trip"), status);
+        }
+        for state in DeadlineState::ALL {
+            assert_eq!(
+                deadline_state_from(state.as_str()).expect("round trip"),
+                state
+            );
+        }
+    }
+
+    /// **A row this store cannot read is not a row with a default value.**
+    #[test]
+    fn an_unreadable_column_is_refused_rather_than_defaulted() {
+        for (what, err) in [
+            ("case status", status_from("Closed").err()),
+            ("case status", status_from("").err()),
+            ("deadline state", deadline_state_from("breach").err()),
+        ] {
+            assert!(
+                matches!(err, Some(StoreError::Corrupt { .. })),
+                "an unrecognised {what} decoded to a value instead of refusing"
+            );
+        }
+    }
+
+    /// An obligation whose state will not parse still blocks closure.
+    ///
+    /// `is_outstanding` reads the stored spelling, so it is the one predicate
+    /// here that meets a damaged row before any decoder does. Fail-closed: a
+    /// row that dropped out of the index because nobody could read it is an
+    /// obligation this store forgot, and `close` would then admit a matter
+    /// with an unmet duty — the one thing the whole case layer is built to
+    /// refuse.
+    #[test]
+    fn an_unreadable_obligation_is_still_outstanding() {
+        assert!(is_outstanding(DeadlineState::Pending.as_str()));
+        assert!(is_outstanding(DeadlineState::Warned.as_str()));
+        assert!(!is_outstanding(DeadlineState::Met.as_str()));
+        assert!(!is_outstanding(DeadlineState::Breached.as_str()));
+        assert!(!is_outstanding(DeadlineState::Cancelled.as_str()));
+        assert!(
+            is_outstanding("half a word"),
+            "a state nobody can read must not silently leave the obligation index"
+        );
+    }
 }

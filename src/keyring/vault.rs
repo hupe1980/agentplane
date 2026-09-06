@@ -159,8 +159,11 @@ impl VaultTransit {
             .map_err(|e| KeyError::Unavailable(format!("{url}: {e}")))?;
 
         let status = response.status().as_u16();
-        let text = response
-            .text()
+        // A wrapped key or an error message, both small. The key service is
+        // infrastructure the operator runs, so this is the least adversarial
+        // surface here — read under a ceiling anyway, because a bounded read is
+        // cheaper than an argument about which counterparties are trusted.
+        let text = crate::netguard::intake::read_text(response, crate::netguard::intake::METADATA)
             .await
             .map_err(|e| KeyError::Unavailable(format!("{url}: reading the reply: {e}")))?;
 
@@ -262,34 +265,9 @@ fn first_error(body: &str) -> Option<String> {
         .next()
 }
 
-/// RFC 4648 §4, which is what Vault speaks for key material.
-fn unb64(s: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => u32::from(c - b'A'),
-            b'a'..=b'z' => u32::from(c - b'a') + 26,
-            b'0'..=b'9' => u32::from(c - b'0') + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        })
-    };
-    let raw: Vec<u8> = s.bytes().filter(|b| *b != b'=').collect();
-    let mut out = Vec::with_capacity(raw.len() * 3 / 4);
-    for chunk in raw.chunks(4) {
-        let mut n = 0u32;
-        for (i, c) in chunk.iter().enumerate() {
-            n |= val(*c)? << (18 - 6 * i);
-        }
-        for i in 0..chunk.len() * 6 / 8 {
-            out.push(((n >> (16 - 8 * i)) & 0xff) as u8);
-        }
-    }
-    Some(out)
-}
-
 fn to_key(b64: &str, what: &str) -> Result<DataKey, KeyError> {
-    let raw = unb64(b64).ok_or_else(|| KeyError::Refused(format!("{what} is not valid base64")))?;
+    let raw = crate::core::b64::decode(b64)
+        .ok_or_else(|| KeyError::Refused(format!("{what} is not valid base64")))?;
     let bytes: [u8; 32] = raw.try_into().map_err(|_| {
         KeyError::Refused(format!(
             "{what} is not 32 bytes — ask transit for a 256-bit key"
@@ -434,9 +412,12 @@ mod tests {
     /// from a well-formed reply.
     #[test]
     fn the_base64_decoder_reaches_the_bytes_that_differ() {
-        assert_eq!(unb64("+/8=").expect("decodes"), vec![0xFB, 0xFF]);
+        assert_eq!(
+            crate::core::b64::decode("+/8=").expect("decodes"),
+            vec![0xFB, 0xFF]
+        );
         assert!(
-            unb64("-_8=").is_none(),
+            crate::core::b64::decode("-_8=").is_none(),
             "the URL-safe alphabet was accepted, so a key would decode to the \
              wrong bytes without anything reporting it"
         );

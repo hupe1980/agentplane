@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::core::{
-    Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState, Digest, RunId,
-    StoreError, Timestamp,
+    BreachNote, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState,
+    Digest, RunId, StoreError, Timestamp,
 };
 
 /// What admission did with an inbound trigger.
@@ -212,6 +212,19 @@ pub trait CaseStore: Send + Sync + Debug {
         state: Value,
     ) -> Result<CaseVersion, StoreError>;
 
+    /// Move a case to a status.
+    ///
+    /// `Closed` routes through [`close`](Self::close), because closure releases
+    /// the correlation keys as well as writing the column, and the two spellings
+    /// of *closed* must not drift.
+    ///
+    /// **Leaving `Closed` re-claims them**, which is the same rule read
+    /// backwards. Without it a matter reopened by any route — a run calling
+    /// `set_case_status`, or the sweep escalating over an expired task — comes
+    /// back as a case no inbound message can ever correlate to again, which
+    /// looks exactly like a live matter and is not one. A key another case has
+    /// since claimed stays with that case: the identifier belongs to whichever
+    /// matter is open for it now, and reopening must not take one back.
     async fn set_status(&self, case: CaseId, status: CaseStatus) -> Result<(), StoreError>;
 
     /// Close a case.
@@ -223,6 +236,21 @@ pub trait CaseStore: Send + Sync + Debug {
 
     /// Register an obligation. The resolved instant is stored as given and never
     /// recomputed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::CaseClosed`] if the matter is closed. [`close`](Self::close)
+    /// refuses while an obligation is outstanding, and that check is worth
+    /// nothing on its own: it holds at one instant, and this is the write that
+    /// walks past it afterwards. Both halves are needed for *a closed case owes
+    /// nothing* to be a property of the store rather than of the order two
+    /// callers happened to run in.
+    ///
+    /// Implementations must make the two decide one at a time. The redb backend
+    /// gets that from its single write transaction; a SQL backend has to take
+    /// the case row's lock, because two snapshots each reading the other's
+    /// pre-state is how both writes commit and the matter ends up closed and
+    /// owing.
     async fn register_deadline(&self, deadline: &Deadline) -> Result<(), StoreError>;
 
     async fn deadlines(&self, case: CaseId) -> Result<Vec<Deadline>, StoreError>;
@@ -240,7 +268,7 @@ pub trait CaseStore: Send + Sync + Debug {
     /// deadline is a stored number that nobody reads.
     async fn due(&self, now: Timestamp, limit: usize) -> Result<Vec<Deadline>, StoreError>;
 
-    /// Obligations that were missed, longest-overdue first.
+    /// Missed obligations nobody has accounted for, longest-overdue first.
     ///
     /// Reads the obligation's own row, which outlives every status its case
     /// passes through — the escalation a breach causes is retired by
@@ -248,7 +276,41 @@ pub trait CaseStore: Send + Sync + Debug {
     ///
     /// Not derivable from [`due`](Self::due), which answers *what still needs
     /// attention*. A breach is past attention; it needs an account.
+    ///
+    /// **Acknowledged breaches are excluded**, which is what makes this a backlog
+    /// rather than a level that only rises: taken oldest-first and bounded by a
+    /// page, a listing nothing ever leaves shows the same head forever, and the
+    /// entries an operator could still act on are the ones they never see.
+    /// [`acknowledge_breach`](Self::acknowledge_breach) is the verb that empties
+    /// it; the obligation stays [`Breached`](crate::core::DeadlineState::Breached)
+    /// either way, because what ends is the question, not the fact.
     async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError>;
+
+    /// Record that somebody has accounted for a breach.
+    ///
+    /// Takes it off [`breached`](Self::breached) and leaves the obligation
+    /// `Breached`, with the account readable through
+    /// [`deadlines`](Self::deadlines) — the fact and the answer to it are
+    /// different things and both are kept.
+    ///
+    /// **Idempotent, first account wins.** Returns whether this call was the one
+    /// that recorded it, so a retry cannot rewrite who looked or when — the same
+    /// rule [`KeyRing::destroy`] follows for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the case or the obligation does not exist,
+    /// and [`StoreError::NotBreached`] if it exists and has not been breached —
+    /// accepting an account before the breach would take an obligation off the
+    /// listing while it was still going to be missed.
+    ///
+    /// [`KeyRing::destroy`]: crate::keyring::KeyRing::destroy
+    async fn acknowledge_breach(
+        &self,
+        case: CaseId,
+        name: &str,
+        note: &BreachNote,
+    ) -> Result<bool, StoreError>;
 
     /// Cases matching a status, newest first.
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError>;
@@ -275,4 +337,12 @@ pub struct CaseCensus {
     pub oldest_age_secs: Option<u64>,
     /// Obligations at or past their instant, still `Pending` or `Warned`.
     pub due: u64,
+    /// Breaches nobody has accounted for.
+    ///
+    /// A gauge rather than a counter, and the distinction is the point: this
+    /// number falls when somebody acknowledges one, so an alert on it says
+    /// *there is unattended work* rather than *this deployment has ever missed
+    /// something*. A monotonic instrument cannot express the first, which is
+    /// the only one anybody can act on.
+    pub breached: u64,
 }

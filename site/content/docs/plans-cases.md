@@ -212,14 +212,40 @@ Two schema constraints carry the correctness:
 Every record of a case-bound run carries its case id, so "show me everything
 about this matter" is one indexed range scan instead of a join across runs.
 
-**Closing is guarded.** A case with an unmet obligation refuses to close — as
-the typed `ObligationsOutstanding` refusal, never a backend fault, so a store
-that is merely unreachable cannot read as the rule firing. That is the check
-that stops a missed regulatory window from vanishing behind a tidy status.
-Closing releases the correlation keys, so a genuinely new matter about the
-same entity opens a fresh case rather than reanimating a concluded one. Both
-halves hold on the agent path too: `set_status(Closed)` routes through the
-same closure, and the conformance battery pins the refusal's type on every
+**Closing is guarded, in both directions.** A case with an unmet obligation
+refuses to close — as the typed `ObligationsOutstanding` refusal, never a
+backend fault, so a store that is merely unreachable cannot read as the rule
+firing. That is the check that stops a missed regulatory window from vanishing
+behind a tidy status.
+
+On its own it would only be a check. *A closed case owes nothing* is a property
+of the store rather than of the order two callers happened to run in, so the
+write that could break it afterwards refuses too: registering an obligation on
+a closed case is `CaseClosed`. Without that half the sweep breaches the late
+obligation and escalates, and a matter audited as settled acquires a duty and
+misses it with no run and no operator involved. The two decide one at a time —
+redb by its single write transaction, PostgreSQL by taking the case row's lock
+before it counts.
+
+Closing releases the correlation keys, so a genuinely new matter about the same
+entity opens a fresh case rather than reanimating a concluded one. **Leaving
+`Closed` takes the free ones back**, which is the same rule read backwards: a
+case reopened by any route — a run's `set_case_status`, the sweep escalating
+over an expired task — would otherwise come back live-looking and unreachable,
+a matter no inbound message can correlate to. A key another case has since
+claimed stays where it is; the identifier belongs to whichever matter is open
+for it now.
+
+**How an obligation ended is not editable.** Met, breached and withdrawn are
+terminal. `cx.meet_deadline` is a `set_deadline_state` write like any other, so
+without that rule a run answering after the window closed would move a breached
+obligation to met — erasing the only record that it closed unmet and taking the
+miss off the obligation listing in one call. Re-applying the state already held
+still succeeds, because a sweep repeating its own last write is a retry rather
+than an edit. A late answer is recorded as an account of the breach.
+
+Every half holds on the agent path too: `set_status(Closed)` routes through the
+same closure, and the conformance battery pins each refusal's type on every
 backend.
 
 ### Why a case rather than one long-lived run
@@ -620,6 +646,27 @@ exclusion, dual control is a naming convention.
 Claiming is also atomic: two reviewers opening one queue must not both believe
 they hold a task, and a check followed by a separate write has exactly that
 window.
+
+### A task's state answers three different questions
+
+`GET /tasks`, the backlog gauge and the expiry sweep read three different sets,
+and a backend that treats them as one shows a held decision to a second
+reviewer or stops applying an expiry policy plane-wide.
+
+| State | In the queue | In the backlog | Owed to the expiry sweep |
+|---|---|---|---|
+| `open` | ✅ | ✅ | ✅ |
+| `claimed` | — | ✅ | ✅ |
+| `escalated` | ✅ | ✅ | — |
+| `completed`, `expired` | — | — | — |
+
+A claimed task leaves the queue because it is nobody else's to take, and stays
+in the backlog because it is still a decision the plane is waiting on. An
+escalated one is queued again — escalation releases the claim and widens the
+audience, which is only a remedy if somebody can then see it — and is owed
+nothing further by the sweep, because its expiry policy has already fired. The
+three predicates are `TaskState::is_queued`, `is_pending` and `awaits_expiry`;
+an implementation of `TaskStore` should call them rather than re-deciding.
 
 ### Expiry is declared, never decided in the moment
 

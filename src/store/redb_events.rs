@@ -15,7 +15,11 @@ use crate::core::{
     Timestamp,
 };
 
-use super::redb::{MAX_STR, RedbStore, be, begin_write};
+use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
+
+fn phase_from(s: &str) -> Result<crate::core::Phase, StoreError> {
+    decoded("step phase", s, crate::core::Phase::parse(s))
+}
 
 /// `(source, id) -> (source, id, kind, payload, received_at, claimed_by,
 /// claimed_at, has_claim, dead, dead_reason)`.
@@ -115,41 +119,6 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
     w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
     Ok(())
-}
-
-/// Stored as text so a human reading the table sees which pass is waiting.
-fn phase_str(p: crate::core::Phase) -> &'static str {
-    match p {
-        crate::core::Phase::Forward => "forward",
-        crate::core::Phase::Compensating => "compensating",
-    }
-}
-
-/// Refused rather than defaulted, exactly as the timer store and the
-/// shared-store backend refuse it.
-///
-/// A subscription's phase is which cursor the delivered event is journaled
-/// under, and forward and compensating effects must never share one. Read as
-/// `Forward` on damage, a compensating wait's answer lands on the forward
-/// cursor: the wait it was meant for is never satisfied and waits forever,
-/// while a strict replay finds a record on the forward cursor that this build
-/// never asked for and quarantines the run. Both are silent at the moment the
-/// column is misread.
-///
-/// It is also the only field of this row that was total. Every one beside it —
-/// the case id, the effect key — already answers `Corrupt`, so one decoder
-/// guessed while its neighbours refused.
-fn phase_from(s: &str) -> Result<crate::core::Phase, StoreError> {
-    Ok(match s {
-        "forward" => crate::core::Phase::Forward,
-        "compensating" => crate::core::Phase::Compensating,
-        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown subscription phase '{other}'"),
-            });
-        }
-    })
 }
 
 fn ts(t: Timestamp) -> i64 {
@@ -415,7 +384,7 @@ impl EventStore for RedbStore {
         let case = sub.case.map(|c| c.to_string()).unwrap_or_default();
         let has_case = u8::from(sub.case.is_some());
         let step = sub.step.0;
-        let phase = phase_str(sub.phase);
+        let phase = sub.phase.as_str();
         let kind = sub.kind.clone();
         let keys = sub.correlation.clone();
         self.with_db(move |db| {
@@ -1282,7 +1251,7 @@ mod codec_tests {
             crate::core::Phase::Forward,
             crate::core::Phase::Compensating,
         ] {
-            assert_eq!(phase_from(phase_str(phase)).expect("round trip"), phase);
+            assert_eq!(phase_from(phase.as_str()).expect("round trip"), phase);
         }
     }
 

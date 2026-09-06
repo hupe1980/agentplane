@@ -216,8 +216,10 @@ impl Witness for HttpWitness {
             .map_err(|e| WitnessError::Unavailable(format!("{url}: {e}")))?;
 
         let status = response.status().as_u16();
-        let text = response
-            .text()
+        // A cosignature or a size line — small by construction, so the small
+        // ceiling. A witness is an independent party and that is the point of
+        // it; independent is not the same as trusted with this process's memory.
+        let text = crate::netguard::intake::read_text(response, crate::netguard::intake::METADATA)
             .await
             .map_err(|e| WitnessError::Unavailable(format!("{url}: reading the reply: {e}")))?;
 

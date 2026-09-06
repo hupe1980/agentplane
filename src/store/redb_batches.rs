@@ -6,7 +6,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 use crate::batch::{BatchCensus, BatchStore, ItemOutcome, ItemRecord};
 use crate::core::{BatchId, RunId, Spend, StoreError};
 
-use super::redb::{MAX_STR, RedbStore, be, begin_write};
+use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
 
 /// `batch_id -> (plan_digest, exhausted)`.
 const BATCHES: TableDefinition<(&str, &str), (&str, u8)> = TableDefinition::new("batches");
@@ -29,13 +29,14 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
 }
 
 fn outcome_to_row(o: &ItemOutcome) -> (&'static str, String) {
-    match o {
-        ItemOutcome::Succeeded => ("succeeded", String::new()),
-        ItemOutcome::Failed(d) => ("failed", d.clone()),
-        ItemOutcome::Quarantined(d) => ("quarantined", d.clone()),
-        ItemOutcome::Suspended(d) => ("suspended", d.clone()),
-        ItemOutcome::Exhausted(d) => ("exhausted", d.clone()),
-    }
+    let detail = match o {
+        ItemOutcome::Succeeded => String::new(),
+        ItemOutcome::Failed(d)
+        | ItemOutcome::Quarantined(d)
+        | ItemOutcome::Suspended(d)
+        | ItemOutcome::Exhausted(d) => d.clone(),
+    };
+    (o.as_str(), detail)
 }
 
 /// `None` means *no outcome yet* — and only that. An outcome string this
@@ -46,27 +47,14 @@ fn outcome_from_row(has: u8, s: &str, detail: &str) -> Result<Option<ItemOutcome
     if has != 1 {
         return Ok(None);
     }
-    let d = detail.to_owned();
-    Ok(Some(match s {
-        "succeeded" => ItemOutcome::Succeeded,
-        "failed" => ItemOutcome::Failed(d),
-        "quarantined" => ItemOutcome::Quarantined(d),
-        "suspended" => ItemOutcome::Suspended(d),
-        "exhausted" => ItemOutcome::Exhausted(d),
-        other => {
-            return Err(StoreError::Corrupt {
-                seq: 0,
-                detail: format!("unknown item outcome '{other}'"),
-            });
-        }
-    }))
+    decoded("item outcome", s, ItemOutcome::parse(s, detail.to_owned())).map(Some)
 }
 
 /// Whether an item still needs work. A suspended item is *not* terminal — it is
 /// waiting, and a resume that steps over it reports the batch complete while it
 /// is not.
 fn is_open(has_outcome: u8, outcome: &str) -> bool {
-    has_outcome != 1 || outcome == "suspended" || outcome == "exhausted"
+    has_outcome != 1 || ItemOutcome::parse(outcome, String::new()).is_none_or(|o| !o.is_terminal())
 }
 
 #[async_trait]
@@ -311,27 +299,31 @@ impl BatchStore for RedbStore {
                 let (_, v) = e.map_err(|e| be(&e))?;
                 let (_, outcome, has, _, tokens, minor) = v.value();
                 if has == 1 {
-                    match outcome {
-                        "succeeded" => c.succeeded += 1,
-                        "failed" => c.failed += 1,
-                        "quarantined" => c.quarantined += 1,
-                        "suspended" => c.suspended += 1,
-                        "exhausted" => c.exhausted += 1,
-                        // Damage, not a bucket: filed as in-flight this row
-                        // would keep the batch `Running` forever, silently.
-                        other => {
-                            return Err(StoreError::Corrupt {
-                                seq: 0,
-                                detail: format!("unknown item outcome '{other}'"),
-                            });
-                        }
+                    // Bucketed off the *parsed* outcome, so an outcome added
+                    // later is a compiler error here rather than a row that
+                    // lands in no bucket. Damage is not a bucket either: filed
+                    // as in-flight it would keep the batch `Running` forever,
+                    // silently.
+                    let parsed = decoded(
+                        "item outcome",
+                        outcome,
+                        ItemOutcome::parse(outcome, String::new()),
+                    )?;
+                    match parsed {
+                        ItemOutcome::Succeeded => c.succeeded += 1,
+                        ItemOutcome::Failed(_) => c.failed += 1,
+                        ItemOutcome::Quarantined(_) => c.quarantined += 1,
+                        ItemOutcome::Suspended(_) => c.suspended += 1,
+                        ItemOutcome::Exhausted(_) => c.exhausted += 1,
                     }
                 } else {
                     // Reserved, no outcome recorded.
                     c.in_flight += 1;
                 }
-                c.spend.tokens += tokens;
-                c.spend.minor_units += minor;
+                c.spend += Spend {
+                    tokens,
+                    minor_units: minor,
+                };
             }
             Ok(c)
         })

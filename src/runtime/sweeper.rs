@@ -642,6 +642,7 @@ impl Runtime {
             c.open_cases = cc.open;
             c.oldest_case_age_secs = cc.oldest_age_secs;
             c.due_deadlines = cc.due;
+            c.unaccounted_breaches = cc.breached;
         }
         if let Some(timers) = self.timers() {
             c.pending_timers = timers.pending_count().await?;

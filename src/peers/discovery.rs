@@ -319,10 +319,17 @@ impl CardClient {
             )));
         }
 
-        let card: AgentCard = response
-            .json()
+        // A card is a description of an agent, so the small ceiling applies. A
+        // card is also the one thing here fetched from a URL that may have
+        // arrived in a message, which is why it is read under a ceiling at all.
+        let body = crate::netguard::intake::read(response, crate::netguard::intake::METADATA)
             .await
             .map_err(|e| DiscoveryError::Malformed {
+                url: url.to_owned(),
+                detail: e.to_string(),
+            })?;
+        let card: AgentCard =
+            serde_json::from_slice(&body).map_err(|e| DiscoveryError::Malformed {
                 url: url.to_owned(),
                 detail: e.to_string(),
             })?;

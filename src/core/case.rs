@@ -79,12 +79,15 @@ impl CaseStatus {
 
     /// The inverse of [`as_str`](Self::as_str), for a status arriving as text.
     ///
+    /// **The reason every enum in this crate that reaches a stored column has
+    /// this pair, and the reason nothing else may spell the vocabulary.**
     /// Written over [`ALL`](Self::ALL) rather than as a second `match`, so the
-    /// two directions cannot disagree. A hand-written match here would be one
-    /// rule with two implementations, and the boundary nobody probes is a
-    /// variant added later: `as_str` gets the new arm because the compiler
-    /// insists, and the parser silently starts refusing a status the rest of
-    /// the system emits.
+    /// two directions cannot disagree. `as_str` is exhaustive because the
+    /// compiler insists; a hand-written reader is *total*, so it keeps
+    /// compiling when a variant is added and starts refusing — or worse,
+    /// silently defaulting — a value the writer beside it emits. Every store
+    /// backend reads through here for that reason: two backends deciding a
+    /// vocabulary apart is two answers to one question about the same data.
     ///
     /// Unknown text is `None` rather than a default. A status filter that
     /// silently became `Open` on a typo would answer *what is escalated* with a
@@ -246,11 +249,86 @@ impl DeadlineState {
         }
     }
 
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`ALL`](Self::ALL) for the reason [`CaseStatus::parse`] is.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    /// Every state an obligation can be in.
+    pub const ALL: [Self; 5] = [
+        Self::Pending,
+        Self::Warned,
+        Self::Breached,
+        Self::Met,
+        Self::Cancelled,
+    ];
+
     /// Whether this deadline still constitutes an open obligation.
     #[must_use]
     pub fn is_open(self) -> bool {
         matches!(self, Self::Pending | Self::Warned)
     }
+
+    /// Whether an obligation in this state may be moved to `to`.
+    ///
+    /// The three ways an obligation ends — met, missed, withdrawn — are
+    /// terminal, and [`Breached`](Self::Breached) is the one that has to be.
+    /// It is the only record that a window closed unmet, and
+    /// [`set_deadline_state`] is reachable from a skill: `cx.meet_deadline` on
+    /// an obligation the sweep had already breached would take the miss off the
+    /// operator's listing and out of the row at once, leaving no account of it
+    /// anywhere. Answering late is a fact to record beside the breach — an
+    /// [`acknowledge_breach`] note says so — not a way to unsay it.
+    ///
+    /// Re-applying the state already held is allowed. Every writer here is a
+    /// sweep or a resumed run, and both repeat their own last write by design:
+    /// refusing that would turn an idempotent retry into a failure.
+    ///
+    /// Fails **closed** on a state this relation does not name, so a new
+    /// variant is unmovable until somebody says where it may go rather than
+    /// silently movable anywhere.
+    ///
+    /// [`set_deadline_state`]: crate::case::CaseStore::set_deadline_state
+    /// [`acknowledge_breach`]: crate::case::CaseStore::acknowledge_breach
+    #[must_use]
+    pub const fn may_become(self, to: Self) -> bool {
+        matches!(
+            (self, to),
+            (Self::Pending, Self::Pending | Self::Warned)
+                | (Self::Warned, Self::Warned)
+                | (Self::Met, Self::Met)
+                | (Self::Breached, Self::Breached)
+                | (Self::Cancelled, Self::Cancelled)
+                | (
+                    Self::Pending | Self::Warned,
+                    Self::Met | Self::Breached | Self::Cancelled
+                )
+        )
+    }
+}
+
+/// Somebody's account of a breach.
+///
+/// A missed obligation is a fact and does not stop being one. What can end is
+/// the *question* it puts to an operator — has anybody looked at this. The
+/// obligation keeps [`Breached`](DeadlineState::Breached); the listing that asks
+/// the question stops returning it. Why that listing has to drain is on
+/// [`CaseStore::breached`].
+///
+/// [`CaseStore::breached`]: crate::case::CaseStore::breached
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreachNote {
+    /// The authenticated actor who accounted for it. Never taken from a request
+    /// body: an account of a missed obligation that names whoever the caller
+    /// said they were is not an account.
+    pub by: String,
+    /// What they had to say. May be empty — an operator who has looked and has
+    /// nothing to add has still answered the question the listing asked.
+    pub note: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: Timestamp,
 }
 
 /// A registered obligation with a resolved instant.
@@ -274,12 +352,32 @@ pub struct Deadline {
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub warn_at: Option<Timestamp>,
     pub state: DeadlineState,
+    /// Who accounted for the breach, once somebody has.
+    ///
+    /// Only ever set on a [`Breached`](DeadlineState::Breached) obligation, and
+    /// it is what takes the breach off the obligation listing — see
+    /// [`CaseStore::acknowledge_breach`]. `None` on every other state, because
+    /// there is nothing to account for.
+    ///
+    /// [`CaseStore::acknowledge_breach`]: crate::case::CaseStore::acknowledge_breach
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged: Option<BreachNote>,
 }
 
 impl Deadline {
     #[must_use]
     pub fn is_due(&self, now: Timestamp) -> bool {
         self.state.is_open() && now >= self.resolved_at
+    }
+
+    /// A breach nobody has accounted for yet.
+    ///
+    /// The predicate behind the obligation listing, written once so the two
+    /// backends compare the same two things rather than each deciding what
+    /// "still on the list" means.
+    #[must_use]
+    pub const fn is_unaccounted(&self) -> bool {
+        matches!(self.state, DeadlineState::Breached) && self.acknowledged.is_none()
     }
 
     #[must_use]

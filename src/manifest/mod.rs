@@ -990,8 +990,7 @@ pub struct Security {
     /// since a sealed record is still a record and a key ring is still an
     /// operational dependency.
     ///
-    /// Absent means unbounded, which is the behaviour every deployment had
-    /// before this field existed. Setting it makes the mistake a refusal at
+    /// Absent means unbounded. Setting it makes the mistake a refusal at
     /// dispatch rather than a discovery at an erasure request: bytes above the
     /// ceiling belong in a blob, with the chain committing to the digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]

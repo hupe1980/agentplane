@@ -69,8 +69,6 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-#[cfg(feature = "media")]
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1517,7 +1515,7 @@ async fn materialize_media(
         })?;
         crate::media::verify_materialized(&reference.media_type, &bytes)
             .map_err(EffectError::Rejected)?;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let encoded = crate::core::b64::encode(bytes);
         let value = match reference.encoding.as_str() {
             "base64" => encoded,
             "data_url" => format!("data:{};base64,{encoded}", reference.media_type),

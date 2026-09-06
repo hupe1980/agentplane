@@ -4890,11 +4890,7 @@ impl Runtime {
             telemetry::STEP_SPAN,
             { telemetry::STEP } = tracing::field::display(ctx.node.id),
             { telemetry::CAPABILITY } = tracing::field::display(&ctx.node.capability.0),
-            { telemetry::PHASE } = if ctx.phase.is_forward() {
-                "forward"
-            } else {
-                "compensating"
-            },
+            { telemetry::PHASE } = ctx.phase.as_str(),
             { telemetry::MODE } = telemetry::mode_str(ctx.mode),
             { telemetry::OUTCOME } = tracing::field::Empty,
         );
