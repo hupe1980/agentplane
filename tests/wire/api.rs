@@ -730,6 +730,32 @@ async fn only_the_holder_can_release_a_claim() {
 
 // ── Both gates, on every route ──────────────────────────────────────────────
 
+/// The webhook routes, when this build serves them.
+///
+/// Empty without the feature, so the walks below extend **unconditionally**. A
+/// `#[cfg]` on the `extend` instead leaves the vector's `mut` unused in the
+/// build that omits it, and `-D warnings` then fails the one job that compiles
+/// exactly that combination — `just test-http`, which is a separate CI job and
+/// not part of `just ci`.
+fn push_routes(actor: Option<&str>) -> Vec<Request<Body>> {
+    #[cfg(feature = "push")]
+    {
+        vec![
+            get("/push", actor),
+            post(
+                "/push/rearm",
+                actor,
+                &json!({ "run": "not-an-id", "id": "d" }),
+            ),
+        ]
+    }
+    #[cfg(not(feature = "push"))]
+    {
+        let _ = actor;
+        Vec::new()
+    }
+}
+
 /// No credentials, no answer — on every route.
 #[tokio::test]
 async fn an_unauthenticated_request_is_refused_everywhere() {
@@ -781,14 +807,7 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
         ),
         get("/dead-letters", None),
     ];
-    // Served only when the feature that carries webhook delivery is compiled
-    // in, so the walk asks about them only then — a 404 for a route that does
-    // not exist is not a gate refusing anybody.
-    #[cfg(feature = "push")]
-    requests.extend([
-        get("/push", None),
-        post("/push/rearm", None, &json!({ "run": "r", "id": "d" })),
-    ]);
+    requests.extend(push_routes(None));
     for req in requests {
         let uri = req.uri().to_string();
         let (status, _) = send(&router, req).await;
@@ -874,15 +893,7 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         get("/obligations", Some("bob")),
         get("/dead-letters", Some("bob")),
     ];
-    #[cfg(feature = "push")]
-    requests.extend([
-        get("/push", Some("bob")),
-        post(
-            "/push/rearm",
-            Some("bob"),
-            &json!({ "run": "not-an-id", "id": "d" }),
-        ),
-    ]);
+    requests.extend(push_routes(Some("bob")));
     for req in requests {
         let uri = req.uri().to_string();
         let (status, body) = send(&router, req).await;

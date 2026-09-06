@@ -16,9 +16,16 @@ just ci           # what CI runs, in one pass
 just ci-full      # the above, plus TLA+ specs and the full mutation sweep
 ```
 
-`just ci` is the same set of commands CI runs, called through the same recipes —
-so a check cannot drift between your machine and the pipeline. When they differ,
-the pipeline is right and you find out late; the justfile exists so they cannot.
+`just ci` runs the same commands CI runs, through the same recipes, so a check
+cannot drift between your machine and the pipeline. When they differ, the
+pipeline is right and you find out late; the justfile exists so they cannot, and
+a guard in `tests/guards/docs.rs` holds every recipe the workflows invoke to
+either `just ci` or a named exemption.
+
+**Two exemptions, both because they need a daemon**: `just test-postgres` and
+`just test-vault` want a container, so they stay their own CI jobs rather than
+making the local gate depend on Docker. Run them before touching a store
+backend or the key ring.
 
 **What to run when:**
 

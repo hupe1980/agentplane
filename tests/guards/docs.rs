@@ -1862,6 +1862,140 @@ fn every_documentation_page_is_in_the_navigation() {
     assert!(pages > 10, "found only {pages} pages — wrong tree");
 }
 
+/// **Every recipe the pipeline invokes is one the local gate runs.**
+///
+/// `CONTRIBUTING.md` promises that `just ci` is what CI runs, "so a check
+/// cannot drift between your machine and the pipeline". That promise has been
+/// false twice, and both times the symptom was a green local gate and a red
+/// pipeline: once for `site-check`, once for the per-seam test jobs, where a
+/// list built under a `#[cfg]` left an unused `mut` visible only to the one
+/// feature combination `just ci` never compiled.
+///
+/// The failure is structural rather than careless. A workflow gains a job by
+/// editing YAML; the local gate gains a step by editing a justfile; nothing
+/// holds the two together, and the drift is invisible until a push.
+///
+/// Exemptions are named here with a reason, because a recipe that needs a
+/// container must not make the local gate depend on a daemon — but the *set* of
+/// such recipes is a decision, not a default.
+#[test]
+fn every_recipe_ci_runs_is_in_the_local_gate() {
+    /// Recipes the pipeline runs that `just ci` deliberately does not.
+    const OWN_JOB: &[(&str, &str)] = &[
+        ("ci", "the gate itself"),
+        ("ci-full", "the gate plus the two slow layers"),
+        (
+            "mutants",
+            "its own job: it rebuilds the library once per mutation",
+        ),
+        (
+            "specs",
+            "its own job: TLA+ model checking, minutes per spec",
+        ),
+        ("test-postgres", "needs a PostgreSQL container"),
+        ("test-vault", "needs a Vault container"),
+    ];
+
+    let justfile = read("justfile");
+    let gate: Vec<&str> = justfile
+        .lines()
+        .find_map(|l| l.strip_prefix("ci: "))
+        .expect("the justfile declares a `ci` recipe")
+        .split_whitespace()
+        .collect();
+    assert!(gate.len() > 5, "got {gate:?}");
+
+    // Everything `ci` reaches, including one level of composition — `seams`
+    // exists precisely to name four recipes at once.
+    let mut reached: Vec<String> = gate.iter().map(|s| (*s).to_owned()).collect();
+    for step in &gate {
+        if let Some(deps) = justfile
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{step}: ")))
+        {
+            reached.extend(deps.split_whitespace().map(ToOwned::to_owned));
+        }
+    }
+
+    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut missing = Vec::new();
+    let mut invoked = 0usize;
+    for entry in std::fs::read_dir(&workflows)
+        .expect("read .github/workflows")
+        .filter_map(Result::ok)
+    {
+        let file = entry.file_name().to_string_lossy().to_string();
+        let yaml = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        for line in yaml.lines() {
+            let Some(rest) = line.split("just ").nth(1) else {
+                continue;
+            };
+            let stem: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            if stem.is_empty() {
+                continue;
+            }
+            // `just test-${{ matrix.seam }}` is five recipes, and taking the
+            // literal prefix as one name checks none of them — which is how the
+            // first version of this test passed while the seams were missing
+            // from the gate. The matrix is expanded from its own declaration.
+            for recipe in expand_matrix(&yaml, &stem, rest) {
+                invoked += 1;
+                if !reached.contains(&recipe) && !OWN_JOB.iter().any(|(name, _)| *name == recipe) {
+                    missing.push(format!("{file}: just {recipe}"));
+                }
+            }
+        }
+    }
+    assert!(
+        invoked > 6,
+        "found only {invoked} recipe invocations across the workflows — the matrix \
+         is not being expanded, and a guard that checks nothing passes"
+    );
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "the pipeline runs these and `just ci` does not, so they fail after a push \
+         rather than before one — add them to the gate, or to this test's exemption \
+         list with the reason they cannot be:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// One workflow invocation, as the set of recipes it actually runs.
+///
+/// A plain name is itself. `test-${{ matrix.seam }}` is one recipe per entry in
+/// the job's `seam:` list, read from the same file rather than restated here —
+/// a list in two places is the drift this whole test exists to catch.
+fn expand_matrix(yaml: &str, stem: &str, rest: &str) -> Vec<String> {
+    let Some(var) = rest
+        .split("matrix.")
+        .nth(1)
+        .map(|v| {
+            v.chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect::<String>()
+        })
+        .filter(|v| !v.is_empty())
+    else {
+        return vec![stem.to_owned()];
+    };
+    let Some(values) = yaml
+        .lines()
+        .find_map(|l| l.trim().strip_prefix(&format!("{var}: [")))
+        .and_then(|l| l.split(']').next())
+    else {
+        panic!("a workflow expands `matrix.{var}` and no `{var}: [...]` declares it");
+    };
+    values
+        .split(',')
+        .map(|v| format!("{stem}{}", v.trim()))
+        .collect()
+}
+
 /// **A heading with an emoji in it names its own anchor.**
 ///
 /// Zola slugifies an emoji to its Unicode name, so `## 🎲 Disposition` becomes

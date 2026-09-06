@@ -189,6 +189,31 @@ that actually seal something: `RunAdmitted`, `PlanFrozen`, `EffectStarted`,
 in `..`. Those are the arms where the silence costs most, because a new payload
 field on one of them is by construction the caller's data. All named now.
 
+### Fixed — the local gate did not compile the tests CI compiles
+
+`just ci` went green and the pipeline went red, on an unused `mut`: a list built
+under `#[cfg(feature = "push")]` leaves the vector's `mut` unused in a build
+without that feature, and `-D warnings` refuses it. Nothing local saw it. The
+`features` stage lints one feature at a time and without `--all-targets`, so it
+never compiles a *test*; every stage that does compile tests runs
+`--all-features`, the defaults, or nothing. The one configuration that sees it
+is `just test-http` — `http,redb` and no more — which is a separate CI job.
+
+`just ci` now runs `seams` (`test-mcp`, `test-http`, `test-attestation`,
+`test-drivers`), about ninety seconds warm. `test-postgres` and `test-vault`
+stay out and stay named: both need a container, and the local gate must not
+depend on a daemon.
+
+The promise this broke is one `CONTRIBUTING.md` makes in so many words — *"a
+check cannot drift between your machine and the pipeline"* — and it had already
+been false once, for `site-check`. A promise that has now failed twice is a
+guard's job, so `every_recipe_ci_runs_is_in_the_local_gate` holds every recipe
+the workflows invoke to either the `ci` chain or a named exemption. It expands
+`just test-${{ matrix.seam }}` from the matrix that declares it: the first
+version took the literal prefix as one recipe name, checked none of the five,
+and passed with all four seams missing from the gate — a check that could not
+fail, written while fixing a check that did not exist.
+
 ### Fixed — every emoji in a heading was naming that heading's URL
 
 Zola slugifies an emoji to its Unicode name, so `## 🎲 Disposition` published as

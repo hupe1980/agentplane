@@ -365,11 +365,24 @@ audit:
 
 # ── What CI runs ────────────────────────────────────────────────────────────
 
-# `mutants` and `specs` are their own CI jobs because they rebuild repeatedly;
-# run them before a release, not on every save.
+# Each seam compiled and tested with *only* its own features on — the
+# configuration an embedder who wants that seam and nothing else builds.
+#
+# `features` is not this: it lints one feature at a time and without
+# `--all-targets`, so it never compiles a *test*. That is the gap these close.
+# A test file gated on two features (`http` + `redb`) is empty under either
+# alone, so a list built conditionally under a third (`push`) left an unused
+# `mut` that only this combination sees — green everywhere else, `-D warnings`
+# here.
+#
+# `postgres` and `vault` are deliberately absent: both need a container, so they
+# stay their own recipes and their own CI jobs rather than making `ci` depend on
+# a daemon. Everything here needs nothing but cargo, and costs about 90 seconds
+# warm.
+seams: test-mcp test-http test-attestation test-drivers
 
 # everything CI runs, minus the two slow layers
-ci: lint features anchors audit test test-default test-minimal examples cli-smoke doc-examples docs site-check package
+ci: lint features anchors audit test test-default test-minimal seams examples cli-smoke doc-examples docs site-check package
 
 # everything, including the slow layers — what a release must pass
 ci-full: ci specs mutants
