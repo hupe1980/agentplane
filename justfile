@@ -324,8 +324,13 @@ doc-examples:
 # breaks it — while an external link is a property of somebody else's server,
 # so checking one in the gate makes a green build depend on the internet. The
 # deploy job checks both.
+# The same check the Pages workflow runs, external links included.
+#
+# Skipping them locally is what let a link to an unreleased item reach a push:
+# `docs.rs/…/latest` serves the last *published* crate, so a link to anything
+# added since resolves to a 404 that only the network can see. ~5 s.
 site-check:
-    cd site && zola check --skip-external-links
+    cd site && zola check
 
 # build the docs site into site/public
 site: site-check

@@ -190,8 +190,7 @@ call carries a timeout, which bounds how long an answer may take and says
 nothing about how much arrives inside it — a fast endpoint delivers a gigabyte
 long before one fires, and one OOM takes down every run on the instance.
 
-[`netguard::intake`](https://docs.rs/agentplane/latest/agentplane/netguard/intake/)
-is that ceiling, applied twice per call: against the declared `Content-Length`
+`netguard::intake` is that ceiling, applied twice per call: against the declared `Content-Length`
 before a byte is read, then against the accumulated bytes. The second is the one
 that matters — the header is a claim by the party under suspicion.
 

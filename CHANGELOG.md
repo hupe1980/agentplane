@@ -41,6 +41,43 @@ archaeology presented as a record.
 
 ## [0.30.0] — 2026-09-06
 
+### Fixed — a documentation link to an API that is not published yet
+
+`security.md` linked `netguard::intake` to
+`docs.rs/agentplane/latest/agentplane/netguard/intake/`. That module is new in
+this release, and `docs.rs/…/latest` serves the last *published* crate — so the
+link 404s until the version carrying it ships. It is named in code rather than
+linked, which is what any reference to unreleased API has to be.
+
+**It reached a push because the local gate ran a weaker command than the
+pipeline.** `just site-check` ran `zola check --skip-external-links`; the Pages
+workflow runs `zola check`. Only the second resolves a link, so the one class of
+error that needs the network was the one class the gate declined to look for.
+The recipe now runs what the pipeline runs — 5 seconds, and it reproduces the
+failure locally.
+
+### Fixed — the gate-parity guard could only see half of a workflow
+
+`every_recipe_ci_runs_is_in_the_local_gate` holds every `just <recipe>` the
+pipeline invokes to the local gate's chain. A workflow step that runs a tool
+*itself* contains no `just`, so it was invisible: the divergence above walked
+out through the spelling the guard does not read. A control that inspects one
+shape of CI step leaves the other unguarded, and that is worse than no control,
+because the survey sentence reads as complete.
+
+`every_command_ci_runs_itself_is_one_the_gate_runs` reads the raw `run:` steps
+of the verification workflows, splits each on `&&`, and requires every command
+to be one a recipe runs — or to be named, with its reason, in a short exemption
+list. `release.yml` is exempt wholesale: it publishes rather than checks, and
+its steps cannot have a local twin.
+
+**The first version of it was itself a check that could not fail**, which is why
+this project proves a guard bites before believing it. Matching with
+`justfile.contains(command)` accepts a *substring*, so the weaker `zola check
+--skip-external-links` satisfied a pipeline step running `zola check` — the
+exact defect, admitted by the matching rule. It compares whole commands now, and
+reintroducing the divergence fails it.
+
 ### Added — a second implementation reads the format specification and derives the same bytes
 
 `tools/verify_export.py` is written from the

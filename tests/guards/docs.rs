@@ -1965,6 +1965,90 @@ fn every_recipe_ci_runs_is_in_the_local_gate() {
     );
 }
 
+/// A workflow step that runs a tool directly is held to the gate too.
+///
+/// The half above reads `just <recipe>` lines, so a step that invokes a tool
+/// itself is invisible to it — and that is the shape the divergence took: the
+/// Pages workflow ran `zola check` while the local recipe ran `zola check
+/// --skip-external-links`, so the gate deliberately skipped the one check that
+/// failed. A control that inspects one spelling of a CI step leaves the other
+/// spelling unguarded, which is worse than no control, because the survey
+/// sentence reads as complete.
+///
+/// Verification workflows only. `release.yml` publishes rather than checks, and
+/// its steps cannot have a local equivalent by construction.
+#[test]
+fn every_command_ci_runs_itself_is_one_the_gate_runs() {
+    /// Steps that legitimately have no local twin, with the reason.
+    const NOT_LOCAL: &[(&str, &str)] = &[(
+        "cargo check --all-features",
+        "the MSRV job, which pins a toolchain the local gate does not install",
+    )];
+
+    // Whole commands, never substrings. `contains` would let the weaker
+    // `zola check --skip-external-links` satisfy a CI step running `zola
+    // check` — the exact divergence this exists to catch, admitted by the
+    // matching rule rather than by the justfile.
+    let justfile = read("justfile");
+    let recipe_commands: Vec<String> = justfile
+        .lines()
+        .filter(|l| l.starts_with(char::is_whitespace))
+        .flat_map(|l| l.split("&&"))
+        .map(|c| c.trim().to_owned())
+        .filter(|c| !c.is_empty())
+        .collect();
+
+    let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let mut missing = Vec::new();
+    let mut checked = 0usize;
+
+    for entry in std::fs::read_dir(&workflows)
+        .expect("read .github/workflows")
+        .filter_map(Result::ok)
+    {
+        let file = entry.file_name().to_string_lossy().to_string();
+        if file.starts_with("release") {
+            continue;
+        }
+        let yaml = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        for line in yaml.lines() {
+            let Some(command) = line.trim().strip_prefix("- run: ") else {
+                continue;
+            };
+            let command = command.trim();
+            if command.contains("just ") {
+                continue; // the other half of this pair reads those
+            }
+            checked += 1;
+            // Every command the step chains, so `a && b` is two claims.
+            for part in command.split("&&").map(str::trim) {
+                if part.is_empty()
+                    || NOT_LOCAL.iter().any(|(exempt, _)| *exempt == part)
+                    || recipe_commands.iter().any(|c| c == part)
+                {
+                    continue;
+                }
+                missing.push(format!("{file}: {part}"));
+            }
+        }
+    }
+
+    assert!(
+        checked > 0,
+        "no raw run step was found at all — the guard is reading nothing rather \
+         than passing"
+    );
+    missing.sort();
+    missing.dedup();
+    assert!(
+        missing.is_empty(),
+        "the pipeline runs these itself and no recipe does, so they fail after a \
+         push rather than before one — give them a recipe the gate reaches, or \
+         name them in this test's exemption list:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
 /// One workflow invocation, as the set of recipes it actually runs.
 ///
 /// A plain name is itself. `test-${{ matrix.seam }}` is one recipe per entry in
