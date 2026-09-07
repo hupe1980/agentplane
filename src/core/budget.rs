@@ -257,13 +257,24 @@ pub struct Budget {
     /// anything else may widen. Zero permits no step at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_steps: Option<usize>,
-    /// How many times the policy may refuse this run before it is stopped.
+    /// How many times this run may be refused before it is stopped.
     ///
-    /// **A run that keeps hitting the policy is probing it.** Refusals carry a
-    /// uniform message precisely so a model cannot tell one from another
+    /// **A run that keeps being refused is probing.** Refusals carry a uniform
+    /// message precisely so a model cannot tell one from another
     /// ([`REFUSED`](crate::core::REFUSED)), but the refused/allowed bit itself
     /// still leaks one bit per attempt, and nothing short of fabricating success
     /// removes that. What bounds the channel is bounding the attempts.
+    ///
+    /// **Both refusal paths count, and they behave differently.** A sink
+    /// refusal — an untrusted value in a protected field, a sensitivity over a
+    /// ceiling — comes back to a tool-calling model as `REFUSED` and the loop
+    /// continues, so those accumulate and this is what stops them. An engine
+    /// denial is not model-facing at all: in that same loop it ends the run
+    /// outright, which is a stricter bound than any ceiling, and it accumulates
+    /// only where a run's own code catches
+    /// [`StepError::Denied`](crate::core::StepError::Denied) and carries on.
+    /// Counting only the second would leave the ceiling naming a channel it did
+    /// not reach.
     ///
     /// It is an operational ceiling as much as a security one: a run stuck in a
     /// denial loop has stopped making progress, exactly like one that replans
@@ -361,7 +372,7 @@ impl Budget {
         self
     }
 
-    /// How many policy refusals this run may accrue.
+    /// How many refusals this run may accrue — sink and engine alike.
     #[must_use]
     pub const fn denials(mut self, n: u32) -> Self {
         self.max_denials = Some(n);

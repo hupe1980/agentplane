@@ -1742,9 +1742,7 @@ mod tests {
         let config = aws_sdk_bedrockruntime::Config::builder()
             .region(Region::new("eu-west-1"))
             .behavior_version_latest()
-            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                |_req| http::Response::builder().status(200).body("").unwrap(),
-            ))
+            .http_client(crate::model::canned_http(200, None, ""))
             .build();
         let client = Client::from_conf(config);
         let plain = Bedrock::from_client(client.clone()).expect("a client with a region");
@@ -1808,9 +1806,7 @@ mod tests {
             // suite the macOS keychain read can transiently yield zero roots
             // — a panic inside aws-smithy, in a test that asserts a JSON
             // profile and never opens a connection.
-            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                |_req| http::Response::builder().status(200).body("").unwrap(),
-            ))
+            .http_client(crate::model::canned_http(200, None, ""))
             .build();
         let driver =
             Bedrock::from_client(Client::from_conf(config)).expect("a client with a region");
@@ -1858,9 +1854,7 @@ mod tests {
         let stub = |region: Option<&str>| {
             let mut config = aws_sdk_bedrockruntime::Config::builder()
                 .behavior_version_latest()
-                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                    |_req| http::Response::builder().status(200).body("").unwrap(),
-                ));
+                .http_client(crate::model::canned_http(200, None, ""));
             if let Some(region) = region {
                 config = config.region(Region::new(region.to_owned()));
             }
@@ -1896,9 +1890,7 @@ mod tests {
         let config = aws_sdk_bedrockruntime::Config::builder()
             .region(Region::new("eu-west-1"))
             .behavior_version_latest()
-            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                |_req| http::Response::builder().status(200).body("").unwrap(),
-            ))
+            .http_client(crate::model::canned_http(200, None, ""))
             .build();
         Bedrock::from_client(Client::from_conf(config)).expect("a client with a region")
     }

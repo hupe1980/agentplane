@@ -327,4 +327,35 @@ impl QuotaStore for RedbStore {
         })
         .await
     }
+
+    async fn running_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(t) = r.open_table(RUNNING) else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for e in t
+                .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, _) = e.map_err(|e| be(&e))?;
+                let raw = k.value().1;
+                // A key this store cannot read is damage, not absence: skipping
+                // it would hide exactly the stranded slot this listing exists to
+                // name, and hide it as a shorter list nobody can tell from a
+                // shorter queue.
+                out.push(RunId::parse(raw).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("bad run id '{raw}' in the quota slot table: {e}"),
+                })?);
+            }
+            Ok(out)
+        })
+        .await
+    }
 }

@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chacha20poly1305::aead::{Aead, AeadCore, OsRng};
+use chacha20poly1305::aead::{Aead, Generate as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -148,7 +148,7 @@ impl EncryptedMemoryStore {
             .data_key(&self.scope(&item.subject))
             .await
             .map_err(key_error)?;
-        let nonce = chacha20poly1305::XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let nonce = chacha20poly1305::XNonce::generate();
         let ciphertext = Self::cipher(&key)
             .encrypt(
                 &nonce,
@@ -188,7 +188,9 @@ impl EncryptedMemoryStore {
         };
         let plain = Self::cipher(&key)
             .decrypt(
-                envelope.nonce.as_slice().into(),
+                super::xnonce(&envelope.nonce).ok_or_else(|| {
+                    StoreError::Backend("encrypted memory nonce has the wrong length".to_owned())
+                })?,
                 chacha20poly1305::aead::Payload {
                     msg: &envelope.ciphertext,
                     aad: envelope.digest.as_bytes(),

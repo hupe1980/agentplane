@@ -50,7 +50,7 @@ most once.
 
 Three mechanisms enforce it, because convention is not enforcement:
 
-1. **Lint gating** — `SystemTime::now`, `rand::random`, `Ulid::new` and friends
+1. **Lint gating** — `SystemTime::now`, `rand::random`, `Ulid::generate` and friends
    are denied crate-wide.
 2. **Effect-key verification** — on replay, a recomputed key that differs from
    history quarantines the run instead of diverging silently.

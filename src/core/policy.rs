@@ -187,6 +187,27 @@ pub struct PolicyRequest<'a> {
     pub context: &'a Value,
 }
 
+impl PolicyRequest<'_> {
+    /// Whether this is the effect gate, rather than admission or a release.
+    ///
+    /// The scoping a hand-written engine needs and a Cedar policy gets for
+    /// free, since every example rule binds `action == Action::"effect:perform"`
+    /// and the binding is copied along with the syntax. Discoverable from the
+    /// type so it does not have to be learnt from a log: a rule reading the run
+    /// input's `amount` matches at admission too, where the same context is
+    /// present and no effect has been proposed.
+    #[must_use]
+    pub fn is_effect(&self) -> bool {
+        self.action == ACTION_PERFORM
+    }
+
+    /// Whether this is the admission gate — asked once, before a run starts.
+    #[must_use]
+    pub fn is_admission(&self) -> bool {
+        self.action == ACTION_ADMIT
+    }
+}
+
 /// The answer.
 ///
 /// Not a `Result`, on purpose: there is no error case. See the module docs on
@@ -276,6 +297,58 @@ impl PolicyDecision {
 /// **pure**: no I/O, no clock, no randomness. Two calls with the same request
 /// against the same policy set must return the same decision, or a run stops
 /// being replayable for reasons nobody can see.
+///
+/// # What you will be asked
+///
+/// An engine is consulted at more than one place, and a first one written for
+/// effects alone refuses every run at admission — a failure that does not look
+/// like a policy problem. The runtime tier asks exactly [`ACTIONS`]:
+///
+/// | `action` | `resource` | asked |
+/// |---|---|---|
+/// | [`ACTION_ADMIT`] | the run's capability | once, before a run starts |
+/// | [`ACTION_PERFORM`] | the effect kind | before every live effect |
+/// | [`ACTION_RELEASE`] | `"information_flow.label"` | on each typed release |
+///
+/// A served surface adds its own vocabulary — see `api::a2a::action::ALL` — so
+/// the set is closed per wired surface, not globally. **Match on what you mean
+/// and permit the rest**, or scope with [`PolicyRequest::is_effect`]; a `_ =>
+/// Deny` arm refuses admission and every release along with the effects it was
+/// written for.
+///
+/// [`ACTION_DECLARED`] and [`ACTION_EGRESS`] are **never asked**. They label
+/// refusals the manifest and the flow gates already decided, so an engine that
+/// matched on them would be writing rules for a question nobody puts to it.
+///
+/// ```
+/// use agentplane::core::{PolicyDecision, PolicyEngine, PolicyRequest};
+///
+/// #[derive(Debug)]
+/// struct AmountCeiling;
+///
+/// impl PolicyEngine for AmountCeiling {
+///     fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+///         // Scoped first. Without this the rule below reads `amount` out of
+///         // the admission context and refuses the run before it starts.
+///         if !request.is_effect() {
+///             return PolicyDecision::Permit;
+///         }
+///         match request.context.get("amount_eur").and_then(serde_json::Value::as_u64) {
+///             Some(amount) if amount > 5_000 => PolicyDecision::Deny {
+///                 reason: format!("{amount} EUR is over the 5000 ceiling"),
+///             },
+///             _ => PolicyDecision::Permit,
+///         }
+///     }
+///
+///     fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+///         agentplane::core::PolicyBundleIdentity::new(
+///             agentplane::core::Digest::of(b"amount-ceiling-v1"),
+///             "amount-ceiling/v1",
+///         )
+///     }
+/// }
+/// ```
 pub trait PolicyEngine: Send + Sync + Debug {
     fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision;
 
@@ -292,7 +365,9 @@ pub trait PolicyEngine: Send + Sync + Debug {
     /// may be the `forbid` that would have stopped the call, so the gate
     /// refuses. One unguarded rule therefore denies every effect of every run
     /// from a policy set that compiled cleanly. An engine written as Rust code
-    /// has no such trap and has nothing to say here.
+    /// has no such trap and has nothing to say here — about *this* trap. It has
+    /// its own, and the trait's own docs name it: an engine that does not scope
+    /// on the action refuses admission for a rule written about effects.
     ///
     /// Implementations must keep the contract the trait already demands —
     /// total, pure, no I/O — because this runs during `build`, where a
@@ -342,6 +417,14 @@ impl PolicyEngine for DenyAll {
         )
     }
 }
+
+/// Every action the **runtime tier** puts to a [`PolicyEngine`].
+///
+/// Enumerable for the reason `api::a2a::action::ALL` is: a deployment has to be
+/// able to list what it must write rules for, and an implementor has to be able
+/// to see that effects are not the whole of it. A served surface asks its own
+/// actions beside these.
+pub const ACTIONS: &[&str] = &[ACTION_ADMIT, ACTION_PERFORM, ACTION_RELEASE];
 
 /// The action string for performing an effect.
 pub const ACTION_PERFORM: &str = "effect:perform";

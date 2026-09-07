@@ -39,6 +39,72 @@ mod anthropic_stream;
 pub mod bedrock;
 #[cfg(feature = "bedrock")]
 mod bedrock_stream;
+/// A canned HTTP client for the AWS SDK, for tests that must not build a real one.
+///
+/// # Why this exists rather than the vendor's `test-util`
+///
+/// The Bedrock tests here need *an* HTTP client for one reason: building an SDK
+/// `Config` without one constructs the default TLS provider, which reads the
+/// operating system's trust store eagerly — and a parallel test run can make
+/// the macOS keychain transiently yield zero roots, which aws-smithy answers
+/// with a panic. None of them wants a network.
+///
+/// `aws-smithy-http-client`'s `test-util` does exactly this and costs a hyper
+/// stack, a CBOR codec and a protocol-test harness — **a cluster of crates
+/// linked into every example this crate builds**, because cargo links
+/// dev-dependencies into example targets and offers no way to opt out. The
+/// connector trait is a documented extension point ("it can also be useful to
+/// create fake/mock connectors implementing this trait for testing"), and
+/// `http_client_fn` is the vendor's own constructor over it, so this is the
+/// supported seam rather than a reimplementation of one.
+///
+/// It answers every request identically. A test needing to branch on the
+/// request wants the real utility back, and should say so here.
+#[cfg(all(test, feature = "bedrock"))]
+pub(crate) fn canned_http(
+    status: u16,
+    content_type: Option<&'static str>,
+    body: &'static str,
+) -> aws_smithy_runtime_api::client::http::SharedHttpClient {
+    use aws_smithy_runtime_api::client::http::{
+        HttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
+    };
+    use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+    use aws_smithy_types::body::SdkBody;
+
+    #[derive(Debug)]
+    struct Canned {
+        status: u16,
+        content_type: Option<&'static str>,
+        body: &'static str,
+    }
+
+    impl HttpConnector for Canned {
+        fn call(
+            &self,
+            _request: aws_smithy_runtime_api::client::orchestrator::HttpRequest,
+        ) -> HttpConnectorFuture {
+            let status = self
+                .status
+                .try_into()
+                .expect("a test's own status code is in range");
+            let mut response = HttpResponse::new(status, SdkBody::from(self.body));
+            if let Some(kind) = self.content_type {
+                response.headers_mut().insert("content-type", kind);
+            }
+            HttpConnectorFuture::ready(Ok(response))
+        }
+    }
+
+    http_client_fn(move |_settings, _components| {
+        SharedHttpConnector::new(Canned {
+            status,
+            content_type,
+            body,
+        })
+    })
+}
+
 #[cfg(feature = "providers")]
 pub mod chat_completions;
 #[cfg(feature = "providers")]
@@ -52,6 +118,9 @@ mod chat_completions_stream;
 // embedder's type so a gate that configures one out fails *this* crate's build.
 #[cfg(any(feature = "providers", feature = "bedrock"))]
 pub mod embeddings;
+/// The deterministic stand-in provider. See [`fake`] for why it ships.
+#[cfg(feature = "fake-model")]
+pub mod fake;
 #[cfg(feature = "providers")]
 pub mod gemini;
 #[cfg(feature = "providers")]
@@ -558,6 +627,18 @@ pub enum ModelError {
     #[error("'{model}' refused the request: {detail}")]
     Refused { model: ModelId, detail: String },
 
+    /// **This plane** refused to connect: the driver's host is not one the
+    /// deployment's [`Egress`](crate::core::Egress) allowlist grants.
+    ///
+    /// Distinct from [`Refused`](ModelError::Refused), which says the
+    /// *provider* declined. Both are `DidNotHappen` and neither spends a retry
+    /// attempt, so the distinction buys no different recovery — it buys the
+    /// operator the right half of the system to go and look at. Reported as a
+    /// provider refusal, an egress misconfiguration sends somebody to a
+    /// vendor's status page.
+    #[error("this plane may not reach '{model}': {detail}")]
+    Egress { model: ModelId, detail: String },
+
     /// Rate-limited before generating.
     ///
     /// Separate from [`Refused`](ModelError::Refused) because the response is
@@ -653,6 +734,7 @@ impl ModelError {
         match self {
             Self::Unreachable { .. }
             | Self::Refused { .. }
+            | Self::Egress { .. }
             | Self::RateLimited { .. }
             // Safe to repeat despite having reached the provider: a completion
             // is the one outward call here that does not change the world, so
@@ -684,6 +766,7 @@ impl ModelError {
             Self::Interrupted { usage, .. } | Self::Unusable { usage, .. } => *usage,
             Self::Unreachable { .. }
             | Self::Refused { .. }
+            | Self::Egress { .. }
             | Self::RateLimited { .. }
             | Self::Unavailable { .. }
             | Self::Unaccounted { .. } => Usage {
@@ -1428,13 +1511,16 @@ impl Effect for ModelCall {
             // exists to bound a runaway provider counts zero.
             if spend.is_free() {
                 match e.disposition() {
-                    // A provider's refusal is an answer, not a fault: the
-                    // request is *wrong* — unknown model, malformed schema,
-                    // input filtered — and asking again asks the same rule the
-                    // same question. Carried as `Refused` so the retry loop
-                    // spends no attempt on it, where an outage stays `Rejected`
-                    // and retries under policy.
-                    Disposition::DidNotHappen if matches!(e, ModelError::Refused { .. }) => {
+                    // A refusal is an answer, not a fault: the request is
+                    // *wrong* — unknown model, malformed schema, input filtered
+                    // — and asking again asks the same rule the same question.
+                    // An egress denial is the same shape from the other side:
+                    // the allowlist will not change mid-run. Both spend no retry
+                    // attempt, where an outage stays `Rejected` and retries
+                    // under policy.
+                    Disposition::DidNotHappen
+                        if matches!(e, ModelError::Refused { .. } | ModelError::Egress { .. }) =>
+                    {
                         EffectError::Refused(detail)
                     }
                     // A throttle is a wait, and the provider is the only party

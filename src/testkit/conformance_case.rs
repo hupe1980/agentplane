@@ -2876,7 +2876,84 @@ pub async fn check_batches(store: &Arc<dyn BatchStore>, r: &mut Report) {
         Err(e) => r.record("cursor", format!("cursor failed: {e}")),
     }
 
+    check_batch_backlog(store, id, r).await;
     check_batch_identity(store, id, r).await;
+}
+
+/// The listing that turns *43 failed* into the 43 keys.
+///
+/// The state left by [`check_batches`] is exactly the interesting one: one
+/// settled item, one suspended, and one reserved with no outcome at all. A
+/// store that filters on `outcome <> 'succeeded'` passes on the suspended item
+/// and silently drops the reserved one — and the reserved items are the ones a
+/// crash left mid-flight, which is the class an operator most needs named.
+async fn check_batch_backlog(store: &Arc<dyn BatchStore>, id: BatchId, r: &mut Report) {
+    r.checked += 1;
+    let _ = store.reserve(id, "item-003", RunId::generate()).await;
+
+    let keys = match store.items_needing_attention(id, 100).await {
+        Ok(items) => items.iter().map(|i| i.key.clone()).collect::<Vec<_>>(),
+        Err(e) => {
+            r.record("backlog", format!("items_needing_attention failed: {e}"));
+            return;
+        }
+    };
+
+    if keys.contains(&"item-001".to_owned()) {
+        r.record(
+            "backlog",
+            "a succeeded item is in the backlog, so the listing an operator reads to \
+             find the failures is mostly successes — which is the paging problem it \
+             exists to remove",
+        );
+    }
+    for (key, why) in [
+        (
+            "item-002",
+            "a suspended item is missing from the backlog. It is not terminal and not \
+             settled: something is waiting on a person, an event or a raised ceiling, \
+             and nothing else names it",
+        ),
+        (
+            "item-003",
+            "an item reserved with no outcome is missing from the backlog. That is what \
+             a crash mid-item leaves, and a store filtering on `outcome <> settled` \
+             drops it because NULL compares to nothing",
+        ),
+    ] {
+        if !keys.contains(&key.to_owned()) {
+            r.record("backlog", why);
+        }
+    }
+
+    // Ordering, because the listing is a work queue: a page that is not the
+    // oldest unsettled items is a page whose head moves for reasons that have
+    // nothing to do with what was resolved.
+    r.checked += 1;
+    let mut sorted = keys.clone();
+    sorted.sort();
+    if keys != sorted {
+        r.record(
+            "backlog",
+            format!("the backlog is not ordered oldest key first: {keys:?}"),
+        );
+    }
+
+    // And it has to empty, which is what makes an ascending page legitimate at
+    // all — see I13 on a backlog with no verb.
+    r.checked += 1;
+    let _ = store
+        .record(id, "item-003", &ItemOutcome::Succeeded, Spend::default())
+        .await;
+    match store.items_needing_attention(id, 100).await {
+        Ok(items) if items.iter().any(|i| i.key == "item-003") => r.record(
+            "backlog",
+            "settling an item did not take it off the backlog, so the listing only \
+             grows — a queue that floods retires the control without anyone deciding to",
+        ),
+        Ok(_) => {}
+        Err(e) => r.record("backlog", format!("items_needing_attention failed: {e}")),
+    }
 }
 
 /// One batch runs one frozen plan, and the store's row is the only witness to

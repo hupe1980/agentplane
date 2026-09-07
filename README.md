@@ -67,6 +67,9 @@ cargo run --example governed_transfer --features manifest
 cargo run --example saga_checkout      # reverse compensation, replay-safe unwind
 cargo run --example effect_group       # calls that take together, or not at all
 cargo run --example memory_run         # private/team memory, provenance, recall
+cargo run --example batch_run          # one act, many items: a resume that
+                                        # re-settles nothing, and partial failure
+                                        # as a terminal state
 cargo run --example budget_pause       # a ceiling pauses the run; a raise
                                         # resumes it, on the record, nothing repeated
 cargo run --example answered_doubt     # a call nobody can account for: a person
@@ -262,8 +265,9 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 
 Ten rows, not the inventory. The full surface — the export/audit/restore
 toolchain, a durable manifest registry with an enumerable inventory, typed
-release, standing authorities, effect groups that commit with the journal, the
-scoped emergency stop, the audited sweeper, a scheduled recovery drill and a
+release, standing authorities, effect groups that commit with the journal,
+batch runs over 10⁵ items with per-item journals and an item-granular resume,
+the scoped emergency stop, the audited sweeper, a scheduled recovery drill and a
 retention pass that says what it could not reach, model drivers and streaming,
 MCP and A2A on both sides, signed Agent Cards, governed media and memory,
 multi-tenancy, quotas, witnessing, break-glass, and why there is no `AllowAll`

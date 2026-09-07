@@ -721,6 +721,76 @@ async fn an_exhausted_item_is_a_held_pause_not_a_failure() {
     );
 }
 
+/// **The alert predicate answers the question a person has, not "is it done".**
+///
+/// Both halves matter and they pull opposite ways. A batch operated in windows
+/// — the shape `max_items` exists for — returns `Running` on every normal pass,
+/// so a predicate keyed on the status would be true every time somebody used
+/// the feature correctly, and a predicate that is always true is one people
+/// stop reading. And an item paused at a ceiling leaves the batch `Running`
+/// with nothing in flight, so a predicate keyed on `in_flight` alone would be
+/// silent about the one state whose only exit is a person raising a limit.
+///
+/// The `exhausted` count on the report is what tells those two `Running`s
+/// apart; before it there was nothing in a report that could.
+#[tokio::test]
+async fn the_alert_predicate_separates_unfinished_from_stuck() {
+    // A deliberate window over a healthy batch: unfinished, and nothing to do.
+    let store = db();
+    let world: World = Arc::default();
+    let windowed = runtime(&store, &world, vec![])
+        .run_batch(
+            BatchId::generate(),
+            &BatchSpec::new(plan(), Arc::new(Keys::upto(5)))
+                .page(1)
+                .max_items(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(windowed.status, BatchStatus::Running);
+    assert_eq!(windowed.exhausted, 0);
+    assert!(
+        !windowed.needs_attention(),
+        "a window that settled everything it took needs nobody — flagging it \
+         makes the predicate true on every correct use of `max_items`, and a \
+         predicate that is always true is one nobody reads"
+    );
+
+    // An item paused at a ceiling: also `Running`, and somebody has to decide.
+    let stuck_store = db();
+    let stuck_world: World = Arc::default();
+    let stuck_id = BatchId::generate();
+    let stuck = capped(&stuck_store, &stuck_world, 1)
+        .run_batch(
+            stuck_id,
+            &BatchSpec::new(two_step_plan(), Arc::new(Keys::upto(1))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stuck.status,
+        BatchStatus::Running,
+        "the two cases are indistinguishable by status, which is the point"
+    );
+    assert_eq!(stuck.exhausted, 1);
+    assert!(
+        stuck.needs_attention(),
+        "an item paused at a ceiling waits for a person to raise it; nothing \
+         else in the report says so"
+    );
+
+    // And the predicate can say which item, which is what makes it actionable.
+    let backlog = (Arc::clone(&stuck_store) as Arc<dyn BatchStore>)
+        .items_needing_attention(stuck_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        backlog.iter().map(|i| i.key.as_str()).collect::<Vec<_>>(),
+        vec!["item-001"],
+        "a predicate that says yes and cannot say which is a counter with no alert"
+    );
+}
+
 /// Unused import guard: `StoreError` is part of the store contract surface.
 #[allow(dead_code)]
 fn _store_error_is_in_scope(_: StoreError) {}

@@ -25,6 +25,54 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## `testkit` is out of the `cli` feature, and `fake-model` is what replaced it
+
+**Affected:** anything building the binary or the image with `--features cli`
+and relying on `testkit` coming along; anything calling
+`A2aClient::allow_loopback` from a `cli` build; `agentplane run`/`serve --peer`
+with an `http://` URL.
+
+`cli` listed `testkit` for one need — the `provider: fake` every
+[getting started](@/docs/getting-started.md) page runs on — so the published
+binary and the image also carried fault injection, a self-minting signer, and
+the exceptions permitting plaintext HTTP to a loopback peer, each documented at
+its definition as impossible in a production build.
+
+- **`fake-model` is that need, carved out**, and it ships: the provider lives at
+  `agentplane::model::fake`, and `cli` enables it, so `provider: fake` works with
+  no flag.
+- **`agentplane::testkit::FakeProvider` still resolves**, re-exported. No call
+  site changes.
+- **`testkit` implies `fake-model`**, so `--features testkit` is unchanged.
+- **`--peer` requires `https://`**, refused at wiring rather than at the first
+  call. The URL an `A2aClient` reaches is not always one an operator typed —
+  discovery takes it from an agent card — so a plaintext hop lets the network
+  steer the calls that follow. For a peer on this machine, build with
+  `--features cli,a2a,testkit`.
+
+## Dependency floors moved: redb 4, rand 0.10, ulid 3
+
+**Affected:** anyone opening an existing `.redb` journal, and any embedder
+naming `rand` or `ulid` types across this crate's API.
+
+- **redb 3 → 4.** The on-disk format changed with it. Pre-freeze the remedy for
+  an old store is *recreate*, not migrate — `agentplane export` writes the
+  framed record first, and `restore` rebuilds into a fresh store.
+- **`StepCtx::rng` returns `impl rand::RngExt`.** rand 0.10 renamed the old
+  `Rng` to `RngExt` and gave the name `Rng` to what was `RngCore`, so a skill
+  drawing a number wants `use agentplane::rand::RngExt as _`. **`rand` is now
+  re-exported as `agentplane::rand`**, for the reason `async_trait` is: reaching
+  the traits through a `rand` of your own means matching this crate's version in
+  a second manifest, and getting it wrong is a type error naming two
+  identical-looking traits.
+- **`rand_chacha` is gone.** rand 0.10 carries the implementation, and the
+  stream is byte-identical — pinned now by `rng_stream_is_pinned`, so a future
+  bump that changed it fails a test instead of quarantining every replayed run
+  that ever drew a number.
+- **`ulid::Ulid::new` became `Ulid::generate`**, which is also the path
+  `clippy.toml` now denies. This crate's own `RunId::generate` and friends are
+  unchanged.
+
 ## Stored states are spelled once, by the type
 
 **Affected:** anything matching on the string form of `CaseStatus`,

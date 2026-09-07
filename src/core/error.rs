@@ -981,8 +981,9 @@ pub enum PolicyError {
 ///
 /// This does not remove the denied/allowed bit itself. Nothing can, short of
 /// fabricating success. What bounds *that* channel is
-/// [`Budget::max_denials`](crate::core::Budget::max_denials): a run that keeps
-/// hitting the policy is probing it, and it is stopped.
+/// [`Budget::max_denials`](crate::core::Budget::max_denials), which counts the
+/// refusals a model is shown — these — as well as the engine denials it is not:
+/// a run that keeps being refused is probing, and it is stopped.
 pub const REFUSED: &str = "this action was not permitted";
 
 impl PolicyError {

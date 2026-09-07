@@ -1,5 +1,18 @@
 //! One battery pinning every native `due_in` to the trait's own default.
 //!
+//! Beside the other conformance batteries rather than in `tests/`, which is
+//! where it started and was the odd one out: it is a *shared contract* run
+//! against every backend, which is what this module's five siblings are. Living
+//! in one backend's test binary meant the other backend could only reach it
+//! through `crate::`, so the battery and its callers had to stay in the same
+//! compiled target — and that is a layout constraint, not a design one.
+//!
+//! It asserts rather than filling a [`Report`](crate::testkit::conformance::Report),
+//! unlike its siblings. The difference is deliberate and narrow: this battery
+//! compares a store against *itself* under two implementations, so there is no
+//! partial answer to collect — either the override agrees with the default or
+//! the store is wrong about its own backlog.
+//!
 //! `PushStore::due_in` ships a paging default that is correct against any
 //! backend, and both stores override it with an in-query filter for the reason
 //! the trait documents. An override is where semantics drift: a filter that
@@ -20,8 +33,8 @@
 
 use std::sync::Arc;
 
-use agentplane::core::{RunId, Secret, StoreError};
-use agentplane::push::{DueBatch, PushConfig, PushNamespace, PushRegistration, PushStore};
+use crate::core::{RunId, Secret, StoreError};
+use crate::push::{DueBatch, PushConfig, PushNamespace, PushRegistration, PushStore};
 
 /// The trait's default `due_in`, forced over any backend.
 ///

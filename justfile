@@ -210,34 +210,39 @@ test-a2a-tck:
 test-a2a-server:
     cargo test --features a2a-server,a2a,signing,redb,testkit --test wire a2a_server::
 
+# The union of every example's `required-features`, so the crate is compiled
+# once instead of once per example.
+EXAMPLE_FEATURES := "redb,testkit,manifest,keyring,media,mcp,a2a,a2a-server"
+
 # run every example end to end
+#
+# Two builds, not thirteen. This recipe used to spell each example's minimal
+# feature set on its own `cargo run` line, which reads well and meant cargo
+# rebuilt agentplane — and the whole dev-dependency graph behind it, testcontainers
+# and bollard included — every time the set changed. Twelve rebuilds to run
+# twenty-seven programs that each take milliseconds.
+#
+# The first build is the one that carries an assurance the union cannot: it
+# compiles every example that claims to need nothing but the default features,
+# under exactly those features. That is the claim the README makes on a
+# newcomer's behalf — `cargo run --example hello_skill`, no flags — and an
+# example that quietly grew a dependency on `testkit` would fail here rather
+# than for the reader.
 examples:
-    cargo run --example hello_skill
-    cargo run --example durable_pipeline
-    cargo run --example clearing_case
-    cargo run --example plan_graph
-    cargo run --example governed_transfer --features redb,manifest
-    cargo run --example saga_checkout
-    cargo run --example effect_group
-    cargo run --example tool_loop --features redb,testkit,manifest
-    cargo run --example approved_call --features redb,testkit,manifest
-    cargo run --example planned_run --features redb,testkit,manifest
-    cargo run --example sealed_run --features redb,testkit,keyring
-    cargo run --example model_run --features redb,testkit
-    cargo run --example media_run --features redb,testkit,media
-    cargo run --example memory_run
-    cargo run --example budget_pause
-    cargo run --example answered_doubt
-    cargo run --example operator_stop
-    cargo run --example recovered_run
-    cargo run --example manifest_run --features redb,testkit,manifest
-    cargo run --example mcp_tools --features redb,testkit,manifest,mcp
-    cargo run --example blog_room --features redb,testkit,manifest
-    cargo run --example a2a_peer --features redb,a2a-server,manifest
-    cargo run --example peer_call --features redb,testkit,manifest,a2a,a2a-server
-    cargo run --example standing_authority --features redb,testkit
-    cargo run --example streaming_run --features redb,testkit
-    cargo run --example observability
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --quiet --examples
+    cargo build --quiet --examples --features {{EXAMPLE_FEATURES}}
+    for ex in \
+        hello_skill durable_pipeline clearing_case plan_graph governed_transfer \
+        saga_checkout effect_group tool_loop approved_call planned_run sealed_run \
+        model_run media_run memory_run batch_run budget_pause answered_doubt \
+        operator_stop recovered_run manifest_run mcp_tools blog_room a2a_peer \
+        peer_call standing_authority streaming_run observability
+    do
+        printf '\n\033[1m── %s ─────────────────────────────────\033[0m\n' "$ex"
+        ./target/debug/examples/"$ex"
+    done
 
 FULL_FEATURES := "cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push"
 

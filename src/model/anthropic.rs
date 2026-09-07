@@ -222,7 +222,7 @@ impl Anthropic {
             .and_then(|u| u.host_str().map(ToOwned::to_owned));
         egress
             .permits(host.as_deref())
-            .map_err(|e| ModelError::Refused {
+            .map_err(|e| ModelError::Egress {
                 model: model.clone(),
                 detail: e.to_string(),
             })

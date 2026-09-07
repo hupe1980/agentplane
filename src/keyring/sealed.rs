@@ -119,14 +119,14 @@ fn erased(e: KeyError) -> BlobError {
 #[async_trait]
 impl BlobStore for EncryptedBlobs {
     async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
-        use chacha20poly1305::aead::{Aead, AeadCore, OsRng};
+        use chacha20poly1305::aead::{Aead, Generate as _};
 
         // Addressed by the plaintext, so a digest already in a journal keeps
         // meaning what it meant.
         let digest = Digest::of(bytes);
         let (key, wrapped) = self.keys.data_key(&self.scope).await.map_err(erased)?;
         let cipher = Self::cipher(&key);
-        let nonce = chacha20poly1305::XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let nonce = chacha20poly1305::XNonce::generate();
 
         // The digest is the associated data: the envelope is bound to the
         // address it lives at, so ciphertext moved to another address fails to
@@ -182,7 +182,8 @@ impl BlobStore for EncryptedBlobs {
         let key = self.keys.open(&wrapped).await.map_err(erased)?;
         let plain = Self::cipher(&key)
             .decrypt(
-                nonce.into(),
+                super::xnonce(nonce)
+                    .ok_or_else(|| corrupt(digest, "the envelope's nonce is the wrong width"))?,
                 chacha20poly1305::aead::Payload {
                     msg: sealed,
                     aad: digest.to_hex().as_bytes(),

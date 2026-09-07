@@ -29,7 +29,7 @@
 //! tampering, for a version skew whose remedy is running a different build.
 
 use chacha20poly1305::XChaCha20Poly1305;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::aead::{Aead, Generate as _, KeyInit};
 
 use super::{DataKey, KeyError, KeyRing, WrappedKey};
 
@@ -65,7 +65,7 @@ pub(super) async fn seal(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, KeyError> {
     let (key, wrapped) = keys.data_key(scope).await?;
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let nonce = chacha20poly1305::XNonce::generate();
     let sealed = cipher(&key)
         .encrypt(
             &nonce,
@@ -96,7 +96,7 @@ pub(super) async fn seal(
 /// An envelope's header, split from the bytes it describes.
 struct Parsed<'a> {
     wrapped: WrappedKey,
-    nonce: &'a [u8],
+    nonce: &'a chacha20poly1305::XNonce,
     sealed: &'a [u8],
 }
 
@@ -140,6 +140,11 @@ fn parse(envelope: &[u8]) -> Result<Parsed<'_>, KeyError> {
     let wrapped: WrappedKey = serde_json::from_slice(wrapped_bytes)
         .map_err(|e| KeyError::Refused(format!("the wrapped key would not parse: {e}")))?;
     let (nonce, sealed) = rest.split_at(NONCE);
+    // `split_at(NONCE)` already fixes the width, so this cannot fail; it is
+    // written fallibly anyway because the alternative is a panic on bytes that
+    // came from a store.
+    let nonce = super::xnonce(nonce)
+        .ok_or_else(|| KeyError::Refused("the envelope's nonce is the wrong width".to_owned()))?;
     Ok(Parsed {
         wrapped,
         nonce,
@@ -187,10 +192,7 @@ pub(super) async fn open(
     } = parse(envelope)?;
     let key = keys.open(&wrapped).await?;
     cipher(&key)
-        .decrypt(
-            nonce.into(),
-            chacha20poly1305::aead::Payload { msg: sealed, aad },
-        )
+        .decrypt(nonce, chacha20poly1305::aead::Payload { msg: sealed, aad })
         .map_err(|_| KeyError::Refused("the sealed payload did not authenticate".to_owned()))
 }
 

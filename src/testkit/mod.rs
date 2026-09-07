@@ -5,8 +5,14 @@
 //! rebuilding a fault injector per project is how each one ends up testing a
 //! slightly different, slightly weaker thing.
 //!
-//! Behind the `testkit` feature, off by default: nothing here should be
-//! reachable from a production build.
+//! Behind the `testkit` feature, off by default, and **no feature a release
+//! enables pulls it in** — `no_shipped_feature_enables_testkit` in
+//! `tests/guards/docs.rs` is what makes that a fact rather than an intention.
+//!
+//! The deterministic *model* is deliberately not here but in
+//! [`model::fake`](crate::model::fake), behind `fake-model`, which ships: a
+//! stand-in model is a driver, while everything in this module stands in for a
+//! control.
 
 pub mod backstop;
 pub mod conformance;
@@ -18,10 +24,11 @@ pub mod conformance;
 pub mod conformance_case;
 #[cfg(feature = "keyring")]
 pub mod conformance_keyring;
+#[cfg(feature = "push")]
+pub mod conformance_push;
 pub mod conformance_quota;
 #[cfg(feature = "manifest")]
 pub mod conformance_registry;
-mod fake_model;
 pub mod faults;
 #[cfg(feature = "keyring")]
 pub mod memory_keyring;
@@ -34,7 +41,12 @@ pub use memory_keyring::MemoryKeyRing;
 pub use staged_atomic::{StagedAtomic, Statement};
 pub use stub_signer::StubSigner;
 
+/// The deterministic provider, which lives beside the real drivers.
+///
+/// Named here too, because a test author looking for a double looks in
+/// `testkit`. It is *not* gated on `testkit` at its definition — see
+/// [`model::fake`](crate::model::fake).
+pub use crate::model::fake::{Ask, FakeProvider};
 pub use backstop::assert_replay_was_not_backstopped;
 pub use conformance::{Report, Violation, check as check_journal_store};
-pub use fake_model::{Ask, FakeProvider};
 pub use faults::{Fault, Faulty, Schedule};

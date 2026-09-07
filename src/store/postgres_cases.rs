@@ -2805,19 +2805,63 @@ impl BatchStore for PostgresStore {
     }
 
     async fn items(&self, batch: BatchId, limit: usize) -> Result<Vec<ItemRecord>, StoreError> {
+        self.query_items(
+            batch,
+            limit,
+            "SELECT item_key, run_id, outcome, detail, tokens, minor FROM batch_items
+              WHERE batch_id = $1 AND tenant = $3 ORDER BY item_key ASC LIMIT $2",
+            &[],
+        )
+        .await
+    }
+
+    async fn items_needing_attention(
+        &self,
+        batch: BatchId,
+        limit: usize,
+    ) -> Result<Vec<ItemRecord>, StoreError> {
+        // `<> ALL` rather than `<> 'succeeded'`, and the set comes from the
+        // type: an outcome added later lands in this listing without anyone
+        // remembering to widen a literal here.
+        //
+        // `IS NULL OR` is load-bearing: a reserved item has no outcome at all,
+        // and `NULL <> ALL (...)` is NULL, which `WHERE` treats as false — so
+        // without it the interrupted items, the ones a crash left mid-flight,
+        // would be exactly the ones this listing dropped.
+        self.query_items(
+            batch,
+            limit,
+            "SELECT item_key, run_id, outcome, detail, tokens, minor FROM batch_items
+              WHERE batch_id = $1 AND tenant = $3
+                AND (outcome IS NULL OR outcome <> ALL($4))
+              ORDER BY item_key ASC LIMIT $2",
+            &ItemOutcome::settled_tags(),
+        )
+        .await
+    }
+}
+
+impl PostgresStore {
+    /// One shape of item query, so the two listings cannot drift in how they
+    /// decode a row or order it.
+    async fn query_items(
+        &self,
+        batch: BatchId,
+        limit: usize,
+        sql: &str,
+        settled: &[&str],
+    ) -> Result<Vec<ItemRecord>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        let rows = client
-            .query(
-                "SELECT item_key, run_id, outcome, detail, tokens, minor FROM batch_items
-                  WHERE batch_id = $1 AND tenant = $3 ORDER BY item_key ASC LIMIT $2",
-                &[
-                    &batch.to_string(),
-                    &i64::try_from(limit).unwrap_or(i64::MAX),
-                    &self.tenant_name(),
-                ],
-            )
-            .await
-            .map_err(|e| be(&e))?;
+        let batch_key = batch.to_string();
+        let capped = i64::try_from(limit).unwrap_or(i64::MAX);
+        let tenant = self.tenant_name();
+        let settled: Vec<String> = settled.iter().map(|s| (*s).to_owned()).collect();
+        let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+            vec![&batch_key, &capped, &tenant];
+        if !settled.is_empty() {
+            params.push(&settled);
+        }
+        let rows = client.query(sql, &params).await.map_err(|e| be(&e))?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let key: String = row.get(0);

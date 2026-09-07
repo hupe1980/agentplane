@@ -113,6 +113,16 @@ pub mod retention;
 pub mod runtime;
 pub mod tools;
 
+/// The random-number traits [`StepCtx::rng`] hands back.
+///
+/// Re-exported for the reason [`prelude::async_trait`] is: the generator is
+/// unusable without its traits in scope, and reaching them through a `rand` of
+/// one's own means matching this crate's version in a second manifest — where
+/// getting it wrong is a type error naming two identical-looking traits.
+///
+/// [`StepCtx::rng`]: crate::runtime::StepCtx::rng
+pub use rand;
+
 #[cfg(any(feature = "redb", feature = "postgres"))]
 pub mod store;
 

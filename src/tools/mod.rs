@@ -919,7 +919,15 @@ impl ToolCall {
             && let Err(refused) = egress.permits(Some(&host))
         {
             return Err(ToolError::Unreachable {
-                detail: format!("the transport for server '{}' reaches {refused}", id.server),
+                // Em dash, not a splice. `EgressError` owns the whole sentence
+                // about the host — it is the only layer that knows one — and
+                // this clause owns the server, which it does not. Joined with
+                // `reaches {refused}` the two read as one broken sentence:
+                // *…reaches 'evil.example' is not a granted destination*.
+                detail: format!(
+                    "the transport for server '{}' was refused — {refused}",
+                    id.server
+                ),
                 tool: id,
             });
         }

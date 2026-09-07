@@ -1117,6 +1117,21 @@ control; `agentplane.hupe1980.github.io/` is reserved for the same reason. A
 blank value is refused too — a key that answers nothing reads, to a reviewer,
 like a question that was answered.
 
+**Making it a rule rather than a convention.** Because the runtime never reads
+the map, nothing in it can notice that a production agent shipped without an
+owner. That check belongs in review, so `validate` will do it:
+
+```sh
+agentplane validate agent.yaml \
+  --require-annotation example.com/business-owner \
+  --require-annotation example.com/risk-class
+```
+
+Repeatable, exits non-zero naming each agent and key that is absent, and checked
+per agent — in a room, "one of them has an owner" is not the rule anybody meant.
+The runtime still reads nothing: the keys stay your vocabulary and the
+enforcement is a job you run, which is the division `--policy` already draws.
+
 ## 🧯 Build a plane from a manifest you did not write {#build-a-plane-from-a-manifest-you-did-not-write}
 
 `build()` panics on a wiring mistake, and for a binary wiring its own skills that

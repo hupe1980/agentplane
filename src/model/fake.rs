@@ -1,9 +1,20 @@
 //! A model provider with no model behind it.
 //!
 //! For tests, examples, and local runs where the point is the *plane* rather
-//! than the answer. Lives in `testkit` — off by default, never in a production
-//! build — for the same reason [`StubSigner`](super::StubSigner) does: something
-//! that stands in for a real component must not be reachable by accident.
+//! than the answer.
+//!
+//! # Why this ships and `testkit` does not
+//!
+//! The distinction is what the stand-in replaces.
+//! [`StubSigner`](crate::testkit::StubSigner) replaces a *control*: a build that
+//! can mint its own attestations proves nothing by producing one, so it must be
+//! impossible to link into a deployment. A model provider is not a control, it
+//! is the thing under governance — and the getting-started guide and every
+//! `examples/*.yaml` name `provider: fake`, which is what running a manifest
+//! with no API key means.
+//!
+//! Selecting it is never implicit: a manifest has to say `provider: fake`, and
+//! `agentplane run` refuses any provider name this build cannot construct.
 //!
 //! # Two traps, both of which make a fake worse than useless
 //!

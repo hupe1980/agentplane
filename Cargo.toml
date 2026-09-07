@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.30.0"
+version      = "0.31.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -55,7 +55,13 @@ manifest = ["dep:serde_yaml_ng", "dep:jsonschema"]
 # Everything the `agentplane` binary needs. `signing` is here for the audit
 # verbs: an `audit`/`verify` that could not check a signature would send the
 # independent party back to writing Rust.
-cli = ["manifest", "redb", "providers", "bedrock", "testkit", "signing", "dep:tracing-subscriber", "dep:clap"]
+#
+# **Never `testkit`.** The binary needs one thing from it — `provider: fake` —
+# and that is `fake-model`. Taking the whole feature would ship fault injection,
+# a self-minting signer and a plaintext-loopback exception in every published
+# artifact, each documented at its definition as impossible in a production
+# build. `no_shipped_feature_enables_testkit` holds it.
+cli = ["manifest", "redb", "providers", "bedrock", "fake-model", "signing", "dep:tracing-subscriber", "dep:clap"]
 # Content-addressed blobs on any backend OpenDAL reaches, for bytes too big for
 # the chain to carry.
 opendal = ["dep:opendal"]
@@ -66,9 +72,14 @@ keyring = ["dep:chacha20poly1305"]
 # A key ring that is somebody else — Vault's transit engine. The wrapping key
 # never leaves it, so erasure is something this crate asks for and cannot undo.
 keyring-vault = ["keyring", "dep:reqwest"]
+# A model provider with no model behind it: deterministic answers, real usage
+# figures. It ships, because a stand-in *model* is a driver and not a control —
+# see `model::fake`. What stands in for a control is `testkit`.
+fake-model = []
 # Fault injection and harness pieces. Never in a production build — nothing in
-# `testkit` is reachable without it.
-testkit = []
+# `testkit` is reachable without it, and no feature a release enables pulls it
+# in. `tests/guards/docs.rs` holds that second half.
+testkit = ["fake-model"]
 # Cedar as the authorization engine. The crate defines the policy seam and
 # ships no evaluator.
 cedar = ["dep:cedar-policy"]
@@ -124,7 +135,7 @@ async-trait = "0.1"
 # which is the whole guarantee where a signature covers the text.
 # `crate::core::b64` names the two dialects this crate speaks; nothing else
 # reaches for the engine.
-base64 = "0.22"
+base64 = "0.23"
 serde       = { version = "1", features = ["derive"] }
 # NOTE: this crate must not ask for `preserve_order`, but it can no longer
 # assume nobody does — cargo unifies features across the graph and cedar-policy
@@ -134,10 +145,10 @@ serde_json  = "1"
 # Schema *from the type*, so a tool's arguments have one declaration rather
 # than a hand-written copy in a manifest and a hand-indexed copy in the body.
 schemars    = "1"
-jsonschema  = { version = "0.49.5", default-features = false, optional = true }
+jsonschema  = { version = "0.55.0", default-features = false, optional = true }
 futures-core = "0.3"
 thiserror   = "2"
-ulid        = { version = "1", features = ["serde"] }
+ulid        = { version = "3", features = ["serde"] }
 sha2        = "0.11"
 # HMAC for signed push bodies: the audited construction, not hand-rolled
 # RFC 2104. Pinned to 0.13 to share `digest` 0.11 with `sha2` above.
@@ -148,8 +159,10 @@ hex         = "0.4"
 # API key is not an optional-feature concern.
 zeroize     = { version = "1", features = ["alloc", "derive"] }
 time        = { version = "0.3", features = ["serde-well-known", "macros", "formatting", "parsing"] }
-rand        = "0.9"
-rand_chacha = "0.9"
+# `chacha` for `ChaCha8Rng`, the deterministic source behind `StepCtx::rng`.
+# Through `rand` rather than a separate `rand_chacha`, so one crate declares the
+# generator that produces a replayed run's numbers; two would resolve apart.
+rand        = { version = "0.10", features = ["chacha"] }
 tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 # Two combinators: `join_all` to dispatch a ready set concurrently, and
 # `buffer_unordered` where the set is a backlog rather than a frontier and has
@@ -167,13 +180,16 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # ignored. +9 crates on `cli`, +0 on the library; re-derive with `cargo tree
 # --no-default-features --features cli -e normal --prefix none | sort -u | wc -l`.
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "env", "wrap_help"], optional = true }
-redb        = { version = "3", optional = true }
+redb        = { version = "4", optional = true }
 # The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
 serde_yaml_ng = { version = "0.10", optional = true }
 # `default-features = false`: the defaults pull in a long list of service
 # backends. An embedder picks the one they use; `services-fs` is the only one
 # that makes sense to assume.
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"], optional = true }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"], optional = true }
+# Held at 0.58: **0.59.0 does not build**. Its `opendal-core` omits the
+# `CHANGELOG.md` its own `src/docs/mod.rs` reads with `include_str!`. Re-check
+# on the next release with `cargo check --features opendal`.
 opendal     = { version = "0.58", default-features = false, features = ["services-fs"], optional = true }
 cedar-policy = { version = "4.12.0", default-features = false, optional = true }
 tokio-postgres = { version = "0.7.18", optional = true, features = [
@@ -225,6 +241,11 @@ aws-sdk-bedrockruntime = { version = "1.139.0", default-features = false, featur
 aws-smithy-types = { version = "1.6.1", optional = true }
 
 [dev-dependencies]
+# The connector seam `model::canned_http` builds a stub over. Deliberately not
+# `aws-smithy-http-client`'s `test-util`: its one useful function costs a hyper
+# stack and a CBOR codec in every example this crate builds.
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
+aws-smithy-types = { version = "1" }
 # An **independent** A2A server, so this crate's *client* has an outside
 # authority to talk to — the one interoperability gap the conformance kit
 # cannot close, since it validates servers. Pre-1.0 churn is acceptable here
@@ -232,11 +253,6 @@ aws-smithy-types = { version = "1.6.1", optional = true }
 # default pulls a TLS stack a loopback double needs for nothing.
 a2a-lf = { version = "0.3.0", default-features = false }
 a2a-server-lf = { version = "0.4.1", default-features = false }
-# A stub HTTP client for the Bedrock tests, so building an SDK `Config` never
-# constructs the default TLS provider: that provider reads the OS trust store
-# eagerly, and a parallel test run can make the macOS keychain transiently
-# yield zero roots, which aws-smithy answers with a panic.
-aws-smithy-http-client = { version = "1", features = ["test-util"] }
 # For the streaming driver tests: the stub server hands axum a body stream of
 # `Bytes`, including one that errors partway so a severed response can be tested
 # without a real network.
@@ -323,6 +339,12 @@ required-features = ["redb"]
 
 [[example]]
 name              = "memory_run"
+required-features = ["redb"]
+
+# One act made of many: a windowed pass, an item-granular resume, and a partial
+# failure that is terminal rather than a degraded success.
+[[example]]
+name              = "batch_run"
 required-features = ["redb"]
 
 # Exhaustion is a pause with a protocol: refused, resumed under the same

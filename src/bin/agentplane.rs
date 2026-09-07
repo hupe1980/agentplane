@@ -102,7 +102,7 @@ enum Verb {
     /// Host an agent as an A2A 1.0 peer.
     Serve(Box<ServeArgs>),
     /// Check every document in a file, and say what is in it.
-    Validate(FileArgs),
+    Validate(ValidateArgs),
     /// Print the manifest format as a JSON Schema, for editors and CI linters.
     Schema,
     /// Print the identity a registry pins.
@@ -383,6 +383,25 @@ fn verifier_from(keys: &[String]) -> Result<Option<agentplane::policy::Ed25519Ve
 struct FileArgs {
     /// The manifest, or a `---`-separated file of them.
     manifest: String,
+}
+
+#[derive(clap::Args, Debug)]
+struct ValidateArgs {
+    /// The manifest, or a `---`-separated file of them.
+    manifest: String,
+
+    /// Require this annotation key to be present and non-empty. Repeatable.
+    ///
+    /// The runtime never reads `metadata.annotations` — that is what makes them
+    /// safe to carry, and it is why nothing can notice a production agent that
+    /// shipped without an owner. A control nobody checks is a convention.
+    ///
+    /// This does not change that: the check lives in review, the keys stay the
+    /// deployment's own vocabulary, and no interpretation crosses the trust
+    /// boundary. It is the division `--policy` already draws — the rule is
+    /// yours, the enforcement is a job you run.
+    #[arg(long = "require-annotation", value_name = "KEY")]
+    require_annotation: Vec<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -918,12 +937,7 @@ fn manifests_at(path: &str) -> Result<Vec<Manifest>, String> {
 
 fn dispatch(cli: Cli) -> Result<ExitCode, String> {
     match cli.verb {
-        Verb::Validate(a) => {
-            for m in &manifests_at(&a.manifest)? {
-                println!("ok: {} {}", m.metadata.name, m.metadata.version);
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        Verb::Validate(a) => validate(&a),
         Verb::Schema => {
             // The parser stays authoritative: the schema is the format's
             // *shape*, and the semantic refusals run only in `validate`. The
@@ -1493,12 +1507,25 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
             grant = grant.with_credential(&peer, PeerCredential::for_audience(peer.clone(), token));
         }
         registry = registry.allow(peer.clone(), grant);
+        // Refused here rather than at the first call, because the two failures
+        // read nothing alike: a plaintext peer wired at boot fails much later,
+        // once, inside whichever run happened to reach it, as a peer refusal
+        // that names no cause a person can act on.
+        //
+        // This build cannot lift it. The exception for `http://` to this machine
+        // is `testkit`, which the released binary does not carry — see the `cli`
+        // feature — and reaching a local peer from a development build means
+        // `--features cli,a2a,testkit`.
+        if !url.starts_with("https://") {
+            return Err(format!(
+                "--peer `{name}` is `{url}`, and a peer is reached over HTTPS. A card or a \
+                 peer answer steers the calls that follow it, so a plaintext hop would let \
+                 the network choose them. For a peer on this machine, build with \
+                 `--features cli,a2a,testkit`."
+            ));
+        }
         let client = A2aClient::new(Endpoint::new(url))
-            .map_err(|e| format!("could not build a client for peer `{name}`: {e}"))?
-            // The CLI build carries `testkit`, so a peer served on this
-            // machine is reachable; the exception applies to loopback
-            // literals only, never to a name that merely resolved to one.
-            .allow_loopback();
+            .map_err(|e| format!("could not build a client for peer `{name}`: {e}"))?;
         router = router.peer(
             peer,
             Arc::new(client) as Arc<dyn agentplane::peers::PeerClient>,
@@ -1509,6 +1536,51 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
         registry,
         Arc::new(router) as Arc<dyn agentplane::peers::PeerClient>,
     )))
+}
+
+/// Parse every manifest in the file, and hold each to the annotations a
+/// deployment requires.
+///
+/// The runtime never reads `metadata.annotations` — that is what makes them safe
+/// to carry, and it is why nothing in a running plane can notice an agent that
+/// shipped without an owner. This does not change that: the keys stay the
+/// deployment's vocabulary, no interpretation crosses the trust boundary, and
+/// the enforcement is a job somebody runs in review.
+///
+/// # Errors
+///
+/// If a manifest will not parse, or a required annotation is absent.
+fn validate(a: &ValidateArgs) -> Result<ExitCode, String> {
+    let mut missing = Vec::new();
+    for m in &manifests_at(&a.manifest)? {
+        // Checked per agent, because a file may hold a room and "one of them
+        // has an owner" is not the rule anybody meant.
+        //
+        // Presence only: an annotation *present and empty* never reaches here,
+        // because the parser refuses it — a key that answers nothing reads to a
+        // reviewer like a question that was answered.
+        let absent: Vec<&String> = a
+            .require_annotation
+            .iter()
+            .filter(|key| !m.metadata.annotations.contains_key(*key))
+            .collect();
+        if absent.is_empty() {
+            println!("ok: {} {}", m.metadata.name, m.metadata.version);
+        } else {
+            for key in absent {
+                println!("MISSING: {} — annotation '{key}'", m.metadata.name);
+                missing.push(format!("{}: {key}", m.metadata.name));
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    Err(format!(
+        "{} required annotation(s) absent: {}",
+        missing.len(),
+        missing.join(", ")
+    ))
 }
 
 /// Naming the feature rather than ignoring the flag, as `--mcp` does.
@@ -2012,8 +2084,8 @@ async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
             }
             Ok(Arc::new(driver))
         }
-        #[cfg(feature = "testkit")]
-        "fake" => Ok(agentplane::testkit::FakeProvider::new()),
+        #[cfg(feature = "fake-model")]
+        "fake" => Ok(agentplane::model::fake::FakeProvider::new()),
         other => Err(format!(
             "no driver for provider '{other}'. This binary ships {}; anything else is an \
              embedder's own driver, registered through RuntimeBuilder::provider",
@@ -2037,7 +2109,7 @@ fn shipped_providers() -> Vec<&'static str> {
     names.extend(["anthropic", "chat-completions", "gemini", "openai"]);
     #[cfg(feature = "bedrock")]
     names.push("bedrock");
-    #[cfg(feature = "testkit")]
+    #[cfg(feature = "fake-model")]
     names.push("fake");
     names.sort_unstable();
     names

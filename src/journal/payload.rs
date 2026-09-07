@@ -157,6 +157,12 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             attempt: _,
             backoff_ms: _,
             outbound_label: _,
+            // **Clear on purpose, and it is the one field here whose whole
+            // value is surviving erasure.** A byte count is not caller data —
+            // nothing about it identifies a person — and *how much left* has to
+            // stay answerable after *what left* is destroyed. Sealing it would
+            // make the volume signal vanish with the payload it measures.
+            outbound_bytes: _,
         } => vec![SealedField::Value(&mut descriptor.args)],
         K::EffectDone {
             output,

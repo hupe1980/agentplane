@@ -53,7 +53,7 @@ Three layers enforce it, because convention is not enforcement:
    clock, RNG, socket, or filesystem. Non-determinism is unreachable rather than
    discouraged.
 2. **Lint gating.** `clippy.toml` denies `SystemTime::now`, `Instant::now`,
-   `rand::random`, `Ulid::new`. The two legitimate call sites in the crate carry
+   `rand::random`, `Ulid::generate`. The two legitimate call sites in the crate carry
    an explicit `#[allow]` and a comment naming the record that captures the
    value.
 3. **Effect-key verification.** On replay the key is recomputed from the
@@ -122,9 +122,13 @@ src/
              the provider drivers, each with a streaming twin, sit behind
              features (`providers` for Anthropic, OpenAI, Gemini and
              Chat Completions; `bedrock` for Bedrock — both off by default)
-  testkit/   fault injection, a fake model provider, and shared assertions
-             (feature `testkit`, off by default) — for this crate's assurance
-             layers and for embedders testing their own stores and skills
+  testkit/   fault injection, a signer that mints its own attestations, store
+             conformance batteries and shared assertions (feature `testkit`,
+             off by default, and no shipped feature enables it) — for this
+             crate's assurance layers and for embedders testing their own
+             stores and skills. The fake *model* is not here but with the real
+             drivers, under `fake-model`: a stand-in model is a driver, not a
+             control, and the CLI runs `provider: fake`
   prelude    the names a program that does nothing unusual needs, so the first
              one is a single `use` — re-exports only, no API of its own
 ```

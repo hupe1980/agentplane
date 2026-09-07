@@ -128,7 +128,7 @@ impl MemoryKeyRing {
             .or_default()
             .entry(generation)
             .or_insert_with(|| {
-                use rand::RngCore as _;
+                use rand::Rng as _;
                 let mut k = [0u8; 32];
                 // The determinism gate exists so a replayed run reads a journaled
                 // value instead of drawing a fresh one. Key material is the opposite
@@ -166,7 +166,7 @@ impl KeyRing for MemoryKeyRing {
         // Fresh per call, exactly as a service mints one.
         let mut dek = [0u8; 32];
         {
-            use rand::RngCore as _;
+            use rand::Rng as _;
             #[allow(clippy::disallowed_methods)]
             rand::rng().fill_bytes(&mut dek);
         }

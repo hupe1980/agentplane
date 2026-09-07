@@ -90,14 +90,22 @@ macro_rules! ulid_newtype {
         pub struct $name(pub ulid::Ulid);
 
         impl $name {
-            /// Mint a fresh id from a monotonic source.
+            /// Mint a fresh id from the ambient clock and a random tail.
             ///
             /// Reserved for the runtime's admission path, which journals the
             /// result. Skills must never call this — see `clippy.toml`.
+            ///
+            /// **Sorted to the millisecond, not beyond it.** Ordering comes
+            /// from the timestamp prefix, so two ids minted in the same
+            /// millisecond order by their random tails — arbitrarily, and
+            /// differently on each instance. A range scan over one run's
+            /// records is exact because the run id is a *prefix*; "cases sort
+            /// by creation time" is true between milliseconds and a coin flip
+            /// inside one.
             #[allow(clippy::disallowed_methods)]
             #[must_use]
             pub fn generate() -> Self {
-                Self(ulid::Ulid::new())
+                Self(ulid::Ulid::generate())
             }
 
             /// Reconstruct from a stored string.

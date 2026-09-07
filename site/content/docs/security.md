@@ -1149,6 +1149,27 @@ silently acknowledging a terminal task without its artifact. Operators must
 schedule the worker returned by the server; only that wired deployment
 advertises push.
 
+### Volume is not sensitivity, and the journal records it
+
+A label answers *what may this value touch*. It does not answer *how much of it
+left*: ten thousand records labelled `Internal` pass every gate one record
+passes, and the only volume-shaped ceilings — a budget's effect count, a tenant
+quota — are cost controls that bound work rather than disclosure. An extraction
+sized just under either is invisible to them.
+
+So `EffectStarted` carries **`outbound_bytes`**: the canonical size of the value
+that crossed the sink, beside the label of what crossed it. Absent when an effect
+binds no value, so the ordinary record is unchanged.
+
+It is not a control, deliberately — *forty times the median for this capability*
+is a threshold a deployment sets against its own traffic. What this supplies is
+the figure, so that rule is an ordinary query over the journal.
+
+Recorded rather than derived: the bytes are in `descriptor.args`, so a scan could
+measure them until the payload is sealed or erased. A count is not personal data
+and survives both, because *how much left* has to stay answerable after *what
+left* is destroyed.
+
 ### A peer endpoint and a card URL refuse plaintext
 
 The outbound A2A call carries the run's payload and, when one is held, a
@@ -1157,6 +1178,11 @@ URL is routinely attacker-influenced. Both legs therefore refuse anything but
 HTTPS — the same rule the push webhook applies — with loopback *names* in a
 testkit build as the one exception. The scheme arrives inside a discovered
 card, which is untrusted input, so it is not the far side's choice to make.
+
+The `agentplane` binary does not carry the exception: `cli` does not enable
+`testkit`, and `--peer` refuses a non-HTTPS URL at wiring rather than at the
+first call that reaches it. Reaching a peer on your own machine is a development
+build — `--features cli,a2a,testkit`.
 
 ### A peer's message is untrusted, and names its sender
 

@@ -316,4 +316,30 @@ impl QuotaStore for PostgresStore {
             .get(0);
         Ok(u32::try_from(n).unwrap_or(u32::MAX))
     }
+
+    async fn running_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT run_id FROM quota_running WHERE tenant = $1 \
+                 ORDER BY run_id ASC LIMIT $2",
+                &[
+                    &self.tenant_name(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let raw: String = row.get(0);
+            // Damage rather than absence — see the embedded backend for why a
+            // skipped row is the worst available answer here.
+            out.push(RunId::parse(&raw).map_err(|e| StoreError::Corrupt {
+                seq: 0,
+                detail: format!("bad run id '{raw}' in the quota slot table: {e}"),
+            })?);
+        }
+        Ok(out)
+    }
 }

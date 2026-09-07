@@ -206,8 +206,10 @@ async fn postgres_due_in_matches_the_paging_default() {
         .await
         .expect("connect")
         .for_tenant(agentplane::core::TenantId::new("push-due-in").unwrap());
-    crate::due_conformance::pin_due_in_against_the_default(Arc::new(store) as Arc<dyn PushStore>)
-        .await;
+    agentplane::testkit::conformance_push::pin_due_in_against_the_default(
+        Arc::new(store) as Arc<dyn PushStore>
+    )
+    .await;
 }
 
 async fn memory_revisions_are_shared_and_serialized(

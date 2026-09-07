@@ -189,6 +189,43 @@ mod tests {
         assert_eq!(e.permits(None), Err(EgressError::NoHost));
     }
 
+    /// **Every refusal is a whole sentence, so no caller has to splice one.**
+    ///
+    /// This type is wrapped by three error vocabularies — a tool's, a peer
+    /// discovery's, a model driver's — and each of them once joined its own
+    /// clause to this one and produced something ungrammatical: *…the transport
+    /// for server 'ledger' reaches 'evil.example' is not a granted destination*,
+    /// and *this client may not connect to ''evil.example' is not a granted
+    /// destination…'*. The message an operator reads at 03:00 is the product
+    /// this crate ships as much as the refusal is.
+    ///
+    /// A caller cannot be stopped from splicing by a test here. What can be
+    /// pinned is the premise the callers rely on: the sentence stands alone, so
+    /// the fix is always to give it its own clause rather than to reword it.
+    #[test]
+    fn a_refusal_is_a_sentence_that_stands_on_its_own() {
+        for e in [
+            Egress::new().permits(Some("evil.example")).unwrap_err(),
+            Egress::new().permits(None).unwrap_err(),
+        ] {
+            let text = e.to_string();
+            assert!(
+                !text.ends_with(' ') && !text.starts_with(' '),
+                "a wrapped message must not depend on the caller's spacing: {text:?}"
+            );
+            // The tell of a fragment: it opens with a verb or a connective, so
+            // whatever precedes it has to supply the subject.
+            for fragment in ["is ", "was ", "which ", "that ", "and ", "because "] {
+                assert!(
+                    !text.starts_with(fragment),
+                    "the message opens with `{fragment}` and is therefore a \
+                     fragment — a caller must splice it into a sentence of its \
+                     own to read at all: {text:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn grants_are_listable_for_an_operator() {
         let e = Egress::new().allow("b.example").allow("a.example");

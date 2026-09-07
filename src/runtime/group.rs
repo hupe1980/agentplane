@@ -845,6 +845,7 @@ impl crate::journal::AtomicWork for GroupCommit {
                     // registration — it would need `sink`, and a group has no
                     // labelled value to bind on its behalf.
                     outbound_label: None,
+                    outbound_bytes: None,
                 })
                 .effect(*key),
             );

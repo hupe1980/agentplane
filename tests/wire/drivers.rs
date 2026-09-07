@@ -2574,7 +2574,20 @@ async fn a_model_call_to_an_ungranted_host_is_refused() {
         .await
         .expect_err("127.0.0.1 was never granted");
 
-    assert!(matches!(err, ModelError::Refused { .. }), "{err}");
+    // `Egress`, not `Refused`. Both are `DidNotHappen` and neither spends a
+    // retry attempt, so the distinction buys no different recovery — it buys
+    // the operator the right half of the system to look at. Reported as the
+    // provider refusing, a deployment's own allowlist sends somebody to a
+    // vendor status page.
+    assert!(matches!(err, ModelError::Egress { .. }), "{err}");
+    assert!(
+        !matches!(err, ModelError::Refused { .. }),
+        "this plane refused to connect; the provider was never asked"
+    );
+    assert!(
+        err.to_string().starts_with("this plane may not reach"),
+        "the message must name who refused: {err}"
+    );
     assert_eq!(
         err.disposition(),
         Disposition::DidNotHappen,

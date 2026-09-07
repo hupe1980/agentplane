@@ -141,9 +141,8 @@ docker run --rm --read-only --network none -v "$PWD:/work:ro" \
 
 `--read-only --network none` are not decoration — they are the check that the
 claim below is true. The default journal is in memory and the fake driver needs
-no network, so the first run needs neither a disk nor the internet; the image's
-own smoke test runs exactly this way, which is how it caught that "in memory"
-had been an unlinked file under `TMPDIR` all along.
+no network, so the first run needs neither a disk nor the internet, and the
+image's own smoke test runs exactly this way rather than taking that on trust.
 
 The image is distroless, nonroot, has no shell, and is published multi-arch,
 cosign-signed and with SLSA provenance and an SBOM bound to the digest.
@@ -355,7 +354,8 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `opendal` | content-addressed blob storage on S3, GCS, Azure or a filesystem — where bytes too large for the journal go |
 | `keyring` | envelope encryption for payload bytes, and the cryptographic erasure it makes provable — destroying a key erases every copy, including backups |
 | `keyring-vault` | a key ring that is somebody else: HashiCorp Vault's transit engine over its HTTP API, so the wrapping key never leaves Vault |
-| `testkit` | fault injection, store conformance, and a fake model provider that can stream — so an observer is testable without a key or a network |
+| `fake-model` | a model provider with no model behind it: deterministic answers, real usage figures. What makes `provider: fake` run without a key or a network; `cli` includes it |
+| `testkit` | fault injection, store conformance, a signer that mints its own attestations, and the plaintext-loopback exceptions. **Never in a shipped build** — no feature a release enables pulls it in, and a guard holds that |
 
 ## 3. Write a skill 🛠️ {#write-a-skill}
 
@@ -547,8 +547,9 @@ for approval. When someone decides, the run resumes exactly where it was.
 
 ## 7. Test it 🧪 {#test-it}
 
-The `testkit` feature gives you a model provider with no model behind it, so a
-test can exercise the whole path with no key and no network:
+The `fake-model` feature — which `testkit` and `cli` both enable — gives you a
+model provider with no model behind it, so a test can exercise the whole path
+with no key and no network:
 
 ```rust
 use agentplane::testkit::FakeProvider;

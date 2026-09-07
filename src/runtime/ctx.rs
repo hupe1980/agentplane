@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
+use rand::rngs::ChaCha8Rng;
 use serde_json::Value;
 
 use crate::case::{CaseStore, EventStore, TaskStore, TimerStore};
@@ -1069,7 +1069,23 @@ impl<'a> StepCtx<'a> {
     /// journal carries no entropy records at all. Cheaper *and* stronger than
     /// recording each value — there is no way for the recorded and recomputed
     /// streams to disagree.
-    pub fn rng(&mut self) -> &mut impl rand::Rng {
+    ///
+    /// **The stream is part of the replay contract** — nothing in the journal
+    /// records which generator wrote a history — so it is pinned by a golden
+    /// vector rather than left to a dependency's discretion.
+    ///
+    /// The traits are re-exported as [`agentplane::rand`](crate::rand), so
+    /// drawing from this does not begin with matching a `rand` version in your
+    /// own manifest:
+    ///
+    /// ```
+    /// # use agentplane::runtime::StepCtx;
+    /// use agentplane::rand::RngExt as _;
+    /// # fn draw(cx: &mut StepCtx<'_>) -> u32 {
+    /// cx.rng().random_range(0..100)
+    /// # }
+    /// ```
+    pub fn rng(&mut self) -> &mut impl rand::RngExt {
         &mut self.rng
     }
 
@@ -2547,6 +2563,7 @@ impl<'a> StepCtx<'a> {
                 backoff_ms: 0,
                 // A durable wait binds no outbound value.
                 outbound_label: None,
+                outbound_bytes: None,
             },
         )
         .await?;
@@ -2633,6 +2650,22 @@ impl<'a> StepCtx<'a> {
             // A runtime that cannot record what it refused must not report
             // the tidier error instead.
             return e;
+        }
+
+        // **Counted, because this is the refusal a model can actually probe.**
+        //
+        // The engine gate counts its own denials, and in a tool-calling loop
+        // one of those is not model-facing and ends the run — so nothing there
+        // accumulates. What does accumulate is here: a sink refusal comes back
+        // as `REFUSED`, the loop continues, and the model may try again. That
+        // is the channel `REFUSED`'s own documentation says `max_denials`
+        // bounds, and it was the one path not counted.
+        //
+        // After the record, for the reason the engine gate gives: the refusal
+        // has happened and belongs in the journal whatever the ceiling says.
+        // What the ceiling stops is the next attempt.
+        if let Err(exceeded) = self.ledger.lock().expect("budget mutex").record_denial() {
+            return StepError::Budget(exceeded);
         }
         denial.into()
     }
@@ -3331,6 +3364,11 @@ impl<'a> StepCtx<'a> {
                     attempt,
                     backoff_ms,
                     outbound_label: outbound.cloned(),
+                    // Measured from what the sink was handed, so the figure is
+                    // the payload rather than the descriptor around it.
+                    outbound_bytes: effect.sink_arguments().map(|args| {
+                        crate::core::canon::to_bytes(args).map_or(0, |b| b.len() as u64)
+                    }),
                 },
             )
             .await?;
@@ -3557,6 +3595,10 @@ fn subscription_clock() -> Timestamp {
 }
 
 /// Derive a reproducible RNG stream for one step.
+///
+/// Both halves — the seed layout and the generator — are a durable contract,
+/// because replay recomputes the stream instead of reading it back.
+/// `rng_stream_is_pinned` holds them to literal bytes.
 fn seeded_rng(run: RunId, step: StepId) -> ChaCha8Rng {
     let mut seed = [0u8; 32];
     seed[..16].copy_from_slice(&run.0.to_bytes());
@@ -5035,6 +5077,7 @@ impl StepCtx<'_> {
                     backoff_ms: 0,
                     // An awaited inbound event binds no outbound value.
                     outbound_label: None,
+                    outbound_bytes: None,
                 },
             )
             .await?;
@@ -5206,7 +5249,38 @@ pub(crate) fn merge_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::Rng as _;
+    use rand::{Rng as _, RngExt as _};
+
+    /// The entropy stream is a durable contract, and this is the only test that
+    /// can tell when it breaks.
+    ///
+    /// The two tests below compare one build against itself, so they hold for
+    /// *any* generator: they would pass unchanged the day a dependency swapped
+    /// `ChaCha8` for something else, whereupon every run that had ever drawn a
+    /// number re-derives different effect arguments and is quarantined as
+    /// non-determinism — with nothing in the journal to name the cause.
+    ///
+    /// Literal words for a literal seed, therefore, for the reason the
+    /// canonicalization goldens exist. If this fails after a dependency bump,
+    /// the bump changed every replay in the world — that is the finding, not
+    /// the vector.
+    #[test]
+    fn rng_stream_is_pinned() {
+        let run = RunId(ulid::Ulid(0x018F_2A3B_4C5D_6E7F_8091_A2B3_C4D5_E6F7));
+        let mut r = seeded_rng(run, StepId(7));
+        let drawn: Vec<u64> = (0..4).map(|_| r.next_u64()).collect();
+        assert_eq!(
+            drawn,
+            vec![
+                0x5dc1_d7b7_0c89_cfc8,
+                0xd538_d4d4_ce78_3876,
+                0xe2d6_bb02_860a_b9c7,
+                0x91e7_553e_9e7d_bdc3,
+            ],
+            "the ChaCha8 stream behind StepCtx::rng moved; every replay that \
+             ever drew a number now diverges"
+        );
+    }
 
     #[test]
     fn rng_is_reproducible_for_the_same_run_and_step() {

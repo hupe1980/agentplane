@@ -102,6 +102,15 @@ because rounding up is how a condition list stops being checkable.
 | 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ⬜ open |
 | 8 | **The deferred format questions are settled**, because each one moves a record: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open |
 
+**7 and 8 are independent, with one join.** They can be worked in parallel:
+agility is about how a digest says *which function produced it* and how a
+verifier meets an older one, while the deferred questions add **fields** to
+record kinds that are already hashed — a field on `EffectFailed` changes the
+bytes, not the scheme that covers them. The join is the policy-bundle canonical
+format, which is itself a hashed artifact: agility enumerates every durable or
+signed format, and that enumeration is not complete until the bundle's format
+exists. So 8 does not gate 7's *design*, only the last line of its inventory.
+
 Two things follow that are worth stating plainly.
 
 **Freezing the journal does not freeze everything.** Store schemas are a

@@ -152,6 +152,7 @@ fn effects() -> Vec<RecordKind> {
             attempt: 2,
             backoff_ms: 250,
             outbound_label: Some(Label::trusted()),
+            outbound_bytes: None,
         },
         RecordKind::EffectDone {
             output: json!({ "charge": "ch_9RtQ" }),
@@ -306,7 +307,24 @@ fn every_record_kind_hashes_to_its_golden_vector() {
                 "raw": String::from_utf8(sealed.raw().to_vec())
                     .expect("canonical records are UTF-8"),
             });
-            serde_json::to_string(&line).expect("a vector serialises")
+            // Canonical, not `serde_json::to_string`. The envelope's own key
+            // order is not a property of the record format, and it was
+            // nevertheless load-bearing: each line is compared as a *string*,
+            // and `serde_json::Map` orders by insertion when anything in the
+            // build enables `preserve_order` and by sort when nothing does.
+            // Nothing here asks for it — `cedar-policy` does, and so did a
+            // dev-dependency — so the corpus passed under `--all-features` and
+            // under the default set for two different reasons, and removing an
+            // unrelated dev-dependency made the default set disagree with a
+            // file that had not moved.
+            //
+            // `canon::to_bytes` is the writer this crate already owns for
+            // exactly this: its order comes from the canonicalizer rather than
+            // from whichever map serde_json happened to compile.
+            String::from_utf8(
+                agentplane::core::canon::to_bytes(&line).expect("a vector serialises"),
+            )
+            .expect("canonical JSON is UTF-8")
         })
         .collect();
 

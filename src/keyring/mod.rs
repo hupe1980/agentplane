@@ -328,6 +328,17 @@ pub(crate) fn assert_serves(store: &str, tenant: &crate::core::TenantId, kind: &
     );
 }
 
+/// The AEAD's own nonce type, over bytes read back from a store.
+///
+/// `None` where the slice is not exactly [`chacha20poly1305::XNonce`]'s width.
+/// This is the conversion, not the check — every caller has already refused a
+/// wrong-length nonce with an error of its own vocabulary — but it is fallible
+/// rather than panicking, because the bytes come from a store and a reader of
+/// stored bytes that aborts the process is a denial of service.
+pub(crate) fn xnonce(bytes: &[u8]) -> Option<&chacha20poly1305::XNonce> {
+    <&chacha20poly1305::XNonce>::try_from(bytes).ok()
+}
+
 mod envelope;
 
 /// The sealed-envelope construction this build writes, and the only one it

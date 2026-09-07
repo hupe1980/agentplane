@@ -27,7 +27,12 @@ jobs:
       # for, and crates.io is immutable.
       - name: Tag matches Cargo.toml
         run: |
-          crate=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          # By name, never by index. `--no-deps` lists every workspace member,
+          # and this repo has two — so `.packages[0]` is whichever cargo emits
+          # first, which became the test-only member and its version 0.0.0.
+          crate=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "agentplane") | .version')
+          [ -n "$crate" ] || { echo "::error::no package named agentplane in cargo metadata"; exit 1; }
           tag=${GITHUB_REF_NAME#v}
           echo "tag=$tag crate=$crate"
           [ "$tag" = "$crate" ] || { echo "::error::tag v$tag != Cargo.toml $crate"; exit 1; }

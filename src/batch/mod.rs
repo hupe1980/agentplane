@@ -209,6 +209,39 @@ impl ItemOutcome {
             .map(Self::as_str)
             .collect()
     }
+
+    /// Whether this item is finished *and* needs nothing from anybody.
+    ///
+    /// Terminal and settled are different questions, and the difference is the
+    /// backlog: `Failed` and `Quarantined` are terminal and are exactly what a
+    /// person has to see. Written as a match rather than `== Succeeded` so a
+    /// variant added later is unsettled by construction — the safe direction.
+    #[must_use]
+    pub const fn is_settled(&self) -> bool {
+        match self {
+            Self::Succeeded => true,
+            Self::Failed(_) | Self::Quarantined(_) | Self::Suspended(_) | Self::Exhausted(_) => {
+                false
+            }
+        }
+    }
+
+    /// The stored spellings of every outcome nobody has to act on.
+    ///
+    /// The set a store negates to build [`items_needing_attention`]. Derived
+    /// from [`all`](Self::all) for the reason
+    /// [`terminal_tags`](Self::terminal_tags) is: a hand-kept list of strings
+    /// stops naming a class of trouble the day somebody adds one.
+    ///
+    /// [`items_needing_attention`]: BatchStore::items_needing_attention
+    #[must_use]
+    pub fn settled_tags() -> Vec<&'static str> {
+        Self::all(String::new())
+            .iter()
+            .filter(|o| o.is_settled())
+            .map(Self::as_str)
+            .collect()
+    }
 }
 
 /// What a batch has done, and whether it is done.
@@ -269,10 +302,52 @@ pub struct BatchReport {
     pub status: BatchStatus,
     /// Items reserved but not yet terminal — suspended, or interrupted.
     pub in_flight: u64,
+    /// Items paused at a ceiling, resumable once somebody raises it.
+    ///
+    /// Separate from [`in_flight`](Self::in_flight) because the move differs: an
+    /// interrupted item resumes when a sweep reaches it, this one waits for a
+    /// decision. Its own field because both leave the batch
+    /// [`Running`](BatchStatus::Running), and so does a deliberate `max_items`
+    /// window — only the counts tell those apart.
+    pub exhausted: u64,
     /// The whole batch's consumption, summed from its items.
     pub spend: Spend,
     /// The key processing stopped after, for a resume.
     pub cursor: Option<String>,
+}
+
+impl BatchReport {
+    /// Whether anything here needs a person — the alerting predicate.
+    ///
+    /// Deliberately **not** *is this batch unfinished*. Every windowed pass
+    /// returns [`Running`](BatchStatus::Running), so a status-keyed predicate
+    /// would be true on every correct use of [`BatchSpec::max_items`], and a
+    /// predicate that is always true is one people stop reading. It reads the
+    /// facts somebody acts on instead: `in_flight`, `exhausted`, and the failed
+    /// or quarantined counts.
+    ///
+    /// [`BatchStore::items_needing_attention`] is the listing behind the answer;
+    /// a predicate that says *yes* and cannot say *which* is a counter with no
+    /// alert.
+    ///
+    /// [`BatchSpec::max_items`]: crate::runtime::BatchSpec::max_items
+    #[must_use]
+    pub const fn needs_attention(&self) -> bool {
+        self.in_flight > 0 || self.exhausted > 0 || self.failed_or_quarantined() > 0
+    }
+
+    /// The terminal items that did not settle.
+    #[must_use]
+    pub const fn failed_or_quarantined(&self) -> u64 {
+        match self.status {
+            BatchStatus::Running => 0,
+            BatchStatus::Completed {
+                failed,
+                quarantined,
+                succeeded: _,
+            } => failed + quarantined,
+        }
+    }
 }
 
 /// Durable batch state.
@@ -375,6 +450,32 @@ pub trait BatchStore: Send + Sync + Debug {
     /// Every item record, oldest key first. For operators and for tests; the
     /// driver uses `cursor` and `census`.
     async fn items(&self, batch: BatchId, limit: usize) -> Result<Vec<ItemRecord>, StoreError>;
+
+    /// The items that are not settled, oldest key first.
+    ///
+    /// [`census`](Self::census) answers *43 failed*; the question an operator
+    /// has is **which 43**, and over the size a batch exists for the only other
+    /// route is paging [`items`](Self::items) through a hundred thousand rows
+    /// that are almost all successes — the finding indexed and reaching nobody.
+    ///
+    /// Unsettled, not un-terminal: a failed item and a suspended one are both
+    /// here, because *finished* and *finished with* are different questions.
+    /// Each record's [`ItemOutcome`] says whether the next move is a re-run, a
+    /// raised ceiling, or a look.
+    ///
+    /// Oldest-first is legitimate because entries **leave**: resolving an item
+    /// drops it. An ascending page over a listing nothing empties would have a
+    /// permanent head and an unreachable tail.
+    ///
+    /// # Errors
+    ///
+    /// Backend failures. An unknown batch is an empty listing, not an error:
+    /// [`plan_digest`](Self::plan_digest) is the existence question.
+    async fn items_needing_attention(
+        &self,
+        batch: BatchId,
+        limit: usize,
+    ) -> Result<Vec<ItemRecord>, StoreError>;
 }
 
 /// A batch's tally.

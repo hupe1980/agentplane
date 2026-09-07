@@ -76,7 +76,7 @@ pub use label::{
 };
 pub use plan::{ArgSource, Collaboration, PlanError, PlanIR, PlanNode, Topology};
 pub use policy::{
-    ACTION_ADMIT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE, DenyAll,
+    ACTION_ADMIT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE, ACTIONS, DenyAll,
     PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
 };
 pub use retry::{RetryPolicy, retry_after_seconds};

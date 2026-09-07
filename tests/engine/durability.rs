@@ -473,6 +473,7 @@ async fn the_store_refuses_a_duplicate_effect_start() {
         attempt: 1,
         backoff_ms: 0,
         outbound_label: None,
+        outbound_bytes: None,
     };
 
     s.append(lease.epoch, vec![Append::new(run, started()).effect(key)])

@@ -443,6 +443,26 @@ pub trait QuotaStore: Send + Sync + Debug {
     ///
     /// If the store cannot be reached.
     async fn running(&self) -> Result<u32, StoreError>;
+
+    /// **Which** runs hold this tenant's slots.
+    ///
+    /// [`running`](Self::running) says *five of five*, and one of those five may
+    /// not be a run at all: a slot is taken at admission and given back at
+    /// settlement, so an instance that dies in between strands one —
+    /// indistinguishable from live work in a count, and the tenant is throttled
+    /// by a run that stopped existing.
+    ///
+    /// The answer is one join away. A stranded slot is a run this listing holds
+    /// whose lease has lapsed, which [`JournalStore::abandoned_runs`] returns;
+    /// the recovery sweep resumes it and settlement gives the slot back. Ordered
+    /// by run id, and legitimately ascending because a settled run leaves.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    ///
+    /// [`JournalStore::abandoned_runs`]: crate::journal::JournalStore::abandoned_runs
+    async fn running_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError>;
 }
 
 /// Refuse a run whose tenant has already spent its ceiling.

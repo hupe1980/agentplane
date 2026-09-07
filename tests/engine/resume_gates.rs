@@ -616,6 +616,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         attempt: 1,
                         backoff_ms: 0,
                         outbound_label: None,
+                        outbound_bytes: None,
                     },
                 )
                 .step(StepId(0))
@@ -654,6 +655,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         attempt: 1,
                         backoff_ms: 0,
                         outbound_label: None,
+                        outbound_bytes: None,
                     },
                 )
                 .step(StepId(1))

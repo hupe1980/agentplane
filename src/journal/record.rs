@@ -270,6 +270,22 @@ pub enum RecordKind {
         /// the ordinary case costs no bytes and hashes identically.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outbound_label: Option<Label>,
+        /// How many canonical bytes this effect sent, when it bound a value.
+        ///
+        /// **Volume is not sensitivity, and nothing else records it**: ten
+        /// thousand records labelled `Internal` pass every gate one record
+        /// passes. Not a control — a threshold is the deployment's to set — but
+        /// the figure that makes such a rule a query over the journal.
+        ///
+        /// Recorded rather than derived, because `descriptor.args` is sealed
+        /// under a key ring and destroyed by erasure while a count is neither:
+        /// *how much left* has to stay answerable after *what left* is gone.
+        ///
+        /// Canonical, so the figure does not move with a serializer's spacing.
+        /// Absent for an effect that binds no value, so the ordinary record
+        /// hashes identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outbound_bytes: Option<u64>,
     },
 
     EffectDone {

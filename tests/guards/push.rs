@@ -426,12 +426,12 @@ async fn registrations_round_trip() {
 ///
 /// The override exists to make the namespace filter one scan instead of a
 /// re-reading window; it must never make it a different *answer*. The battery
-/// and its reasoning live in [`crate::due_conformance`], shared with the
+/// and its reasoning live in [`agentplane::testkit::conformance_push`], shared with the
 /// `PostgreSQL` backend so the two overrides are held to one semantics.
 #[tokio::test]
 async fn redb_due_in_matches_the_paging_default() {
     let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn PushStore>;
-    crate::due_conformance::pin_due_in_against_the_default(store).await;
+    agentplane::testkit::conformance_push::pin_due_in_against_the_default(store).await;
 }
 
 /// Replacing credentials or a URL must not acknowledge events on the receiver's

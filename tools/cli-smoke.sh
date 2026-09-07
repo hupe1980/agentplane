@@ -16,6 +16,18 @@ YAML=examples/summariser.yaml
 echo "── validate ──"
 "${BIN[@]}" validate "$YAML"
 
+# A review rule the runtime deliberately never enforces: `metadata.annotations`
+# is never read, which is what makes it safe to carry, and is why nothing can
+# notice an agent shipped without an owner. The check belongs in CI, so it has
+# to actually fail there.
+echo "── a required annotation is a build failure, not a convention ──"
+if "${BIN[@]}" validate "$YAML" --require-annotation example.com/nobody >/dev/null 2>&1; then
+    echo "FAIL: a missing required annotation exited zero"; exit 1
+fi
+"${BIN[@]}" validate "$YAML" >/dev/null || {
+    echo "FAIL: the same manifest must still pass with nothing required"; exit 1; }
+echo "ok: a missing required annotation fails, and requiring none still passes"
+
 echo "── schema names its published home ──"
 schema="$("${BIN[@]}" schema)"
 echo "$schema" | grep -q '"\$id": "https://hupe1980.github.io/agentplane/agent.schema.json"' || {

@@ -56,7 +56,14 @@ pub const JSONRPC: &str = "JSONRPC";
 /// Why a card could not be obtained or believed.
 #[derive(Debug, thiserror::Error)]
 pub enum DiscoveryError {
-    #[error("this client may not connect to '{0}'")]
+    /// Carries a **complete sentence**, so this variant does not quote it.
+    ///
+    /// All three refusals here — a plaintext card URL, a host egress does not
+    /// grant, an address `netguard` forbids — arrive as finished sentences from
+    /// the layer that knows the fact. Wrapping one in `'{0}'` produced *this
+    /// client may not connect to ''evil.example' is not a granted destination;
+    /// …'*: nested quotes around a clause that was never a host.
+    #[error("this client may not connect: {0}")]
     Refused(String),
     #[error("the card could not be fetched: {0}")]
     Unreachable(String),

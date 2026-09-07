@@ -578,6 +578,7 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                         recovery: Recovery::RequiresOperator,
                         mutates: true,
                         outbound_label: None,
+                        outbound_bytes: None,
                     },
                 )
                 .step(StepId(0))

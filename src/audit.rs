@@ -42,6 +42,22 @@ use crate::journal::{Checkpoint, JournalStore, Record};
 /// report exists for should not have to link this crate to read it. The
 /// findings render as the sentences they display as, because an auditor reads
 /// prose and a machine that wants structure has the run ids beside it.
+///
+/// # What no report here can speak for: the runs that never started
+///
+/// A run refused **before it exists** — a policy denial on
+/// [`ACTION_ADMIT`](crate::core::ACTION_ADMIT), a tenant ceiling, a standing
+/// halt — has no run id and therefore no chain to append to. Nothing about it
+/// is in this report, and no amount of reading the journal will find it.
+///
+/// Stated because *how often did policy stop a run from starting* is a question
+/// an auditor asks, and a clean report answers it with silence rather than with
+/// zero. The number lives in the `agentplane.policy.denials` metric and
+/// `agentplane.policy.denied` telemetry, outside the hash chain.
+///
+/// It is not in [`not_checked`](Self::not_checked): that reports what *this*
+/// audit could not check, and an entry in every report ever produced would train
+/// a reader to skip the list.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AuditReport {
     /// The checkpoint the store reports now.

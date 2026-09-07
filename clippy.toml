@@ -14,5 +14,5 @@ disallowed-methods = [
     { path = "time::OffsetDateTime::now_utc",    reason = "non-deterministic — use StepCtx::now(), which journals the instant" },
     { path = "rand::random",                     reason = "non-deterministic — use StepCtx::rng(), seeded from the run id" },
     { path = "rand::rng",                        reason = "non-deterministic — use StepCtx::rng(), seeded from the run id" },
-    { path = "ulid::Ulid::new",                  reason = "non-deterministic — mint ids via StepCtx, which journals them" },
+    { path = "ulid::Ulid::generate",             reason = "non-deterministic — mint ids via StepCtx, which journals them" },
 ]

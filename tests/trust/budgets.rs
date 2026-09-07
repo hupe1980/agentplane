@@ -934,3 +934,133 @@ async fn a_wall_clock_ceiling_stops_the_run() {
     );
     assert_eq!(again.consumed.elapsed_secs, out.consumed.elapsed_secs);
 }
+
+/// **The denial ceiling bounds the refusal a model can actually probe.**
+///
+/// `REFUSED`'s own documentation says `max_denials` is what bounds the
+/// denied/allowed bit a uniform message cannot remove. That was true of the
+/// engine gate and false of this path, which is the one the bit travels on: a
+/// sink refusal comes back to a tool-calling model as `REFUSED` and the loop
+/// continues, so a skill — or a model — may keep asking. Only the engine gate
+/// counted, and an engine denial is not model-facing at all.
+///
+/// The skill here catches each refusal and tries again, which is what a run
+/// probing a boundary looks like from the outside. With the ceiling at two, the
+/// third refusal must end the run rather than answer it.
+#[tokio::test]
+async fn a_sink_refusal_counts_against_the_denial_ceiling() {
+    use agentplane::core::{ProtectedField, RetryPolicy, SourceId};
+
+    #[derive(Debug)]
+    struct Guarded {
+        arguments: Value,
+        protected: Vec<ProtectedField>,
+    }
+
+    #[async_trait::async_trait]
+    impl Effect for Guarded {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::new("guarded.send", json!({}))
+        }
+        fn mutates(&self) -> bool {
+            true
+        }
+        fn sink_arguments(&self) -> Option<&Value> {
+            Some(&self.arguments)
+        }
+        fn protected_fields(&self) -> &[ProtectedField] {
+            &self.protected
+        }
+        fn source(&self) -> SourceId {
+            SourceId::new("tool.guarded")
+        }
+        fn recovery(&self) -> Recovery {
+            Recovery::Retry
+        }
+        fn retry(&self) -> RetryPolicy {
+            RetryPolicy::never()
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            Ok(json!({}))
+        }
+    }
+
+    /// Asks four times, swallowing every refusal — the shape of a probe.
+    #[derive(Debug)]
+    struct Probes(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl Skill for Probes {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("probe")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            for _ in 0..4 {
+                let untrusted = Tainted::from_source(
+                    json!({ "recipient": "AC-9" }),
+                    SourceId::new("model:probe"),
+                );
+                let effect = Guarded {
+                    arguments: untrusted.peek().clone(),
+                    protected: vec![ProtectedField::trusted("/recipient")],
+                };
+                match cx.sink(effect, &untrusted).await {
+                    // A refusal the run answers by asking again.
+                    Err(agentplane::core::StepError::Policy(_)) => {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // Anything else — above all the ceiling — leaves the loop.
+                    Err(other) => return Err(other.into()),
+                    Ok(_) => unreachable!("an untrusted value reached a trusted field"),
+                }
+            }
+            Ok(Outcome::done(input))
+        }
+    }
+
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().unwrap());
+    let refused = Arc::new(AtomicUsize::new(0));
+    let out = Runtime::builder(Arc::clone(&store))
+        .owner("probe")
+        .budget(Budget::unlimited().denials(2))
+        .skill(Probes(Arc::clone(&refused)))
+        .build()
+        .run("probe", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Exhausted(_)),
+        "a run that kept being refused must stop at its ceiling, not answer \
+         forever: {:?}",
+        out.status
+    );
+    assert_eq!(
+        refused.load(Ordering::SeqCst),
+        2,
+        "two refusals are answered and the third is not handed back — the run \
+         stops at the ceiling instead of continuing to probe"
+    );
+
+    // The third refusal is still on the record. The ceiling is counted *after*
+    // the append for exactly this reason: the refusal happened, and a ceiling
+    // that suppressed the evidence of the attempt it stopped would hide the
+    // probe it exists to catch.
+    let denials = store
+        .read(out.run_id, 1)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| matches!(r.kind(), RecordKind::PolicyDenied { .. }))
+        .count();
+    assert_eq!(
+        denials, 3,
+        "every refusal is journaled, including the one the ceiling stopped the \
+         run over"
+    );
+}

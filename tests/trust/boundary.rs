@@ -1329,3 +1329,89 @@ async fn a_refused_sink_strict_replays_to_the_same_refusal() {
         "a taint-gate refusal did not replay to the verdict the run recorded"
     );
 }
+
+/// **How much crossed a sink is on the record, beside the label of what did.**
+///
+/// Sensitivity does not track volume and nothing else did either: ten thousand
+/// records labelled `Internal` pass every gate one record passes, and the only
+/// volume-shaped ceilings are a budget's effect count and a tenant quota — cost
+/// controls that bound work rather than disclosure, so an extraction sized just
+/// under either is invisible to them.
+///
+/// This is not a control and does not try to be one; *40× the median for this
+/// capability* is a threshold a deployment sets, not one this crate could pick.
+/// What it pins is that the figure exists, so such a rule is an ordinary query
+/// over the journal rather than an unanswerable question.
+///
+/// The count is deliberately **not** derived from `descriptor.args` at read
+/// time: those bytes are sealed under a key ring and destroyed by erasure, and
+/// *how much left* has to stay answerable after *what left* is gone.
+#[tokio::test]
+async fn a_sink_records_how_many_bytes_crossed_it() {
+    #[derive(Debug)]
+    struct SendsPayload {
+        world: World,
+        arguments: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for SendsPayload {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("sink").provides("sink")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let value = Tainted::trusted(self.arguments.clone());
+            cx.sink(
+                Transfer {
+                    world: Arc::clone(&self.world),
+                    arguments: value.peek().clone(),
+                },
+                &value,
+            )
+            .await?;
+            Ok(Outcome::done(Tainted::trusted(json!({}))))
+        }
+    }
+
+    let store = db();
+    let world: World = Arc::default();
+    let payload = json!({ "recipient": "AC-1", "rows": ["a", "b", "c"] });
+
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("volume")
+        .skill(SendsPayload {
+            world: Arc::clone(&world),
+            arguments: payload.clone(),
+        })
+        .build()
+        .run("sink", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
+
+    let recorded: Vec<Option<u64>> = store
+        .read(out.run_id, 1)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::EffectStarted { outbound_bytes, .. } => Some(*outbound_bytes),
+            _ => None,
+        })
+        .collect();
+
+    let expected = agentplane::core::canon::to_bytes(&payload).unwrap().len() as u64;
+    assert_eq!(
+        recorded,
+        vec![Some(expected)],
+        "the sink's outbound size must be journaled beside its label"
+    );
+    assert!(
+        expected > 0,
+        "a fixture measuring nothing would pass whatever the runtime recorded"
+    );
+}

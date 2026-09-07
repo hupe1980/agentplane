@@ -710,6 +710,40 @@ counts. This is deliberate: "mostly worked" is reported as success everywhere it
 is not explicitly handled, and the items that failed are the ones a human needed
 to hear about.
 
+### A count is not a finding
+
+`failed: 43` is not something anybody can act on. The question is **which 43**,
+and over the size a batch exists for the only route to it through a plain item
+listing is paging a hundred thousand rows that are almost all successes — the
+finding indexed and reaching nobody.
+
+```rust
+let report = runtime.run_batch(id, &spec).await?;
+if report.needs_attention() {
+    for item in batches.items_needing_attention(id, 100).await? {
+        // `outcome` says which move is next: a re-run, a raised ceiling, or a look.
+        eprintln!("{} → {:?}", item.key, item.outcome);
+    }
+}
+```
+
+`items_needing_attention` lists the items nobody is finished with — failed,
+quarantined, suspended, exhausted, and the ones a crash left reserved with no
+outcome at all. *Unsettled*, not *un-terminal*: "finished" and "finished with"
+are different questions and the second is the one a person is asking. It is
+ordered oldest key first, which is legitimate here because entries leave it as
+items are resolved.
+
+`BatchReport::needs_attention()` is the predicate to alert on, and it is
+deliberately **not** *is this batch unfinished*: every windowed pass returns
+`Running`, so a status-keyed predicate would be true on every correct use of
+`max_items`. It reads the facts a person acts on instead — `in_flight`,
+`exhausted`, and the failed or quarantined counts. `exhausted` is its own field
+because a batch stuck at a ceiling and one halfway through a deliberate window
+are both `Running`, and only the counts tell them apart.
+
+`cargo run --example batch_run` walks all of this end to end.
+
 ### An item is processed the way an effect is performed
 
 Announce, act, record. The item's run id is written to the batch store *before*

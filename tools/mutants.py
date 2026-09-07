@@ -2774,7 +2774,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     # for the wrong reason, which is the exact failure mode this whole file
     # exists to catch. So the fake gets mutated like anything else.
     "TheFakeAnswersForFree": (
-        "src/testkit/fake_model.rs",
+        "src/model/fake.rs",
         "an_answer_is_never_free",
         "the fake reports zero usage, so every token and cost ceiling test passes "
         "over a runtime that has stopped counting",
@@ -2782,7 +2782,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        input_tokens: 0,\n        output_tokens: 0,",
     ),
     "TheFakeIsExemptFromTheMediaRefusal": (
-        "src/testkit/fake_model.rs",
+        "src/model/fake.rs",
         "the_fake_refuses_a_provider_side_media_url_like_every_driver",
         "the fake skips the provider-side media refusal every real driver makes, "
         "so a test proving that a caller-named URL never reaches a provider "
@@ -2792,7 +2792,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        let _ = &request.prompt;",
     ),
     "TheFakeIgnoresADeclaredSchema": (
-        "src/testkit/fake_model.rs",
+        "src/model/fake.rs",
         "a_declared_schema_binds_the_fake_the_way_it_binds_a_driver",
         "the fake records `output.schema` and ignores it, so a run scripted with "
         "prose completes and yields Null where every real driver answers "
@@ -2801,7 +2801,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            .map(|completion| completion);",
     ),
     "TheFakeIsNotDeterministic": (
-        "src/testkit/fake_model.rs",
+        "src/model/fake.rs",
         "the_same_question_gets_the_same_answer",
         "the fake answers differently each call, so every replay test becomes a "
         "coin-toss that mostly passes",
@@ -2818,7 +2818,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        });",
     ),
     "TheFakeScriptRunsBackwards": (
-        "src/testkit/fake_model.rs",
+        "src/model/fake.rs",
         "scripted_answers_come_back_in_order_then_the_default_takes_over",
         "scripted answers are handed out in reverse, so a test arranging "
         "failure-then-success exercises success-then-failure",
@@ -7508,6 +7508,7 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
             re.findall(r'feature\s*=\s*"([a-z0-9-]+)"', src[max(0, at - 400) : at])
         )
         return target, feats
+
 
     # A unit test inside the library.
     #

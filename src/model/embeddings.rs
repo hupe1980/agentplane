@@ -826,14 +826,10 @@ mod bedrock_reply_tests {
             .region(aws_config::Region::new("eu-central-1"))
             .credentials_provider(aws_sdk_bedrockruntime::config::Credentials::for_tests())
             .behavior_version_latest()
-            .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                move |_req| {
-                    http::Response::builder()
-                        .status(200)
-                        .header("content-type", "application/json")
-                        .body(body)
-                        .unwrap()
-                },
+            .http_client(crate::model::canned_http(
+                200,
+                Some("application/json"),
+                body,
             ))
             .build();
         BedrockEmbedder::from_client(
@@ -926,9 +922,7 @@ mod bedrock_reply_tests {
             let config = aws_sdk_bedrockruntime::Config::builder()
                 .region(aws_config::Region::new(region))
                 .behavior_version_latest()
-                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                    |_req| http::Response::builder().status(200).body("").unwrap(),
-                ))
+                .http_client(crate::model::canned_http(200, None, ""))
                 .build();
             BedrockEmbedder::from_client(
                 aws_sdk_bedrockruntime::Client::from_conf(config),
@@ -966,9 +960,7 @@ mod bedrock_reply_tests {
         let stub = |region: Option<&str>| {
             let mut config = aws_sdk_bedrockruntime::Config::builder()
                 .behavior_version_latest()
-                .http_client(aws_smithy_http_client::test_util::infallible_client_fn(
-                    |_req| http::Response::builder().status(200).body("").unwrap(),
-                ));
+                .http_client(crate::model::canned_http(200, None, ""));
             if let Some(region) = region {
                 config = config.region(aws_config::Region::new(region.to_owned()));
             }

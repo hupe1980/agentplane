@@ -165,7 +165,40 @@ async fn reserving_twice_takes_one_slot(
         ),
         Err(e) => report.record("counting running runs", format!("{e}")),
     }
+
+    // A count says *one of one* and a throttled tenant needs the id, because
+    // the slot may belong to a run that stopped existing — see
+    // `QuotaStore::running_runs`.
+    report.checked += 1;
+    match store.running_runs(100).await {
+        Ok(held) if held == vec![run] => {}
+        Ok(held) => report.record(
+            "naming the runs that hold slots",
+            format!(
+                "one run holds a slot and the listing says {held:?} — an operator \
+                 told only how many cannot tell a live run from a slot a dead \
+                 instance stranded, which is the case the accounting exists for"
+            ),
+        ),
+        Err(e) => report.record("naming the runs that hold slots", format!("{e}")),
+    }
+
     let _ = store.release(run).await;
+
+    // And it empties, which is what makes the listing a queue rather than a
+    // record of everything that ever ran.
+    report.checked += 1;
+    match store.running_runs(100).await {
+        Ok(held) if held.is_empty() => {}
+        Ok(held) => report.record(
+            "releasing a slot takes the run off the listing",
+            format!("the released run is still listed as holding a slot: {held:?}"),
+        ),
+        Err(e) => report.record(
+            "releasing a slot takes the run off the listing",
+            format!("{e}"),
+        ),
+    }
 }
 
 /// Spend sums within a period and does not cross between them.

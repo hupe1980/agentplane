@@ -783,6 +783,67 @@ async fn the_request_carries_what_a_rule_needs() {
             .any(|(p, a, r)| p == "pay" && a == ACTION_PERFORM && r == "ledger.transfer"),
         "each effect must be authorized by its kind: {seen:?}"
     );
+
+    // **The documented action list is the one the runtime actually asks.**
+    //
+    // `core::ACTIONS` exists so a deployment can enumerate what it must write
+    // rules for, and so an implementor can see that effects are not the whole
+    // of it — the first hand-written engine that assumes they are refuses every
+    // run at admission, and the failure does not look like a policy problem.
+    // A list beside the code is a list that rots, so it is held against
+    // behaviour rather than against another list.
+    //
+    // This run exercises admission and effects. The release action is covered
+    // by `a_release_is_asked_under_the_listed_action`, because no single run
+    // reaches all three.
+    assert_listed(seen.iter().map(|(_, a, _)| a.as_str()));
+}
+
+/// Every action a run put to the engine is one `core::ACTIONS` names.
+fn assert_listed<'a>(actions: impl Iterator<Item = &'a str>) {
+    let unlisted: Vec<&str> = actions
+        .filter(|a| !agentplane::core::ACTIONS.contains(a))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "the runtime asked for actions `core::ACTIONS` does not list: {unlisted:?}. \
+         An engine written from that list would not have scoped for them"
+    );
+}
+
+/// The third listed action, which no other test here reaches.
+#[tokio::test]
+async fn a_release_is_asked_under_the_listed_action() {
+    #[derive(Debug, Default)]
+    struct Capturing(Mutex<Vec<String>>);
+
+    impl PolicyEngine for Capturing {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            self.0.lock().unwrap().push(r.action.to_string());
+            PolicyDecision::Permit
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            test_bundle(b"capturing-release")
+        }
+    }
+
+    let store = db();
+    let engine = Arc::new(Capturing::default());
+    Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("policy")
+        .policy(engine.clone())
+        .skill(Releases)
+        .build()
+        .run("release", Tainted::trusted(json!({})))
+        .await
+        .ok();
+
+    let seen = engine.0.lock().unwrap().clone();
+    assert!(
+        seen.iter().any(|a| a == agentplane::core::ACTION_RELEASE),
+        "a typed release must be authorized under its own action: {seen:?}"
+    );
+    assert_listed(seen.iter().map(String::as_str));
 }
 
 /// A run id is never leaked into the principal by accident.

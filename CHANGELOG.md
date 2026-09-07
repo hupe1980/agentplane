@@ -39,6 +39,339 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.31.0] — 2026-09-07
+
+### Fixed — three egress refusals read as two sentences spliced together
+
+`EgressError` renders a complete sentence — *'evil.example' is not a granted
+destination; a host reachable without being listed is a self-service egress
+channel* — and three vocabularies joined their own clause to the front of it.
+The tool path produced *the transport for server 'ledger' reaches 'evil.example'
+is not a granted destination*. Peer discovery was worse: `Refused(String)` wrapped
+its payload in `'{0}'`, and all three of its call sites pass finished sentences,
+so a refusal came back as *this client may not connect to ''evil.example' is not
+a granted destination…'*.
+
+This is the message an operator reads at 03:00, so: the outer clause contributes
+only what the inner cannot know — the server, the tool — and the sentence about
+the host stands on its own. A test in `core::egress` pins that premise, since a
+caller cannot be stopped from splicing but the thing it splices can be kept whole.
+
+### Fixed — a refusal by this plane was reported as the provider refusing
+
+The third splice was not cosmetic. A model driver mapped an egress denial to
+`ModelError::Refused`, whose own documentation says *the provider refused before
+generating* — so a deployment's own allowlist blocking a host produced *'gemini/x'
+refused the request*, and sent whoever read it to a vendor status page.
+
+`ModelError::Egress` is the distinction, and the retry semantics are why it is a
+new variant rather than a reuse of `Unreachable`: `Refused` is what stops the
+retry loop spending attempts on a decision that cannot change, and an allowlist
+will not change mid-run either. Both are `DidNotHappen`, both spend no attempt;
+what differs is which half of the system the message sends you to.
+
+### Fixed — `max_denials` did not bound the refusal a model can actually probe
+
+`REFUSED`'s documentation said this ceiling is what bounds the allowed/denied bit
+that a uniform message cannot remove. It was not: only engine denials were
+counted, and an engine denial is not model-facing — in a tool-calling loop it
+ends the run outright. The path the bit travels on is the sink refusal, which
+comes back as `REFUSED` so the loop *continues*, and that one was not counted at
+all. A run could be refused without limit precisely where refusals are cheap.
+
+Sink refusals now count. Both paths are documented for what they are, including
+that an engine denial ending the run is a stricter bound than any ceiling, and a
+test drives a skill that swallows refusals and asks again — the shape of a probe
+— asserting the run stops, and that the refusal the ceiling stopped it over is
+still journaled.
+
+### Added — `PolicyEngine` says which requests it will be asked
+
+The trait documented its two hard requirements — total, pure — and not what it
+would be handed. An engine written for effects refuses every run at admission,
+because the run input is in the admission context and a rule reading `amount`
+matches there too; the failure does not look like a policy problem, and finding
+it means instrumenting the engine. Cedar users are steered right by accident,
+since every example rule binds `action == Action::"effect:perform"` and the
+binding is copied along with the syntax.
+
+- **`core::ACTIONS`** lists what the runtime tier asks — `run:admit`,
+  `effect:perform`, `data:release` — the way `api::a2a::action::ALL` already does
+  for the served surface. A test asserts every action a run actually put to an
+  engine is one this list names, because a list beside the code is a list that
+  rots.
+- **`PolicyRequest::is_effect` and `is_admission`**, so the scoping is
+  discoverable from the type rather than from a log.
+- **A worked non-Cedar engine** in the trait docs, scoped on the first line.
+- `ACTION_DECLARED` and `ACTION_EGRESS` are documented as **never asked**: they
+  label refusals the manifest and the flow gates already decided.
+
+The `preflight` note saying an engine written in Rust *has nothing to say here*
+now says which trap it means. It was true of the unevaluable-rule trap and read
+as broader reassurance than it was.
+
+### Added — `EffectStarted.outbound_bytes`, so volume is a question the journal answers
+
+Sensitivity does not track volume and nothing else did: ten thousand records
+labelled `Internal` pass every gate one record passes, and the only volume-shaped
+ceilings are a budget's effect count and a tenant quota — cost controls that bound
+work rather than disclosure, so an extraction sized just under either is invisible
+to them.
+
+The canonical size of the value that crossed a sink is now recorded beside the
+label of what crossed it. Deliberately not a control: *forty times the median for
+this capability* is a threshold a deployment sets against its own traffic and not
+one this crate could pick. What this supplies is the figure, so such a rule is an
+ordinary query over the journal.
+
+Recorded rather than derived, and that is the whole point. The bytes are in
+`descriptor.args`, so a scan could measure them — until the payload is sealed, or
+erased, at which point the size goes with it. A count is not personal data and
+survives both: *how much left* has to stay answerable after *what left* is
+destroyed. Absent for an effect that binds no value, so the ordinary record hashes
+identically and the golden corpus did not move.
+
+### Added — `agentplane validate --require-annotation`
+
+`metadata.annotations` is never read by the runtime, which is what makes it safe
+to carry and is exactly why nothing could notice a production agent shipped
+without an owner. A control nobody checks is a convention.
+
+The flag is repeatable, exits non-zero naming each agent and key that is absent,
+and checks **per agent** — in a room, *one of them has an owner* is not the rule
+anybody meant. The runtime still reads nothing: the keys stay the deployment's
+vocabulary and the enforcement is a CI job, which is the division `--policy`
+already draws. Presence only, because the parser already refuses a key with a
+blank value.
+
+### Fixed — an audit report was silent about the runs that never started
+
+A run refused *before it exists* — a policy denial on `run:admit`, a tenant
+ceiling, a standing halt — has no run id and no chain, so nothing about it is in
+the journal. An auditor asking *how often did policy stop a run from starting*
+therefore reads a clean report as zero, when it is silence.
+
+The boundary is the format's rather than an omission, and it is now stated on
+`AuditReport` itself and in the operator guide, with where the number does live.
+It is deliberately **not** in `not_checked`: that list reports what *this* audit
+could not check, and an entry present in every report ever produced would train a
+reader to skip it — which is the failure the list exists to avoid.
+
+### Changed — the published binary and the container image carried `testkit`
+
+`cli` listed `testkit` in its feature set. It needed exactly one thing from it:
+the `provider: fake` that the getting-started guide, the first-agent walkthrough
+and every `examples/*.yaml` run on, so that a first command needs no API key and
+no network. The price was everything else in that feature — fault injection, a
+signer that mints its own attestations, and the exceptions permitting plaintext
+HTTP to a loopback peer or webhook — compiled into `cargo install agentplane
+--features cli` and into `ghcr.io/hupe1980/agentplane`.
+
+Each of those is documented at its own definition as something that *cannot
+exist in a production build*. The sentence beside `A2aClient::allow_loopback`
+read "behind `testkit` and therefore **absent from a production build**"; the
+sentence beside `PushSender::allow_plaintext_loopback` read "it cannot exist in
+a production build". Both were false for every published artifact, and the CLI's
+own source acknowledged it two thousand lines away — "the CLI build carries
+`testkit`" — which is how a claim survives: the person who knew wrote it
+somewhere the people reading the claim were not.
+
+- **`fake-model` is the carve-out.** The deterministic provider moved to
+  `agentplane::model::fake`, beside the real drivers, and ships. The distinction
+  is what a stand-in replaces: `StubSigner` replaces a *control*, so a build able
+  to link it proves nothing by producing a signature; a model provider is not a
+  control, it is the thing under governance, and a plane whose provider answers
+  deterministically is what running a manifest without a key means.
+- **`agentplane::testkit::FakeProvider` still resolves**, re-exported, because
+  that is where a test author looks — so the move edited no call site, in this
+  tree or anybody else's.
+- **`testkit` implies `fake-model`**, so `--features testkit` is as it was.
+
+### Fixed — the CLI reached A2A peers over plaintext, and said nothing
+
+`connect_peers` called `A2aClient::allow_loopback()` on **every** `--peer`,
+unconditionally, because the `cli` build happened to carry `testkit`. It was not
+a flag, was not documented, and appeared in no output. The endpoint an
+`A2aClient` reaches is not always one an operator typed — `PeerDiscovery` takes
+it from an agent card, which the security guide names as routinely
+attacker-influenced — so the exception is not the operator-named-destination
+case it looked like.
+
+The exception stays `testkit`-only and the CLI no longer has it. A non-HTTPS
+`--peer` is refused **at wiring**, with a message naming the reason and the
+development build that permits it (`--features cli,a2a,testkit`). Refusing at
+wiring rather than at dispatch is the point: the old failure surfaced once, much
+later, inside whichever run first reached the peer, as a refusal naming no cause.
+
+### Assurance — a guard computes the feature closure and holds `testkit` out of it
+
+A comment could not hold this: adding `testkit` to a shipped feature compiles,
+every test passes, and nothing about the artifact says what is in it.
+`no_shipped_feature_enables_testkit` walks `[features]`, takes the transitive
+closure of every feature a user can enable, and fails if any but `testkit`
+reaches `testkit`. Its other half asserts `cli` still reaches `fake-model`, so
+the guard cannot be satisfied by deleting the capability instead of separating
+it. Verified against the defect that motivated it before being kept.
+
+### Added — a batch's unsettled items are a listing, not a count
+
+`BatchCensus` answered *43 failed*, and 43 is not something anybody can act on.
+The question an operator has is **which 43**, and over the size a batch exists
+for — the module's own example is a Jahresabrechnung across 10⁵
+Marktlokationen — the only route to it was paging `items()` through a hundred
+thousand rows that are almost all successes. That is I13's *detection without
+delivery*: the finding exists, it is indexed, it reaches nobody, and the count
+manufactures the belief that somebody was told. The module doc had already
+written the sentence — "the items that failed are precisely the ones a human
+needed to hear about" — over an API that could not name them.
+
+- **`BatchStore::items_needing_attention(batch, limit)`** lists the items nobody
+  is finished with, oldest key first. *Unsettled*, not *un-terminal*: a failed
+  item and a suspended one are both on it, because "finished" and "finished
+  with" are different questions and the second is the one a person is asking.
+  Reserved-with-no-outcome — what a crash mid-item leaves — is on it too, which
+  is the row a `WHERE outcome <> 'succeeded'` silently drops, since NULL
+  compares to nothing.
+- **It empties**, which is the only thing that makes an ascending page
+  legitimate: an item re-run, a quarantine cleared, a ceiling raised or a
+  suspension answered drops off it.
+- **`BatchReport::needs_attention()`** is the predicate the sweep report, the
+  delivery report and the witness report already had, and the batch report did
+  not. It is keyed on facts rather than on the status, and both directions
+  matter: a batch operated in windows returns `Running` on every correct pass,
+  so a status-keyed predicate would be true whenever somebody used `max_items`
+  as intended — always true is the same failure as never falling — while an item
+  paused at a ceiling is also `Running` with nothing in flight, and is the one
+  state whose only exit is a person raising a limit.
+- **`BatchReport::exhausted`** is a new field, and it is what tells those two
+  `Running`s apart. The report carried `in_flight` (interrupted or waiting) and
+  folded a ceiling pause into the bare status, so nothing in a report
+  distinguished *stuck* from *more to fetch*. `failed_or_quarantined()` is
+  beside it for the terminal half.
+- **`ItemOutcome::is_settled` and `settled_tags`** are the filter, derived from
+  `all()` for the reason `terminal_tags` is: an outcome added later is unsettled
+  by construction rather than by somebody finding a literal in two backends.
+- Both backends implement it and the conformance battery holds them to it,
+  including against a real PostgreSQL server.
+
+### Added — the runs holding a tenant's concurrency slots are a listing, not a count
+
+The second instance of the batch defect above, found by looking for one: when a
+gap is closed, the other instance of the same kind is worth finding before
+anybody writes that it was the last. `QuotaStore` tracked
+concurrency as a *set* of runs — deliberately, and the operator guide said why:
+"a process that dies mid-run strands a slot an operator can name and release,
+rather than a number nobody can audit." The set was in both backends' storage.
+The trait exposed `running() -> u32` and nothing else, so the sentence was true
+of the table and false of every API anybody could reach.
+
+It is the case the accounting exists for. A slot is taken at admission and given
+back at settlement; an instance that dies in between holds one forever, and in a
+count a stranded slot and live work are the same number. The tenant is throttled
+by a run that stopped existing and there is no way to say which.
+
+**`QuotaStore::running_runs(limit)`** names them, ordered by run id. The join
+that makes it actionable already existed: a stranded slot is a run this listing
+holds whose lease has lapsed, which `JournalStore::abandoned_runs` returns, and
+the recovery sweep settles it — the verb that empties the listing. Both backends
+implement it and the conformance battery holds them to it, including the half
+that checks a released run leaves.
+
+### Added — `examples/batch_run.rs`, and a tier the README never mentioned
+
+Batches had a store contract, a census, a conformance battery, a process test
+file and a documentation page, and no runnable example — and the word did not
+appear in the README at all. The example walks a windowed first pass, an
+item-granular resume that re-settles nothing, partial failure as a terminal
+state, the listing above naming the item, per-item cost summed, and a re-run of
+the whole batch from item one that performs nothing.
+
+### Changed — `just examples` builds twice instead of thirteen times
+
+Each line spelled its own example's minimal feature set, which reads well and
+meant cargo rebuilt agentplane — and the dev-dependency graph behind it,
+testcontainers and bollard included — every time the set changed. Twelve
+rebuilds to run twenty-seven programs that each take milliseconds. It now builds
+once with the default features and once with the union, then runs the binaries.
+
+The first build is not redundant: it compiles every example claiming to need
+nothing but the defaults *under exactly those defaults*, which is the claim the
+README makes on a newcomer's behalf. A union build alone would let an example
+grow a dependency on `testkit` and fail for the reader instead of for CI.
+
+### Changed — a test-only AWS dependency was linked into every example
+
+`aws-smithy-http-client` was a dev-dependency for one function: a stub HTTP
+client, so that building an SDK `Config` never constructs the default TLS
+provider and panics on a macOS keychain that transiently yields no roots. Its
+`test-util` feature costs a hyper stack, a CBOR codec and a protocol-test
+harness, and cargo links dev-dependencies into every example a package builds —
+so `cargo run --example hello_skill` compiled all of it before printing a line.
+
+`model::canned_http` builds the same stub over `aws-smithy-runtime-api`'s
+connector trait, which the vendor documents as the extension point for exactly
+this and supplies `http_client_fn` over. The tests could not move instead: they
+are unit tests reaching private helpers in `bedrock.rs`.
+
+Re-derive the cost of a first build with:
+
+```sh
+cargo tree --features redb -e normal     --prefix none | sort -u | wc -l
+cargo tree --features redb -e normal,dev --prefix none | sort -u | wc -l
+```
+
+### Changed — redb 4, rand 0.10, ulid 3, base64 0.23, jsonschema 0.55, chacha20poly1305 0.11
+
+- **redb 3 → 4.** The on-disk format moved with it; pre-freeze the remedy for an
+  old store is *recreate*, which `export` and `restore` already are.
+- **rand 0.9 → 0.10**, and **`rand_chacha` is gone** — rand 0.10 carries the
+  ChaCha implementation, so one crate now declares the generator that produces a
+  replayed run's numbers rather than two resolving independently.
+  `StepCtx::rng` returns `impl rand::RngExt`, because 0.10 renamed the
+  ergonomic trait and gave `Rng` to what was `RngCore`.
+- **`rand` is re-exported as `agentplane::rand`**, for the reason `async_trait`
+  is in the prelude: reaching the traits through a `rand` of your own means
+  matching this crate's version in a second manifest, and getting it wrong is a
+  type error naming two identical-looking traits.
+- **ulid 1 → 3**: `Ulid::new` became `Ulid::generate`, which is also the path
+  `clippy.toml` denies now. This crate's own `RunId::generate` is unchanged.
+- **chacha20poly1305 0.10 → 0.11**: nonces are `hybrid-array` arrays and are
+  minted through `Generate`. The envelope's parsed nonce is now the AEAD's own
+  type, so its width is a type rather than a `split_at` nobody re-checks.
+
+### Assurance — the entropy stream behind `StepCtx::rng` is pinned to literal words
+
+`rng()` is seeded from `(run_id, step)` and **recomputed** on replay rather than
+journaled, so the generator is part of the replay contract and nothing in the
+journal records which one wrote a history. The two existing tests compared one
+build against itself and would have passed unchanged the day a dependency
+swapped ChaCha8 for something else — after which every run that had ever drawn a
+number re-derives different effect arguments and is quarantined as
+non-determinism, the most serious conclusion this runtime reaches, reported for
+healthy history with nothing naming the cause.
+
+`rng_stream_is_pinned` asserts four literal words for a literal seed, the way
+the canonicalization goldens do. It is what established that rand 0.10's stream
+is byte-identical to rand_chacha 0.9's, which is why this release's dependency
+move is not a durable-format change.
+
+### Fixed — `RunId::generate` documented itself as monotonic, and is not
+
+"Mint a fresh id from a monotonic source" — but a bare ULID orders by its
+millisecond timestamp and then by a random tail, so two ids minted in the same
+millisecond order arbitrarily, and differently on each instance. The doc now
+states the granularity every ordering claim in this crate holds at: a range scan
+over one run's records is exact because the run id is a *prefix*, while "cases
+sort by creation time" is true between milliseconds and a coin flip inside one.
+
+### Known — `opendal` is held at 0.58 because 0.59.0 does not build
+
+0.59.0 split the crate into `opendal-core` plus transport crates, and the
+published `opendal-core` 0.59.0 omits the `CHANGELOG.md` its own `src/docs/mod.rs`
+pulls in with `include_str!`. The dependency fails to compile before any of this
+crate's code is reached. Re-check on the next release rather than on a version
+bump alone; the check is `cargo check --features opendal`.
+
 ## [0.30.0] — 2026-09-06
 
 ### Fixed — a documentation link to an API that is not published yet

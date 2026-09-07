@@ -75,6 +75,18 @@ fn core_has_no_io_dependencies() {
 /// If these lints are ever removed, ambient clock and RNG reads silently become
 /// legal again and replay breaks in a way that presents as a mysterious runtime
 /// bug months later.
+///
+/// **This is a text check, and the second half is clippy's.** An entry naming a
+/// path that no longer exists would deny nothing while still satisfying every
+/// assertion below — the exact shape of a guard that reads the wrong thing. It
+/// is not a gap, and the reason is worth writing down so nobody builds
+/// machinery for it: clippy reports `does not refer to a reachable function`
+/// for an unresolvable `disallowed-methods` entry, and every lint recipe runs
+/// under `-D warnings`, so a dead entry fails the build rather than going
+/// quiet. Verified by pointing an entry at a method that does not exist.
+///
+/// The two halves answer different questions — *is the rule still written down*
+/// and *does it still resolve* — and neither implies the other.
 #[test]
 fn the_determinism_lints_are_configured() {
     let cfg = read("clippy.toml");
@@ -83,7 +95,7 @@ fn the_determinism_lints_are_configured() {
         "Instant::now",
         "OffsetDateTime::now_utc",
         "rand::random",
-        "ulid::Ulid::new",
+        "ulid::Ulid::generate",
     ] {
         assert!(cfg.contains(m), "clippy.toml no longer denies `{m}`");
     }

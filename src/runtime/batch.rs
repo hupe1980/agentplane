@@ -232,6 +232,7 @@ impl Runtime {
             id,
             status: status_of(&census, exhausted),
             in_flight: census.in_flight + census.suspended,
+            exhausted: census.exhausted,
             spend: census.spend,
             cursor,
         })

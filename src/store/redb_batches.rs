@@ -331,8 +331,37 @@ impl BatchStore for RedbStore {
     }
 
     async fn items(&self, batch: BatchId, limit: usize) -> Result<Vec<ItemRecord>, StoreError> {
+        self.scan_items(batch, limit, false).await
+    }
+
+    async fn items_needing_attention(
+        &self,
+        batch: BatchId,
+        limit: usize,
+    ) -> Result<Vec<ItemRecord>, StoreError> {
+        self.scan_items(batch, limit, true).await
+    }
+}
+
+impl RedbStore {
+    /// One range scan over a batch's items, optionally keeping only the ones
+    /// nobody is finished with.
+    ///
+    /// `limit` counts what is **returned**, so an unsettled page is a page of
+    /// unsettled items rather than whatever a limit on the scan happened to
+    /// catch — the distinction is the whole listing when 99,957 of 100,000 rows
+    /// succeeded.
+    async fn scan_items(
+        &self,
+        batch: BatchId,
+        limit: usize,
+        unsettled_only: bool,
+    ) -> Result<Vec<ItemRecord>, StoreError> {
         let tenant = self.tenant_name();
         let batch_key = batch.to_string();
+        // Hoisted: the set is a property of the type, not of the row, and a
+        // batch is 10⁵ rows.
+        let settled = ItemOutcome::settled_tags();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(ITEMS).map_err(|e| be(&e))?;
@@ -349,6 +378,13 @@ impl BatchStore for RedbStore {
                 }
                 let (k, v) = e.map_err(|e| be(&e))?;
                 let (run_s, outcome, has, detail, tokens, minor) = v.value();
+                // The filter is the type's own vocabulary, not a literal: an
+                // outcome added later is unsettled by construction, so a new
+                // kind of trouble appears in this listing without anyone
+                // remembering to widen a string here.
+                if unsettled_only && has == 1 && settled.contains(&outcome) {
+                    continue;
+                }
                 out.push(ItemRecord {
                     key: k.value().2.to_owned(),
                     run: RunId::parse(run_s).map_err(|e| StoreError::Corrupt {

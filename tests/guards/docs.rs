@@ -175,6 +175,146 @@ fn the_documented_feature_table_matches_cargo_toml() {
     );
 }
 
+/// **The release workflow names the package whose version it checks.**
+///
+/// `cargo metadata --no-deps` returns a *list*, and `.packages[0].version` is
+/// only unambiguous while that list has one entry. A tag check that compares the
+/// wrong package's version to the right tag passes and says nothing, and
+/// crates.io is immutable — so the selection is by name, and held here rather
+/// than remembered.
+#[test]
+fn the_release_workflow_selects_the_published_package_by_name() {
+    let release = read(".github/workflows/release.yml");
+    // Comments stripped first. The prohibition below is on what the workflow
+    // *runs*, and the first version of this guard failed on the sentence
+    // explaining why — a checker that reads a file's prose as its behaviour is
+    // the same mistake in the other direction.
+    let script: String = release
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| !l.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        script.contains("cargo metadata"),
+        "the release workflow no longer reads cargo metadata — this guard is inert"
+    );
+    assert!(
+        !script.contains(".packages[0]"),
+        "the release workflow picks a package by index. `--no-deps` lists every \
+         workspace member, so index 0 is whichever one cargo emits first — and \
+         this workspace has a test-only member at version 0.0.0. Select by \
+         `.name == \"agentplane\"`"
+    );
+    assert!(
+        script.contains(r#"select(.name == "agentplane")"#),
+        "the release workflow must select the published package by name"
+    );
+}
+
+/// **Nothing a release ships pulls `testkit` in.**
+///
+/// `testkit` carries fault injection, a signer that mints its own attestations,
+/// and the exception that lets a peer be reached over plaintext — each of them
+/// documented, at its definition, as a thing that cannot exist in a production
+/// build. That claim was false for a year: `cli` listed `testkit`, so the
+/// published binary and the container image carried all three. The one thing
+/// `cli` actually needed was `provider: fake`, which is now `fake-model`.
+///
+/// A comment cannot hold this, because the failure is silent in both
+/// directions: adding `testkit` to a shipped feature compiles, tests pass, and
+/// nothing about the artifact says what is in it. So the closure is computed
+/// here, over every feature a user can enable, and only `testkit` may reach
+/// `testkit`.
+#[test]
+fn no_shipped_feature_enables_testkit() {
+    let manifest = read("Cargo.toml");
+    let table = manifest
+        .split("\n[features]")
+        .nth(1)
+        .expect("Cargo.toml has a [features] section")
+        .split("\n[")
+        .next()
+        .expect("the section ends");
+
+    let mut graph: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for line in table.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some((name, rest)) = line.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let enables = rest
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .map(|e| e.trim().trim_matches('"'))
+            // `dep:` entries are dependencies, not features of this crate.
+            .filter(|e| !e.is_empty() && !e.contains(':'))
+            .collect();
+        graph.insert(name, enables);
+    }
+
+    assert!(
+        graph.contains_key("testkit") && graph.len() > 5,
+        "the [features] scan found {graph:?} — Cargo.toml moved and this guard is now inert"
+    );
+
+    // What `f` ends up enabling, following the table to a fixed point.
+    let closure = |f: &str| {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo = vec![f];
+        while let Some(next) = todo.pop() {
+            for e in graph.get(next).into_iter().flatten() {
+                if seen.insert(*e) {
+                    todo.push(e);
+                }
+            }
+        }
+        seen
+    };
+
+    let leaks: Vec<&str> = graph
+        .keys()
+        .copied()
+        .filter(|f| *f != "testkit" && closure(f).contains("testkit"))
+        .collect();
+
+    assert!(
+        leaks.is_empty(),
+        "these features enable `testkit`, so a build that asks for them ships fault \
+         injection, a self-minting signer and the plaintext-loopback exception — each \
+         of which is documented as impossible in a production build: {leaks:?}. If one \
+         of them needs a piece of `testkit`, that piece is not a test double and \
+         belongs beside the real thing, the way `fake-model` does."
+    );
+
+    // The other half: `cli` still has to be able to run `provider: fake`, which
+    // is the need that put `testkit` there in the first place. Without this, the
+    // guard above is satisfied by deleting the capability rather than by
+    // separating it, and every getting-started page stops working.
+    //
+    // It checks the feature *graph*, and that is not the whole claim: the
+    // binary's provider dispatch stayed `cfg(testkit)` through the split, so the
+    // graph was right and `agentplane run` still answered "no driver for
+    // provider 'fake'". `tools/cli-smoke.sh` is what caught it, because the
+    // binary is never exercised by `cargo test` — it only compiles. Two checks,
+    // and neither substitutes for the other.
+    assert!(
+        closure("cli").contains("fake-model"),
+        "`cli` no longer enables `fake-model`, so `agentplane run` cannot construct the \
+         `provider: fake` that the getting-started guide, first-agent and every \
+         examples/*.yaml name"
+    );
+}
+
 /// Every `cargo run --example …` command in the README actually runs.
 ///
 /// The examples' `required-features` live in Cargo.toml, and a README line
@@ -678,15 +818,47 @@ fn every_example_is_run_by_the_examples_recipe() {
          guard is now inert"
     );
 
+    // The recipe names each example as a bare word in the loop it runs, so a
+    // word-boundary match rather than a substring one: `model_run` must not be
+    // satisfied by `batch_run` sharing a suffix, nor `plan_graph` by a comment
+    // that mentions it.
+    let named: Vec<&str> = block
+        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .collect();
+
     let missing: Vec<&String> = on_disk
         .iter()
-        .filter(|name| !block.contains(&format!("--example {name}")))
+        .filter(|name| !named.contains(&name.as_str()))
         .collect();
 
     assert!(
         missing.is_empty(),
         "these examples are never executed by `just examples`, so nothing \
          notices when they stop working: {missing:?}"
+    );
+
+    // And the other direction, which the substring form could not ask: a name
+    // in the loop with no file behind it makes the recipe fail with
+    // `no such file or directory` on a path nobody recognises, at the end of a
+    // run that already took a minute.
+    let phantom: Vec<&str> = block
+        .lines()
+        .skip_while(|l| !l.contains("for ex in"))
+        .take_while(|l| !l.contains("done"))
+        .flat_map(|l| l.split_whitespace())
+        .filter(|w| {
+            w.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && w.contains('_')
+                && *w != "for"
+                && *w != "ex"
+                && *w != "in"
+        })
+        .filter(|w| !on_disk.iter().any(|d| d == w))
+        .collect();
+
+    assert!(
+        phantom.is_empty(),
+        "`just examples` runs names with no file in examples/: {phantom:?}"
     );
 }
 

@@ -685,6 +685,25 @@ bounds, and reaching the limit prints a warning on **stderr** — so it survives
 `> out.jsonl` and an operator piping the export somewhere still learns the view
 was partial.
 
+### What no audit can answer: the runs that never started
+
+A run refused **before it exists** — a policy denial on `run:admit`, a tenant
+ceiling, a standing halt — has no run id and so no chain to append to. Nothing
+about it is in the journal or in the report, so *how often did policy stop a run
+from starting* is a question a clean report answers with silence rather than with
+zero.
+
+Manufacturing a run to record its own refusal would mean a chain, a seal and a
+Merkle leaf for something that never executed, and would let a caller grow the
+store by being denied. Every refusal **after** admission is journaled, which is
+why an effect-level denial has a `PolicyDenied` record and this one does not.
+
+The number lives in the `agentplane.policy.denials` metric and
+`agentplane.policy.denied` telemetry, both carrying the action, with the
+durability of whatever collects them. It is deliberately not in `not_checked`:
+that list is what *this* audit could not check, and an entry in every report ever
+produced would train you to skip it.
+
 Auditing open runs (`--outcome failed`, say) is not an alarm: an open run has
 no Merkle leaf, so it is checked on chain and signatures and the report says in
 `not_checked` that nothing pins its tail until it seals. The finding is the
@@ -1299,6 +1318,21 @@ than admits — a ceiling that yields when its accounting is down is one an
 attacker removes by taking the accounting down. And concurrency is tracked as a
 *set of runs*, not a counter, so a process that dies mid-run strands a slot an
 operator can name and release, rather than a number nobody can audit.
+
+Naming them is `QuotaStore::running_runs(limit)`. `running()` answers *five of
+five*, and one of those five may not be a run at all: a slot is taken at
+admission and given back at settlement, so an instance that dies in between
+holds one forever, indistinguishable from live work in a count.
+
+```rust
+let held = quotas.running_runs(100).await?;
+let stranded = journal.abandoned_runs(100).await?;
+// A slot whose run has no live lease is the one to look at. The recovery sweep
+// resumes it and settlement gives the slot back.
+```
+
+The listing empties as runs settle, which is what makes it a queue rather than a
+record of everything that ever ran.
 
 ### The emergency stop
 

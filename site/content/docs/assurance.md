@@ -44,7 +44,14 @@ it must fail.
 | `tests/wire/drivers.rs` | The two wire drivers' failure mappings — whether a peer acted, and whether a model call was billed |
 | `tests/trust/format.rs` | The durable formats against frozen bytes — every record kind's canonical form and digest, a sealed export a future build must still verify, and what a reader does with a shape it does not know |
 | `tests/guards/layering.rs` | Architectural invariants — core purity, lint config, canonical JSON, spec/code correspondence |
+| `tests/guards/postgres.rs` | The shared-store backend against a real PostgreSQL server: tenant isolation with a *valid* identifier from the other tenant, concurrency under a lock, the case layer's contracts |
+| `tests/wire/a2a_interop.rs` | This crate's A2A **client** against the reference SDK's server — the one interoperability gap the conformance kit cannot close, since the kit validates servers |
+| `tests/guards/vault.rs` | The key-ring contract against a real Vault — where the status codes an in-process ring cannot get wrong actually live |
 | `spec/` | TLA+ models of the effect protocol, retry safety, sagas, and fencing, plus the mutants that prove those models constrain anything |
+
+Those three need a Docker daemon or a foreign implementation, and are skipped
+rather than failed without one — so they stay compiled and exercised by
+`just test` on every machine, between the rarer runs that have both.
 
 ### A format checks itself against its own bytes, not against its own reader
 

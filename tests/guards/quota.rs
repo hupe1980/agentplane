@@ -126,6 +126,13 @@ impl QuotaStore for FailsFirstSettlement {
     async fn running(&self) -> Result<u32, agentplane::core::StoreError> {
         self.inner.running().await
     }
+
+    async fn running_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::RunId>, agentplane::core::StoreError> {
+        self.inner.running_runs(limit).await
+    }
 }
 
 #[async_trait::async_trait]
