@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.31.0"
+version      = "0.32.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -304,18 +304,18 @@ required-features = ["redb"]
 
 [[example]]
 name              = "tool_loop"
-required-features = ["redb", "testkit", "manifest"]
+required-features = ["redb", "fake-model", "manifest"]
 
 # A person approves the exact tool call — `requires_approval` end to end:
 # suspend, worklist, approve or refuse, and a strict replay that re-opens
 # nothing.
 [[example]]
 name              = "approved_call"
-required-features = ["redb", "testkit", "manifest"]
+required-features = ["redb", "fake-model", "manifest"]
 
 [[example]]
 name              = "planned_run"
-required-features = ["redb", "testkit", "manifest"]
+required-features = ["redb", "fake-model", "manifest"]
 
 [[example]]
 name              = "sealed_run"
@@ -380,37 +380,37 @@ required-features = ["redb"]
 name              = "recovered_run"
 required-features = ["redb"]
 
-# Needs `testkit` for the fake provider. Deliberately: an example that called a
-# real model would need an API key to run, and the claim it demonstrates — that
+# Needs `fake-model`, not a key. Deliberately: an example that called a real
+# model would need an API key to run, and the claim it demonstrates — that
 # a completion replays from the journal rather than being asked again — would
 # stay a sentence in the README instead of something anyone can execute.
 [[example]]
 name              = "model_run"
-required-features = ["redb", "testkit"]
+required-features = ["redb", "fake-model"]
 
 # Digest-only multimodal dispatch and strict zero-I/O replay, with a fake model
 # and an in-memory blob store so the security contract is runnable offline.
 [[example]]
 name              = "media_run"
-required-features = ["redb", "testkit", "media"]
+required-features = ["redb", "fake-model", "media"]
 
 # The manifest example reads `examples/triage.yaml` and runs the agent it
 # declares, so it needs the parser as well as the fake provider.
 [[example]]
 name              = "manifest_run"
-required-features = ["redb", "testkit", "manifest"]
+required-features = ["redb", "fake-model", "manifest"]
 
 # A real MCP server in-process beside a typed tool, so the two-transport shape
 # is runnable rather than only described. `rmcp`'s server half is a
 # dev-dependency, which examples may use.
 [[example]]
 name              = "mcp_tools"
-required-features = ["redb", "testkit", "manifest", "mcp"]
+required-features = ["redb", "fake-model", "manifest", "mcp"]
 
 # Three agents, three manifests, three runtimes.
 [[example]]
 name              = "blog_room"
-required-features = ["redb", "testkit", "manifest"]
+required-features = ["redb", "fake-model", "manifest"]
 
 # `tower::oneshot` drives the router in-process, so the A2A round trip is real
 # without a port, a key, or a second process.
@@ -435,13 +435,13 @@ required-features = ["redb", "a2a-server", "manifest", "testkit"]
 # exhausted, then revoked — with the terms still readable afterwards.
 [[example]]
 name              = "standing_authority"
-required-features = ["redb", "testkit"]
+required-features = ["redb", "fake-model"]
 
 # Live deltas beside a single journaled completion — the one part of the model
 # seam a fake could not reach until `FakeProvider::streaming`.
 [[example]]
 name              = "streaming_run"
-required-features = ["redb", "testkit"]
+required-features = ["redb", "fake-model"]
 
 [lints.rust]
 unsafe_code = "forbid"

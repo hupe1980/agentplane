@@ -4,7 +4,7 @@
 //! before anything untrusted is read. From then on, data moves between steps
 //! as labelled references the runtime resolves — never through a model's
 //! context — so the prompt injection riding inside a tool output has no
-//! reader. Fully offline: the "model" is `testkit::FakeProvider`.
+//! reader. Fully offline: the "model" is `model::fake::FakeProvider`.
 //!
 //! Fixing control flow is only half the defence, and the manifest carries the
 //! other half. A frozen plan stops an injection from *choosing the steps*; it
@@ -34,10 +34,10 @@ use agentplane::core::Provenance;
 use agentplane::core::Tainted;
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
+use agentplane::model::fake::FakeProvider;
 use agentplane::model::{Completion, ModelProvider, Usage};
 use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
 use agentplane::store::RedbStore;
-use agentplane::testkit::FakeProvider;
 use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId};
 use serde_json::{Value, json};
 

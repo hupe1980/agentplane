@@ -87,12 +87,12 @@ cargo run --example bedrock_live --features bedrock
                                         # env-gated Amazon Bedrock Converse call
 cargo run --example openai_live --features providers
                                         # env-gated OpenAI Responses call
-cargo run --example tool_loop --features redb,testkit,manifest
+cargo run --example tool_loop --features redb,fake-model,manifest
                                         # a model choosing tools, and four refusals
-cargo run --example approved_call --features redb,testkit,manifest
+cargo run --example approved_call --features redb,fake-model,manifest
                                         # a person approves the exact call —
                                         # suspend, worklist, approve or refuse
-cargo run --example planned_run --features redb,testkit,manifest
+cargo run --example planned_run --features redb,fake-model,manifest
                                         # plan once, execute without the model —
                                         # a prompt injection with no reader, and
                                         # an invented recipient refused
@@ -101,21 +101,21 @@ cargo run --example sealed_run --features redb,testkit,keyring
                                         # and the chain still verifies
 
 # Calls a model and replays without calling it again — no API key, no network.
-cargo run --example model_run --features redb,testkit
+cargo run --example model_run --features redb,fake-model
 
 # Digest-only multimodal dispatch and zero-I/O replay — also fully offline.
-cargo run --example media_run --features redb,testkit,media
+cargo run --example media_run --features redb,fake-model,media
 
 # An agent whose prompt, model, result shape and ceilings come from a file.
-cargo run --example manifest_run --features redb,testkit,manifest
+cargo run --example manifest_run --features redb,fake-model,manifest
 
 # A real MCP server in this process beside a typed Rust tool — one agent
 # reaching both, and a strict replay that calls neither.
-cargo run --example mcp_tools --features redb,testkit,manifest,mcp
+cargo run --example mcp_tools --features redb,fake-model,manifest,mcp
 
 # Four agents, one plane: a coded editor that dictates the sequence, and a
 # YAML desk that consults the same specialists as tool://agent/... grants.
-cargo run --example blog_room --features redb,testkit,manifest
+cargo run --example blog_room --features redb,fake-model,manifest
 
 # This plane served as an A2A 1.0 agent, called the way a peer would call it:
 # a public card, authenticated methods, and a message that arrives untrusted.
@@ -128,11 +128,11 @@ cargo run --example peer_call --features redb,testkit,manifest,a2a,a2a-server
 
 # Live tokens for a human, one journaled completion for the machine — and a
 # replay that performs neither.
-cargo run --example streaming_run --features redb,testkit
+cargo run --example streaming_run --features redb,fake-model
 
 # One customer's approved €500, spent across two separate runs, then revoked —
 # with the terms still readable afterwards.
-cargo run --example standing_authority --features redb,testkit
+cargo run --example standing_authority --features redb,fake-model
 ```
 
 Or skip Rust entirely — a file and a key are the whole agent, and a file may

@@ -27,10 +27,10 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::media::{FetchedMedia, MediaRetention};
+use agentplane::model::fake::FakeProvider;
 use agentplane::model::{ModelCall, ModelId, ModelProvider};
 use agentplane::runtime::{Mode, Runtime, StepCtx};
 use agentplane::store::RedbStore;
-use agentplane::testkit::FakeProvider;
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{Value, json};

@@ -6,7 +6,7 @@
 //! cargo run --example manifest_run --features redb,testkit,manifest
 //! ```
 //!
-//! No API key, no network — `testkit::FakeProvider` stands in for the provider.
+//! No API key, no network — `model::fake::FakeProvider` stands in for the provider.
 //!
 //! The claim this example exists to make concrete: **a builder call is invisible
 //! in review, and a file is not.** Everything security-relevant here —
@@ -31,10 +31,10 @@ use std::sync::Arc;
 use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted};
 use agentplane::journal::JournalStore;
 use agentplane::manifest::{Manifest, ManifestError, MemoryRegistry, Registry, RegistryError};
+use agentplane::model::fake::FakeProvider;
 use agentplane::model::{ModelId, ModelProvider};
 use agentplane::runtime::{Agent, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
-use agentplane::testkit::FakeProvider;
 use serde_json::{Value, json};
 
 /// The declaration, checked in beside the code that runs it.

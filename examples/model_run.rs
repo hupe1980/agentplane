@@ -6,7 +6,7 @@
 //! cargo run --example model_run --features redb,testkit
 //! ```
 //!
-//! No API key, no network. `testkit::FakeProvider` stands in for the provider,
+//! No API key, no network. `model::fake::FakeProvider` stands in for the provider,
 //! which is what makes this the one example that can demonstrate the crate's
 //! headline claim end to end — a real driver would make it unrunnable for anyone
 //! without an account, and the claim would stay in the README.
@@ -26,10 +26,10 @@ use std::sync::Arc;
 
 use agentplane::core::{Budget, Outcome, Skill, SkillDescriptor, SkillError, Tainted, Trust};
 use agentplane::journal::JournalStore;
+use agentplane::model::fake::FakeProvider;
 use agentplane::model::{ModelCall, ModelError, ModelId, ModelProvider, Usage};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
-use agentplane::testkit::FakeProvider;
 use serde_json::{Value, json};
 
 fn render(output: Option<&Value>) -> String {

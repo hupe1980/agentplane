@@ -45,10 +45,13 @@ never as corruption.
 
 - **Digest** — SHA-256. Thirty-two bytes, written in JSON as 64 lowercase hex
   characters.
-- **RunId**, **CaseId** — [ULID](https://github.com/ulid/spec), written in
-  Crockford base32, 26 characters. A `CaseId` is written `case_` + the ULID
-  where it appears as a case identifier and bare inside a record body's `case`
-  field.
+- **RunId**, **CaseId**, **BatchId** — a type prefix, `_`, then a
+  [ULID](https://github.com/ulid/spec) in Crockford base32, 26 characters:
+  `run_01ARZ3NDEKTSV4RRFFQ69G5FAV`, `case_…`, `batch_…`. The same spelling
+  everywhere — record bodies, export blocks, store keys, log lines — so an
+  identifier says which kind it is wherever it is read, and `_` is outside
+  Crockford base32 so the prefix can never be part of the ULID. A reader may
+  accept a bare ULID; a writer emits the prefix.
 - **Seq**, **Epoch** — unsigned 64-bit integers.
 - **Timestamp** — RFC 3339 with an offset, as a JSON string.
 - **Bytes in JSON** — base64, RFC 4648 standard alphabet, **padded**, and
@@ -96,8 +99,8 @@ members of exactly one kind, **flattened into the same object**.
 | Member | Type | Presence |
 |---|---|---|
 | `seq` | integer | always |
-| `run` | ULID string | always |
-| `case` | ULID string | omitted when absent |
+| `run` | id string, `run_` + ULID | always |
+| `case` | id string, `case_` + ULID | omitted when absent |
 | `step` | integer | omitted when absent |
 | `phase` | `"forward"` or `"compensating"` | omitted when `forward` |
 | `epoch` | integer | always |
@@ -288,13 +291,13 @@ is inside its body, one level down, and must not be mistaken for the frame's.
 ### Run block {#run-block}
 
 ```json
-{"kind":"agentplane.export.run","run":"<ulid>","index":0,"seal":"<hex>"}
+{"kind":"agentplane.export.run","run":"run_<ulid>","index":0,"seal":"<hex>"}
 ```
 
 | Member | Type | Presence |
 |---|---|---|
 | `kind` | `"agentplane.export.run"` | always |
-| `run` | ULID string | always |
+| `run` | id string, `run_` + ULID | always |
 | `index` | integer, the position in the Merkle log | omitted for an open run |
 | `seal` | digest hex, the run's terminal chain hash | omitted for an open run |
 
@@ -337,8 +340,8 @@ than trusting either alone.
 
 ```json
 {"kind":"agentplane.export.case",
- "case":{"id":"<ulid>","kind":"…","status":"open","correlation":[…],
-         "state":{…},"version":0,"opened_at":"<rfc3339>","runs":["<ulid>"]},
+ "case":{"id":"case_<ulid>","kind":"…","status":"open","correlation":[…],
+         "state":{…},"version":0,"opened_at":"<rfc3339>","runs":["run_<ulid>"]},
  "deadlines":[…],"blobs":["<hex>"]}
 ```
 
@@ -379,7 +382,7 @@ unchecked.
 | `runs_exported` | integer |
 | `records` | integer |
 | `cases` | integer |
-| `unreadable` | array of `{"run": "<ulid>", "reason": "…"}` |
+| `unreadable` | array of `{"run": "run_<ulid>", "reason": "…"}` |
 
 `unreadable` **names** the runs the export could not read rather than counting
 them, because the run that fails to read is not a random one.

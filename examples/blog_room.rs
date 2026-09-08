@@ -53,9 +53,9 @@ use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Tainted, Tru
 use agentplane::journal::JournalStore;
 use agentplane::manifest::{Manifest, ManifestError};
 use agentplane::model::ModelProvider;
+use agentplane::model::fake::FakeProvider;
 use agentplane::runtime::{Agent, Mode, Runtime, StepCtx};
 use agentplane::store::RedbStore;
-use agentplane::testkit::FakeProvider;
 use serde_json::{Value, json};
 
 const EDITOR: &str = include_str!("blog-editor.yaml");

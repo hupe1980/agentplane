@@ -85,8 +85,24 @@ pub type Epoch = u64;
 macro_rules! ulid_newtype {
     ($(#[$m:meta])* $name:ident, $prefix:literal) => {
         $(#[$m])*
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-        #[serde(transparent)]
+        ///
+        /// # One spelling, everywhere
+        ///
+        #[doc = concat!(" Prefixed (`", $prefix, "_01J8Z…`) in every direction:")]
+        /// [`Display`](std::fmt::Display), `Serialize`, the store key, the
+        /// column. An id is self-describing wherever it lands — a log line, a
+        /// URL, a JSON field, a SIEM — and grepping one against another finds
+        /// it whichever way round you do it.
+        ///
+        /// That was not always so, and the asymmetry was the kind that costs a
+        /// consumer an afternoon: keys carried the prefix while record payloads
+        /// did not, so the same id was spelled two ways inside one store.
+        ///
+        /// [`Deserialize`] and [`parse`](Self::parse) still accept a bare ULID,
+        /// because one arrives from somewhere else often enough. The prefix is
+        /// checked rather than stripped blindly, so a `case_…` string is refused
+        /// where a [`RunId`] is wanted instead of silently becoming one.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub struct $name(pub ulid::Ulid);
 
         impl $name {
@@ -111,12 +127,53 @@ macro_rules! ulid_newtype {
             /// Reconstruct from a stored string.
             ///
             /// Accepts both the prefixed form produced by [`std::fmt::Display`]
-            /// (`run_01J8Z…`) and a bare ULID, so ids round-trip through logs,
-            /// URLs, and database columns without the caller having to know
-            /// which form it is holding.
+            /// and a bare ULID, so ids round-trip through logs, URLs, and
+            /// database columns without the caller having to know which form it
+            /// is holding.
+            ///
+            /// # Errors
+            ///
+            /// If what remains after the prefix is not a ULID.
             pub fn parse(s: &str) -> Result<Self, ulid::DecodeError> {
                 let bare = s.strip_prefix(concat!($prefix, "_")).unwrap_or(s);
                 ulid::Ulid::from_string(bare).map(Self)
+            }
+        }
+
+        /// The trait an id arrives through: an `axum` path segment, a `clap`
+        /// argument, a TOML key, a `serde` field with `#[serde(with = …)]`.
+        ///
+        /// `.parse()` is where every consumer reaches first, and its absence
+        /// made [`parse`](Self::parse) something each of them had to find.
+        impl std::str::FromStr for $name {
+            type Err = ulid::DecodeError;
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::parse(s)
+            }
+        }
+
+        /// The written form, so a record says which kind of id it holds.
+        impl Serialize for $name {
+            fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_str(self)
+            }
+        }
+
+        /// Through [`parse`](Self::parse), so a bare ULID from somewhere else
+        /// still reads.
+        ///
+        /// A refusal names the type and the input: `ulid`'s own error is
+        /// `invalid length`, which says nothing about which field was wrong or
+        /// what it wanted.
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let raw = <std::borrow::Cow<'de, str>>::deserialize(d)?;
+                Self::parse(&raw).map_err(|e| {
+                    D::Error::custom(format!(
+                        concat!("not a ", stringify!($name), " ('{}'): {}"),
+                        raw, e
+                    ))
+                })
             }
         }
 
@@ -465,6 +522,61 @@ mod tests {
     #[test]
     fn parsing_rejects_garbage() {
         assert!(RunId::parse("run_not-a-ulid").is_err());
+    }
+
+    /// **One spelling, in every direction.**
+    ///
+    /// `Display`, `Serialize`, the store key and the column all write the
+    /// prefixed form, so the same id greps against itself wherever it is read.
+    /// They did not always: keys carried the prefix and record payloads did
+    /// not, so a consumer who stored the string an operator sees in a log could
+    /// not deserialize it — `invalid length`, from a check inside `ulid`, naming
+    /// neither the field nor the fact that there were two forms.
+    #[test]
+    fn one_spelling_is_written_and_both_are_read() {
+        let r = RunId::generate();
+
+        assert_eq!(
+            serde_json::to_string(&r).expect("serialises"),
+            format!("\"{r}\""),
+            "the written form is the one Display shows"
+        );
+
+        for text in [r.to_string(), r.0.to_string()] {
+            let json = serde_json::to_string(&text).expect("a string");
+            assert_eq!(
+                serde_json::from_str::<RunId>(&json).expect("both forms read"),
+                r,
+                "the {text} spelling did not deserialize"
+            );
+        }
+    }
+
+    /// Leniency stops at the prefix: a case id is not a run id.
+    ///
+    /// The half that makes accepting two spellings safe. `parse` strips only
+    /// *this* type's prefix, so `case_…` fails the ULID decode rather than
+    /// quietly becoming a `RunId` — which a blind `strip_prefix` up to the
+    /// underscore would have allowed.
+    #[test]
+    fn another_types_prefix_is_refused_rather_than_stripped() {
+        let case = CaseId::generate();
+        assert!(
+            serde_json::from_str::<RunId>(&format!("\"{case}\"")).is_err(),
+            "a case id deserialized as a run id"
+        );
+        assert!(RunId::parse(&case.to_string()).is_err());
+        // And the positive half, so the negative one is not vacuous.
+        assert!(CaseId::parse(&case.to_string()).is_ok());
+    }
+
+    /// `.parse()` is where an id arrives — a path segment, a CLI argument.
+    #[test]
+    fn ids_arrive_through_from_str() {
+        let r = RunId::generate();
+        assert_eq!(r.to_string().parse::<RunId>().unwrap(), r);
+        assert_eq!(r.0.to_string().parse::<RunId>().unwrap(), r);
+        assert!("nope".parse::<RunId>().is_err());
     }
 
     /// **The digest is SHA-256, pinned to values computed outside this crate.**

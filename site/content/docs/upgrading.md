@@ -25,6 +25,26 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## Ids carry their type prefix everywhere, including on the wire
+
+**Affected:** every stored journal — this changes each record's chain digest.
+Recreate the store; `export` writes the framed record and `restore` rebuilds
+from it. Also anything that compared a serialized id to a literal bare ULID.
+
+`RunId`, `CaseId` and `BatchId` were spelled two ways: `Display`, the redb key
+and the Postgres column wrote `run_01J8Z…`, while `Serialize` wrote the bare
+ULID. The same id therefore appeared in two forms inside one store, and storing
+the form an operator reads in a log made it undeserializable — `invalid length`,
+from a check inside `ulid` that names neither the field nor the two forms.
+
+- **`Serialize` now writes the prefixed form**, matching everything else.
+- **`Deserialize` and `parse` still accept a bare ULID**, so an id pasted from
+  elsewhere reads, and a refusal names the type and the input.
+- **`FromStr` is implemented**, so `path_segment.parse::<RunId>()` works.
+
+Leniency stops at the prefix: `parse` strips only its own type's, so `case_…`
+deserialized as a `RunId` is refused rather than quietly becoming one.
+
 ## `testkit` is out of the `cli` feature, and `fake-model` is what replaced it
 
 **Affected:** anything building the binary or the image with `--features cli`

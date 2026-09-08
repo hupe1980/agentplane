@@ -39,7 +39,40 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
-## [0.31.0] — 2026-09-07
+## [0.32.0] — 2026-09-08
+
+### Changed — ids carry their type prefix everywhere, including on the wire
+
+**A durable-format hard cut: every record's chain digest moves.** Recreate a
+store rather than migrating it — `export` writes the framed record and `restore`
+rebuilds from it.
+
+`RunId`, `CaseId` and `BatchId` were spelled two ways. `Display`, the redb store
+key and the Postgres column wrote `run_01J8Z…`; `Serialize` wrote the bare ULID.
+So the same id appeared in two forms **inside one store** — prefixed in the key,
+bare in the record body it pointed at — and a consumer who stored the string an
+operator reads in a log could not deserialize it, getting `invalid length` from
+a check inside `ulid` that names neither the field nor the two forms.
+
+The justification for keeping them apart was that a record's field name already
+says what the id is of. It does, until the string leaves the record — into an
+API response, an export, a log line, a SIEM — which is most of what an id is
+for. One spelling is simpler, and `_` is outside Crockford base32, so the prefix
+can never be mistaken for part of the ULID.
+
+- **`Serialize` writes the prefixed form.** `Deserialize` and `parse` still
+  accept a bare ULID, because one arrives from elsewhere often enough.
+- **`FromStr`** on all three, so `.parse()` works where an id actually arrives —
+  an `axum` path segment, a `clap` argument, a TOML key.
+- **A refusal names the type and the input** rather than surfacing `ulid`'s
+  `invalid length`.
+- Leniency stops at the prefix: `parse` strips only its own type's, so a `case_…`
+  string deserialized as a `RunId` is refused rather than becoming one.
+
+The golden corpora were re-blessed. Only the `run` and `case` fields moved —
+verified field by field — and `tools/verify_export.py` re-derives all 27 vectors
+from the [published specification](https://hupe1980.github.io/agentplane/docs/format/),
+which is the check that says so from outside this build.
 
 ### Fixed — three egress refusals read as two sentences spliced together
 
@@ -156,6 +189,8 @@ The boundary is the format's rather than an omission, and it is now stated on
 It is deliberately **not** in `not_checked`: that list reports what *this* audit
 could not check, and an entry present in every report ever produced would train a
 reader to skip it — which is the failure the list exists to avoid.
+
+## [0.31.0] — 2026-09-07
 
 ### Changed — the published binary and the container image carried `testkit`
 
