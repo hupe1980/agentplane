@@ -462,7 +462,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "policy is re-evaluated while replaying a recorded run",
         "            if self.mode.is_replaying() {",
         "            self.gate(key, &descriptor, effect.mutates(), outbound, "
-        "Some(DeclaredCeilings::of(&effect)))\n                .await?;\n"
+        "Some(DeclaredCeilings::of(&effect)), Self::outbound_size(&effect))\n"
+        "                .await?;\n"
         "            if self.mode.is_replaying() {",
     ),
     "DenialNotJournaled": (
@@ -7386,7 +7387,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "code deciding what the run did next, so a resume exhausts a ceiling "
         "its own history never reached, at a point no record contains",
         """        // Deliberately bills nothing. The recorded failure was billed by the""",
-        """        self.bill_replayed(crate::core::Spend::default());
+        """        self.bill_replayed(crate::core::Spend::default(), 0);
         // Deliberately bills nothing. The recorded failure was billed by the""",
     ),
     "ASupersededFigureIsDiscarded": (
@@ -8161,9 +8162,105 @@ def _named_test_failed(out: str, test: str) -> bool:
     )
 
 
+def _added_lines(diff: str) -> dict[str, set[int]]:
+    """Line numbers touched in each file's post-image, from a `-U0` diff."""
+    out: dict[str, set[int]] = {}
+    path = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            path = line[6:]
+            out.setdefault(path, set())
+        elif line.startswith("@@"):
+            m = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            if m and path:
+                start, count = int(m.group(1)), int(m.group(2) or 1)
+                out[path].update(range(start, start + max(count, 1)))
+    return out
+
+
+def _signature_spans(src: list[str]) -> list[tuple[str, range]]:
+    """Each `fn name`'s line span from its declaration to the close of its
+    parameter list — the region where adding an argument breaks every
+    replacement that calls it."""
+    spans = []
+    for i, line in enumerate(src):
+        m = re.search(r"\bfn\s+([a-z_][a-z0-9_]*)\s*[(<]", line)
+        if not m:
+            continue
+        depth, end = 0, i
+        for j in range(i, min(i + 40, len(src))):
+            depth += src[j].count("(") - src[j].count(")")
+            end = j
+            if depth <= 0 and "(" in "".join(src[i : j + 1]):
+                break
+        spans.append((m.group(1), range(i + 1, end + 2)))
+    return spans
+
+
+def affected(since: str | None = None) -> int:
+    """Name the mutations a signature change in the working tree may have broken.
+
+    `--check` reads only the *find* half, so it cannot see a **replacement** that
+    stopped compiling — and the replacement is the half that calls into the
+    code. Add a parameter to a function and every mutation whose replacement
+    calls it becomes an ERROR: reported by a sweep as "not pinned", identical to
+    a guarantee that genuinely lost its test, and invisible until CI runs the
+    hour-long job. That has happened twice to the same anchor.
+
+    So this lists, rather than judges: every `fn` whose signature line the
+    working diff touches, and every mutation mentioning one. Run `--verify` on
+    what comes back. A listing cannot give false confidence the way a
+    heuristic check would — and a parameter count parsed out of Rust by regex
+    would be exactly that.
+    """
+    where = [since] if since else []
+    diff = subprocess.run(
+        ["git", "diff", "-U0", *where, "--", "src/"],
+        capture_output=True, text=True, cwd=ROOT, check=False,
+    ).stdout
+    # A changed line that falls inside a **parameter list** — which is not the
+    # same as a changed `fn` line. The break this exists to find was a sixth
+    # parameter added to `gate` on a line of its own, leaving `fn gate(`
+    # untouched: matching on the `fn` line alone misses exactly the case that
+    # has now bitten twice. A function merely *added* is excluded, since no
+    # replacement written before it existed can call it.
+    names: set[str] = set()
+    base = since or "HEAD"
+    for path, lines in _added_lines(diff).items():
+        src = (ROOT / path).read_text().splitlines() if (ROOT / path).exists() else []
+        before = subprocess.run(
+            ["git", "show", f"{base}:{path}"],
+            capture_output=True, text=True, cwd=ROOT, check=False,
+        ).stdout
+        existed = {m for m in re.findall(r"\bfn\s+([a-z_][a-z0-9_]*)", before)}
+        for name, span in _signature_spans(src):
+            # It has to have existed before: a replacement written against a
+            # function that did not yet exist cannot be calling it.
+            if name in existed and any(n in span for n in lines):
+                names.add(name)
+    if not names:
+        scope = f"since {since}" if since else "in the working tree"
+        print(f"no function signature in src/ changed {scope}")
+        return 0
+    hits = sorted(
+        n for n, (_f, _t, _d, find, repl) in MUTANTS.items()
+        if any(re.search(rf"(?<![a-z_]){re.escape(fn)}\s*\(", find + repl) for fn in names)
+    )
+    print(f"{len(names)} function(s) changed: {', '.join(sorted(names))}\n")
+    if not hits:
+        print("no mutation mentions any of them")
+        return 0
+    print(f"{len(hits)} mutation(s) mention one — `--verify` each:")
+    for n in hits:
+        print(f"  python3 tools/mutants.py {n} --verify")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--check":
         return check()
+    if sys.argv[1:2] == ["--affected"] and len(sys.argv) <= 3:
+        return affected(sys.argv[2] if len(sys.argv) == 3 else None)
     if sys.argv[1:2] == ["--list"]:
         # Emitted **grouped by the feature set each mutation is checked under**,
         # because that set is what decides the build. Cargo keeps one set of

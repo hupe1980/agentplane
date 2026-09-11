@@ -94,6 +94,23 @@ Two outcomes are errors rather than skips, and both mean the row is testing
 nothing: an anchor that no longer matches, and a mutation that does not compile.
 The mutation has to *remove the guarantee*, not break the file.
 
+**After changing a function signature, check what it broke.** `just anchors`
+reads only the *find* half, so it cannot see a **replacement** that stopped
+compiling — and the replacement is the half that calls into the code. Add a
+parameter and every mutation whose replacement calls that function becomes an
+error: reported by a sweep as *not pinned*, which reads identically to a
+guarantee that genuinely lost its test, and invisible until the hour-long CI job.
+
+```sh
+python3 tools/mutants.py --affected          # against the working tree
+python3 tools/mutants.py --affected HEAD~1   # or since a commit
+```
+
+It lists rather than judges — a parameter count parsed out of Rust by regex
+would be a check that answers wrongly — so `--verify` what it names. It reads
+signature *spans*, not `fn` lines: the parameter that broke this twice was added
+on a line of its own.
+
 `just anchors` runs the cheap half of that constantly: a text-only pass proving
 every mutation's anchor still appears exactly once in the code it names — the
 code a mutation points at moves in routine refactors, and a drifted anchor
