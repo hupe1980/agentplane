@@ -904,7 +904,7 @@ pub enum PolicyError {
 
     /// A protected field exceeds its own sensitivity ceiling.
     #[error(
-        "protected field '{path}' sensitivity {actual:?} exceeds sink '{sink}' field ceiling {ceiling:?}"
+        "protected field '{path}' sensitivity {actual} exceeds sink '{sink}' field ceiling {ceiling}"
     )]
     ProtectedFieldSensitivity {
         sink: String,
@@ -943,7 +943,7 @@ pub enum PolicyError {
     /// and then meets this refusal would otherwise conclude the seal is not
     /// working.
     #[error(
-        "sensitivity {actual:?} exceeds the journal ceiling {ceiling:?} for sink \
+        "sensitivity {actual} exceeds the journal ceiling {ceiling} for sink \
          '{sink}' — the journal is append-only, so this argument could not be \
          removed afterwards. Put the bytes in a blob and pass the digest, or \
          configure a key ring so payloads are sealed under a key erasure destroys"
@@ -957,7 +957,7 @@ pub enum PolicyError {
     /// A value's sensitivity exceeds what the sink is allowed to receive. This
     /// is the exfiltration path that matters: not the network, but a
     /// legitimate-looking tool call carrying a secret read three steps ago.
-    #[error("sensitivity {actual:?} exceeds sink '{sink}' ceiling {ceiling:?}")]
+    #[error("sensitivity {actual} exceeds sink '{sink}' ceiling {ceiling}")]
     EgressCeiling {
         sink: String,
         actual: Sensitivity,

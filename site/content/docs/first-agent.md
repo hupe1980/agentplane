@@ -132,6 +132,7 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [severity, summary]
       properties:
         severity: { type: string }
@@ -214,6 +215,7 @@ spec:
       description: "Read a ticket by id"
       arguments:
         type: object
+        additionalProperties: false
         required: [id]
         properties: { id: { type: string } }
   budgets: { max_tokens: 20000 }

@@ -29,6 +29,7 @@ spec:
       description: "Read a ticket by id"
       arguments:
         type: object
+        additionalProperties: false
         required: [id]
         properties: { id: { type: string } }
   budgets: { max_tokens: 1000 }

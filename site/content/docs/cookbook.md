@@ -316,6 +316,7 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [summary]
       properties: { summary: { type: string } }
   budgets: { max_tokens: 10000 }
@@ -1801,10 +1802,10 @@ spec:
 ```
 
 The planner answers with steps like
-`{ "tool": "crm__lookup", "args": { "id": "$input/customer" } }` and
-`{ "tool": "mail__send", "args": { "to": "$step0/email" } }` — the references
-are resolved by the runtime, labels intact. A `parse` step hands a prior
-output to the quarantined model under a bounded schema.
+`{ "tool": "crm__lookup", "args": "{\"id\": \"$input/customer\"}" }` — the
+references are resolved by the runtime, labels intact, and `args` is JSON *text*
+because constrained decoding has no free-form object. A `parse` step hands a
+prior output to the quarantined model under a bounded schema.
 
 Freezing control flow is half the defence; the grant carries the other half.
 Because a reference arrives at the sink with the provenance of the value it
@@ -1816,7 +1817,9 @@ model completion is not among the allowed sources, however well-shaped the
 string. Run
 `cargo run --example planned_run --features redb,testkit,manifest` to watch
 both: a prompt injection arrive in a tool output and find no reader, and a
-planner-invented recipient stop at the field rule.
+planner-invented recipient stop at the field rule. `just camel-live` runs the
+same shape against two real `OpenAI` models and asserts, at the wire, that the
+injection was in the quarantined prompt and in no other.
 
 **The trap:** planning over untrusted input. It is refused outright — the
 planner reads the input to write the plan, so hand hostile content to a tool
@@ -2889,8 +2892,8 @@ decision; then store the released value.
 
 For governed automatic formation, declare `spec.memory.formation` on a
 declarative agent. It requires a reviewed subject, purpose, extraction
-instruction, item bound and retention. The model proposes only `key/content`;
-runtime derives stable ids and security labels. Coded skills invoke
+instruction, item bound and retention. The model proposes only `key/content`,
+both strings; runtime derives stable ids and security labels. Coded skills invoke
 `cx.form_memories` explicitly. There is intentionally no generic post-model hook
 that silently stores every conversation.
 

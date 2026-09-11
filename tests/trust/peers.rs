@@ -960,6 +960,7 @@ spec:
       description: Ask the reviewer to check an invoice.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           invoice: { type: string }
         required: [invoice]

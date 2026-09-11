@@ -1883,6 +1883,55 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        let url = format!(\"{}/add-checkpoint\", self.prefix);",
         "        let old_size = checkpoint.size.saturating_sub(proof.len() as u64);\n        let url = format!(\"{}/add-checkpoint\", self.prefix);",
     ),
+    "AnOpenObjectSchemaIsAccepted": (
+        "src/manifest/mod.rs",
+        "an_object_schema_a_model_may_add_to_is_refused",
+        "a declarative agent may declare an object schema the model can add "
+        "fields to — the vacuous `schema: {}` one level down, and the one "
+        "constrained decoding cannot bind, so the reviewed contract stops "
+        "holding at the moment it is supposed to",
+        """        if is_object && schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+        {""",
+        """        if false && is_object {""",
+    ),
+    "TheOpenObjectRuleStopsAtTheSurface": (
+        "src/manifest/mod.rs",
+        "an_object_schema_a_model_may_add_to_is_refused",
+        "only the outermost object is checked, so a nested one the model also "
+        "fills in stays open — and a reviewer reading a closed top level has "
+        "no way to see it",
+        """        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+            for (name, nested) in properties {
+                Self::refuse_open_objects(nested, &format!("{at}.{name}"))?;
+            }
+        }""",
+        """        if false && let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+            for (name, nested) in properties {
+                Self::refuse_open_objects(nested, &format!("{at}.{name}"))?;
+            }
+        }""",
+    ),
+    "ASensitivityRendersAsRustRatherThanAsWritten": (
+        "src/core/label.rs",
+        "a_sensitivity_reads_back_as_the_name_a_manifest_writes",
+        "a policy refusal names a level in a spelling no manifest uses, so an "
+        "operator matching the refusal against the file that caused it has to "
+        "know that `Internal` and `internal` are one level",
+        """            Self::Confidential => "confidential",""",
+        """            Self::Confidential => "Confidential",""",
+    ),
+    "APlanFormatNoProviderWillAccept": (
+        "src/runtime/declarative.rs",
+        "the_plan_format_survives_constrained_decoding",
+        "the plan a privileged model is asked for falls back outside the "
+        "subset constrained decoding accepts, so `planned` — the dual-model "
+        "execution kind — is refused by the driver before it is sent and can "
+        "only ever run against a fake",
+        """                        "args": {
+                            "type": ["string", "null"],""",
+        """                        "args": {
+                            "type": "object",""",
+    ),
     "AParseStepAcceptsProseArguments": (
         "src/runtime/declarative.rs",
         "a_parse_step_carrying_args_is_refused",
@@ -1890,8 +1939,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a field that parses and is never read, manufacturing confidence in "
         "arguments nothing executes, in the artifact whose whole point is that "
         "what is accepted is what runs",
-        """                    if step.args.is_some() {""",
-        """                    if step.args.is_some() && false {""",
+        """                        Ok(args) if args.is_empty() => {}""",
+        """                        Ok(_) => {}""",
     ),
     "ATakeOverDisplacesWhoeverHoldsIt": (
         "src/store/redb_tasks.rs",

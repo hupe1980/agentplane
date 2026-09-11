@@ -21,6 +21,7 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [summary]
       properties: { summary: { type: string } }
   budgets: { max_tokens: 10000 }

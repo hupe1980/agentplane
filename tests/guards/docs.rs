@@ -773,6 +773,199 @@ fn every_documented_manifest_parses() {
     );
 }
 
+/// Every recipe's `just --list` line is a summary, not a sentence fragment.
+///
+/// `just` shows the **last** comment line above a recipe and nothing else, so a
+/// rationale paragraph ending in a subordinate clause is published as the
+/// recipe's description. Two thirds of them had read like *"than for the
+/// reader."* and *"warm."* — and `just --list` is the first thing anyone runs.
+///
+/// The rule is the shape that makes it true: a summary is separated from the
+/// rationale above it by a bare `#`, or is the only comment line. It is a
+/// property of the file rather than of the prose, which is what makes it
+/// checkable at all.
+#[test]
+fn every_recipe_publishes_a_summary_rather_than_a_fragment() {
+    let recipe = read("justfile");
+    let lines: Vec<&str> = recipe.lines().collect();
+    let mut checked = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        // A recipe header: a name at column zero ending in `:`, which
+        // distinguishes it from an assignment (`NAME := "..."`).
+        let Some((head, _)) = line.split_once(':') else {
+            continue;
+        };
+        if line.starts_with([' ', '\t', '#']) || head.is_empty() || line.contains(":=") {
+            continue;
+        }
+        let name = head.split_whitespace().next().unwrap_or_default();
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        {
+            continue;
+        }
+        let Some(previous) = index.checked_sub(1).map(|i| lines[i]) else {
+            continue;
+        };
+        if !previous.starts_with('#') {
+            // Undocumented is a different finding, and `just --list` says so
+            // for itself by printing no description at all.
+            continue;
+        }
+        checked += 1;
+        let before_summary = index.checked_sub(2).map(|i| lines[i]).unwrap_or_default();
+        if before_summary.starts_with('#') && before_summary.trim() != "#" {
+            bad.push(format!(
+                "{name}: `just --list` publishes `{}`",
+                previous.trim()
+            ));
+        }
+    }
+
+    assert!(
+        checked > 20,
+        "only {checked} documented recipes were found — the justfile moved and \
+         this guard is now inert"
+    );
+    assert!(
+        bad.is_empty(),
+        "these recipes publish the tail of a paragraph as their description — \
+         put a one-line summary last, separated by a bare `#`:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
+/// Every schema this repository publishes can actually be asked for.
+///
+/// Constrained decoding accepts a **subset** of JSON Schema, and the `OpenAI`
+/// driver refuses anything outside it before sending — so a declared
+/// `output.schema` missing `additionalProperties: false`, or an array with no
+/// `items`, is an agent that parses, passes every test against `FakeProvider`,
+/// and fails at its first real model call. Four shipped manifests were in that
+/// state, including two a reader is pointed at by name.
+///
+/// A tool's `arguments` fails differently and more quietly: the drivers drop to
+/// non-strict rather than refusing, so the schema becomes a suggestion the
+/// model may ignore — which is the thing this crate says a schema is not.
+///
+/// The checker is the authority, as the parser is next door: re-deriving the
+/// subset here would be a second copy of it, agreeing everywhere except the
+/// boundary that matters.
+#[test]
+#[cfg(all(feature = "manifest", feature = "providers"))]
+fn every_published_schema_survives_constrained_decoding() {
+    use agentplane::manifest::{API_VERSION, Manifest};
+    use agentplane::model::strict_schema_problem;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut sources: Vec<(String, String)> = Vec::new();
+
+    for entry in std::fs::read_dir(root.join("examples")).expect("examples are readable") {
+        let path = entry.expect("a readable directory entry").path();
+        let name = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("yaml") => {
+                sources.push((
+                    name,
+                    std::fs::read_to_string(&path).expect("a readable file"),
+                ));
+            }
+            // An example that embeds its manifest as a raw string is as
+            // published as one that ships a file beside it, and is more likely
+            // to be the thing a reader copies.
+            Some("rs") => {
+                let text = std::fs::read_to_string(&path).expect("a readable file");
+                for (index, block) in text.split("r#\"").enumerate() {
+                    if index == 0 {
+                        continue;
+                    }
+                    let Some((body, _)) = block.split_once("\"#") else {
+                        continue;
+                    };
+                    sources.push((name.clone(), body.to_owned()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut files: Vec<std::path::PathBuf> = vec![root.join("README.md")];
+    let mut stack = vec![root.join("site/content")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("the site content tree is readable") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "md") {
+                files.push(path);
+            }
+        }
+    }
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("a readable page");
+        for (index, block) in text.split("```").enumerate() {
+            if index % 2 == 0 {
+                continue;
+            }
+            let body = block.split_once('\n').map_or("", |(_, rest)| rest);
+            if body.contains(API_VERSION) {
+                let name = file
+                    .strip_prefix(root)
+                    .unwrap_or(file)
+                    .display()
+                    .to_string();
+                sources.push((name, body.to_owned()));
+            }
+        }
+    }
+
+    let mut checked = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    for (name, text) in &sources {
+        let Ok(manifests) = Manifest::parse_all(text) else {
+            // Unparseable is the neighbouring guard's finding, not this one's.
+            continue;
+        };
+        for manifest in manifests {
+            let agent = manifest.metadata.name.clone();
+            let mut schemas: Vec<(String, &serde_json::Value)> = Vec::new();
+            if let Some(output) = manifest.output_schema() {
+                schemas.push(("spec.output.schema".to_owned(), output));
+            }
+            for grant in &manifest.spec.tools {
+                if let Some(arguments) = grant.arguments.as_ref() {
+                    schemas.push((format!("{} arguments", grant.reference), arguments));
+                }
+            }
+            for (where_, schema) in schemas {
+                checked += 1;
+                if let Some(problem) = strict_schema_problem(schema) {
+                    bad.push(format!("{name} [{agent}] {where_}: {problem}"));
+                }
+            }
+        }
+    }
+
+    assert!(
+        checked > 8,
+        "only {checked} schemas were found — the walk stopped matching and this \
+         guard is now inert"
+    );
+    assert!(
+        bad.is_empty(),
+        "a published schema cannot be asked for under constrained decoding, so \
+         the agent declaring it fails at its first real model call:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
 /// Every example is actually run by the recipe that claims to run them all.
 ///
 /// `just examples` is the only thing that executes example code, so an example

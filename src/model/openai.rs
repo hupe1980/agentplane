@@ -465,24 +465,27 @@ impl ApiResponse {
 
 /// The prompt shapes this driver accepts.
 ///
-/// A bare string, the API's own `input` array, or an object carrying one.
-/// Whatever the shape, it is part of the effect key — so a changed prompt is a
-/// changed effect and shows up on replay as divergence rather than as a run that
-/// quietly did something else.
+/// A bare string, the API's own `input` array, or an envelope carrying one —
+/// `prompt_envelope` decides when an object counts as the second rather than
+/// as content. Whatever the shape, it is part
+/// of the effect key, so a changed prompt is a changed effect and shows up on
+/// replay as divergence rather than as a run that quietly did something else.
 fn input(prompt: &Value) -> Value {
     match prompt {
         Value::String(s) => json!(s),
         Value::Array(_) => prompt.clone(),
-        other => other.get("input").cloned().unwrap_or_else(|| {
-            // `system` is an instruction about the content, not content; leaving
-            // it in would show the caller's instruction to the model as part of
-            // the question it is answering.
-            let mut rest = other.clone();
-            if let Some(map) = rest.as_object_mut() {
-                map.remove("system");
-            }
-            json!(rest.to_string())
-        }),
+        other => crate::model::prompt_envelope(other, "input")
+            .cloned()
+            .unwrap_or_else(|| {
+                // `system` is an instruction about the content, not content; leaving
+                // it in would show the caller's instruction to the model as part of
+                // the question it is answering.
+                let mut rest = other.clone();
+                if let Some(map) = rest.as_object_mut() {
+                    map.remove("system");
+                }
+                json!(rest.to_string())
+            }),
     }
 }
 
@@ -1178,6 +1181,38 @@ mod tests {
             "the system instruction must become `instructions`: {body}"
         );
         assert_eq!(body["input"], "hi", "the question must survive: {body}");
+    }
+
+    /// `{ system, input }` is an envelope; `{ system, input, tools }` is not.
+    ///
+    /// The declarative planner's prompt is the second shape — `input` is the
+    /// run's own input and `tools` is the surface it must choose from. Reading
+    /// the key there sent the run's input alone, as an object the API rejects,
+    /// and would have silently dropped the tool surface if it had not.
+    #[test]
+    fn a_prompt_carrying_more_than_the_envelope_is_asked_whole() {
+        let body = driver()
+            .body(
+                &ModelId::new("openai", "gpt-x"),
+                &json!({
+                    "system": "plan it",
+                    "input": { "customer": "AC-1" },
+                    "tools": [{ "tool": "crm__lookup" }],
+                }),
+                None,
+                &[],
+                &[],
+            )
+            .expect("body");
+        let asked = body["input"].as_str().expect("a question, not an envelope");
+        assert!(
+            asked.contains("AC-1") && asked.contains("crm__lookup"),
+            "a field of the question was dropped on the way to the wire: {asked}"
+        );
+        assert!(
+            !asked.contains("plan it"),
+            "the instruction leaked into the question: {asked}"
+        );
     }
 
     #[test]

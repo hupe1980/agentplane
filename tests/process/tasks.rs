@@ -2103,8 +2103,15 @@ spec:
     provider.will_answer(agentplane::model::Completion {
         text: String::new(),
         structured: Some(json!({
-            "steps": [{ "tool": "ledger__payout",
-                         "args": { "recipient": "$input/payee", "amount": 250_000 } }]
+            // `args` is JSON text on the wire: constrained decoding has no
+            // free-form object, so a plan carrying one could not be asked for.
+            "steps": [{
+                "tool": "ledger__payout",
+                "args": json!({ "recipient": "$input/payee", "amount": 250_000 })
+                    .to_string(),
+                "parse": null,
+            }],
+            "answer": null,
         })),
         tool_calls: Vec::new(),
         usage: agentplane::model::Usage::default(),

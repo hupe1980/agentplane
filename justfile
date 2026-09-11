@@ -30,6 +30,8 @@ fmt:
 #
 # `--all-features` cannot see a lint that only fires when a feature is OFF, so
 # the seam configurations below are not redundant with the first line.
+#
+# fmt + clippy across all three feature configurations
 lint:
     cargo fmt --all -- --check
     RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features
@@ -53,6 +55,8 @@ lint:
 # for as long as that combination existed, invisible to every gate. Compiling a
 # feature alone proves it builds; linting it alone is what the rest of the
 # codebase is held to.
+#
+# every optional feature lints on its own, one at a time
 features:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -94,6 +98,8 @@ anchors:
 #   --self-test    damages that export six ways and asserts each is reported —
 #                  a reader that answers "0 findings" for everything agrees
 #                  with this crate perfectly and is worth nothing
+#
+# a second implementation reads the published export and agrees
 verify-golden:
     python3 tools/verify_export.py tests/golden/records.jsonl --canon-check
     python3 tools/verify_export.py tests/golden/export.jsonl
@@ -137,6 +143,8 @@ test-minimal:
 # defects that matter. With redb on, `store` could be — and was — gated on `redb`
 # alone, and the case-layer battery with it, so the shared-store backend was
 # untestable and unreachable in the configuration a Postgres deployment ships.
+#
+# the store contract, against a real Postgres container
 test-postgres:
     cargo test --no-default-features --features postgres,testkit,keyring --test guards postgres::
 
@@ -146,6 +154,8 @@ test-postgres:
 # a HashMap wrong, so one passing says nothing about the other. This found three
 # real defects the unit tests could not: Vault reports a destroyed key as a 400
 # with a message, not a 404.
+#
+# the key-ring contract, against a real Vault container
 test-vault:
     cargo test --no-default-features --features keyring-vault,testkit --test guards vault:: -- --test-threads=1
 
@@ -175,7 +185,11 @@ test-drivers:
 # the rest say so loudly. The Gemini one carries the load here: a thought
 # signature is minted and validated by Google, so a canned server accepts
 # whatever a fixture tells it to and proves nothing about whether Gemini takes
-# the signature back.
+# the signature back. The compatible-wire battery runs on HF_TOKEN, or on
+# CHAT_COMPLETIONS_BASE_URL pointed at a local engine — which is the more
+# useful thing to do before trusting one.
+#
+# the drivers against real provider APIs — costs money
 test-live:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -185,6 +199,21 @@ test-live:
     fi
     set -a; . ./.env; set +a
     AGENTPLANE_LIVE=1 cargo test --features providers,redb,testkit --test live -- --nocapture --test-threads=1
+
+# Same discipline as `test-live`: the key comes from .env, which is gitignored,
+# because a credential being available is not a decision to spend it. The
+# offline twin is `planned_run`, which needs no key.
+#
+# the dual-model (CaMeL) example against real models — costs money
+camel-live:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f .env ]; then
+        echo "no .env — put OPENAI_API_KEY in it, or export it and run the example directly" >&2
+        exit 1
+    fi
+    set -a; . ./.env; set +a
+    cargo run --quiet --example camel_live --features redb,providers,manifest
 
 # standing authority: cross-run ceilings, idempotent draws, revocation
 test-authority:
@@ -198,15 +227,17 @@ test-memory:
 test-push:
     cargo test --features push,media,redb,testkit --test guards push::
 
-# the official A2A conformance kit against this server — the outside authority
-#
 # Every other A2A test drives this server with this crate's own client, which
 # proves symmetry, not conformance. Network-gated (clones and installs the
 # kit); needs `uv`. Two kit MUSTs are excluded with evidence — see the script.
+#
+# the official A2A conformance kit against this server — the outside authority
 test-a2a-tck:
     bash tools/a2a_tck.sh
 
 # being called: the public card, the 1.0 methods, and a client/server round trip
+#
+# what another organisation's agent sees when it calls this one
 test-a2a-server:
     cargo test --features a2a-server,a2a,signing,redb,testkit --test wire a2a_server::
 
@@ -228,6 +259,8 @@ EXAMPLE_FEATURES := "redb,testkit,manifest,keyring,media,mcp,a2a,a2a-server"
 # newcomer's behalf — `cargo run --example hello_skill`, no flags — and an
 # example that quietly grew a dependency on `testkit` would fail here rather
 # than for the reader.
+#
+# build and run every example, and check the ones with no flags
 examples:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -251,6 +284,8 @@ FULL_FEATURES := "cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,
 # Not in `ci`: it is a measurement, it takes half a minute, and the figure is
 # hardware-specific — the point is that anybody can re-derive the one the docs
 # quote, not that CI asserts it.
+#
+# what an effect costs, so a performance claim can carry a number
 perf:
     cargo run --release --quiet --example journal_bench --features redb
     DISK=1 cargo run --release --quiet --example journal_bench --features redb
@@ -269,6 +304,8 @@ cli-smoke:
 # in-repo test missed because they all run on a writable filesystem.
 #
 # Needs Docker; not in `ci` for that reason. The release workflow runs it.
+#
+# the container image: builds it, then proves it does what it exists for
 docker-smoke features="cli":
     FEATURES={{features}} tools/docker-smoke.sh
 
@@ -279,6 +316,8 @@ docker-smoke features="cli":
 # reach somebody's model is not smaller, it is useless to them. `full` adds the
 # surfaces: MCP, the A2A peer server, the operator HTTP API, Cedar, key rings,
 # governed media, blobs, Postgres.
+#
+# build both published container variants locally, as the registry gets them
 docker:
     docker build --build-arg FEATURES=cli -t agentplane:slim .
     docker build --build-arg FEATURES={{FULL_FEATURES}} -t agentplane:full .
@@ -290,6 +329,8 @@ docker:
 # references to `TursoStore` survived the move to redb — one of them in the
 # crate-level docs, which is the first thing a reader sees — and nothing in the
 # gate said a word. Clippy does not check doc links; only rustdoc does.
+#
+# build the rustdoc a reader would land on
 docs:
     RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
 
@@ -334,6 +375,8 @@ doc-examples:
 # Skipping them locally is what let a link to an unreleased item reach a push:
 # `docs.rs/…/latest` serves the last *published* crate, so a link to anything
 # added since resolves to a 404 that only the network can see. ~5 s.
+#
+# the site's links, internal and external, as the deploy job checks them
 site-check:
     cd site && zola check
 
@@ -366,6 +409,8 @@ specs:
 # Listing uncommitted files is exactly right here. The question this asks is
 # "would the *current* contents ship", and the current contents are what a
 # release is cut from.
+#
+# list the publish tarball and refuse if the internal design doc is in it
 package:
     cargo package --list --allow-dirty
     @echo
@@ -388,6 +433,8 @@ publish-dry:
 #
 # In `ci` rather than `ci-full`: an advisory published this morning is a fact
 # about today's tree, and finding out at release time is finding out late.
+#
+# no dependency in the tree has a known advisory against it
 audit:
     cargo audit --deny warnings
 
@@ -407,6 +454,8 @@ audit:
 # stay their own recipes and their own CI jobs rather than making `ci` depend on
 # a daemon. Everything here needs nothing but cargo, and costs about 90 seconds
 # warm.
+#
+# each feature seam compiled and linted with its own tests on
 seams: test-mcp test-http test-attestation test-drivers
 
 # everything CI runs, minus the two slow layers

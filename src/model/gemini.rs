@@ -471,22 +471,25 @@ impl Gemini {
     /// A bare string is one user turn. An array is already `contents` and is
     /// passed through untouched — which is how governed media reaches this
     /// driver, as `inlineData` parts the caller assembled and the runtime
-    /// materialised. An object is read for `messages`, and anything else is one
-    /// user turn carrying the object.
+    /// materialised. An object is read for `messages` only when
+    /// `prompt_envelope` says it is an envelope rather than content; anything
+    /// else is one user turn carrying the object.
     fn contents(prompt: &Value) -> Value {
         match prompt {
             Value::String(text) => json!([{ "role": "user", "parts": [{ "text": text }] }]),
             Value::Array(_) => prompt.clone(),
-            other => other.get("messages").cloned().unwrap_or_else(|| {
-                // `system` is an instruction *about* the content and is lifted
-                // out separately; leaving it here would show the model its own
-                // orders as part of the question.
-                let mut rest = other.clone();
-                if let Some(map) = rest.as_object_mut() {
-                    map.remove("system");
-                }
-                json!([{ "role": "user", "parts": [{ "text": rest.to_string() }] }])
-            }),
+            other => crate::model::prompt_envelope(other, "messages")
+                .cloned()
+                .unwrap_or_else(|| {
+                    // `system` is an instruction *about* the content and is lifted
+                    // out separately; leaving it here would show the model its own
+                    // orders as part of the question.
+                    let mut rest = other.clone();
+                    if let Some(map) = rest.as_object_mut() {
+                        map.remove("system");
+                    }
+                    json!([{ "role": "user", "parts": [{ "text": rest.to_string() }] }])
+                }),
         }
     }
 

@@ -41,6 +41,180 @@ archaeology presented as a record.
 
 ## [0.34.0] — 2026-09-11
 
+### Fixed — `planned` had never run against a real model, and could not have
+
+**The plan format was outside the subset constrained decoding accepts, so the
+`OpenAI` driver refused it before it was sent.**
+
+`execution.kind: planned` is this crate's `CaMeL` implementation, and every test
+it had ran against `FakeProvider`, which accepts any schema. The real driver does
+not: strict mode enumerates every object's properties and requires every one of
+them, so a free-form `args` object cannot be expressed at all. `plan_schema` used
+one, and a second for a `parse` step's schema. The refusal was correct and the
+format was wrong, which nothing could notice without a real provider on the other
+end.
+
+`args` and a parse step's `schema` are now JSON **text**, parsed strictly on
+arrival; `tool`, `args` and `parse` are required and nullable, as strict mode
+spells optionality. `CaMeL`'s own reference implementation makes the same trade,
+with the plan as Python source. A plan written by hand — in a test, or in the
+`planned_run` example — changes with it: `"args": { "id": "$input/customer" }`
+becomes `"args": "{\"id\": \"$input/customer\"}"`.
+
+A planner-written parse schema is now closed and required all the way down
+rather than only at its root, because a field the planner named is a field it
+wants answered — absence is what the injected `have_enough_information` bit is
+for. And `strict_schema_problem` itself read only the string spelling of `type`,
+so `["object", "null"]` — the way strict mode spells an optional object — skipped
+both of its checks and reached the provider as a 400.
+
+### Fixed — a prompt field named `input` was mistaken for the wire's own
+
+**Every driver's envelope escape hatch opened on a key that may equally be
+content, and sent one field while dropping the rest.**
+
+A prompt object may hand a driver the wire's real shape — `{ system, messages }`
+on the chat wires, `{ system, input }` on Responses. The declarative planner's
+prompt is `{ system, input, tools }`, where `input` is the run's own input and
+`tools` is the surface it must choose from. The drivers read the key regardless:
+`OpenAI` sent the run's input alone, as an object the API rejects outright, and a
+string input would have been sent silently with the tool surface gone.
+
+The hatch now opens only when the object carries nothing else but `system` —
+otherwise the prompt is content and is serialized whole. Fixed in the `OpenAI`,
+Anthropic, Gemini, Bedrock and Chat Completions drivers together, since all five
+carried it.
+
+### Assurance — four new mutations, and the count is 708
+
+The plan format, the open-object refusal at both depths, and a level's name in a
+refusal each break on purpose now, and each names the one test that must fail.
+Every one `--verify`'d.
+
+### Changed — an open object schema is refused at parse
+
+**`additionalProperties: false` is required on every object a declarative agent
+declares, in `spec.output.schema` and in `spec.tools[].arguments`.**
+
+The vacuous `schema: {}` has always been refused because it *permits anything
+while looking answered*. An open object is that same defect one level down, and
+it is the one with teeth at dispatch: constrained decoding cannot bind a schema
+that lets the model add fields, so a driver either refuses the call or generates
+without constraint, and the declaration a reviewer approved stops holding at
+exactly the moment it is supposed to.
+
+Refused rather than closed on the author's behalf. A manifest is digest-covered,
+and rewriting it would make the file a reviewer signed and the shape that runs
+two different documents — the same objection the driver already states for
+caller-supplied schemas.
+
+Narrow by design. The rest of the strict-decoding subset — `required`,
+nullable unions, `items` — is spelled differently by different providers, and
+refusing a manifest that runs perfectly well on Gemini would be this crate
+inventing a restriction one vendor has. A **coded** agent is exempt entirely:
+its schemas are contracts the runtime applies itself, and nothing generates
+against them.
+
+### Changed — `just --list` stopped publishing sentence fragments
+
+**Fourteen recipes described themselves as *"than for the reader."*, *"warm."*
+and *"with a message, not a 404."***
+
+`just` publishes the **last** comment line above a recipe and nothing else, so
+a rationale paragraph ending in a subordinate clause becomes the description —
+in the first thing anyone runs in this repository. Each recipe now carries a
+one-line summary, separated from its rationale by a bare `#`, and a guard holds
+the shape: a summary is the only comment line or is preceded by a blank one,
+which is a property of the file rather than of the prose and is therefore
+checkable.
+
+### Assurance — two wires that had never been called for real
+
+**A live battery for the `OpenAI`-compatible Chat Completions wire, and one for
+the embedding wire.**
+
+The compatible wire is how this crate reaches every self-hosted engine — TGI,
+vLLM, Ollama, llama.cpp, LM Studio — and it had no live coverage at all, which
+is the gap that let the two defects above ship. Hugging Face's router *is* this
+endpoint, so the wire is testable without standing a server up: `HF_TOKEN`
+beside `AGENTPLANE_LIVE=1`, or `CHAT_COMPLETIONS_BASE_URL` pointed at a local
+engine, which is the more useful thing to do before trusting one. Three tests:
+the emulated schema binds the answer, a tool declaration survives the round trip
+and its arguments parse out of the JSON string this wire carries them in, and
+the plan format is accepted here too.
+
+The battery skips loudly on `401`, `402` and `403` — a free router's monthly
+allowance running out is the same fact as an absent key, arriving later — and
+retries once on a cut stream, which these drivers report honestly rather than
+smoothing over.
+
+The embedding wire had only canned-server tests, which prove the parser and
+nothing about the space. `spec.memory` ranks by cosine distance, so the whole
+feature rests on a related sentence landing nearer than an unrelated one; that
+is now asserted against the real model.
+
+### Changed — two values stopped speaking Rust to operators
+
+**`Spend` and `Sensitivity` render as prose in the messages people read.**
+
+A standing authority short of what a draw asked for said *has `Spend { tokens:
+0, minor_units: 5000 }` left* — Rust syntax in the middle of an English
+sentence. A policy refusal named a level as `Internal` while the manifest that
+caused it says `internal`, leaving an operator to know that two spellings are
+one value. Both types now have a `Display`, the level's matching its serde name
+under a test, because two spellings of one thing is the defect this project
+treats most seriously.
+
+### Fixed — three more features that only ever ran against a fake
+
+**The same audit, widened: every schema this project sends to a provider, and
+every schema it publishes, checked against the subset constrained decoding
+accepts.**
+
+`spec.memory.formation` could not run at all. Its schema declared
+`"content": {}` — valid JSON Schema, and refused by strict decoding, which has
+no untyped subschema. A memory's content is now a string, which is what a
+durable fact is; the permissive spelling was never buying what it cost.
+
+**A typed tool's arguments were a suggestion, silently.** `schemars` does not
+emit `additionalProperties: false`, the drivers do not refuse a schema outside
+the subset — they drop to unconstrained generation — so every `ToolBox` tool was
+advertised without the enforcement this crate says a schema carries. Nothing
+failed; the guarantee was simply absent. `ToolBox::with` now closes the generated
+objects. `required` is left alone: a type with an `Option` field has a genuinely
+optional property, strict mode has none, and such a tool keeps falling back —
+which is the honest outcome rather than a field nobody can omit.
+
+**Published manifests declared schemas no `OpenAI`-backed run could use** — in
+four shipped `examples/*.yaml` and five documentation pages, including the one
+on the *Your first agent* page. A reader copying them got an agent that parses,
+passes, and fails at its first real model call.
+
+`strict_schema_problem` was also missing four of the rules it exists to enforce,
+each verified against the live API rather than inferred from documentation: an
+array with no `items`, `oneOf`, `allOf`, and a subschema with no `type` all
+reached the provider as a 400. It is now public — the answer belongs to whoever
+wrote the schema. The plan format, the formation schema and a typed tool's
+arguments each have a test of their own now, and every manifest this repository
+publishes is checked where it is published.
+
+### Added — the dual-model pattern, against real models
+
+**`examples/camel_live.rs` runs a privileged planner and a quarantined extractor
+against `OpenAI`, and asserts at the wire which one was shown the attack.**
+
+The offline `planned_run` proves the crate's logic; it cannot prove that a
+provider accepts what the crate sends, which is how both defects above survived.
+This one declares `spec.models.privileged` and `spec.models.quarantined` as two
+different models, puts a prompt injection in a support email, and checks the
+recorded requests: the injection is in the quarantined prompt and in no other,
+the refund leaves for the address the CRM returned, strict replay asks nothing
+again, and untrusted input never reaches the privileged model at all.
+
+`just camel-live` runs it with the key from `.env`. Like every `_live` example it
+is absent from `just examples`, because a credential being available is not a
+decision to spend it.
+
 ### Added — a scheduled stop is no longer served as a crash
 
 **`agentplane serve` drains on `SIGTERM` and `SIGINT`, and `Runtime::drain`

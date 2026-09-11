@@ -5,10 +5,13 @@
 //! Every test here skips unless **both** are set:
 //!
 //! * `AGENTPLANE_LIVE=1` — the deliberate opt-in;
-//! * the provider's credential — `OPENAI_API_KEY`, `GEMINI_API_KEY`.
+//! * the provider's credential — `OPENAI_API_KEY`, `GEMINI_API_KEY`, or
+//!   `HF_TOKEN` for the compatible wire.
 //!
 //! Each module skips on its own credential, so a machine holding one key runs
-//! that provider's battery and loudly skips the rest.
+//! that provider's battery and loudly skips the rest. The compatible wire also
+//! skips on a `401`, `402` or `403`: a free router's monthly allowance running
+//! out is the same fact as an absent key, arriving later.
 //!
 //! Two signals rather than one, and the second is the API key on purpose. A
 //! developer with `OPENAI_API_KEY` exported in their shell — which is most
@@ -34,5 +37,10 @@
 //! *accepts* what this crate sends, and that what it sends back is read the way
 //! the crate claims.
 
+/// The `OpenAI`-compatible wire every self-hosted engine speaks, reached
+/// through Hugging Face's router — or through
+/// `CHAT_COMPLETIONS_BASE_URL`, which is the more useful thing to point at
+/// before trusting a local one.
+mod chat_completions;
 mod gemini;
 mod openai;

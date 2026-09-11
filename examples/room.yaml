@@ -55,6 +55,7 @@ spec:
       description: Ask the researcher for grounded claims about a topic.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           topic: { type: string }
         required: [topic]
@@ -62,6 +63,7 @@ spec:
       description: Ask the writer for a draft, handing over the brief and the claims.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           brief: { type: string }
           claims: { type: string }
@@ -111,9 +113,10 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [claims]
       properties:
-        claims: { type: array }
+        claims: { type: array, items: { type: string } }
 
   budgets:
     max_tokens: 50000
@@ -154,6 +157,7 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [title, body]
       properties:
         title: { type: string }

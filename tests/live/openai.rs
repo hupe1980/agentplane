@@ -321,3 +321,76 @@ async fn openai_accepts_our_tool_declaration_and_asks_for_it() {
         asked.arguments
     );
 }
+
+/// The embedding wire, for real — and the property semantic recall rests on.
+///
+/// `spec.memory` ranks by cosine distance in this space, so the whole feature
+/// is only as sound as the vectors underneath it. A canned server returns
+/// whatever a fixture says, which proves the parser and nothing about the
+/// space: it cannot show that a related sentence lands nearer than an unrelated
+/// one, and that is the single claim ranking makes.
+///
+/// Cheap enough to run beside the completions: three short texts.
+#[tokio::test]
+async fn openai_embeddings_put_related_text_closer_than_unrelated() {
+    use agentplane::memory::Embedder;
+    use agentplane::model::embeddings::OpenAiEmbedder;
+
+    if std::env::var("AGENTPLANE_LIVE").as_deref() != Ok("1") {
+        eprintln!("skipping: set AGENTPLANE_LIVE=1 to run tests that call a real provider");
+        return;
+    }
+    let Ok(key) = std::env::var("OPENAI_API_KEY") else {
+        eprintln!("skipping: OPENAI_API_KEY is not set");
+        return;
+    };
+    let embedder = OpenAiEmbedder::new("text-embedding-3-small")
+        .expect("build the embedder")
+        .key(key);
+
+    assert!(
+        embedder.revision().contains("text-embedding-3-small"),
+        "the revision does not name the model, so a model change would not \
+         show up as replay divergence: {}",
+        embedder.revision()
+    );
+
+    let query = embedder
+        .embed("what language does the customer prefer?")
+        .await
+        .expect("the live embedding failed");
+    let related = embedder
+        .embed("The customer prefers German.")
+        .await
+        .expect("the live embedding failed");
+    let unrelated = embedder
+        .embed("The warehouse roof was replaced in March.")
+        .await
+        .expect("the live embedding failed");
+
+    assert_eq!(
+        query.len(),
+        related.len(),
+        "two vectors from one model came back different widths, so nothing \
+         can be compared against anything"
+    );
+    assert!(
+        query.iter().any(|f| *f != 0.0),
+        "the vector is all zeros — a parser reading the wrong field returns \
+         exactly this, and every ranking built on it is arbitrary"
+    );
+
+    let cosine = |a: &[f32], b: &[f32]| -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    };
+    let near = cosine(&query, &related);
+    let far = cosine(&query, &unrelated);
+    assert!(
+        near > far,
+        "the related sentence did not land nearer than the unrelated one \
+         ({near} vs {far}) — ranking in this space is not ranking"
+    );
+}

@@ -74,6 +74,22 @@ pub enum Sensitivity {
     Secret,
 }
 
+/// The name a manifest writes, so a refusal and the file it came from agree.
+///
+/// `{:?}` renders `Internal` while `max_sensitivity: internal` is what the
+/// operator wrote, and an operator matching a refusal against their own file
+/// should not have to know that the two spellings are the same level.
+impl std::fmt::Display for Sensitivity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+            Self::Confidential => "confidential",
+            Self::Secret => "secret",
+        })
+    }
+}
+
 /// A value's position in the information-flow lattice.
 ///
 /// A pure product of three joins — provenance unions, trust degrades,
@@ -1051,6 +1067,28 @@ mod tests {
 
     fn src(s: &str) -> SourceId {
         SourceId::new(s)
+    }
+
+    /// A level has one name, and a refusal must use the one the file uses.
+    ///
+    /// Two spellings of one value is the defect this project treats most
+    /// seriously; here the second spelling reaches an operator reading a policy
+    /// refusal while holding the manifest that caused it.
+    #[test]
+    fn a_sensitivity_reads_back_as_the_name_a_manifest_writes() {
+        for level in [
+            Sensitivity::Public,
+            Sensitivity::Internal,
+            Sensitivity::Confidential,
+            Sensitivity::Secret,
+        ] {
+            let serialized = serde_json::to_value(level).expect("a level serializes");
+            assert_eq!(
+                serde_json::Value::String(level.to_string()),
+                serialized,
+                "`{level}` renders differently from the name it is written with"
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,76 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## A declarative agent's object schemas must be closed
+
+**Affected:** any manifest with an `execution` block declaring
+`spec.output.schema` or `spec.tools[].arguments`.
+
+Every object in those schemas now needs `additionalProperties: false`, refused
+at parse if it is missing. Open is the vacuous `schema: {}` one level down — it
+lets the model answer with fields nobody declared — and constrained decoding
+cannot bind a schema that permits them, so a driver either refuses the call or
+generates without constraint.
+
+```diff
+   output:
+     schema:
+       type: object
++      additionalProperties: false
+       required: [summary]
+       properties: { summary: { type: string } }
+```
+
+Nested objects too, and the refusal names which one. A **coded** agent is
+untouched: its schemas are contracts the runtime applies itself.
+
+## A formed memory's content is a string
+
+**Affected:** anyone declaring `spec.memory.formation` whose forming model was
+writing structured values.
+
+The forming schema declared `"content": {}`, which no provider with constrained
+decoding accepts — so formation could not run against `OpenAI` at all. It is now
+`{"type": "string"}`. A memory read back is a string where it used to be
+whatever the model answered with; nothing stored changes, and existing memories
+are returned exactly as they were written.
+
+## A typed tool's arguments are closed
+
+**Affected:** anyone registering tools with `ToolBox::with`, and anyone whose
+journals record a tool declaration.
+
+`schemars` does not emit `additionalProperties: false`, so every typed tool was
+advertised to models outside the strict-decoding subset and generated without
+constraint. `ToolBox::with` now closes the generated objects. The declaration is
+part of a model call's effect key, so a **replay of a journal written before this
+change reports divergence** on the first model call that offered a typed tool.
+That is the mechanism working: the request genuinely differs.
+
+## A plan step's `args` is JSON text, and so is a parse step's `schema`
+
+**Affected:** anyone writing a plan by hand — a test double scripting a planner
+answer, or a fixture — for `execution.kind: planned`. Nothing else: plans are
+written by models, and a model answers in whatever the response schema asks for.
+
+Constrained decoding accepts a subset of JSON Schema in which every object
+enumerates and requires its properties, so a free-form `args` object cannot be
+expressed. The `OpenAI` driver refused the old plan schema before sending it,
+which meant `planned` could not run against a real provider at all.
+
+```diff
+-{ "tool": "crm__lookup", "args": { "id": "$input/customer" } }
++{ "tool": "crm__lookup", "args": "{\"id\": \"$input/customer\"}", "parse": null }
+```
+
+`tool`, `args` and `parse` are each required and nullable, which is how strict
+mode spells an optional field — a scripted answer that omits one is refused by
+the schema check, not silently accepted. `answer` is required at the top level
+on the same terms. A parse step's `schema` travels as text for the same reason.
+
+References are unchanged: `$input/…` and `$stepN/…` still resolve with labels
+intact, and a literal still arrives at every gate as model output.
+
 ## `Budget` gained a ceiling, and `Consumed` a figure
 
 **Affected:** anyone constructing `Budget` or `Consumed` by struct literal, and

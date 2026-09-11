@@ -1366,18 +1366,24 @@ for, which is why the check is over every plane rather than the first.
 
 ### Checking a driver against the real thing
 
-`just test-live` exercises the OpenAI and Gemini drivers against the actual
-APIs, loading keys from `.env`. Each provider's battery skips on its own key, so
-one key runs one battery and the rest say so. It is gated twice — `AGENTPLANE_LIVE=1` **and** the key — and is
+`just test-live` exercises the OpenAI, Gemini and compatible-wire drivers plus
+the embedding wire against the actual APIs, loading keys from `.env`. Each
+battery skips on its own credential, so one key runs one battery and the rest
+say so. It is gated twice — `AGENTPLANE_LIVE=1` **and** the key — and is
 never part of `just ci`: a developer with `OPENAI_API_KEY` exported would
 otherwise be billed for running the test suite, and would find out at the end of
 the month.
 
+The compatible-wire battery runs on `HF_TOKEN` against Hugging Face's router, or
+on `CHAT_COMPLETIONS_BASE_URL` pointed at a local engine — which is the more
+useful thing to do before trusting one.
+
 Worth having because a stubbed provider cannot have the defects a real one finds.
 It accepts any request shape and returns whatever it is told to, so a driver that
-sends a malformed body, or mis-reads a response, passes every offline test. Both
-bugs these found were of exactly that kind: a tool declaration in the wrong shape
-for the API being called, and a tool call read as an empty answer.
+sends a malformed body, or mis-reads a response, passes every offline test. What
+these catch is exactly that: a tool declaration in the wrong shape for the API
+being called, a plan format no provider with constrained decoding accepts, a
+prompt field mistaken for the wire's own.
 
 ### Putting a tenant on your metrics
 

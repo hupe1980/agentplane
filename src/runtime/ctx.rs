@@ -4364,26 +4364,7 @@ impl StepCtx<'_> {
             ),
             ("source".to_owned(), source),
         ]);
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "memories": {
-                    "type": "array",
-                    "maxItems": formation.max_items,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "key": {"type": "string", "minLength": 1},
-                            "content": {}
-                        },
-                        "required": ["key", "content"],
-                        "additionalProperties": false
-                    }
-                }
-            },
-            "required": ["memories"],
-            "additionalProperties": false
-        });
+        let schema = formation_schema(formation.max_items);
         let completion = self
             .sink_with(&prompt, |value| {
                 role.applied_to(
@@ -4834,6 +4815,36 @@ impl StepCtx<'_> {
         .await?;
         Ok(())
     }
+}
+
+/// What a forming model may answer with.
+///
+/// A free function so a test can hold it to the rule the drivers apply: an
+/// untyped subschema is valid JSON Schema and is refused by constrained
+/// decoding, so a schema built inline here is one nothing checks.
+fn formation_schema(max_items: usize) -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "memories": {
+                "type": "array",
+                "maxItems": max_items,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string", "minLength": 1},
+                        // A memory is a durable fact stated plainly, so the
+                        // permissive spelling was never buying what it cost.
+                        "content": {"type": "string"}
+                    },
+                    "required": ["key", "content"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["memories"],
+        "additionalProperties": false
+    })
 }
 
 /// Durable waits.
@@ -5310,6 +5321,21 @@ pub(crate) fn merge_identity(
 mod tests {
     use super::*;
     use rand::{Rng as _, RngExt as _};
+
+    /// Memory formation has to be askable of a real provider.
+    ///
+    /// It was not: `"content": {}` is valid JSON Schema, and constrained
+    /// decoding refuses an untyped subschema — so every run declaring
+    /// `spec.memory.formation` failed at the forming call against `OpenAI`,
+    /// while every test against `FakeProvider` passed.
+    #[test]
+    #[cfg(feature = "providers")]
+    fn the_formation_schema_survives_constrained_decoding() {
+        assert_eq!(
+            crate::model::strict_schema_problem(&formation_schema(3)),
+            None
+        );
+    }
 
     /// The entropy stream is a durable contract, and this is the only test that
     /// can tell when it breaks.

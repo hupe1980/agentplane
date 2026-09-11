@@ -228,6 +228,41 @@ impl Debug for ToolBox {
     }
 }
 
+/// Say `additionalProperties: false` on every object the generator left open.
+///
+/// Constrained decoding needs it, and a driver handed an open object drops
+/// silently to unconstrained generation — which makes a tool's arguments a
+/// suggestion rather than the constraint this crate says a schema is, with
+/// nothing failing to say so.
+///
+/// Applied rather than refused because this schema is *generated*, not
+/// authored: there is no author to send it back to, and the closed form is what
+/// the body already enforces — `serde` hands the tool its declared fields and
+/// no others.
+///
+/// `required` is left alone: a type with an `Option` field has a genuinely
+/// optional property, strict mode has no such thing, and forcing it in would
+/// make the field impossible to omit. Such a tool keeps falling back, which is
+/// the honest outcome.
+fn close_objects(node: &mut Value) {
+    if node.get("type") == Some(&serde_json::json!("object"))
+        && let Some(map) = node.as_object_mut()
+    {
+        map.entry("additionalProperties")
+            .or_insert_with(|| serde_json::json!(false));
+    }
+    for key in ["properties", "$defs", "definitions"] {
+        if let Some(children) = node.get_mut(key).and_then(Value::as_object_mut) {
+            for child in children.values_mut() {
+                close_objects(child);
+            }
+        }
+    }
+    if let Some(items) = node.get_mut("items") {
+        close_objects(items);
+    }
+}
+
 impl ToolBox {
     #[must_use]
     pub fn new() -> Self {
@@ -240,8 +275,9 @@ impl ToolBox {
     /// and the arguments the body receives are the same declaration.
     #[must_use]
     pub fn with<T: Tool>(mut self) -> Self {
-        let schema = serde_json::to_value(schemars::schema_for!(T))
+        let mut schema = serde_json::to_value(schemars::schema_for!(T))
             .expect("a schemars-generated schema must serialize to JSON");
+        close_objects(&mut schema);
         // Keep the type's description for inspection and for deployments with
         // no manifest presentation. A declarative agent deliberately uses the
         // manifest's description instead: it is model-steering text, so a
@@ -487,6 +523,28 @@ mod tests {
                 self.account
             )))
         }
+    }
+
+    /// The schema a typed tool advertises must be one a model can be *held* to.
+    ///
+    /// A tool declaration outside the strict-decoding subset is not refused —
+    /// the drivers quietly drop to unconstrained generation — so a schemars
+    /// default that omitted `additionalProperties: false` would turn every
+    /// typed tool's arguments from a constraint into a suggestion, which is
+    /// exactly what this crate says a schema is not. Nothing would fail; the
+    /// guarantee would just be gone.
+    #[test]
+    #[cfg(feature = "providers")]
+    fn a_typed_tools_schema_can_constrain_generation() {
+        let box_ = ToolBox::new().with::<Refuses>();
+        let (_, schema, _) = box_
+            .declared(&ToolId::new("ledger", "read"))
+            .expect("the tool was registered");
+        assert_eq!(
+            crate::model::strict_schema_problem(schema),
+            None,
+            "schema: {schema}"
+        );
     }
 
     /// Each failure keeps its disposition, and gains the right identity.

@@ -1650,6 +1650,80 @@ fn an_output_schema_that_permits_anything_is_refused() {
     );
 }
 
+/// An open object schema is refused for the same reason `{}` is.
+///
+/// `additionalProperties` defaults to *anything else is also allowed*, so an
+/// open object is the vacuous schema one level down: it looks answered in
+/// review and lets the model answer with fields nobody declared. It is also the
+/// rule with teeth at dispatch — constrained decoding cannot bind a schema that
+/// permits them, so a driver either refuses the call or generates without
+/// constraint, and the declaration a reviewer approved stops holding exactly
+/// when it is supposed to.
+///
+/// Refused rather than closed on the author's behalf: a manifest is
+/// digest-covered, and rewriting it would make the file a reviewer signed and
+/// the shape that runs two different documents.
+#[test]
+fn an_object_schema_a_model_may_add_to_is_refused() {
+    let declarative = |schema: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: auditor, version: "2.0.0" }}
+spec:
+  capabilities: {{ provides: [audit.check] }}
+  identity: {{ role: "Audit a record" }}
+  models:
+    privileged: {{ provider: fake, model: m-1 }}
+  execution: {{ kind: completion }}
+  output:
+    schema:
+{schema}
+  budgets: {{}}
+"#
+        )
+    };
+
+    let open = declarative(
+        "      type: object\n      required: [finding]\n      \
+         properties: { finding: { type: string } }",
+    );
+    let refusal = Manifest::parse(&open).expect_err("an open result contract was accepted");
+    assert!(
+        refusal.to_string().contains("additionalProperties"),
+        "the refusal does not say what to write: {refusal}"
+    );
+
+    let closed = declarative(
+        "      type: object\n      additionalProperties: false\n      required: [finding]\n      \
+         properties: { finding: { type: string } }",
+    );
+    Manifest::parse(&closed).expect("a closed result contract parses");
+
+    // Nested too: an object inside a closed one is still an object a model
+    // fills in, and the refusal names which.
+    let nested = declarative(
+        "      type: object\n      additionalProperties: false\n      required: [line]\n      \
+         properties:\n        line:\n          type: object\n          required: [sku]\n          \
+         properties: { sku: { type: string } }",
+    );
+    let refusal = Manifest::parse(&nested).expect_err("an open nested object was accepted");
+    assert!(
+        refusal.to_string().contains("spec.output.schema.line"),
+        "the refusal does not name which object is open: {refusal}"
+    );
+
+    // And a coded agent is left alone: the rule is about what a *model* is held
+    // to, and nothing generates against a schema the runtime applies itself.
+    let coded = nested
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("execution:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Manifest::parse(&coded).expect("a coded agent's schemas are its own business");
+}
+
 // ── The models ──────────────────────────────────────────────────────────────
 
 /// Swapping a model changes the manifest's identity.
@@ -2009,7 +2083,7 @@ async fn the_manifest_egress_ceiling_binds_every_sink() {
     .await;
     match out.status {
         agentplane::runtime::RunStatus::Failed(reason) => assert!(
-            reason.contains("Confidential") && reason.contains("Internal"),
+            reason.contains("confidential") && reason.contains("internal"),
             "wrong refusal: {reason}"
         ),
         other => panic!("a confidential value crossed an internal manifest ceiling: {other:?}"),
@@ -2308,6 +2382,7 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [summary]
       properties:
         summary: { type: string }
@@ -2929,6 +3004,30 @@ fn a_reviewed_tool_grant_can_only_tighten() {
     );
 }
 
+/// A `tool-calling` agent granting one read-only tool.
+const TELLER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  capabilities:
+    provides: [ledger.ask]
+  models:
+    privileged: { provider: fake, model: declared-1 }
+  tools:
+    - ref: tool://ledger/read
+      mutates: false
+      description: Read a ledger account's balance.
+      arguments:
+        type: object
+        additionalProperties: false
+        properties:
+          id: { type: string }
+        required: [id]
+  execution: { kind: tool-calling, max_turns: 4 }
+  budgets: {}
+"#;
+
 /// A `tool-calling` agent runs the loop, and every call is governed.
 ///
 /// The whole point: the model picks the tool and the arguments, and neither
@@ -2966,29 +3065,7 @@ async fn a_tool_calling_agent_loops_until_it_answers() {
         }
     }
 
-    const YAML: &str = r#"
-apiVersion: agentplane.hupe1980.github.io/v1alpha1
-kind: Agent
-metadata: { name: teller, version: "1.0.0" }
-spec:
-  capabilities:
-    provides: [ledger.ask]
-  models:
-    privileged: { provider: fake, model: declared-1 }
-  tools:
-    - ref: tool://ledger/read
-      mutates: false
-      description: Read a ledger account's balance.
-      arguments:
-        type: object
-        properties:
-          id: { type: string }
-        required: [id]
-  execution: { kind: tool-calling, max_turns: 4 }
-  budgets: {}
-"#;
-
-    let mut m = Manifest::parse(YAML).expect("parse");
+    let mut m = Manifest::parse(TELLER).expect("parse");
     m.spec.security.max_sensitivity_egress = Some(agentplane::core::Sensitivity::Internal);
     let provider = agentplane::testkit::FakeProvider::new();
     // Turn 1: malformed proposal, refused locally. Turn 2: corrected call.
@@ -3106,7 +3183,7 @@ spec:
     - ref: tool://vault/read
       mutates: false
       description: Read a value.
-      arguments: { type: object }
+      arguments: { type: object, additionalProperties: false }
   execution: { kind: tool-calling, max_turns: 3 }
   security: { max_sensitivity_egress: internal }
   budgets: {}
@@ -4616,6 +4693,7 @@ spec:
       description: Read a ledger account's balance.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           id: { type: string }
         required: [id]
@@ -5381,6 +5459,7 @@ spec:
       description: Ask the researcher to summarise a topic.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           topic: { type: string }
         required: [topic]
@@ -5719,6 +5798,7 @@ spec:
       description: 'Read a ticket by id'
       arguments:
         type: object
+        additionalProperties: false
         required: [id]
         properties: { id: { type: string } }
   budgets: { max_tokens: 1000 }

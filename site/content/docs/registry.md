@@ -47,7 +47,11 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [finding, severity]
+      properties:
+        finding: { type: string }
+        severity: { type: string }
   tools:
     - ref: "tool://validator/apply_correction"
       mutates: true

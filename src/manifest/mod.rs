@@ -1531,6 +1531,7 @@ impl Manifest {
         self.validate_topology()?;
         self.validate_models()?;
         self.validate_output()?;
+        self.validate_declared_schemas()?;
         self.validate_memory()?;
         let mut tool_ids = std::collections::BTreeSet::new();
         for grant in &self.spec.tools {
@@ -2577,6 +2578,75 @@ impl Manifest {
             return Err(ManifestError::Syntax(
                 "memory formation retention windows must be greater than zero".to_owned(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Refuse an object schema that lets the model add fields nobody declared.
+    ///
+    /// The rule `schema: {}` is refused under, one level down. JSON Schema
+    /// defaults `additionalProperties` to *anything else is also allowed*,
+    /// which is never what a result contract or a tool's arguments mean, and it
+    /// is the one rule with teeth at dispatch: a driver handed an open object
+    /// either refuses the call or generates without constraint, so the schema a
+    /// reviewer approved stops binding anything.
+    ///
+    /// Refused rather than closed on the author's behalf. A manifest is
+    /// digest-covered, and rewriting it would mean the file a reviewer signed
+    /// and the shape that runs are two different documents.
+    ///
+    /// Deliberately narrow: this is *not* the whole strict-decoding subset.
+    /// Optionality and unions are spelled differently by different providers,
+    /// and refusing a manifest that runs perfectly well on Gemini would be this
+    /// crate inventing a restriction one vendor has.
+    fn refuse_open_objects(schema: &serde_json::Value, at: &str) -> Result<(), ManifestError> {
+        let is_object = match schema.get("type") {
+            Some(serde_json::Value::String(name)) => name == "object",
+            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "object"),
+            _ => false,
+        };
+        if is_object && schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+        {
+            return Err(ManifestError::Syntax(format!(
+                "{at} declares an object without `additionalProperties: false`, so the \
+                 model may answer with fields nobody declared — and constrained decoding \
+                 cannot bind a schema that permits them, which leaves the declaration \
+                 advisory at exactly the moment it is supposed to hold. Close it"
+            )));
+        }
+        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
+            for (name, nested) in properties {
+                Self::refuse_open_objects(nested, &format!("{at}.{name}"))?;
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            Self::refuse_open_objects(items, &format!("{at}[]"))?;
+        }
+        Ok(())
+    }
+
+    /// Every schema a **model** is held to is one that can still hold.
+    ///
+    /// Scoped to declarative agents, which is where the rule has meaning: a
+    /// coded agent's schemas are validation contracts the runtime applies
+    /// itself, and nothing generates against them. The moment an `execution`
+    /// block exists, both of these are sent to a provider — the result shape on
+    /// every turn, a tool's arguments as the declaration the model chooses
+    /// from — and an open object stops binding either.
+    fn validate_declared_schemas(&self) -> Result<(), ManifestError> {
+        if self.spec.execution.is_none() {
+            return Ok(());
+        }
+        if let Some(output) = &self.spec.output {
+            Self::refuse_open_objects(&output.schema, "spec.output.schema")?;
+        }
+        for grant in &self.spec.tools {
+            if let Some(arguments) = &grant.arguments {
+                Self::refuse_open_objects(
+                    arguments,
+                    &format!("spec.tools['{}'].arguments", grant.reference),
+                )?;
+            }
         }
         Ok(())
     }

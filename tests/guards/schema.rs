@@ -80,6 +80,7 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       properties:
         severity: { type: string }
   memory:

@@ -844,7 +844,12 @@ impl Declarative {
                             "plan step {index}: '{name}' has no model-facing declaration"
                         )));
                     };
-                    let args = step.args.clone().unwrap_or_default();
+                    let args = match step_arguments(step.args.as_ref()) {
+                        Ok(args) => args,
+                        Err(why) => {
+                            return Ok(Outcome::fail(format!("plan step {index}: {why}")));
+                        }
+                    };
                     let mut assembled = match assemble_arguments(
                         &Value::Object(args),
                         &plan_label,
@@ -941,12 +946,15 @@ impl Declarative {
                     // nothing executes. Refused for the same reason the
                     // manifest refuses `routed`: what is accepted must be
                     // what runs.
-                    if step.args.is_some() {
-                        return Ok(Outcome::fail(format!(
-                            "plan step {index} is a parse and carries `args` — a parse takes \
-                             `from` and `schema`, and arguments nothing executes would be \
-                             accepted prose"
-                        )));
+                    match step_arguments(step.args.as_ref()) {
+                        Ok(args) if args.is_empty() => {}
+                        _ => {
+                            return Ok(Outcome::fail(format!(
+                                "plan step {index} is a parse and carries `args` — a parse \
+                                 takes `from` and `schema`, and arguments nothing executes \
+                                 would be accepted prose"
+                            )));
+                        }
                     }
                     let source = match resolve_reference(&parse.from, &input, &outputs) {
                         Ok(source) => source,
@@ -954,9 +962,11 @@ impl Declarative {
                             return Ok(Outcome::fail(format!("plan step {index}: {why}")));
                         }
                     };
-                    let Some(schema) = bounded_parse_schema(&parse.schema) else {
+                    let declared = serde_json::from_str::<Value>(&parse.schema);
+                    let Some(schema) = declared.ok().as_ref().and_then(bounded_parse_schema) else {
                         return Ok(Outcome::fail(format!(
-                            "plan step {index}: a parse schema must be an object schema"
+                            "plan step {index}: a parse schema must be JSON text describing an \
+                             object schema"
                         )));
                     };
                     // The whole role, ceilings included. A parse is the one
@@ -1456,11 +1466,22 @@ const PARSE_INSTRUCTION: &str = "Extract the requested fields from the source. R
 /// text — so the instruction slot stays exactly the reviewed identity, and the
 /// format is versioned in code where changing it is a diff. The step bound is
 /// the manifest's `max_turns`, the same ceiling the loop spends per turn.
+///
+/// # Why `args` and a parse schema travel as text
+///
+/// Constrained decoding accepts a *subset* of JSON Schema in which every object
+/// enumerates its properties, so a free-form `args` cannot be expressed at all
+/// and a schema carrying one is refused before it is sent. The two open-ended
+/// fields are therefore JSON **text**, parsed strictly on arrival; every other
+/// field stays typed. `CaMeL`'s own reference implementation makes the same
+/// trade, with the plan as Python source.
 fn plan_schema(max_steps: u32) -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["steps"],
+        // Strict mode has no optional properties: absence is spelled as an
+        // explicit null in a union type, and every key is required.
+        "required": ["steps", "answer"],
         "properties": {
             "steps": {
                 "type": "array",
@@ -1469,23 +1490,27 @@ fn plan_schema(max_steps: u32) -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
+                    "required": ["tool", "args", "parse"],
                     "properties": {
                         "tool": {
-                            "type": "string",
-                            "description": "a granted tool to call, named exactly as offered"
+                            "type": ["string", "null"],
+                            "description": "a granted tool to call, named exactly as \
+                                 offered; null on a parse step"
                         },
                         "args": {
-                            "type": "object",
-                            "description": "the tool's arguments. A string beginning with '$' \
-                                 is a reference to earlier data, not a literal: '$input' is \
-                                 the run's input and '$step0' is the first step's output, \
-                                 and a JSON Pointer may follow the head, e.g. \
-                                 '$step1/customer/email'. Escape a literal leading '$' as \
-                                 '$$'. Prefer references over copying values: a reference \
-                                 carries the data's provenance, a copy does not"
+                            "type": ["string", "null"],
+                            "description": "the tool's arguments as a JSON object, \
+                                 written as text, e.g. {\"id\": \"$input/customer\"}. \
+                                 A string beginning with '$' is a reference to earlier \
+                                 data, not a literal: '$input' is the run's input and \
+                                 '$step0' is the first step's output, and a JSON Pointer \
+                                 may follow the head, e.g. '$step1/customer/email'. \
+                                 Escape a literal leading '$' as '$$'. Prefer references \
+                                 over copying values: a reference carries the data's \
+                                 provenance, a copy does not. Null on a parse step"
                         },
                         "parse": {
-                            "type": "object",
+                            "type": ["object", "null"],
                             "additionalProperties": false,
                             "required": ["from", "schema"],
                             "properties": {
@@ -1495,21 +1520,23 @@ fn plan_schema(max_steps: u32) -> Value {
                                          e.g. '$step0/body'"
                                 },
                                 "schema": {
-                                    "type": "object",
-                                    "description": "a JSON Schema with type 'object' naming \
-                                         the fields to extract"
+                                    "type": "string",
+                                    "description": "a JSON Schema of type 'object' naming \
+                                         the fields to extract, written as text, e.g. \
+                                         {\"type\": \"object\", \"properties\": \
+                                         {\"order\": {\"type\": \"string\"}}}"
                                 }
                             },
                             "description": "extract structured fields from a prior output \
-                                 instead of calling a tool"
+                                 instead of calling a tool; null on a tool step"
                         }
                     }
                 }
             },
             "answer": {
-                "type": "string",
+                "type": ["string", "null"],
                 "description": "reference selecting the run's answer, e.g. '$step1/summary'; \
-                     omitted means the last step's output"
+                     null means the last step's output"
             }
         }
     })
@@ -1533,8 +1560,10 @@ struct PlanDoc {
 struct PlanStep {
     #[serde(default)]
     tool: Option<String>,
+    /// JSON text, not a map — see [`plan_schema`] for why the open-ended
+    /// fields are text.
     #[serde(default)]
-    args: Option<serde_json::Map<String, Value>>,
+    args: Option<String>,
     #[serde(default)]
     parse: Option<ParseStep>,
 }
@@ -1543,7 +1572,24 @@ struct PlanStep {
 #[serde(deny_unknown_fields)]
 struct ParseStep {
     from: String,
-    schema: Value,
+    /// JSON text, as `args` is.
+    schema: String,
+}
+
+/// A step's `args` as an object, or why it is not one.
+///
+/// Empty for a step that carries none: a planner answering a required field it
+/// has no use for writes `null` or `{}`, and treating those as *present*
+/// arguments would fail a parse step over punctuation.
+fn step_arguments(args: Option<&String>) -> Result<serde_json::Map<String, Value>, String> {
+    let Some(text) = args else {
+        return Ok(serde_json::Map::new());
+    };
+    match serde_json::from_str::<Value>(text) {
+        Ok(Value::Object(map)) => Ok(map),
+        Ok(_) => Err("`args` is JSON, but not a JSON object".to_owned()),
+        Err(e) => Err(format!("`args` is not JSON: {e}")),
+    }
 }
 
 /// Resolve a `$input` / `$stepN` reference, labels intact.
@@ -1630,6 +1676,12 @@ fn assemble_arguments(
 /// not a parse. Mirrors `CaMeL`'s reference implementation, which injects the
 /// same field with `create_model` for the same reason: a model short of
 /// information that answers anyway produces wrong data nothing can detect.
+///
+/// Closed and required all the way down, which is the same rule and also what
+/// constrained decoding demands: a planner writing `{"order": {"type":
+/// "string"}}` means *give me the order*, and absence is what the escape bit is
+/// for. Normalised rather than refused because this is the value that goes into
+/// the call, so the corrected shape and the request bytes stay identical.
 fn bounded_parse_schema(declared: &Value) -> Option<Value> {
     if declared.get("type") != Some(&json!("object")) {
         return None;
@@ -1649,12 +1701,31 @@ fn bounded_parse_schema(declared: &Value) -> Option<Value> {
                  rather than inventing any value."
         }),
     );
-    let required = map.entry("required").or_insert_with(|| json!([]));
-    let required = required.as_array_mut()?;
-    if !required.contains(&json!("have_enough_information")) {
-        required.push(json!("have_enough_information"));
-    }
+    close(&mut schema);
     Some(schema)
+}
+
+/// Close an object schema and require every property it names, recursively.
+fn close(node: &mut Value) {
+    if let Some(list) = node.get_mut("properties").and_then(Value::as_object_mut) {
+        let names: Vec<Value> = list.keys().map(|k| json!(k)).collect();
+        for nested in list.values_mut() {
+            close(nested);
+        }
+        let is_object = match node.get("type") {
+            Some(Value::String(name)) => name == "object",
+            Some(Value::Array(names)) => names.iter().any(|n| n == "object"),
+            _ => false,
+        };
+        if is_object {
+            let map = node.as_object_mut().expect("an object schema is an object");
+            map.insert("additionalProperties".to_owned(), json!(false));
+            map.insert("required".to_owned(), Value::Array(names));
+        }
+    }
+    if let Some(items) = node.get_mut("items") {
+        close(items);
+    }
 }
 
 /// The object a declarative agent's model call is given.
@@ -1903,5 +1974,54 @@ fn model_facing(e: &crate::core::StepError) -> Option<String> {
             Some(inner.to_string())
         }
         _ => None,
+    }
+}
+
+#[cfg(all(test, feature = "providers"))]
+mod tests {
+    use super::*;
+
+    /// A plan format outside the strict-decoding subset makes `planned`
+    /// unusable against the provider most people have: the driver refuses the
+    /// schema before it is sent, so the crate's `CaMeL` implementation runs
+    /// only against fakes. It did, until this test.
+    #[test]
+    fn the_plan_format_survives_constrained_decoding() {
+        assert_eq!(
+            crate::model::wire::strict_schema_problem(&plan_schema(4)),
+            None
+        );
+    }
+
+    /// The planner writes the parse schema, so it is not a reviewed artefact —
+    /// `bounded_parse_schema` has to hand the driver something usable however
+    /// loosely it was written.
+    #[test]
+    fn a_loosely_written_parse_schema_is_closed_rather_than_refused() {
+        let loose = json!({
+            "type": "object",
+            "properties": {
+                "order": { "type": "string" },
+                "line": {
+                    "type": "object",
+                    "properties": { "sku": { "type": "string" } }
+                }
+            }
+        });
+        let bounded = bounded_parse_schema(&loose).expect("an object schema is bounded");
+        assert_eq!(crate::model::wire::strict_schema_problem(&bounded), None);
+        let mut required: Vec<&str> = bounded["required"]
+            .as_array()
+            .expect("required is a list")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        required.sort_unstable();
+        assert_eq!(
+            required,
+            ["have_enough_information", "line", "order"],
+            "a field the planner named must be answered — absence is what the \
+             escape bit is for, not an omitted key"
+        );
     }
 }

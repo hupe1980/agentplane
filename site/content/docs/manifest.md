@@ -77,7 +77,11 @@ spec:
       max_sensitivity: internal
       description: "Read a support ticket."
   output:
-    schema: { type: object, required: [severity], properties: { severity: { type: string } } }
+    schema:
+      type: object
+      additionalProperties: false
+      required: [severity]
+      properties: { severity: { type: string } }
   oversight:
     approval: required
     deadline: { name: refund-review, kind: working-days, params: { n: 1 } }
@@ -200,7 +204,8 @@ the settled answer is validated against the schema before it is returned. An age
 **`planned`** — plan first, then execute without the model. One privileged
 call reads the run's input — which **must be trusted**, refused otherwise —
 and answers with a plan in a bounded schema: which granted tools to call, in
-what order, with which arguments. The runtime validates every step against
+what order, with which arguments — as JSON text, since constrained decoding has
+no free-form object. The runtime validates every step against
 the grants and executes the plan itself. Step outputs travel as **references**
 (`$step0/customer/email`, `$input/payee`), resolved with labels intact and
 never read by a model — so a hostile tool output cannot steer later steps,
@@ -594,6 +599,22 @@ because two artifacts stating one decision must agree.
 |---|---|
 | `schema` | JSON Schema, digest-covered. Handed to `ModelCall::expecting`, so it enters the effect key — editing it makes a replay report divergence rather than reinterpreting a stored answer. `schema: {}` is refused: it permits anything while looking answered. |
 
+**Every object needs `additionalProperties: false`** — here and in a
+declarative agent's `spec.tools[].arguments`, refused at parse rather than
+closed for you, because this file is digest-covered and a rewrite would make
+the document a reviewer signed and the shape that runs two different things.
+Open is `schema: {}` one level down, and it is the rule with teeth at dispatch:
+a driver handed an open object either refuses the call or generates without
+constraint. A **coded** agent is exempt — nothing generates against its
+schemas.
+
+The rest of the constrained-decoding subset is not checked here, because
+providers spell it differently, but the OpenAI driver refuses the call before
+sending if it is missed: every property in `required`, every array with `items`,
+optionality as `type: [string, null]`, no `oneOf`, `allOf` or `default`, and a
+`type` on every subschema. `agentplane::model::strict_schema_problem` answers
+for one schema, naming the rule it breaks.
+
 ## `spec.oversight`
 
 Only meaningful beside `execution`. Declared next to a *coded* agent it is
@@ -766,8 +787,9 @@ declared `privileged` model.
 | `access_retention_seconds` | none | Sliding expiry, refreshed by an explicit journaled touch. |
 | `max_sensitivity` | `public` | Ceiling on what the forming model may be shown. |
 
-The model proposes bounded key/content pairs; the **runtime** derives ids, taint,
-provenance and retention. Trust is never taken from what the content says.
+The model proposes bounded key/content pairs, both strings; the **runtime**
+derives ids, taint, provenance and retention. Trust is never taken from what
+the content says.
 
 ### Binding the subject to the party a run is about
 

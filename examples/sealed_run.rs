@@ -77,10 +77,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("the case exists");
 
     // ── 2. Readable through the plane, sealed underneath ────────────────────
+    // Ciphertext is the whole point and a page of base64 is not: the first
+    // line of it makes the same point the whole blob does, and leaves the
+    // three findings below readable.
+    let opaque = |value: &serde_json::Value| {
+        let rendered = value.to_string();
+        match rendered.char_indices().nth(64) {
+            Some((cut, _)) => format!("{}… ({} bytes)", &rendered[..cut], rendered.len()),
+            None => rendered,
+        }
+    };
     let stored = raw.case(case).await?.expect("stored");
     println!(
         "2. in the store   → {} (sealed: {})",
-        stored.state,
+        opaque(&stored.state),
         payload::is_sealed(&stored.state)
     );
     let records = raw.read(out.run_id, 1).await?;
@@ -92,7 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .expect("the run was admitted");
     println!(
-        "   journal input  → {journalled} (sealed: {})",
+        "   journal input  → {} (sealed: {})",
+        opaque(&journalled),
         payload::is_sealed(&journalled)
     );
     println!(

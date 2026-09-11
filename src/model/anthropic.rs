@@ -451,16 +451,18 @@ fn messages(prompt: &Value) -> Value {
     match prompt {
         Value::String(s) => json!([{ "role": "user", "content": s }]),
         Value::Array(_) => prompt.clone(),
-        other => other.get("messages").cloned().unwrap_or_else(|| {
-            // An object with no `messages` is content, not an envelope — except
-            // for `system`, which is an instruction *about* the content and
-            // would otherwise be shown to the model as part of the question.
-            let mut rest = other.clone();
-            if let Some(map) = rest.as_object_mut() {
-                map.remove("system");
-            }
-            json!([{ "role": "user", "content": rest.to_string() }])
-        }),
+        other => crate::model::prompt_envelope(other, "messages")
+            .cloned()
+            .unwrap_or_else(|| {
+                // An object with no `messages` is content, not an envelope — except
+                // for `system`, which is an instruction *about* the content and
+                // would otherwise be shown to the model as part of the question.
+                let mut rest = other.clone();
+                if let Some(map) = rest.as_object_mut() {
+                    map.remove("system");
+                }
+                json!([{ "role": "user", "content": rest.to_string() }])
+            }),
     }
 }
 

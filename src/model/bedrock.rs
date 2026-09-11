@@ -508,9 +508,9 @@ impl Bedrock {
         exchanges: &[ToolExchange],
         continuation: Option<&ProviderContinuation>,
     ) -> Result<Vec<Message>, ModelError> {
-        let source = prompt
-            .get("messages")
-            .unwrap_or_else(|| prompt.get("input").unwrap_or(prompt));
+        let source = crate::model::prompt_envelope(prompt, "messages")
+            .or_else(|| crate::model::prompt_envelope(prompt, "input"))
+            .unwrap_or(prompt);
         let mut messages = match source {
             Value::Array(items) => items
                 .iter()

@@ -926,7 +926,7 @@ fn a_model_is_told_the_same_thing_whatever_the_reason() {
     // And the operator-facing form must still say everything.
     let detailed = denials[2].to_string();
     assert!(
-        detailed.contains("Secret") && detailed.contains("email"),
+        detailed.contains("secret") && detailed.contains("email"),
         "the journal keeps the detail an auditor needs: {detailed}"
     );
     assert!(

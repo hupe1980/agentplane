@@ -267,8 +267,8 @@ pub enum AuthorityError {
     /// Reports the whole arithmetic rather than a bare refusal: an operator
     /// reconciling this needs to know what was asked against what was left.
     #[error(
-        "standing authority '{authority}' has {remaining:?} left and the draw asked \
-         for {asked:?} — this does not replenish; issue another authority if more \
+        "standing authority '{authority}' has {remaining} left and the draw asked \
+         for {asked} — this does not replenish; issue another authority if more \
          was intended"
     )]
     Exhausted {

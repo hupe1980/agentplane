@@ -96,6 +96,10 @@ cargo run --example planned_run --features redb,fake-model,manifest
                                         # plan once, execute without the model —
                                         # a prompt injection with no reader, and
                                         # an invented recipient refused
+cargo run --example camel_live --features redb,providers,manifest
+                                        # the same, against two real models: a
+                                        # privileged planner and a quarantined
+                                        # extractor (env-gated)
 cargo run --example sealed_run --features redb,testkit,keyring
                                         # erase a case: every copy unreadable,
                                         # and the chain still verifies
@@ -360,13 +364,16 @@ crate's own client, which proves symmetry, not conformance — a client and
 server written from the same misreading agree everywhere. The kit's first run
 found five defects no in-repo test could reach.
 
-**🌐 Tests against a real provider.** `just test-live` runs the OpenAI and
-Gemini drivers against the actual APIs. They are gated twice — an explicit `AGENTPLANE_LIVE=1`
+**🌐 Tests against a real provider.** `just test-live` runs the OpenAI, Gemini
+and `OpenAI`-compatible drivers, plus the embedding wire, against the actual
+APIs. They are gated twice — an explicit `AGENTPLANE_LIVE=1`
 *and* a key — because a credential being available is not a decision to spend
 money with it, and they are never part of `ci`. They exist because a stubbed
 provider is structurally unable to have the defects a real one finds: it never
 rejects a malformed request and never returns a shape the driver mis-reads.
-Writing them found two, both of which every offline test had passed. The Gemini
+What they catch had passed every offline test — including a plan format no
+provider with constrained decoding accepts, which left the dual-model execution
+kind unable to run for real at all. The Gemini
 battery is the sharpest case: a **thought signature** is minted and validated by
 Google, so a canned server accepts whatever a fixture tells it to and says
 nothing about whether Gemini takes the signature back — the one check that

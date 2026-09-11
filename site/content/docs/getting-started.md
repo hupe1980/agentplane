@@ -101,6 +101,7 @@ spec:
   output:
     schema:
       type: object
+      additionalProperties: false
       required: [summary]
       properties: { summary: { type: string } }
   budgets: { max_tokens: 10000 }
@@ -613,6 +614,11 @@ Pick the example for the question you have; none needs credentials or network:
 | What does another organisation's agent see when it calls this one? | `a2a_peer` |
 | How does an agent call another *plane's* agent, and whose chain does the peer see? | `peer_call` |
 | How do live tokens coexist with a journal that must replay exactly? | `streaming_run` |
+
+The one exception is `camel_live`, which needs an `OPENAI_API_KEY` and spends
+real money: it runs `planned_run`'s shape against a privileged and a
+quarantined model, and checks at the wire which of them was shown the attack.
+`just camel-live` runs it from `.env`.
 
 | | |
 |---|---|

@@ -286,6 +286,12 @@ required-features = ["cli"]
 name              = "openai_live"
 required-features = ["redb", "providers"]
 
+# The dual-model (CaMeL) shape against real models, so what each role is allowed
+# to read is checked at the wire rather than against a fake that cannot disagree.
+[[example]]
+name              = "camel_live"
+required-features = ["redb", "providers", "manifest"]
+
 [[example]]
 name              = "bedrock_live"
 required-features = ["bedrock"]

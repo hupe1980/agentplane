@@ -71,6 +71,24 @@ fn plan(value: Value) -> agentplane::model::Completion {
     }
 }
 
+/// A tool step as it travels.
+///
+/// `args` is JSON **text** on the wire: constrained decoding has no free-form
+/// object, so a plan that carried one could not be asked for from a real
+/// provider at all. The encoding lives here rather than at every call site.
+fn call(tool: &str, args: &Value) -> Value {
+    json!({ "tool": tool, "args": args.to_string(), "parse": null })
+}
+
+/// A parse step as it travels, its schema text for the same reason.
+fn extract(from: &str, schema: &Value) -> Value {
+    json!({
+        "tool": null,
+        "args": null,
+        "parse": { "from": from, "schema": schema.to_string() }
+    })
+}
+
 const PLANNED: &str = r#"
 apiVersion: agentplane.hupe1980.github.io/v1alpha1
 kind: Agent
@@ -87,6 +105,7 @@ spec:
       description: Look up a customer record.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           id: { type: string }
         required: [id]
@@ -95,6 +114,7 @@ spec:
       description: Send a message.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           to: { type: string }
         required: [to]
@@ -165,8 +185,8 @@ async fn a_planned_agent_routes_data_by_reference_not_through_a_model() {
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
         "steps": [
-            { "tool": "crm__lookup", "args": { "id": "$input/customer" } },
-            { "tool": "mail__send", "args": { "to": "$step0/email" } }
+            call("crm__lookup", &json!({ "id": "$input/customer" })),
+            call("mail__send", &json!({ "to": "$step0/email" }))
         ],
         "answer": "$step0/email"
     })));
@@ -255,7 +275,8 @@ async fn a_plan_naming_an_ungranted_tool_fails_before_any_dispatch() {
     let manifest = Manifest::parse(PLANNED).expect("parse");
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
-        "steps": [{ "tool": "vault__open", "args": {} }]
+        "steps": [call("vault__open", &json!({}))],
+        "answer": null
     })));
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, read_only_catalog(), &client);
@@ -292,6 +313,7 @@ spec:
       description: Look up a customer record.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           id: { type: string }
         required: [id]
@@ -313,7 +335,8 @@ async fn a_plan_naming_the_dotted_spelling_is_told_the_wire_name() {
     let manifest = Manifest::parse(DOTTED).expect("parse");
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
-        "steps": [{ "tool": "crm__account.lookup", "args": {} }]
+        "steps": [call("crm__account.lookup", &json!({}))],
+        "answer": null
     })));
     let client = Arc::new(Recorder::default());
     let catalog = Arc::new(ToolCatalog::new().allow(
@@ -349,7 +372,8 @@ async fn a_plan_naming_nothing_at_all_gets_no_spelling_hint() {
     let manifest = Manifest::parse(DOTTED).expect("parse");
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
-        "steps": [{ "tool": "vault__open", "args": {} }]
+        "steps": [call("vault__open", &json!({}))],
+        "answer": null
     })));
     let client = Arc::new(Recorder::default());
     let catalog = Arc::new(ToolCatalog::new().allow(
@@ -393,6 +417,7 @@ spec:
       description: Pay a recipient.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           recipient: { type: string }
           memo: { type: string }
@@ -420,8 +445,11 @@ async fn a_reference_keeps_provenance_a_literal_does_not() {
     // Bound: /recipient comes from the run's trusted input, by reference.
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
-        "steps": [{ "tool": "ledger__pay",
-                     "args": { "recipient": "$input/payee", "memo": "invoice 7" } }]
+        "steps": [call(
+            "ledger__pay",
+            &json!({ "recipient": "$input/payee", "memo": "invoice 7" })
+        )],
+        "answer": null
     })));
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, Arc::clone(&catalog), &client);
@@ -443,8 +471,11 @@ async fn a_reference_keeps_provenance_a_literal_does_not() {
     // model output, and model output does not pay a protected field's bill.
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
-        "steps": [{ "tool": "ledger__pay",
-                     "args": { "recipient": "eve@evil.example", "memo": "invoice 7" } }]
+        "steps": [call(
+            "ledger__pay",
+            &json!({ "recipient": "eve@evil.example", "memo": "invoice 7" })
+        )],
+        "answer": null
     })));
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, catalog, &client);
@@ -483,6 +514,7 @@ spec:
       description: Fetch a page.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           url: { type: string }
         required: [url]
@@ -493,15 +525,15 @@ spec:
 fn parsing_plan() -> Value {
     json!({
         "steps": [
-            { "tool": "web__fetch", "args": { "url": "$input/url" } },
-            { "parse": {
-                "from": "$step0/body",
-                "schema": {
+            call("web__fetch", &json!({ "url": "$input/url" })),
+            extract(
+                "$step0/body",
+                &json!({
                     "type": "object",
                     "properties": { "email": { "type": "string" } },
                     "required": ["email"]
-                }
-            } }
+                })
+            )
         ],
         "answer": "$step1/email"
     })
@@ -585,6 +617,7 @@ spec:
       description: Fetch a page.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           url: { type: string }
         required: [url]
@@ -658,6 +691,7 @@ spec:
       description: Fetch a page.
       arguments:
         type: object
+        additionalProperties: false
         properties:
           url: { type: string }
         required: [url]
@@ -747,19 +781,21 @@ async fn a_parse_step_carrying_args_is_refused() {
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
         "steps": [
-            { "tool": "web__fetch", "args": { "url": "$input/url" } },
+            call("web__fetch", &json!({ "url": "$input/url" })),
             {
-                "args": { "stray": "accepted prose" },
+                "tool": null,
+                "args": json!({ "stray": "accepted prose" }).to_string(),
                 "parse": {
                     "from": "$step0/body",
-                    "schema": {
+                    "schema": json!({
                         "type": "object",
                         "properties": { "email": { "type": "string" } },
                         "required": ["email"]
-                    }
+                    }).to_string()
                 }
             }
-        ]
+        ],
+        "answer": null
     })));
     let client = Arc::new(Recorder::default());
     let catalog = Arc::new(ToolCatalog::new().allow(
@@ -1005,6 +1041,7 @@ spec:
       max_sensitivity: secret
       arguments:
         type: object
+        additionalProperties: false
         properties:
           id: { type: string }
         required: [id]
@@ -1263,7 +1300,8 @@ async fn data_within_the_journal_ceiling_still_runs() {
     let manifest = Manifest::parse(JOURNALLED).expect("parse");
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(plan(json!({
-        "steps": [{ "tool": "crm__lookup", "args": { "id": "$input/customer" } }]
+        "steps": [call("crm__lookup", &json!({ "id": "$input/customer" }))],
+        "answer": null
     })));
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, read_only_catalog(), &client);

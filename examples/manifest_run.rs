@@ -182,10 +182,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let asked = provider.asked();
     let ask = asked.first().expect("the provider was asked");
-    println!(
-        "   system prompt:  {}",
-        ask.prompt["system"].as_str().unwrap_or("<none>")
-    );
+    // The instruction is a paragraph, and printing it raw breaks the column
+    // this block is read in — the blank line especially, which looks like the
+    // output ended.
+    for (index, line) in ask.prompt["system"]
+        .as_str()
+        .unwrap_or("<none>")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .enumerate()
+    {
+        let label = if index == 0 { "system prompt:" } else { "" };
+        println!("   {label:<15} {line}");
+    }
     println!("   schema sent:    {}", ask.schema.is_some());
 
     assert_eq!(

@@ -132,7 +132,14 @@ mod openai_stream;
 #[cfg(feature = "providers")]
 mod sse;
 #[cfg(feature = "providers")]
-mod wire;
+pub(crate) mod wire;
+/// Why a schema cannot be used with constrained decoding, if it cannot.
+///
+/// Public because the answer belongs to whoever wrote the schema — a manifest's
+/// `spec.output.schema`, a tool's `arguments` — and finding out by running the
+/// agent is finding out late.
+#[cfg(feature = "providers")]
+pub use wire::strict_schema_problem;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -229,6 +236,25 @@ fn provider_side_media_refusal(kind: &str) -> String {
          this plane's egress policy and journal; inline the media bytes, or fetch them \
          through an explicit governed effect first"
     )
+}
+
+/// The wire's own turn list, when the caller handed one over.
+///
+/// Every driver accepts a prompt object as an envelope — `{ system, messages }`
+/// on the chat wires, `{ system, input }` on Responses — so a caller who needs
+/// the real shape can reach it. The trap is that the same key may be *content*:
+/// the declarative planner's prompt is `{ system, input, tools }`, where
+/// `input` is the run's own input and `tools` is the surface it must choose
+/// from. Reading the key there sends one field and silently drops the rest, so
+/// the envelope opens only when the object holds nothing else to lose —
+/// otherwise it is content, and is serialized whole.
+#[cfg(any(feature = "providers", feature = "bedrock"))]
+pub(crate) fn prompt_envelope<'a>(prompt: &'a Value, key: &str) -> Option<&'a Value> {
+    let map = prompt.as_object()?;
+    if !map.keys().all(|name| name == key || name == "system") {
+        return None;
+    }
+    map.get(key)
 }
 
 pub(crate) fn refuse_provider_side_media(

@@ -167,6 +167,23 @@ impl Spend {
     }
 }
 
+/// What it cost, in a sentence a person reads.
+///
+/// This type reaches operators through refusals — a standing authority short of
+/// what a draw asked for names both amounts — where `{:?}` puts Rust syntax in
+/// the middle of an English sentence. A zero is still printed: it says the
+/// other dimension was unspent, where omitting it leaves a reader to guess
+/// whether it was unmetered.
+impl std::fmt::Display for Spend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} tokens and {} minor units",
+            self.tokens, self.minor_units
+        )
+    }
+}
+
 impl std::ops::AddAssign for Spend {
     fn add_assign(&mut self, rhs: Self) {
         *self = self.plus(rhs);

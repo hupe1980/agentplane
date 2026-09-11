@@ -366,13 +366,13 @@ fn messages(prompt: &Value) -> Vec<Value> {
     }
     // `messages` beside `system`: the wire's turn list with the instruction
     // kept in the one vocabulary every driver shares.
-    if let Some(Value::Array(turns)) = prompt.get("messages") {
+    if let Some(Value::Array(turns)) = crate::model::prompt_envelope(prompt, "messages") {
         out.extend(turns.iter().cloned());
         return out;
     }
     let user = match prompt {
         Value::String(s) => s.clone(),
-        other => match other.get("input") {
+        other => match crate::model::prompt_envelope(other, "input") {
             Some(Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
             None => {

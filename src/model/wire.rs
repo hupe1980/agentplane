@@ -227,7 +227,50 @@ pub fn strict_schema_problem(schema: &serde_json::Value) -> Option<String> {
             ));
         }
 
-        if obj.get("type").and_then(|t| t.as_str()) == Some("object") {
+        // `anyOf` is the one union strict mode takes; the other two are
+        // rejected outright, and walking into them as if they were fine let a
+        // schema through that came back as a 400.
+        for combinator in ["oneOf", "allOf"] {
+            if obj.contains_key(combinator) {
+                out.push(format!(
+                    "`{path}` uses `{combinator}`, which strict mode does not permit — \
+                     `anyOf` is the union it takes"
+                ));
+            }
+        }
+
+        // Every subschema must say what it is. `anyOf` says it by branching,
+        // `$ref` by pointing, `enum` and `const` by enumerating; a bare
+        // `{ "description": ... }` says nothing and is refused.
+        if !["type", "anyOf", "$ref", "enum", "const"]
+            .iter()
+            .any(|key| obj.contains_key(*key))
+        {
+            out.push(format!(
+                "`{path}` has no `type`, which strict mode requires"
+            ));
+        }
+
+        let is_array = match obj.get("type") {
+            Some(serde_json::Value::String(name)) => name == "array",
+            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "array"),
+            _ => false,
+        };
+        if is_array && !obj.contains_key("items") {
+            out.push(format!(
+                "`{path}` is an array without `items`, which strict mode requires"
+            ));
+        }
+
+        // `["object", "null"]` is how strict mode spells an optional object,
+        // and it is still an object: reading only the string form let a
+        // nullable one skip both checks below and reach the provider as a 400.
+        let is_object = match obj.get("type") {
+            Some(serde_json::Value::String(name)) => name == "object",
+            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "object"),
+            _ => false,
+        };
+        if is_object {
             if obj.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
                 out.push(format!(
                     "`{path}` is an object without `additionalProperties: false`"
