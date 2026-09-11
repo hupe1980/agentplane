@@ -1030,11 +1030,28 @@ impl<'a> StepCtx<'a> {
     ///
     /// A separate function so the guard's scope is a single statement and cannot
     /// accidentally span an await.
-    pub(crate) fn bill_replayed(&self, spend: crate::core::Spend) {
+    pub(crate) fn bill_replayed(&self, spend: crate::core::Spend, outbound: u64) {
         self.ledger
             .lock()
             .expect("budget mutex")
-            .replay_effect(spend);
+            .replay_effect(spend, outbound);
+    }
+
+    /// How many bytes this effect would hand its sink.
+    ///
+    /// One implementation, read by three callers that must agree: the ceiling
+    /// that refuses before dispatch, the `EffectStarted` record that states what
+    /// crossed, and the replayed billing that has to reach the same tally. Two
+    /// spellings of "how big is this" would agree until one of them learned to
+    /// measure something else.
+    ///
+    /// `None` — an effect binding no outbound value — is zero rather than
+    /// absent: nothing crossed a sink, and a read must not consume an egress
+    /// ceiling.
+    pub(crate) fn outbound_size<E: crate::core::Effect>(effect: &E) -> u64 {
+        effect.sink_arguments().map_or(0, |args| {
+            crate::core::canon::to_bytes(args).map_or(0, |b| b.len() as u64)
+        })
     }
 
     /// Take an effect's slot for an announcement no ceiling gates.
@@ -1043,8 +1060,11 @@ impl<'a> StepCtx<'a> {
     /// and neither is exempt from having happened: the journal holds an
     /// announcement, so every later pass bills one, and a live pass that
     /// billed none would exhaust later than its own replay.
-    pub(crate) fn count_unadmitted(&self) {
-        self.ledger.lock().expect("budget mutex").count_effect();
+    pub(crate) fn count_unadmitted(&self, outbound: u64) {
+        self.ledger
+            .lock()
+            .expect("budget mutex")
+            .count_effect(outbound);
     }
 
     /// Add what a **freshly dispatched** attempt cost. Its slot was taken at
@@ -1301,8 +1321,16 @@ impl<'a> StepCtx<'a> {
             // visible rather than silent, and a pass replaying the
             // announcement bills the same one.
             let ceilings = Some(DeclaredCeilings::of(&effect));
-            self.gate(key, &descriptor, effect.mutates(), outbound, ceilings)
-                .await?;
+            let outbound_bytes = Self::outbound_size(&effect);
+            self.gate(
+                key,
+                &descriptor,
+                effect.mutates(),
+                outbound,
+                ceilings,
+                outbound_bytes,
+            )
+            .await?;
 
             let backoff = policy.wait_before(self.run, key, attempt, advice.take());
             if !backoff.is_zero() {
@@ -1503,6 +1531,7 @@ impl<'a> StepCtx<'a> {
         &mut self,
         key: EffectKey,
         refusal: EffectReplay,
+        outbound_bytes: u64,
     ) -> Result<(), StepError> {
         let EffectReplay::Refused { limit, used } = refusal else {
             return Err(recorded_refusal(refusal));
@@ -1522,7 +1551,11 @@ impl<'a> StepCtx<'a> {
         // ceiling now in force still refuse", and the dispatch that follows a
         // yes goes through the ordinary gate, which is what takes the slot.
         // Taking one here as well would charge the re-admitted effect twice.
-        let verdict = self.ledger.lock().expect("budget mutex").can_admit_effect();
+        let verdict = self
+            .ledger
+            .lock()
+            .expect("budget mutex")
+            .can_admit_effect(outbound_bytes);
         if verdict.is_err() {
             // The ledger now in force still refuses: the run concludes
             // exhausted again, and the standing refusal already says so — no
@@ -1630,7 +1663,8 @@ impl<'a> StepCtx<'a> {
                 // wait's own kind, which `label_inbound` holds together.
                 declared: _,
             }) => {
-                self.bill_replayed(spend);
+                // A wait hands nothing to a sink: what arrives is inbound.
+                self.bill_replayed(spend, 0);
                 Ok(Some(ReplayedWait::Recorded(Self::label_inbound(
                     output,
                     &spec.kind,
@@ -1653,7 +1687,7 @@ impl<'a> StepCtx<'a> {
                 reason,
             }),
             Some(EffectReplay::Failed { error, spend, .. }) => {
-                self.bill_replayed(spend);
+                self.bill_replayed(spend, 0);
                 Err(StepError::Effect(crate::core::EffectError::Rejected(error)))
             }
             // Announced, and *possibly* registered: a crash — or a transient
@@ -1671,7 +1705,7 @@ impl<'a> StepCtx<'a> {
                 // including on the repair path, which re-enters the
                 // registration below with the announcement skipped and would
                 // otherwise be the one pass that waits for free.
-                self.bill_replayed(crate::core::Spend::default());
+                self.bill_replayed(crate::core::Spend::default(), 0);
                 if self.mode == Mode::Resume {
                     Ok(Some(ReplayedWait::Repair))
                 } else {
@@ -1689,7 +1723,13 @@ impl<'a> StepCtx<'a> {
     /// real calls with journal reads, and billed at the figure that was
     /// *recorded* — so a replayed run reaches the same budget verdict at the
     /// same point as the original.
-    fn replayed_done(&mut self, kind: &str, attempt: u32, spend: crate::core::Spend) {
+    fn replayed_done(
+        &mut self,
+        kind: &str,
+        attempt: u32,
+        spend: crate::core::Spend,
+        outbound_bytes: u64,
+    ) {
         tracing::debug!(
             target: telemetry::EFFECT_SPAN,
             kind = %kind,
@@ -1698,7 +1738,7 @@ impl<'a> StepCtx<'a> {
             outcome = "done",
         );
         self.meter.count(metrics::EFFECTS_REPLAYED, kind);
-        self.bill_replayed(spend);
+        self.bill_replayed(spend, outbound_bytes);
     }
 
     /// The reviewed grant for an effect, if the manifest names one.
@@ -1742,6 +1782,7 @@ impl<'a> StepCtx<'a> {
         mutates: bool,
         outbound: Option<&crate::core::Label>,
         ceilings: Option<DeclaredCeilings>,
+        outbound_bytes: u64,
     ) -> Result<(), StepError> {
         // A compensating phase, or a group being taken back inside a forward
         // one. Both are undo, and both are exempt for the same reason: refusing
@@ -1752,7 +1793,7 @@ impl<'a> StepCtx<'a> {
         // live pass that billed none would exhaust later than its own replay.
         // The overshoot stays visible rather than becoming invisible.
         if !self.phase.is_forward() || self.reversing {
-            self.count_unadmitted();
+            self.count_unadmitted(outbound_bytes);
             return Ok(());
         }
         // First, because it is the cheapest and the most fundamental: an effect
@@ -1769,7 +1810,7 @@ impl<'a> StepCtx<'a> {
         #[cfg(feature = "manifest")]
         let mutates = mutates || self.tool_grant_for(descriptor).is_some_and(|g| g.mutates);
         self.authorize(key, descriptor, mutates, outbound).await?;
-        self.admit(key, &descriptor.kind).await
+        self.admit(key, &descriptor.kind, outbound_bytes).await
     }
 
     /// Check an effect against the agent's **own manifest**, journalling any
@@ -2099,9 +2140,18 @@ impl<'a> StepCtx<'a> {
     /// Without it a replayed run reaches this point, finds no history, and
     /// reports that the *build* performs more effects than the record — sending
     /// an operator to look for a code change that does not exist.
-    async fn admit(&mut self, key: EffectKey, kind: &str) -> Result<(), StepError> {
+    async fn admit(
+        &mut self,
+        key: EffectKey,
+        kind: &str,
+        outbound_bytes: u64,
+    ) -> Result<(), StepError> {
         // Scoped so the guard is gone before any await below.
-        let verdict = self.ledger.lock().expect("budget mutex").admit_effect();
+        let verdict = self
+            .ledger
+            .lock()
+            .expect("budget mutex")
+            .admit_effect(outbound_bytes);
         let Err(exceeded) = verdict else {
             return Ok(());
         };
@@ -2201,7 +2251,12 @@ impl<'a> StepCtx<'a> {
                 declared,
                 ..
             }) => {
-                self.replayed_done(&descriptor.kind, attempt, spend);
+                self.replayed_done(
+                    &descriptor.kind,
+                    attempt,
+                    spend,
+                    Self::outbound_size(effect),
+                );
                 Ok(Replayed::Answered(
                     serde_json::from_value(output)?,
                     declared,
@@ -2210,7 +2265,8 @@ impl<'a> StepCtx<'a> {
             Some(refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. })) => {
                 // Re-admitted refusals fall through to a live dispatch of the
                 // same key; everything else re-raises inside.
-                self.replayed_refusal(key, refusal).await?;
+                self.replayed_refusal(key, refusal, Self::outbound_size(effect))
+                    .await?;
                 Ok(Replayed::Continue(attempt))
             }
             Some(EffectReplay::Failed {
@@ -2234,6 +2290,7 @@ impl<'a> StepCtx<'a> {
                 // `mutates` lives on the start record the cursor has already
                 // collapsed.
                 effect.mutates(),
+                Self::outbound_size(effect),
             )?)),
             Some(EffectReplay::Orphan {
                 recovery: recorded, ..
@@ -2242,7 +2299,7 @@ impl<'a> StepCtx<'a> {
                 // this run made against the world, and every pass that reads it
                 // bills the one slot the live pass took when it admitted the
                 // attempt.
-                self.bill_replayed(crate::core::Spend::default());
+                self.bill_replayed(crate::core::Spend::default(), Self::outbound_size(effect));
                 if let Some(output) = self
                     .orphan_verdict(effect, key, attempt, &recorded, recovery, policy)
                     .await?
@@ -2481,7 +2538,8 @@ impl<'a> StepCtx<'a> {
         if self.mode.is_replaying() {
             match self.cursor.next(key)? {
                 Some(EffectReplay::Done { spend, .. }) => {
-                    self.bill_replayed(spend);
+                    // A durable sleep sends nothing; it is registered.
+                    self.bill_replayed(spend, 0);
                     return Ok(());
                 }
                 Some(EffectReplay::Refused { limit, used }) => {
@@ -2502,7 +2560,7 @@ impl<'a> StepCtx<'a> {
                     });
                 }
                 Some(EffectReplay::Failed { error, spend, .. }) => {
-                    self.bill_replayed(spend);
+                    self.bill_replayed(spend, 0);
                     return Err(StepError::Effect(crate::core::EffectError::Rejected(error)));
                 }
                 // Announced, and *possibly* armed: whether the arm landed is
@@ -2521,7 +2579,7 @@ impl<'a> StepCtx<'a> {
                 Some(EffectReplay::Orphan { .. }) => {
                     // Announced on the record, so this pass bills the wait —
                     // the re-arm below writes no second announcement.
-                    self.bill_replayed(crate::core::Spend::default());
+                    self.bill_replayed(crate::core::Spend::default(), 0);
                     if self.mode == Mode::Resume {
                         timers
                             .arm(&crate::core::Timer {
@@ -2549,7 +2607,7 @@ impl<'a> StepCtx<'a> {
         // refusing one would strand a run mid-plan rather than stop work. It
         // is still an operation the journal holds, so it takes its slot, and
         // every pass that replays the announcement bills the same one.
-        self.count_unadmitted();
+        self.count_unadmitted(0);
 
         // Announce before arming, so a crash between the two leaves an orphan
         // the resumed run recognises rather than a timer nobody is waiting on.
@@ -3252,8 +3310,9 @@ impl<'a> StepCtx<'a> {
         spend: crate::core::Spend,
         permanent: bool,
         mutates: bool,
+        outbound_bytes: u64,
     ) -> Result<u32, StepError> {
-        self.bill_replayed(spend);
+        self.bill_replayed(spend, outbound_bytes);
         self.recorded_failure(
             descriptor,
             ordinal,
@@ -3365,10 +3424,11 @@ impl<'a> StepCtx<'a> {
                     backoff_ms,
                     outbound_label: outbound.cloned(),
                     // Measured from what the sink was handed, so the figure is
-                    // the payload rather than the descriptor around it.
-                    outbound_bytes: effect.sink_arguments().map(|args| {
-                        crate::core::canon::to_bytes(args).map_or(0, |b| b.len() as u64)
-                    }),
+                    // the payload rather than the descriptor around it. `None`
+                    // where nothing crossed, so the ordinary record is
+                    // unchanged — the ceiling reads the same measurement with
+                    // absence flattened to zero.
+                    outbound_bytes: effect.sink_arguments().map(|_| Self::outbound_size(effect)),
                 },
             )
             .await?;
@@ -5066,7 +5126,7 @@ impl StepCtx<'_> {
             // refusing a wait strands a run, counted because the journal holds
             // the announcement and every replay of it bills one. A repair pass
             // already billed it off the orphan record.
-            self.count_unadmitted();
+            self.count_unadmitted(0);
             self.append_effect(
                 key,
                 RecordKind::EffectStarted {
@@ -5427,8 +5487,12 @@ impl Effect for Commission {
         // `Interrupted`, not `Rejected`: this caller cannot know whether the
         // commissioned agent performed effects before it failed, and asserting
         // that nothing was applied would be a claim it has no basis for.
-        let out = match plane
-            .run_under(
+        //
+        // An outcome rather than an `Admission`, because a commission carries no
+        // idempotency key: there is no in-flight answer for a caller to have to
+        // handle, and the key is the run's own effect key on the parent's chain.
+        let out = plane
+            .commission_run(
                 &self.capability,
                 Tainted::with_label(self.input.clone(), self.label.clone()),
                 terms,
@@ -5437,20 +5501,7 @@ impl Effect for Commission {
             .map_err(|e| crate::core::EffectError::Interrupted {
                 driver: self.capability.clone(),
                 detail: e.to_string(),
-            })? {
-            super::Admission::Fresh(out) | super::Admission::Replayed(out) => out,
-            // Unkeyed terms always admit fresh; an in-flight answer here
-            // would be the store contradicting itself.
-            super::Admission::InFlight(run) => {
-                return Err(crate::core::EffectError::Interrupted {
-                    driver: self.capability.clone(),
-                    detail: format!(
-                        "commission of '{}' reported run {run} as in flight",
-                        self.capability
-                    ),
-                });
-            }
-        };
+            })?;
 
         let spend = out.spend();
         let answer = out

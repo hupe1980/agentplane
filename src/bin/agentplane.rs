@@ -633,6 +633,31 @@ struct ServeArgs {
     /// Reach an A2A peer at URL as `tool://NAME/...`, as `run` takes it.
     #[arg(long, value_name = "NAME=URL")]
     peer: Vec<String>,
+
+    /// How long to keep working after a stop signal, in seconds.
+    ///
+    /// On `SIGTERM` or `SIGINT` this process stops accepting connections,
+    /// finishes the requests already in hand, lets the periodic passes complete
+    /// the tick they are in, and waits this long for the runs it started in the
+    /// background to reach a journaled resting point.
+    ///
+    /// **It has to fit inside the supervisor's own grace period**, which is what
+    /// sends `SIGKILL` afterwards — 30 seconds on Kubernetes and Docker unless
+    /// raised. The default leaves margin under that. `0` exits as soon as the
+    /// listeners are closed.
+    ///
+    /// What it buys: a run killed inside a tool call leaves an announced effect
+    /// with no outcome, and no later reader can tell whether that call reached
+    /// the world — so the effect's declared recovery decides, which for anything
+    /// not safe to repeat means waiting for a person. Draining turns the
+    /// ordinary case of a deploy back into an ordinary conclusion.
+    #[arg(
+        long,
+        value_name = "SECS",
+        env = "AGENTPLANE_DRAIN_SECS",
+        default_value_t = 25
+    )]
+    drain_secs: u64,
 }
 
 /// The anchoring checkpoint an audit was given, and **how it was obtained**.
@@ -1613,7 +1638,6 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
          There is deliberately no default — a server that authenticates nobody has no \
          actor to record a decision against",
     )?;
-    let addr = opts.addr.as_str();
 
     let policy_src = std::fs::read_to_string(policy_path)
         .map_err(|e| format!("reading the policy set {policy_path}: {e}"))?;
@@ -1685,31 +1709,246 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
             .map_err(|e| e.to_string())?;
 
         server = wire_push(server, &opts.push_host, &store)?;
-        if let Some(worker) = server.push_worker() {
-            spawn_push_worker(worker, opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS));
-        }
-
-        spawn_sweeper(&runtime, opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS));
-        spawn_drill(&runtime, opts.drill_every.unwrap_or(0));
-
-        if let Some(operator_addr) = opts.operator_addr.as_deref() {
-            spawn_operator_surface(&runtime, operator_auth, operator_addr).await?;
-        }
-
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| format!("could not bind {addr}: {e}"))?;
-        // stderr, so the answer stream stays clean for whatever pipes this.
-        eprintln!(
-            "serving {} {} on {addr} as {url}",
-            manifest.metadata.name, manifest.metadata.version
-        );
-        eprintln!("  card: {url}/.well-known/agent-card.json");
-        axum::serve(listener, server.router())
-            .await
-            .map_err(|e| format!("the server stopped: {e}"))?;
+        serve_until_stopped(&runtime, server, operator_auth, opts, manifest, url).await?;
         Ok(ExitCode::SUCCESS)
     })
+}
+
+/// Serve until a supervisor says stop, then stop everything this process owns.
+///
+/// Split from `serve` because wiring a plane and running one are different jobs
+/// with different failure modes, and because the shutdown order below is the
+/// part worth reading on its own.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+async fn serve_until_stopped(
+    runtime: &Arc<Runtime>,
+    server: agentplane::api::a2a::A2aServer,
+    operator_auth: Arc<dyn agentplane::api::Authenticator>,
+    opts: &ServeArgs,
+    manifest: &Manifest,
+    url: &str,
+) -> Result<(), String> {
+    let addr = opts.addr.as_str();
+    // One signal, every listener. Raised by the signal watcher below, and
+    // by `serve` itself returning for any other reason — a bind that dies
+    // under a running plane must not leave the periodic passes sweeping a
+    // store nothing is serving from.
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut background: Vec<Task> = Vec::new();
+    if let Some(worker) = server.push_worker() {
+        background.extend(spawn_push_worker(
+            worker,
+            opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS),
+            stop_rx.clone(),
+        ));
+    }
+
+    background.extend(spawn_sweeper(
+        runtime,
+        opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS),
+        stop_rx.clone(),
+    ));
+    background.extend(spawn_drill(
+        runtime,
+        opts.drill_every.unwrap_or(0),
+        stop_rx.clone(),
+    ));
+
+    if let Some(operator_addr) = opts.operator_addr.as_deref() {
+        background.push(
+            spawn_operator_surface(runtime, operator_auth, operator_addr, stop_rx.clone()).await?,
+        );
+    }
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("could not bind {addr}: {e}"))?;
+    // stderr, so the answer stream stays clean for whatever pipes this.
+    eprintln!(
+        "serving {} {} on {addr} as {url}",
+        manifest.metadata.name, manifest.metadata.version
+    );
+    eprintln!("  card: {url}/.well-known/agent-card.json");
+    eprintln!("  stop: SIGTERM drains for up to {}s", opts.drain_secs);
+
+    let mut peer = tokio::spawn(async move {
+        axum::serve(listener, server.router())
+            .with_graceful_shutdown(stopping(stop_rx))
+            .await
+    });
+
+    // Whichever comes first. A server that ends on its own — an accept loop that
+    // died — must still stop the rest of this process, or the periodic passes go
+    // on sweeping a store nothing is serving from.
+    let mut ended = tokio::select! {
+        () = stop_requested() => None,
+        joined = &mut peer => Some(joined),
+    };
+    let still_serving = ended.is_none();
+    let _ = stop_tx.send(true);
+    let grace = std::time::Duration::from_secs(opts.drain_secs);
+    let deadline = tokio::time::Instant::now() + grace;
+
+    // **Concurrently, and that is the design.** The two waits are for different
+    // things — the connections still being served, and the runs this process put
+    // on a task of its own — and `Runtime::drain` closes admission on its first
+    // poll, which is what lets an open subscription end rather than hold the
+    // graceful shutdown open for as long as the run it is watching.
+    let (report, closed) = tokio::join!(
+        runtime.drain(grace),
+        stop_serving(&mut peer, background, still_serving, deadline),
+    );
+    ended = ended.or(closed);
+    report_drain(&report);
+    match ended {
+        Some(Ok(listening)) => listening.map_err(|e| format!("the server stopped: {e}")),
+        Some(Err(e)) => Err(format!("the server task failed: {e}")),
+        None => Ok(()),
+    }
+}
+
+/// Wait out the listeners and the periodic passes, bounded by one deadline.
+///
+/// Everything here is abandoned rather than waited for once the deadline
+/// passes. A periodic pass holds no lease of its own and every write in it is
+/// idempotent, so the next instance's first tick repeats whatever it did not
+/// finish; a connection still open is a client that reconnects. What must not be
+/// abandoned early is a *run*, and that is the other half of the join this is
+/// called from.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+async fn stop_serving(
+    peer: &mut tokio::task::JoinHandle<std::io::Result<()>>,
+    background: Vec<Task>,
+    still_serving: bool,
+    deadline: tokio::time::Instant,
+) -> Option<Result<std::io::Result<()>, tokio::task::JoinError>> {
+    let mut ended = None;
+    if still_serving {
+        match tokio::time::timeout_at(deadline, peer).await {
+            Ok(joined) => ended = Some(joined),
+            Err(_) => eprintln!("  stop: connections were still open at the grace period"),
+        }
+    }
+    for task in background {
+        if tokio::time::timeout_at(deadline, task).await.is_err() {
+            break;
+        }
+    }
+    ended
+}
+
+/// Say what the stop cost, and to whom.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn report_drain(report: &agentplane::runtime::DrainReport) {
+    if report.is_complete() {
+        eprintln!(
+            "stopped; {} background runs finished first",
+            report.settled()
+        );
+        return;
+    }
+    // Named, at `warn`, and on stderr: these are runs whose leases this process
+    // is about to stop renewing, so each expires unreleased and the next
+    // instance's recovery sweep takes it over — the same path a crash takes.
+    // Nothing is lost, and the number is what an operator sizing `--drain-secs`
+    // against their supervisor's grace period has to see.
+    let unfinished: Vec<String> = report.unfinished.iter().map(ToString::to_string).collect();
+    tracing::warn!(
+        settled = report.settled(),
+        unfinished = ?unfinished,
+        "the grace period ended with runs still executing; they are left for the recovery sweep"
+    );
+    eprintln!(
+        "stopped; {} background runs finished, {} left to the recovery sweep: {}",
+        report.settled(),
+        unfinished.len(),
+        unfinished.join(" ")
+    );
+}
+
+/// A stop signal, broadcast to everything this process started.
+///
+/// `watch` rather than a one-shot because there are several listeners and none
+/// of them owns the signal: two HTTP servers and up to three periodic passes all
+/// have to hear the same thing, and a channel that only one can take would make
+/// the order they were started in decide which ones stop.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+type Stop = tokio::sync::watch::Receiver<bool>;
+
+/// A background pass this process must see the end of before it exits.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+type Task = tokio::task::JoinHandle<()>;
+
+/// Wait for the next tick, or for the stop signal. `false` means stop.
+///
+/// The check is here and not around the work, so a pass that is *mid-tick* when
+/// the signal arrives finishes that tick and stops before the next one. A sweep
+/// abandoned halfway is not a fault — every write in it is idempotent and the
+/// next instance repeats it — but finishing costs milliseconds and leaves less
+/// for somebody else to redo.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+async fn next_tick(tick: &mut tokio::time::Interval, stop: &mut Stop) -> bool {
+    tokio::select! {
+        _ = tick.tick() => true,
+        _ = stop.changed() => false,
+    }
+}
+
+/// Resolve when the stop signal is raised, or when the last sender is dropped.
+///
+/// A dropped sender is treated as a stop rather than as a hang: the sender lives
+/// in `serve`, so its absence means `serve` has already returned.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+async fn stopping(mut stop: Stop) {
+    let _ = stop.changed().await;
+}
+
+/// The signals a supervisor stops a process with.
+///
+/// `SIGTERM` is what Kubernetes, Docker and systemd send; `SIGINT` is a person
+/// at a terminal. They mean the same thing here and are handled the same way —
+/// a second one is *not* special-cased into an immediate exit, because the whole
+/// point of the drain is that the grace period belongs to the supervisor, which
+/// already holds a `SIGKILL` for a process that overstays it.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+async fn stop_requested() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let term = match signal(SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            // A process that cannot install the handler must not silently become
+            // one that ignores the signal. Said out loud, and `SIGTERM` keeps
+            // its default disposition — which kills this process without a
+            // drain, exactly as it would have before the handler was attempted.
+            Err(error) => {
+                tracing::error!(%error, "could not listen for SIGTERM; this process will not drain");
+                None
+            }
+        };
+        let terminated = async move {
+            match term {
+                Some(mut term) => {
+                    term.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = terminated => {}
+            r = tokio::signal::ctrl_c() => {
+                if let Err(error) = r {
+                    tracing::error!(%error, "could not listen for SIGINT");
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(%error, "could not listen for an interrupt");
+        }
+    }
 }
 
 /// Rehearse recovery on a timer, because a control nobody exercises is one an
@@ -1725,22 +1964,25 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
 /// because the difference between *sound* and *nothing I looked at was wrong*
 /// is exactly that list — the same reason the report carries it at all.
 #[cfg(all(feature = "a2a-server", feature = "cedar"))]
-fn spawn_drill(runtime: &Arc<Runtime>, every: u32) {
+fn spawn_drill(runtime: &Arc<Runtime>, every: u32, stop: Stop) -> Option<Task> {
     if every == 0 {
-        return;
+        return None;
     }
     if runtime.cases().is_none() {
         eprintln!(
             "  drill: --drill-every was given but this plane has no case store, \
              so there are no cases to walk"
         );
-        return;
+        return None;
     }
     let plane = Arc::clone(runtime);
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(u64::from(every)));
+        let mut stop = stop;
         loop {
-            tick.tick().await;
+            if !next_tick(&mut tick, &mut stop).await {
+                break;
+            }
             match plane.drill().await {
                 Ok(report) if !report.is_sound() => {
                     tracing::error!(?report, "the recovery drill found unrecoverable references");
@@ -1755,7 +1997,7 @@ fn spawn_drill(runtime: &Arc<Runtime>, every: u32) {
                 Err(error) => tracing::error!(%error, "the recovery drill could not run"),
             }
         }
-    });
+    }))
 }
 
 /// Sweep on a clock, because nothing else will.
@@ -1770,15 +2012,18 @@ fn spawn_drill(runtime: &Arc<Runtime>, every: u32) {
 /// second instance sweeping the same store, is safe. `0` turns it off for a
 /// deployment driving the sweep from its own scheduler.
 #[cfg(all(feature = "a2a-server", feature = "cedar"))]
-fn spawn_sweeper(runtime: &Arc<Runtime>, every: u32) {
+fn spawn_sweeper(runtime: &Arc<Runtime>, every: u32, stop: Stop) -> Option<Task> {
     if every == 0 {
-        return;
+        return None;
     }
     let sweeper = Arc::clone(runtime);
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(u64::from(every)));
+        let mut stop = stop;
         loop {
-            tick.tick().await;
+            if !next_tick(&mut tick, &mut stop).await {
+                break;
+            }
             // The sweeper's clock is the wall clock by design: it decides *when*
             // an obligation is late, which is not a journaled observation of a
             // run. Every transition it makes is journaled by the sweep's own
@@ -1808,7 +2053,7 @@ fn spawn_sweeper(runtime: &Arc<Runtime>, every: u32) {
                 Err(error) => tracing::error!(%error, "the sweep failed"),
             }
         }
-    });
+    }))
 }
 
 /// The operator surface, on its **own listener**.
@@ -1832,18 +2077,21 @@ async fn spawn_operator_surface(
     runtime: &Arc<Runtime>,
     auth: Arc<dyn agentplane::api::Authenticator>,
     addr: &str,
-) -> Result<(), String> {
+    stop: Stop,
+) -> Result<Task, String> {
     let api = agentplane::api::Api::new(Arc::clone(runtime), auth).map_err(|e| e.to_string())?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| format!("could not bind the operator surface {addr}: {e}"))?;
     eprintln!("  operator: http://{addr}/runs?outcome=failed");
-    tokio::spawn(async move {
-        if let Err(error) = axum::serve(listener, api.router()).await {
+    Ok(tokio::spawn(async move {
+        let served = axum::serve(listener, api.router())
+            .with_graceful_shutdown(stopping(stop))
+            .await;
+        if let Err(error) = served {
             tracing::error!(%error, "the operator surface stopped");
         }
-    });
-    Ok(())
+    }))
 }
 
 /// A peer registry and the transport that reaches every peer in it.
@@ -2176,14 +2424,21 @@ fn wire_push(
 /// scheduler running the plane's periodic work. Several instances may race and
 /// produce duplicates; cursors advance monotonically, so none can regress.
 #[cfg(all(feature = "a2a-server", feature = "cedar"))]
-fn spawn_push_worker(worker: agentplane::api::a2a::A2aPushWorker, every: u32) {
+fn spawn_push_worker(
+    worker: agentplane::api::a2a::A2aPushWorker,
+    every: u32,
+    stop: Stop,
+) -> Option<Task> {
     if every == 0 {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(u64::from(every)));
+        let mut stop = stop;
         loop {
-            tick.tick().await;
+            if !next_tick(&mut tick, &mut stop).await {
+                break;
+            }
             #[allow(clippy::disallowed_methods)]
             let at = time::OffsetDateTime::now_utc().unix_timestamp();
             let Ok(at) = u64::try_from(at) else { continue };
@@ -2205,7 +2460,7 @@ fn spawn_push_worker(worker: agentplane::api::a2a::A2aPushWorker, every: u32) {
                 Err(error) => tracing::error!(%error, "push delivery failed"),
             }
         }
-    });
+    }))
 }
 
 /// The same verb, in a build that cannot answer it.

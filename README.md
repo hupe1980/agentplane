@@ -237,6 +237,13 @@ sweeps deadlines, task expiry, dead letters, due timers **and abandoned runs**
 holding the run, and the sweep takes it over and resumes it — so a run that
 sleeps, waits or loses its instance actually finishes.
 
+And it **drains** on `SIGTERM`: stop accepting, answer what is in hand, close
+admission, and give the runs still executing `--drain-secs` to reach a journaled
+resting point. A process killed mid-call leaves an effect nothing can decide the
+outcome of, and a rolling deploy should not be the ordinary way a plane produces
+those ([stopping an
+instance](https://hupe1980.github.io/agentplane/docs/operations/#stopping-an-instance)).
+
 Both `--policy` and `--tokens` are required and have no defaults. That is the
 design rather than an inconvenience: a permissive engine and no engine are the
 same behaviour, and a server that authenticates nobody has no actor to record a
@@ -253,10 +260,10 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | | |
 |---|---|
 | 🧾 | **A journal you can audit** — append-only, hash-chained, per-record signatures naming the workload that wrote them, and a per-plane Merkle log so deleting a whole run is detectable |
-| ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect. Recovery is *initiated*, not merely possible: a sweep finds every run whose owner died holding it and takes it over |
+| ⏱️ | **Durable execution** — crash mid-run and resume from the last completed effect. Recovery is *initiated*, not merely possible: a sweep finds every run whose owner died holding it and takes it over, and a scheduled stop drains rather than becoming a crash |
 | 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never migrates an in-flight workflow. Admission claims an idempotency key in the transaction that writes the first record, so a redelivery is answered with the original run |
 | 🛡️ | **Policy before live dispatch** — a total, I/O-free gate; denials are journaled, strict replay never re-judges history, and plan authority is checked before step 1 |
-| 🏷️ | **Field-level information flow** — outbound arguments carry hierarchical provenance, so an authority-bearing field can require a trusted or named source while ordinary content stays untrusted |
+| 🏷️ | **Field-level information flow** — outbound arguments carry hierarchical provenance, so an authority-bearing field can require a trusted or named source while ordinary content stays untrusted. Volume is the axis a label lacks, so the size crossing each sink is journaled and `max_egress_bytes` bounds it |
 | 💸 | **Budgets and tenant quotas that bind** — a failed model call is billed for what it burned, because the provider bills for it too, and a replayed run reaches the same tally at the same point → [budgets](https://hupe1980.github.io/agentplane/docs/plans-cases/#budgets) |
 | 🧬 | **Effects that take together, or not at all** — each reversible member records the concrete call that undoes it, built from what that call *actually returned*; an irreversible send is **deferred** to commit, so an aborted group never sends it → [effects](https://hupe1980.github.io/agentplane/docs/effects/) |
 | 👤 | **Human oversight on the *call*, not a summary of it** — a task carries the exact tool and arguments about to be dispatched, and a read-only `preview` puts *four thousand records* on the reviewer's screen instead of `older_than: "2024-01-01"` → [worklists](https://hupe1980.github.io/agentplane/docs/plans-cases/#human-tasks) |

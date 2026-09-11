@@ -33,9 +33,9 @@ const TERMS: TableDefinition<(&str, &str), &str> = TableDefinition::new("authori
 /// `revoked` is an explicit flag and **not** a sentinel timestamp. The obvious
 /// encoding — `revoked_at == 0` means live — collides with a real value: the
 /// Unix epoch is a representable instant, so an authority revoked at it read
-/// back as standing. That is not a hypothetical; it is what the first version of
-/// this table did, and the revocation test caught it. A sentinel that overlaps
-/// the domain it guards is a bug waiting for the one caller who uses that value.
+/// back as standing. A sentinel that overlaps the domain it guards is a bug
+/// waiting for the one caller who uses that value, and the revocation test is
+/// what holds this one apart from it.
 type BalanceRow<'a> = (u64, u64, u32, bool, i64, &'a str);
 
 /// `(tenant, authority) -> `[`BalanceRow`].

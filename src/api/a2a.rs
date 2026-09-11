@@ -146,6 +146,16 @@ pub mod code {
     /// operator's reason: the counterparty gets the outcome, not the plane's
     /// internals.
     pub const HALTED: i32 = -32030;
+
+    /// This instance is shutting down and did not admit the request.
+    ///
+    /// The third admission refusal, under the same identification rule — the
+    /// `(domain, reason)` pair, never the numeral. It is its own code because
+    /// it is the only one of the three a caller clears by *moving*: a ceiling
+    /// and a halt are facts about the agent, and this is a fact about one
+    /// process serving it. A peer told to back off waits out a window it never
+    /// needed; a peer told to abandon gives up on an agent that is fine.
+    pub const DRAINING: i32 = -32031;
 }
 
 /// Actions this surface asks the policy engine about.
@@ -187,6 +197,14 @@ const QUOTA_EXHAUSTED_MESSAGE: &str =
 /// no scope: an incident's description is for the operator's own worklist.
 const HALTED_MESSAGE: &str =
     "this agent is halted by its operator; do not retry until it is lifted";
+
+/// The one sentence a draining instance answers with, beside [`code::DRAINING`].
+///
+/// No hostname, no instance id and no grace period: which process is going away
+/// is this deployment's topology, and a caller's correct behaviour does not
+/// depend on knowing it.
+const DRAINING_MESSAGE: &str =
+    "this instance is shutting down and did not take the request on; retry";
 
 /// Which of the two admission refusals a quota error is, on the wire.
 ///
@@ -289,6 +307,16 @@ fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
         // investigates rather than the one they dismiss.
         | RunStatus::Abandoned { .. }
         | RunStatus::Replanning(_) => TaskState::Failed,
+        // Neither is a task, and `REJECTED` is the state that says so: no peer
+        // submitted a sweep or a break-glass crossing, and a run id that
+        // resolves to one is a caller asking about this plane's record of
+        // itself. `FAILED` would claim the agent tried and could not; `CANCELED`
+        // would claim somebody's work was stopped. Both invent a task where
+        // there was none, and a peer reads either as being about *their*
+        // request. Nothing narrows further here on purpose — which of this
+        // plane's internal runs exists is not a peer's question, so the answer
+        // is the same one for a run that does not exist at all.
+        RunStatus::Swept | RunStatus::BrokeGlass { .. } => TaskState::Rejected,
     }
 }
 
@@ -872,6 +900,7 @@ impl RpcError {
         const SELF_DOMAIN: &str = crate::peers::ERROR_DOMAIN;
         const QUOTA_EXHAUSTED_REASON: &str = crate::peers::QUOTA_EXHAUSTED_REASON;
         const HALTED_REASON: &str = crate::peers::HALTED_REASON;
+        const DRAINING_REASON: &str = crate::peers::DRAINING_REASON;
         match self.code {
             code::TASK_NOT_FOUND => Some((A2A, "TASK_NOT_FOUND")),
             code::TASK_NOT_CANCELABLE => Some((A2A, "TASK_NOT_CANCELABLE")),
@@ -882,6 +911,7 @@ impl RpcError {
             code::VERSION_NOT_SUPPORTED => Some((A2A, "VERSION_NOT_SUPPORTED")),
             code::QUOTA_EXHAUSTED => Some((SELF_DOMAIN, QUOTA_EXHAUSTED_REASON)),
             code::HALTED => Some((SELF_DOMAIN, HALTED_REASON)),
+            code::DRAINING => Some((SELF_DOMAIN, DRAINING_REASON)),
             _ => None,
         }
     }
@@ -1760,6 +1790,9 @@ async fn stream_method(
                 Err(crate::core::RuntimeError::QuotaExceeded(e)) => {
                     return Err(quota_refusal(&e));
                 }
+                Err(crate::core::RuntimeError::Draining) => {
+                    return Err(RpcError::new(code::DRAINING, DRAINING_MESSAGE));
+                }
                 Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
             }
         }
@@ -2132,6 +2165,9 @@ async fn send_message(
                 | crate::core::RuntimeError::Delegation(_),
             ) => Ok(json!({ "message": declined(&skill) })),
             Err(crate::core::RuntimeError::QuotaExceeded(e)) => Err(quota_refusal(&e)),
+            Err(crate::core::RuntimeError::Draining) => {
+                Err(RpcError::new(code::DRAINING, DRAINING_MESSAGE))
+            }
             Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
                 Err(RpcError::new(code::TASK_NOT_FOUND, why))
             }
@@ -2162,6 +2198,12 @@ async fn send_message(
         // the spec's `-32004` and why the quota arithmetic stays out of it.
         Err(crate::core::RuntimeError::QuotaExceeded(e)) => {
             return Err(quota_refusal(&e));
+        }
+        // Not a fault and not back-pressure from the agent: this process is
+        // going away and admitted nothing. A caller retrying now reaches a
+        // different instance and is served.
+        Err(crate::core::RuntimeError::Draining) => {
+            return Err(RpcError::new(code::DRAINING, DRAINING_MESSAGE));
         }
         Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
             return Err(RpcError::new(code::TASK_NOT_FOUND, why));
@@ -2857,6 +2899,10 @@ pub(super) fn sealed_state(outcome: &str) -> TaskState {
         "succeeded" => TaskState::Completed,
         "cancelled" => TaskState::Canceled,
         "suspended" => TaskState::InputRequired,
+        // Not tasks at all: nobody submitted this plane's record of a sweep or
+        // of an operator crossing a tenant boundary. `state_of` decides that
+        // and this agrees, which is the direction the test beside it enforces.
+        "swept" | "broke-glass" => TaskState::Rejected,
         _ => TaskState::Failed,
     }
 }
@@ -3263,7 +3309,7 @@ mod state_agreement_tests {
         let statuses = crate::runtime::every_status();
         assert_eq!(
             statuses.len(),
-            8,
+            10,
             "a RunStatus variant was added or removed — decide which A2A state it \
              surfaces as, in `state_of` and in `sealed_state` both"
         );

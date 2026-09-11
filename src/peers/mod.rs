@@ -75,6 +75,15 @@ pub const QUOTA_EXHAUSTED_REASON: &str = "QUOTA_EXHAUSTED";
 /// teach every peer to hammer the one refusal that means stop.
 pub const HALTED_REASON: &str = "HALTED";
 
+/// The reason token a draining instance answers with, inside [`ERROR_DOMAIN`].
+///
+/// The third of the three admission refusals, and the only one a caller can act
+/// on *immediately*: a ceiling clears when a run finishes on that plane, a halt
+/// clears when a person lifts it, and this one clears the moment the caller
+/// reaches a different instance. Answered under the quota token it would teach a
+/// peer to wait out a back-off for a refusal that a retry now would pass.
+pub const DRAINING_REASON: &str = "DRAINING";
+
 /// Parse an A2A protocol version into the `Major.Minor` pair used for
 /// negotiation.
 ///

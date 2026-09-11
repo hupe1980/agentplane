@@ -575,6 +575,16 @@ fn classify_rpc(peer: &PeerId, e: &RpcError) -> PeerError {
             peer: peer.clone(),
             detail: format!("{detail} — the peer is halted by its operator; do not retry"),
         },
+        // The instance that answered is shutting down and admitted nothing. The
+        // disposition is the third one's again — nothing was performed — and
+        // the advice differs from both: a retry now reaches a different process
+        // and is served, so there is no window to wait out.
+        -32031 if e.names_reason(super::ERROR_DOMAIN, super::DRAINING_REASON) => {
+            PeerError::Refused {
+                peer: peer.clone(),
+                detail: format!("{detail} — that instance is shutting down; retry now"),
+            }
+        }
         // `-32603 Internal error` and anything unrecognised. The request
         // arrived; whether the peer acted is exactly what it is not saying.
         // Calling this a refusal is how a half-finished transfer is sent again

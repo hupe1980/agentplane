@@ -916,8 +916,12 @@ impl StepCtx<'_> {
                     // charged on the first. A ceiling that checks a write and
                     // then counts it on neither path is a ceiling a group of
                     // fifty members walks straight through.
+                    //
+                    // Zero egress, for the reason the gate below states: a
+                    // member writes to a database this deployment owns, in the
+                    // transaction that commits this run's own records.
                     Some(crate::journal::EffectReplay::Done { spend, .. }) => {
-                        self.bill_replayed(spend);
+                        self.bill_replayed(spend, 0);
                         continue;
                     }
                     // The same rule as the ordinary dispatch loop, through the
@@ -933,7 +937,7 @@ impl StepCtx<'_> {
                         refusal @ (crate::journal::EffectReplay::Refused { .. }
                         | crate::journal::EffectReplay::Denied { .. }),
                     ) => {
-                        self.replayed_refusal(key, refusal).await?;
+                        self.replayed_refusal(key, refusal, 0).await?;
                     }
                     // An atomic member's records commit with its transaction,
                     // so the only things history can hold under its key are
@@ -973,7 +977,12 @@ impl StepCtx<'_> {
             // opening a transaction to discover the caller had no right to it
             // would be a rollback where a refusal would do, and the journaled
             // denial would land after work the run was never allowed to start.
-            self.gate(key, &descriptor, true, None, None).await?;
+            //
+            // Zero against the egress ceiling, and that is a judgement rather
+            // than an omission: a member is a write to a co-located database in
+            // the transaction that commits this run's own records. That ceiling
+            // bounds what left the deployment, and nothing here did.
+            self.gate(key, &descriptor, true, None, None, 0).await?;
             keyed.push((key, member));
         }
         if keyed.is_empty() {

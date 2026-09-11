@@ -514,6 +514,7 @@ verbatim, because re-admitting it would dispatch into recorded history.
 | `max_denials` | Yes — each policy refusal is counted |
 | `max_parallel_steps` | Yes — the ready set is dispatched no wider |
 | `max_wallclock_secs` | Opt-in; costs one journaled clock read per step boundary, and the reading has to be journaled or the verdict changes every time you look |
+| `max_egress_bytes` | Yes, and **exactly** — the outbound size is known before dispatch, so the call that would cross the ceiling is the call refused |
 
 A ready set runs concurrently, which is what the two "counted in advance"
 answers have to survive. A step is counted when it finishes and a whole wave is

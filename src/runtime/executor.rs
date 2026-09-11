@@ -318,6 +318,10 @@ impl std::fmt::Display for RunFailure {
             RunStatus::Cancelled { actor, reason } => {
                 write!(f, "{actor} cancelled it — {reason}")
             }
+            RunStatus::Swept => write!(f, "the plane recorded a pass over its own state"),
+            RunStatus::BrokeGlass { actor, reason } => {
+                write!(f, "{actor} crossed into this tenant — {reason}")
+            }
             RunStatus::Abandoned { actor, reason } => {
                 write!(
                     f,
@@ -386,6 +390,26 @@ pub enum RunStatus {
         actor: String,
         reason: String,
     },
+    /// A pass this plane made over its own state, journaled as a run of its own.
+    ///
+    /// The sweep records what it decided — which obligations breached, which
+    /// tasks it escalated, which runs it took over — rather than logging it, so
+    /// *who decided what* is answerable from the chain six weeks later. It is
+    /// not `Succeeded` because nothing asked for it and there is no answer to
+    /// hand back: a sweep is the plane reporting on itself.
+    Swept,
+    /// An operator crossed into this tenant deliberately, and the reason they
+    /// gave for it.
+    ///
+    /// The one exception to tenant isolation, and the exception's entire value
+    /// is this record. Both halves are carried because an incident review asks
+    /// two questions and neither is worth less than the other: `actor` is read
+    /// back from the crossing record, `reason` from the conclusion, and a
+    /// crossing cannot be recorded without one.
+    BrokeGlass {
+        actor: String,
+        reason: String,
+    },
 }
 
 impl RunStatus {
@@ -408,12 +432,13 @@ impl RunStatus {
     pub fn reason(&self) -> Option<std::borrow::Cow<'_, str>> {
         use std::borrow::Cow;
         match self {
-            Self::Succeeded => None,
+            Self::Succeeded | Self::Swept => None,
             Self::Failed(reason)
             | Self::Quarantined(reason)
             | Self::Replanning(reason)
             | Self::Cancelled { reason, .. }
-            | Self::Abandoned { reason, .. } => Some(Cow::Borrowed(reason.as_str())),
+            | Self::Abandoned { reason, .. }
+            | Self::BrokeGlass { reason, .. } => Some(Cow::Borrowed(reason.as_str())),
             Self::Suspended(reason) => Some(Cow::Owned(reason.to_string())),
             Self::Exhausted(exceeded) => Some(Cow::Owned(exceeded.to_string())),
         }
@@ -443,6 +468,30 @@ impl RunStatus {
             Self::Replanning(_) => "replanning",
             Self::Cancelled { .. } => "cancelled",
             Self::Abandoned { .. } => "abandoned",
+            Self::Swept => super::sweeper::SWEEP_OUTCOME,
+            Self::BrokeGlass { .. } => BREAK_GLASS_OUTCOME,
+        }
+    }
+
+    /// Who brought this run to this state, where a person did.
+    ///
+    /// `None` for every ending the runtime reached on its own, which is most of
+    /// them. One accessor rather than three `matches!` at each surface, because
+    /// *who* is the question an operator asks immediately after *what* — and a
+    /// surface that reads the reason and drops the actor answers half of it.
+    #[must_use]
+    pub fn actor(&self) -> Option<&str> {
+        match self {
+            Self::Cancelled { actor, .. }
+            | Self::Abandoned { actor, .. }
+            | Self::BrokeGlass { actor, .. } => Some(actor.as_str()),
+            Self::Succeeded
+            | Self::Failed(_)
+            | Self::Suspended(_)
+            | Self::Exhausted(_)
+            | Self::Quarantined(_)
+            | Self::Replanning(_)
+            | Self::Swept => None,
         }
     }
 
@@ -482,7 +531,11 @@ impl RunStatus {
     pub fn seals(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. }
+            Self::Succeeded
+                | Self::Cancelled { .. }
+                | Self::Abandoned { .. }
+                | Self::Swept
+                | Self::BrokeGlass { .. }
         )
     }
 }
@@ -493,10 +546,11 @@ impl RunStatus {
 /// query — a backlog listing is a range read rather than a table scan — so any
 /// caller that wants every sealed run has to name the outcomes one by one. This
 /// is the list to name them from, and it lives beside [`RunStatus::seals`]
-/// because it is the same rule in its other spelling: the statuses that seal,
-/// plus the two sealed conclusions that are not run statuses at all — a sweep
-/// (`swept`) and a break-glass crossing (`broke-glass`), each sealed at birth
-/// with no goal to have succeeded or failed at.
+/// because it is the same rule in its other spelling: exactly the statuses that
+/// seal, with no exception clause. A sweep (`swept`) and a break-glass crossing
+/// (`broke-glass`) are sealed at birth with no goal to have succeeded or failed
+/// at, and they are statuses all the same — an ending this plane writes and its
+/// own reader cannot name is an ending it reports as unrecognised.
 ///
 /// It lived in the CLI first, as string literals — two implementations of one
 /// rule, where a new sealing outcome would have been exported by nobody and
@@ -780,6 +834,15 @@ pub struct Runtime {
     /// is anchored nowhere outside itself, which is a deployment decision and
     /// is reported as one by `audit`.
     witnesses: Option<Arc<Witnessing>>,
+    /// The runs this instance put on a background task, and the gate that
+    /// closes admission when it is asked to stop.
+    ///
+    /// Process-local on purpose: it answers *what is this instance executing
+    /// right now*, which no other instance can be told and no store can hold.
+    /// The durable cousin is [`Runtime::set_halt`], which stops a tenant
+    /// everywhere and survives a restart — a different question with a
+    /// different audience.
+    inflight: Arc<super::drain::InFlight>,
 }
 
 /// The witness set and the bar a submission round is held to.
@@ -796,6 +859,25 @@ pub(crate) struct Witnessing {
     /// re-submits once and the protocol absorbs it; a durable copy would be a
     /// second answer to a question the counterparty already answers.
     pub(crate) submitted: std::sync::atomic::AtomicU64,
+}
+
+/// Where a run is entering this plane from.
+///
+/// The one thing the drain gate needs to know, and it cannot be derived at the
+/// gate: by the time admission runs, an agent commissioning another one and a
+/// peer sending a message look identical. The difference is whose work it is —
+/// a commission is a step of a run this process is *already* executing and has
+/// promised to finish, so refusing it would make the drain manufacture the
+/// undecided effects it exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// A caller outside this process: an embedder, an operator, a peer, a batch
+    /// pass. Refused while draining.
+    Outside,
+    /// A run already executing here, ordering work it needs in order to
+    /// conclude. Never refused for draining — the parent is what the drain is
+    /// waiting for.
+    Nested,
 }
 
 /// A backend that implements every store a full plane runs on.
@@ -1509,6 +1591,57 @@ impl Runtime {
         quotas.halts().await.map_err(RuntimeError::Store)
     }
 
+    /// Stop this instance taking on work, then wait for what it is already
+    /// doing.
+    ///
+    /// A process killed mid-step leaves an announced effect with no terminal
+    /// record, so its declared [`Recovery`](crate::core::Recovery) has to
+    /// decide whether it happened — the right answer to an accident, and an
+    /// expensive one to schedule on every deploy.
+    ///
+    /// Admission closes **first**: every later [`run`](Self::run),
+    /// [`spawn`](Self::spawn) and plan is refused
+    /// [`RuntimeError::Draining`](crate::core::RuntimeError::Draining), leaving
+    /// no lease, no slot and no journal. Then this waits up to `grace` for the
+    /// runs it put on a background task to reach a journaled resting point.
+    /// Closing first is what makes the answer worth having — a wait alone
+    /// reports about an instant — and it is also the only signal a long-lived
+    /// read gets, so an open A2A subscription ends rather than holding a
+    /// graceful shutdown for as long as the run it watches.
+    ///
+    /// **Run it beside a server's own graceful shutdown, not after it** —
+    /// `tokio::join!` of the two. Serialising deadlocks one on the other in
+    /// whichever order you pick: a run awaited inside a request handler is
+    /// finished by the server, and an open subscription is ended by this.
+    ///
+    /// Three things it deliberately does not do. It does not wait for runs on
+    /// somebody else's task; those belong to that caller's own shutdown. It
+    /// does not gate resumes or an agent commissioning another one — both
+    /// continue work this plane already owns, and a commission is a step of a
+    /// run this is waiting for. And it does not hand back the leases of runs it
+    /// did not finish: a release says takeover is safe, and for a run still
+    /// inside `perform` the next owner would re-perform the call beside the one
+    /// in flight. Left to expire, the lease is the signal the recovery sweep
+    /// reads as *an instance died holding this run* — which is what a
+    /// drained-out run is.
+    ///
+    /// Idempotent: draining an instance that is already draining waits again.
+    pub async fn drain(&self, grace: std::time::Duration) -> super::DrainReport {
+        self.inflight.drain(grace).await
+    }
+
+    /// Whether this instance has stopped admitting runs.
+    ///
+    /// For an embedder whose server keeps its listener open while it drains and
+    /// therefore needs something to answer a readiness probe with. The shipped
+    /// server needs none: it closes its listeners first, so a probe that
+    /// connects already fails — which is why this crate's HTTP surface has no
+    /// `/health` route to flip. See [`crate::api`] on why it has none at all.
+    #[must_use]
+    pub fn is_draining(&self) -> bool {
+        self.inflight.is_draining()
+    }
+
     /// # Errors
     ///
     /// If the store is unreachable.
@@ -2170,7 +2303,8 @@ impl Runtime {
     /// # Errors
     ///
     /// [`RuntimeError::NoProvider`] when no skill provides `target`, and
-    /// whatever admission refuses — policy, quota, a halted tenant, a lease.
+    /// whatever admission refuses — policy, quota, a halted tenant, an instance
+    /// draining, a lease.
     pub async fn run(
         &self,
         target: &str,
@@ -2222,12 +2356,29 @@ impl Runtime {
         let capability = first_capability(&skill.descriptor());
 
         let run = RunId::generate();
+        // Registered before admission, not after. Admission is several store
+        // writes, and a drain beginning inside them would take its snapshot
+        // without this run, report a complete stop, and let the process exit
+        // while the run was still being admitted. Registered first, both orders
+        // work out: a drain that starts after this waits for the run, and one
+        // that starts before it is seen by the gate inside `admit_only`, which
+        // refuses and drops the ticket on the way out.
+        let ticket = self.inflight.enter(run);
         let admitted = self
-            .admit_only(run, PlanIR::single(capability), input, terms)
+            .admit_only(
+                run,
+                PlanIR::single(capability),
+                input,
+                terms,
+                Entry::Outside,
+            )
             .await?;
 
         let plane = Arc::clone(self);
-        tokio::spawn(async move { plane.execute_admitted(admitted).await });
+        tokio::spawn(async move {
+            let _ticket = ticket;
+            plane.execute_admitted(admitted).await
+        });
         Ok(run)
     }
 
@@ -2712,8 +2863,35 @@ impl Runtime {
         input: Tainted<Value>,
         terms: RunTerms,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan_as(RunId::generate(), plan, input, terms)
+        self.admit_plan_as(RunId::generate(), plan, input, terms, Entry::Outside)
             .await
+    }
+
+    /// Admit the run one already-executing run ordered from another agent.
+    ///
+    /// Apart from every other entry point for one reason: a commission is a
+    /// *step* of a run this process is executing, so the drain gate must not
+    /// see it. A drain that refused here would fail the commissioning step of
+    /// exactly the runs it is waiting for — and that step's failure is
+    /// `Interrupted`, the in-doubt classification, because a commissioning
+    /// caller cannot know what the agent it ordered from managed to do. The
+    /// drain would manufacture the state it exists to prevent.
+    pub(crate) async fn commission_run(
+        &self,
+        target: &str,
+        input: Tainted<Value>,
+        terms: RunTerms,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let skill = self.resolve(target)?;
+        let capability = first_capability(&skill.descriptor());
+        self.admit_plan_as(
+            RunId::generate(),
+            PlanIR::single(capability),
+            input,
+            terms,
+            Entry::Nested,
+        )
+        .await
     }
 
     /// Record the chain this run acts under, beside the plan it authorizes.
@@ -2923,7 +3101,15 @@ impl Runtime {
         plan: PlanIR,
         input: Tainted<Value>,
         terms: RunTerms,
+        entry: Entry,
     ) -> Result<Admitted, RuntimeError> {
+        // First, and before the plan is even read: a draining instance is going
+        // away, and everything below this line takes on work it may not be able
+        // to finish. Refusing here leaves no lease, no quota slot and no
+        // journal — the same nothing a policy denial leaves.
+        if entry == Entry::Outside && self.inflight.is_draining() {
+            return Err(RuntimeError::Draining);
+        }
         crate::plan::validate(&plan, &self.contract())
             .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
 
@@ -3288,8 +3474,9 @@ impl Runtime {
         plan: PlanIR,
         input: Tainted<Value>,
         terms: RunTerms,
+        entry: Entry,
     ) -> Result<RunOutcome, RuntimeError> {
-        let admitted = self.admit_only(run, plan, input, terms).await?;
+        let admitted = self.admit_only(run, plan, input, terms, entry).await?;
         self.execute_admitted(admitted).await
     }
 
@@ -5398,7 +5585,14 @@ fn severity(status: &RunStatus) -> u8 {
         // A replan request is the weakest signal in a batch: a sibling that
         // failed outright has already decided the run, and re-planning around a
         // failure is not what the requesting step was asking for.
-        RunStatus::Replanning(_) | RunStatus::Suspended(_) | RunStatus::Succeeded => 0,
+        // Neither is reachable here at all — a sweep and a crossing are sealed
+        // at birth with no steps to compete — and both are named for the reason
+        // abandonment is: a rank given by omission is a decision nobody made.
+        RunStatus::Replanning(_)
+        | RunStatus::Suspended(_)
+        | RunStatus::Succeeded
+        | RunStatus::Swept
+        | RunStatus::BrokeGlass { .. } => 0,
     }
 }
 
@@ -6517,8 +6711,17 @@ fn recorded_status(
             actor: recorded_decider(records).unwrap_or_else(|| "unknown".into()),
             reason: said(),
         },
+        super::sweeper::SWEEP_OUTCOME => RunStatus::Swept,
+        BREAK_GLASS_OUTCOME => RunStatus::BrokeGlass {
+            actor: recorded_crosser(records).unwrap_or_else(|| "unknown".into()),
+            reason: said(),
+        },
         // Fail closed, as the resume path does: a conclusion this build cannot
-        // interpret is not permission to treat the run as ordinary.
+        // interpret is not permission to treat the run as ordinary. Every
+        // outcome this build *writes* has an arm above, and a guard holds the
+        // two lists together — an ending answered here as unrecognised would be
+        // this plane calling its own record foreign, and the surface it reaches
+        // is the one an operator uses to read a break-glass crossing.
         other => RunStatus::Quarantined(format!(
             "recorded as '{other}', which this build does not recognise"
         )),
@@ -6545,6 +6748,20 @@ fn recorded_canceller(records: &[Record]) -> Option<String> {
 fn recorded_decider(records: &[Record]) -> Option<String> {
     records.iter().rev().find_map(|r| match r.kind() {
         RecordKind::QuarantineDecided { decider, .. } => Some(decider.clone()),
+        _ => None,
+    })
+}
+
+/// Who crossed into this tenant, read back from the chain.
+///
+/// The third of the family, and the one the record exists for. A crossing's
+/// conclusion carries the reason the operator had to give; the operator is on
+/// the crossing record itself, and an incident review that can see the reason
+/// and not the person has been told half of what the control was written to
+/// capture.
+fn recorded_crosser(records: &[Record]) -> Option<String> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::BreakGlass { actor, .. } => Some(actor.clone()),
         _ => None,
     })
 }
@@ -8132,6 +8349,7 @@ impl RuntimeBuilder {
         Ok(Arc::new_cyclic(|self_ref| Runtime {
             self_ref: self_ref.clone(),
             witnesses,
+            inflight: Arc::default(),
             signer: self.signer,
             store: self.store,
             skills,
@@ -8698,6 +8916,11 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
             actor: "ops".into(),
             reason: "nobody could establish what happened".into(),
         },
+        RunStatus::Swept,
+        RunStatus::BrokeGlass {
+            actor: "ops".into(),
+            reason: "INC-42".into(),
+        },
     ]
 }
 
@@ -8730,7 +8953,7 @@ mod resume_agreement_tests {
         let statuses = every_status();
         assert_eq!(
             statuses.len(),
-            8,
+            10,
             "a RunStatus variant was added or removed — decide whether it seals \
              and whether a resume may continue from it, then update this list"
         );
@@ -8787,13 +9010,55 @@ mod resume_agreement_tests {
                 status.as_str()
             );
         }
-        for special in ["swept", "broke-glass"] {
-            assert!(
-                super::SEALED_OUTCOMES.contains(&special),
-                "'{special}' is sealed at birth by the sweeper or a break-glass \
-                 crossing and must be exportable"
+    }
+
+    /// **Every outcome this build writes is one its own reader recognises.**
+    ///
+    /// The reader is a `match` over `&str` with a catch-all, so it goes on
+    /// compiling forever while the writer's list grows — and the catch-all is
+    /// not benign: it answers `Quarantined`, so a run this plane sealed itself
+    /// reads back as *the runtime could not decide what happened*. Two endings
+    /// sat there, `swept` and `broke-glass`, and a break-glass crossing — the
+    /// one control whose entire content is who crossed and why — answered the
+    /// operator surface with the words "this build does not recognise it" in
+    /// place of the reason.
+    ///
+    /// Held from the writer's side, because that is the list that grows: every
+    /// spelling in `OUTCOMES_OF_RECORD` must round-trip to a status that spells
+    /// itself the same way back.
+    #[test]
+    fn every_outcome_this_build_writes_is_one_it_can_read_back() {
+        for outcome in super::OUTCOMES_OF_RECORD {
+            let status = super::recorded_status(outcome, Some("why"), None, &[]);
+            assert_eq!(
+                &status.as_str(),
+                outcome,
+                "this build seals runs as '{outcome}' and reads that back as \
+                 '{}' — a catch-all answering `Quarantined` about a record this \
+                 plane wrote itself",
+                status.as_str()
             );
         }
+    }
+
+    /// A crossing answers with the operator's reason, not with a diagnostic.
+    ///
+    /// The half the round-trip above cannot see: `as_str` agreeing says the
+    /// vocabulary lines up, and says nothing about whether the sentence an
+    /// incident review reads is the one the operator gave.
+    #[test]
+    fn a_break_glass_crossing_reports_the_reason_it_was_given() {
+        let status = super::recorded_status(
+            super::BREAK_GLASS_OUTCOME,
+            Some("INC-42: stuck settlement"),
+            None,
+            &[],
+        );
+        assert_eq!(
+            status.reason().as_deref(),
+            Some("INC-42: stuck settlement"),
+            "a crossing must surface the reason it refused to be recorded without"
+        );
     }
 
     /// The offline sweep covers every ending, plus the backlog that is not one.

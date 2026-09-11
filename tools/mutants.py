@@ -47,12 +47,21 @@ import functools
 import os
 import pathlib
 import re
+import signal
 import subprocess
 import shutil
 import sys
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# How long one cargo invocation may take before it is killed as hung.
+#
+# Generous, because a cold feature set builds the dependency graph before it
+# runs anything and the whole-suite fallback runs every test in the crate. It is
+# a bound on *infinite*, not a performance budget: the slowest measured group is
+# under three minutes per mutation.
+TIMEOUT_SECONDS = int(os.environ.get("MUTANTS_TIMEOUT_SECS", "900"))
 
 # name -> (file, test that must fail, description, find, replace)
 #
@@ -63,12 +72,22 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "a_committed_but_lost_effect_record_is_not_performed_again",
         "replay re-performs a completed effect instead of reading it back",
-        """                self.replayed_done(&descriptor.kind, attempt, spend);
+        """                self.replayed_done(
+                    &descriptor.kind,
+                    attempt,
+                    spend,
+                    Self::outbound_size(effect),
+                );
                 Ok(Replayed::Answered(
                     serde_json::from_value(output)?,
                     declared,
                 ))""",
-        """                self.replayed_done(&descriptor.kind, attempt, spend);
+        """                self.replayed_done(
+                    &descriptor.kind,
+                    attempt,
+                    spend,
+                    Self::outbound_size(effect),
+                );
                 let _ = (output, declared);
                 Ok(Replayed::Live)""",
     ),
@@ -76,9 +95,19 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/ctx.rs",
         "strict_replay_does_not_read_media_blobs_or_call_the_model",
         "strict replay re-materializes a media blob and calls the model again",
-        """                self.replayed_done(&descriptor.kind, attempt, spend);
+        """                self.replayed_done(
+                    &descriptor.kind,
+                    attempt,
+                    spend,
+                    Self::outbound_size(effect),
+                );
                 Ok(Replayed::Answered(""",
-        """                self.replayed_done(&descriptor.kind, attempt, spend);
+        """                self.replayed_done(
+                    &descriptor.kind,
+                    attempt,
+                    spend,
+                    Self::outbound_size(effect),
+                );
                 if descriptor.kind == "model.complete" {
                     let _ = effect.perform().await;
                 }
@@ -3367,7 +3396,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                         refusal @ (crate::journal::EffectReplay::Refused { .. }
                         | crate::journal::EffectReplay::Denied { .. }),
                     ) => {
-                        self.replayed_refusal(key, refusal).await?;
+                        self.replayed_refusal(key, refusal, 0).await?;
                     }""",
         """                    Some(
                         refusal @ (crate::journal::EffectReplay::Refused { .. }
@@ -3674,7 +3703,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "path that *commits* is the only one policy, the manifest and the budget "
         "all miss — and being wrapped in a transaction makes it reliable rather "
         "than authorised",
-        "            self.gate(key, &descriptor, true, None, None).await?;",
+        "            self.gate(key, &descriptor, true, None, None, 0).await?;",
         "",
     ),
     "ARewrittenMemoryIsOnlyAFailure": (
@@ -4161,6 +4190,69 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "peer backs off and retries the one refusal that means stop",
         "        crate::quota::QuotaError::Halted { .. } => RpcError::new(code::HALTED, HALTED_MESSAGE),",
         "        crate::quota::QuotaError::Halted { .. } => RpcError::new(code::QUOTA_EXHAUSTED, QUOTA_EXHAUSTED_MESSAGE),",
+    ),
+    "ADrainingPlaneStillAdmits": (
+        "src/runtime/executor.rs",
+        "a_draining_instance_admits_nothing_and_writes_nothing",
+        "the admission gate a drain closes is never consulted, so an instance "
+        "that has announced it is going away keeps taking on runs it will not "
+        "finish — and the drain report it hands back is true for an instant",
+        "        if entry == Entry::Outside && self.inflight.is_draining() {",
+        "        if false && entry == Entry::Outside && self.inflight.is_draining() {",
+    ),
+    "ADrainRefusesACommission": (
+        "src/runtime/executor.rs",
+        "a_drain_does_not_refuse_the_commission_of_a_run_it_is_waiting_for",
+        "the drain gate sees commissions as well as callers, so a run the drain "
+        "is waiting for fails its own delegating step — and that failure is "
+        "in-doubt, so the drain manufactures the state it exists to prevent",
+        "        if entry == Entry::Outside && self.inflight.is_draining() {",
+        "        if self.inflight.is_draining() {",
+    ),
+    "ADrainForgetsWhatItDidNotFinish": (
+        "src/runtime/drain.rs",
+        "a_run_the_grace_period_did_not_cover_is_named_and_keeps_its_lease",
+        "a drain that ran out of time reports an empty unfinished list, so a "
+        "deploy that cut runs short looks exactly like one that did not and "
+        "nobody learns the grace period is too short",
+        "            unfinished: self.snapshot(),",
+        "            unfinished: Vec::new(),",
+    ),
+    "ADrainDoesNotWait": (
+        "src/runtime/drain.rs",
+        "a_drain_waits_for_a_background_run_to_reach_its_conclusion",
+        "a drain closes admission and returns without waiting, so every run in "
+        "flight is cut at the same point a crash would cut it — the whole "
+        "difference between a scheduled stop and an accident",
+        "            if self.running.lock().expect(\"in-flight runs\").is_empty() {\n                break;\n            }",
+        "            if true {\n                break;\n            }",
+    ),
+    "ADrainWearsTheBackPressureCode": (
+        "src/api/a2a.rs",
+        "a_draining_instance_is_neither_a_ceiling_nor_a_halt",
+        "a draining instance answers a peer with QUOTA_EXHAUSTED, so a caller "
+        "waits out a back-off window for a refusal a retry now would pass",
+        "        Err(crate::core::RuntimeError::Draining) => {\n            return Err(RpcError::new(code::DRAINING, DRAINING_MESSAGE));\n        }",
+        "        Err(crate::core::RuntimeError::Draining) => {\n            return Err(RpcError::new(code::QUOTA_EXHAUSTED, QUOTA_EXHAUSTED_MESSAGE));\n        }",
+    ),
+    "AStreamOutlivesTheInstanceServingIt": (
+        "src/api/a2a_stream.rs",
+        "a_stream_ends_when_the_instance_is_draining",
+        "a subscription goes on polling while this instance is stopping, so a "
+        "graceful shutdown waits for a connection that lasts as long as the run "
+        "it watches — and an ordinary deploy hangs until the supervisor kills "
+        "it, which is the one stop nothing can drain",
+        "            if runtime.is_draining() {\n                return;\n            }",
+        "            if false {\n                return;\n            }",
+    ),
+    "ADrainingPeerIsAnUnknownFault": (
+        "src/peers/a2a.rs",
+        "a_draining_peer_is_refused_rather_than_left_in_doubt",
+        "the client does not recognise a peer's marked drain, so it falls to "
+        "the unknown-fault arm as InDoubt — and a mutating call that never "
+        "left is treated as one that may have landed",
+        "        -32031 if e.names_reason(super::ERROR_DOMAIN, super::DRAINING_REASON) => {",
+        "        -32031 if false && e.names_reason(super::ERROR_DOMAIN, super::DRAINING_REASON) => {",
     ),
     "APeersHaltIsAnUnknownFault": (
         "src/peers/a2a.rs",
@@ -5867,9 +5959,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "quarantined right now* — and a default-deny engine then refuses the "
         "backlog that exists so a quarantine reaches somebody",
         """        RUN_READ,
+        RUN_HISTORY,
         RUN_LIST,
         RUN_CANCEL,""",
         """        RUN_READ,
+        RUN_HISTORY,
         RUN_CANCEL,""",
     ),
     "EscalatedCasesAreNotListable": (
@@ -6181,12 +6275,85 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the history past the leaf a checkpoint attests",
         """        matches!(
             self,
-            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. }
+            Self::Succeeded
+                | Self::Cancelled { .. }
+                | Self::Abandoned { .. }
+                | Self::Swept
+                | Self::BrokeGlass { .. }
         )""",
         """        matches!(
             self,
-            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. } | Self::Failed(_)
+            Self::Succeeded
+                | Self::Cancelled { .. }
+                | Self::Abandoned { .. }
+                | Self::Swept
+                | Self::BrokeGlass { .. }
+                | Self::Failed(_)
         )""",
+    ),
+    "ARunsJournalRidesTheStatusVerb": (
+        "src/api/mod.rs",
+        "a_denying_policy_stops_every_route_before_it_touches_anything",
+        "reading a run's whole journal is authorized under the status view's "
+        "verb, so every deployment that granted an on-call rota `run.read` "
+        "silently also granted them every input, model exchange and argument "
+        "the run sent",
+        """    let s = api.gate(&headers, action::RUN_HISTORY, &run).await?;""",
+        """    let s = api.gate(&headers, action::RUN_READ, &run).await?;""",
+    ),
+    "AnEgressCeilingOvershoots": (
+        "src/core/budget.rs",
+        "an_egress_ceiling_refuses_the_call_that_would_cross_it",
+        "the egress ceiling is compared like a metered one — against what has "
+        "already been sent rather than what this call would reach — so the "
+        "effect that crosses it is sent and only the next one is refused, "
+        "which is an overshoot the size being known in advance makes avoidable",
+        """            && self.consumed.egress_bytes.saturating_add(outbound) > max""",
+        """            && self.consumed.egress_bytes >= max""",
+    ),
+    "AReplayForgetsWhatItSent": (
+        "src/core/budget.rs",
+        "a_strict_replay_reaches_the_same_egress_tally",
+        "a replayed attempt bills its slot and not its outbound size, so a "
+        "resumed run has room under an egress ceiling its own history had "
+        "already reached — the divergence journaled figures exist to prevent",
+        """    pub fn replay_effect(&mut self, spend: Spend, outbound: u64) {
+        self.consumed.effects += 1;
+        self.consumed.spend += spend;
+        self.consumed.egress_bytes = self.consumed.egress_bytes.saturating_add(outbound);""",
+        """    pub fn replay_effect(&mut self, spend: Spend, outbound: u64) {
+        let _ = outbound;
+        self.consumed.effects += 1;
+        self.consumed.spend += spend;""",
+    ),
+    "AReadCostsEgress": (
+        "src/runtime/ctx.rs",
+        "a_zero_egress_ceiling_still_permits_a_read",
+        "an effect that binds no outbound value is counted as having sent "
+        "something, so a run of pure reads exhausts an egress ceiling and the "
+        "one shape the ceiling exists to permit — look but do not send — "
+        "cannot run at all",
+        """        effect.sink_arguments().map_or(0, |args| {""",
+        """        effect.sink_arguments().map_or(1, |args| {""",
+    ),
+    "ABreakGlassCrossingIsUnrecognised": (
+        "src/runtime/executor.rs",
+        "every_outcome_this_build_writes_is_one_it_can_read_back",
+        "the reader loses the arm for a crossing, so a run this plane sealed "
+        "itself reads back as quarantined with 'this build does not recognise "
+        "it' in place of the operator's reason — on the one surface the docs "
+        "send an incident review to",
+        """        BREAK_GLASS_OUTCOME => RunStatus::BrokeGlass {""",
+        """        "never-written-by-this-build" => RunStatus::BrokeGlass {""",
+    ),
+    "ACrossingIsAnonymous": (
+        "src/runtime/executor.rs",
+        "a_break_glass_crossing_names_who_crossed",
+        "the crossing's actor is not read back from the chain, so the control "
+        "whose whole content is who crossed and why answers with the reason and "
+        "nobody's name against it",
+        """        RecordKind::BreakGlass { actor, .. } => Some(actor.clone()),""",
+        """        RecordKind::BreakGlass { .. } => None,""",
     ),
     "UnknownOutcomeResumes": (
         "src/runtime/executor.rs",
@@ -7206,10 +7373,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "admission checks the effect ceiling without taking the slot, so the "
         "window between the verdict and the billing is one every concurrently "
         "dispatched step passes through on the same last slot",
-        """        self.can_admit_effect()?;
+        """        self.can_admit_effect(outbound)?;
         self.consumed.effects += 1;
+        self.consumed.egress_bytes = self.consumed.egress_bytes.saturating_add(outbound);
         Ok(())""",
-        """        self.can_admit_effect()""",
+        """        self.can_admit_effect(outbound)""",
     ),
     "ARecordedFailureCostsTwoSlots": (
         "src/runtime/ctx.rs",
@@ -7315,7 +7483,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "gate took live, so a group is free on the second pass and charged on "
         "the first",
         """                    Some(crate::journal::EffectReplay::Done { spend, .. }) => {
-                        self.bill_replayed(spend);
+                        self.bill_replayed(spend, 0);
                         continue;
                     }""",
         """                    Some(crate::journal::EffectReplay::Done { .. }) => continue,""",
@@ -7326,11 +7494,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a quarantine freezes the journal and publishes a Merkle leaf, so the "
         "one record that answers it can never be appended — the format makes "
         "'a human must resolve it before it can run again' impossible",
-        """            Self::Succeeded | Self::Cancelled { .. } | Self::Abandoned { .. }""",
         """            Self::Succeeded
                 | Self::Cancelled { .. }
                 | Self::Abandoned { .. }
-                | Self::Quarantined(_)""",
+                | Self::Swept""",
+        """            Self::Succeeded
+                | Self::Cancelled { .. }
+                | Self::Abandoned { .. }
+                | Self::Quarantined(_)
+                | Self::Swept""",
     ),
     "AQuarantineNeedsNoAnswerToResume": (
         "src/runtime/executor.rs",
@@ -7862,21 +8034,52 @@ def verify(name: str) -> int:
     env["CARGO_PROFILE_DEV_DEBUG"] = env.get("CARGO_PROFILE_DEV_DEBUG_MUTANTS", "0")
     env["CARGO_PROFILE_TEST_DEBUG"] = env.get("CARGO_PROFILE_TEST_DEBUG_MUTANTS", "0")
 
-    def run(args: list[str]) -> str:
-        proc = subprocess.run(
+    def run(args: list[str]) -> str | None:
+        """Run one cargo invocation, or `None` if it had to be killed.
+
+        A mutation can make a test *hang* rather than fail — remove a gate and
+        the work it was refusing runs, and if that work waits on something the
+        test never supplies, nothing ever returns. Without a bound this blocks
+        until the CI job's own timeout, which names no mutation and reads as
+        infrastructure. Bounded, it is an INCONCLUSIVE verdict pointing at the
+        one mutation to go look at.
+
+        Killed by process group, not by pid: `subprocess`'s own timeout kills
+        cargo and leaves rustc and the test binary running, which is how a
+        "stopped" sweep goes on holding the target lock.
+        """
+        proc = subprocess.Popen(
             ["cargo", "test", *args],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
             cwd=ROOT,
-            check=False,
             env=env,
+            start_new_session=True,
         )
-        return proc.stdout + proc.stderr
+        try:
+            return proc.communicate(timeout=TIMEOUT_SECONDS)[0]
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+            return None
 
     if apply(name) != 0:
         return 2
     try:
         out = run([*selector, test])
+        if out is None:
+            print(
+                f"{name}: INCONCLUSIVE — `{test}` did not finish within "
+                f"{TIMEOUT_SECONDS}s and was killed. A mutation that makes a test "
+                f"hang has proved nothing: the guarantee is unpinned until the "
+                f"test is rewritten to fail rather than block. Raise the bound "
+                f"with MUTANTS_TIMEOUT_SECS only if the test is genuinely slow."
+            )
+            return 2
         if _target_did_not_build(out):
             # The derived feature set does not build the target, which is a
             # defect in this tool or in the test file — never a verdict about
@@ -7897,6 +8100,12 @@ def verify(name: str) -> int:
             # Slow path, and only here: the named test held, so the question is
             # now whether *anything* did.
             out = run(["--all-features", "--no-fail-fast"])
+            if out is None:
+                print(
+                    f"{name}: INCONCLUSIVE — the whole-suite fallback did not "
+                    f"finish within {TIMEOUT_SECONDS}s and was killed."
+                )
+                return 2
     finally:
         revert(name)
 

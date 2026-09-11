@@ -94,11 +94,11 @@ macro_rules! ulid_newtype {
         /// URL, a JSON field, a SIEM — and grepping one against another finds
         /// it whichever way round you do it.
         ///
-        /// That was not always so, and the asymmetry was the kind that costs a
-        /// consumer an afternoon: keys carried the prefix while record payloads
-        /// did not, so the same id was spelled two ways inside one store.
+        /// What this rules out is a store spelling one id two ways — prefixed in
+        /// its keys and bare in its payloads — which costs a consumer an
+        /// afternoon and looks like two ids until it does.
         ///
-        /// [`Deserialize`] and [`parse`](Self::parse) still accept a bare ULID,
+        /// [`Deserialize`] and [`parse`](Self::parse) accept a bare ULID too,
         /// because one arrives from somewhere else often enough. The prefix is
         /// checked rather than stripped blindly, so a `case_…` string is refused
         /// where a [`RunId`] is wanted instead of silently becoming one.

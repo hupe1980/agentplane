@@ -61,6 +61,14 @@ step that did not happen.
 | Detecting removal | A per-plane Merkle log over sealed runs, with inclusion **and consistency** proofs — deleting a whole run is detectable, which a per-run chain alone cannot do |
 | Checkable by someone else | An offline auditor (`audit`) that runs against a store it did not write, and reports what it *could not* check as prominently as what it did |
 | *Which instructions* produced a decision | The system prompt lives inside the digested manifest (`manifest`), so a rewording is a version bump. A prompt composed in the deployer's code has no version at all: it changes in a deploy, the journal faithfully records every run it affected, and nothing connects the two |
+| *How much* left, not only what | `EffectStarted.outbound_bytes` — the canonical size of the value that crossed each sink, beside the label of what crossed it. Volume is the axis a sensitivity label does not have → [volume is not sensitivity](@/docs/security.md#volume-is-not-sensitivity-and-the-journal-records-it) |
+
+**A run refused *before it exists* is deliberately not in the journal**, and an
+evaluator should know where to find it instead: the `agentplane.policy.denials`
+metric, carrying the action. So *how often policy stopped a run from starting* is
+a telemetry question by design rather than by omission — the reasoning, and what
+it would cost to journal it, are under [what no audit can
+answer](@/docs/operations.md#what-no-audit-can-answer-the-runs-that-never-started).
 
 **The limit, stated plainly:** a checkpoint that never leaves the operator's
 store is exactly as trustworthy as the operator. The `Witness` seam enforces the
@@ -104,8 +112,13 @@ about you. See [status](@/docs/status.md).
 | What the agent is, in one reviewable artifact | A manifest declares the prompt, grants, ceilings, models, result shape and oversight, and the runtime **refuses** effects the declaration never named. The A2A Agent Card is derived from the same file, so what a peer is told and what the runtime enforces cannot drift |
 | The version that runs is the version that was reviewed | The registry addresses a manifest by digest, refuses to replace a published version with different content, and lets a caller pin the digest they reviewed — the form that survives the registry itself being compromised |
 | Who published it | A domain-separated publisher attestation, verified on resolve, with publisher reassignment refused. An unsigned publish may adopt its first signature; an existing publisher may not be replaced |
-| Facts a registry entry needs and a manifest could not hold | `metadata.annotations` — business owner, technical owner, risk class, ticket — namespaced, never interpreted by the runtime, and covered by the digest, so changing an owner is a version bump with a reviewer on it rather than an edit in a second system. `agentplane validate --require-annotation KEY` makes a missing one a build failure without the runtime reading any of it |
+| Facts a registry entry needs and a manifest could not hold | `metadata.annotations` — business owner, risk class, ticket — namespaced, never interpreted by the runtime, and covered by the digest |
 | *Which agents does this organisation run* | `Registry::names()`, against a **durable** registry: both shipped stores implement the registry, so the inventory survives the process that published it |
+
+Because annotations are inside the digest, changing an owner is a version bump
+with a reviewer on it rather than an edit in a second system — and
+`agentplane validate --require-annotation KEY` makes a missing one a build
+failure, without the runtime reading any of it.
 
 **The limit, stated plainly:** trust in publisher keys is a deployment decision.
 This crate never mints a key and never decides to trust one — `resolve_verified`
@@ -145,13 +158,12 @@ agentplane verify history.jsonl --checkpoint cp.note   # check a copy, offline
 agentplane restore history.jsonl --store ./rebuilt.redb
 ```
 
-`--checkpoint` is the deletion check, and without it there is none. The Merkle
-root rebuilt from the file can otherwise only be compared with the file's *own
-header* — which whoever dropped a run rewrites too — so the report lists
-deletion under `not_checked` rather than calling the file sound. Pass the
-checkpoint an earlier `audit` printed, or fetch one with `--witness` and
-`--origin`: the point is that it comes from somewhere other than the file being
-checked.
+`--checkpoint` is the deletion check, and without it there is none: a root
+rebuilt from the file proves only that the file agrees with itself, which is
+what an editor who dropped a run also achieves. Supply one an earlier `audit`
+printed, or fetch one with `--witness` and `--origin` — [how the checkpoint is
+obtained](@/docs/operations.md#taking-the-record-away) is what the verdict rests
+on.
 
 Both verbs take a store and nothing else — no manifest, no source tree, no Rust
 toolchain — because that is what an auditor holds. The export is JSON Lines: a
@@ -257,3 +269,12 @@ Three questions worth asking of any tool in this space, including this one:
 3. **What does it refuse to tell you?** The auditor reports skipped checks beside
    findings, and [status](@/docs/status.md) lists what is not built. Anything that
    reports only findings is telling you about its coverage by omission.
+
+Three answers evaluators have had to ask for, collected here because each lives
+on a page you may not have opened:
+
+| Question | Answer |
+|---|---|
+| How much data did a run send? | `EffectStarted.outbound_bytes`, per effect → [volume](@/docs/security.md#volume-is-not-sensitivity-and-the-journal-records-it). `Budget::max_egress_bytes` bounds it, exactly — the size is known before dispatch, so the call that would cross the ceiling is the call refused |
+| How often did policy stop a run from *starting*? | The `agentplane.policy.denials` metric, by action. Not the journal, and [deliberately](@/docs/operations.md#what-no-audit-can-answer-the-runs-that-never-started) |
+| What does `max_denials` actually bound? | The refusals a model can probe — sink refusals, which come back as `REFUSED` and let the loop continue. An engine denial ends the run in that same loop → [what it counts](@/docs/security.md#what-max-denials-counts) |

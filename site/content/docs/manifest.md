@@ -404,6 +404,30 @@ decision that has to be visible — declare `budgets: {}` to mean it.
 | `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes → [what it costs](#wallclock) |
 | `max_denials` | policy refusals, before the run is stopped |
 | `max_parallel_steps` | how many of a plan's ready steps run at once |
+| `max_egress_bytes` | bytes sent **into sinks** — a tool call's arguments, a model call's prompt, a peer call's payload. Reads cost nothing → [volume](#egress) |
+
+#### The one ceiling on *how much left* {#egress}
+
+Every other ceiling here bounds **work**: steps, calls, tokens, money, time. An
+extraction sized just under any of them passes, because a label answers *what may
+this value touch* and never *how much of it went*. `max_egress_bytes` bounds the
+quantity.
+
+It is the only ceiling that is **exact**. A token cost is unknown until the call
+returns, so those refuse once consumption has reached the limit and the run
+overshoots by one operation; an outbound size is in hand before dispatch, so the
+effect that would cross the ceiling is the effect refused and nothing over the
+limit is ever sent. The refusal names what the call would have sent, so you can
+tell a ceiling that is too low from one call that is too big.
+
+`0` is meaningful, like `max_replans` and `max_denials`: it says this agent may
+read and may not send.
+
+It is a ceiling, not a detector. *Forty times the median for this capability* is
+a threshold you set against your own traffic, and
+`EffectStarted.outbound_bytes` — the same figure, per effect — is what makes that
+an ordinary query over the journal. A ceiling bounds the worst case; the figure
+catches the case that stayed under it.
 
 #### What `max_wallclock_secs` costs, and what it stops {#wallclock}
 

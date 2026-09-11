@@ -25,6 +25,124 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## `Budget` gained a ceiling, and `Consumed` a figure
+
+**Affected:** anyone constructing `Budget` or `Consumed` by struct literal, and
+anyone matching exhaustively on `BudgetExceeded`.
+
+- **`Budget::max_egress_bytes`** bounds the bytes a run may send into sinks —
+  a tool call's arguments, a model call's prompt, a peer call's payload. Reads
+  cost nothing. `Budget::unlimited()` and `Default` leave it unset, so nothing
+  changes for a budget that does not name it.
+- **`Consumed::egress_bytes`** is the running tally, and
+  **`BudgetExceeded::Egress { allowed, used, attempted }`** the refusal. The
+  enum is `#[non_exhaustive]`, so a match with a `_` arm is unaffected.
+- **`spec.budgets.max_egress_bytes`** is the declarative half, and is in the
+  published JSON schema. `0` is accepted and means *may read, may not send*.
+
+Nothing durable moved: the per-effect figure this bounds
+(`EffectStarted.outbound_bytes`) has been journaled since 0.32.0, the tally is
+recomputed from it rather than stored, and the golden corpora did not change.
+
+## A run's journal is readable over HTTP, under a new verb
+
+**Affected:** every deployment enumerating `api::action::ALL` against a
+deny-by-default policy engine.
+
+`GET /runs/{run}/history?from=<seq>` serves one run's records, bounded by the
+same page `GET /cases/{case}` uses and cursored by `next_from`.
+
+**`api:run.history` is a new action and must be granted**, or the route is
+refused to everybody — which is what a deny-by-default engine does with a verb
+nobody wrote a rule for. It is deliberately not `api:run.read`: the status view
+answers from six fields, and this answers with the run's input, its model
+exchanges and every argument it sent.
+
+## `RunStatus` gained two variants, and `RunView` a field
+
+**Affected:** anyone matching exhaustively on `RunStatus`, and anyone reading
+`GET /runs/{run}` for a sweep or a break-glass crossing.
+
+This plane seals two outcomes that are runs it writes about *itself* — `swept`
+and `broke-glass` — and the reader that turns a recorded ending back into a
+status had no arm for either. The catch-all answers `Quarantined`, so a crossing
+reported `status: "quarantined"` with `"recorded as 'broke-glass', which this
+build does not recognise"` where the operator's stated reason belonged.
+
+- **`RunStatus::Swept` and `RunStatus::BrokeGlass { actor, reason }`** are new
+  variants. An exhaustive match gains two arms; the compiler names the sites.
+  Both seal, neither is resumable, and neither is a goal outcome —
+  `RunStatus::reason()` is `None` for `Swept` and the operator's words for
+  `BrokeGlass`.
+- **`RunStatus::actor()`** is new: who brought the run to this state where a
+  person did — the canceller, the abandoner, the crosser — and `None` for every
+  ending the runtime reached on its own.
+- **`RunView` gained `decided_by`**, from that accessor. A struct literal over
+  the view grows one field. It is *not* `cancellation_requested_by`, which stays
+  and answers a different question: somebody has asked, about a run that may
+  still be running.
+- **A2A answers `TASK_STATE_REJECTED`** for a run id that resolves to either.
+  Neither was ever a task, and `FAILED` would have claimed the agent tried.
+
+Nothing about the durable format changed — the outcome strings are the same ones
+this build has always written — so no export needs re-taking and no golden
+corpus moved.
+
+## A served plane drains on SIGTERM, and admission can refuse for a third reason
+
+**Affected:** anyone matching exhaustively on `RuntimeError`, anyone running
+`agentplane serve` under a supervisor, and any A2A client keying on this
+plane's server-defined error codes.
+
+A process killed mid-step leaves an announced effect with no terminal record,
+and nothing in the journal can say whether that call reached the world — so the
+effect's declared recovery decides, which for anything not safe to repeat means
+waiting for a person. That is the right answer to a crash. It was also, until
+now, the price of every rolling deploy.
+
+- **`agentplane serve` drains on `SIGTERM` and `SIGINT`.** The signal stops both
+  listeners accepting *and* closes admission; then, under `--drain-secs`
+  (default 25, `AGENTPLANE_DRAIN_SECS`), it waits for the requests already being
+  served, for the runs it put on a background task, and for the periodic passes
+  to finish their tick. Runs it could not finish are named on stderr and at
+  `warn`, and left to the recovery sweep exactly as a crash leaves them.
+
+  **Check your supervisor's grace period.** `--drain-secs` has to fit inside it
+  — 30 seconds on Kubernetes and Docker unless raised — together with any
+  `preStop` sleep, which is what covers the unrelated race between endpoint
+  removal and the signal.
+
+- **`Runtime::drain(grace) -> DrainReport`** is that for an embedder, and
+  `Runtime::is_draining()` answers a readiness probe for a server that keeps its
+  listener open. Run it **beside** your own graceful shutdown — `tokio::join!` of
+  the two — not after it. Serialising deadlocks one on the other: a run awaited
+  inside a request handler is finished by the server's shutdown, and an open A2A
+  subscription is ended by the drain.
+
+- **`RuntimeError::Draining` is a new variant.** Nothing is written when it is
+  returned — no lease, no quota slot, no journal — so a caller retries
+  elsewhere with nothing to reconcile. A batch pass stops on it and leaves its
+  reservations without outcomes, which is what makes the next instance re-admit
+  exactly those items.
+
+- **A2A answers `-32031` with the `ErrorInfo` reason `DRAINING`**, beside
+  `-32029 QUOTA_EXHAUSTED` and `-32030 HALTED`. A client keying on the pair is
+  told *retry now* rather than *back off* or *stop*: the refusal is a fact about
+  one process and clears the moment the request reaches another instance. A bare
+  `-32031` from a foreign server is an unknown fault, as the other two are.
+
+- **An A2A subscription ends when the instance serving it drains.** A stream is a
+  long poll over the journal, so one watching a run that has not concluded would
+  otherwise keep a connection open for as long as that run — and a graceful
+  shutdown waits for every connection. A client reconnects and is told the
+  current state from the journal, which is the module's standing contract rather
+  than anything a drain introduced.
+
+Nothing releases a lease it did not finish, and that is deliberate: a release
+says takeover is safe, and for a run still inside a tool call the next owner
+would perform that call a second time beside the first. The epoch bump fences
+the second append; nothing fences the second send.
+
 ## An export carries the runs still in flight, and a restore names the waiters
 
 **Affected:** anyone constructing `RestoreReport`, and every deployment whose

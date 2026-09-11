@@ -2507,6 +2507,60 @@ async fn a_halted_agent_is_not_back_pressure() {
     );
 }
 
+/// A draining instance says so, and says it is not the agent that is refusing.
+///
+/// The third admission refusal, and the only one a caller clears by moving: a
+/// ceiling clears when a run finishes on that plane and a halt when a person
+/// lifts it, but this one clears the moment the request reaches a different
+/// process. Answered under either of the other two, a rolling deploy would spend
+/// a peer's back-off window — or, worse under `HALTED`, teach it to abandon an
+/// agent that is perfectly healthy.
+///
+/// What this does NOT cover is the peer-side classification of `-32031`; that is
+/// `a_draining_peer_is_refused_rather_than_left_in_doubt` in the client tests.
+#[tokio::test]
+async fn a_draining_instance_is_neither_a_ceiling_nor_a_halt() {
+    let f = fixture();
+    // Nothing is running, so the grace period is not exercised here — what is
+    // under test is the gate the drain leaves behind.
+    let report = f.rt.drain(std::time::Duration::ZERO).await;
+    assert!(report.is_complete(), "{report:?}");
+
+    let (status, body) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:#}");
+    assert_eq!(
+        err_code(&body),
+        -32031,
+        "a drain must wear neither the ceiling nor the halt code: {body:#}"
+    );
+    let info = &body["error"]["data"][0];
+    assert_eq!(info["domain"], "agentplane.hupe1980.github.io", "{body:#}");
+    assert_eq!(info["reason"], "DRAINING", "{body:#}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("retry"),
+        "a drain must tell the caller to come back: {message}"
+    );
+    assert!(
+        !message.contains("do not retry"),
+        "a drain is not a halt: {message}"
+    );
+    // The refusal is about this process, and naming which one would make a
+    // caller's correct behaviour depend on a topology it cannot see.
+    assert!(
+        !message.contains("later"),
+        "a drain has no window to wait out: {message}"
+    );
+}
+
 /// A full quota answers with the server-defined back-pressure code, and the
 /// quota arithmetic stays inside.
 ///

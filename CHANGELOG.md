@@ -39,6 +39,330 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.34.0] — 2026-09-11
+
+### Added — a scheduled stop is no longer served as a crash
+
+**`agentplane serve` drains on `SIGTERM` and `SIGINT`, and `Runtime::drain`
+is that sequence for an embedder.**
+
+The gap was not subtle once it was looked at. `axum::serve` was called with no
+graceful shutdown, no signal handler was installed anywhere, and the sweep, the
+recovery drill and push delivery all ran on detached tasks nothing held a handle
+to. So the ordinary way every supervisor stops a process — a rolling deploy, a
+scale-in, a spot reclamation, `docker stop`, `systemctl restart` — cut this plane
+off wherever it happened to be.
+
+Where it happened to be matters more here than in most runtimes. `EffectStarted`
+is durable *before* the call goes out, precisely so that a crash between the
+announcement and the outcome is recoverable; what recovers it is the effect's
+declared `Recovery`, because the journal genuinely cannot say whether that call
+reached the world. For a retryable effect that means performing it again, and
+for anything not safe to repeat it means waiting for a person. Both are correct
+answers to an accident. Neither is an acceptable standing cost of deploying, and
+a design that spends as much as this one does to keep undecided effects rare
+should not manufacture them on a schedule.
+
+The signal does two things at once — stops both listeners accepting, and closes
+admission — and one grace period then covers four waits: the requests already
+being served, including a run a blocking `message/send` is awaiting; the runs
+this process put on a background task of its own; the sweep, the drill and push
+delivery each finishing the tick it is in; and open subscriptions, which end
+rather than being waited out. `--drain-secs` (default 25,
+`AGENTPLANE_DRAIN_SECS`) is that period, and whatever is still executing when it
+ends is **named**, on stderr and at `warn`.
+
+Closing admission *with* the listeners rather than after them is the part that
+took a second pass to get right, and the reason is a long-lived read. A streaming
+subscription is a poll over the journal that ends when its run does, and a
+graceful shutdown waits for every open connection — so waiting for connections
+before closing admission means waiting for the run, which may be sleeping for a
+week. Closing admission is what tells such a reader to end. What it costs is a
+request that arrives on an already-open connection after the signal: it is
+refused `DRAINING` and retries elsewhere, which is exactly what that refusal is
+for.
+
+`--drain-secs` has to fit inside the supervisor's own grace period, which is what
+sends `SIGKILL` afterwards — 30 seconds on Kubernetes and Docker unless raised.
+The number is the operator's because only they know their kill timer.
+
+The container image made this worse than it looks. Its entrypoint is exec form,
+so the binary is **PID 1** — and PID 1 has no default signal dispositions, so a
+`SIGTERM` nobody has registered a handler for is discarded rather than
+terminating. `docker stop` therefore waited out its whole timeout and then
+`SIGKILL`ed, which is the one stop that cannot be drained at all.
+
+`Runtime::drain(grace) -> DrainReport` is that for an embedder, and
+`Runtime::is_draining()` answers a readiness probe for a server that keeps its
+listener open. Run it **beside** your own graceful shutdown rather than after it
+— `tokio::join!` of the two — because serialising deadlocks one on the other in
+whichever order you pick.
+
+**An A2A subscription now ends when the instance serving it is stopping.** The
+same fact from the client's side, and it is safe for the reason the module was
+already built on: the stream is a view of history rather than a subscription to
+memory, so a client reconnects and is told the current state from the journal by
+whichever instance is up.
+
+### Changed — a drain hands back no lease it did not finish
+
+The obvious companion to draining is to release the leases of whatever is left,
+so the next instance need not wait out the TTL. It is wrong, and the operations
+page recommended it in as many words.
+
+A release asserts *takeover is safe now*. For a run still inside `perform` it is
+not: the next owner replays, finds the announced effect with no terminal record,
+and performs that call a second time while the first is still in flight. The
+epoch bump fences the second **append** — which is what the page's own account of
+the residue stopped at — and nothing fences the second **send**. Releasing would
+convert the one hazard this protocol exists to avoid from unlikely into certain,
+and it would do it on every deploy.
+
+So the residue of a drain is deliberately identical to the residue of a crash: a
+lease that expires while still naming an owner, which is the one signal the
+recovery sweep reads as *an instance died holding this run*. Nothing is lost and
+nothing new has to be looked at. The page now says so, and says why the intuition
+runs the other way.
+
+### Added — `RuntimeError::Draining`, and a third admission refusal on the wire
+
+Admission answers `RuntimeError::Draining` while an instance is stopping —
+before the lease, before the quota slot, before the first append, so a caller
+that retries elsewhere has nothing to reconcile. A batch pass stops on it and
+leaves its reservations without outcomes, which is exactly what makes the next
+instance re-admit those items rather than recording them failed.
+
+On the A2A surface it is `-32031` with the `google.rpc.ErrorInfo` reason
+`DRAINING`, beside `-32029 QUOTA_EXHAUSTED` and `-32030 HALTED`, under the same
+rule that the `(domain, reason)` pair is the identity and a bare numeral proves
+nothing. Three codes rather than one because they ask three different things: a
+ceiling says come back, a halt says stop, and this one says **retry now** — it is
+a fact about one process, and it clears the moment the caller reaches another
+instance. Answered as back-pressure it costs a peer a back-off window it never
+needed; answered as a halt it costs an abandoned request to a healthy agent. The
+message is a fixed sentence naming no host and no grace period, because a
+caller's correct behaviour must not depend on a topology it cannot see.
+
+### Fixed — the drain gate would have refused the runs it was waiting for
+
+Found by writing the test for it, and worth recording because the shape is
+general. `cx.commission` — one agent ordering work from another on the same
+plane — admits a run through the same funnel a peer's message does. A gate that
+saw every admission would therefore have refused the commissioning step of
+exactly the runs the drain was waiting for, and that step's failure is
+`Interrupted`: the in-doubt classification, because a commissioning caller cannot
+know what the agent it ordered from managed to do. The drain would have
+manufactured the state it exists to prevent, on every deploy, for every plane
+whose agents delegate.
+
+The distinction a gate cannot make for itself is *whose work this is*, so it is
+carried to the gate rather than inferred at it: admission takes an `Entry`
+argument, `Outside` for a caller and `Nested` for a run already executing here.
+Resumes are not gated for the neighbouring reason — a resume continues work this
+plane already owns, and refusing one turns a stopping instance into a source of
+failed wakes for work the next instance is about to take.
+
+### Added — `Budget::max_egress_bytes`, the one ceiling that is exact
+
+Every other ceiling here bounds **work**: steps, calls, tokens, money, time. A
+label answers *what may this value touch* and never *how much of it went*, so an
+extraction sized just under any of them passes all of them. `outbound_bytes` made
+the quantity *answerable* — this bounds it.
+
+It is exact, and that is not a detail. Every metered ceiling compares a cost it
+cannot know until the call returns, so it refuses once consumption has *reached*
+the limit and the run overshoots by one operation. An outbound size is in hand
+before dispatch, so the effect that would cross the ceiling is the effect refused
+and nothing over the limit is ever sent. `BudgetExceeded::Egress` carries
+`attempted` beside `used` for the same reason: an operator can tell a ceiling
+that is too low from one call that is too big.
+
+Zero is meaningful and is not a bricked ceiling — it says *this run may read and
+may not send*, which is a real agent shape. Reads cost nothing, because an effect
+that binds no outbound value crossed no sink. An atomic group member costs
+nothing either, and that is a judgement rather than an omission: it writes to a
+database this deployment owns, in the transaction that commits the run's own
+records, so nothing left.
+
+**The tally is recomputed on replay rather than journaled**, which is sound here
+and would not be for spend. The outbound value is inside `descriptor.args` and
+therefore inside the effect key, so a value that changed would quarantine as
+divergence before it could be billed; spend has no such cover, which is why spend
+is read back. A strict replay reaches the same `Consumed.egress_bytes` as the
+live run, and a test asserts exactly that.
+
+Declarable as `spec.budgets.max_egress_bytes`, in the published JSON schema.
+
+### Fixed — seven entries were filed one release late, so 0.31.0 users were told they lacked what they had
+
+Seven of the eight entries under `0.32.0` described work that shipped in
+**0.31.0**. Only *ids carry their type prefix* was actually 0.32.0's — the whole
+`v0.31.0..v0.32.0` diff is that one change to `core::id`.
+
+Each of the seven is present in the `v0.31.0` tree and absent from `v0.30.0`:
+`EffectStarted.outbound_bytes`, `--require-annotation` (byte-identical between
+the two tags), the `max_denials` refusal-path fix, `PolicyRequest::is_effect`,
+both egress-message fixes, and the audit report naming runs that never started.
+The `v0.31.0` tree's own changelog has no `0.32.0` section at all, which is the
+shape of the mistake: the code was released, and the entries describing it were
+written in the next cycle under the next heading.
+
+They are now under `0.31.0`. A reader on that version was being told they were
+missing six things they had — the one failure this file's stated contract does
+not allow, since every entry is written for somebody who already depends on a
+version.
+
+It was a field report that surfaced it, by attributing two of these to 0.31.0
+from measurement while this file said otherwise. Their attribution was right.
+
+No check is added, deliberately. Whether an entry describes this release's work
+or the last one's is not a question a test can ask, and a guard that appeared to
+answer it would be worse than none. What the contributing guide now says instead
+is the actual control: the entry goes in the change.
+
+### Fixed — the security page said what `max_denials` checks, not what it bounds
+
+Twice, in two copies of one paragraph. Both said the ceiling is *checked before
+the policy is consulted* — true, and a statement about where the check sits
+rather than about which channel it bounds. A reader concluded it bounds probing
+of the policy engine, and in a tool-calling loop it does not have to: an engine
+denial is not model-facing there and ends the run outright, so nothing
+accumulates on that path.
+
+What accumulates is the **sink** refusal — an untrusted value in a protected
+field, a sensitivity over a ceiling — which comes back as `REFUSED`, lets the
+loop continue, and is therefore the channel a model can actually probe. Both are
+counted; the page now says so and the duplicate is a pointer.
+
+The behaviour was already right and `Budget::max_denials`'s own documentation
+already said this. A page contradicting the API docs is worse than a page that
+is merely silent, because the reader who checks one stops.
+
+### Added — `GET /runs/{run}/history`, because a case's records were readable and a run's were not
+
+The asymmetry was the tell. `GET /cases/{case}` has always served the records of
+a matter — the sweep's decisions, the deadline transitions, each one whole. The
+run view served `records: 41`. So a plane whose thesis is that the journal is the
+plan of record had no in-band way to read one run's journal, and the answer to
+*what did this run actually do* was `agentplane export` — an offline artifact
+over the whole plane — or writing Rust against `JournalStore::read`.
+
+Cursored rather than offset-paged: a run's records are contiguous from sequence
+one, so `?from=<seq>` is the next sequence a reader has not seen, which is the
+cursor the streaming surface and any resumable consumer already use. `next_from`
+comes back rather than being left to compute, and only when the page was cut —
+a cursor handed back on a complete page is one a caller loops on forever. Past
+the end is an empty page and not a `404`: the run exists and the reader has
+caught up, which are different facts from *no such run*.
+
+**Its own verb, `api:run.history`.** Widening `api:run.read` would have been a
+silent grant: the status view answers from six fields, and this answers with the
+run's input, its model exchanges and every argument it sent. Same reasoning that
+gave `api:obligation.list` its own verb rather than widening `api:case.list`.
+
+### Fixed — a break-glass crossing reported itself as a quarantine
+
+**`RunStatus` gained `Swept` and `BrokeGlass { actor, reason }`, and the reader
+that turns a recorded ending back into a status gained the two arms it was
+missing.**
+
+This plane seals five outcomes. Three of them — `succeeded`, `cancelled`,
+`abandoned` — are what a run pursuing a goal reaches. The other two are runs the
+plane writes about *itself*: a sweep's pass over its own state, and an operator
+crossing a tenant boundary. `recorded_status` enumerated the first three plus the
+three open ones and ended in a catch-all, and the catch-all is not benign — it
+answers `Quarantined`, the status meaning *the runtime could not establish what
+happened*.
+
+So `GET /runs/{run}` on a break-glass crossing answered:
+
+```json
+{ "status": "quarantined",
+  "reason": "recorded as 'broke-glass', which this build does not recognise" }
+```
+
+The operator's stated reason — the thing the control refuses to be recorded
+without — was **replaced** by a sentence about the build, on the surface the
+operations page sends an incident review to. A sweep run read the same way.
+
+The accommodation that allowed it was written down: `SEALED_OUTCOMES`'s own
+documentation described those two as "not run statuses at all", which made an
+incomplete total reader look deliberate. They are statuses. What they are not is
+*goal* outcomes, and the seal test now runs over every variant with no exception
+list beside it — the exception list was exactly the two the reader could not
+name.
+
+Three consequences were checked and are fine: `decide_quarantine` reads the
+sealed outcome string rather than this reader, so nobody could ever reopen a
+sweep run; `resume_is_closed` already refused both; and the quarantine gauge
+counts the outcome index, not this.
+
+Four exhaustive matches had to decide, which is what the variants are for. A2A
+answers `REJECTED` for both — no peer submitted a sweep, and `FAILED` would claim
+the agent tried. A batch item answers `Quarantined`, because reaching it means
+the reservation and the journal disagree about which run an item is. The stop
+severity ranks them with the statuses that never compete, named rather than
+given a rank by omission.
+
+**A guard now holds the writer's list to the reader**, which is the half that
+was missing: every spelling in `OUTCOMES_OF_RECORD` must round-trip to a status
+that spells itself the same way back. The class is the one this project
+catalogues as an exhaustive writer and a total reader — `as_str` is a match over
+the type, so the compiler forces an arm, while every reader over `&str` keeps
+compiling forever.
+
+### Added — `GET /runs/{run}` says whose decision an ending was
+
+`RunView.decided_by`, from a new `RunStatus::actor()`. Distinct from
+`cancellation_requested_by`, which answers *somebody has asked* about a run that
+may still be running; this answers *who ended it*.
+
+It was missing for cancellations and abandonments too, and for the same reason in
+each: the endpoint read `reason()` and dropped the actor. An abandoned run named
+the doubt nobody could resolve and not the person who decided to stop trying — a
+half-answer, on the endpoint where *who* is the question asked immediately after
+*what*.
+
+### Fixed — three source comments narrated a previous implementation
+
+`RunId`'s type documentation explained that ids "were not always" spelled one
+way; a comment in the declarative tier and one on the redb authority table each
+cited what a first version did wrong. All three now state the rule and the
+hazard it rules out, which is what a reader of the current code wants.
+
+### Assurance — six new mutations, and a caller sweep over the public surface
+
+Mutation count **704**. Thirteen new anchors, each `--verify`'d: the admission gate,
+the commission exemption, the report that names what a drain could not finish,
+the wait itself, the A2A code, the client's classification of it, the
+subscription that ends, the crossing this build could not read back, the
+crossing with nobody's name on it, and the run journal riding the status
+view's verb. The commission one is the anchor worth having — it is
+the only thing that fails if the gate is ever widened back to every admission.
+
+**`tools/mutants.py` bounds a cargo run and keeps a distinct INCONCLUSIVE
+verdict for one that overruns.** A mutation can make a test *hang* rather than
+fail — delete a gate and the work it was refusing runs, and if that work waits on
+something the test never supplies, nothing returns. This round's first anchor did
+exactly that, and unbounded it would have burned a CI shard's whole job timeout
+and named no mutation. The kill is by process group, because `subprocess`'s own
+timeout kills cargo and leaves rustc and the test binary holding the target
+lock. A hang is not a kill: the guarantee stays unpinned until the test is
+rewritten to fail rather than block, which is what the gate test now does.
+
+One property is pinned without a mutation and deliberately so. A drain cannot
+release a lease because it holds no epochs: `Runtime::drain` has no way to reach
+one, which makes the guarantee structural rather than a branch somebody could
+delete. The test that asserts a drained-out run keeps its lease is still there,
+as the executable statement of a property a future change could break.
+
+The round opened with a caller sweep over every public function in the crate —
+the tell being a capability with no caller outside its own definition, the fake
+and the tests. It found the shutdown path and nothing else that was not already
+answered: the two embedder-facing predicates on `Disposition` and `RuntimeError`
+carry a test saying why they have no in-crate caller, and the MCP child-process
+transport's own `Drop` handles the case this round would otherwise have had to.
+
 ## [0.33.0] — 2026-09-10
 
 ### Added — the witness tier has a door, and the anchor comes back
@@ -446,6 +770,8 @@ verified field by field — and `tools/verify_export.py` re-derives all 27 vecto
 from the [published specification](https://hupe1980.github.io/agentplane/docs/format/),
 which is the check that says so from outside this build.
 
+## [0.31.0] — 2026-09-07
+
 ### Fixed — three egress refusals read as two sentences spliced together
 
 `EgressError` renders a complete sentence — *'evil.example' is not a granted
@@ -561,8 +887,6 @@ The boundary is the format's rather than an omission, and it is now stated on
 It is deliberately **not** in `not_checked`: that list reports what *this* audit
 could not check, and an entry present in every report ever produced would train a
 reader to skip it — which is the failure the list exists to avoid.
-
-## [0.31.0] — 2026-09-07
 
 ### Changed — the published binary and the container image carried `testkit`
 

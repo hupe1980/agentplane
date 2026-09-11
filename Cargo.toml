@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.33.0"
+version      = "0.34.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -56,14 +56,16 @@ manifest = ["dep:serde_yaml_ng", "dep:jsonschema"]
 # here for the audit verbs, for one reason: an `audit`/`verify` that could not
 # check a signature, or could not fetch an anchoring checkpoint from a witness,
 # sends the independent party back to writing Rust — or back to the operator
-# for the very checkpoint the check is about.
+# for the very checkpoint the check is about. `tokio/signal` is here because
+# `serve` drains on `SIGTERM`, and as PID 1 in a container an unhandled one is
+# discarded rather than fatal — so the handler is what makes `docker stop` work.
 #
 # **Never `testkit`.** The binary needs one thing from it — `provider: fake` —
 # and that is `fake-model`. Taking the whole feature would ship fault injection,
 # a self-minting signer and a plaintext-loopback exception in every published
 # artifact, each documented at its definition as impossible in a production
 # build. `no_shipped_feature_enables_testkit` holds it.
-cli = ["manifest", "redb", "providers", "bedrock", "fake-model", "signing", "witness-http", "dep:tracing-subscriber", "dep:clap"]
+cli = ["manifest", "redb", "providers", "bedrock", "fake-model", "signing", "witness-http", "tokio/signal", "dep:tracing-subscriber", "dep:clap"]
 # Content-addressed blobs on any backend OpenDAL reaches, for bytes too big for
 # the chain to carry.
 opendal = ["dep:opendal"]

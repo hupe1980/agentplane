@@ -1088,6 +1088,21 @@ pub struct Budgets {
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_denials: Option<u32>,
+    /// Bytes this agent may send into sinks in one run.
+    ///
+    /// The declarative half of the one axis a label does not have. Sensitivity
+    /// says *what may this value touch*; it does not say *how much of it left*,
+    /// and every other ceiling here bounds work rather than disclosure — an
+    /// extraction sized just under an effect count passes all of them.
+    ///
+    /// Counted as the canonical size of each effect's outbound value: a tool
+    /// call's arguments, a model call's prompt, a peer call's payload. Reads
+    /// cost nothing.
+    ///
+    /// `0` is meaningful and accepted, like the two ceilings above: it says
+    /// this agent may read and may not send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_egress_bytes: Option<u64>,
     /// How many of a plan's ready steps may run at once.
     ///
     /// A plan with any width dispatches its ready set concurrently, and each
@@ -1574,9 +1589,10 @@ impl Manifest {
     /// this whole document exists to remove. The two ways to say it are already
     /// there, and the message names them.
     ///
-    /// `max_replans` and `max_denials` are deliberately absent: zero is a
-    /// coherent instruction for both, because each counts an event that may
-    /// never occur, so forbidding it forbids nothing the run needs.
+    /// `max_replans`, `max_denials` and `max_egress_bytes` are deliberately
+    /// absent: zero is a coherent instruction for each — do not replan, stop on
+    /// the first refusal, send nothing — so forbidding it forbids nothing the
+    /// run needs.
     fn validate_budgets(&self) -> Result<(), ManifestError> {
         // Which ceilings are bricked is `Budget`'s rule, not this layer's: the
         // same budget reaches the runtime through `RuntimeBuilder::budget`
@@ -2748,6 +2764,7 @@ impl Manifest {
             max_wallclock_secs: b.max_wallclock_secs,
             max_denials: b.max_denials,
             max_parallel_steps: b.max_parallel_steps,
+            max_egress_bytes: b.max_egress_bytes,
         }
     }
 }

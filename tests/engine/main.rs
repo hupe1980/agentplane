@@ -17,6 +17,7 @@
 
 mod cancellation;
 mod compensation;
+mod draining;
 mod durability;
 mod faults;
 mod quarantine;
@@ -24,5 +25,6 @@ mod reconciliation;
 mod recovery;
 mod resume_gates;
 mod retries;
+mod self_records;
 mod simulation;
 mod waits;

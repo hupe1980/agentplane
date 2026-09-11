@@ -82,6 +82,13 @@ issued. So every effect declares its recovery semantics:
 `RequiresOperator` is the **default**, so an effect that forgets to declare
 itself gets the conservative treatment rather than the convenient one.
 
+Which is why a plane that is asked to stop **drains** rather than being cut where
+it stands. A rolling deploy, a scale-in and a spot reclamation are all a
+supervisor sending `SIGTERM`, and a process killed inside `perform` produces
+exactly the announcement-with-no-outcome above — for a `RequiresOperator` effect,
+a person's afternoon, on a schedule. See [stopping an
+instance](@/docs/operations.md#stopping-an-instance).
+
 ### Retries, and the failures that must not be retried
 
 Rule 3 above is about a *crash* leaving the outcome unknown. A call that fails

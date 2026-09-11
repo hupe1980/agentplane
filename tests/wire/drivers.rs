@@ -603,6 +603,79 @@ async fn a_peers_halt_is_a_refusal_that_says_do_not_retry() {
     );
 }
 
+/// A draining peer is a refusal a caller may retry **now**.
+///
+/// The third of this domain's admission reasons and the one with no window: a
+/// ceiling asks for a back-off and a halt asks for silence, while this asks for
+/// nothing at all — the next request reaches a different instance. Same
+/// disposition as the other two, because a drain refuses before admission. And
+/// a bare `-32031` from a foreign server proves nothing, for the reason the
+/// whole family exists: `-32001..-32099` is the band A2A reserves for its own
+/// future table.
+#[tokio::test]
+async fn a_draining_peer_is_refused_rather_than_left_in_doubt() {
+    let marked = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+            "code": -32031,
+            "message": "this instance is shutting down and did not take the request on; retry",
+            "data": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "domain": "agentplane.hupe1980.github.io",
+                "reason": "DRAINING",
+            }],
+        }
+    });
+    let (c, _) = canned(200, marked);
+    let url = serve(c).await;
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.disposition(), Disposition::DidNotHappen, "{err}");
+    match &err {
+        PeerError::Refused { detail, .. } => assert!(
+            detail.contains("shutting down") && detail.contains("retry now"),
+            "a drain must not read as a window to wait out: {detail}"
+        ),
+        other => panic!("a marked drain is a refusal: {other}"),
+    }
+
+    let bare = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": { "code": -32031, "message": "server error" }
+    });
+    let (c, _) = canned(200, bare);
+    let url = serve(c).await;
+    let client = A2aClient::new(Endpoint::new(url)).unwrap().allow_loopback();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.disposition(),
+        Disposition::InDoubt,
+        "a foreign server's bare -32031 is an unknown fault: {err}"
+    );
+}
+
 /// An internal error is **not** a refusal.
 ///
 /// The expensive row in the table. `-32603` can be raised after the peer has

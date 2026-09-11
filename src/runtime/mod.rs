@@ -5,6 +5,7 @@ mod build_error;
 mod ctx;
 #[cfg(feature = "manifest")]
 mod declarative;
+mod drain;
 #[cfg(feature = "manifest")]
 pub use declarative::PREVIEW_EVIDENCE_BYTES;
 pub mod effects;
@@ -17,6 +18,7 @@ pub mod telemetry;
 pub use batch::BatchSpec;
 pub use build_error::BuildError;
 pub use ctx::{BuildsEffect, Mode, StepCtx};
+pub use drain::DrainReport;
 #[cfg(feature = "manifest")]
 pub use executor::Agent;
 /// The one `RunStatus` list, shared by every test that owes a per-variant

@@ -86,18 +86,102 @@ bearing on replay.
 
 ### Releasing frees the lease without forgetting the epoch
 
-A graceful shutdown hands the lease back so the next instance need not wait out
-the TTL. What it must **not** do is delete the row: the epoch lives there, and
-without it `append` has nothing to fence against while the next `acquire` starts
-again at 1 — so a writer already fenced at 2 outranks the new owner and the
-mechanism inverts. Releasing marks the row expired instead, and the next
-takeover advances the epoch as any takeover does.
+Every clean exit — sealed, failed, suspended — hands its lease back, so the next
+instance need not wait out the TTL. What a release must **not** do is delete the
+row: the epoch lives there, and without it `append` has nothing to fence against
+while the next `acquire` starts again at 1 — so a writer already fenced at 2
+outranks the new owner and the mechanism inverts. Releasing marks the row expired
+instead, and the next takeover advances the epoch as any takeover does.
 
-That last part is worth stating because the intuition runs the other way:
-releasing says the owner *intends* to stop, not that it already has. An
-un-awaited task or a crash between release and exit leaves an append in flight,
-and only a bump stops it. Takeover is immediate either way, which was the point
-of releasing.
+**Releasing is something a run does, never something a shutdown does.** The
+intuition runs the other way — hand the leases back on the way out and the next
+instance starts immediately — and it is wrong in a way the fence does not cover.
+A release says *takeover is safe now*. For a run still inside a tool call it is
+not: the next owner replays, finds the announced effect with no outcome, and
+performs the call a second time while the first is still in flight. The epoch
+bump stops the second **append**; nothing stops the second **send**. So an
+instance on its way out finishes what it can and leaves the rest to expire —
+which is the one signal the recovery sweep reads as *an instance died holding
+this run*, and is exactly what a run cut short by a shutdown is.
+
+## Stopping an instance {#stopping-an-instance}
+
+A process killed mid-step leaves an announced effect with no terminal record,
+and nothing in the journal can say whether that call reached the world. The
+effect's declared recovery then decides — perform it again, or wait for a
+person — which is the right answer to an accident and an expensive one to
+schedule on every deploy. Draining is the difference between a stop somebody
+chose and a crash.
+
+`agentplane serve` drains on `SIGTERM` and `SIGINT`. The signal does two things
+at once and then waits for four:
+
+| On the signal | Waited for, under one grace period |
+| --- | --- |
+| Both listeners stop accepting | Requests already being served, including the runs a blocking `message/send` is awaiting |
+| **Admission closes** — `Runtime::drain` | Runs this process put on a background task of its own |
+| | The sweep, the drill and push delivery, each finishing the tick it is in |
+| | Open subscriptions, which end at once rather than being waited out |
+
+Closing admission *with* the listeners rather than after them is the part worth
+stating. A request that arrives on an already-open connection after the signal is
+answered `DRAINING` and retries elsewhere, which is what that refusal is for — and
+it is what lets an open subscription end. A stream is a long poll over the
+journal, so a subscription to a run that sleeps for five working days would
+otherwise hold the graceful shutdown open for five working days.
+
+`--drain-secs` (default 25) has to fit inside the supervisor's own grace period,
+which is what sends `SIGKILL` afterwards — 30 seconds on Kubernetes and Docker
+unless raised. Runs still executing when it ends are **named on stderr and at
+`warn`**, and left to the recovery sweep on the path a crash takes.
+
+In the published image the binary is the entrypoint, so it runs as **PID 1**.
+That is the right shape — the signal reaches the process that has to act on it,
+with no shell in between — and it is also why the handler is not optional: PID 1
+has no default signal dispositions, so a `SIGTERM` with no handler registered is
+discarded and `docker stop` falls through to `SIGKILL`.
+
+Two things a drain deliberately does not do. It does not gate **resumes**: a
+resume continues work this plane already owns, and refusing one would turn a
+shutting-down instance into a source of failed wakes for work the next instance
+is about to take. And it does not gate an agent **commissioning** another one —
+that is a step of a run the drain is itself waiting for.
+
+An embedder driving its own server runs `Runtime::drain(grace)` **beside** their
+own graceful shutdown rather than after it — `tokio::join!` of the two — and
+reads `DrainReport::unfinished`. Serialising them either way deadlocks one on the
+other: a run awaited inside a request handler is finished by the server's
+shutdown, and a subscription is ended by the drain.
+
+### What a caller is told while an instance drains
+
+Admission answers `RuntimeError::Draining` — before the lease, the quota slot and
+the first append, so nothing is half-written. On the A2A surface that is
+`-32031` with the `ErrorInfo` reason `DRAINING`, which is its own code beside
+`QUOTA_EXHAUSTED` and `HALTED` because it asks something neither of them does: a
+ceiling clears when a run finishes on this plane, a halt clears when a person
+lifts it, and this one clears the moment the caller reaches a different process.
+There is no window to wait out, so a compliant peer retries immediately.
+
+### The endpoint race is the deployment's to close
+
+Endpoint removal and `SIGTERM` are not sequenced against each other: a pod can
+receive the signal while requests are still being routed to it. No shutdown
+handler can serve a request that arrives after its listener is closed, so the
+fix is a `preStop` sleep covering the propagation delay, and a
+`terminationGracePeriodSeconds` large enough to hold the sleep *and*
+`--drain-secs`:
+
+```yaml
+terminationGracePeriodSeconds: 60
+lifecycle:
+  preStop:
+    exec: { command: ["sleep", "15"] }
+```
+
+There is no readiness route to flip, for the reason there is no `/health` at
+all — see [the operator surface](#the-operator-surface). A draining instance
+closes its listeners, so any probe that connects already fails.
 
 ## Two backends, one contract
 
@@ -906,6 +990,11 @@ offline, and lists with the rest:
 curl -H "$AUTH" 'https://plane/runs?outcome=broke-glass'
 ```
 
+`GET /runs/{run}` on one answers `status: "broke-glass"`, `decided_by` with the
+operator, and `reason` with the words they gave. Both halves, because an
+incident review asks two questions and a surface that answers only *why* sends
+the reader to the export for the name.
+
 Who may pull it is your policy engine's decision, not this crate's.
 
 ### One matter, one scan
@@ -967,9 +1056,10 @@ Two things are deliberately *not* in it, and both are worth knowing. Dead-letter
 events are counted rather than named, because the event store reports how many
 aged out and not which — they stay in the report and the emitted event, and
 there is deliberately no `SweptAction` for them, because a variant nobody
-constructs reads as a capability. And a sweep run is not a *plan*: it is sealed
-with the outcome `swept` rather than a run status, because a tick that breached
-forty obligations is not a plan that completed.
+constructs reads as a capability. And a sweep run is not a *plan*: it seals as
+`swept`, never as `succeeded`, because a tick that breached forty obligations is
+not a plan that completed. `GET /runs/{run}` answers `swept` with no reason —
+what it decided is on its records, not in a one-line summary.
 
 ### A capped tick says it was capped
 
@@ -1184,7 +1274,8 @@ Then schedule the two loops, or let the binary do it:
 ```sh
 agentplane serve --manifest agent.yaml \
   --sweep-every 30      `# gauges, deadlines, task expiry, dead letters` \
-  --drill-every 86400   `# the recovery rehearsal`
+  --drill-every 86400   `# the recovery rehearsal` \
+  --drain-secs 25       `# how long a SIGTERM may keep working`
 ```
 
 ## The operator surface
@@ -1213,11 +1304,13 @@ deadlines, task expiry, dead letters and due timers are swept, and `0` runs
 the sweep from your own scheduler instead.
 `--push-host` permits A2A push notifications to that exact host and is
 repeatable — without one, push is not wired and the Agent Card advertises it as
-absent rather than claiming a capability nothing serves. Every flag but
-`--push-host` is also an environment variable (`AGENTPLANE_ADDR`,
-`AGENTPLANE_OPERATOR_ADDR`, `AGENTPLANE_POLICY`, `AGENTPLANE_TOKENS`,
-`AGENTPLANE_SWEEP_EVERY`, `AGENTPLANE_STORE`), which is how a container image
-is configured without editing its command line.
+absent rather than claiming a capability nothing serves.
+`--drain-secs` bounds the stop: see [stopping an
+instance](#stopping-an-instance). Every flag but `--push-host` is also an
+environment variable (`AGENTPLANE_ADDR`, `AGENTPLANE_OPERATOR_ADDR`,
+`AGENTPLANE_POLICY`, `AGENTPLANE_TOKENS`, `AGENTPLANE_SWEEP_EVERY`,
+`AGENTPLANE_DRAIN_SECS`, `AGENTPLANE_STORE`), which is how a container image is
+configured without editing its command line.
 
 ### Identity comes from the request, never from its body
 
@@ -1495,7 +1588,8 @@ whether a run id exists by comparing a `400` against a `404`.
 | Route | The question it answers |
 |---|---|
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
-| `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end? |
+| `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end, and on whose decision? |
+| `GET /runs/{run}/history` | What did it actually *do*? The journal, record by record, from `?from=<seq>` |
 | `GET /tasks` | What is waiting for me? |
 | `GET /tasks/{task}` | What is this proposal, and may I decide it? |
 | `POST /tasks/{task}/claim` | This one is mine — don't let a colleague duplicate it |

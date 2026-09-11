@@ -889,7 +889,7 @@ spec:
     // ends the run, rather than the run being over before it starts.
     let mut ledger = agentplane::core::Ledger::new(agentplane::core::Budget::default().denials(0));
     ledger
-        .admit_effect()
+        .admit_effect(0)
         .expect("a zero denial ceiling must not refuse an effect nobody was denied");
     assert!(
         ledger.record_denial().is_err(),

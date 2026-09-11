@@ -286,6 +286,35 @@ pub struct Budget {
     /// run. A run nothing refuses never notices it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_denials: Option<u32>,
+    /// Bytes this run may send **into sinks**, in total.
+    ///
+    /// Volume is the axis a label does not have. Ten thousand records marked
+    /// `Internal` pass every gate one record passes, and every ceiling above is
+    /// a cost control that bounds *work*: an extraction sized just under an
+    /// effect count is invisible to all of them. This bounds the quantity that
+    /// left.
+    ///
+    /// Measured as the canonical size of each effect's outbound value — a tool
+    /// call's arguments, a model call's prompt, a peer call's payload — which is
+    /// the figure `EffectStarted.outbound_bytes` records. An effect binding no
+    /// outbound value costs nothing here, so a run of pure reads is unaffected.
+    ///
+    /// **Exact, unlike every metered ceiling above.** A token cost is unknown
+    /// until the call returns, so those refuse once consumption has *reached*
+    /// the limit and the run overshoots by at most one operation. This size is
+    /// known before dispatch, so the effect that would cross the ceiling is the
+    /// effect refused: nothing over the limit is ever sent.
+    ///
+    /// Zero is meaningful, like [`max_denials`](Self::max_denials) and unlike
+    /// the metered ceilings: it says this run may read and may not send, which
+    /// is a coherent thing to ask of an agent. So it is not a bricked ceiling.
+    ///
+    /// What it is not is an anomaly detector. *Forty times the median for this
+    /// capability* is a threshold a deployment sets against its own traffic,
+    /// and the journaled figure is what makes that an ordinary query. A ceiling
+    /// bounds the worst case; the figure catches the case that stayed under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_egress_bytes: Option<u64>,
 }
 
 impl Budget {
@@ -299,10 +328,13 @@ impl Budget {
     /// on every run it will ever make, which makes it a wiring mistake rather
     /// than a budget.
     ///
-    /// [`max_replans`](Self::max_replans) and [`max_denials`](Self::max_denials)
-    /// are excluded, because zero is meaningful for both: it says *do not
-    /// replan* and *the first refusal ends the run*, and a run that never
-    /// replans or is never refused is unaffected by either.
+    /// Three are excluded, because zero is a coherent instruction for each:
+    /// [`max_replans`](Self::max_replans) says *do not replan*,
+    /// [`max_denials`](Self::max_denials) says *the first refusal ends the
+    /// run*, and [`max_egress_bytes`](Self::max_egress_bytes) says *this run
+    /// may read and may not send*. A run that never replans, is never refused,
+    /// or sends nothing is unaffected by its own — which is what separates
+    /// them from a ceiling that refuses the first operation of any kind.
     #[must_use]
     pub const fn bricked_ceiling(&self) -> Option<&'static str> {
         // `matches!` rather than `== Some(0)` so this stays `const`.
@@ -339,6 +371,7 @@ impl Budget {
             max_wallclock_secs: None,
             max_denials: None,
             max_parallel_steps: None,
+            max_egress_bytes: None,
         }
     }
 
@@ -376,6 +409,13 @@ impl Budget {
     #[must_use]
     pub const fn denials(mut self, n: u32) -> Self {
         self.max_denials = Some(n);
+        self
+    }
+
+    /// How many bytes this run may send into sinks.
+    #[must_use]
+    pub const fn egress_bytes(mut self, n: u64) -> Self {
+        self.max_egress_bytes = Some(n);
         self
     }
 
@@ -425,6 +465,16 @@ pub struct Consumed {
     /// Policy refusals this run has accrued.
     #[serde(default)]
     pub denials: u32,
+    /// Bytes this run has sent into sinks.
+    ///
+    /// Accumulated from each announced attempt's outbound value, on the pass
+    /// that announces it and on every pass that replays it. Recomputed from the
+    /// effect rather than read back from the record, which is sound *here* and
+    /// not for spend: the outbound value lives inside `descriptor.args` and so
+    /// inside the effect key, and a value that changed would diverge before it
+    /// could be billed. Spend has no such cover, which is why it is journaled.
+    #[serde(default)]
+    pub egress_bytes: u64,
 }
 
 /// Which limit stopped the run, and where it stood.
@@ -470,6 +520,23 @@ pub enum BudgetExceeded {
 
     #[error("time budget exhausted: {allowed}s permitted, {used}s elapsed")]
     Wallclock { allowed: u64, used: u64 },
+
+    /// The run tried to send more than it may.
+    ///
+    /// Carries `attempted` as well as `used`, which the metered ceilings cannot:
+    /// this one is checked against a size known before dispatch, so an operator
+    /// raising the limit sees both where the run stood and what it was about to
+    /// send — and can tell a ceiling that is too low from one call that is too
+    /// big.
+    #[error(
+        "egress budget exhausted: {allowed} byte(s) permitted, {used} sent, and \
+         this call would send {attempted} more"
+    )]
+    Egress {
+        allowed: u64,
+        used: u64,
+        attempted: u64,
+    },
 }
 
 impl BudgetExceeded {
@@ -490,6 +557,7 @@ impl BudgetExceeded {
             Self::Tokens { .. } => "tokens",
             Self::Money { .. } => "money",
             Self::Wallclock { .. } => "wallclock",
+            Self::Egress { .. } => "egress_bytes",
         }
     }
 }
@@ -542,6 +610,7 @@ impl Ledger {
                 },
                 elapsed_secs: 0,
                 denials: 0,
+                egress_bytes: 0,
             },
             live: Spend {
                 tokens: 0,
@@ -650,9 +719,10 @@ impl Ledger {
     ///
     /// The first ceiling this effect would cross. Nothing is counted when the
     /// answer is a refusal.
-    pub fn admit_effect(&mut self) -> Result<(), BudgetExceeded> {
-        self.can_admit_effect()?;
+    pub fn admit_effect(&mut self, outbound: u64) -> Result<(), BudgetExceeded> {
+        self.can_admit_effect(outbound)?;
         self.consumed.effects += 1;
+        self.consumed.egress_bytes = self.consumed.egress_bytes.saturating_add(outbound);
         Ok(())
     }
 
@@ -665,7 +735,7 @@ impl Ledger {
     /// # Errors
     ///
     /// The first ceiling the next effect would cross.
-    pub fn can_admit_effect(&self) -> Result<(), BudgetExceeded> {
+    pub fn can_admit_effect(&self, outbound: u64) -> Result<(), BudgetExceeded> {
         // Checked here as well as at the denial itself, and that is the half
         // that actually binds: a probing loop swallows the error it gets back,
         // so refusing the *next* attempt is what stops the probing rather than
@@ -695,6 +765,21 @@ impl Ledger {
                 used: self.consumed.spend.minor_units,
             });
         }
+        // `>` against the total *this effect would reach*, not `>=` against the
+        // total so far. Every ceiling above compares a cost it cannot know yet
+        // and therefore refuses once consumption has reached the limit, leaving
+        // the run to overshoot by one operation. This size is in hand before
+        // dispatch, so the comparison is the exact one and nothing over the
+        // ceiling is ever sent.
+        if let Some(max) = self.budget.max_egress_bytes
+            && self.consumed.egress_bytes.saturating_add(outbound) > max
+        {
+            return Err(BudgetExceeded::Egress {
+                allowed: max,
+                used: self.consumed.egress_bytes,
+                attempted: outbound,
+            });
+        }
         self.check_time()
     }
 
@@ -705,8 +790,9 @@ impl Ledger {
     /// and no order, and a durable wait, which is registered rather than
     /// dispatched. Both still happened, so both still count — the alternative
     /// is a ceiling a run walks through by phrasing its work as an undo.
-    pub const fn count_effect(&mut self) {
+    pub const fn count_effect(&mut self, outbound: u64) {
         self.consumed.effects += 1;
+        self.consumed.egress_bytes = self.consumed.egress_bytes.saturating_add(outbound);
     }
 
     /// Add what an announced attempt cost, without taking a slot.
@@ -739,9 +825,10 @@ impl Ledger {
     /// performs — a replayed run must reach the same verdict at the same
     /// point, and it can only do that if one announcement costs one slot on
     /// both paths.
-    pub fn replay_effect(&mut self, spend: Spend) {
+    pub fn replay_effect(&mut self, spend: Spend, outbound: u64) {
         self.consumed.effects += 1;
         self.consumed.spend += spend;
+        self.consumed.egress_bytes = self.consumed.egress_bytes.saturating_add(outbound);
     }
 
     /// Count a policy refusal, and report if that was one too many.
@@ -809,7 +896,7 @@ mod tests {
     fn an_unlimited_budget_admits_everything() {
         let mut l = Ledger::new(Budget::unlimited());
         for _ in 0..1000 {
-            l.admit_effect().unwrap();
+            l.admit_effect(0).unwrap();
             l.record_spend(Spend::tokens(10_000));
         }
         l.admit_step(0).unwrap();
@@ -834,11 +921,11 @@ mod tests {
     fn the_effect_limit_stops_a_runaway_loop_of_free_operations() {
         let mut l = Ledger::new(Budget::default().effects(3));
         for _ in 0..3 {
-            l.admit_effect().unwrap();
+            l.admit_effect(0).unwrap();
             l.record_spend(Spend::default());
         }
         assert!(matches!(
-            l.admit_effect().unwrap_err(),
+            l.admit_effect(0).unwrap_err(),
             BudgetExceeded::Effects {
                 allowed: 3,
                 used: 3
@@ -849,9 +936,9 @@ mod tests {
     #[test]
     fn the_token_limit_reports_where_it_stood() {
         let mut l = Ledger::new(Budget::default().tokens(100));
-        l.admit_effect().unwrap();
+        l.admit_effect(0).unwrap();
         l.record_spend(Spend::tokens(150));
-        match l.admit_effect().unwrap_err() {
+        match l.admit_effect(0).unwrap_err() {
             BudgetExceeded::Tokens { allowed, used } => {
                 assert_eq!(
                     (allowed, used),
@@ -866,12 +953,12 @@ mod tests {
     #[test]
     fn the_cost_limit_uses_integers() {
         let mut l = Ledger::new(Budget::default().minor_units(500));
-        l.admit_effect().unwrap();
+        l.admit_effect(0).unwrap();
         l.record_spend(Spend::money(499));
-        l.admit_effect().expect("still under");
+        l.admit_effect(0).expect("still under");
         l.record_spend(Spend::money(2));
         assert!(matches!(
-            l.admit_effect().unwrap_err(),
+            l.admit_effect(0).unwrap_err(),
             BudgetExceeded::Money {
                 allowed: 500,
                 used: 501
@@ -965,7 +1052,7 @@ mod tests {
             let mut l = Ledger::new(Budget::default().tokens(100));
             let mut stopped_at = None;
             for (i, s) in spends.iter().enumerate() {
-                if l.admit_effect().is_err() {
+                if l.admit_effect(0).is_err() {
                     stopped_at = Some(i);
                     break;
                 }
@@ -1055,12 +1142,12 @@ mod tests {
     #[test]
     fn a_metered_budget_overshoots_by_at_most_one_operation() {
         let mut l = Ledger::new(Budget::default().tokens(100));
-        l.admit_effect().unwrap();
+        l.admit_effect(0).unwrap();
         l.record_spend(Spend::tokens(99));
-        l.admit_effect().expect("99 has not reached 100");
+        l.admit_effect(0).expect("99 has not reached 100");
         l.record_spend(Spend::tokens(1_000_000));
 
-        assert!(l.admit_effect().is_err(), "but nothing further starts");
+        assert!(l.admit_effect(0).is_err(), "but nothing further starts");
         assert_eq!(l.consumed().spend.tokens, 1_000_099);
     }
 
@@ -1068,11 +1155,11 @@ mod tests {
     #[test]
     fn an_effect_count_budget_is_exact() {
         let mut l = Ledger::new(Budget::default().effects(2));
-        l.admit_effect().unwrap();
+        l.admit_effect(0).unwrap();
         l.record_spend(Spend::tokens(1));
-        l.admit_effect().unwrap();
+        l.admit_effect(0).unwrap();
         l.record_spend(Spend::tokens(1));
-        assert!(l.admit_effect().is_err());
+        assert!(l.admit_effect(0).is_err());
         assert_eq!(l.consumed().effects, 2, "never more than asked for");
     }
 }
@@ -1105,16 +1192,16 @@ mod denial_tests {
     #[test]
     fn past_the_ceiling_no_further_effect_is_admitted() {
         let mut ledger = Ledger::new(Budget::unlimited().denials(1));
-        assert!(ledger.admit_effect().is_ok());
+        assert!(ledger.admit_effect(0).is_ok());
         let _ = ledger.record_denial();
         assert!(
-            ledger.admit_effect().is_ok(),
+            ledger.admit_effect(0).is_ok(),
             "one refusal is within a ceiling of one"
         );
         let _ = ledger.record_denial();
         assert!(
             matches!(
-                ledger.admit_effect(),
+                ledger.admit_effect(0),
                 Err(BudgetExceeded::Denials { allowed: 1 })
             ),
             "past the ceiling the next attempt must be refused before it is \
@@ -1136,6 +1223,6 @@ mod denial_tests {
         for _ in 0..1_000 {
             assert!(ledger.record_denial().is_ok());
         }
-        assert!(ledger.admit_effect().is_ok());
+        assert!(ledger.admit_effect(0).is_ok());
     }
 }

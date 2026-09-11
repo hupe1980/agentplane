@@ -319,11 +319,25 @@ whose call is refused and reads what the next turn was told.
 
 That leaves the refused/allowed bit itself, which no wording removes short of
 fabricating success. `Budget::max_denials` bounds it instead — a ceiling on how
-often one run may be refused, checked **before** the policy is consulted, since a
-refusal is journaled as it happens and a ceiling applied afterwards bounds
-nothing an observer has not already seen. It reads as a security control and is
-equally an operational one: a run stuck in a denial loop has stopped making
-progress.
+often one run may be refused. It reads as a security control and is equally an
+operational one: a run stuck in a denial loop has stopped making progress.
+
+#### What `max_denials` counts {#what-max-denials-counts}
+
+**The two paths do not behave alike.** A **sink** refusal — an untrusted value in a protected
+field, a sensitivity over a ceiling — comes back to a tool-calling model as
+`REFUSED`, the loop continues, and the model may try again. Those accumulate,
+and this is the ceiling that stops them: it is the channel a model can actually
+probe. An **engine** denial is not model-facing at all. In that same loop it
+ends the run outright, which is a stricter bound than any ceiling, and it
+accumulates only where a run's own code catches `StepError::Denied` and carries
+on. Both are counted, because counting only the second would leave the ceiling
+naming a channel it never reached.
+
+The check sits **before** the policy is consulted, and that is a statement about
+its position rather than its purpose: a refusal is journaled as it happens, so a
+ceiling applied afterwards bounds nothing an observer has not already seen. What
+it stops is the *next* attempt.
 
 ## The trust boundary
 
@@ -1189,9 +1203,24 @@ So `EffectStarted` carries **`outbound_bytes`**: the canonical size of the value
 that crossed the sink, beside the label of what crossed it. Absent when an effect
 binds no value, so the ordinary record is unchanged.
 
-It is not a control, deliberately — *forty times the median for this capability*
-is a threshold a deployment sets against its own traffic. What this supplies is
-the figure, so that rule is an ordinary query over the journal.
+The figure is not itself a control — *forty times the median for this
+capability* is a threshold a deployment sets against its own traffic, not one
+this crate could pick. What it supplies is the number, so that rule is an
+ordinary query over the journal.
+
+Beside it sits the ceiling: **`Budget::max_egress_bytes`**, declarable as
+`spec.budgets.max_egress_bytes`, bounding the total a run may send. It is the
+one ceiling in this crate that is **exact** — every metered limit compares a cost
+it cannot know until the call returns and so overshoots by one operation, while
+an outbound size is in hand before dispatch, so the call that would cross the
+ceiling is the call refused. Zero is meaningful and says *may read, may not
+send*.
+
+The two answer different halves and neither replaces the other. A ceiling bounds
+the worst case and says nothing about an extraction that stayed under it; the
+figure catches that one and stops nothing. An agent whose job is to answer
+questions has a small honest ceiling; an agent whose job is bulk export has a
+large one and is watched by the figure.
 
 Recorded rather than derived: the bytes are in `descriptor.args`, so a scan could
 measure them until the payload is sealed or erased. A count is not personal data
@@ -1472,10 +1501,8 @@ anything that reaches a prompt. An auditor can still answer *why*; the thing tha
 might be attacking the policy learns nothing it can tell apart.
 
 That leaves the refused/allowed bit itself, which no wording removes short of
-fabricating success. `Budget::max_denials` bounds it instead — a ceiling on how
-often one run may be refused, checked **before** the policy is consulted, since a
-refusal is journaled as it happens and a ceiling applied afterwards bounds
-nothing an observer has not already seen.
+fabricating success. `Budget::max_denials` bounds it — see [what that ceiling
+counts](#what-max-denials-counts), which is not the same on both refusal paths.
 
 ## Content guardrails
 

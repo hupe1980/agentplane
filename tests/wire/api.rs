@@ -844,6 +844,10 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
 
     let mut requests = vec![
         get("/runs/not-an-id", Some("bob")),
+        // Its own verb, and asked before the id is even parsed: the records of
+        // a run are its inputs and every argument it sent, which is not what a
+        // deployment granted when it granted the status view.
+        get("/runs/not-an-id/history", Some("bob")),
         post(
             "/runs/not-an-id/cancel",
             Some("bob"),
@@ -1150,6 +1154,85 @@ async fn an_exhausted_runs_view_carries_the_typed_ceiling() {
     assert_eq!(body["exhaustion"]["allowed"], 3, "{body}");
     assert_eq!(body["exhaustion"]["used"], 3, "{body}");
     assert_eq!(body["sealed"], false, "{body}");
+}
+
+/// **A run's journal is readable from the surface that answers about runs.**
+///
+/// The status view serves a *count* of records, which answers "is it doing
+/// anything" and nothing about what it did. `GET /cases/{case}` has always
+/// served the records of a matter, so the asymmetry was the tell: a plane whose
+/// thesis is that the journal is the plan of record had no in-band way to read
+/// one run's journal, leaving `agentplane export` — an offline artifact over the
+/// whole plane — as the answer to a question about one run.
+///
+/// The cursor is asserted rather than the contents: what makes a bounded
+/// history usable is that a reader can continue it, and a `truncated` flag with
+/// no cursor beside it tells somebody there is more without telling them where.
+#[tokio::test]
+async fn a_runs_journal_is_readable_and_pages_from_a_cursor() {
+    let f = fixture();
+    let router = f.router();
+    let task = f.pending_task().await;
+    let run = (f.store.clone() as Arc<dyn TaskStore>)
+        .task(agentplane::core::TaskId::parse(&task).expect("a task id"))
+        .await
+        .unwrap()
+        .expect("the task")
+        .run;
+
+    let (status, body) = send(&router, get(&format!("/runs/{run}/history"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let records = body["records"].as_array().expect("records");
+    assert!(
+        records.len() > 1,
+        "a completed run has a history worth reading: {body}"
+    );
+    assert_eq!(records[0]["seq"], 1, "{body}");
+    assert_eq!(records[0]["kind"], "RunAdmitted", "{body}");
+    assert!(
+        records[0]["record"].is_object(),
+        "the record itself, not only its name: {body}"
+    );
+    assert_eq!(body["truncated"], false, "this run fits in a page: {body}");
+    assert!(
+        body["next_from"].is_null(),
+        "a complete page hands back no cursor, or a caller loops on it forever: {body}"
+    );
+
+    // A cursor past the first record skips exactly it, which is what makes the
+    // read resumable for a consumer that already has the prefix.
+    let (status, body) = send(
+        &router,
+        get(&format!("/runs/{run}/history?from=2"), Some("bob")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["from"], 2, "{body}");
+    assert_eq!(body["records"][0]["seq"], 2, "{body}");
+
+    // Past the end is an empty page, not a 404: the run exists and the reader
+    // has caught up, which are different facts from "no such run".
+    let (status, body) = send(
+        &router,
+        get(&format!("/runs/{run}/history?from=100000"), Some("bob")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["records"].as_array().expect("records").is_empty(),
+        "{body}"
+    );
+
+    let (status, _) = send(
+        &router,
+        get("/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/history", Some("bob")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unknown run is not an empty one"
+    );
 }
 
 /// An unknown run is a 404, and a malformed one a 400 — after the gate.

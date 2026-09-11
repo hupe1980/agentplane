@@ -2121,6 +2121,54 @@ message after the instant is refused with the expiry named. Leave both out and
 the caller has no chain: its runs act under whatever the plane was built with,
 which for `serve` is none.
 
+## 🛑 Stop an instance without turning it into a crash {#stop-an-instance-without-turning-it-into-a-crash}
+
+`agentplane serve` does this for you on `SIGTERM` — the recipe is for an embedder
+serving the plane from their own process.
+
+```rust
+use std::time::Duration;
+
+// Both at once, and that is the point. Your server's graceful shutdown finishes
+// the requests already being served — including a run one of them is awaiting —
+// while `drain` closes admission and waits for the runs this plane put on a task
+// of its own. Serialising them deadlocks one on the other.
+let (report, served) = tokio::join!(
+    runtime.drain(Duration::from_secs(25)),
+    axum::serve(listener, app).with_graceful_shutdown(async { stop.notified().await }),
+);
+served?;
+if !report.is_complete() {
+    tracing::warn!(
+        settled = report.settled(),
+        unfinished = ?report.unfinished,
+        "the grace period ended with runs still executing"
+    );
+}
+```
+
+Why it is worth the twenty lines: an announcement goes into the journal *before*
+a call leaves, so a process killed in between leaves an outcome nothing can
+decide — and the effect's declared `Recovery` has to answer, which for anything
+not safe to repeat means a person. Draining turns the ordinary case of a deploy
+back into an ordinary conclusion.
+
+The grace period is a bound, not a promise. Runs still executing when it ends
+keep their leases, stop being renewed, and are taken over by the recovery sweep
+on the path a crash takes — which is why `drain` does **not** hand those leases
+back: a release says takeover is safe, and the next owner would re-perform a call
+still in flight here.
+
+What it does not wait for: a run you `await` yourself belongs to your task, and
+your server's graceful shutdown is what finishes it. What it does not refuse:
+resumes, and an agent commissioning another one — both are work this plane
+already owns.
+
+If you serve the A2A surface, closing admission is also what ends open
+subscriptions. A stream is a long poll over the journal, so one watching a run
+that has not concluded would keep its connection — and your graceful shutdown —
+open for as long as that run lasts.
+
 ## 📤 Emit an event per run, without an outbox table {#emit-an-event-per-run-without-an-outbox-table}
 
 A2A push is **caller-shaped**: the URL comes from whoever created the task, which

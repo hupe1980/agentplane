@@ -290,9 +290,8 @@ impl Declarative {
                 // The arguments *are* part of the completion, so they carry
                 // the completion's own label rather than one invented
                 // here. Synthesising a label would assert a provenance
-                // nothing established — and the first version of this did
-                // exactly that, producing a sensitivity the model call
-                // never had and a refusal nobody could explain.
+                // nothing established, producing a sensitivity the model
+                // call never had and a refusal nobody could explain.
                 //
                 // Untrusted either way, so the grant's protected fields
                 // and the sink's ceiling decide, exactly as they would

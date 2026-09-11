@@ -30,6 +30,12 @@
 //! an out-of-band answer may resume the task without another client request.
 //! Intermediaries may reap a very idle connection; reconnecting is safe because
 //! the stream is rebuilt from the journal rather than resumed from memory.
+//!
+//! It also ends when **this instance** is stopping, for the same reason and with
+//! the same remedy. A subscription outlives any one process by reconnecting, and
+//! a stream that did not end would hold the server's graceful shutdown open for
+//! as long as the run it watches — which for a run sleeping five working days is
+//! until the supervisor gives up and kills it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -251,6 +257,17 @@ fn frames(
             if done {
                 return;
             }
+            // A subscription to a run that sleeps for five working days is a
+            // connection that never closes, and a server draining gracefully
+            // waits for every connection — so without this an ordinary deploy
+            // would hang until the supervisor's `SIGKILL`, which is the one stop
+            // nothing can drain. Ending here is the failure this module is
+            // already shaped for: the stream is a view of history, so the client
+            // reconnects, is told the current state from the journal, and is
+            // served by whichever instance is up.
+            if runtime.is_draining() {
+                return;
+            }
             tokio::time::sleep(POLL).await;
         }
     };
@@ -337,6 +354,49 @@ mod tests {
             1,
             "a stream on a finished task must yield the snapshot and stop; it \
              produced {} events",
+            collected.len()
+        );
+    }
+
+    /// **A stream ends when this instance is stopping.**
+    ///
+    /// A subscription to a run that has not concluded polls indefinitely by
+    /// design, and a server draining gracefully waits for every open connection
+    /// — so without this an ordinary deploy hangs until the supervisor's
+    /// `SIGKILL`, which is the one stop nothing can drain. The bound below turns
+    /// "never ends" into a sentence rather than a CI timeout, exactly as the
+    /// test above does.
+    ///
+    /// What this does **not** cover is the client's side: reconnecting is what
+    /// makes ending here safe, and that is the module's standing contract rather
+    /// than something a drain introduced.
+    #[tokio::test]
+    async fn a_stream_ends_when_the_instance_is_draining() {
+        let store = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"));
+        let runtime = crate::runtime::Runtime::builder(
+            Arc::clone(&store) as Arc<dyn crate::journal::JournalStore>
+        )
+        .build();
+        let run = RunId::generate();
+
+        // Working, so the loop would otherwise poll a run that never concludes.
+        let working = crate::api::a2a::task_of(run, TaskState::Working, "accepted", None);
+        runtime.drain(std::time::Duration::ZERO).await;
+
+        let collected: Vec<Result<Event, std::convert::Infallible>> = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            frames(runtime, run, None, json!(1), working, 1).collect(),
+        )
+        .await
+        .expect(
+            "a stream did not end while the instance was draining: it would hold the \
+             server's graceful shutdown open for as long as the run it watches",
+        );
+
+        assert_eq!(
+            collected.len(),
+            1,
+            "a draining instance must yield the snapshot and stop; it produced {} events",
             collected.len()
         );
     }

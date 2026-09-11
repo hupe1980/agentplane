@@ -72,6 +72,10 @@
 //! * *What is this run doing, and why is it not finishing?* — a suspended run
 //!   reports **what it is waiting for**, because "suspended" alone sends someone
 //!   into the journal.
+//! * *And what did it do?* — the journal itself, cursored, under its own verb.
+//!   The status view answers from six fields; this answers with the run's
+//!   inputs, its model exchanges and every argument it sent, which is a
+//!   different grant to make.
 //! * *What is waiting for me?* — the worklist, filtered to the caller's roles,
 //!   with each item saying whether **this** caller may decide it and who has
 //!   already reserved it.
@@ -396,6 +400,20 @@ pub struct RunView {
     /// to unwind, and an operator who cannot see that will ask again.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancellation_requested_by: Option<String>,
+    /// Whose decision this ending was, where a person made it.
+    ///
+    /// Distinct from `cancellation_requested_by`, which answers *somebody has
+    /// asked* about a run that may still be running. This answers *who ended
+    /// it*, read back from the chain: the canceller, the operator who abandoned
+    /// a quarantine, or the one who crossed into this tenant. Absent for every
+    /// ending the runtime reached on its own.
+    ///
+    /// Beside `reason` rather than folded into it, because *who* and *why* are
+    /// two questions — and an endpoint that answered the second and dropped the
+    /// first left a break-glass crossing reporting its reason with nobody's
+    /// name against it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided_by: Option<String>,
     /// Journal length — the operator's handle on "is it doing anything".
     pub records: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,7 +733,7 @@ pub struct Api {
     auth: Arc<dyn Authenticator>,
     /// How many worklist items one request may return.
     limit: usize,
-    /// How much of a matter's history one case view returns.
+    /// How much history one view returns — a matter's, or a run's.
     history: usize,
 }
 
@@ -779,12 +797,17 @@ impl Api {
         self
     }
 
-    /// How much of a matter's history one case view returns.
+    /// How much history one view returns — a matter's, or a run's.
     ///
     /// Its own knob rather than [`limit`](Self::limit), because the two bound
     /// different readings: a list page is scanned, a history is followed — and
     /// an operator who widens the worklist page should not silently deepen
     /// every case view with it.
+    ///
+    /// One knob for both histories rather than two, because they are the same
+    /// reading: a page of records a caller continues from a cursor. A run's is
+    /// the one that keeps going — `?from=<seq>` picks up where the last page
+    /// stopped — while a matter's is bounded by the matter.
     #[must_use]
     pub const fn history_limit(mut self, limit: usize) -> Self {
         self.history = limit;
@@ -800,6 +823,7 @@ impl Api {
         let router = Router::new()
             .route("/runs", get(runs_by_outcome))
             .route("/runs/{run}", get(run_view))
+            .route("/runs/{run}/history", get(run_history))
             .route("/runs/{run}/cancel", post(cancel_run))
             .route("/runs/{run}/reopen", post(reopen_run))
             .route("/runs/{run}/abandon", post(abandon_run))
@@ -888,6 +912,15 @@ impl Api {
 /// somebody else's verb.
 pub mod action {
     pub const RUN_READ: &str = "api:run.read";
+    /// Reading a run's journal, record by record.
+    ///
+    /// Its own verb rather than a widened `run.read`, for the reason
+    /// `obligation.list` is not a widened `case.list`: the status view answers
+    /// *what is this doing and why is it not finishing* from six fields, and
+    /// this answers it with the run's inputs, its model exchanges and every
+    /// argument it sent. A deployment that grants an on-call rota the first has
+    /// said nothing about the second.
+    pub const RUN_HISTORY: &str = "api:run.history";
     pub const RUN_LIST: &str = "api:run.list";
     pub const RUN_CANCEL: &str = "api:run.cancel";
     /// Handing a quarantined run back to be judged again. Its own verb rather
@@ -953,6 +986,7 @@ pub mod action {
     /// this list can omit the same verb from both sides and pass.
     pub const ALL: &[&str] = &[
         RUN_READ,
+        RUN_HISTORY,
         RUN_LIST,
         RUN_CANCEL,
         RUN_REOPEN,
@@ -1020,6 +1054,81 @@ fn store_failed() -> ApiError {
 
 fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("no such {what}"))
+}
+
+/// One run's journal, from a sequence the caller names.
+///
+/// The gap this fills was an asymmetry with no reason behind it: `GET
+/// /cases/{case}` serves the records of a matter, and the run view served a
+/// *count* of them. So the one question a plane whose thesis is "the journal is
+/// the plan of record" exists to answer — what did this run actually do — had no
+/// in-band answer at all. The alternatives were `agentplane export`, which is an
+/// offline artifact over the whole plane, and writing Rust against
+/// `JournalStore::read`.
+///
+/// Cursored rather than paged by offset. A run's records are contiguous from
+/// sequence one, so `from` is the next sequence a reader has not seen, which is
+/// the same cursor the streaming surface and any resumable consumer already use
+/// — and `next_from` is returned rather than left to be computed, because a
+/// cursor a caller derives is a cursor two callers derive differently.
+///
+/// Bounded by the same page the case history uses, and `truncated` says so: a
+/// history cut off at the limit is shaped exactly like a complete one, and a
+/// reader who cannot tell reads absence as evidence.
+#[cfg(feature = "http")]
+async fn run_history(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Path(run): Path<String>,
+    Query(page): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::RUN_HISTORY, &run).await?;
+    let id = RunId::parse(&run).map_err(|_| bad("run"))?;
+    // Sequences start at one, so `0` and absence mean the same thing: from the
+    // beginning. Taken as given otherwise — a cursor past the end is an empty
+    // page, which is the truthful answer to "what have I not seen".
+    let from = page.from.unwrap_or(1).max(1);
+
+    let mut records = s
+        .plane
+        .journal()
+        .read(id, from)
+        .await
+        .map_err(|_| store_failed())?;
+    // An empty history at sequence one is a run nobody has heard of; an empty
+    // one further along is a reader who has caught up. The two get different
+    // answers because they are different facts.
+    if records.is_empty() && from == 1 {
+        return Err(not_found("run"));
+    }
+
+    let truncated = records.len() > api.history;
+    records.truncate(api.history);
+    let next_from = records.last().map(|r| r.body.seq + 1);
+
+    Ok(Json(json!({
+        "run": id.to_string(),
+        "from": from,
+        "records": records
+            .iter()
+            .map(|r| json!({
+                "seq": r.seq(),
+                "kind": r.kind().kind_str(),
+                "record": serde_json::to_value(r.kind()).unwrap_or(Value::Null),
+            }))
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+        // Only where there is more to ask for. A cursor handed back on a
+        // complete page is one a caller loops on forever.
+        "next_from": truncated.then_some(next_from).flatten(),
+    })))
+}
+
+/// Where in a run's journal to read from.
+#[cfg(feature = "http")]
+#[derive(serde::Deserialize)]
+struct HistoryQuery {
+    from: Option<crate::core::Seq>,
 }
 
 async fn run_view(
@@ -1096,11 +1205,17 @@ async fn run_view(
         .map_err(|_| store_failed())?
         .map(|c| c.actor);
 
+    let decided_by = observed
+        .as_ref()
+        .and_then(RunStatus::actor)
+        .map(ToOwned::to_owned);
+
     Ok(Json(RunView {
         run: id.to_string(),
         status,
         waiting_for,
         reason,
+        decided_by,
         exhaustion,
         sealed,
         cancellation_requested_by,

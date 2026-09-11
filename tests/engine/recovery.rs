@@ -1492,12 +1492,20 @@ fn every_conclusion_but_success_carries_a_reason() {
             actor: "ops".into(),
             reason: "the provider has no record either way".into(),
         },
+        RunStatus::Swept,
+        RunStatus::BrokeGlass {
+            actor: "ops:hupe".into(),
+            reason: "INC-42: stuck settlement".into(),
+        },
     ];
 
     for status in statuses {
         let reason = status.reason();
         match &status {
-            RunStatus::Succeeded => assert!(
+            // A sweep is beside a success here for the same reason: it pursued
+            // no goal, so there is no ending to explain. What it did is on its
+            // own records, not in a one-line summary.
+            RunStatus::Succeeded | RunStatus::Swept => assert!(
                 reason.is_none(),
                 "a success has no reason to give, and inventing one would put a \
                  sentence in a field an embedder renders as a failure note"
@@ -1508,7 +1516,10 @@ fn every_conclusion_but_success_carries_a_reason() {
             | RunStatus::Cancelled { .. }
             | RunStatus::Abandoned { .. }
             | RunStatus::Suspended(_)
-            | RunStatus::Exhausted(_) => {
+            | RunStatus::Exhausted(_)
+            // A crossing cannot be recorded without one, so this is the variant
+            // where an empty reason would be a refusal that did not happen.
+            | RunStatus::BrokeGlass { .. } => {
                 let text = reason.unwrap_or_else(|| {
                     panic!("{} ended without saying why", status.as_str());
                 });

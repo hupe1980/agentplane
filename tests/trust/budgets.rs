@@ -1064,3 +1064,208 @@ async fn a_sink_refusal_counts_against_the_denial_ceiling() {
          run over"
     );
 }
+
+// ── Volume, which sensitivity does not measure ──────────────────────────────
+
+/// An effect that binds a chosen payload to its sink.
+///
+/// `sink_arguments` is what crosses, so it is what the egress ceiling counts —
+/// and it is inside `descriptor.args`, which is inside the effect key, which is
+/// why a replay may recompute the size instead of reading it back.
+#[derive(Debug, Clone)]
+struct Sends {
+    payload: Value,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Effect for Sends {
+    type Output = Value;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("test.send", json!({ "payload": self.payload }))
+    }
+
+    fn mutates(&self) -> bool {
+        true
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    fn sink_arguments(&self) -> Option<&Value> {
+        Some(&self.payload)
+    }
+
+    fn max_sensitivity(&self) -> agentplane::core::Sensitivity {
+        agentplane::core::Sensitivity::Internal
+    }
+
+    async fn perform(&self) -> Result<Value, EffectError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "sent": true }))
+    }
+}
+
+/// Sends `payload` once per call until something refuses.
+#[derive(Debug)]
+struct Exports {
+    payload: Value,
+    n: usize,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Skill for Exports {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("exports").provides("demo.export")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        for _ in 0..self.n {
+            cx.sink(
+                Sends {
+                    payload: self.payload.clone(),
+                    calls: Arc::clone(&self.calls),
+                },
+                &Tainted::trusted(self.payload.clone()),
+            )
+            .await?;
+        }
+        Ok(Outcome::done(Tainted::trusted(json!({ "done": true }))))
+    }
+}
+
+fn payload_size(v: &Value) -> u64 {
+    agentplane::core::canon::to_bytes(v)
+        .map(|b| b.len() as u64)
+        .unwrap()
+}
+
+/// **The ceiling is exact: nothing over it is ever sent.**
+///
+/// Every other metered ceiling compares a cost it cannot know until the call
+/// returns, so it refuses once consumption has *reached* the limit and the run
+/// overshoots by one operation. An outbound size is in hand before dispatch, so
+/// the effect that would cross the ceiling is the effect refused — and the
+/// assertion that matters is the call count, not the status: a ceiling that
+/// stopped the run *after* the send would look identical here.
+#[tokio::test]
+async fn an_egress_ceiling_refuses_the_call_that_would_cross_it() {
+    let payload = json!({ "records": ["a".repeat(200)] });
+    let each = payload_size(&payload);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .budget(Budget::unlimited().egress_bytes(each * 2 + 1))
+        .skill(Exports {
+            payload: payload.clone(),
+            n: 5,
+            calls: Arc::clone(&calls),
+        })
+        .build();
+
+    let out = rt
+        .run("demo.export", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "two payloads fit under the ceiling and the third does not — a run that \
+         sent three has an overshoot this ceiling is specified not to have"
+    );
+    match &out.status {
+        RunStatus::Exhausted(agentplane::core::BudgetExceeded::Egress {
+            allowed,
+            used,
+            attempted,
+        }) => {
+            assert_eq!(*allowed, each * 2 + 1);
+            assert_eq!(*used, each * 2, "both sends are billed, and only those");
+            assert_eq!(
+                *attempted, each,
+                "the refusal names what the call would have sent, so an operator \
+                 can tell a ceiling that is too low from one call that is too big"
+            );
+        }
+        other => panic!("expected an egress exhaustion, got {other:?}"),
+    }
+}
+
+/// A read costs nothing here, so a ceiling of zero is a run that may look and
+/// may not send.
+#[tokio::test]
+async fn a_zero_egress_ceiling_still_permits_a_read() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let steps = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .budget(Budget::unlimited().egress_bytes(0))
+        .skill(Spends {
+            n: 2,
+            tokens: 3,
+            minor_units: 0,
+            calls: Arc::clone(&calls),
+        })
+        .skill(Noop("demo.noop", Arc::clone(&steps)))
+        .build();
+
+    let out = rt
+        .run("demo.spend", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "a metered read binds no outbound value, so it costs nothing against an \
+         egress ceiling: {:?}",
+        out.status
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+}
+
+/// **A replayed run reaches the same egress tally as the original.**
+///
+/// The figure is recomputed from the effect rather than read back from the
+/// record, which is only sound because the outbound value is inside
+/// `descriptor.args` and therefore inside the effect key: a value that changed
+/// would quarantine as divergence before it could be billed. This is the
+/// assertion that would fail if that ever stopped being true.
+#[tokio::test]
+async fn a_strict_replay_reaches_the_same_egress_tally() {
+    let payload = json!({ "records": ["z".repeat(64)] });
+    let each = payload_size(&payload);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Exports {
+            payload,
+            n: 3,
+            calls: Arc::clone(&calls),
+        })
+        .build();
+
+    let live = rt
+        .run("demo.export", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(live.consumed.egress_bytes, each * 3);
+
+    let replayed = rt.replay(live.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(
+        replayed.consumed.egress_bytes, live.consumed.egress_bytes,
+        "a strict pass performs nothing and must still reach the tally the live \
+         run reached, or a resumed run exhausts where its own history did not"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "strict replay dispatched nothing"
+    );
+}

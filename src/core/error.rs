@@ -198,6 +198,22 @@ pub enum RuntimeError {
     #[error(transparent)]
     QuotaExceeded(#[from] crate::quota::QuotaError),
 
+    /// This instance is shutting down, so nothing was admitted.
+    ///
+    /// Back-pressure, not a verdict: the work is fine and another instance will
+    /// take it. Kept apart from a quota refusal because the two clear on
+    /// different terms — a ceiling clears when a run finishes here, this one
+    /// clears when the caller reaches a different process — and apart from a
+    /// halt, which means *stop asking anybody*.
+    ///
+    /// Nothing was written: no lease, no quota slot, no journal. A caller may
+    /// retry immediately, elsewhere.
+    #[error(
+        "this instance is draining and did not admit the run — retry; \
+         nothing was written and another instance can take it"
+    )]
+    Draining,
+
     /// A live pass finished, but its durable quota receipt did not commit.
     ///
     /// The run deliberately keeps its lease. Once it expires, the abandonment

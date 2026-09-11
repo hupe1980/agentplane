@@ -113,6 +113,14 @@ five minutes with the crate.
 with the code — it is the published documentation, not a copy of it.
 A design document that does not update on contact is decoration.
 
+**A changelog entry, in the same change.** `CHANGELOG.md`'s contract is that it
+is written for somebody who already depends on a version, so an entry is only
+true if it sits under the version that shipped the code. Written a cycle later
+it lands under the *next* heading and tells every reader on the release that
+actually has the feature that they do not. No check catches this: whether an
+entry describes this release's work or the last one's is not a question a test
+can ask, which makes writing it beside the change the only control there is.
+
 ## 🚫 Things that will be pushed back on
 
 **Reading the clock, RNG, or generating an id directly.** These are denied

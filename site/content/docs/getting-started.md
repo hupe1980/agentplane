@@ -249,6 +249,12 @@ default, `0` to drive it from your own scheduler). Without it an agent that call
 never make progress — a suspended run is a row, and something has to come back
 for it.
 
+And it **drains**. `SIGTERM` or `SIGINT` stops it accepting, answers what it has
+in hand, and gives the runs already executing `--drain-secs` (25 by default) to
+finish. Without that a deploy cuts runs mid-tool-call, which the journal can only
+report as *this call may or may not have happened* — see [stopping an
+instance](@/docs/operations.md#stopping-an-instance).
+
 Four things are refused rather than defaulted, and each refusal is the design:
 
 - **`--policy`** — a Cedar policy set. A permissive engine and no engine are the
@@ -293,7 +299,7 @@ declared orchestrator; say `--capability` when the file leaves any doubt.
 Every verb takes only its own flags — `agentplane run --push-host …` does not
 parse, because the flag lives on `serve`'s struct. Deployment wiring also reads
 `AGENTPLANE_STORE`, `AGENTPLANE_URL`, `AGENTPLANE_POLICY`, `AGENTPLANE_TOKENS`,
-`AGENTPLANE_ADDR` and `AGENTPLANE_OPERATOR_ADDR`, with the flag winning when
+`AGENTPLANE_ADDR`, `AGENTPLANE_OPERATOR_ADDR` and `AGENTPLANE_DRAIN_SECS`, with the flag winning when
 both are given — one rule, rather than a config file and a precedence table.
 `agentplane <verb> --help` is generated from the same structs that enforce the
 flags, so it cannot describe an option nobody implemented.

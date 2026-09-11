@@ -172,13 +172,19 @@ impl Runtime {
                 // than admitting again. Two mechanisms for one invariant would
                 // be two places to disagree.
                 super::executor::RunTerms::default(),
+                // A batch pass is started from outside this process, so its
+                // items stop when the plane stops admitting. The refusal is
+                // not recorded, the reservation keeps no outcome, and the next
+                // instance's pass re-admits exactly these items.
+                super::executor::Entry::Outside,
             )
             .await
         };
 
         // Only a run that reached an outcome is an item outcome. An error
-        // here is the plane refusing to *admit* — a halt, a ceiling, a store
-        // that could not be reached — and it holds for the next item as much
+        // here is the plane refusing to *admit* — a halt, a ceiling, an
+        // instance shutting down, a store that could not be reached — and it
+        // holds for the next item as much
         // as this one, so the pass stops with it. Recording it would write a
         // terminal `Failed` over an item nothing ever ran: the halt lifts, the
         // ceiling frees, and the item stays failed forever. The reservation
@@ -290,6 +296,17 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
         // An item somebody stopped did not settle, and the batch must not
         // report otherwise — but the reason names the person, so a partial
         // batch can be told apart from one that hit a wall.
+        // Unreachable by construction — a batch item is admitted as an ordinary
+        // run and neither of these is ever admitted — so reaching it means the
+        // reservation points at a run this batch did not start. `Quarantined`
+        // for the same reason abandonment is: the answer to *what does a person
+        // do next* is hands off, and filing it under `Failed` would hand it to
+        // the readers who re-run.
+        RunStatus::Swept | RunStatus::BrokeGlass { .. } => ItemOutcome::Quarantined(
+            "this item's run id resolves to one of the plane's own records, not to \
+             the item's run — the reservation and the journal disagree"
+                .to_owned(),
+        ),
         RunStatus::Cancelled { actor, reason } => {
             ItemOutcome::Failed(format!("cancelled by '{actor}': {reason}"))
         }

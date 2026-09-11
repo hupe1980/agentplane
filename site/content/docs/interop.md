@@ -475,13 +475,21 @@ standards-compliant. The client backs off only on the marked pair; a bare
 message beside the code is one fixed sentence with no numbers in it — the
 quota's counters are the operator's to read, not a prober's.
 
-A halt is the other admission refusal, and it is deliberately **not** the same
-answer: `-32030` with the reason `HALTED`, under the same domain and the same
-pair-is-the-identity rule. A ceiling says *come back*; a halt says somebody is
-dealing with an incident, and a peer that backs off and retries is doing
-exactly what the switch exists to end. The message is fixed and carries none of
-the operator's reason — the counterparty gets the outcome, not the plane's
-internals.
+Admission has three refusals in all, and each gets its own code under the same
+domain and the same pair-is-the-identity rule, because each asks something
+different of the caller.
+
+| Code | Reason | What it asks |
+| --- | --- | --- |
+| `-32029` | `QUOTA_EXHAUSTED` | Back off and come back — a ceiling clears when a run here finishes |
+| `-32030` | `HALTED` | Stop. Somebody is dealing with an incident, and retrying is what the switch exists to end |
+| `-32031` | `DRAINING` | Retry now. This *process* is shutting down; the next request reaches another instance |
+
+Collapsing any two of them costs the caller something real: a halt under the
+ceiling's code teaches every peer to hammer the one refusal that means stop, and
+a drain under either teaches a peer to wait out a window that does not exist. All
+three messages are fixed sentences carrying no counters, no operator reason and
+no instance name — the counterparty gets the outcome, not the plane's internals.
 
 Outbound, both legs refuse plaintext: the peer call carries the run's payload
 and a bearer credential, and the card fetch decides where that call will go,
