@@ -519,6 +519,53 @@ async fn an_audit_reports_what_it_could_not_look_at() {
     assert!(report.not_checked.iter().any(|s| s.contains("signatures")));
 }
 
+/// The report names the anchor it was held to.
+///
+/// A clean report and a clean report *against an outside checkpoint* are
+/// different statements, and only one of them is evidence about deletion. With
+/// `held_to` absent they read identically to anything parsing the JSON — which
+/// is what a SIEM, a ticket attachment and a compliance reviewer all are.
+/// `RestoreReport` and `VerifyReport` both name their checkpoint; this was the
+/// one that did not.
+#[tokio::test]
+async fn an_audit_names_the_checkpoint_it_was_held_to() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 2).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    let blind = agentplane::audit::audit(&s, &runs, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        blind.held_to.is_none(),
+        "an audit given no checkpoint claimed one: {:?}",
+        blind.held_to
+    );
+
+    let prior = s.checkpoint().await.unwrap();
+    let armed = agentplane::audit::audit(
+        &s,
+        &runs,
+        &agentplane::audit::Evidence {
+            prior: Some(&prior),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        armed.held_to.as_ref(),
+        Some(&prior),
+        "the report does not say which history it compared against, so a clean \
+         verdict cannot be told from one that checked nothing"
+    );
+    assert!(
+        !armed.not_checked.iter().any(|n| n.contains("deletion")),
+        "the deletion check ran and the report still says it did not: {:?}",
+        armed.not_checked
+    );
+}
+
 /// **A truncated-but-internally-consistent history is a finding, not sound.**
 ///
 /// A prefix of a hash chain verifies on its own — chaining catches edits and

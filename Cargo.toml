@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.32.0"
+version      = "0.33.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -52,16 +52,18 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # pattern. Off by default — the runtime is usable wired by builder calls; the
 # manifest is what makes those declarations reviewable.
 manifest = ["dep:serde_yaml_ng", "dep:jsonschema"]
-# Everything the `agentplane` binary needs. `signing` is here for the audit
-# verbs: an `audit`/`verify` that could not check a signature would send the
-# independent party back to writing Rust.
+# Everything the `agentplane` binary needs. `signing` and `witness-http` are
+# here for the audit verbs, for one reason: an `audit`/`verify` that could not
+# check a signature, or could not fetch an anchoring checkpoint from a witness,
+# sends the independent party back to writing Rust — or back to the operator
+# for the very checkpoint the check is about.
 #
 # **Never `testkit`.** The binary needs one thing from it — `provider: fake` —
 # and that is `fake-model`. Taking the whole feature would ship fault injection,
 # a self-minting signer and a plaintext-loopback exception in every published
 # artifact, each documented at its definition as impossible in a production
 # build. `no_shipped_feature_enables_testkit` holds it.
-cli = ["manifest", "redb", "providers", "bedrock", "fake-model", "signing", "dep:tracing-subscriber", "dep:clap"]
+cli = ["manifest", "redb", "providers", "bedrock", "fake-model", "signing", "witness-http", "dep:tracing-subscriber", "dep:clap"]
 # Content-addressed blobs on any backend OpenDAL reaches, for bytes too big for
 # the chain to carry.
 opendal = ["dep:opendal"]
@@ -137,10 +139,10 @@ async-trait = "0.1"
 # reaches for the engine.
 base64 = "0.23"
 serde       = { version = "1", features = ["derive"] }
-# NOTE: this crate must not ask for `preserve_order`, but it can no longer
-# assume nobody does — cargo unifies features across the graph and cedar-policy
-# enables it. Canonical order is therefore produced by `core::canon` itself
-# rather than inherited from serde_json::Map. See that module.
+# NOTE: this crate must not ask for `preserve_order`, and cannot assume nobody
+# else does — cargo unifies features across the graph and cedar-policy enables
+# it. Canonical order is therefore produced by `core::canon` itself rather than
+# inherited from serde_json::Map. See that module.
 serde_json  = "1"
 # Schema *from the type*, so a tool's arguments have one declaration rather
 # than a hand-written copy in a manifest and a hand-indexed copy in the body.

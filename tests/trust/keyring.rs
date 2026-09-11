@@ -477,7 +477,8 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
     assert_ne!(backup, SECRET, "the run wrote its payload in the clear");
     assert!(
         matches!(disk.get_raw(digest).await, Err(BlobError::NotFound(_))),
-        "the bytes were filed at the bare content digest, outside the case's          erasure unit"
+        "the bytes were filed at the bare content digest, outside the case's \
+             erasure unit"
     );
 
     let sealed_view = EncryptedBlobs::new(

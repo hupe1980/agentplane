@@ -87,7 +87,7 @@ impl OpenAiEmbedder {
     ///
     /// If the HTTP client cannot be built.
     pub fn new(model: impl Into<String>) -> Result<Self, StoreError> {
-        let http = reqwest::Client::builder()
+        let http = crate::netguard::guarded_client(crate::netguard::Reach::Configured)
             .build()
             .map_err(|e| StoreError::Backend(format!("could not build an HTTP client: {e}")))?;
         Ok(Self {
@@ -565,7 +565,7 @@ impl GeminiEmbedder {
     ///
     /// If the HTTP client cannot be built.
     pub fn new(key: impl Into<String>, model: impl Into<String>) -> Result<Self, StoreError> {
-        let http = reqwest::Client::builder()
+        let http = crate::netguard::guarded_client(crate::netguard::Reach::Configured)
             .build()
             .map_err(|e| StoreError::Backend(format!("could not build an HTTP client: {e}")))?;
         Ok(Self {

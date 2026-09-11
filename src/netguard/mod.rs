@@ -6,18 +6,32 @@
 //! that cannot make this process connect inward can still make it allocate
 //! without limit, and neither control substitutes for the other.
 //!
-//! Three features dereference a URL somebody else influenced: governed media
-//! fetches one a model was handed, a push notification posts to one a peer
-//! supplied, and Agent Card discovery fetches one that arrived in a config, a
-//! registry entry or a message. All three face the same attack — a hostname
-//! that resolves inward, to a metadata service, a database, or a health
-//! endpoint that answers with something interesting.
+//! # Every outbound client, and why the list is not a list
 //!
-//! Counting them is part of the control. This module said *two* while discovery
-//! was already the third and unguarded, which is the shape of a claim written
-//! about every other door while looking at this one: the sentence was true when
-//! written, nothing re-checked it, and the door it did not know about was the
-//! one standing open.
+//! The attack is one hostname that resolves inward — to a metadata service, a
+//! database, a health endpoint that answers with something interesting — and
+//! two settings that quietly hand the connection to somebody else: an ambient
+//! proxy, and a redirect this plane follows.
+//!
+//! It is tempting to scope that to the calls whose URL somebody outside the
+//! deployment influenced: governed media fetches one a model was handed, a
+//! push notification posts to one a peer supplied, Agent Card discovery
+//! fetches one that arrived in a config or a message. That scoping is wrong,
+//! and the reason is the third setting. **A configured URL becomes an
+//! influenced URL after one redirect.** A model endpoint's own answer chooses
+//! the next host; a client that follows it has left the allowlist behind while
+//! still carrying whatever header authenticates the request — and `reqwest`
+//! strips only `Authorization`, `Cookie` and `Proxy-Authorization` across
+//! origins, so `x-api-key`, `x-goog-api-key` and `X-Vault-Token` travel.
+//!
+//! So the rule is not a count of doors: **every outbound client in this crate
+//! is built by one constructor** — `netguard::guarded_client`, crate-private
+//! and so named in code font rather than linked. The one exception is
+//! [`media`](crate::media), which pins each connection to an address it
+//! resolved itself. Both the rule and the exception are held by
+//! `tests/guards/layering.rs::every_outbound_client_is_guarded`, because a
+//! prose count of the doors is a sentence that is true when written and is
+//! not re-checked — and the door it omits is the one standing open.
 //!
 //! The classification lives here, once, because two implementations of one rule
 //! diverge and the one that diverges is whichever nobody probed at the boundary.
@@ -54,10 +68,29 @@
 //! on that path — which is why it is applied there unconditionally, and why a
 //! deployment that can name its peers should still name them.
 
-#[cfg(any(feature = "push", feature = "a2a"))]
+// Gated on every feature that builds an outbound client, which is every
+// reqwest-bearing feature: the rule above admits no door that opts out.
+#[cfg(any(
+    feature = "push",
+    feature = "a2a",
+    feature = "providers",
+    feature = "witness-http",
+    feature = "keyring-vault",
+))]
 mod resolver;
+#[cfg(any(
+    feature = "push",
+    feature = "a2a",
+    feature = "providers",
+    feature = "witness-http",
+    feature = "keyring-vault",
+))]
+pub(crate) use resolver::{Reach, guarded_client};
+// The pre-flight half, which only the two doors carrying a host allowlist ask
+// for: `guarded_client` is what the socket obeys, `judge` is what an operator
+// gets told before a connection is attempted.
 #[cfg(any(feature = "push", feature = "a2a"))]
-pub(crate) use resolver::{Reach, guarded_client, judge};
+pub(crate) use resolver::judge;
 
 // The other half of the outbound edge. Gated on the reqwest-bearing features
 // rather than on a transport of its own: it reads a `reqwest::Response` and

@@ -353,6 +353,26 @@ pub struct SweepReport {
     /// Carried on the report as well as emitted, so an embedder that wants the
     /// numbers does not have to stand up a metrics subscriber to see them.
     pub census: Census,
+    /// Cosignatures gathered over this plane's checkpoint this tick.
+    ///
+    /// Zero on a tick that did not submit — no witnesses configured, or a log
+    /// that has not grown since the last round that met its quorum. A number
+    /// to see rather than to alert on: evidence accumulating is the system
+    /// working.
+    pub cosignatures: usize,
+    /// Cosignatures the declared quorum still wants.
+    ///
+    /// The plane is running and its history is anchored by fewer independent
+    /// parties than the deployment said it required, which is a state nothing
+    /// else will clear.
+    pub witness_shortfall: usize,
+    /// Witnesses that refused on integrity grounds: a log that shrank, forked,
+    /// or whose claimed growth would not verify.
+    ///
+    /// Reported even when the quorum was **met**. Two honest cosigners do not
+    /// answer a third that remembers a different history — they may simply
+    /// never have seen the history it remembers.
+    pub witness_integrity: usize,
     /// The gauges could not be read this tick.
     ///
     /// The counters above are still real — the tick's work happened — but the
@@ -386,6 +406,11 @@ impl SweepReport {
             // default; somebody should know the numbers are missing, not
             // merely zero.
             || self.census_unavailable
+            // A plane anchored by fewer parties than it declared, and a
+            // witness that saw this history move. The second is loud even
+            // beside a met quorum, which is why it is its own count.
+            || self.witness_shortfall > 0
+            || self.witness_integrity > 0
     }
 
     #[must_use]
@@ -410,10 +435,83 @@ impl SweepReport {
             && self.wake_failures == 0
             && self.runs_recovered == 0
             && self.recovery_failures == 0
+            // Gathering evidence is activity, and a shortfall or an integrity
+            // refusal most of all. A tick that submitted nothing — no
+            // witnesses, or a log that has not grown — leaves all three at
+            // zero and stays quiet.
+            && self.cosignatures == 0
+            && self.witness_shortfall == 0
+            && self.witness_integrity == 0
     }
 }
 
 impl Runtime {
+    /// Submit this plane's current checkpoint to its witnesses.
+    ///
+    /// Off the run path and after sealing, which is what witnessing is: the
+    /// evidence is read after the fact, and making a run wait on a third party
+    /// would trade the plane's availability for it.
+    ///
+    /// Nothing happens without witnesses configured. With them, a round is
+    /// skipped when the log has not grown since the last round that met the
+    /// declared quorum — the alternative is re-submitting an unchanged
+    /// checkpoint on every tick, which every witness answers and none of which
+    /// tells anybody anything.
+    ///
+    /// A witness failing is never an error here. It is what the counts on
+    /// [`SweepReport`] carry, so a shortfall reaches
+    /// [`needs_attention`](SweepReport::needs_attention) rather than aborting
+    /// the sweep that already breached obligations and recovered runs.
+    ///
+    /// # Errors
+    ///
+    /// Only if the **store** cannot answer with a checkpoint or build a
+    /// consistency proof.
+    async fn cosign_checkpoint(&self, report: &mut SweepReport) -> Result<(), RuntimeError> {
+        use std::sync::atomic::Ordering;
+
+        let Some(witnessing) = self.witnessing() else {
+            return Ok(());
+        };
+        let checkpoint = self.store().checkpoint().await?;
+        // Equality only: an unchanged log needs no new evidence, while a log
+        // reporting a *smaller* size than what was already cosigned is
+        // precisely the submission a witness must be given the chance to
+        // refuse — so it is not skipped.
+        if checkpoint.size == witnessing.submitted.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let outcome = crate::journal::cosign_quorum(
+            self.store().as_ref(),
+            &checkpoint,
+            &witnessing.witnesses,
+            witnessing.quorum,
+        )
+        .await?;
+        report.cosignatures = outcome.cosignatures.len();
+        report.witness_shortfall = outcome.shortfall();
+        report.witness_integrity = outcome.integrity.len();
+        for (index, refusal) in &outcome.integrity {
+            // The audience for this is never only the operator who runs the
+            // plane: a witness reporting that this log moved is the one event
+            // the party being audited has an interest in nobody hearing.
+            tracing::error!(
+                event = crate::runtime::telemetry::WITNESS_INTEGRITY,
+                witness = index,
+                origin = %checkpoint.origin,
+                size = checkpoint.size,
+                refusal = %refusal,
+                "a witness refused this plane's checkpoint on integrity grounds"
+            );
+        }
+        if outcome.met() {
+            witnessing
+                .submitted
+                .store(checkpoint.size, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     /// Run one sweep.
     ///
     /// Idempotent: a transition already applied is not applied twice, so calling
@@ -465,6 +563,11 @@ impl Runtime {
                     report.saturated.timers = true;
                 }
             }
+            // Last of the phases, and deliberately: it makes no state change
+            // any other phase depends on, and it is the one phase whose
+            // counterparty is somebody else's server. A witness that is slow
+            // must not delay a breach or a recovery.
+            self.cosign_checkpoint(&mut report).await?;
             Ok(())
         }
         .await;

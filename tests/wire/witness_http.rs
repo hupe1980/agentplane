@@ -9,9 +9,7 @@
 use std::sync::Arc;
 
 use agentplane::core::{Digest, merkle};
-use agentplane::journal::{
-    Checkpoint, HttpWitness, NoteSignature, TrustedWitness, Witness, WitnessError,
-};
+use agentplane::journal::{Checkpoint, HttpWitness, LogKey, TrustedWitness, Witness, WitnessError};
 use axum::Router;
 use axum::extract::State;
 use axum::routing::post;
@@ -51,6 +49,11 @@ async fn server(status: u16, reply: &str) -> (String, LastBody) {
 struct SigningWitness {
     key: ed25519_dalek::SigningKey,
     name: String,
+    /// The instant this witness claims. Configurable so the forbidden zero can
+    /// be sent by something that is otherwise a correct witness.
+    time: u64,
+    /// The last checkpoint note it cosigned, for the monitoring endpoint.
+    held: std::sync::Mutex<Option<(String, String)>>,
 }
 
 impl SigningWitness {
@@ -63,6 +66,10 @@ impl SigningWitness {
         Self {
             key,
             name: name.to_owned(),
+            // The worked example's instant from `tlog-cosignature`, which the
+            // in-module codec vectors already pin.
+            time: 1_679_315_147,
+            held: std::sync::Mutex::new(None),
         }
     }
 
@@ -92,17 +99,23 @@ impl SigningWitness {
     /// specification describes a witness building one: the note body without
     /// its signature lines, under the `cosignature/v1` header and a `time`
     /// line, with the timestamp leading the payload big-endian.
+    /// Claim a different observation instant — including the forbidden zero.
+    fn at_time(mut self, time: u64) -> Self {
+        self.time = time;
+        self
+    }
+
     fn cosign_line(&self, request: &str) -> String {
         use ed25519_dalek::Signer as _;
-        const TIME: u64 = 1_679_315_147;
+        let time = self.time;
         let note = request.split_once("\n\n").map_or(request, |(_, note)| note);
         let text = note
             .split_once("\n\n")
             .map_or_else(|| note.to_owned(), |(text, _)| format!("{text}\n"));
-        let message = format!("cosignature/v1\ntime {TIME}\n{text}");
+        let message = format!("cosignature/v1\ntime {time}\n{text}");
         let signature = self.key.sign(message.as_bytes());
         let mut payload = self.key_id().to_vec();
-        payload.extend_from_slice(&TIME.to_be_bytes());
+        payload.extend_from_slice(&time.to_be_bytes());
         payload.extend_from_slice(&signature.to_bytes());
         // A line from someone else comes first, because `tlog-witness` allows a
         // 200 to carry one *or more* signatures and a client that reads only
@@ -149,9 +162,70 @@ async fn signing_server(witness: Arc<SigningWitness>) -> (String, LastBody) {
             "/add-checkpoint",
             post(
                 |State((w, seen)): State<(Arc<SigningWitness>, LastBody)>, body: String| async move {
+                    // The spec's MUST, before anything else: a witness cosigns
+                    // a *specific log's* claim, and answers 403 when it cannot
+                    // attribute the checkpoint to a key it trusts.
+                    if !log_signature_verifies(&body) {
+                        *seen.lock().unwrap() = body;
+                        return (axum::http::StatusCode::FORBIDDEN, String::new());
+                    }
                     let line = w.cosign_line(&body);
                     *seen.lock().unwrap() = body;
                     (axum::http::StatusCode::OK, line)
+                },
+            ),
+        )
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// A witness that also serves what it cosigned, at the monitoring path.
+///
+/// The reply is the note the client submitted with the witness's cosignature
+/// line appended, which is what `tlog-witness` says the endpoint returns: the
+/// checkpoint, the witness's cosignature(s), *and* the log's own signature
+/// that the witness verified.
+async fn monitoring_server(witness: Arc<SigningWitness>) -> (String, LastBody) {
+    let seen: LastBody = Arc::new(std::sync::Mutex::new(String::new()));
+    let state = (Arc::clone(&witness), Arc::clone(&seen));
+    let app = Router::new()
+        .route(
+            "/add-checkpoint",
+            post(
+                |State((w, seen)): State<(Arc<SigningWitness>, LastBody)>, body: String| async move {
+                    if !log_signature_verifies(&body) {
+                        return (axum::http::StatusCode::FORBIDDEN, String::new());
+                    }
+                    let line = w.cosign_line(&body);
+                    let note = body
+                        .split_once("\n\n")
+                        .map_or(body.as_str(), |(_, note)| note)
+                        .to_owned();
+                    let origin = note.lines().next().unwrap_or_default().to_owned();
+                    *w.held.lock().unwrap() = Some((origin, format!("{note}{line}")));
+                    *seen.lock().unwrap() = body;
+                    (axum::http::StatusCode::OK, line)
+                },
+            ),
+        )
+        .route(
+            "/{hash}/checkpoint",
+            axum::routing::get(
+                |State((w, _)): State<(Arc<SigningWitness>, LastBody)>,
+                 axum::extract::Path(hash): axum::extract::Path<String>| async move {
+                    use sha2::{Digest as _, Sha256};
+                    let held = w.held.lock().unwrap().clone();
+                    match held {
+                        Some((origin, note))
+                            if hex::encode(Sha256::digest(origin.as_bytes())) == hash =>
+                        {
+                            (axum::http::StatusCode::OK, note)
+                        }
+                        _ => (axum::http::StatusCode::NOT_FOUND, String::new()),
+                    }
                 },
             ),
         )
@@ -184,18 +258,281 @@ fn checkpoint(size: u64) -> Checkpoint {
 fn client(url: &str) -> HttpWitness {
     HttpWitness::new(
         url,
-        log_sig(),
+        log_key(),
         vec![SigningWitness::new("witness-1", 7).trusted()],
     )
     .unwrap()
 }
 
-fn log_sig() -> NoteSignature {
-    NoteSignature {
-        name: "plane-a".into(),
-        key_id: [1, 2, 3, 4],
-        signature: vec![9; 8],
+/// The log's own note name, shared by the client and by every fake witness
+/// that has to recognise it.
+const LOG_NAME: &str = "plane-a";
+
+/// This log's signing key, fixed so the id is stable across runs.
+fn log_signer() -> Arc<agentplane::policy::Ed25519Signer> {
+    Arc::new(agentplane::policy::Ed25519Signer::new(
+        "log-key",
+        &[0x11u8; 32],
+    ))
+}
+
+fn log_key() -> LogKey {
+    let signer = log_signer();
+    LogKey::ed25519(LOG_NAME, signer.verifying_key(), signer).expect("a valid note key name")
+}
+
+/// What a conformant witness checks before it cosigns anything: that the
+/// submitted checkpoint carries a signature from a key it trusts for this
+/// origin, over the note body it was sent.
+///
+/// `tlog-witness` makes this a MUST and gives it a status — *403 Forbidden if
+/// either no signature from a trusted key for the origin is present, or a
+/// signature line's key name and ID match a trusted key but the signature
+/// itself fails to verify*. A fake witness that skips it is a fake witness
+/// that accepts a signature made over some other checkpoint, which is exactly
+/// the defect this file could not see.
+fn log_signature_verifies(request: &str) -> bool {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
+
+    let Some((_, note)) = request.split_once("\n\n") else {
+        return false;
+    };
+    let Some((text, lines)) = note.split_once("\n\n") else {
+        return false;
+    };
+    let body = format!("{text}\n");
+    let key_id = agentplane::journal::key_id(LOG_NAME, 0x01, &log_signer().verifying_key());
+    let verifying =
+        VerifyingKey::from_bytes(&log_signer().verifying_key()).expect("a valid public key");
+    for line in lines.lines() {
+        let Some(rest) = line.strip_prefix("\u{2014} ") else {
+            continue;
+        };
+        let Some((name, payload)) = rest.split_once(' ') else {
+            continue;
+        };
+        if name != LOG_NAME {
+            continue;
+        }
+        let Some(bytes) = decode_base64(payload) else {
+            continue;
+        };
+        if bytes.len() < 4 || bytes[..4] != key_id {
+            continue;
+        }
+        let Ok(signature) = Signature::from_slice(&bytes[4..]) else {
+            continue;
+        };
+        if verifying.verify(body.as_bytes(), &signature).is_ok() {
+            return true;
+        }
     }
+    false
+}
+
+/// Minimal RFC 4648 §4 decode, so the fake witness reads a line without the
+/// crate's own decoder.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0u32;
+    let mut have = 0u32;
+    let mut out = Vec::new();
+    for c in text.trim().bytes() {
+        if c == b'=' {
+            break;
+        }
+        let v = u32::try_from(A.iter().position(|a| *a == c)?).ok()?;
+        bits = (bits << 6) | v;
+        have += 6;
+        if have >= 8 {
+            have -= 8;
+            out.push(u8::try_from((bits >> have) & 0xff).ok()?);
+        }
+    }
+    Some(out)
+}
+
+/// Each checkpoint is signed over its own note, not once at configuration.
+///
+/// The load-bearing part is that the witness here **verifies** the log
+/// signature, as `tlog-witness` says it MUST. Against a fake witness that
+/// skips that check, a client holding one signature as configuration passes
+/// every test in this file and receives `403 Forbidden` from every real
+/// witness, forever — while the message it prints says the log's key is not
+/// registered, which sends the operator to ask an operator who registered it
+/// correctly.
+///
+/// Two submissions of *different* checkpoints, because one proves nothing: a
+/// fixed signature made over the first note would satisfy a single-checkpoint
+/// test.
+#[tokio::test]
+async fn every_checkpoint_is_signed_over_its_own_note() {
+    let witness = Arc::new(SigningWitness::new("witness-1", 7));
+    let (url, seen) = signing_server(Arc::clone(&witness)).await;
+    let w = HttpWitness::new(&url, log_key(), vec![witness.trusted()]).unwrap();
+
+    w.cosign(&checkpoint(4), 0, &[])
+        .await
+        .expect("a checkpoint carrying its own signature is cosigned");
+    let first = seen.lock().unwrap().clone();
+
+    let proof = merkle::consistency_proof(&leaves(8), 4);
+    w.cosign(&checkpoint(8), 4, &proof)
+        .await
+        .expect("the second checkpoint must carry the second checkpoint's signature");
+    let second = seen.lock().unwrap().clone();
+
+    let line = |body: &str| {
+        body.rsplit_once(&format!("\u{2014} {LOG_NAME} "))
+            .map(|(_, sig)| sig.trim().to_owned())
+            .expect("the log's own signature line")
+    };
+    assert_ne!(
+        line(&first),
+        line(&second),
+        "both checkpoints were submitted under one signature, so at most one of \
+         them was actually signed — and a witness that verifies, as the \
+         specification requires it to, refuses the other with 403"
+    );
+}
+
+/// A witness's own record of this log is reachable, and it is what an auditor
+/// holds.
+///
+/// The submission direction leaves the evidence with the party under audit.
+/// This is the other one: the monitoring endpoint answers with a checkpoint
+/// the plane did not write, carrying cosignatures from keys the *reader*
+/// chose. Without it, "an independent party observed this log" is a claim the
+/// plane makes about itself.
+#[tokio::test]
+async fn a_witness_serves_back_what_it_cosigned() {
+    let witness = Arc::new(SigningWitness::new("witness-1", 7));
+    let (url, _) = monitoring_server(Arc::clone(&witness)).await;
+    let w = HttpWitness::new(&url, log_key(), vec![witness.trusted()]).unwrap();
+
+    let cp = checkpoint(4);
+    w.cosign(&cp, 0, &[]).await.expect("cosigned");
+
+    let reader = w.reader().expect("a reader for the same witness");
+    let held = reader
+        .latest(&cp.origin)
+        .await
+        .expect("the witness answers for a log it cosigned")
+        .expect("a log it has cosigned is not unknown");
+    assert_eq!(
+        held.checkpoint, cp,
+        "the anchor names this log at this size"
+    );
+    assert_eq!(
+        held.cosignatures.len(),
+        1,
+        "exactly the one trusted cosignature; the log's own signature travels on \
+         the same note and must not be counted as corroboration"
+    );
+
+    let unknown = reader
+        .latest("example.com/some-other-plane")
+        .await
+        .expect("an unknown log is an answer, not an outage");
+    assert!(
+        unknown.is_none(),
+        "a log this witness never cosigned answered with something — which an \
+         auditor would read as an anchor"
+    );
+}
+
+/// A monitoring endpoint serving the plane's own checkpoint is not an anchor.
+///
+/// The failure that looks like success, at the one place it would be worst: a
+/// reader that returned whatever the URL served would hand an auditor the
+/// plane's own claim under the name of an independent party's — and the
+/// auditor would then run the deletion check against the very history they are
+/// checking.
+#[tokio::test]
+async fn an_uncosigned_checkpoint_is_not_an_anchor() {
+    use agentplane::journal::WitnessReader;
+
+    // Serves a checkpoint note carrying the log's own signature and no
+    // witness line — which is exactly what a plane could publish about itself.
+    let cp = checkpoint(4);
+    let signer = log_signer();
+    let body = cp.to_note();
+    let signature = {
+        use ed25519_dalek::Signer as _;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        key.sign(body.as_bytes())
+    };
+    let mut payload = agentplane::journal::key_id(LOG_NAME, 0x01, &signer.verifying_key()).to_vec();
+    payload.extend_from_slice(&signature.to_bytes());
+    // The blank line is `signed-note`'s boundary between body and signatures.
+    let note = format!(
+        "{body}\n\u{2014} {LOG_NAME} {}\n",
+        base64_standard(&payload)
+    );
+
+    let origin = cp.origin.clone();
+    let app = Router::new().route(
+        "/{hash}/checkpoint",
+        axum::routing::get(
+            move |axum::extract::Path(hash): axum::extract::Path<String>| {
+                let note = note.clone();
+                let origin = origin.clone();
+                async move {
+                    use sha2::{Digest as _, Sha256};
+                    if hex::encode(Sha256::digest(origin.as_bytes())) == hash {
+                        (axum::http::StatusCode::OK, note)
+                    } else {
+                        (axum::http::StatusCode::NOT_FOUND, String::new())
+                    }
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let reader =
+        WitnessReader::new(&url, vec![SigningWitness::new("witness-1", 7).trusted()]).unwrap();
+    let refused = reader.latest(&cp.origin).await;
+    assert!(
+        matches!(&refused, Err(WitnessError::Unavailable(d))
+            if d.contains("nobody independent signed")),
+        "a checkpoint carrying only the log's own signature was returned as an \
+         anchor: {refused:?}"
+    );
+}
+
+/// A reader with no trusted key is refused at construction.
+#[test]
+fn a_reader_with_no_keys_cannot_report_an_anchor() {
+    let refused = agentplane::journal::WitnessReader::new("http://example.invalid", Vec::new())
+        .expect_err("a reader that verifies nothing is not a reader");
+    assert!(
+        refused.to_string().contains("at least one trusted key"),
+        "wrong refusal: {refused}"
+    );
+}
+
+/// A cosignature with a zero timestamp is not counted.
+///
+/// `tlog-witness`: *the cosignature MUST NOT omit the timestamp, i.e. the
+/// timestamp MUST NOT be zero*. A zero says nothing about when the witness saw
+/// the log, and that instant is half of what a cosignature is for — it is what
+/// separates a witness that is watching from one that answered once and
+/// stopped.
+#[tokio::test]
+async fn a_cosignature_without_an_observation_time_is_not_counted() {
+    let witness = Arc::new(SigningWitness::new("witness-1", 7).at_time(0));
+    let (url, _) = signing_server(Arc::clone(&witness)).await;
+    let w = HttpWitness::new(&url, log_key(), vec![witness.trusted()]).unwrap();
+
+    let refused = w.cosign(&checkpoint(4), 0, &[]).await;
+    assert!(
+        matches!(&refused, Err(WitnessError::Unavailable(d))
+            if d.contains("verified against a trusted key")),
+        "a zero-timestamp cosignature was counted: {refused:?}"
+    );
 }
 
 /// The request is shaped the way the specification says.
@@ -208,7 +545,7 @@ fn log_sig() -> NoteSignature {
 async fn the_request_body_follows_the_protocol() {
     let witness = Arc::new(SigningWitness::new("witness-1", 7));
     let (url, seen) = signing_server(Arc::clone(&witness)).await;
-    let w = HttpWitness::new(&url, log_sig(), vec![witness.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![witness.trusted()]).unwrap();
 
     // Realistic numbers on purpose. A consistency proof is O(log n) hashes, so
     // a 50→100 proof carries seven — and an implementation computing
@@ -409,17 +746,91 @@ async fn an_off_spec_400_cannot_invent_a_shrink() {
     }
 }
 
-/// A 422 is a proof that does not verify, which *is* a fork.
+/// A 422 names three different things, and only one of them is a fork.
+///
+/// The specification gives the status three causes: a size-zero checkpoint
+/// whose root is not the empty tree's, a consistency proof that does not
+/// verify, and equal sizes with unequal roots. Only the last is evidence about
+/// the log — no proof-building mistake produces two roots for one size — and
+/// the split has to be made by the client, because the status does not carry
+/// it.
+///
+/// Reporting all three as `Forked` is the mistake this test exists to hold
+/// shut: it pages an operator for an integrity incident over a proof their own
+/// log built wrongly, and the alert that matters stops being believed.
 #[tokio::test]
-async fn an_unverifiable_proof_is_a_fork() {
+async fn a_422_is_a_fork_only_where_the_witness_removed_the_ambiguity() {
     let (url, _) = server(422, "").await;
     let w = client(&url);
-    assert!(
-        matches!(
-            w.cosign(&checkpoint(4), 0, &[]).await,
-            Err(WitnessError::Forked { .. })
+
+    // Equal sizes: the witness is at 4, this log offers 4, and the roots
+    // differ. Unambiguous.
+    match w.cosign(&checkpoint(4), 4, &[]).await {
+        Err(WitnessError::Forked { seen, offered, .. }) => {
+            assert_eq!((seen, offered), (4, 4), "the two sizes the fork was at");
+        }
+        other => panic!("equal sizes with unequal roots is the split view: {other:?}"),
+    }
+
+    // Growth: the proof did not verify. Either this log built it wrongly or
+    // its history moved, and the reply does not say which.
+    match w
+        .cosign(&checkpoint(4), 2, &[Digest::from_bytes([7u8; 32])])
+        .await
+    {
+        Err(WitnessError::Inconsistent {
+            old_size, offered, ..
+        }) => {
+            assert_eq!(
+                (old_size, offered),
+                (2, 4),
+                "the growth that failed to verify"
+            );
+        }
+        other => panic!(
+            "a proof that did not verify names a cause the witness did not, and \
+             `Forked` is that cause: {other:?}"
         ),
-        "a proof the witness could not verify is a history that does not extend"
+    }
+}
+
+/// The two 422 causes this client can see are refused before a request goes out.
+///
+/// Both are its own inputs, and both come back from a witness under the same
+/// status as a history that does not extend — so sending them spends a
+/// submission to receive an answer that has to be reclassified by guessing.
+#[tokio::test]
+async fn a_request_a_witness_would_refuse_is_refused_here_first() {
+    // A server that would answer 200 to anything, so a request that reaches it
+    // succeeds and the assertions below can only pass if none does.
+    let (url, seen) = server(200, "").await;
+    let w = client(&url);
+
+    let incoherent = Checkpoint {
+        origin: "test-log".into(),
+        size: 0,
+        root: Digest::from_bytes([3u8; 32]),
+    };
+    let refused = w.cosign(&incoherent, 0, &[]).await;
+    assert!(
+        matches!(&refused, Err(WitnessError::Unavailable(d))
+            if d.contains("empty tree's root")),
+        "a size-0 checkpoint with a root the empty tree does not have: {refused:?}"
+    );
+
+    let refused = w
+        .cosign(&checkpoint(4), 0, &[Digest::from_bytes([5u8; 32])])
+        .await;
+    assert!(
+        matches!(&refused, Err(WitnessError::Unavailable(d))
+            if d.contains("must carry no consistency proof")),
+        "a submission from size 0 carrying a proof: {refused:?}"
+    );
+
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "a request the specification says is unprocessable was still sent, so a \
+         422 that comes back cannot be told from one about the log"
     );
 }
 
@@ -475,7 +886,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
     // The positive half first, so the negatives below are a verification rule
     // rather than a client that refuses everything.
     let (url, _) = signing_server(Arc::clone(&real)).await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted()]).unwrap();
     let co = w
         .cosign(&cp, 0, &[])
         .await
@@ -492,7 +903,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
     //    simply not from anyone this client trusts.
     let stranger = Arc::new(SigningWitness::new("witness-1", 42));
     let (url, _) = signing_server(Arc::clone(&stranger)).await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted()]).unwrap();
     let err = w
         .cosign(&cp, 0, &[])
         .await
@@ -511,7 +922,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
         &format!("\u{2014} witness-1 {}\n", base64_standard(&[0xAA; 68])),
     )
     .await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted()]).unwrap();
     assert!(
         w.cosign(&cp, 0, &[]).await.is_err(),
         "a line claiming a trusted witness's name under a different key was counted"
@@ -529,7 +940,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
         &format!("\u{2014} witness-1 {}\n", base64_standard(&payload)),
     )
     .await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted()]).unwrap();
     assert!(
         w.cosign(&cp, 0, &[]).await.is_err(),
         "sixty-four zero bytes under a trusted key id were counted as that \
@@ -544,7 +955,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
     //     during a routine rotation, which reads as a witness being down.
     let rotated = Arc::new(SigningWitness::new("witness-1", 99));
     let (url, _) = signing_server(Arc::clone(&rotated)).await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted(), rotated.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted(), rotated.trusted()]).unwrap();
     let co = w
         .cosign(&cp, 0, &[])
         .await
@@ -559,7 +970,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
     //    just do not say what the client is about to record them as saying.
     let other = checkpoint(9);
     let (url, _) = signing_server(Arc::clone(&real)).await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted()]).unwrap();
     let good = w.cosign(&other, 0, &[]).await.expect("baseline");
     let (url, _) = server(
         200,
@@ -569,7 +980,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
         ),
     )
     .await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted()]).unwrap();
     assert!(
         w.cosign(&cp, 0, &[]).await.is_err(),
         "a genuine signature over a different checkpoint was replayed onto this one"
@@ -593,7 +1004,7 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
         &format!("\u{2014} witness-1 {}\n", base64_standard(&bare)),
     )
     .await;
-    let w = HttpWitness::new(&url, log_sig(), vec![real.trusted()]).unwrap();
+    let w = HttpWitness::new(&url, log_key(), vec![real.trusted()]).unwrap();
     assert!(
         w.cosign(&cp, 0, &[]).await.is_err(),
         "a signature over the bare note — the log's own claim-shape — was counted as \
@@ -609,10 +1020,123 @@ async fn a_cosignature_is_counted_only_if_it_verifies() {
 /// construction, where a human is present to read the message.
 #[test]
 fn a_witness_client_with_no_keys_is_not_a_witness_client() {
-    let err = HttpWitness::new("http://example.invalid", log_sig(), Vec::new())
+    let err = HttpWitness::new("http://example.invalid", log_key(), Vec::new())
         .expect_err("a client that trusts nobody must not be constructible");
     assert!(
         err.to_string().contains("trusted"),
         "the refusal should name what is missing: {err}"
+    );
+}
+
+/// A run removed from the store is caught, using an anchor no operator handed
+/// over.
+///
+/// This is the whole point of the tier, end to end, and it is the one check
+/// nothing else in this crate can make. The chain verifies, the signatures
+/// verify, the inclusion proofs verify — and all three draw both halves of
+/// their comparison from the store, so an operator who drops a run and
+/// recomputes the tree passes every one of them. `audit` says so in
+/// `not_checked` and can do nothing about it, because the missing input is a
+/// checkpoint from somewhere else.
+///
+/// So: seal three runs, submit the checkpoint to a witness, delete a run,
+/// then audit against what the *witness* holds.
+#[tokio::test]
+async fn a_deleted_run_is_caught_by_the_anchor_a_witness_holds() {
+    use agentplane::journal::{Append, JournalStore, RecordKind, WitnessReader};
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let journal: Arc<dyn JournalStore> = store.clone();
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let run = agentplane::RunId::generate();
+        let lease = store
+            .acquire(run, "w", std::time::Duration::from_mins(1))
+            .await
+            .expect("lease");
+        store
+            .append(
+                lease.epoch,
+                vec![Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "witnessed".into(),
+                        governed_by: None,
+                        input_label: agentplane::core::Label::trusted(),
+                        input: serde_json::Value::Null,
+                        policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
+                        idempotency_key: None,
+                    },
+                )],
+            )
+            .await
+            .expect("append");
+        store
+            .seal(run, lease.epoch, "succeeded")
+            .await
+            .expect("seal");
+        runs.push(run);
+    }
+
+    let witness = Arc::new(SigningWitness::new("witness-1", 7));
+    let (url, _) = monitoring_server(Arc::clone(&witness)).await;
+    let client = HttpWitness::new(&url, log_key(), vec![witness.trusted()]).unwrap();
+    let cp = journal.checkpoint().await.expect("checkpoint");
+    client
+        .cosign(&cp, 0, &[])
+        .await
+        .expect("the witness cosigns");
+
+    // The operator removes a run and carries on.
+    store.delete_run_for_test(runs[1]).await.expect("deleted");
+    let survivors = vec![runs[0], runs[2]];
+
+    let blind = agentplane::audit::audit(
+        &journal,
+        &survivors,
+        &agentplane::audit::Evidence::default(),
+    )
+    .await
+    .expect("an audit");
+    assert!(
+        blind.is_sound(),
+        "the store-only audit found something it has no way to find, so this test \
+         is not measuring what it claims: {:?}",
+        blind.findings
+    );
+    assert!(
+        blind.not_checked.iter().any(|n| n.contains("deletion")),
+        "the store-only audit did not say the check it could not make: {:?}",
+        blind.not_checked
+    );
+
+    // The anchor, from the party that is not the operator.
+    let reader = WitnessReader::new(&url, vec![witness.trusted()]).expect("a reader");
+    let anchor = reader
+        .latest(&cp.origin)
+        .await
+        .expect("the witness answers")
+        .expect("it cosigned this log");
+    let armed = agentplane::audit::audit(
+        &journal,
+        &survivors,
+        &agentplane::audit::Evidence {
+            prior: Some(&anchor.checkpoint),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("an audit");
+    assert!(
+        armed.findings.iter().any(|f| matches!(
+            f,
+            agentplane::audit::Finding::Shrunk { .. }
+                | agentplane::audit::Finding::NotAppendOnly { .. }
+        )),
+        "a checkpoint fetched from a witness did not catch a deleted run, so the \
+         one attack the rest of this crate structurally cannot see is still \
+         invisible: {:?}",
+        armed.findings
     );
 }

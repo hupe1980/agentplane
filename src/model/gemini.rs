@@ -295,7 +295,7 @@ impl Gemini {
     ///
     /// If the HTTP client cannot be built.
     pub fn new(key: impl Into<String>) -> Result<Self, ModelError> {
-        let http = reqwest::Client::builder()
+        let http = crate::netguard::guarded_client(crate::netguard::Reach::Configured)
             .build()
             .map_err(|e| ModelError::Unreachable {
                 model: ModelId::new(PROVIDER, "*"),

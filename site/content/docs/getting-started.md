@@ -350,7 +350,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `signing` | Ed25519 record attestation |
 | `manifest` | declare an agent's grants and ceilings in a reviewable YAML file, and pin it by digest |
 | `cli` | the `agentplane` binary — run a declarative agent from a YAML file with no Rust at all |
-| `witness-http` | submit checkpoints to a real witness over C2SP `tlog-witness` — the half that gives the split-view guarantee a counterparty |
+| `witness-http` | submit checkpoints to a real witness over C2SP `tlog-witness`, and read back what it holds — the half that gives the split-view guarantee a counterparty. Included in `cli`, because the deletion check needs a checkpoint from outside the store |
 | `opendal` | content-addressed blob storage on S3, GCS, Azure or a filesystem — where bytes too large for the journal go |
 | `keyring` | envelope encryption for payload bytes, and the cryptographic erasure it makes provable — destroying a key erases every copy, including backups |
 | `keyring-vault` | a key ring that is somebody else: HashiCorp Vault's transit engine over its HTTP API, so the wrapping key never leaves Vault |

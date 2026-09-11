@@ -81,6 +81,41 @@ pub enum WitnessError {
     #[error("log '{origin}': a consistency proof is required to extend size {seen}")]
     ProofMissing { origin: String, seen: u64 },
 
+    /// The witness could not verify the growth this submission claimed, and
+    /// which side is at fault is not decidable from the answer.
+    ///
+    /// Its own variant rather than [`Forked`](Self::Forked), because the two
+    /// send an operator to different places. A witness answering *this
+    /// consistency proof does not verify* is either looking at a proof this
+    /// log built wrongly — a bug on this side, permanent until the code
+    /// changes — or at a history that genuinely no longer extends what it
+    /// remembers. `Forked` is reserved for the answer where the witness
+    /// removes the ambiguity itself: equal sizes with unequal roots, which no
+    /// proof-building mistake can produce.
+    ///
+    /// Classified with the integrity refusals all the same, and deliberately:
+    /// resubmitting reproduces it, so filing it as routine would leave a plane
+    /// whose evidence silently stopped accumulating.
+    #[error(
+        "log '{origin}': the witness could not verify growth from {old_size} to \
+         {offered} — either the consistency proof this log built is wrong, or the \
+         history it was built over no longer extends what the witness remembers"
+    )]
+    Inconsistent {
+        origin: String,
+        old_size: u64,
+        offered: u64,
+    },
+
+    /// This log could not sign its own checkpoint.
+    ///
+    /// The fault is local, and saying so is the point: a witness cannot cosign
+    /// a checkpoint it cannot attribute, so an unsigned submission is refused
+    /// with `403` by every conformant witness — which reads as *the witness
+    /// does not trust us* rather than as *our signer is down*.
+    #[error("the log's own checkpoint could not be signed: {0}")]
+    Unsigned(#[from] SignError),
+
     /// The witness could not be reached or refused for its own reasons.
     #[error("witness: {0}")]
     Unavailable(String),
@@ -146,6 +181,26 @@ pub(crate) fn cosignature_payload(blob: &[u8]) -> Option<(u64, &[u8])> {
     let (stamp, signature) = blob.split_at(8);
     let timestamp = u64::from_be_bytes(stamp.try_into().expect("eight bytes"));
     Some((timestamp, signature))
+}
+
+/// A checkpoint and the cosignatures over it.
+///
+/// What an auditor needs, and the only artifact here that is evidence *about*
+/// the producing party: the checkpoint alone is a claim the plane could have
+/// made up, and a cosignature alone does not say what it covers. Obtained
+/// from a witness rather than from the plane — see
+/// [`WitnessReader`](crate::journal::WitnessReader), which is a separate type
+/// from [`Witness`] because reading is a **different party's** action and
+/// needs none of the log's own key material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CosignedCheckpoint {
+    /// The checkpoint the witness holds for this log.
+    pub checkpoint: Checkpoint,
+    /// Cosignatures over it, from keys the caller declared trusted. Never
+    /// empty: a cosigned checkpoint with no cosignature is a checkpoint, and
+    /// returning one under this name is how a plane's own claim gets read as a
+    /// witness's.
+    pub cosignatures: Vec<Cosignature>,
 }
 
 /// Something that will vouch for having seen a log grow.
@@ -236,9 +291,14 @@ pub struct QuorumOutcome {
     /// operational — resubmit later.
     pub routine: Vec<(usize, WitnessError)>,
     /// Integrity refusals, by witness index: a witness that saw this log
-    /// **shrink or fork**. The event witnessing exists to detect, and it is
-    /// reported even when the quorum was met — two honest cosigners do not
-    /// silence a third that remembers a different history.
+    /// **shrink or fork**, or that could not verify the growth this log
+    /// claimed. The event witnessing exists to detect, and it is reported even
+    /// when the quorum was met — two honest cosigners do not silence a third
+    /// that remembers a different history.
+    ///
+    /// The last of the three is here despite naming no cause: resubmitting
+    /// reproduces it, so filing it as routine would leave a plane whose
+    /// evidence silently stopped accumulating while its report stayed clean.
     pub integrity: Vec<(usize, WitnessError)>,
     required: usize,
 }
@@ -266,6 +326,67 @@ impl QuorumOutcome {
     pub fn needs_attention(&self) -> bool {
         !self.met() || !self.integrity.is_empty()
     }
+}
+
+/// Two witnesses holding one tree size with two different roots.
+///
+/// The event witnessing exists to detect, and the one an operator auditing
+/// their own plane structurally cannot find: every other check compares the
+/// store against something the store produced. Only a reader that asked
+/// **more than one** witness is in a position to see it, which is why this
+/// takes a set rather than a checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitView {
+    /// The two witnesses, as the caller names them.
+    pub between: (String, String),
+    /// The size both claim.
+    pub size: u64,
+    /// What each holds there.
+    pub roots: (Digest, Digest),
+}
+
+impl std::fmt::Display for SplitView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "split view: {} holds size {} with root {}, and {} holds the same size with \
+             root {} — two histories of one log",
+            self.between.0,
+            self.size,
+            self.roots.0.to_hex(),
+            self.between.1,
+            self.roots.1.to_hex(),
+        )
+    }
+}
+
+/// Every disagreement in a set of witness answers about one log.
+///
+/// **Equal sizes with unequal roots, and nothing else.** Two witnesses at
+/// *different* sizes is the ordinary case — they observed at different times,
+/// and the smaller one is a prefix of the larger unless something proves
+/// otherwise, which is what the consistency check at submission is for. Equal
+/// size with unequal roots admits no such reading: one tree of a given size
+/// has one root, so two of them is two histories.
+///
+/// Pairwise over the set, so three witnesses disagreeing produce all three
+/// pairs rather than one summary. An operator reading this has to know which
+/// witnesses to ask.
+#[must_use]
+pub fn split_views(held: &[(String, Checkpoint)]) -> Vec<SplitView> {
+    let mut out = Vec::new();
+    for (i, (a_name, a)) in held.iter().enumerate() {
+        for (b_name, b) in held.iter().skip(i + 1) {
+            if a.size == b.size && a.root != b.root {
+                out.push(SplitView {
+                    between: (a_name.clone(), b_name.clone()),
+                    size: a.size,
+                    roots: (a.root, b.root),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Submit one checkpoint to every witness and hold the result to a quorum.
@@ -312,7 +433,11 @@ pub async fn cosign_quorum(
         };
         match result {
             Ok(cosignature) => outcome.cosignatures.push(cosignature),
-            Err(e @ (WitnessError::Forked { .. } | WitnessError::Shrank { .. })) => {
+            Err(
+                e @ (WitnessError::Forked { .. }
+                | WitnessError::Shrank { .. }
+                | WitnessError::Inconsistent { .. }),
+            ) => {
                 outcome.integrity.push((index, e));
             }
             Err(e) => outcome.routine.push((index, e)),
@@ -335,17 +460,47 @@ pub async fn cosign_quorum(
 #[derive(Debug)]
 pub struct MemoryWitness {
     signer: std::sync::Arc<dyn CheckpointSigner>,
+    observed_at: u64,
     seen: Mutex<BTreeMap<String, (u64, Digest)>>,
 }
 
 impl MemoryWitness {
-    /// A witness signing as this identity.
-    #[must_use]
-    pub fn new(signer: std::sync::Arc<dyn CheckpointSigner>) -> Self {
-        Self {
+    /// A witness signing as this identity, claiming `observed_at` as the
+    /// instant it saw every log.
+    ///
+    /// One instant, supplied by the caller, because this witness has no clock
+    /// of record and the two alternatives are worse. Reading the wall clock
+    /// would make a cosignature's bytes differ between two runs of the same
+    /// test, which is the property every fixture here depends on. And zero —
+    /// the value that would say *no clock of record* — is the one
+    /// `tlog-witness` forbids: *the cosignature MUST NOT omit the timestamp,
+    /// i.e. the timestamp MUST NOT be zero*. A stand-in producing bytes no
+    /// conformant verifier accepts is a stand-in for something else.
+    ///
+    /// # Errors
+    ///
+    /// If `observed_at` is at or before the Unix epoch, whose encoding is the
+    /// forbidden zero.
+    pub fn new(
+        signer: std::sync::Arc<dyn CheckpointSigner>,
+        observed_at: crate::core::Timestamp,
+    ) -> Result<Self, WitnessError> {
+        let seconds = observed_at.unix_timestamp();
+        let observed_at = u64::try_from(seconds)
+            .ok()
+            .filter(|s| *s > 0)
+            .ok_or_else(|| {
+                WitnessError::Unavailable(format!(
+                    "a witness observing at {seconds} would cosign with a timestamp of zero, \
+                 which `tlog-witness` forbids — the cosignature would be rejected by \
+                 every conformant verifier, including this crate's own"
+                ))
+            })?;
+        Ok(Self {
             signer,
+            observed_at,
             seen: Mutex::new(BTreeMap::new()),
-        }
+        })
     }
 
     /// The last checkpoint this witness accepted for a log.
@@ -474,10 +629,7 @@ impl Witness for MemoryWitness {
         // Signed over the `cosignature/v1` message — the same construction a
         // remote witness signs — so every `Cosignature` this crate produces
         // means one thing and an auditor verifies both kinds with one rule.
-        // The timestamp is zero because this witness has no clock of record:
-        // an in-process observation carries no independent time claim, and
-        // zero states that rather than dressing an ambient clock up as one.
-        let message = cosignature_message(0, &checkpoint.to_note());
+        let message = cosignature_message(self.observed_at, &checkpoint.to_note());
         // Awaited, because this signer is permitted to be a KMS or an HSM —
         // which is where the trust anchor's key belongs. A failure here is
         // reported, never swallowed: a cosignature that silently did not happen
@@ -494,7 +646,7 @@ impl Witness for MemoryWitness {
                 }
             })?;
         let mut payload = Vec::with_capacity(8 + signature.len());
-        payload.extend_from_slice(&0u64.to_be_bytes());
+        payload.extend_from_slice(&self.observed_at.to_be_bytes());
         payload.extend_from_slice(&signature);
         Ok(Cosignature {
             key_id: self.signer.key_id(),

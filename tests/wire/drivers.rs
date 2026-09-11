@@ -128,6 +128,153 @@ fn canned_observed(status: u16, body: Value) -> (Canned, SeenBody, SeenHeaders) 
     )
 }
 
+/// Records that it was reached at all, for the redirect test below.
+///
+/// Answering a plausible completion is deliberate: it lets a
+/// follow-the-redirect build *succeed*, which is the failure under test, so
+/// the assertions look at the flag rather than at the outcome.
+async fn sink(State(reached): State<Arc<std::sync::atomic::AtomicBool>>) -> axum::Json<Value> {
+    reached.store(true, std::sync::atomic::Ordering::SeqCst);
+    axum::Json(json!({ "content": [{ "type": "text", "text": "hi" }] }))
+}
+
+/// Answers every request with a 307 to the same path on another host.
+///
+/// 307 rather than 302 because it preserves the method and the body: the
+/// prompt itself is what would travel.
+async fn redirect(
+    State(to): State<String>,
+    uri: axum::http::Uri,
+) -> (
+    axum::http::StatusCode,
+    [(axum::http::header::HeaderName, String); 1],
+) {
+    (
+        axum::http::StatusCode::TEMPORARY_REDIRECT,
+        [(axum::http::header::LOCATION, format!("{to}{}", uri.path()))],
+    )
+}
+
+/// One request shape for all four drivers.
+fn request<'a>(model: &'a ModelId, prompt: &'a Value) -> agentplane::model::Request<'a> {
+    agentplane::model::Request {
+        model,
+        prompt,
+        max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+        reasoning_effort: None,
+        schema: None,
+        tools: &[],
+        exchanges: &[],
+        continuation: None,
+        stream: None,
+    }
+}
+
+/// A provider that answers with a redirect does not move this plane.
+///
+/// The assertion that matters is the **second** one: not that the driver
+/// failed, which many bugs also produce, but that the host named in the
+/// `Location` never saw a request. `reqwest` follows ten redirects by default
+/// and strips only `Authorization`, `Cookie` and `Proxy-Authorization` across
+/// origins, so a client built without `netguard::guarded_client` would deliver
+/// `x-api-key` and the prompt body to whatever host the first endpoint chose,
+/// with the egress allowlist consulted once, for the hop that was abandoned.
+///
+/// A 307 rather than a 302 because 307 preserves the method and the body: the
+/// prompt itself is what would travel.
+#[tokio::test]
+async fn a_provider_that_redirects_does_not_move_this_plane() {
+    let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sink_app = Router::new()
+        .route("/v1/messages", post(sink))
+        .route("/v1/responses", post(sink))
+        .route("/v1/chat/completions", post(sink))
+        .route("/v1beta/models/{model}", post(sink))
+        .with_state(Arc::clone(&reached));
+    let sink_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_url = format!("http://{}", sink_listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(sink_listener, sink_app).await;
+    });
+
+    let redirect_app = Router::new()
+        .route("/v1/messages", post(redirect))
+        .route("/v1/responses", post(redirect))
+        .route("/v1/chat/completions", post(redirect))
+        .route("/v1beta/models/{model}", post(redirect))
+        .with_state(sink_url.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, redirect_app).await;
+    });
+
+    let prompt = json!("hello");
+    let anthropic_model = ModelId::new("anthropic", "claude-x");
+    let openai_model = ModelId::new("openai", "gpt-x");
+    let compatible_model = ModelId::new("openai-compatible", "m");
+    let gemini_model = ModelId::new("gemini", "g-x");
+
+    let calls: Vec<(&str, ModelError)> = vec![
+        (
+            "anthropic",
+            Anthropic::new("k")
+                .unwrap()
+                .base(url.clone())
+                .complete(request(&anthropic_model, &prompt))
+                .await
+                .expect_err("a redirect is not a completion"),
+        ),
+        (
+            "openai",
+            OpenAi::new("k")
+                .unwrap()
+                .base(url.clone())
+                .complete(request(&openai_model, &prompt))
+                .await
+                .expect_err("a redirect is not a completion"),
+        ),
+        (
+            "chat_completions",
+            ChatCompletions::new(url.clone())
+                .unwrap()
+                .complete(request(&compatible_model, &prompt))
+                .await
+                .expect_err("a redirect is not a completion"),
+        ),
+        (
+            "gemini",
+            Gemini::new("k")
+                .unwrap()
+                .base(url.clone())
+                .complete(request(&gemini_model, &prompt))
+                .await
+                .expect_err("a redirect is not a completion"),
+        ),
+    ];
+
+    assert!(
+        !reached.load(std::sync::atomic::Ordering::SeqCst),
+        "the host the redirect named was reached, so this plane followed an \
+         endpoint's `Location` past its own egress grant, carrying the \
+         credential and the prompt — the address rule was applied to the hop \
+         that was abandoned"
+    );
+
+    for (driver, error) in calls {
+        assert!(
+            matches!(error, ModelError::Egress { .. }),
+            "{driver} reported a refused redirect as {error:?}; this plane's own \
+             decision reported as the provider's costs the whole retry ladder \
+             before anyone learns the endpoint is redirecting"
+        );
+        assert!(
+            error.to_string().contains("does not follow redirects"),
+            "{driver}'s message does not say what happened: {error}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn model_drivers_bound_a_provider_that_never_responds() {
     let url = serve_hanging().await;

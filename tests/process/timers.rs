@@ -599,3 +599,201 @@ async fn two_concurrent_siblings_can_both_sleep() {
     assert_eq!(seals, vec!["succeeded".to_string()], "sealed exactly once");
     store.verify(out.run_id).await.unwrap();
 }
+
+// ── Surviving a disaster ────────────────────────────────────────────────────
+//
+// A suspended run is the state the export was least equipped to carry, and it
+// is the one a disaster recovery exists for. Two properties, and the second is
+// the one that makes the first worth reporting.
+
+/// A run still in flight is in no outcome index, and `runs_in_flight` is how
+/// an export finds it.
+///
+/// `runs_by_outcome` indexes *conclusions*, so a sleeping run is in none of
+/// them — and an export driven by `OUTCOMES_OF_RECORD` alone contains no run
+/// that was working. The absence is invisible in the result, because the
+/// Merkle log commits to sealed runs only: an export missing every in-flight
+/// run still restores to an equal root at an equal size and reports itself
+/// faithful.
+#[tokio::test]
+async fn a_run_still_in_flight_is_named_by_nothing_the_outcome_indexes_hold() {
+    let f = fixture(Duration::from_secs(3600));
+    let sleeping =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    assert!(
+        matches!(sleeping.status, RunStatus::Suspended(_)),
+        "expected a suspension, got {:?}",
+        sleeping.status
+    );
+
+    let journal = f.store.clone() as Arc<dyn JournalStore>;
+
+    // The negative half, and the reason this test exists: every outcome the
+    // export sweeps by default, and none of them names it.
+    for outcome in agentplane::runtime::OUTCOMES_OF_RECORD {
+        let named = journal.runs_by_outcome(outcome, 100).await.unwrap();
+        assert!(
+            !named.contains(&sleeping.run_id),
+            "'{outcome}' named a run that has not concluded, so this test is \
+             measuring the wrong thing"
+        );
+    }
+
+    let flight = agentplane::export::runs_in_flight(&journal, 100)
+        .await
+        .unwrap();
+    assert!(
+        flight.runs.contains(&sleeping.run_id),
+        "the in-flight selection missed a sleeping run, so an export taken for \
+         disaster recovery would carry no run that was waiting: {flight:?}"
+    );
+    assert!(flight.unreadable.is_empty(), "{flight:?}");
+
+    // The negative half, and it needs a run that actually **ended**: without
+    // it the selection could be "every run" wearing a narrower name, and an
+    // export would carry every sealed run twice. A second plane on the same
+    // store, because the fixture's only skill suspends.
+    let finisher = Runtime::builder(Arc::clone(&journal))
+        .owner("finisher")
+        .skill(Finishes)
+        .build();
+    let done = finisher
+        .run("demo.finish", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(done.status, RunStatus::Succeeded),
+        "expected a conclusion, got {:?}",
+        done.status
+    );
+
+    let flight = agentplane::export::runs_in_flight(&journal, 100)
+        .await
+        .unwrap();
+    assert!(
+        flight.runs.contains(&sleeping.run_id),
+        "the sleeping run stopped being selected: {flight:?}"
+    );
+    assert!(
+        !flight.runs.contains(&done.run_id),
+        "a run that concluded was selected as in flight, so an export would \
+         carry every sealed run a second time: {flight:?}"
+    );
+}
+
+/// Finishes on the spot, so a test can have a run that actually concluded.
+#[derive(Debug)]
+struct Finishes;
+
+#[async_trait::async_trait]
+impl Skill for Finishes {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("finishes").provides("demo.finish")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::done(Tainted::trusted(json!({ "done": true }))))
+    }
+}
+
+/// A restored wait is armed by nothing, and a resume repairs it.
+///
+/// This is the claim `RestoreReport::awaiting` makes, and it has to be true
+/// for the report's advice to be worth printing. A wait is journaled —
+/// `RunSuspended` carries the instant — but what makes it *happen* is a timer
+/// row in a store the export does not carry. So a restored suspended run has
+/// no timer to fire, no subscription to match, and released its lease cleanly
+/// when it suspended, which keeps it out of the recovery pass too: nothing in
+/// the system names it.
+///
+/// The repair is not new machinery. The runtime already treats an
+/// announced-but-unarmed wait as repairable — a crash between the
+/// announcement and the registration produces exactly this state — so a
+/// resume re-arms from the journal, and `until` derives from journaled reads
+/// so the instant is the same on every pass.
+#[tokio::test]
+async fn a_restored_wait_is_armed_by_nothing_until_the_run_is_resumed() {
+    let f = fixture(Duration::from_secs(3600));
+    let sleeping =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    let run = sleeping.run_id;
+    assert_eq!(
+        f.store.armed_timers(run).await.unwrap(),
+        1,
+        "the original plane armed the wait"
+    );
+
+    let journal = f.store.clone() as Arc<dyn JournalStore>;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&journal, None, &[run], &mut out)
+        .await
+        .expect("an in-flight run exports");
+
+    // A different store, as a restore is.
+    let fresh_store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let fresh: Arc<dyn JournalStore> = fresh_store.clone();
+    let report = agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(&out))
+        .await
+        .expect("the restore reads it");
+
+    assert!(
+        report.awaiting.contains(&run),
+        "the restore did not name the run that came back waiting, so the one \
+         thing an operator has to act on is not in the report: {report:?}"
+    );
+    assert_eq!(
+        fresh_store.armed_timers(run).await.unwrap(),
+        0,
+        "a timer appeared in a store the export does not carry timers into — \
+         which would mean this test is not measuring the gap it names"
+    );
+
+    // Nothing else will do it: the run released its lease when it suspended,
+    // so the recovery pass does not see it.
+    let abandoned = fresh.abandoned_runs(100).await.unwrap();
+    assert!(
+        !abandoned.contains(&run),
+        "a cleanly suspended run appeared in the recovery queue, so the claim \
+         that nothing names it is wrong: {abandoned:?}"
+    );
+
+    // The repair, on a plane that holds the agent's own code.
+    let woke = Arc::new(AtomicUsize::new(0));
+    let restored = Runtime::builder(Arc::clone(&fresh))
+        .owner("restored")
+        .timers(fresh_store.clone() as Arc<dyn TimerStore>)
+        .skill(Sleeps {
+            how_long: Duration::from_secs(3600),
+            woke: Arc::clone(&woke),
+        })
+        .build();
+
+    let again = restored.replay(run, Mode::Resume).await.unwrap();
+    assert!(
+        matches!(
+            again.status,
+            RunStatus::Suspended(SuspendReason::AwaitingTime { .. })
+        ),
+        "the resumed run did not go back to waiting: {:?}",
+        again.status
+    );
+    assert_eq!(
+        fresh_store.armed_timers(run).await.unwrap(),
+        1,
+        "the resume did not re-arm the wait, so `awaiting` is advice that does \
+         not work and the run is stranded on the restored plane too"
+    );
+    assert_eq!(
+        woke.load(Ordering::SeqCst),
+        0,
+        "the resume ran the work past the sleep instead of waiting again"
+    );
+}

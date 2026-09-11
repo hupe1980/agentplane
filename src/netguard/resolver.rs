@@ -36,30 +36,42 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// How far a client is permitted to reach.
+///
+/// Each variant is gated on the features that construct it, so the compiler
+/// answers *which reaches exist in this build* rather than a lint being
+/// silenced to let a variant outlive its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reach {
     /// Publicly routable addresses only — the rule for anything whose URL was
     /// influenced by somebody outside the deployment.
+    #[cfg(any(feature = "push", feature = "a2a"))]
     Public,
     /// Public, plus a host that **is** a loopback literal or `localhost`.
     ///
     /// Named rather than inferred: the exception covers a host that *is*
     /// loopback, never one that merely resolved there, which is the rebinding
     /// attack and stays refused. Reachable only from `testkit` callers.
+    #[cfg(any(feature = "push", feature = "a2a"))]
     PublicOrLoopbackName,
     /// Whatever the resolver answers.
     ///
     /// For destinations the **deployment itself** configured, where resolving
-    /// inward is the point: an in-cluster collector has no public address, and
-    /// refusing it leaves an operator running a sidecar that terminates TLS and
-    /// forwards in clear — the same exposure with an extra hop.
+    /// inward is the point: an in-cluster collector has no public address, an
+    /// on-premise model gateway and a Vault cluster usually have none either,
+    /// and refusing them leaves an operator running a sidecar that terminates
+    /// TLS and forwards in clear — the same exposure with an extra hop.
     ///
-    /// Gated on the feature that owns the only construction, so a build without
-    /// an operator outbox has no way to name the unrestricted reach at all —
-    /// the compiler's answer to *which reaches exist here*, rather than a
-    /// silenced lint that would let the variant outlive its caller.
-    #[cfg(feature = "push")]
-    Any,
+    /// What this reach does **not** waive is the other two settings, and they
+    /// are the ones these doors were missing: a proxy taken from the ambient
+    /// environment, and a redirect that moves the request to a host no
+    /// allowlist granted.
+    #[cfg(any(
+        feature = "push",
+        feature = "providers",
+        feature = "witness-http",
+        feature = "keyring-vault",
+    ))]
+    Configured,
 }
 
 /// Judge a set of resolved addresses against a reach.
@@ -86,11 +98,18 @@ where
 {
     let addrs: Vec<SocketAddr> = resolved.into_iter().collect();
     let exempt = match reach {
-        #[cfg(feature = "push")]
-        Reach::Any => true,
+        #[cfg(any(
+            feature = "push",
+            feature = "providers",
+            feature = "witness-http",
+            feature = "keyring-vault",
+        ))]
+        Reach::Configured => true,
         // Named rather than inferred: the exception covers a host that *is*
         // loopback, never one that merely resolved there.
+        #[cfg(any(feature = "push", feature = "a2a"))]
         Reach::PublicOrLoopbackName => super::is_loopback_name(host),
+        #[cfg(any(feature = "push", feature = "a2a"))]
         Reach::Public => false,
     };
     if !exempt {
@@ -188,6 +207,7 @@ mod tests {
     /// connections after that check returned, re-resolving as it does. A
     /// resolver that answered with the addresses anyway would leave every
     /// caller's refusal a formality that holds only until the first reconnect.
+    #[cfg(any(feature = "push", feature = "a2a"))]
     #[tokio::test]
     async fn a_public_only_client_is_not_handed_a_loopback_address() {
         let name: reqwest::dns::Name = "localhost".parse().expect("a resolvable name");
@@ -212,6 +232,7 @@ mod tests {
     /// listener is bound so that the default resolver would *succeed*, which is
     /// what makes the failure meaningful rather than a name that resolves to
     /// nothing.
+    #[cfg(any(feature = "push", feature = "a2a"))]
     #[tokio::test]
     async fn a_guarded_client_does_not_reach_a_live_server_on_this_machine() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -300,23 +321,42 @@ mod tests {
         served.abort();
     }
 
-    /// The named exception is an exception, and the deployment's own reach is
-    /// not the caller's.
+    /// Whichever reaches this build has, the exempt ones are exempt.
+    ///
+    /// A `const fn` per variant rather than a conditional `vec!` literal, so a
+    /// build's list is assembled from calls that each return nothing when the
+    /// variant does not exist — the pattern this crate prefers over a `mut`
+    /// binding whose mutability depends on a feature.
     #[tokio::test]
-    async fn the_two_exemptions_reach_what_they_are_for_and_nothing_else() {
-        // Built as a list rather than an array because the unrestricted reach
-        // only exists where an operator outbox does. `mut` would be unused in
-        // the build without one, which is itself denied.
-        let exempt = {
-            #[cfg(feature = "push")]
-            {
-                vec![Reach::PublicOrLoopbackName, Reach::Any]
-            }
-            #[cfg(not(feature = "push"))]
-            {
-                vec![Reach::PublicOrLoopbackName]
-            }
-        };
+    async fn the_exemptions_reach_what_they_are_for_and_nothing_else() {
+        fn loopback_name() -> Vec<Reach> {
+            #[cfg(any(feature = "push", feature = "a2a"))]
+            return vec![Reach::PublicOrLoopbackName];
+            #[cfg(not(any(feature = "push", feature = "a2a")))]
+            return Vec::new();
+        }
+        fn configured() -> Vec<Reach> {
+            #[cfg(any(
+                feature = "push",
+                feature = "providers",
+                feature = "witness-http",
+                feature = "keyring-vault",
+            ))]
+            return vec![Reach::Configured];
+            #[cfg(not(any(
+                feature = "push",
+                feature = "providers",
+                feature = "witness-http",
+                feature = "keyring-vault",
+            )))]
+            return Vec::new();
+        }
+        let exempt: Vec<Reach> = loopback_name().into_iter().chain(configured()).collect();
+        assert!(
+            !exempt.is_empty(),
+            "this build compiled the resolver and has no reach at all, so nothing \
+             here is under test"
+        );
         for reach in exempt {
             let name: reqwest::dns::Name = "localhost".parse().expect("a resolvable name");
             let addrs = GuardedResolver::new(reach)
@@ -337,6 +377,7 @@ mod tests {
     /// refused with the exception in force — otherwise the exemption is not an
     /// exception, it is an off switch anybody can reach by controlling a DNS
     /// record.
+    #[cfg(any(feature = "push", feature = "a2a"))]
     #[test]
     fn a_name_that_is_not_loopback_gets_no_exemption_from_its_answers() {
         let inward = "10.0.0.1:443".parse().expect("an address");

@@ -1523,6 +1523,82 @@ fn only_the_sealed_accessor_reads_the_raw_blob_store() {
     );
 }
 
+/// Every outbound client in the crate is built by `netguard::guarded_client`.
+///
+/// The constructor carries three settings that are not independent — a custom
+/// resolver, `no_proxy`, and `redirect::none` — and a client that sets two of
+/// them looks guarded and is not. Nothing downstream can observe the
+/// difference: the address a client must not reach is one no test can make DNS
+/// answer with on demand, and a proxy taken from the environment changes which
+/// host is resolved at all.
+///
+/// So the rule is checked by counting constructions rather than by reading the
+/// module doc that states it. That doc used to carry a *prose count* of the
+/// doors — it said two while a third stood open, and later three while six
+/// more had appeared, each following redirects and each honouring
+/// `HTTPS_PROXY`.
+///
+/// One exception, named here rather than left to a comment:
+/// [`media`](agentplane::media) resolves a URL itself and pins the connection
+/// to the addresses it judged, using `resolve` — which `reqwest` applies
+/// *over* a custom resolver rather than through it, so the two cannot be
+/// combined.
+#[test]
+fn every_outbound_client_is_guarded() {
+    /// The file that may build a client by hand, and why.
+    const EXEMPT: &[(&str, &str)] = &[
+        (
+            "src/media/mod.rs",
+            "pins each connection to addresses it resolved and judged itself, \
+             which `reqwest` applies over a custom resolver rather than through it",
+        ),
+        (
+            "src/netguard/resolver.rs",
+            "is the constructor, and its own tests build unguarded clients to \
+             prove what the guarded one refuses",
+        ),
+    ];
+
+    let mut unguarded = Vec::new();
+    for file in walk("src") {
+        let src = read(&file);
+        let hand_rolled = code_only(&src)
+            .matches("reqwest::Client::builder()")
+            .count();
+        if hand_rolled == 0 {
+            continue;
+        }
+        if EXEMPT.iter().any(|(f, _)| *f == file) {
+            continue;
+        }
+        unguarded.push(format!("{file} ({hand_rolled}×)"));
+    }
+    assert!(
+        unguarded.is_empty(),
+        "these files build a `reqwest` client by hand rather than through \
+         `netguard::guarded_client`, so each one decides for itself whether to \
+         follow a redirect and whether to honour an ambient proxy — and \
+         `reqwest` defaults to following ten redirects while stripping only \
+         `Authorization`, `Cookie` and `Proxy-Authorization` across origins, so \
+         `x-api-key`, `x-goog-api-key` and `X-Vault-Token` travel to whatever \
+         host the endpoint names: {}",
+        unguarded.join(", ")
+    );
+
+    // The exemptions are exemptions from *this* rule, not from having one: a
+    // file that stopped building a client by hand no longer needs to be listed,
+    // and a stale entry would silently license the next hand-rolled client in
+    // it.
+    for (file, why) in EXEMPT {
+        assert!(
+            code_only(&read(file)).contains("reqwest::Client::builder()"),
+            "{file} is exempt because it {why}, and it no longer builds a client \
+             by hand — drop the exemption, or the next one written there is \
+             licensed by a list nobody re-read"
+        );
+    }
+}
+
 /// Every declared route appears in the unauthenticated-request test.
 ///
 /// That test is the one saying "no credentials, no answer — on every route", and

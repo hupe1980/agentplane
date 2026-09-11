@@ -50,6 +50,83 @@ async fn one_run() -> (Arc<dyn JournalStore>, agentplane::core::RunId) {
     (store as Arc<dyn JournalStore>, out.run_id)
 }
 
+/// An open run's tail is unpinned, and the report says so.
+///
+/// `audit` says this about a live store — an open run has no Merkle leaf, so
+/// nothing pins its tail and a truncation is undetectable until the run seals.
+/// The offline reader answers the same question about the same history and is
+/// the one an independent auditor holds, so it is the worse of the two to
+/// leave silent. It mattered little while an export carried only concluded
+/// runs; an export taken for recovery carries in-flight ones by design.
+#[tokio::test]
+async fn an_open_runs_tail_is_reported_as_unpinned() {
+    use agentplane::journal::{Append, RecordKind};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let journal: Arc<dyn JournalStore> = Arc::clone(&store) as Arc<dyn JournalStore>;
+
+    // Admitted and never concluded: records, no seal, no log position.
+    let open = agentplane::core::RunId::generate();
+    let lease = journal
+        .acquire(open, "w", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    journal
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                open,
+                RecordKind::RunAdmitted {
+                    capability: "demo.open".into(),
+                    governed_by: None,
+                    input_label: agentplane::core::Label::trusted(),
+                    input: Value::Null,
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&journal, None, &[open], &mut out)
+        .await
+        .expect("export");
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("the file reads");
+    assert!(
+        report.findings.is_empty(),
+        "an open run is a state, not a defect: {:?}",
+        report.findings
+    );
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.contains("open run(s)") && n.contains("no position in the Merkle log")),
+        "the report is silent about the one thing the root cannot prove for this \
+         file: {:?}",
+        report.not_checked
+    );
+
+    // And an export of only concluded runs does not claim the limit it does
+    // not have — otherwise the note is noise and a reader learns to skip it.
+    let (sealed_store, sealed) = one_run().await;
+    let mut done = Vec::new();
+    agentplane::export::to_jsonl(&sealed_store, None, &[sealed], &mut done)
+        .await
+        .expect("export");
+    let clean = agentplane::export::verify(std::io::Cursor::new(&done), None, None)
+        .expect("the file reads");
+    assert!(
+        !clean.not_checked.iter().any(|n| n.contains("open run(s)")),
+        "a wholly sealed export reported open runs: {:?}",
+        clean.not_checked
+    );
+}
+
 /// A run id as it appears *in the file*.
 ///
 /// `RunId::to_string()` renders `run_01K…` and the JSON form is bare, so a

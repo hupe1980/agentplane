@@ -207,7 +207,10 @@ against a store it did not write, taking inputs the auditor holds:
 Only the third detects deletion, and only because the checkpoint came from
 outside. The test that makes this concrete audits a store somebody deleted a run
 from **twice**: with no prior checkpoint it comes back clean — honestly, because
-there is nothing to compare against — and with one it fails.
+there is nothing to compare against — and with one it fails. A second test does
+the same thing with the checkpoint fetched from a witness rather than saved
+earlier, which is the version an auditor can run without the operator's
+cooperation.
 
 That asymmetry is why `AuditReport` carries `not_checked` as prominently as
 `findings`, and why `assert_complete` fails on a skipped check as well as a
@@ -228,9 +231,43 @@ Rust struct.
   operator.
 * **Split views** — one history to one auditor, a different one to another — are
   refused by a witness that remembers, because the second history cannot prove
-  it extends the first. The client and wire protocol exist; independence still
-  comes from choosing a witness run by somebody other than the operator.
-  Hosting your own proves nothing about you.
+  it extends the first. Independence comes from choosing a witness run by
+  somebody other than the operator; hosting your own proves nothing about you.
+* **Where the submission happens.** `RuntimeBuilder::witnesses(witnesses,
+  quorum)` wires the set, and the periodic `sweep` submits — after sealing,
+  off the run path, and skipped when the log has not grown since the last
+  round that met the bar. `SweepReport` carries the three answers, so a
+  shortfall reaches `needs_attention` and an integrity refusal also goes to
+  `agentplane.witness.integrity`: the audience for *a witness says this
+  history moved* is not only the operator who runs the plane. Build refuses a
+  quorum larger than the witness list, in both directions — a bar no round can
+  clear reports a shortfall every tick, which is how an operator learns to
+  ignore the one that means something.
+* **Where the anchor comes back.** `WitnessReader::latest(origin)` reads
+  `tlog-witness`'s monitor endpoint, and it is a separate type from `Witness`
+  because reading is a **different party's** action: submitting needs the
+  log's own signing key, reading needs nothing but the URL and the witness
+  keys the *reader* trusts. That is the direction an auditor uses.
+  `agentplane audit --witness <prefix> --witness-key <name>=<base64>` is the
+  same call from the command line, and it is what makes the deletion check
+  runnable by somebody the operator did not hand a checkpoint to. Naming
+  several witnesses buys a check no single anchor makes: a split view is
+  exactly two witnesses holding one tree size with two different roots.
+* **The checkpoint is signed per submission, never once at configuration.**
+  A witness `MUST verify the checkpoint signature against the public key(s) it
+  trusts for the checkpoint origin`, and that signature covers the note body —
+  origin, size, root — which changes with every checkpoint. So `LogKey` holds
+  a signer and a note key name, and a signature is made over each checkpoint
+  as it goes out. A held signature would be correct for exactly one checkpoint
+  and answered `403 Forbidden` for every one after it.
+* **A `422` is three different answers.** The specification gives the status a
+  size-zero checkpoint whose root is not the empty tree's, a consistency proof
+  that does not verify, and equal sizes with unequal roots. The first two are
+  the client's own inputs — refused here before a request goes out — and only
+  the last is evidence about the log, because no proof-building mistake
+  produces two roots for one size. A `422` on growth is
+  `WitnessError::Inconsistent`, which names what is actually known: either the
+  proof this log built is wrong, or its history moved.
 * **Cosignatures are verified, not counted.** `HttpWitness::new` takes the
   `TrustedWitness` keys a deployment accepts and refuses to build without at
   least one. Each signature line on a `200` is matched to a trusted key by
@@ -240,7 +277,10 @@ Rust struct.
   the signature covers the `cosignature/v1` header, the `time` line, then the
   note body that was submitted. The header is what separates a witness's
   observation from a log's own note signature — same algorithm, same key
-  length, different claim. The construction is pinned to the spec's published
+  length, different claim. A zero timestamp is refused: the specification says
+  *the cosignature MUST NOT omit the timestamp*, and the observation instant is
+  what separates a witness that is watching from one that answered once and
+  stopped. The construction is pinned to the spec's published
   example rather than to a round trip, since a signer and verifier written
   from one misreading round-trip cleanly. A quorum is otherwise a count of
   HTTP status codes, and every guarantee resting on *an independent party

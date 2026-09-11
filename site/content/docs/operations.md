@@ -305,6 +305,7 @@ dead-lettering, and finally timers:
 | An event nobody claimed aged out | Dead-lettered with a reason |
 | A sleeping run's instant arrived | The run is woken; reported as `timers_fired` |
 | A wake was recorded but the resume died | Reported as `wake_failures`; the lease lapses and the recovery pass picks the run up on a later tick |
+| The log grew since the last anchored checkpoint | It is submitted to the deployment's witnesses; reported as `cosignatures`, `witness_shortfall` and `witness_integrity` |
 
 `now` is passed in rather than read, so the caller controls the clock. That keeps
 the sweeper testable at all, and lets a simulation drive a year of obligations
@@ -323,10 +324,23 @@ be written. `census_unavailable` means the gauges could not be read this tick,
 so the census in the report is a default rather than a reading — a blind spot
 wearing a zero.
 
+The witness pass is the one phase whose counterparty is somebody else's server,
+which is why it runs last: a slow witness must not delay a breach or a
+recovery. `cosignatures` is evidence accumulating — the system working, like
+`timers_fired`. `witness_shortfall` is a plane running with fewer independent
+parties vouching for its history than the deployment declared it required, and
+nothing else will clear it. `witness_integrity` is a witness refusing on
+integrity grounds — the log shrank, forked, or claimed growth the witness
+could not verify — and it is reported even when the quorum was **met**,
+because two honest cosigners do not answer a third that remembers a different
+history. It is also the one sweep finding that goes to `tracing` as well as to
+the report: the audience for *a witness says this history moved* is not only
+the operator running the plane.
+
 `needs_attention()` is the alerting predicate, and it enumerates exactly what a
 human should see: `breached`, `tasks_expired` or `dead_lettered` above zero, any
 saturated pass, `recovery_failures` or `wake_failures` above zero,
-`evidence_lost`, and `census_unavailable`. Recoveries that *succeeded* stay off
+`evidence_lost`, `census_unavailable`, and either witness count above zero. Recoveries that *succeeded* stay off
 that list — they are the plane healing, findable in the report and in the
 sweep's own run. `is_quiet()` is the broader predicate: a healthy plane sweeps
 silently, so a non-silent sweep means something happened, even when it was only
@@ -743,11 +757,43 @@ position at all — without it an export is a transcript rather than evidence.
 Exit codes: findings fail, `not_checked` does not. A pass with no public key has
 established less rather than failed, and the report says which.
 
+Both verbs print **one document**, so a redirect cannot separate the verdict
+from the grounds. Beside the report is an `anchor` object:
+
+| Field | Says |
+|---|---|
+| `obtained_from` | a witness's prefix, or a file |
+| `cosigned_by` | the witness keys whose signature over that checkpoint verified — empty for a file, which carries none to check |
+| `unreached` | witnesses asked that gave no anchor, and why |
+| `split_view` | witnesses that disagree, which fails the command |
+
+A clean report against a cosigned anchor and a clean report against a
+checkpoint somebody typed are different statements; the anchor is what
+distinguishes them. `held_to` on the report names the checkpoint itself — the
+anchor says how it was obtained, and never repeats the value.
+
+**Name a second `--witness`.** Two witnesses holding one tree size with two
+different roots is the event witnessing exists to detect, and the one an
+operator auditing their own plane cannot find alone: every other check compares
+the store against something the store produced. Witnesses at *different* sizes
+are not a split view — they observed at different times.
+
 `restore` rebuilds a journal from an export and proves it by one comparison:
 **equal Merkle roots at equal size**. That is a far stronger statement than "the
-rows loaded" — it means every record, in every run, in the order the log
-recorded them, rebuilt to the same commitment. A run restored this way
+rows loaded" — it means every record, in every **sealed** run, in the order the
+log recorded them, rebuilt to the same commitment. A run restored this way
 strict-replays on a plane that never executed it.
+
+*Sealed* is the load-bearing word, and it decides what to export. The log
+commits to runs that ended, so a file carrying no in-flight run rebuilds to
+exactly the same root at exactly the same size as one carrying all of them —
+a clean `verify` says nothing either way. And the runs still in flight are the
+ones no outcome index names: `runs_by_outcome` indexes conclusions, so a
+sleeping run, a run awaiting a message and a run waiting on a person are in
+none of them. `agentplane export` asks for them separately and says on stderr
+how many it carried; `export::runs_in_flight` is the same selection for an
+embedder. Narrowing with `--outcome` turns it off, because naming outcomes is
+a request for exactly those conclusions.
 
 It rebuilds the case layer beside the journal: every matter is queryable again
 — `case`, correlation, the status worklist, the deadline sweep, the blob links
@@ -772,6 +818,35 @@ runs a failover produced. Both backends fence only when a lease row exists, so
 restoring into a store with no leases writes each record under its own epoch.
 
 What does not survive is named in the report rather than left to be discovered.
+
+**A restored wait is armed by nothing, and this is the entry that costs work.**
+`RestoreReport::awaiting` lists the runs whose history ends in a wait, as ids
+rather than a count, because each one needs an act. The wait itself is
+journaled — `RunSuspended` carries the instant, the kind and the correlation —
+but what makes a wait *happen* is a row in a store the export does not carry:
+a timer, a subscription, and any worklist row the wait opened. So a restored
+suspended run has no timer to fire and no subscription to match, and because it
+released its lease cleanly when it suspended, the recovery pass does not see it
+either. Nothing in the system names it.
+
+**Resuming it repairs it**, and not by new machinery: the runtime already treats
+an announced-but-unarmed wait as repairable, because a crash between the
+announcement and the registration produces exactly this state. A resume replays
+to the wait, finds no terminal record, and re-arms the timer, re-subscribes and
+re-opens the task row from the journal — `until` derives from journaled reads,
+so the instant is the one the original recorded. `restore` cannot do it: a
+resume runs the agent's own code and a restore holds stores. So the runbook step
+is *resume every run in `awaiting`*, and a plane that skips it has restored a
+history and not the work.
+
+**Four layers are not in the export at all**: the worklist and the decisions
+recorded against it, inbound events nobody claimed, webhook registrations with
+their delivery cursors, and governed memory beside the batch, quota and
+standing-authority ledgers. A decision a run already consumed survives, because
+that run journaled it; one nobody had consumed does not. Re-establish webhook
+registrations by hand — nothing journals a delivery cursor, so nothing can
+rebuild one.
+
 **Signatures**: `append` attests as the restoring store's signer, so a history
 signed by a key this store does not hold comes back unsigned — hashes and the
 root are unaffected, since a signature is taken over the chain hash and stored
@@ -1061,6 +1136,7 @@ Every failure P7 exists to surface has its own event target:
 | `agentplane.event.dead_lettered` | An event aged out with nobody waiting — a correlation bug |
 | `agentplane.deadline.breached` | An obligation passed unmet |
 | `agentplane.timer.fired` | A sleeping run's instant arrived |
+| `agentplane.witness.integrity` | A witness refused this plane's checkpoint: the log shrank, forked, or claimed growth the witness could not verify |
 
 That list is `telemetry::LOUD_EVENTS`, and this table is checked against it:
 `tests/guards/docs.rs` fails the build if the runtime promises an event this

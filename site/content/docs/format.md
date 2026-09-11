@@ -444,6 +444,24 @@ An implementation that does the following has verified the file.
    ticket. A verifier given no such checkpoint has not checked for deletion and
    must report that it did not, rather than reporting a pass.
 
+   And a verifier MUST report, once, how many **open** runs the file carries —
+   a run block with no `index` and no `seal`. The root proves nothing about
+   one, so its chain was checked and records cut from its tail before the
+   export was taken are undetectable from the file. A clean report over a file
+   that is mostly open runs has established much less than the same report over
+   a sealed one, and only the count says which.
+
+   And the limit that survives even a checkpoint from outside: **the
+   checkpoint commits to sealed runs only.** A run still in flight has no
+   position in the log, so a file carrying none of them rebuilds to exactly
+   the same root at exactly the same size as one carrying all of them. A clean
+   verdict here therefore says nothing about whether the work that was *in
+   progress* is in the file — which is the work a restore is usually for. That
+   is a property of what a Merkle log over sealed runs can prove, not a defect
+   in the verifier, and the only place it can be answered is the producer's
+   selection: a writer exporting for recovery has to ask the store for runs
+   that have not concluded, because no outcome index names them.
+
 7. **Cross-layer.** A record naming a `case` the file does not carry is a
    finding.
 8. **The trailer.** No trailer means a prefix. A non-empty `unreadable` means

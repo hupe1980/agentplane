@@ -159,13 +159,37 @@ An unconfigured seam is no control, spelled as absence: there is no
 Stated as a table rather than left to a reader to infer, because a rule that
 reads as exhaustive and is not is how a deployment sizes its risk wrongly.
 
-| Path | Who checks | How the host is known |
+| Path | Who checks the host | How the host is known |
 |---|---|---|
 | HTTP model drivers — Anthropic, OpenAI, Gemini, Chat Completions | the driver, from `.egress(..)` | it parses its own base URL |
+| Embedders | the driver, from `.egress(..)` | the same |
 | A2A peers | the peer client | the card URL, before it is fetched |
-| Push webhooks, governed media | [`netguard`](https://docs.rs/agentplane/latest/agentplane/netguard/), a stricter rule again | the URL being dereferenced |
+| Push webhooks, governed media, Agent Card discovery | [`netguard`](https://docs.rs/agentplane/latest/agentplane/netguard/), which also judges the resolved **addresses** | the URL being dereferenced |
 | **Tool calls — MCP, typed tools, anything else** | the **plane**, from `RuntimeBuilder::egress(..)` | the transport declares it: `ToolClient::destination` |
+| A witness, a Vault key ring | **nobody**, deliberately | the URL is deployment configuration and reaches no caller-supplied string |
 | Bedrock | **nobody**, and it says so | the SDK will not disclose its endpoint |
+
+Whoever judges the host, **every outbound client in this crate is built by one
+constructor**, and it carries two rules the host allowlist cannot: no ambient
+proxy, and no redirects. Both matter for the same reason. An allowlist is
+consulted once, for the first hop — so a client that follows a `Location`
+leaves it behind, and `reqwest` strips only `Authorization`, `Cookie` and
+`Proxy-Authorization` across origins, which means `x-api-key`,
+`x-goog-api-key` and `X-Vault-Token` would arrive wherever the endpoint chose.
+A `307` re-sends the body too, so the prompt travels. And a proxy taken from
+the environment resolves *the proxy*, so the address check never sees the
+destination at all and this plane's ambient identity rides a request it did
+not authorize.
+
+A refused redirect is `ModelError::Egress` — this plane's decision, not the
+provider's — so it spends no retry attempt and sends whoever reads it to their
+own gateway configuration rather than to a vendor status page.
+`tests/guards/layering.rs::every_outbound_client_is_guarded` counts the
+constructions, because a prose list of the doors is what this rule carried
+before and it went stale twice. Governed media is the one exception and is
+named there: it resolves a URL itself and pins the connection to the addresses
+it judged, which `reqwest` applies *over* a custom resolver rather than
+through it.
 
 The tool path works differently from the rest. A grant is `tool://server/name`,
 which names a catalogue entry and not a destination, so there is no URL for the
@@ -216,11 +240,15 @@ gets written by hand is the unbounded one.
 
 #### Is MCP-over-HTTP outside `netguard`? Yes, and here is why
 
-`netguard` covers push webhooks and governed media: paths where **this crate
-dereferences a URL it was handed**, and where the URL can be attacker-influenced
-— an A2A card URL, an image link in a document. Those need DNS pinning, redirect
-revalidation and a public-address check, because the string arrived from
-somewhere.
+`netguard`'s **address** rule covers push webhooks, governed media and Agent
+Card discovery: paths where this crate dereferences a URL it was handed, and
+where the URL can be attacker-influenced — a card URL, an image link in a
+document. Those need DNS pinning, redirect revalidation and a public-address
+check, because the string arrived from somewhere. A deployment's own endpoints
+— a model gateway, a Vault cluster, a witness — are judged by the host
+allowlist instead, because resolving inward is often the point: an in-cluster
+gateway has no public address, and refusing it leaves an operator running a
+sidecar that terminates TLS and forwards in clear.
 
 An MCP server URL is not that string. This crate **never dereferences it**:
 `McpClient::connect` takes a transport and `McpClient::new` an already-initialised `rmcp` service, so the transport is

@@ -5644,8 +5644,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "answering with a well-formed base64 string is counted toward a "
         "quorum — and every guarantee resting on 'an independent party saw "
         "this log' becomes a guarantee about string formatting",
-        """        if verifying.verify(message.as_bytes(), &signature).is_ok() {""",
-        """        if true {""",
+        """    verifying.verify(message.as_bytes(), &signature).ok()?;""",
+        """    let _ = (&verifying, &signature);""",
     ),
     "ACosignatureIsMatchedOnNameAlone": (
         "src/journal/witness_http.rs",
@@ -5654,8 +5654,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "`signed-note`'s conjunction — so a server that picks the name it "
         "sends can wear the identity of any witness the operator registered, "
         "and a rotated-away key keeps counting",
-        """            .find(|k| k.name == line.name && k.note_key_id == line.key_id)""",
-        """            .find(|k| k.name == line.name)""",
+        """        .find(|k| k.name == line.name && k.note_key_id == line.key_id)?;""",
+        """        .find(|k| k.name == line.name)?;""",
     ),
     "OnlyTheFirstSignatureLineIsRead": (
         "src/journal/witness_http.rs",
@@ -5663,8 +5663,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "only the first signature line of a 200 is considered, so which "
         "cosignature counts is decided by the answering server's ordering and "
         "a real one behind an unknown key's line is discarded",
-        """    for line in &note.signatures {""",
-        """    for line in note.signatures.iter().take(1) {""",
+        """    for line in &note.signatures {
+        if let Some(cosignature) = verify_line(line, &note_text, trusted) {""",
+        """    for line in note.signatures.iter().take(1) {
+        if let Some(cosignature) = verify_line(line, &note_text, trusted) {""",
     ),
     "AWitnessKeyIdNamesAPlainSignature": (
         "src/journal/witness_http.rs",
@@ -5677,6 +5679,154 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """        let note_key_id = super::note::key_id(&name, 0x04, &public_key);""",
         """        let note_key_id = super::note::key_id(&name, 0x01, &public_key);""",
     ),
+    "ACheckpointIsSignedOnceAtConfiguration": (
+        "src/journal/witness_http.rs",
+        "every_checkpoint_is_signed_over_its_own_note",
+        "the log's own signature over a checkpoint is taken from configuration "
+        "rather than made over this checkpoint's note body — so it is correct "
+        "for exactly one checkpoint and every conformant witness answers 403 "
+        "Forbidden for every one after it, while the client's message says the "
+        "log's key is not registered",
+        """        let signature = self.log.sign(&body).await?;""",
+        """        let signature = self.log.sign("plane-a\\n0\\nAA==\\n").await?;""",
+    ),
+    "AnUnverifiableProofIsAFork": (
+        "src/journal/witness_http.rs",
+        "a_422_is_a_fork_only_where_the_witness_removed_the_ambiguity",
+        "a 422 is reported as a forked history whatever its cause, but the "
+        "specification gives it three and only equal-sizes-unequal-roots is "
+        "evidence about the log — so a consistency proof this plane built "
+        "wrongly pages an operator for a split view, which is the alert this "
+        "module's own 409 handling exists to keep believable",
+        """            422 if old_size == checkpoint.size => Err(WitnessError::Forked {""",
+        """            422 if old_size <= checkpoint.size => Err(WitnessError::Forked {""",
+    ),
+    "ACosignatureNeedsNoObservationTime": (
+        "src/journal/witness_http.rs",
+        "a_cosignature_without_an_observation_time_is_not_counted",
+        "a cosignature with a zero timestamp is counted, which `tlog-witness` "
+        "forbids in as many words — and the observation instant is half of "
+        "what a cosignature is: it is what separates a witness that is "
+        "watching from one that answered once and stopped",
+        """    if timestamp == 0 {
+        return None;
+    }""",
+        """    if false {
+        return None;
+    }""",
+    ),
+    "AnOpenRunsTailReadsAsPinned": (
+        "src/export.rs",
+        "an_open_runs_tail_is_reported_as_unpinned",
+        "an offline verification of a file carrying in-flight runs says nothing "
+        "about the one thing its root cannot prove — a run with no position in "
+        "the Merkle log has an unpinned tail, so records cut from it before the "
+        "export was taken are undetectable — while `audit` states exactly that "
+        "about the same history, leaving the reader an independent auditor "
+        "holds as the laxer of the two",
+        """    if open_runs > 0 {""",
+        """    if false {""",
+    ),
+    "AnAuditDoesNotNameItsAnchor": (
+        "src/audit.rs",
+        "an_audit_names_the_checkpoint_it_was_held_to",
+        "the report does not record which checkpoint the append-only check ran "
+        "against, so a clean verdict against an outside anchor is "
+        "indistinguishable from a clean verdict that compared the store with "
+        "itself — to a SIEM, a ticket attachment and a compliance reviewer "
+        "alike, which are the three readers of this JSON",
+        """        held_to: evidence.prior.cloned(),""",
+        """        held_to: None,""",
+    ),
+    "AConcludedRunCountsAsInFlight": (
+        "src/export.rs",
+        "a_run_still_in_flight_is_named_by_nothing_the_outcome_indexes_hold",
+        "a concluded run is selected as in flight, so an export carries every "
+        "sealed run twice — and the arm that decides it is the one that must "
+        "fail closed, because a conclusion this build cannot interpret is "
+        "still a conclusion",
+        """                        Some(_) => false,""",
+        """                        Some(_) => true,""",
+    ),
+    "AnInFlightRunIsNotSelected": (
+        "src/export.rs",
+        "a_run_still_in_flight_is_named_by_nothing_the_outcome_indexes_hold",
+        "a run that has not concluded is left out of the selection, so an "
+        "export taken for disaster recovery carries no run that was sleeping, "
+        "awaiting a message or waiting on a person — and the loss is invisible "
+        "in the result, because the Merkle log commits to sealed runs only and "
+        "the restore still reports itself faithful",
+        """                    if in_flight {
+                        found.runs.push(run);
+                    }""",
+        """                    if in_flight {
+                        let _ = run;
+                    }""",
+    ),
+    "ARestoredWaitIsNotNamed": (
+        "src/export.rs",
+        "a_restored_wait_is_armed_by_nothing_until_the_run_is_resumed",
+        "a restore does not name the runs that came back waiting, so the one "
+        "thing an operator must act on is absent from the report — and a "
+        "restored wait is armed by nothing: no timer fires, no subscription "
+        "matches, and the run released its lease cleanly when it suspended, so "
+        "recovery does not see it either",
+        """            awaiting.push(run.run);""",
+        """            let _ = run;""",
+    ),
+    "AnyWitnessDisagreementIsASplitView": (
+        "src/journal/witness.rs",
+        "a_split_view_is_equal_sizes_with_unequal_roots_and_nothing_else",
+        "two witnesses at different tree sizes are reported as a split view, so "
+        "the ordinary case — witnesses that observed at different times — pages "
+        "an operator for the system working, and the one alert this crate "
+        "cannot raise any other way stops being believed",
+        """            if a.size == b.size && a.root != b.root {""",
+        """            if a.root != b.root {""",
+    ),
+    "TheSweepNeverAsksAWitness": (
+        "src/runtime/sweeper.rs",
+        "a_plane_with_witnesses_anchors_its_history_on_the_sweep",
+        "the periodic pass never submits a checkpoint, so a plane configured "
+        "with witnesses is anchored nowhere outside itself while every report "
+        "it prints stays clean — the shape this whole tier had before there "
+        "was a door: the mechanism exists, so the requirement reads as met",
+        """            self.cosign_checkpoint(&mut report).await?;""",
+        """            let _ = &mut report;""",
+    ),
+    "AWitnessShortfallIsAQuietTick": (
+        "src/runtime/sweeper.rs",
+        "a_witness_that_cannot_be_reached_is_a_shortfall_on_the_report",
+        "a plane anchored by fewer independent parties than the deployment "
+        "declared it required does not reach `needs_attention`, so witnessing "
+        "silently stops and the sweep that says so looks like every other "
+        "quiet tick",
+        """            || self.witness_shortfall > 0""",
+        """            || false""",
+    ),
+    "AWitnessReaderNeedsNoKeys": (
+        "src/journal/witness_http.rs",
+        "a_reader_with_no_keys_cannot_report_an_anchor",
+        "a reader is constructible with no trusted key, so it reports whatever "
+        "a URL served as an independent anchor — the sibling of the client's "
+        "own refusal, on the direction an auditor actually uses",
+        """        if trusted.is_empty() {
+            return Err(WitnessError::Unavailable(
+                "a witness reader needs at least one trusted key""",
+        """        if false {
+            return Err(WitnessError::Unavailable(
+                "a witness reader needs at least one trusted key""",
+    ),
+    "AnUncosignedCheckpointIsAnAnchor": (
+        "src/journal/witness_http.rs",
+        "an_uncosigned_checkpoint_is_not_an_anchor",
+        "a monitoring endpoint's answer is returned whether or not any trusted "
+        "key covers it, so an auditor is handed the plane's own checkpoint "
+        "under the name of an independent party's — and then runs the deletion "
+        "check against the history it is supposed to be checking",
+        """        if cosignatures.is_empty() {""",
+        """        if false {""",
+    ),
     "AWitnessClientNeedsNoKeys": (
         "src/journal/witness_http.rs",
         "a_witness_client_with_no_keys_is_not_a_witness_client",
@@ -5684,8 +5834,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "verifies nothing and refuses everything — a misconfiguration that "
         "reads as a witness being down rather than as never having been "
         "configured",
-        """        if trusted.is_empty() {""",
-        """        if false {""",
+        """        if trusted.is_empty() {
+            return Err(WitnessError::Unavailable(
+                "a witness needs at least one trusted key""",
+        """        if false {
+            return Err(WitnessError::Unavailable(
+                "a witness needs at least one trusted key""",
     ),
     "AnUnreadableStaleSizeBecomesZero": (
         "src/journal/witness_http.rs",
@@ -6314,10 +6468,32 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "card_discovery_refuses_an_inward_address_a_redirect_and_a_hang",
         "every guarded client follows redirects, so the address and host checks "
         "apply only to the first hop and an allowed server forwards this plane "
-        "wherever it likes — card discovery, webhook delivery and peer calls at "
-        "once, because they share one constructor",
+        "wherever it likes — every outbound door at once, because they share one "
+        "constructor: card discovery, webhook delivery, peer calls, four model "
+        "drivers, both embedders, the key ring and the witness client",
         "        .redirect(reqwest::redirect::Policy::none())",
         "        .redirect(reqwest::redirect::Policy::limited(10))",
+    ),
+    "AModelDriverBuildsItsOwnClient": (
+        "src/model/anthropic.rs",
+        "a_provider_that_redirects_does_not_move_this_plane",
+        "a model driver builds its own `reqwest` client rather than the guarded "
+        "one, so it follows up to ten redirects and honours an ambient proxy — "
+        "and since `reqwest` strips only `Authorization`, `Cookie` and "
+        "`Proxy-Authorization` across origins, the `x-api-key` header and the "
+        "prompt body arrive at whatever host the endpoint's `Location` names",
+        "        let http = crate::netguard::guarded_client(crate::netguard::Reach::Configured)",
+        "        let http = reqwest::Client::builder()",
+    ),
+    "ARefusedRedirectIsAProviderOutage": (
+        "src/model/wire.rs",
+        "a_provider_that_redirects_does_not_move_this_plane",
+        "a 3xx is classified as the provider being unavailable rather than as "
+        "this plane declining to follow it, so the retry ladder spends every "
+        "attempt on an answer that cannot change and the operator is sent to a "
+        "vendor status page instead of to their own gateway configuration",
+        "        300..=399 => ModelError::Egress {",
+        "        300..=399 => ModelError::Unavailable {",
     ),
     "ACardFetchIsUnbounded": (
         "src/peers/discovery.rs",

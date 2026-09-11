@@ -13,8 +13,17 @@ use agentplane::core::{Digest, merkle};
 use agentplane::journal::{Checkpoint, MemoryWitness, Witness, WitnessError};
 use agentplane::testkit::StubSigner;
 
+/// The instant every stand-in witness in this file claims to have observed at.
+///
+/// Fixed and non-zero: fixed so a cosignature's bytes are the same on every
+/// run, and non-zero because `tlog-witness` forbids a zero timestamp and this
+/// crate's own client now refuses one.
+fn observed() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("a valid instant")
+}
+
 fn witness() -> MemoryWitness {
-    MemoryWitness::new(Arc::new(StubSigner::default()))
+    MemoryWitness::new(Arc::new(StubSigner::default()), observed()).expect("a non-zero instant")
 }
 
 /// Leaves for a log of `n` runs, and the checkpoint over them.
@@ -176,7 +185,7 @@ async fn a_witness_that_cannot_sign_reports_it() {
         }
     }
 
-    let w = MemoryWitness::new(Arc::new(Unreachable));
+    let w = MemoryWitness::new(Arc::new(Unreachable), observed()).expect("a non-zero instant");
     let (_, cp) = log(1);
 
     match w.cosign(&cp, 0, &[]).await {
@@ -215,7 +224,7 @@ async fn a_revoked_signing_key_names_itself() {
         }
     }
 
-    let w = MemoryWitness::new(Arc::new(Revoked));
+    let w = MemoryWitness::new(Arc::new(Revoked), observed()).expect("a non-zero instant");
     let err = w
         .cosign(&log(1).1, 0, &[])
         .await
@@ -668,20 +677,25 @@ async fn a_cosignature_verifies_as_cosignature_v1_over_the_note_text() {
 
     let signer = Arc::new(Ed25519Signer::new("witness-1", &[3u8; 32]));
     let public = VerifyingKey::from_bytes(&signer.verifying_key()).expect("a valid key");
-    let w = MemoryWitness::new(signer);
+    let w = MemoryWitness::new(signer, observed()).expect("a non-zero instant");
 
     let (_, cp) = log(4);
     let co = w.cosign(&cp, 0, &[]).await.expect("a first checkpoint");
 
-    // The payload is the timestamp, then the signature. The in-process
-    // witness has no clock of record, and zero states that.
+    // The payload is the timestamp, then the signature — and the timestamp is
+    // the instant the caller supplied, never zero. `tlog-witness`: *the
+    // cosignature MUST NOT omit the timestamp, i.e. the timestamp MUST NOT be
+    // zero*, so a witness that sends one produces bytes a conformant verifier
+    // discards — including this crate's own client.
     assert_eq!(co.signature.len(), 8 + 64, "timestamp, then signature");
     let (stamp, sig) = co.signature.split_at(8);
     let timestamp = u64::from_be_bytes(stamp.try_into().expect("eight bytes"));
     assert_eq!(
-        timestamp, 0,
-        "an in-process witness claims no observation time"
+        timestamp,
+        u64::try_from(observed().unix_timestamp()).expect("a positive instant"),
+        "the cosignature claims a different observation time than the caller gave"
     );
+    assert_ne!(timestamp, 0, "the one value the specification forbids");
     let signature = Signature::from_slice(sig).expect("a sixty-four byte signature");
 
     let note = cp.to_note();
@@ -937,4 +951,181 @@ async fn an_incoherent_checkpoint_is_refused_before_it_is_remembered() {
         .cosign(&empty, 0, &[])
         .await
         .expect("a genuinely empty log's checkpoint is coherent and must be cosigned");
+}
+
+// ── The door ────────────────────────────────────────────────────────────────
+//
+// Every mechanism above was reachable only by writing Rust: `cosign_quorum`,
+// `WitnessQuorum::met`, `QuorumOutcome::needs_attention` and the whole HTTP
+// client had no caller in the crate outside these tests, while the CLI's own
+// `--checkpoint` help told an operator to supply "one a witness cosigned".
+// A control whose only caller is a test is a requirement that reads as met.
+
+/// A plane built with witnesses cosigns its own checkpoint on the sweep.
+#[tokio::test]
+async fn a_plane_with_witnesses_anchors_its_history_on_the_sweep() {
+    use agentplane::journal::{JournalStore, WitnessQuorum};
+
+    let store = sealed_store(2).await;
+    let w = Arc::new(witness());
+    let witnesses: Vec<Arc<dyn Witness>> = vec![Arc::clone(&w) as Arc<dyn Witness>];
+    let rt = agentplane::Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .witnesses(witnesses, WitnessQuorum::of(1).expect("one"))
+        .build();
+
+    let cp = store.checkpoint().await.expect("checkpoint");
+    let report = rt
+        .sweep(observed(), std::time::Duration::from_secs(60))
+        .await
+        .expect("a sweep");
+    assert_eq!(
+        report.cosignatures, 1,
+        "the sweep did not submit: {report:?}"
+    );
+    assert_eq!(report.witness_shortfall, 0, "{report:?}");
+    assert_eq!(
+        w.last_seen(&cp.origin),
+        Some((cp.size, cp.root)),
+        "the witness holds nothing for this log, so nothing outside the plane \
+         knows what its history looked like"
+    );
+
+    // A second sweep over an unchanged log submits nothing. Resubmitting a
+    // checkpoint no witness's answer could differ on is chatter, and it would
+    // make every tick non-quiet.
+    let again = rt
+        .sweep(observed(), std::time::Duration::from_secs(60))
+        .await
+        .expect("a second sweep");
+    assert_eq!(
+        again.cosignatures, 0,
+        "an unchanged log was submitted again: {again:?}"
+    );
+    assert!(
+        again.is_quiet(),
+        "a tick that did nothing is not quiet: {again:?}"
+    );
+}
+
+/// A shortfall is a report an operator must clear, never a silent tick.
+#[tokio::test]
+async fn a_witness_that_cannot_be_reached_is_a_shortfall_on_the_report() {
+    use agentplane::journal::{JournalStore, WitnessQuorum};
+
+    let store = sealed_store(2).await;
+    let witnesses: Vec<Arc<dyn Witness>> = vec![Arc::new(Down)];
+    let rt = agentplane::Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .witnesses(witnesses, WitnessQuorum::of(1).expect("one"))
+        .build();
+
+    let report = rt
+        .sweep(observed(), std::time::Duration::from_secs(60))
+        .await
+        .expect("a sweep");
+    assert_eq!(report.cosignatures, 0, "{report:?}");
+    assert_eq!(report.witness_shortfall, 1, "{report:?}");
+    assert!(
+        report.needs_attention(),
+        "a plane running with less evidence than it declared it required read as \
+         a quiet tick: {report:?}"
+    );
+
+    // And the shortfall does not latch: the next sweep asks again, because the
+    // log still has not been anchored.
+    let again = rt
+        .sweep(observed(), std::time::Duration::from_secs(60))
+        .await
+        .expect("a second sweep");
+    assert_eq!(
+        again.witness_shortfall, 1,
+        "a round that fell short was recorded as submitted, so the plane stopped \
+         asking: {again:?}"
+    );
+}
+
+/// A quorum nothing can reach is refused at build.
+#[test]
+fn a_quorum_no_round_can_meet_is_refused_before_the_plane_runs() {
+    use agentplane::journal::WitnessQuorum;
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let witnesses: Vec<Arc<dyn Witness>> = vec![Arc::new(witness())];
+    let refused = agentplane::Runtime::builder(
+        Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>
+    )
+    .witnesses(witnesses, WitnessQuorum::of(2).expect("two"))
+    .try_build()
+    .expect_err("two cosignatures from one witness is a bar no round can clear");
+    assert!(
+        matches!(
+            refused,
+            agentplane::runtime::BuildError::WitnessQuorumUnreachable {
+                declared: 2,
+                configured: 1
+            }
+        ),
+        "wrong refusal: {refused}"
+    );
+}
+
+/// Two witnesses at one size with two different roots is the finding; every
+/// other disagreement is not.
+///
+/// The negative halves carry the weight. Witnesses observing at *different*
+/// sizes is the ordinary case — they looked at different times — and reporting
+/// that as a split view would page an operator for the system working, which
+/// is the failure this crate's witness handling is arranged around. Equal
+/// size with equal roots is agreement.
+#[test]
+fn a_split_view_is_equal_sizes_with_unequal_roots_and_nothing_else() {
+    use agentplane::core::Digest;
+    use agentplane::journal::{Checkpoint, split_views};
+
+    let cp = |size: u64, root: u8| Checkpoint {
+        origin: "example.com/plane-a".into(),
+        size,
+        root: Digest::from_bytes([root; 32]),
+    };
+
+    // Agreement.
+    assert!(
+        split_views(&[("w1".to_owned(), cp(4, 1)), ("w2".to_owned(), cp(4, 1))]).is_empty(),
+        "two witnesses holding the same checkpoint disagree about nothing"
+    );
+
+    // Different sizes: ordinary, and the one a false positive would ruin.
+    assert!(
+        split_views(&[("w1".to_owned(), cp(4, 1)), ("w2".to_owned(), cp(9, 2))]).is_empty(),
+        "witnesses observing at different times were reported as a split view — \
+         the alert that matters stops being believed after one of those"
+    );
+
+    // One witness cannot disagree with itself.
+    assert!(
+        split_views(&[("w1".to_owned(), cp(4, 1))]).is_empty(),
+        "a single answer is not a disagreement"
+    );
+
+    // The real thing.
+    let found = split_views(&[("w1".to_owned(), cp(4, 1)), ("w2".to_owned(), cp(4, 2))]);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].size, 4);
+    assert_eq!(found[0].between, ("w1".to_owned(), "w2".to_owned()));
+    assert!(
+        found[0].to_string().contains("two histories of one log"),
+        "the message does not say what was found: {}",
+        found[0]
+    );
+
+    // Pairwise, because an operator has to know which witnesses to ask.
+    let three = split_views(&[
+        ("w1".to_owned(), cp(4, 1)),
+        ("w2".to_owned(), cp(4, 2)),
+        ("w3".to_owned(), cp(4, 3)),
+    ]);
+    assert_eq!(
+        three.len(),
+        3,
+        "three mutually disagreeing witnesses: {three:?}"
+    );
 }

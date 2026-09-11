@@ -32,6 +32,15 @@ use super::{ModelError, ModelId};
 ///   model, bad key, content filtered on the way in. Nothing was metered, and
 ///   repeating is pointless rather than merely unsafe: the retry loop spends
 ///   no attempt on it.
+/// * **every 3xx** is this plane's own decision, not the provider's. The
+///   client does not follow redirects, because the host a `Location` names is
+///   one no egress grant covers and the credential travels: `reqwest` strips
+///   only `Authorization`, `Cookie` and `Proxy-Authorization` across origins,
+///   so `x-api-key` and `x-goog-api-key` would arrive at whatever host the
+///   endpoint chose. It is [`ModelError::Egress`] for the retry semantics as
+///   much as the audience — an endpoint's redirect will not stop being a
+///   redirect on the second attempt, and reported as an outage it costs the
+///   whole ladder before saying so.
 /// * **anything else** reached the provider and did not say what it cost. See
 ///   [`ModelError::Unavailable`]: guessing "free" lets a retry loop spend
 ///   against a ceiling reading zero, and guessing "fatal" makes a transient blip
@@ -56,6 +65,25 @@ pub fn classify_status(
         400..=499 => ModelError::Refused {
             model: model.clone(),
             detail,
+        },
+        // The `Location` is named because it is the whole diagnosis: whoever
+        // reads this has a gateway, a proxy or a DNS entry sending the call
+        // somewhere else, and the header says where. Absent when the endpoint
+        // sent a 3xx with no target, which is its own answer.
+        300..=399 => ModelError::Egress {
+            model: model.clone(),
+            detail: format!(
+                "HTTP {status}: this client does not follow redirects, and the endpoint \
+                 redirected to {} — a host no egress grant covers, reached with this \
+                 plane's credential",
+                headers
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map_or_else(
+                        || "a target it did not name".to_owned(),
+                        |l| format!("'{l}'")
+                    ),
+            ),
         },
         _ => ModelError::Unavailable {
             model: model.clone(),

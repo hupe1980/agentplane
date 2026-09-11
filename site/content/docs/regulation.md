@@ -69,8 +69,17 @@ last one seen, so a shrunken log and a *split view* (a second history of the sam
 size) are both refused — and `HttpWitness` speaks C2SP `tlog-witness`, so the
 counterparty can be an existing public witness rather than a second process you
 also own. It verifies what comes back: a cosignature counts only if it is a
-valid Ed25519 signature, over the note that was submitted, by a key the
-deployment registered under both its name and its note key id.
+valid Ed25519 signature with a non-zero observation timestamp, over the note
+that was submitted, by a key the deployment registered under both its name and
+its note key id.
+
+Both directions are wired. `RuntimeBuilder::witnesses(witnesses, quorum)`
+submits on the periodic sweep, and `agentplane audit --witness <prefix>
+--witness-key <name>=<base64>` reads back what a witness holds — which is the
+direction that matters for an audit, because it puts the anchor in a reader's
+hands rather than the operator's. Naming two witnesses is a check the plane
+cannot run about itself: a split view is exactly two witnesses holding one tree
+size with two different roots.
 
 What is missing is therefore **not code but a counterparty**. Until a second
 party runs a witness for your log, a witness you host yourself proves nothing
@@ -140,8 +149,8 @@ agentplane restore history.jsonl --store ./rebuilt.redb
 root rebuilt from the file can otherwise only be compared with the file's *own
 header* — which whoever dropped a run rewrites too — so the report lists
 deletion under `not_checked` rather than calling the file sound. Pass the
-checkpoint an earlier `audit` printed, or the `tlog-checkpoint` note a witness
-cosigned: the point is that it comes from somewhere other than the file being
+checkpoint an earlier `audit` printed, or fetch one with `--witness` and
+`--origin`: the point is that it comes from somewhere other than the file being
 checked.
 
 Both verbs take a store and nothing else — no manifest, no source tree, no Rust

@@ -335,6 +335,17 @@ and then damages that export six ways and asserts each is reported. Vectors a
 project generates and then checks are that project agreeing with itself; this
 is the part that is not.
 
+**🔗 An anchor from a party this plane does not control.** The hash chain, the
+signatures and the Merkle log all draw both halves of their comparison from
+the store, so an operator who removes a run and recomputes the tree satisfies
+every one of them — and `agentplane audit` says so rather than reporting a
+clean history. `RuntimeBuilder::witnesses(..)` submits each checkpoint to
+witnesses over C2SP `tlog-witness` on the periodic sweep, and `agentplane
+audit --witness <prefix> --witness-key <name>=<key>` reads back what they
+hold. That second direction is the one that matters: the anchor reaches a
+reader who did not get it from the operator, and two witnesses holding one
+tree size with two different roots is a split view no single anchor exhibits.
+
 **🧾 Conformance by the protocol's own kit.** `just test-a2a-tck` runs the
 official [a2a-tck](https://github.com/a2aproject/a2a-tck) against this crate's
 A2A server on a live socket. Every other A2A test drives this server with this

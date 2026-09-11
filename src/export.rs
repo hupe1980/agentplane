@@ -618,8 +618,19 @@ pub fn verify<R: std::io::BufRead>(
         &mut empty_blocks,
     );
 
+    // Open runs are the blocks that contributed no leaf. Computed here because
+    // this is the one place that holds both numbers, and passed on rather than
+    // recounted.
+    let open_runs = run_blocks.saturating_sub(leaves.len());
     settle(&mut report, header_seen, leaves, expected);
-    settle_trailer(&mut report, &claims, run_blocks, read_runs, &empty_blocks);
+    settle_trailer(
+        &mut report,
+        &claims,
+        run_blocks,
+        read_runs,
+        open_runs,
+        &empty_blocks,
+    );
     settle_cases(&mut report, &stamped, &carried, blob_digests);
     Ok(report)
 }
@@ -718,8 +729,25 @@ fn settle_trailer(
     claims: &TrailerClaims,
     run_blocks: usize,
     read_runs: usize,
+    open_runs: usize,
     empty_blocks: &[RunId],
 ) {
+    // Said here because `audit` says it about a live store, and these two
+    // answer one question about one history: an open run has no Merkle leaf,
+    // so nothing pins its tail and a truncation is undetectable until the run
+    // seals. The offline reader is the one an independent auditor holds, so it
+    // is the worse of the two to leave silent.
+    //
+    // Once per file rather than per run. A reader deciding what a clean report
+    // is worth needs the count and the reason; a line per run buries both.
+    if open_runs > 0 {
+        report.not_checked.push(format!(
+            "{open_runs} open run(s): a run that has not concluded has no position in the \
+             Merkle log, so the root proves nothing about it — its chain and signatures \
+             were verified, and records cut from its tail before the export was taken are \
+             undetectable from this file"
+        ));
+    }
     for (run, reason) in &claims.unreadable {
         report.not_checked.push(format!(
             "run {run}: the export declares it unreadable ({reason}), so its records are \
@@ -1265,6 +1293,176 @@ fn finish_run(
     }
 }
 
+/// What a restore loses beyond the case layer, as sentences a reader can act
+/// on.
+///
+/// Extracted so the restore's control flow is the *writing* and this is the
+/// *accounting*. Each entry names one loss: a count of them would tell an
+/// operator nothing about which one costs them work, and exactly one of these
+/// does.
+fn losses(parsed: &Parsed) -> Vec<String> {
+    let mut out = Vec::new();
+    if parsed.canon != Some(u64::from(crate::core::canon::VERSION)) {
+        out.push(format!(
+            "the digests — the export was written under canonicalization rule {:?} and this \
+             build implements {}, so the rebuilt store re-derives every digest under the new \
+             rule and its checkpoint cannot match the export's. The data is restored; \
+             `is_faithful` is unprovable, not false",
+            parsed.canon,
+            crate::core::canon::VERSION
+        ));
+    }
+    if parsed.signed > 0 && !parsed.runs.is_empty() {
+        out.push(format!(
+            "{} record(s) carried a signature that this store did not reproduce — `append` \
+             attests as the restoring store's own signer, so authorship is lost unless it \
+             holds the original key. Hashes and the Merkle root are unaffected",
+            parsed.signed
+        ));
+    }
+    out.push(
+        "activity timestamps — `recent_runs` now orders by restore time rather than by when \
+         history happened. It is a discovery index for listing, and nothing derives a decision \
+         from it"
+            .to_owned(),
+    );
+
+    // Named whether or not this export happens to hold a waiting run. The
+    // alternative — say it only when `awaiting` is non-empty — makes the
+    // absence of the sentence mean two different things, and the reader who
+    // needs it most is the one restoring an export they did not write.
+    out.push(
+        "every wait's registration — a timer, a subscription and any worklist row a wait \
+         opened live in stores this export does not carry, so a restored run that was \
+         waiting has nothing to wake it: no timer fires, no subscription matches, and its \
+         lease was released cleanly when it suspended, so recovery does not see it either. \
+         Resuming each run in `awaiting` re-arms the wait from the journal"
+            .to_owned(),
+    );
+    out.push(
+        "the worklist, unclaimed inbound events, webhook registrations and their delivery \
+         cursors, governed memory, and the batch, quota and standing-authority ledgers — \
+         none of these layers is in the export. A decision a run already consumed survives \
+         because that run journaled it; one nobody had consumed does not"
+            .to_owned(),
+    );
+
+    out
+}
+
+/// Which of the restored runs came back waiting.
+///
+/// Read with the same function every other surface answers *what does this
+/// run's history say* with. A fourth copy of the match would be the copy that
+/// disagrees the day a record kind arrives.
+async fn awaiting_runs(
+    store: &Arc<dyn JournalStore>,
+    runs: &[RestoredRun],
+) -> Result<Vec<RunId>, StoreError> {
+    let mut awaiting = Vec::new();
+    for run in runs {
+        let records = store.read(run.run, 1).await?;
+        if matches!(
+            crate::runtime::observed_status(&records),
+            Some(crate::runtime::RunStatus::Suspended(_))
+        ) {
+            awaiting.push(run.run);
+        }
+    }
+    Ok(awaiting)
+}
+
+/// Every run the outcome indexes cannot name: the ones still in flight.
+///
+/// **Selecting what to export is two questions, and this is the second.**
+/// `runs_by_outcome` indexes *conclusions*, so a run that has not concluded is
+/// in no outcome, and an export driven by
+/// [`OUTCOMES_OF_RECORD`](crate::runtime::OUTCOMES_OF_RECORD) alone carries no
+/// run that is working, sleeping, awaiting a message or waiting on a person —
+/// which is the work a disaster recovery is for. Nothing downstream can notice:
+/// the Merkle log commits to **sealed** runs, so a file missing every in-flight
+/// run restores to an equal root at an equal size and reports itself faithful.
+///
+/// **Paged, and bounded by `limit` like every other listing here.** It walks
+/// the activity index — the only one that names a run before it ends — and
+/// keeps the runs whose history has not concluded, reading **one record** per
+/// candidate to decide: the head's sequence, then that record. A run whose
+/// records cannot be read is not silently dropped; it is returned in
+/// `unreadable` for the caller to report, on the same principle as the
+/// export's own trailer.
+///
+/// The order is the activity index's, which is rebuilt at restore time and
+/// derives no decision. Selection is not a decision about a run — it is which
+/// rows to read — so using it here does not widen what that index is for.
+///
+/// # Errors
+///
+/// If the activity index cannot be paged. A single unreadable run is reported
+/// rather than raised: one damaged run must not cost an operator the export of
+/// every other.
+pub async fn runs_in_flight(
+    store: &Arc<dyn JournalStore>,
+    limit: usize,
+) -> Result<InFlight, StoreError> {
+    let mut found = InFlight::default();
+    let mut after: Option<(u64, RunId)> = None;
+    // Pages of the activity index, not of the answer: most runs in a healthy
+    // plane have concluded, so the page that yields one in-flight run may have
+    // held five hundred that had ended.
+    while found.runs.len() < limit {
+        let page = store.recent_runs(after, CASE_PAGE).await?;
+        if page.is_empty() {
+            break;
+        }
+        after = page.last().map(|(run, at)| (*at, *run));
+        for (run, _) in page {
+            if found.runs.len() == limit {
+                found.truncated = true;
+                return Ok(found);
+            }
+            let head = store.head(run).await?;
+            if head.seq == 0 {
+                continue;
+            }
+            // The last record alone. `read` is inclusive-from, so this is the
+            // cheapest question the store answers about a run's state, and it
+            // is the one `observed_status` needs.
+            match store.read(run, head.seq).await {
+                Ok(last) => {
+                    // Working (`None` — the last record is neither a
+                    // suspension nor a conclusion) and waiting
+                    // (`Suspended`) are both in flight. Everything else has
+                    // ended, and the wildcard is the arm that matters: a
+                    // conclusion this build cannot interpret is still a
+                    // conclusion, which `observed_status` guarantees by
+                    // failing an unrecognised outcome closed into
+                    // `Quarantined` rather than into `None`.
+                    let in_flight = match crate::runtime::observed_status(&last) {
+                        None | Some(crate::runtime::RunStatus::Suspended(_)) => true,
+                        Some(_) => false,
+                    };
+                    if in_flight {
+                        found.runs.push(run);
+                    }
+                }
+                Err(e) => found.unreadable.push((run, e.to_string())),
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// What [`runs_in_flight`] found, and what it could not read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InFlight {
+    /// Runs that had not concluded, newest activity first.
+    pub runs: Vec<RunId>,
+    /// The limit was reached, so this is a page rather than the set.
+    pub truncated: bool,
+    /// Runs the activity index names and whose records would not read.
+    pub unreadable: Vec<(RunId, String)>,
+}
+
 // ── Putting one back ────────────────────────────────────────────────────────
 
 /// What a restore did, and what it could not carry across.
@@ -1283,6 +1481,20 @@ pub struct RestoreReport {
     pub records: usize,
     /// Cases rebuilt from the export's case layer.
     pub cases: usize,
+    /// Runs whose history ends in a wait, and which nothing will now wake.
+    ///
+    /// **Ids rather than a count, because the operator has to act on each
+    /// one.** A wait is journaled but what performs it is not: the timer, the
+    /// subscription and the task row live in stores this export does not
+    /// carry. A restored suspended run has no timer to fire, no subscription
+    /// to match, and released its lease cleanly when it suspended — so the
+    /// recovery pass does not see it either. Nothing in the system names it,
+    /// which is the state the runtime otherwise repairs on sight.
+    ///
+    /// Resuming each one repairs it: replay reaches the announced wait, finds
+    /// no terminal record, and re-arms from the journal. That needs the
+    /// agent's own code, so it is the caller's step and not the restore's.
+    pub awaiting: Vec<RunId>,
     /// What did not survive, named rather than counted.
     pub not_carried: Vec<String>,
 }
@@ -1333,18 +1545,11 @@ impl RestoreReport {
 ///
 /// # What does not survive
 ///
-/// **Signatures.** `append` attests with the *restoring* store's signer, so a
-/// history signed by a key this store does not hold comes back unsigned. Hashes
-/// and the Merkle root are unaffected — a signature is taken over the chain
-/// hash and stored beside it — so the restore is still provably faithful, but
-/// authorship is gone. It is named in `not_carried` rather than left for
-/// somebody to notice, and it is why an operator restoring their own log should
-/// configure the same signer.
-///
-/// **Activity timestamps.** The discovery index is rebuilt at restore time, so
-/// `recent_runs` orders by when history was restored rather than when it
-/// happened. That index is documented as ordering and cursor stability only,
-/// and nothing derives a decision from it.
+/// Every loss is a sentence in [`RestoreReport::not_carried`], because the
+/// reader who needs it is holding the report rather than this page. One of
+/// them costs work rather than metadata and has its own field:
+/// [`RestoreReport::awaiting`] names the runs that came back waiting, and says
+/// there why nothing will wake them and what does.
 ///
 /// # Errors
 ///
@@ -1454,30 +1659,9 @@ pub async fn from_jsonl<R: std::io::BufRead>(
         (_, true) => {}
     }
 
-    if parsed.canon != Some(u64::from(crate::core::canon::VERSION)) {
-        not_carried.push(format!(
-            "the digests — the export was written under canonicalization rule {:?} and this \
-             build implements {}, so the rebuilt store re-derives every digest under the new \
-             rule and its checkpoint cannot match the export's. The data is restored; \
-             `is_faithful` is unprovable, not false",
-            parsed.canon,
-            crate::core::canon::VERSION
-        ));
-    }
-    if parsed.signed > 0 && !parsed.runs.is_empty() {
-        not_carried.push(format!(
-            "{} record(s) carried a signature that this store did not reproduce — `append` \
-             attests as the restoring store's own signer, so authorship is lost unless it \
-             holds the original key. Hashes and the Merkle root are unaffected",
-            parsed.signed
-        ));
-    }
-    not_carried.push(
-        "activity timestamps — `recent_runs` now orders by restore time rather than by when \
-         history happened. It is a discovery index for listing, and nothing derives a decision \
-         from it"
-            .to_owned(),
-    );
+    not_carried.extend(losses(&parsed));
+
+    let awaiting = awaiting_runs(store, &parsed.runs).await?;
 
     Ok(RestoreReport {
         expected: parsed.checkpoint,
@@ -1485,6 +1669,7 @@ pub async fn from_jsonl<R: std::io::BufRead>(
         runs: parsed.runs.len(),
         records,
         cases: imported,
+        awaiting,
         not_carried,
     })
 }

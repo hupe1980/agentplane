@@ -25,6 +25,87 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## An export carries the runs still in flight, and a restore names the waiters
+
+**Affected:** anyone constructing `RestoreReport`, and every deployment whose
+backups were taken with `agentplane export`.
+
+`runs_by_outcome` indexes conclusions, so the export's default sweep contained
+no run that had not ended — no durable sleep, no awaited message, no pending
+approval. The absence did not show: the Merkle log commits to sealed runs, so
+a file missing every in-flight run restores to an equal root at an equal size
+and reports itself faithful.
+
+- **`agentplane export` now includes in-flight runs** and says on stderr how
+  many. `--outcome` still narrows to exactly the conclusions named, which
+  turns the extra selection off.
+- **`export::runs_in_flight(store, limit)`** is that selection for an
+  embedder, returning `InFlight { runs, truncated, unreadable }`.
+- **`RestoreReport::awaiting`** is a new field: the runs whose history ends in
+  a wait. A struct literal over the report grows one field.
+- **`runtime::observed_status` is no longer gated on `http`.** In-crate only;
+  no action for an embedder.
+
+**Re-take your backups.** An export written before this contains no in-flight
+work, and nothing in verifying it will say so.
+
+**And resume what comes back waiting.** A restored suspended run has no timer
+and no subscription — those live in stores the export does not carry — and it
+released its lease cleanly when it suspended, so the recovery pass does not
+see it either. Resuming each run in `awaiting` re-arms the wait from the
+journal; the runtime already treats an announced-but-unarmed wait as
+repairable, so this is the existing repair path rather than a new one.
+
+## The witness client takes a signer, and `Witness` lost a method
+
+**Affected:** anyone constructing `MemoryWitness` or `HttpWitness`, or matching
+on `WitnessError`.
+
+A `signed-note` signature covers the note body — origin, size, root — which
+changes with every checkpoint, so a signature held as configuration is correct
+for at most one and answered `403 Forbidden` for every one after it.
+
+- **`HttpWitness::new(prefix, log, trusted)`** takes a `LogKey` where it took a
+  `NoteSignature`. Build one with `LogKey::ed25519(name, public_key, signer)`,
+  where `signer` is any `CheckpointSigner` — `Ed25519Signer` implements it. The
+  four-byte note key id is derived from the public key rather than supplied
+  beside it.
+- **`MemoryWitness::new(signer, observed_at)`** takes an observation
+  `Timestamp` and returns `Result`. Pass a fixed non-zero instant;
+  `tlog-witness` forbids a zero timestamp, which this type used to send.
+- **`WitnessError::Inconsistent`** and **`WitnessError::Unsigned`** are new
+  variants. `Inconsistent` is a `422` on growth — the proof did not verify, and
+  the reply does not say whether the fault is the proof or the history — and
+  belongs with the integrity refusals. `Unsigned` is a local signing failure.
+- **`Witness::latest` does not exist.** Reading what a witness holds is
+  `WitnessReader::new(monitoring_prefix, trusted).latest(origin)`, a separate
+  type because reading needs none of the log's key material. `HttpWitness`
+  has `reader()` for the round trip.
+
+Submitting is now wired: `RuntimeBuilder::witnesses(witnesses, quorum)` and the
+periodic `sweep`. `build` refuses a quorum larger than the witness list, and a
+witness list with no quorum.
+
+## A refused redirect is `ModelError::Egress`, not `Unavailable`
+
+**Affected:** code matching on `ModelError` for a `3xx` from a model endpoint,
+and any deployment whose model or embedding endpoint answers with a redirect.
+
+Every outbound client in the crate is built by one constructor now, and it does
+not follow redirects. A `3xx` therefore reaches the driver, and it classifies as
+`ModelError::Egress` — this plane's own decision, which spends no retry attempt
+— rather than as the provider being unavailable, which spent the whole ladder.
+
+If a deployment relied on a redirect (an endpoint that `301`s to its real host,
+a gateway that forwards), name the final host in `base(..)` and in `.egress(..)`
+instead. The redirect was never covered by the allowlist: it is consulted once,
+for the hop that was abandoned.
+
+The same constructor sets `no_proxy`, so `HTTP_PROXY` and `HTTPS_PROXY` are no
+longer honoured by these clients. A deployment that needs an egress proxy names
+it as the endpoint host rather than in the environment, which is also the form
+the allowlist can see.
+
 ## Ids carry their type prefix everywhere, including on the wire
 
 **Affected:** every stored journal — this changes each record's chain digest.

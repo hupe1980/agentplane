@@ -173,6 +173,21 @@ pub const RUN_RECOVERED: &str = "agentplane.run.recovered";
 pub const POLICY_DENIED: &str = "agentplane.policy.denied";
 /// A run changed its plan; the successor is journaled beside its predecessor.
 pub const REPLANNED: &str = "agentplane.run.replanned";
+/// A witness refused this plane's checkpoint on integrity grounds.
+///
+/// The log shrank, forked, or claimed growth a witness could not verify — the
+/// one class of event nothing inside this plane can detect, because every
+/// input to the chain, the signatures and the Merkle log comes from the party
+/// an auditor is being asked to trust.
+///
+/// Loud for a reason no other event here has: the audience is *not* the
+/// operator running the plane. A witness reporting that this history moved is
+/// the finding whoever operates it has the strongest interest in nobody
+/// hearing, so it goes to the same channel every other unexplained mutation
+/// does rather than staying in a sweep report the plane's own operator reads.
+/// It fires even when the declared quorum was met — two honest cosigners do
+/// not answer a third that remembers a different history.
+pub const WITNESS_INTEGRITY: &str = "agentplane.witness.integrity";
 
 /// Every event name P7 promises, for the guard in `tests/guards/layering.rs`.
 ///
@@ -194,6 +209,7 @@ pub const LOUD_EVENTS: &[&str] = &[
     RUN_RECOVERED,
     REPLANNED,
     POLICY_DENIED,
+    WITNESS_INTEGRITY,
 ];
 
 /// How a run is being executed, as a span attribute.

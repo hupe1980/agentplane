@@ -27,10 +27,10 @@ pub(crate) use executor::every_status;
 /// every surface that answers the question. Crate-internal: the public form is
 /// [`Runtime::recorded_outcome`], which is what an embedder holds.
 ///
-/// Gated on the one in-crate consumer, so a build without the HTTP surface does
-/// not carry a re-export nothing reaches — the compiler then answers *which
-/// surfaces exist in this build* rather than an `allow` hiding the question.
-#[cfg(feature = "http")]
+/// Ungated, because both in-crate consumers are: the operator API reads it to
+/// answer `GET /runs/{run}`, and a restore reads it to name the runs that came
+/// back waiting. Two surfaces, one reader — a second copy of the match is the
+/// copy that disagrees the day a record kind arrives.
 pub(crate) use executor::observed_status;
 pub use executor::{
     Admission, FullBackend, LEASE_TTL, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, OUTCOMES_OF_RECORD,

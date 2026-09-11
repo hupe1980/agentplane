@@ -129,11 +129,26 @@ claims to start at 93 — which every witness refuses.
 Only the holder of the log knows. `MemoryWitness` checks the caller's claim
 against what it remembers and reports a mismatch as `Stale`, exactly as a remote
 witness's `409` does, so the in-process model stays a faithful stand-in rather
-than a friendlier one.
+than a friendlier one — including the cosignature timestamp, which is non-zero
+because the specification forbids the value that would say *no clock of record*.
 
 This shipped as a real defect and survived its first test, because that test used
 a four-entry log with a two-hash proof — the one size where the wrong arithmetic
 gives the right answer. The regression test uses fifty and a hundred.
+
+### The fake witness performs the check the specification makes mandatory
+
+A witness `MUST verify the checkpoint signature against the public key(s) it
+trusts for the checkpoint origin`, and answer `403 Forbidden` when it does not
+verify. The stub in `tests/wire/witness_http.rs` does that, deriving the key id
+and the note framing from the specification's words rather than by calling this
+crate's helpers.
+
+It matters because a stub that skips it accepts a signature made over some
+*other* checkpoint — which is a client that submits one signature forever and
+is refused by every real witness, while passing every test in the file. The
+test that pins it submits **two different** checkpoints, since a fixed
+signature over the first note satisfies a single-checkpoint test.
 
 ### The specs are mutation-tested
 

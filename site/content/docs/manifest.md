@@ -324,7 +324,7 @@ confidence.
 | Field | Default | Notes |
 |---|---|---|
 | `max_sensitivity_egress` | unbounded | `public`, `internal`, `confidential`, `secret`. Combined with each sink's own ceiling at dispatch; the **stricter** wins. |
-| `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records**. Egress asks *may this leave*; this asks *may this be written down forever*. Refused at dispatch, before anything is recorded — the *refuse it* answer, where `.keyring(..)` is the *seal it* one → [erasure and keys](@/docs/erasure.md). |
+| `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records** — *may this be written down forever*, where egress asks *may this leave*. Refused at dispatch, before anything is recorded; `.keyring(..)` is the *seal it* answer → [erasure and keys](@/docs/erasure.md). |
 | `max_delegation_depth` | role-dependent | Checked against the configured identity *and* against every delegating sink, including in-plane `commission`. |
 
 ## `spec.capabilities`
@@ -401,9 +401,22 @@ decision that has to be visible — declare `budgets: {}` to mean it.
 | `max_tokens` | tokens, across every model call in the run |
 | `max_minor_units` | money in **minor units** — cents, not euros. A float would make a budget that fails to bind by a rounding error, and it is **unsigned**, so a negative ceiling is a parse failure rather than a ceiling that un-spends itself |
 | `max_replans` | replans |
-| `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes. Costs one journaled clock read per step boundary, paid only by a run that declares it — so this history replays under a raised ceiling and not under a build that removed it. It stops the *next* step: nothing here interrupts a call in flight |
+| `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes → [what it costs](#wallclock) |
 | `max_denials` | policy refusals, before the run is stopped |
 | `max_parallel_steps` | how many of a plan's ready steps run at once |
+
+#### What `max_wallclock_secs` costs, and what it stops {#wallclock}
+
+It is the one ceiling that reads a clock. A run declaring it pays one
+**journaled** clock read per step boundary; a run that does not declare it pays
+nothing. Journaled is what makes it replayable, and it has a consequence worth
+knowing before you set it: such a history replays under a *raised* ceiling and
+not under a build that removed the field, because the reading is part of the
+step.
+
+It stops the **next** step. Nothing here interrupts a call already in flight —
+a ceiling that could would have to abort mid-effect, which is the thing the
+whole runtime is arranged to avoid.
 
 Budgets bind the whole run including delegation: `commission` is an effect, so a
 sub-run's reported spend is billed to the run that ordered it.

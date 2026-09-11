@@ -772,7 +772,7 @@ impl PushSender {
             // Refusing that would leave an operator with a sidecar that
             // terminates TLS and forwards in clear, which is the same exposure
             // with an extra hop.
-            crate::netguard::Reach::Any
+            crate::netguard::Reach::Configured
         } else if self.loopback_allowed() {
             crate::netguard::Reach::PublicOrLoopbackName
         } else {

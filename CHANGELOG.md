@@ -39,6 +39,378 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history rat
 than written at the time, so they are deliberately terse — inventing more would be
 archaeology presented as a record.
 
+## [0.33.0] — 2026-09-10
+
+### Added — the witness tier has a door, and the anchor comes back
+
+**`RuntimeBuilder::witnesses(witnesses, quorum)` and
+`WitnessReader::latest(origin)`.** The whole tier — `Witness`,
+`WitnessQuorum`, `cosign_quorum`, `QuorumOutcome::needs_attention`,
+`HttpWitness` — existed with tests and had no caller in the crate outside
+them. There was no builder method, no pass that submitted anything, and no way
+to read a witness back; meanwhile `verify --checkpoint`'s own help told an
+operator to supply *the checkpoint an earlier audit printed, or one a witness
+cosigned*, and nothing in the product could make the second.
+
+That matters more than an unwired seam usually does, because of what the rest
+of the integrity stack cannot do. The hash chain, the record signatures and the
+Merkle log all draw **both halves of their comparison from the store**: the
+store serves the records, the store serves the leaf, the store serves the root
+the inclusion proof is checked against. An operator who removes a run and
+recomputes the tree satisfies every one of them. `audit` says so in
+`not_checked` and can do nothing about it, because the missing input is a
+checkpoint from somewhere else.
+
+- **Submission runs on `sweep`** — after sealing, off the run path, and last
+  among the phases, since it is the only one whose counterparty is somebody
+  else's server and a slow witness must not delay a breach or a recovery. A
+  round is skipped when the log has not grown since the last round that met
+  the bar; that cursor is in memory on purpose, because the authority on where
+  a witness is has always been the witness, which answers `409` with its own
+  size.
+- **`SweepReport` carries `cosignatures`, `witness_shortfall` and
+  `witness_integrity`**, and the last two reach `needs_attention`. An
+  integrity refusal also emits `agentplane.witness.integrity`: the audience
+  for *a witness says this history moved* is not only the operator running the
+  plane. It fires even beside a met quorum, because two honest cosigners do
+  not answer a third that remembers a different history.
+- **`BuildError::WitnessQuorumUnreachable`** refuses a quorum larger than the
+  witness list, and a witness list with no quorum. Both spell witnessing that
+  is on and is not: the first reports a shortfall on every tick, which is how
+  an operator learns to ignore the one that means something, and the second
+  makes whatever cosignatures happened to arrive the bar they were held to.
+- **`WitnessReader` is a separate type from `Witness`**, and the split is the
+  point rather than tidiness: submitting needs the log's own signing key,
+  reading needs nothing but the URL and the witness keys the *reader* chose to
+  trust. An auditor is exactly the party who has the second and must not have
+  the first. It speaks `tlog-witness`'s monitor retrieval —
+  `GET <monitoring prefix>/<sha256(origin) hex>/checkpoint` — and `HttpWitness`
+  gained its own `monitoring` prefix, because the specification defines two
+  and says a witness `MAY` use one value for both.
+- **`agentplane audit --witness <prefix> --witness-key <name>=<base64>`**, and
+  the same pair on `verify` (which additionally needs `--origin`: the log's
+  name cannot come from the file being checked). `cli` now enables
+  `witness-http` for this. Naming two witnesses buys a check the plane cannot
+  run about itself — a split view is exactly two witnesses holding one tree
+  size with two different roots, reported as `SPLIT VIEW` on stderr before the
+  report.
+
+The end-to-end claim is a test: seal three runs, cosign, delete one, and the
+audit that was clean against the store finds `Shrunk` against the checkpoint
+the witness holds.
+
+### Fixed — the witness client could not have submitted to a real witness
+
+`HttpWitness` held the log's own note signature as a **configuration field**
+and attached it to every checkpoint. A `signed-note` signature covers the note
+body — origin, size, root — which changes with every checkpoint, and
+`tlog-witness` requires the witness to *verify the checkpoint signature against
+the public key(s) it trusts for the checkpoint origin*, answering `403
+Forbidden` when it does not verify. So the client was correct for at most one
+checkpoint and refused for every one after it — and its own `403` message said
+the log's key was not registered, sending the operator to ask an operator who
+had registered it correctly.
+
+`LogKey::ed25519(name, public_key, signer)` replaces the field: the *identity*
+half is configuration, and the signature is made over each checkpoint as it
+goes out. The key id is derived from the public key rather than accepted beside
+it, so the pair cannot disagree.
+
+**The test double is why this survived.** The fake witness in
+`tests/wire/witness_http.rs` did not verify the log's signature, and the
+fixture it was fed was eight bytes of `0x09`. It now performs the check the
+specification makes mandatory, and the new test submits **two different**
+checkpoints — one proves nothing, since a fixed signature made over the first
+note satisfies a single-checkpoint test.
+
+### Fixed — a `422` named a cause the witness did not
+
+`tlog-witness` gives `422 Unprocessable Entity` three causes: a size-zero
+checkpoint whose root is not the empty tree's, a consistency proof that does
+not verify, and equal sizes with unequal roots. All three were reported as
+`WitnessError::Forked` — *the history was rewritten or forked* — which is the
+loudest thing this crate says about its own integrity, raised for a proof the
+plane built wrongly. This module's own handling of `409` argues against exactly
+that: a team paged twice for a routine cursor mismatch stops believing the
+alert that matters.
+
+- Only **equal sizes with unequal roots** stays `Forked`, and it is
+  unambiguous: no proof-building mistake produces two roots for one size.
+- A `422` on growth is new **`WitnessError::Inconsistent`**, which says what is
+  actually known — either the proof this log built is wrong, or the history it
+  was built over no longer extends what the witness remembers. It is in the
+  **integrity** bucket regardless, because resubmitting reproduces it and
+  filing it as routine would leave a plane whose evidence quietly stopped
+  accumulating.
+- The two causes the client can see are refused **before a request goes out**.
+  Sending them spends a submission to receive an answer that then has to be
+  classified by guessing.
+
+`403` now names both halves the specification gives it — an unregistered log,
+and a signature that will not verify under a registered key — because they send
+an operator to different places.
+
+### Fixed — a cosignature with no observation time was counted
+
+`tlog-witness`: *the cosignature MUST NOT omit the timestamp, i.e. the
+timestamp MUST NOT be zero.* `MemoryWitness` sent zero, to mean *no clock of
+record*; the client accepted zero. So the in-process witness produced bytes no
+conformant verifier accepts, and the client counted a cosignature that says
+nothing about *when* the log was seen — which is half of what a cosignature is
+for, since the observation instant is what separates a witness that is watching
+from one that answered once and stopped.
+
+`MemoryWitness::new(signer, observed_at)` takes the instant from the caller and
+refuses one at or before the Unix epoch. Fixed rather than read from a clock,
+so a fixture's bytes are the same on every run. The client's per-line check —
+now one function shared by the submission reply and the monitor read — refuses
+a zero timestamp along with an unknown key, an unusable payload and a signature
+that does not verify.
+
+### Fixed — six outbound clients followed redirects and honoured an ambient proxy
+
+`netguard::guarded_client` carries three settings that are not independent — a
+custom resolver, `no_proxy`, and `redirect::none` — and its own documentation
+says there is one way to build an outbound client in this crate. There were
+nine: push, peer calls and card discovery used the constructor, and the four
+model drivers, both embedders, the key ring's Vault client and the witness
+client built their own.
+
+Six of those followed redirects, because `reqwest`'s default policy is ten. The
+egress allowlist is consulted **once**, for the first hop, so a redirect leaves
+it behind — and `reqwest` strips only `Authorization`, `Cookie` and
+`Proxy-Authorization` across origins. `x-api-key`, `x-goog-api-key` and
+`X-Vault-Token` are not on that list, so they arrive at whatever host the
+endpoint's `Location` names, and a `307` re-sends the request body, which on a
+model call is the prompt. Eight honoured `HTTPS_PROXY` from the environment: a
+proxied request resolves the *proxy*, so the address check never sees the
+destination and this plane's ambient identity rides a request it did not
+authorize.
+
+All eight now go through the constructor. `Reach::Any` became
+`Reach::Configured` and its gate widened to every feature that builds a client
+for a destination the deployment itself configured — a model gateway or a Vault
+cluster usually has no public address, and refusing it leaves an operator
+running a sidecar that terminates TLS and forwards in clear. What that reach
+does not waive is the proxy and the redirect, which are the two these doors
+were missing. Governed media stays as it is and is now a **named** exception:
+it resolves a URL itself and pins the connection to the addresses it judged,
+using `resolve`, which `reqwest` applies over a custom resolver rather than
+through it.
+
+`tests/guards/layering.rs::every_outbound_client_is_guarded` counts the
+constructions and holds the exemption list to files that actually need it. The
+rule this replaces was a **prose count** of the doors in the module
+documentation — it said two while a third stood open, and three while six more
+had appeared.
+
+### Fixed — a refused redirect was reported as the provider being unavailable
+
+A `3xx` fell to `classify_status`'s catch-all and became
+`ModelError::Unavailable`: the provider is having a bad day, retry. An endpoint
+redirecting is not having a bad day and will not stop redirecting on the second
+attempt, so the retry ladder spent every attempt before saying anything, and
+the message sent whoever read it to a vendor status page.
+
+`300..=399` is `ModelError::Egress` — this plane's own decision, which spends
+no attempt — and the message names the `Location`, because that header is the
+whole diagnosis: somebody's gateway, proxy or DNS entry is sending the call
+elsewhere.
+
+### Changed — `WitnessError` gained two variants and `Witness` lost a method
+
+Breaking, and each has a one-line answer:
+
+- **`MemoryWitness::new`** takes an observation `Timestamp` and returns
+  `Result`. Pass a fixed non-zero instant.
+- **`HttpWitness::new`** takes a `LogKey` where it took a `NoteSignature`.
+  Build one with `LogKey::ed25519(name, public_key, signer)`.
+- **`WitnessError::Inconsistent`** and **`WitnessError::Unsigned`** are new. A
+  match over the enum gains two arms; both belong with the integrity refusals
+  and the local-fault refusals respectively.
+- **`Witness` has no `latest`.** Reading is `WitnessReader`, which needs none
+  of the log's key material.
+
+### Fixed — an export taken for disaster recovery carried no run that was working
+
+`runs_by_outcome` indexes **conclusions**, and the export's default sweep is
+`OUTCOMES_OF_RECORD` — every ending, plus the quarantine backlog. A run that
+had not ended is in none of those indexes, so `agentplane export` produced a
+file containing no run that was sleeping, awaiting a message, or waiting on a
+person. That is the work a disaster recovery exists for.
+
+**The loss was invisible in the result, which is why it survived.** The Merkle
+log commits to *sealed* runs, so a file carrying none of the in-flight ones
+rebuilds to exactly the same root at exactly the same size as one carrying all
+of them: `restore` reported `is_faithful: true` and `verify` reported a clean
+pass, truthfully, about a different question than the one an operator was
+asking. `RestoreReport`'s own documentation said equal roots mean *every
+record, in every run* — it means every record in every **sealed** run.
+
+- **`export::runs_in_flight(store, limit)`** is the second selection, and it
+  had to be a second one because no index answers it. It pages the activity
+  index — the only one that names a run before it ends — and reads **one
+  record** per candidate to classify it: the head's sequence, then that
+  record, then `runtime::observed_status`, which is the same reader the
+  operator API and the A2A projection answer this question with. A run whose
+  records will not read is returned in `unreadable` rather than dropped.
+- **The classifier fails closed.** `None` is still going and a suspension is
+  still going *and* waiting — both in flight; every conclusion is not,
+  including one this build cannot interpret, because `observed_status` already
+  turns an unrecognised outcome into `Quarantined` rather than `None`.
+- **`agentplane export` includes them by default** and says on stderr how many
+  it carried, with the reason the checkpoint does not cover them. `--outcome`
+  turns it off: naming outcomes is a request for exactly those conclusions.
+- **The published format specification gained the scope limit**, because it is
+  a property of what a Merkle log over sealed runs can prove and not a defect
+  in any verifier: a clean verdict says nothing about whether the work in
+  progress is in the file, and the only place that can be answered is the
+  producer's selection.
+
+### Added — a restore names the runs that came back waiting
+
+**`RestoreReport::awaiting`**, as run ids rather than a count, because each one
+needs an act.
+
+A restored suspended run was in the one state the runtime otherwise refuses to
+leave a run in: nothing named it. The wait is journaled — `RunSuspended` carries
+the instant, the kind and the correlation — but what makes a wait *happen* is a
+row in a store the export does not carry: a timer, a subscription, and any
+worklist row the wait opened. So there was no timer to fire and no subscription
+to match, and because a suspending run releases its lease cleanly, the recovery
+pass did not see it either.
+
+**A resume repairs it, and that is not new machinery.** The runtime already
+treats an announced-but-unarmed wait as repairable, because a crash between the
+announcement and the registration produces exactly this state — so a resume
+replays to the wait, finds no terminal record, and re-arms the timer,
+re-subscribes and re-opens the task row from the journal. `until` derives from
+journaled reads, so the instant is the one the original recorded. `restore`
+cannot perform it: a resume runs the agent's own code and a restore holds
+stores. So it names the runs and the runbook resumes them.
+
+The test drives the whole sequence rather than asserting the field is
+populated: run, suspend, export, restore into a fresh store, confirm no timer
+is armed *and* that the recovery queue does not name the run, then resume on a
+plane that holds the skill and confirm the wait is armed again and the work
+past the sleep did not run.
+
+`not_carried` also now names the four layers the export does not hold at all —
+the worklist and its decisions, unclaimed inbound events, webhook
+registrations with their delivery cursors, and governed memory beside the
+batch, quota and standing-authority ledgers. A decision a run already consumed
+survives because that run journaled it; one nobody had consumed does not.
+
+### Fixed — a verified anchor's basis was printed to stderr and lost at the first redirect
+
+`agentplane audit --witness <prefix> --witness-key <k>` verifies the witness
+cosignatures against keys the *reader* supplied — establishing that an
+independent party vouched for the checkpoint — and then printed that to
+stderr while the report went to stdout. `> report.json` kept the verdict and
+dropped the grounds.
+
+The filed artifact could therefore not distinguish a checkpoint cosigned by two
+independent witnesses from one typed out of a ticket. Both produce the same
+clean report and the same `held_to`. That is trust laundering by omission, and
+it happens at a shell redirect rather than anywhere in the code.
+
+Both verbs now print **one document**: the report, plus an `anchor` object
+carrying `obtained_from`, `cosigned_by` (the keys whose signature over *that*
+checkpoint verified), `unreached` (witnesses asked that gave no anchor, with
+why), and `split_view`. The basis describes whichever checkpoint was actually
+used — a file's checkpoint never carries a witness's cosignatures, which would
+be the same laundering one level down. The anchor names the *grounds* and never
+the checkpoint: the report already carries that, and one document holding one
+checkpoint in two fields is two answers waiting to disagree.
+
+What the anchor records is what the **command** established, never what the
+library verified. An audit can check that a checkpoint extends; it cannot check
+who vouched for it, so `AuditReport` still carries the checkpoint alone.
+
+### Fixed — a split view printed and did not bind
+
+Two witnesses holding one tree size with two different roots is the event
+witnessing exists to detect, and the one an operator auditing their own plane
+structurally cannot find: every other check compares the store against
+something the store produced. The CLI detected it, printed `SPLIT VIEW:` to
+stderr, and exited **zero** if the report was otherwise sound — a finding
+delivered as a log line.
+
+It now fails the command, in both `audit` and `verify`, and the rule moved into
+the library as `journal::split_views`, where it is tested and where an embedder
+auditing against several witnesses gets it too. The negative halves are what the
+test spends its length on: witnesses at *different* sizes observed at different
+times and are not a split view, and one that reported them would page an
+operator for the system working — which is how the alert that matters stops
+being believed.
+
+### Fixed — two string literals lost their line continuations
+
+`"…cannot come from the                         file being checked"`. A `\`
+continuation inside a non-raw Python heredoc is consumed by Python, so the
+Rust literal reaches the file as one line with a run of spaces in it. It
+compiles, it passes, and it shows up only when somebody reads the message.
+One was in a CLI refusal an operator sees, one in a test assertion. The sweep
+that finds them looks for a space run *mid-sentence* rather than any space run,
+because the tree is full of YAML fixtures that indent legitimately.
+
+### Fixed — an offline verification was silent about the tails it cannot pin
+
+A run with no position in the Merkle log has an unpinned tail: the root proves
+nothing about it, so records cut from it *before* the export was taken are
+undetectable from the file. `audit` states that about a live store — *N open
+run(s) … a truncated tail is undetectable until the run seals* — and
+`export::verify` did not, though it answers the same question about the same
+history and is the reader an independent auditor holds.
+
+It cost nothing while an export carried only concluded runs, because there
+were none to report. An export taken for recovery carries in-flight runs by
+design, so the omission became routine in the same change that made it
+possible. The note is once per file with the count and the reason, and a
+wholly sealed export does not claim a limit it does not have — a coverage line
+that appears on every report is one a reader learns to skip.
+
+### Added — an audit report names the checkpoint it was held to
+
+**`AuditReport::held_to`.** The report carried `current` — the store's own
+claim — and nothing about the anchor the append-only check actually ran
+against, so a clean verdict against an outside checkpoint was
+indistinguishable from a clean verdict that compared the store with itself.
+`not_checked` said so in words when the check was skipped; nothing said which
+history it compared against when it ran.
+
+Its siblings already did this: `RestoreReport` carries the checkpoint it
+expected *and* the one it rebuilt, `VerifyReport` carries the file's. This was
+the outlier, and it is the one whose readers are a SIEM, a ticket attachment
+and a compliance reviewer.
+
+Deliberately not a provenance field. An audit can verify that a checkpoint
+*extends* — that is the check — and cannot verify who vouched for it, so
+recording where it came from would be this report repeating a claim it did not
+check.
+
+### Changed — `RestoreReport` gained a field, and `observed_status` lost its feature gate
+
+`RestoreReport::awaiting` and `AuditReport::held_to` are new; a struct literal
+over either report grows one field. `runtime::observed_status` is no longer `#[cfg(feature = "http")]` —
+it has two in-crate consumers now, and its own documentation said it was gated
+on having one.
+
+### Assurance — seven new mutations, and one claimed finding that was not one
+
+Mutation count **691**, every new anchor `--verify` KILLED, including one on
+the sweep pass (`TheSweepNeverAsksAWitness`), one on the reader's refusal to
+report an uncosigned checkpoint as an anchor, and three on the export's
+in-flight selection — among them the arm that decides whether a conclusion
+this build cannot interpret counts as work still running. Three existing anchors were
+re-pinned after the per-line verification moved into a shared function, which
+is the predictable cost of collapsing two copies of a rule.
+
+One finding this round claimed and withdrew: `audit` was said not to report the
+missing outside anchor. It does, from `missing_evidence`, and the entry was
+already accurate — it now also names where a checkpoint can be obtained, which
+is a change the round made possible rather than a defect it found.
+
 ## [0.32.0] — 2026-09-08
 
 ### Changed — ids carry their type prefix everywhere, including on the wire

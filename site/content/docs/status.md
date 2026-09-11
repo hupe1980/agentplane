@@ -40,6 +40,30 @@ context type would have to cover them all.
 its footprint *within* a run. Two runs grouping over the same resource are
 ordered by the resources themselves, not by the plane.
 
+**Speaking the [Agent Control Standard](https://github.com/GenAI-Security-Project/agent-control-standard).**
+Two directions, two different answers.
+
+As an **observed agent** — asking an external Guardian to permit each step —
+this is not deferred, it is refused. ACS-Core's failure posture defaults to
+*proceed*, for a hook that times out and for a handshake that never completes,
+and the specification states the consequence itself: an adversary who can
+disrupt the channel converts control into audit. The gate here is inside effect
+dispatch, so no partition opens a path to a sink, and a verdict fetched over the
+network could not be replayed in the first place — a recorded decision is
+re-read on a resume, never re-asked.
+
+As a **Guardian** — serving the wire so agents this runtime does not execute can
+be governed by a plane that journals the decision — it is deferred, and the
+mapping is close to complete: Cedar is the deterministic layer, the sink gate is
+allow/deny, an amendment is `MODIFY`, an approval task is `ASK`, a suspension is
+`DEFER`, and the audit chain is already `SHA-256` over RFC 8785 canonical JSON,
+which is ACS's own construction with the fields in the other order. What defers
+it is a durable-format question rather than effort: ACS's SessionContext is a
+second append-only chain over the same session, so either every hook maps onto a
+record kind and the chain is *derived*, or this plane keeps two histories of one
+session and has to say which is the plan of record. Shipping the wire before
+that is answered would be shipping the second one by accident.
+
 **The rest of format freeze.** The mechanics are built, the
 [record format](@/docs/format.md) is specified, and a second implementation
 reads that specification and derives the same bytes. What is left is
@@ -142,14 +166,14 @@ remaining design pressure is.
 | **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
 | **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
 | **Journal record format** | **will change** | not frozen. Upcasters exist, but a format-freeze milestone has not happened and hard cuts are preferred until it does — see the freeze conditions above for what has to land first, and for the export-as-the-durable-artifact position in the meantime |
-| **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. `tool.call` was `mcp.tools/call` until the reference scheme stopped naming a transport |
-| **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` means an added field is safe and a *removed* one is a hard failure. Fields have been removed when they could not be enforced — see the design decisions above. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
+| **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. A reference names a server and a tool, never a transport, so the key does not move when the transport does |
+| **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` means an added field is safe and a *removed* one is a hard failure. A field the runtime cannot enforce is removed rather than kept as a declaration nothing honours. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
 | **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
 | **Error enums** | additive; `#[non_exhaustive]` | they gain variants as the runtime learns to say more — a rate limit is its own variant rather than a generic rejection, and the next distinction will be too. Match with a `_` arm |
 | **`RetryPolicy` fields** | additive | it is a plain struct, so a literal breaks when a field lands. Build with `RetryPolicy::attempts(n)` and the builder methods, or spread `..RetryPolicy::default()` |
 | **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled. `context` gains attributes as the runtime learns to say more; a `forbid` reading one that does not exist is an evaluation error, and the Cedar adapter **denies an `Allow` that arrives with evaluation errors** rather than letting a broken rule disappear — see [security](@/docs/security.md#the-authorization-context) |
 | **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
-| **Store schemas, SQL *and* redb** | **will change without migration** | pre-alpha, and there is no migration tooling. Recreate rather than migrate. This covers both backends deliberately: a redb `TableDefinition` pins its value types, so widening a column is as breaking as an `ALTER TABLE` and fails at open rather than at read. Making money unsigned moved the quota, batch and authority tables on both |
+| **Store schemas, SQL *and* redb** | **will change without migration** | pre-alpha, and there is no migration tooling. Recreate rather than migrate. This covers both backends deliberately: a redb `TableDefinition` pins its value types, so widening a column is as breaking as an `ALTER TABLE`, and it fails at open rather than at read |
 | **A2A / MCP wire behaviour** | tracks the specs | exact released versions, not a compatibility range — see the open protocol-support question in the design decisions above |
 | **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
 

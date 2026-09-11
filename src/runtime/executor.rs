@@ -770,6 +770,32 @@ pub struct Runtime {
     /// holds if the cursor starts at sequence one.
     #[cfg(feature = "push")]
     outbox: Option<Arc<crate::push::Outbox>>,
+    /// The parties this plane submits its checkpoints to, and how many must
+    /// answer.
+    ///
+    /// The one control here whose whole value is that it is **not** this
+    /// plane: the chain, the signatures and the Merkle log all verify against
+    /// inputs the operator supplies, so none of them detects a run removed or
+    /// two histories shown to two auditors. Absent means the plane's history
+    /// is anchored nowhere outside itself, which is a deployment decision and
+    /// is reported as one by `audit`.
+    witnesses: Option<Arc<Witnessing>>,
+}
+
+/// The witness set and the bar a submission round is held to.
+#[derive(Debug)]
+pub(crate) struct Witnessing {
+    pub(crate) witnesses: Vec<Arc<dyn crate::journal::Witness>>,
+    pub(crate) quorum: crate::journal::WitnessQuorum,
+    /// The size last submitted under a **met** quorum.
+    ///
+    /// In memory, deliberately. It exists only to keep a periodic pass from
+    /// re-submitting a log that has not grown, and the authority on where a
+    /// witness actually is has always been the witness — which answers `409`
+    /// with its own size and gets a proof built from there. So a restart
+    /// re-submits once and the protocol absorbs it; a durable copy would be a
+    /// second answer to a question the counterparty already answers.
+    pub(crate) submitted: std::sync::atomic::AtomicU64,
 }
 
 /// A backend that implements every store a full plane runs on.
@@ -861,6 +887,8 @@ impl Runtime {
             providers: HashMap::new(),
             #[cfg(feature = "push")]
             outbox: None,
+            witnesses: Vec::new(),
+            quorum: None,
         }
     }
 
@@ -1653,6 +1681,11 @@ impl Runtime {
     }
 
     #[must_use]
+    /// The witness set and quorum this plane was built with, if any.
+    pub(crate) fn witnessing(&self) -> Option<&Arc<Witnessing>> {
+        self.witnesses.as_ref()
+    }
+
     pub fn store(&self) -> &Arc<dyn JournalStore> {
         &self.store
     }
@@ -6617,6 +6650,11 @@ impl Agent {
 #[derive(Debug)]
 pub struct RuntimeBuilder {
     store: Arc<dyn JournalStore>,
+    /// The witnesses this plane submits checkpoints to, and the bar a round
+    /// is held to. Both or neither: a witness list with no declared quorum is
+    /// witnessing whose evidence is whatever happened to arrive.
+    witnesses: Vec<Arc<dyn crate::journal::Witness>>,
+    quorum: Option<crate::journal::WitnessQuorum>,
     signer: Option<Arc<dyn crate::core::Signer>>,
     skills: Vec<Arc<dyn Skill>>,
     #[cfg(feature = "manifest")]
@@ -7380,6 +7418,46 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Submit this plane's checkpoints to witnesses, and hold each round to a
+    /// quorum.
+    ///
+    /// This is the only control here whose value comes from *not* being this
+    /// plane. The hash chain proves no record was edited, the signatures say
+    /// which workload wrote them, and the Merkle log proves no sealed run was
+    /// removed — but every input to all three comes from the party an auditor
+    /// is being asked to trust. None of them detects a whole run deleted
+    /// before anyone took a checkpoint, or two internally perfect histories
+    /// shown to two auditors. A witness keeps the last checkpoint it saw and
+    /// cosigns only a checkpoint that provably extends it, so those two stop
+    /// being invisible.
+    ///
+    /// Availability never waits on it: submission runs on
+    /// [`sweep`](Runtime::sweep), after sealing and off the run path, and a
+    /// round that falls short is a report rather than a refusal. A run whose
+    /// witnesses are unreachable finished long ago, and making the plane's
+    /// availability depend on a third party is the wrong trade for evidence
+    /// that is read after the fact.
+    ///
+    /// Point it at witnesses somebody else runs. A witness hosted beside the
+    /// history it vouches for is an anchor one compromise removes, and
+    /// [`MemoryWitness`](crate::journal::MemoryWitness) says so at its own
+    /// definition.
+    ///
+    /// # Errors
+    ///
+    /// [`build`](RuntimeBuilder::build) refuses a quorum larger than the
+    /// number of witnesses configured, and a witness list with no quorum.
+    #[must_use]
+    pub fn witnesses(
+        mut self,
+        witnesses: Vec<Arc<dyn crate::journal::Witness>>,
+        quorum: crate::journal::WitnessQuorum,
+    ) -> Self {
+        self.witnesses = witnesses;
+        self.quorum = Some(quorum);
+        self
+    }
+
     /// Supply the calendar that resolves deadline descriptions to instants.
     ///
     /// Defaults to [`WallClock`], which understands plain offsets and refuses
@@ -8032,8 +8110,28 @@ impl RuntimeBuilder {
             }
         }
 
+        // Both or neither, checked here because a builder cannot see the other
+        // half at the moment either is set.
+        let witnesses = match (self.witnesses.is_empty(), self.quorum) {
+            (true, None) => None,
+            (false, Some(quorum)) if quorum.required() <= self.witnesses.len() => {
+                Some(Arc::new(Witnessing {
+                    witnesses: self.witnesses,
+                    quorum,
+                    submitted: std::sync::atomic::AtomicU64::new(0),
+                }))
+            }
+            (empty, quorum) => {
+                return Err(BuildError::WitnessQuorumUnreachable {
+                    declared: quorum.map_or(0, |q| q.required()),
+                    configured: if empty { 0 } else { self.witnesses.len() },
+                });
+            }
+        };
+
         Ok(Arc::new_cyclic(|self_ref| Runtime {
             self_ref: self_ref.clone(),
+            witnesses,
             signer: self.signer,
             store: self.store,
             skills,

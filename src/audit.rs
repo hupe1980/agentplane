@@ -62,6 +62,25 @@ use crate::journal::{Checkpoint, JournalStore, Record};
 pub struct AuditReport {
     /// The checkpoint the store reports now.
     pub current: Checkpoint,
+    /// The checkpoint this audit was held to, when it was given one.
+    ///
+    /// **A report that names its evidence, because the sibling reports do and
+    /// this is the one where it matters most.** `RestoreReport` carries both
+    /// the checkpoint it expected and the one it rebuilt; `VerifyReport`
+    /// carries the file's. This carried only `current` — the store's own claim
+    /// — so a clean report was indistinguishable from a clean report against
+    /// an anchor, and the reader could not tell which history the append-only
+    /// check had actually compared against.
+    ///
+    /// `None` says the deletion check did not run, which
+    /// [`not_checked`](Self::not_checked) also says in words. Both, because
+    /// this one is machine-readable and that one is for a person.
+    ///
+    /// It does not say where the checkpoint came from. An audit can verify a
+    /// checkpoint *extends* — that is the append-only check below — and cannot
+    /// verify who vouched for it, so recording a provenance here would be this
+    /// report repeating a claim it did not check.
+    pub held_to: Option<Checkpoint>,
     /// Runs whose chain, signatures and inclusion all checked out.
     ///
     /// An **open** run — one whose last conclusion does not seal, or which has
@@ -581,7 +600,9 @@ fn missing_evidence(evidence: &Evidence<'_>) -> Vec<String> {
         out.push(
             "deletion — no earlier checkpoint was supplied, so this audit cannot \
              detect a run that was removed. Every check below passes over a store \
-             somebody emptied"
+             somebody emptied, because the records, the leaves and the root all \
+             come from the party being audited. Pass the checkpoint an earlier \
+             audit printed, or the one this plane's witnesses hold"
                 .to_owned(),
         );
     }
@@ -816,6 +837,7 @@ pub async fn audit(
 
     Ok(AuditReport {
         current,
+        held_to: evidence.prior.cloned(),
         sound,
         findings,
         not_checked,

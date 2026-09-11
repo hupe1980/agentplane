@@ -292,10 +292,43 @@ struct VerifyArgs {
     /// root rebuilt from the file can otherwise only be compared with the
     /// file's own header — which an editor who dropped a run rewrites too —
     /// so the report says deletion went unchecked. Supply the checkpoint an
-    /// earlier audit printed, or one a witness cosigned: the point is that it
-    /// comes from somewhere other than the file being checked.
+    /// earlier audit printed, or fetch one with `--witness`: the point is that
+    /// it comes from somewhere other than the file being checked.
     #[arg(long)]
     checkpoint: Option<String>,
+
+    /// Fetch the anchoring checkpoint from a witness, at its monitoring
+    /// prefix. Repeatable.
+    ///
+    /// The deletion check needs a checkpoint from **outside** the store, and
+    /// this is the only way to get one that the operator did not hand over.
+    /// A witness keeps the last checkpoint it cosigned for a log and will only
+    /// cosign one that provably extends it, so a run removed from the store is
+    /// a size the witness still remembers.
+    ///
+    /// Two or more witnesses are worth naming: a split view is precisely two
+    /// witnesses holding one size with different roots, and that is a finding
+    /// no single anchor produces.
+    #[arg(long = "witness")]
+    witness: Vec<String>,
+
+    /// A witness key to trust, as `<name>=<base64 Ed25519 public key>` —
+    /// repeatable, and required by `--witness`.
+    ///
+    /// Without one a fetch could only report what a URL served. The whole
+    /// argument for an outside anchor is that an independent party signed it,
+    /// and a signature nobody checks makes that an argument about a status
+    /// code.
+    #[arg(long = "witness-key")]
+    witness_key: Vec<String>,
+
+    /// The log's origin line, when it is not this store's own.
+    ///
+    /// Defaults to what the store reports, which is right for an auditor
+    /// holding the database. Naming it explicitly is for the case where the
+    /// store's own answer is the thing under suspicion.
+    #[arg(long)]
+    origin: Option<String>,
 }
 
 /// What `audit` takes beyond the shared store arguments: the evidence.
@@ -329,6 +362,39 @@ struct AuditArgs {
     /// teaches the reader to ignore the report.
     #[arg(long)]
     require_signatures: bool,
+
+    /// Fetch the anchoring checkpoint from a witness, at its monitoring
+    /// prefix. Repeatable.
+    ///
+    /// The deletion check needs a checkpoint from **outside** the store, and
+    /// this is the only way to get one that the operator did not hand over.
+    /// A witness keeps the last checkpoint it cosigned for a log and will only
+    /// cosign one that provably extends it, so a run removed from the store is
+    /// a size the witness still remembers.
+    ///
+    /// Two or more witnesses are worth naming: a split view is precisely two
+    /// witnesses holding one size with different roots, and that is a finding
+    /// no single anchor produces.
+    #[arg(long = "witness")]
+    witness: Vec<String>,
+
+    /// A witness key to trust, as `<name>=<base64 Ed25519 public key>` —
+    /// repeatable, and required by `--witness`.
+    ///
+    /// Without one a fetch could only report what a URL served. The whole
+    /// argument for an outside anchor is that an independent party signed it,
+    /// and a signature nobody checks makes that an argument about a status
+    /// code.
+    #[arg(long = "witness-key")]
+    witness_key: Vec<String>,
+
+    /// The log's origin line, when it is not this store's own.
+    ///
+    /// Defaults to what the store reports, which is right for an auditor
+    /// holding the database. Naming it explicitly is for the case where the
+    /// store's own answer is the thing under suspicion.
+    #[arg(long)]
+    origin: Option<String>,
 }
 
 /// The arguments the two journal verbs share.
@@ -569,12 +635,305 @@ struct ServeArgs {
     peer: Vec<String>,
 }
 
+/// The anchoring checkpoint an audit was given, and **how it was obtained**.
+///
+/// The basis of a fact is part of the fact. A checkpoint fetched from two
+/// independent witnesses and verified against keys the reader supplied, and one
+/// typed out of a ticket, are different grounds for the same verdict — and an
+/// artifact that records only the checkpoint lets the second be read as the
+/// first. That is trust laundering by omission, and it happens at a shell
+/// redirect: the report goes to stdout, and a basis printed only to stderr is
+/// gone the moment somebody writes `> report.json`.
+///
+/// So the basis travels with the report. What it records is what **this
+/// command** established, never what the library verified — the audit checks
+/// that a checkpoint *extends*, and cannot check who vouched for it.
+#[derive(Debug, Default, serde::Serialize)]
+struct Anchor {
+    /// The checkpoint itself, held for the caller and **not serialized**.
+    ///
+    /// The report already names it — `held_to` on an audit, the header
+    /// comparison on a verify — and one document carrying one checkpoint in
+    /// two fields is two answers waiting to disagree. What this object adds is
+    /// the half the report cannot have: how the checkpoint was obtained.
+    #[serde(skip)]
+    checkpoint: Option<agentplane::journal::Checkpoint>,
+    /// Where it came from: a witness's monitoring prefix, or a file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    obtained_from: Option<String>,
+    /// The witness keys whose cosignature over **this** checkpoint verified.
+    ///
+    /// Empty for a checkpoint read from a file: a file carries no signature
+    /// this command can check, so it is an asserted fact and saying nothing is
+    /// how that is said.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    cosigned_by: Vec<String>,
+    /// Witnesses that were asked and gave no anchor, with why.
+    ///
+    /// Kept because a clean report over one witness's anchor and a clean report
+    /// over three are different statements, and the difference is only visible
+    /// here.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    unreached: Vec<String>,
+    /// Two witnesses holding one tree size with two different roots.
+    ///
+    /// The event witnessing exists to detect. It fails the command: a finding
+    /// that only prints is one nobody files.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    split_view: Vec<String>,
+}
+
+/// What `audit` prints: the library's report, and what this command
+/// established about the evidence it fed in.
+///
+/// One document rather than two streams, so the basis cannot be separated from
+/// the verdict by a redirect.
+#[derive(serde::Serialize)]
+struct AuditDocument<'a> {
+    anchor: &'a Anchor,
+    #[serde(flatten)]
+    report: &'a agentplane::audit::AuditReport,
+}
+
+/// What `verify` prints: the file's report, and the anchor it was held to.
+#[derive(serde::Serialize)]
+struct VerifyDocument<'a> {
+    anchor: &'a Anchor,
+    #[serde(flatten)]
+    report: &'a agentplane::export::VerifyReport,
+}
+
 /// The two verbs that read a journal instead of a manifest.
 ///
 /// One function because they differ only in what they do with the run list, and
 /// the half that is easy to get wrong — *which* runs, and saying so when the
 /// limit truncated — is the half they share. `audit` is `None` for an export,
 /// and carries the evidence flags for an audit.
+/// The trusted witness keys an auditor named, as the reader takes them.
+fn witness_keys(keys: &[String]) -> Result<Vec<agentplane::journal::TrustedWitness>, String> {
+    let mut out = Vec::new();
+    for entry in keys {
+        let Some((name, encoded)) = entry.split_once('=') else {
+            return Err(format!(
+                "--witness-key takes <name>=<base64 Ed25519 public key>, got '{entry}' — \
+                 the name is the one the witness signs its lines with, and the key is \
+                 what makes a cosignature checkable rather than a string"
+            ));
+        };
+        // Base64 where the sibling `--key` takes hex, and the difference is
+        // whose key it is. A record-signing key id is this deployment's own,
+        // so an operator can publish it in whatever form the flag wants; a
+        // witness key arrives from a third party, published in base64 by
+        // every witness in the existing network. Making an auditor re-encode
+        // it by hand adds a step where a typo reads as "the witness is down".
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+            .map_err(|e| format!("--witness-key {name}: not base64: {e}"))?;
+        let key: [u8; 32] = bytes.try_into().map_err(|b: Vec<u8>| {
+            format!(
+                "--witness-key {name}: an Ed25519 public key is 32 bytes, this is {}",
+                b.len()
+            )
+        })?;
+        out.push(agentplane::journal::TrustedWitness::ed25519(name, key));
+    }
+    Ok(out)
+}
+
+/// What the named witnesses hold for `origin`, and whether they agree.
+///
+/// The **anchor** an auditor needs is one checkpoint from outside the store.
+/// Naming several witnesses buys something a single one cannot: a split view
+/// is exactly two witnesses holding one size with different roots, and no
+/// single anchor exhibits it. So this returns the highest checkpoint any of
+/// them cosigned, and reports a disagreement on stderr as what it is — the
+/// event witnessing exists to detect, found by the party it exists to protect.
+///
+/// `Ok(None)` when no witness was named. A named witness that has never seen
+/// this log is said out loud and is not an anchor: an auditor holding a clean
+/// report has to know that the check they asked for did not happen.
+async fn anchor_from_witnesses(
+    prefixes: &[String],
+    keys: &[String],
+    origin: &str,
+) -> Result<Anchor, String> {
+    let mut anchor = Anchor::default();
+    if prefixes.is_empty() {
+        if !keys.is_empty() {
+            return Err("--witness-key was given with no --witness to use it against".to_owned());
+        }
+        return Ok(anchor);
+    }
+    let trusted = witness_keys(keys)?;
+    if trusted.is_empty() {
+        return Err(
+            "--witness needs at least one --witness-key: a checkpoint fetched from a URL \
+             nobody's signature covers is a stranger's claim presented as an independent \
+             anchor"
+                .to_owned(),
+        );
+    }
+
+    let mut held: Vec<(String, agentplane::journal::Checkpoint)> = Vec::new();
+    for prefix in prefixes {
+        let reader = agentplane::journal::WitnessReader::new(prefix, trusted.clone())
+            .map_err(|e| format!("--witness {prefix}: {e}"))?;
+        match reader.latest(origin).await {
+            Ok(Some(cosigned)) => {
+                eprintln!(
+                    "witness {prefix}: log '{}' at size {} with root {}, {} cosignature(s)",
+                    cosigned.checkpoint.origin,
+                    cosigned.checkpoint.size,
+                    cosigned.checkpoint.root.to_hex(),
+                    cosigned.cosignatures.len(),
+                );
+                // The highest wins: the append-only check asks *since when*,
+                // so the later anchor is the stronger claim. The basis is
+                // taken from the same answer, never assembled separately —
+                // a basis describing a checkpoint other than the one used
+                // would be the laundering this records exist to prevent.
+                if anchor
+                    .checkpoint
+                    .as_ref()
+                    .is_none_or(|b| b.size < cosigned.checkpoint.size)
+                {
+                    anchor.checkpoint = Some(cosigned.checkpoint.clone());
+                    anchor.obtained_from = Some(format!("witness {prefix}"));
+                    anchor.cosigned_by = cosigned
+                        .cosignatures
+                        .iter()
+                        .map(|c| c.key_id.clone())
+                        .collect();
+                }
+                held.push((prefix.clone(), cosigned.checkpoint));
+            }
+            // An answer, and one an auditor acts on: submission never reached
+            // this witness, so the anchor they asked for does not exist.
+            Ok(None) => {
+                let said = format!(
+                    "witness {prefix}: has never cosigned log '{origin}' — no anchor from \
+                     this one, and nothing here is evidence about deletion"
+                );
+                eprintln!("{said}");
+                anchor.unreached.push(said);
+            }
+            // Not fatal: one unreachable witness among several still leaves an
+            // anchor, and failing the command over it would make an auditor's
+            // check depend on every witness being up at once.
+            Err(e) => {
+                let said = format!("witness {prefix}: {e}");
+                eprintln!("{said}");
+                anchor.unreached.push(said);
+            }
+        }
+    }
+
+    // The rule lives in the library, where it can be tested and where an
+    // embedder auditing with several witnesses gets it too. Said before the
+    // report so it is not lost in the scroll — and **kept**, because a
+    // finding delivered only to a terminal is a finding nobody files.
+    for split in agentplane::journal::split_views(&held) {
+        eprintln!("{split}");
+        anchor.split_view.push(split.to_string());
+    }
+    Ok(anchor)
+}
+
+/// The audit half of `journal_verb`, printed and turned into an exit code.
+///
+/// Its own function because the export half and this one share only the run
+/// list, and because assembling the evidence — a key, a saved checkpoint, an
+/// anchor fetched from witnesses — is the part with rules in it.
+async fn audit_report(
+    store: &Arc<dyn JournalStore>,
+    runs: &[agentplane::RunId],
+    audit: &AuditArgs,
+) -> Result<ExitCode, String> {
+    // An audit with no prior checkpoint and no key still checks every
+    // chain, and reports the two things it could not do. That is the
+    // honest default for somebody who has just been handed a database —
+    // and the flags are how they narrow it on the second pass, with the
+    // key the operator published and the checkpoint the first pass printed.
+    let verifier = verifier_from(&audit.key)?;
+    // The store's own origin, unless the auditor named one — which they do
+    // exactly when the store's answer is the thing under suspicion.
+    let origin = match &audit.origin {
+        Some(o) => o.clone(),
+        None => store.checkpoint().await.map_err(|e| e.to_string())?.origin,
+    };
+    let fetched = anchor_from_witnesses(&audit.witness, &audit.witness_key, &origin).await?;
+    let prior: Option<agentplane::journal::Checkpoint> = match &audit.prior {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("reading --prior {path}: {e}"))
+                .and_then(|text| {
+                    serde_json::from_str(&text).map_err(|e| {
+                        format!(
+                            "--prior {path} is not a checkpoint — expected the `current` \
+                             field of an earlier audit report: {e}"
+                        )
+                    })
+                })?,
+        ),
+        None => None,
+    };
+    // A checkpoint from a file and one from a witness are the same kind of
+    // evidence, and the higher one establishes more: the append-only check
+    // is *since when*, so the later anchor is the stronger claim. Both
+    // named is not a conflict to resolve — a witness holding a size the
+    // saved checkpoint has passed is ordinary, and the reverse is a
+    // finding the check below produces on its own.
+    // A checkpoint read from a file wins only where no witness answered
+    // higher, and the basis moves with it: whichever checkpoint is used, the
+    // record says how *that* one was obtained. Reporting a witness's
+    // cosignatures beside a file's checkpoint would be the exact laundering
+    // this field exists to prevent.
+    let mut anchor = fetched;
+    match (prior, anchor.checkpoint.as_ref()) {
+        (Some(saved), Some(found)) if found.size >= saved.size => {}
+        (Some(saved), _) => {
+            anchor.obtained_from = Some(match &audit.prior {
+                Some(path) => format!("file {path}"),
+                None => "file".to_owned(),
+            });
+            anchor.cosigned_by.clear();
+            anchor.checkpoint = Some(saved);
+        }
+        (None, _) => {}
+    }
+
+    let evidence = agentplane::audit::Evidence {
+        prior: anchor.checkpoint.as_ref(),
+        verifier: verifier
+            .as_ref()
+            .map(|v| v as &dyn agentplane::core::Verifier),
+        require_signatures: audit.require_signatures,
+    };
+    let report = agentplane::audit::audit(store, runs, &evidence)
+        .await
+        .map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&AuditDocument {
+            anchor: &anchor,
+            report: &report,
+        })
+        .map_err(|e| e.to_string())?
+    );
+    // Findings are a failure; `not_checked` is not. An auditor who supplied
+    // nothing gets a clean exit and a populated `not_checked`, and it is
+    // their call whether that is enough.
+    //
+    // A split view fails too, and it is not the library's to report: two
+    // witnesses holding one size with two different roots is the event
+    // witnessing exists to detect, and only this command — which asked more
+    // than one witness — is in a position to see it.
+    Ok(if report.is_sound() && anchor.split_view.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
+}
+
 fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -619,6 +978,30 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
             runs.extend(found.into_iter().take(opts.limit));
         }
 
+        // The runs no outcome names. Skipped when the caller narrowed to
+        // specific outcomes, because that is a request for exactly those
+        // conclusions — and an in-flight run is not one.
+        if opts.outcome.is_empty() {
+            let flight = agentplane::export::runs_in_flight(&store, opts.limit)
+                .await
+                .map_err(|e| e.to_string())?;
+            if flight.truncated {
+                truncated.push("in-flight runs".to_owned());
+            }
+            for (run, why) in &flight.unreadable {
+                eprintln!("warning: in-flight run {run} could not be read: {why}");
+            }
+            if !flight.runs.is_empty() {
+                eprintln!(
+                    "including {} run(s) still in flight — sleeping, awaiting a message, \
+                     or waiting on a person. The Merkle log commits to sealed runs only, \
+                     so these are carried and the checkpoint does not cover them",
+                    flight.runs.len()
+                );
+            }
+            runs.extend(flight.runs);
+        }
+
         // Said on stderr so it survives `> out.jsonl`, and said before the work
         // rather than after: an operator who pipes this somewhere is not going
         // to re-read the tail.
@@ -654,49 +1037,7 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
             return Ok(ExitCode::SUCCESS);
         };
 
-        // An audit with no prior checkpoint and no key still checks every
-        // chain, and reports the two things it could not do. That is the
-        // honest default for somebody who has just been handed a database —
-        // and the flags are how they narrow it on the second pass, with the
-        // key the operator published and the checkpoint the first pass printed.
-        let verifier = verifier_from(&audit.key)?;
-        let prior: Option<agentplane::journal::Checkpoint> = match &audit.prior {
-            Some(path) => Some(
-                std::fs::read_to_string(path)
-                    .map_err(|e| format!("reading --prior {path}: {e}"))
-                    .and_then(|text| {
-                        serde_json::from_str(&text).map_err(|e| {
-                            format!(
-                                "--prior {path} is not a checkpoint — expected the `current` \
-                                 field of an earlier audit report: {e}"
-                            )
-                        })
-                    })?,
-            ),
-            None => None,
-        };
-        let evidence = agentplane::audit::Evidence {
-            prior: prior.as_ref(),
-            verifier: verifier
-                .as_ref()
-                .map(|v| v as &dyn agentplane::core::Verifier),
-            require_signatures: audit.require_signatures,
-        };
-        let report = agentplane::audit::audit(&store, &runs, &evidence)
-            .await
-            .map_err(|e| e.to_string())?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
-        );
-        // Findings are a failure; `not_checked` is not. An auditor who supplied
-        // nothing gets a clean exit and a populated `not_checked`, and it is
-        // their call whether that is enough.
-        Ok(if report.is_sound() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        })
+        audit_report(&store, &runs, audit).await
     })
 }
 
@@ -1059,10 +1400,62 @@ fn read_checkpoint(path: &str) -> Result<agentplane::journal::Checkpoint, String
 /// somewhere else.
 fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, String> {
     let verifier = verifier_from(&opts.key)?;
-    let expected = match &opts.checkpoint {
+    let saved = match &opts.checkpoint {
         Some(path) => Some(read_checkpoint(path)?),
         None => None,
     };
+    // The origin an export is *supposed* to be of. Read from the file would
+    // defeat the purpose — the header is written by whoever wrote the file —
+    // so `--origin` is required to fetch an anchor here, where `audit` can ask
+    // its own store. `verify` runs against a file the auditor was handed, and
+    // the name of the log is the one thing they have to know already.
+    let fetched = match (&opts.origin, opts.witness.is_empty()) {
+        (Some(origin), false) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("could not start the async runtime: {e}"))?;
+            rt.block_on(anchor_from_witnesses(
+                &opts.witness,
+                &opts.witness_key,
+                origin,
+            ))?
+        }
+        (None, false) => {
+            return Err(
+                "--witness needs --origin: the log's name cannot come from the file being \
+                 checked, because that header is written by whoever wrote the file"
+                    .to_owned(),
+            );
+        }
+        // No witness named. The key check still has to happen, so a
+        // `--witness-key` with nothing to use it against is a refusal rather
+        // than a flag that did nothing.
+        (_, true) => {
+            if !opts.witness_key.is_empty() {
+                return Err(
+                    "--witness-key was given with no --witness to use it against".to_owned(),
+                );
+            }
+            Anchor::default()
+        }
+    };
+    // The same rule `audit` applies, for the same reason: whichever checkpoint
+    // is used, the record says how *that* one was obtained.
+    let mut anchor = fetched;
+    match (saved, anchor.checkpoint.as_ref()) {
+        (Some(saved), Some(found)) if found.size >= saved.size => {}
+        (Some(saved), _) => {
+            anchor.obtained_from = Some(match &opts.checkpoint {
+                Some(path) => format!("file {path}"),
+                None => "file".to_owned(),
+            });
+            anchor.cosigned_by.clear();
+            anchor.checkpoint = Some(saved);
+        }
+        (None, _) => {}
+    }
+    let expected = anchor.checkpoint.clone();
     let verifier = verifier
         .as_ref()
         .map(|v| v as &dyn agentplane::core::Verifier);
@@ -1077,12 +1470,18 @@ fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, String> {
     }?;
     println!(
         "{}",
-        serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        serde_json::to_string_pretty(&VerifyDocument {
+            anchor: &anchor,
+            report: &report,
+        })
+        .map_err(|e| e.to_string())?
     );
     // Findings fail; `not_checked` does not. A pass with no key — or with no
     // checkpoint — has established less, and saying so is different from
     // failing.
-    Ok(if report.is_sound() {
+    // A split view fails here too. Only a caller that asked more than one
+    // witness can see it, so neither the library's report nor the file can.
+    Ok(if report.is_sound() && anchor.split_view.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE

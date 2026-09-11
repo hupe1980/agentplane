@@ -114,9 +114,8 @@ impl VaultTransit {
         // through this client, so an unbounded one lets a key service that
         // stops answering hold every write that touches a sealed payload —
         // which with a keyring configured is most of them.
-        let http = reqwest::Client::builder()
+        let http = crate::netguard::guarded_client(crate::netguard::Reach::Configured)
             .timeout(Self::TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| KeyError::Unavailable(format!("could not build an HTTP client: {e}")))?;
         Ok(Self {

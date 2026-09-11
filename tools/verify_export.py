@@ -103,6 +103,7 @@ def verify(lines: list[str], expected_root: bytes | None = None) -> Report:
     report = Report()
     expected = expected_root
 
+    open_runs = 0
     parsed: list[dict] = []
     for number, line in enumerate(lines, 1):
         if not line.strip():
@@ -173,7 +174,12 @@ def verify(lines: list[str], expected_root: bytes | None = None) -> Report:
             report.runs += 1
             index, seal = value.get("index"), value.get("seal")
             if index is None and seal is None:
-                continue  # an open run: not in the log, and that is a state
+                # An open run: not in the log, and that is a state rather than
+                # a gap. It is counted, because the root proves nothing about
+                # it and a reader deciding what a clean report is worth has to
+                # be told how much of the file that covers.
+                open_runs += 1
+                continue
             if not isinstance(index, int) or seal is None:
                 report.note(f"run {current_run}: a placed run needs both index and seal")
                 continue
@@ -290,6 +296,17 @@ def verify(lines: list[str], expected_root: bytes | None = None) -> Report:
                 "the Merkle root rebuilt from this export does not match the "
                 "checkpoint it claims to be a copy of"
             )
+
+    # A run with no position in the log has an unpinned tail: the root proves
+    # nothing about it, so records cut from it before the export was taken are
+    # undetectable from this file. Once, with the count and the reason — a
+    # coverage line on every report is one a reader learns to skip.
+    if open_runs:
+        report.unchecked.append(
+            f"{open_runs} open run(s) — a run that has not concluded has no position "
+            "in the Merkle log, so its chain was verified and records cut from its "
+            "tail before the export was taken are undetectable from this file"
+        )
 
     # ── step 6: the root, against a checkpoint from somewhere else ────────
     if expected is None:

@@ -40,6 +40,23 @@ pub enum BuildError {
     )]
     BlobStoreTenant { plane: String, store: String },
 
+    /// A witness quorum this plane could never reach.
+    ///
+    /// Both directions are refused, because both spell witnessing that is on
+    /// and is not. A quorum above the number of witnesses configured is a bar
+    /// every round misses — so every sweep reports a shortfall, an operator
+    /// learns to ignore it, and the deployment has the alerting cost of
+    /// witnessing with none of the evidence. A witness list with no declared
+    /// quorum is the same failure from the other side: whatever cosignatures
+    /// happened to arrive become the bar they were held to.
+    #[error(
+        "this plane declares {declared} witness cosignature(s) per checkpoint and \
+         {configured} witness(es) to ask, so no round can ever meet the bar — \
+         a quorum nothing can reach reports a shortfall on every sweep, which is \
+         how an operator learns to ignore the one that means something"
+    )]
+    WitnessQuorumUnreachable { declared: usize, configured: usize },
+
     /// The plane and its journal store are scoped to different tenants.
     ///
     /// The dangerous one, because it *works*. Runs are written into another
