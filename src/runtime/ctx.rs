@@ -2176,6 +2176,28 @@ impl<'a> StepCtx<'a> {
         Err(StepError::Budget(exceeded))
     }
 
+    /// Put a completion's own report on its span.
+    ///
+    /// Every value here is a fact the provider stated about its own answer, which is
+    /// why absence is preserved rather than defaulted: an attribute this plane fills
+    /// in from the request would report that a substitution had been ruled out when
+    /// nothing looked.
+    fn record_gen_ai_response(span: &tracing::Span, reply: &crate::core::GenAiResponse) {
+        if let Some(model) = &reply.model {
+            span.record(telemetry::GEN_AI_RESPONSE_MODEL, model.as_str());
+        }
+        if let Some(reason) = &reply.finish_reason {
+            span.record(telemetry::GEN_AI_FINISH_REASON, reason.as_str());
+        }
+        span.record(telemetry::GEN_AI_INPUT_TOKENS, reply.input_tokens);
+        span.record(telemetry::GEN_AI_OUTPUT_TOKENS, reply.output_tokens);
+        span.record(telemetry::GEN_AI_CACHE_READ_TOKENS, reply.cache_read_tokens);
+        span.record(
+            telemetry::GEN_AI_CACHE_WRITE_TOKENS,
+            reply.cache_write_tokens,
+        );
+    }
+
     /// Perform one attempt inside its own span.
     ///
     /// One span per *attempt*, not per effect, so a retried call shows as
@@ -2192,18 +2214,41 @@ impl<'a> StepCtx<'a> {
         let span = tracing::info_span!(
             telemetry::EFFECT_SPAN,
             { telemetry::EFFECT_KIND } = tracing::field::display(&effect.descriptor().kind),
+            { telemetry::EFFECT_KEY } = tracing::field::display(&key),
             { telemetry::EFFECT_ATTEMPT } = attempt,
             { telemetry::EFFECT_MUTATES } = effect.mutates(),
             { telemetry::EFFECT_REPLAYED } = false,
+            { telemetry::MODE } = telemetry::mode_str(self.mode),
             { telemetry::OUTCOME } = tracing::field::Empty,
+            { telemetry::ERROR_TYPE } = tracing::field::Empty,
             // Present only on the effects that *are* GenAI operations. Recorded
             // rather than declared with a value so a clock read does not carry
             // an empty `gen_ai.operation.name`, which would make the attribute
             // useless for the tooling that keys on it.
             { telemetry::GEN_AI_OPERATION } = tracing::field::Empty,
+            { telemetry::GEN_AI_PROVIDER } = tracing::field::Empty,
+            { telemetry::GEN_AI_REQUEST_MODEL } = tracing::field::Empty,
+            { telemetry::GEN_AI_TOOL_NAME } = tracing::field::Empty,
+            { telemetry::GEN_AI_RESPONSE_MODEL } = tracing::field::Empty,
+            { telemetry::GEN_AI_FINISH_REASON } = tracing::field::Empty,
+            { telemetry::GEN_AI_INPUT_TOKENS } = tracing::field::Empty,
+            { telemetry::GEN_AI_OUTPUT_TOKENS } = tracing::field::Empty,
+            { telemetry::GEN_AI_CACHE_READ_TOKENS } = tracing::field::Empty,
+            { telemetry::GEN_AI_CACHE_WRITE_TOKENS } = tracing::field::Empty,
         );
         if let Some(op) = effect.gen_ai_operation() {
             span.record(telemetry::GEN_AI_OPERATION, op);
+            // The convention splits the name by operation: a completion names
+            // a model, a tool call names a tool, and neither key means the
+            // other. Read from the effect rather than guessed from the kind.
+            if let Some(request) = effect.gen_ai_request() {
+                if let Some(provider) = &request.provider {
+                    span.record(telemetry::GEN_AI_PROVIDER, provider.as_str());
+                    span.record(telemetry::GEN_AI_REQUEST_MODEL, request.name.as_str());
+                } else {
+                    span.record(telemetry::GEN_AI_TOOL_NAME, request.name.as_str());
+                }
+            }
         }
         // `Instrument`, never `enter()`. An `Entered` guard held across an
         // `.await` stays entered on the *thread*, so when the future yields,
@@ -2223,6 +2268,24 @@ impl<'a> StepCtx<'a> {
             telemetry::OUTCOME,
             if outcome.is_ok() { "done" } else { "failed" },
         );
+        // After the call, because that is when either exists. A failure records
+        // no figures rather than zeroes: *this call reported no usage* and *this
+        // call used none* are different facts, and a panel that cannot tell them
+        // apart reads a metered refusal as free.
+        match &outcome {
+            Ok(answer) => {
+                if let Some(reply) = effect.gen_ai_response(answer) {
+                    Self::record_gen_ai_response(&span, &reply);
+                }
+            }
+            // The convention asks for this on any operation that ends in error,
+            // and without it every `GenAI` panel reports a plane with no
+            // failures at all — which is the one claim this runtime exists not
+            // to make.
+            Err(failure) => {
+                span.record(telemetry::ERROR_TYPE, failure.class());
+            }
+        }
         Ok(outcome)
     }
 

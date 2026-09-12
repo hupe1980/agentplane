@@ -722,6 +722,15 @@ impl JournalStore for BlindToKeys {
     ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
         self.0.read(run, from).await
     }
+
+    async fn read_page(
+        &self,
+        run: agentplane::RunId,
+        from: agentplane::core::Seq,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
+        self.0.read_page(run, from, limit).await
+    }
     async fn forget_admissions(
         &self,
         older_than: agentplane::core::Timestamp,

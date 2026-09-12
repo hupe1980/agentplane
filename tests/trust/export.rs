@@ -654,6 +654,95 @@ async fn assert_derived_indexes_survived(fresh: &Arc<dyn JournalStore>, keyed: R
     );
 }
 
+/// A restore lands in exactly one tenant, and the neighbour cannot see it.
+///
+/// An export carries no tenant: the runs in it belonged to whichever store
+/// wrote the file, and the tenant of a restore is the handle an operator points
+/// it at. That is the right design — a recovery into a differently-named tenant
+/// is a legitimate thing to do — but it makes the operator's choice of handle
+/// the whole of the isolation, and an operator's choice is not a control.
+///
+/// What makes it one is that a restore has no path of its own: it replays
+/// through `append`, and every key `append` writes is already led by the
+/// tenant. So the property to pin is not that the restore checks something —
+/// it is that it *cannot* write outside the handle it was given, over a
+/// database where another tenant's rows are sitting right next to it.
+#[tokio::test]
+async fn a_restore_writes_only_into_the_tenant_it_was_pointed_at() {
+    use agentplane::core::TenantId;
+
+    let acme = TenantId::new("acme").expect("valid");
+    let globex = TenantId::new("globex").expect("valid");
+
+    let origin = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(acme.clone()),
+    );
+    let rt = Runtime::builder(Arc::clone(&origin) as Arc<dyn JournalStore>)
+        .tenant(acme.clone())
+        .skill(Trivial)
+        .build();
+    let run = rt
+        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .await
+        .expect("run")
+        .run_id;
+
+    let source: Arc<dyn JournalStore> = origin;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&source, None, &[run], &mut out)
+        .await
+        .expect("export");
+
+    // One database, two tenants. The neighbour is given work of its own first,
+    // so "the other tenant sees nothing of this run" is a statement about
+    // scoping rather than about an empty store.
+    let disk = RedbStore::open_in_memory().expect("store");
+    let neighbour: Arc<dyn JournalStore> = Arc::new(disk.clone().for_tenant(acme.clone()));
+    let neighbour_rt = Runtime::builder(Arc::clone(&neighbour))
+        .tenant(acme.clone())
+        .skill(Trivial)
+        .build();
+    let theirs = neighbour_rt
+        .run("demo.trivial", Tainted::trusted(json!({ "n": 9 })))
+        .await
+        .expect("run")
+        .run_id;
+
+    // The restore is pointed at the *other* tenant on that same database.
+    let target: Arc<dyn JournalStore> = Arc::new(disk.for_tenant(globex.clone()));
+    let report = agentplane::export::from_jsonl(&target, None, std::io::Cursor::new(&out))
+        .await
+        .expect("restore");
+    assert!(report.runs > 0, "nothing was restored: {report:?}");
+
+    assert!(
+        !target.read(run, 1).await.expect("read").is_empty(),
+        "the restore did not land in the tenant it was pointed at"
+    );
+    assert!(
+        neighbour.read(run, 1).await.expect("read").is_empty(),
+        "a restore into one tenant published its runs to another on the same \
+         database — the recovery of one customer's history would be readable \
+         by the next"
+    );
+    assert!(
+        target.read(theirs, 1).await.expect("read").is_empty(),
+        "the restoring tenant can read the neighbour's pre-existing run, so \
+         the isolation fails in the other direction too"
+    );
+
+    // And the checkpoints are separate histories, not one shared log: a
+    // restore that appended into a shared tree would move the neighbour's root.
+    let ours = target.checkpoint().await.expect("checkpoint");
+    let theirs_cp = neighbour.checkpoint().await.expect("checkpoint");
+    assert_ne!(
+        ours.origin, theirs_cp.origin,
+        "both tenants report one log origin, so their histories are not separable"
+    );
+}
+
 #[tokio::test]
 async fn a_restored_store_rebuilds_the_same_checkpoint() {
     let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
@@ -1058,6 +1147,15 @@ impl JournalStore for StaleCheckpoint {
     }
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
         self.inner.read(run, from).await
+    }
+
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: Seq,
+        _limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        self.read(run, from).await
     }
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.runs_by_outcome(outcome, limit).await

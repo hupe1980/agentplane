@@ -25,6 +25,133 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## A first lease starts past the run's own history
+
+**Affected:** anyone with their own `JournalStore`, and anyone asserting on
+epochs after a restore.
+
+A run with no lease row is no longer leased at epoch 1 unconditionally. The
+first lease is issued one past the highest epoch the run's **journal** already
+records — which is 1 for a genuinely fresh run, and something larger for one
+rebuilt by `restore`, whose lease table an export does not carry.
+
+The store conformance battery checks it, so a custom backend will be told:
+
+```
+fencing: a run whose history reaches epoch 7 was leased at epoch 1 — the
+fencing token went backwards
+```
+
+An epoch that goes backwards is not a fencing token. It also collides: quota
+settlement matches a spend to its pass by that number, so a second ownership
+period wearing the first one's number is settled with the first one's money.
+
+## Span attributes use the convention's names
+
+**Affected:** any dashboard, alert or collector rule keyed on `agentplane.agent`
+or `agentplane.case.id`.
+
+```diff
+-agentplane.agent      → gen_ai.agent.name
+-agentplane.case.id    → gen_ai.conversation.id
+-semconv               → agentplane.semconv
+```
+
+Where the `GenAI` conventions already name a fact, that is the name emitted. A
+second spelling in this crate's namespace is read by nothing generic, and the
+conversation a run belongs to is its **case** — the same thing the A2A surface
+answers `contextId` with.
+
+The rest of the `agentplane.*` attributes are unchanged: they name facts the
+conventions have no equivalent for.
+
+---
+
+## `Completion` carries the model that answered
+
+**Affected:** anything constructing a `Completion` by hand — a test double, a
+custom `ModelProvider`.
+
+```diff
+ Completion {
+     text: answer,
++    model: None,
+     tool_calls: Vec::new(),
+     usage,
+     …
+ }
+```
+
+`None` is the honest value for a wire that names no model. A driver that has one
+should pass it through: it is what makes a silent substitution — an alias that
+resolves, a deployment moved under a pinned name, a gateway that routes
+elsewhere — visible in the run's own evidence, and it is what
+`gen_ai.response.model` is emitted from.
+
+`FakeProvider` fills it with the requested model, which is what a provider that
+did not substitute reports. Script a completion whose `model` is set to something
+else to exercise the other case.
+
+---
+
+## The two `GenAI` `Effect` seams are request and response
+
+**Affected:** any `Effect` implementation that answered `gen_ai_target` or
+`gen_ai_tokens`.
+
+```diff
+-fn gen_ai_target(&self) -> Option<GenAiTarget>
++fn gen_ai_request(&self) -> Option<GenAiRequest>
+
+-fn gen_ai_tokens(&self, output: &Self::Output) -> Option<GenAiTokens>
++fn gen_ai_response(&self, output: &Self::Output) -> Option<GenAiResponse>
+```
+
+`GenAiResponse` carries the model that answered, the finish reason and the token
+counts including the cache split. Both still default to `None`, so an effect that
+is not a `GenAI` operation claims none of the convention's attributes.
+
+---
+
+## `JournalStore` requires `read_page`
+
+**Affected:** anyone with their own `JournalStore`.
+
+```rust
+async fn read_page(
+    &self,
+    run: RunId,
+    from: Seq,
+    limit: usize,
+) -> Result<Vec<Record>, StoreError>;
+```
+
+At most `limit` records from `from`. Required rather than defaulted to `read`
+then truncate, because that default is the defect it exists to remove: a cursored
+endpoint whose every page loads the whole remaining history does work
+proportional to the run's length for each page of it.
+
+The shipped backends make `read` the unbounded call of the same function, so the
+two cannot come to disagree about what a record is.
+
+---
+
+## Five admission methods are gone
+
+**Affected:** anyone calling `spawn_once`, `spawn_in_case`, `spawn_in_case_once`,
+`spawn_correlated` or `run_in_case_once`. Nothing in this repository did.
+
+Each is the general form with terms:
+
+```diff
+-rt.spawn_in_case(target, input, case).await?;
++rt.spawn_under(target, input, RunTerms::default().in_case(case)).await?;
+```
+
+`RunTerms` composes a case binding, correlation keys, an idempotency key and a
+per-run chain in any combination — which is why the named conveniences for
+individual combinations were removed rather than completed.
+
 ## `FakeProvider` refuses a schema constrained decoding cannot enforce
 
 **Affected:** any test or example whose declared schema falls outside the

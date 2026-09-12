@@ -62,6 +62,8 @@ pub struct Accumulator {
     /// Which content block index is the forced structured-output tool.
     tool_index: Option<u64>,
     usage: Usage,
+    /// The model the provider says answered, from `message_start`.
+    served_model: Option<String>,
     /// Whether `message_start` arrived — i.e. whether generation began.
     ///
     /// The whole point of the file. If this is false when the connection dies,
@@ -127,6 +129,12 @@ impl Accumulator {
     #[must_use]
     pub fn stop_reason(&self) -> Option<&str> {
         self.stop_reason.as_deref()
+    }
+
+    /// The model the provider says answered, where `message_start` named one.
+    #[must_use]
+    pub fn served_model(&self) -> Option<&str> {
+        self.served_model.as_deref()
     }
 
     /// The provider's `stop_details`, when the wire carried one.
@@ -238,8 +246,14 @@ impl Accumulator {
         match kind {
             "message_start" => {
                 self.started = true;
-                if let Some(u) = value.get("message").and_then(|m| m.get("usage")) {
-                    self.absorb_usage(u);
+                if let Some(message) = value.get("message") {
+                    if let Some(u) = message.get("usage") {
+                        self.absorb_usage(u);
+                    }
+                    self.served_model = message
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
                 }
             }
             "content_block_start" => {

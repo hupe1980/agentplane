@@ -446,6 +446,239 @@ fn every_spec_invariant_is_claimed_by_a_test() {
     }
 }
 
+/// Every name in the telemetry vocabulary is used by something.
+///
+/// The sibling below checks the **events**. This checks the rest, because the
+/// same argument covers them and nothing did: a span attribute nobody records
+/// is a column that is always blank, and an operator reads blank as *this run
+/// had no model* rather than *nothing reports it*. Seven were in that state —
+/// the whole `GenAI` request and usage set, plus the agent name — while the
+/// module doc said "these constants are the contract".
+///
+/// One exemption, by name and with its reason: `LOUD_EVENTS` is a *list* of the
+/// other names, published so a deployment can wire its alerts from it — so it
+/// is read rather than emitted, by the operations page and by two guards. The
+/// exemption asserts that reading still happens, so a stale entry cannot
+/// license a dead constant.
+#[test]
+fn every_telemetry_name_is_used_by_something() {
+    let vocab = read("src/runtime/telemetry.rs");
+    let src: String = walk("src")
+        .iter()
+        .filter(|p| !p.ends_with("telemetry.rs"))
+        .map(|p| read(p))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // `pub const fn` is a function, not a name in the vocabulary.
+    let names: Vec<&str> = vocab
+        .lines()
+        .filter_map(|l| l.strip_prefix("pub const "))
+        .filter(|l| !l.starts_with("fn "))
+        .filter_map(|l| l.split(':').next())
+        .collect();
+    assert!(
+        names.len() > 30,
+        "only {} telemetry constants were found — the vocabulary moved and \
+         this guard is now inert",
+        names.len()
+    );
+
+    let dead: Vec<&&str> = names
+        .iter()
+        .filter(|n| **n != "LOUD_EVENTS")
+        .filter(|n| !src.contains(&format!("telemetry::{n}")))
+        .collect();
+    assert!(
+        dead.is_empty(),
+        "these telemetry names are declared and nothing uses them, so the \
+         panel they describe is permanently blank: {dead:?}"
+    );
+
+    assert!(
+        read("site/content/docs/operations.md").contains("telemetry::LOUD_EVENTS"),
+        "`LOUD_EVENTS` is exempt because it is published for a deployment to \
+         wire alerts from, and the page that publishes it no longer names it — \
+         the exemption is now licensing a dead constant"
+    );
+}
+
+/// An erased effect answers every question a typed one does.
+///
+/// `Box<dyn AnyEffect>` implements `Effect`, and the module doc promises it
+/// "travels the **same** dispatch path as any other effect". Nothing made that
+/// true. Every `Effect` method has a default, so a method added to the trait and
+/// not forwarded through the erasure compiles, runs, and silently answers the
+/// *default* for every boxed effect — which for the `GenAI` seams meant a
+/// completion dispatched as a group member would open a span naming no model, no
+/// provider and no cost, while the identical typed call named all three.
+///
+/// The same hole left the two `AnyEffect` methods with no caller anywhere: the
+/// forwarding that would have called them was the thing that was missing.
+///
+/// Three lists have to agree, and the guard reads all three out of the source:
+/// the `Effect` trait's methods, the `AnyEffect` trait's, and the forwarding
+/// impl's. A method may be renamed across the erasure — `spend` is
+/// `spend_erased` there, because the output arrives as a `Value` — so the
+/// pairing allows that one suffix and nothing else.
+#[test]
+fn an_erased_effect_forwards_every_seam() {
+    let src = read("src/core/effect.rs");
+
+    let block = |start: &str| -> String {
+        let from = src
+            .find(start)
+            .unwrap_or_else(|| panic!("`{start}` not found — this guard reads the wrong shape"));
+        let open = src[from..].find('{').expect("a block") + from;
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return src[open..open + i].to_owned();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{start}` is not terminated");
+    };
+    let methods = |b: &str| -> Vec<String> {
+        b.lines()
+            .filter_map(|l| {
+                l.trim()
+                    .strip_prefix("fn ")
+                    .or_else(|| l.trim().strip_prefix("async fn "))
+            })
+            .filter_map(|l| l.split('(').next())
+            .filter_map(|l| l.split('<').next())
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let declared = methods(&block("pub trait Effect:"));
+    let erased = methods(&block("pub trait AnyEffect:"));
+    let forwarded = methods(&block("impl Effect for Box<dyn AnyEffect"));
+    assert!(
+        declared.len() >= 15,
+        "only {} `Effect` methods were found, so this guard is reading the wrong \
+         shape rather than passing",
+        declared.len()
+    );
+
+    // `attach` is the one method the erasure renames for a reason other than the
+    // output type: it takes `&mut self`, which a trait object cannot offer
+    // through the blanket impl under the same name.
+    let answers = |name: &str, list: &[String]| {
+        list.iter()
+            .any(|m| m == name || m == &format!("{name}_erased"))
+    };
+    let unerased: Vec<&String> = declared.iter().filter(|m| !answers(m, &erased)).collect();
+    assert!(
+        unerased.is_empty(),
+        "`AnyEffect` cannot answer these `Effect` methods, so an erased effect \
+         falls back to their defaults: {unerased:?}"
+    );
+    let undelivered: Vec<&String> = declared.iter().filter(|m| !forwarded.contains(m)).collect();
+    assert!(
+        undelivered.is_empty(),
+        "`impl Effect for Box<dyn AnyEffect>` does not forward these, so a boxed \
+         effect answers the trait's default instead of its own: {undelivered:?}"
+    );
+}
+
+/// Every event constant is in the list a deployment wires its alerts from.
+///
+/// The sibling below checks that everything `LOUD_EVENTS` names is emitted. This
+/// is the other direction, and it is the one that was open: `LOUD_EVENTS` is
+/// hand-written, so an event added to the vocabulary and emitted by the runtime
+/// simply is not in it, and nothing notices. `agentplane.run.failed` was in that
+/// state — the event added *because* an operator had no way to learn why a run
+/// failed, missing from the published list and from the operations page's table
+/// headed *every*, so the delivery it exists for routed around it.
+///
+/// Read out of the section the events live in rather than by name, so a new one
+/// is in scope the moment it is declared.
+#[test]
+fn every_event_in_the_vocabulary_is_published_for_alerting() {
+    let vocab = read("src/runtime/telemetry.rs");
+    let events = vocab
+        .split("// ── Events")
+        .nth(1)
+        .expect("telemetry declares an events section");
+    let declared: Vec<&str> = events
+        .lines()
+        .filter_map(|l| l.strip_prefix("pub const "))
+        // `pub const fn` is a function, not a name in the vocabulary.
+        .filter(|l| !l.starts_with("fn "))
+        .filter_map(|l| l.split(':').next())
+        .filter(|n| *n != "LOUD_EVENTS")
+        .collect();
+    assert!(
+        declared.len() >= 15,
+        "only {} events were found in the events section, so this guard is \
+         reading the wrong shape rather than passing",
+        declared.len()
+    );
+
+    let list = events
+        .split("pub const LOUD_EVENTS")
+        .nth(1)
+        .expect("telemetry declares LOUD_EVENTS")
+        .split("];")
+        .next()
+        .expect("LOUD_EVENTS is terminated");
+    let missing: Vec<&&str> = declared
+        .iter()
+        .filter(|n| !list.contains(&format!("    {n},")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these events are declared and emitted and are not in `LOUD_EVENTS`, so \
+         a deployment wiring its alerts from that list is not watching them: \
+         {missing:?}"
+    );
+}
+
+/// Every promised event is emitted as a `target`, not as a field.
+///
+/// The module doc states the rule — an event's semantic identity lives in its
+/// `target`, which is the whole reason events are targeted rather than named —
+/// and the operations page publishes the table as *every failure has its own
+/// event target*. One did not: `agentplane.witness.integrity` was emitted as an
+/// `event = ...` field, so a subscriber filtering by target, which is what the
+/// page tells an operator to do, saw nothing.
+///
+/// It matters most for that one. A witness refusing this plane's checkpoint is
+/// the single event whose audience is not the operator running the plane, and it
+/// is the one they have an interest in nobody hearing.
+#[test]
+fn every_promised_event_is_emitted_on_its_own_target() {
+    let src: String = walk("src").iter().map(|f| read(f)).collect();
+    let vocab = read("src/runtime/telemetry.rs");
+    for name in agentplane::runtime::telemetry::LOUD_EVENTS {
+        let decl = vocab
+            .lines()
+            .find(|l| l.contains(&format!("= \"{name}\";")))
+            .unwrap_or_else(|| panic!("`{name}` has no `pub const` in telemetry.rs"));
+        let ident = decl
+            .split_whitespace()
+            .nth(2)
+            .and_then(|t| t.strip_suffix(':'))
+            .unwrap_or_else(|| panic!("cannot read the constant name from: {decl}"));
+        assert!(
+            src.contains(&format!("target: crate::runtime::telemetry::{ident}"))
+                || src.contains(&format!("target: super::telemetry::{ident}"))
+                || src.contains(&format!("target: telemetry::{ident}")),
+            "`{name}` is promised for alerting and nothing emits it as a \
+             `target:` — a subscriber filtering by target, which is what the \
+             operations page tells an operator to do, does not receive it"
+        );
+    }
+}
+
 /// Every event P7 promises must actually be emitted by something.
 ///
 /// A telemetry constant nobody emits is the dashboard equivalent of a dead API:

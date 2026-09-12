@@ -1883,6 +1883,111 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        let url = format!(\"{}/add-checkpoint\", self.prefix);",
         "        let old_size = checkpoint.size.saturating_sub(proof.len() as u64);\n        let url = format!(\"{}/add-checkpoint\", self.prefix);",
     ),
+    "AGenAiSpanNamesNoModel": (
+        "src/runtime/ctx.rs",
+        "a_model_call_is_reported_as_a_gen_ai_chat",
+        "a completion's span carries the operation name and nothing else, so "
+        "which model of which provider answered is invisible to the convention "
+        "the attribute set exists for — and a panel keyed on it reads blank as "
+        "*no model* rather than *nothing reports it*",
+        """            if let Some(request) = effect.gen_ai_request() {""",
+        """            if false && let Some(request) = effect.gen_ai_request() {""",
+    ),
+    "AGenAiSpanNamesNoCost": (
+        "src/runtime/ctx.rs",
+        "a_model_call_is_reported_as_a_gen_ai_chat",
+        "what the provider said about its own answer never reaches the span, so "
+        "a completion's cost, its stop reason and the model that served it are "
+        "absent from the attributes the convention defines for exactly them",
+        """                if let Some(reply) = effect.gen_ai_response(answer) {""",
+        """                if false && let Some(reply) = effect.gen_ai_response(answer) {""",
+    ),
+    "AFailedAttemptNamesNoFault": (
+        "src/runtime/ctx.rs",
+        "a_failed_attempt_names_the_class_of_fault",
+        "a failed attempt's span says only that something went wrong, so every "
+        "panel keyed on `error.type` reports a plane with no failures at all — "
+        "the one claim this runtime exists not to make",
+        """                span.record(telemetry::ERROR_TYPE, failure.class());""",
+        """                let _ = failure;""",
+    ),
+    "APostgresPageIsAdvisory": (
+        "src/store/postgres.rs",
+        "postgres_satisfies_the_journal_store_contract",
+        "the shared backend ignores the page's bound — the redb mutation cannot "
+        "reach this copy of the rule, and SQL is where a forgotten LIMIT looks "
+        "most like a complete query",
+        """                  WHERE tenant = $1 AND run_id = $2 AND seq >= $3 ORDER BY seq ASC
+                  LIMIT $4""",
+        """                  WHERE tenant = $1 AND run_id = $2 AND seq >= $3 ORDER BY seq ASC""",
+    ),
+    "ATenantLabelStopsAtTheMetrics": (
+        "src/runtime/executor.rs",
+        "the_tenant_label_reaches_the_run_span_too",
+        "the tenant policy is honoured on the metrics and not on the traces, so "
+        "a deployment that asked which tenant a run belongs to is answered on "
+        "one signal and left guessing on the other",
+        """        if !self.meter.tenant().is_empty() {
+            span.record(telemetry::TENANT, self.meter.tenant());
+        }""",
+        """        let _ = &self.meter;""",
+    ),
+    "ALeaseForgetsWhatTheHistoryRecords": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a run with no lease row is leased at epoch 1 whatever its history "
+        "already reached, so a restore — which carries no lease table — hands a "
+        "run that had changed hands a second ownership period wearing the "
+        "number of its first, and quota settlement matches passes to spend by "
+        "exactly that number",
+        """                        None => epoch_after_history(&w, key.as_str())?,""",
+        """                        None => 1,""",
+    ),
+    "APostgresLeaseForgetsTheHistory": (
+        "src/store/postgres.rs",
+        "postgres_satisfies_the_journal_store_contract",
+        "the shared backend's first lease ignores the run's journal, so the "
+        "fencing token restarts below the epochs the history already carries — "
+        "the redb mutation cannot reach this copy of the rule",
+        """                         COALESCE((SELECT MAX(epoch) FROM journal
+                                    WHERE tenant = $1 AND run_id = $2), 0) + 1,""",
+        """                         1,""",
+    ),
+    "AJournalPageIsAdvisory": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the store ignores the page's bound and reads a run's whole remaining "
+        "history, which the one surface that pages then truncates — so the "
+        "answers are byte-identical and the only difference is that every page "
+        "of a long run costs the length of the run",
+        """                .map_err(|e| be(&e))?
+                .take(limit)""",
+        """                .map_err(|e| be(&e))?
+                .take(usize::MAX)""",
+    ),
+    "ARecordArrivesWithoutItsEnvelope": (
+        "src/api/mod.rs",
+        "a_runs_journal_is_readable_and_pages_from_a_cursor",
+        "an operator surface serves a record's payload and drops the identity "
+        "it belongs to, so a reader sees that an effect started and not which "
+        "one, and cannot pair a start with its outcome",
+        """        "effect_key": r.effect_key().map(|k| k.to_string()),""",
+        """        "effect_key": Value::Null,""",
+    ),
+    "AnErasedEffectLosesItsTarget": (
+        "src/core/effect.rs",
+        "an_erased_effect_reports_what_a_typed_one_does",
+        "an effect dispatched through the erasure answers the trait's defaults "
+        "for the GenAI seams, so the same call opens a span naming a model when "
+        "typed and naming nothing when boxed — while the module doc promises "
+        "the two travel the same path",
+        """    fn gen_ai_request(&self) -> Option<GenAiRequest> {
+        (**self).gen_ai_request()
+    }""",
+        """    fn gen_ai_request(&self) -> Option<GenAiRequest> {
+        None
+    }""",
+    ),
     "AnAttemptDoesNotChangeAnEffectsIdentity": (
         "src/core/id.rs",
         "effect_key_separates_step_phase_ordinal_and_attempt",
@@ -2948,8 +3053,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the fake records `output.schema` and ignores it, so a run scripted with "
         "prose completes and yields Null where every real driver answers "
         "Unusable — a stub passing tests no provider could pass",
-        "            .and_then(|completion| honour_schema(completion, request.schema, request.model));",
-        "            .map(|completion| completion);",
+        "            .and_then(|completion| honour_schema(completion, request.schema, request.model))",
+        "            .map(|completion| completion)",
     ),
     "TheFakeIsNotDeterministic": (
         "src/model/fake.rs",
@@ -2958,15 +3063,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "coin-toss that mostly passes",
         '        let scripted = self.scripted.lock().expect("fake").pop_front();\n'
         "        let answer = scripted\n"
-        "            .unwrap_or_else(|| Ok(echo(&request)))\n"
-        "            .and_then(|completion| honour_schema(completion, request.schema, request.model));",
+        "            .unwrap_or_else(|| Ok(echo(&request)))",
         '        let scripted = self.scripted.lock().expect("fake").pop_front();\n'
         "        let n = self.calls();\n"
-        "        let answer = scripted.unwrap_or_else(|| {\n"
-        "            let mut c = echo(&request);\n"
-        '            c.text = format!("{} #{n}", c.text);\n'
-        "            Ok(c)\n"
-        "        });",
+        "        let answer = scripted\n"
+        "            .unwrap_or_else(|| {\n"
+        "                let mut c = echo(&request);\n"
+        '                c.text = format!("{} #{n}", c.text);\n'
+        "                Ok(c)\n"
+        "            })",
     ),
     "TheFakeScriptRunsBackwards": (
         "src/model/fake.rs",
@@ -4476,11 +4581,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if false {",
     ),
     "MetricsLeakTheTenantByDefault": (
-        "src/runtime/metrics.rs",
+        "src/runtime/telemetry.rs",
         "metrics_carry_no_tenant_unless_asked",
-        "a plane puts its tenant on every metric without being asked, so "
-        "customer names reach whatever backend the deployment happens to point "
-        "at — usually the least protected system it runs",
+        "a plane puts its tenant on everything it reports without being asked, "
+        "so customer names reach whatever backend the deployment happens to "
+        "point at — usually the least protected system it runs",
         "    #[default]\n    Omitted,",
         "    Omitted,\n    #[default]",
     ),

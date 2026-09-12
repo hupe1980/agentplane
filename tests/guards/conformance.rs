@@ -100,6 +100,15 @@ impl JournalStore for NoExactlyOnce {
     ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
         self.inner.read(run, from).await
     }
+
+    async fn read_page(
+        &self,
+        run: agentplane::core::RunId,
+        from: agentplane::core::Seq,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
+        self.inner.read_page(run, from, limit).await
+    }
     async fn admitted_as(
         &self,
         key: &str,

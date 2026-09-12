@@ -298,6 +298,151 @@ async fn an_orphaned_event_wait_is_resubscribed_on_resume() {
     store.verify(out.run_id).await.unwrap();
 }
 
+/// A plane that suspended a run awaiting a message, and the export of it.
+///
+/// Split out because the sequence under test starts where this ends — and
+/// because a fixture that builds the state is not the thing being asserted.
+async fn a_run_awaiting_a_message() -> (RunId, Vec<u8>) {
+    let origin = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(origin.clone() as Arc<dyn JournalStore>)
+        .owner("origin")
+        .cases(origin.clone() as Arc<dyn CaseStore>)
+        .events(origin.clone() as Arc<dyn EventStore>)
+        .skill(AwaitsApproval {
+            done: Arc::new(AtomicUsize::new(0)),
+            matter: "M-2",
+        })
+        .build();
+
+    let out = rt
+        .run_plan_correlated(
+            await_plan(),
+            Tainted::trusted(json!({})),
+            "matter",
+            &[CorrelationKey::new("matter", "M-2")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+
+    let journal = origin.clone() as Arc<dyn JournalStore>;
+    let cases = origin.clone() as Arc<dyn CaseStore>;
+    let mut bytes = Vec::new();
+    agentplane::export::to_jsonl(&journal, Some(&cases), &[out.run_id], &mut bytes)
+        .await
+        .expect("an in-flight run exports");
+    (out.run_id, bytes)
+}
+
+/// A restored event wait is subscribed by nothing, and a resume repairs it.
+///
+/// The timer twin of this is pinned in `tests/process/timers.rs`; this is the
+/// half a restore leaves in a different store. A subscription lives where the
+/// events do, and an export carries neither — so a restored run awaiting a
+/// message has an announcement in its journal, no subscription anywhere, and a
+/// lease it released cleanly when it suspended, which keeps it out of the
+/// recovery pass. Nothing in the system names it except
+/// `RestoreReport::awaiting`, and that field is advice rather than a control,
+/// so what makes the advice worth printing is that acting on it works.
+///
+/// The sharper failure is the one after the repair: an event that arrives at a
+/// plane with no subscription **buffers**, and a buffered event nobody claims
+/// dead-letters. So a restore whose waits were never repaired loses inbound
+/// messages silently — the run looks like work in progress and the message
+/// looks like a correlation bug.
+#[tokio::test]
+async fn a_restored_event_wait_is_subscribed_by_nothing_until_the_run_is_resumed() {
+    let (run, bytes) = a_run_awaiting_a_message().await;
+
+    // A different store, as a restore is: journal and case layer, nothing else.
+    let rebuilt = Arc::new(RedbStore::open_in_memory().unwrap());
+    let fresh: Arc<dyn JournalStore> = rebuilt.clone();
+    let fresh_cases: Arc<dyn CaseStore> = rebuilt.clone();
+    let report =
+        agentplane::export::from_jsonl(&fresh, Some(&fresh_cases), std::io::Cursor::new(&bytes))
+            .await
+            .expect("the restore reads it");
+
+    assert!(
+        report.awaiting.contains(&run),
+        "the restore did not name the run that came back waiting on a message, \
+         so the one thing an operator has to act on is not in the report: {report:?}"
+    );
+    let abandoned = fresh.abandoned_runs(100).await.unwrap();
+    assert!(
+        !abandoned.contains(&run),
+        "a cleanly suspended run appeared in the recovery queue, so the claim \
+         that nothing else names it is wrong: {abandoned:?}"
+    );
+
+    let done = Arc::new(AtomicUsize::new(0));
+    let restored = Runtime::builder(Arc::clone(&fresh))
+        .owner("restored")
+        .cases(rebuilt.clone() as Arc<dyn CaseStore>)
+        .events(rebuilt.clone() as Arc<dyn EventStore>)
+        .skill(AwaitsApproval {
+            done: Arc::clone(&done),
+            matter: "M-2",
+        })
+        .build();
+
+    // Before the repair the message has nowhere to go. Delivered now it would
+    // buffer and eventually dead-letter, which is the loss this sequence
+    // exists to rule out — so it is asserted rather than assumed.
+    let unheard = restored
+        .deliver(
+            &InboundEvent::new("urn:test:approver", "EV-early", "go.ahead", json!({}))
+                .correlate(CorrelationKey::new("matter", "M-2")),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unheard,
+        Delivery::Buffered,
+        "a restored plane claimed to have a waiter before anything re-subscribed"
+    );
+
+    let again = restored.replay(run, Mode::Resume).await.unwrap();
+    assert!(
+        again.status.is_suspended() || done.load(Ordering::SeqCst) == 1,
+        "the resumed run neither waited again nor consumed the buffered \
+         message: {:?}",
+        again.status
+    );
+
+    // The repair is proven by the message being consumed: the resume either
+    // claimed the one already buffered, or re-subscribed so the next delivery
+    // lands. Both are a live subscription; neither is possible without one.
+    if done.load(Ordering::SeqCst) == 0 {
+        let delivery = restored
+            .deliver(
+                &InboundEvent::new(
+                    "urn:test:approver",
+                    "EV-2",
+                    "go.ahead",
+                    json!({ "ok": true }),
+                )
+                .correlate(CorrelationKey::new("matter", "M-2")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            delivery,
+            Delivery::Resumed { run },
+            "the delivery found no waiter on the restored plane, so `awaiting` \
+             is advice that does not work and every message for this run \
+             buffers until it dead-letters"
+        );
+    }
+    assert_eq!(done.load(Ordering::SeqCst), 1, "the restored run finished");
+    assert_eq!(
+        announcements(&rebuilt, run, "event.await").await,
+        1,
+        "the repair announced the wait a second time"
+    );
+    rebuilt.verify(run).await.unwrap();
+}
+
 // ── The wake path's lease handover ──────────────────────────────────────────
 
 /// A journal store that counts lease acquisitions, so a test can see the
@@ -324,6 +469,15 @@ impl JournalStore for CountsAcquires {
     }
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
         self.inner.read(run, from).await
+    }
+
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: Seq,
+        _limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        self.read(run, from).await
     }
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.runs_by_outcome(outcome, limit).await

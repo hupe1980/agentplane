@@ -1352,8 +1352,9 @@ a **suspended** run is a resting point — a redelivery of a message whose run i
 parked on a four-eyes decision is told *this is already waiting for you*, rather
 than opening a second identical approval.
 
-`spawn_once` and `spawn_correlated_once` are the non-blocking pair; they return
-`Spawned { run, fresh }`.
+`spawn_correlated_once` is the non-blocking form and returns
+`Spawned { run, fresh }`. Any other combination — a case binding, a chain per
+run — goes through `spawn_under` with `RunTerms`, which composes all of them.
 
 **The third trap:** an empty key. A missing header or an unset variable arrives
 as `""`, and `""` is a perfectly good key — the first message claims it and every

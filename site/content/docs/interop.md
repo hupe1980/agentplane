@@ -833,6 +833,12 @@ Details worth stating:
   prose that stops early is readable, and only the caller knows whether they were
   parsing JSON — but a partial answer returned as a whole one is exactly the
   silent truncation refused everywhere else.
+* **The model that answered is carried, where the wire says it.**
+  `Completion::model` is the provider's own word about which weights served the
+  call, and it differs from the request whenever an alias resolves or a
+  deployment moves under a pinned name. `None` where the wire names none —
+  Bedrock's `Converse` — because filling it in from the request would report a
+  substitution had been ruled out when nothing looked.
 * **A provider's error body is trimmed** before it becomes an error message.
   Providers echo the prompt back in error payloads, and a prompt carries whatever
   the run was working on; an unbounded message turns a failure into an

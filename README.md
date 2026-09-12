@@ -217,29 +217,24 @@ agentplane serve examples/served.yaml \
   --store ./served.redb
 ```
 
-Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too —
-the worklist and task decisions, plus the backlogs an on-call person asks for by
-question rather than by id: what is quarantined, what is escalated, which
-obligations were missed, which messages reached nobody, and which webhook
-receivers stopped accepting ([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for)).
-Every backlog that is *work* has a verb that empties it, including the hard one:
-a run stopped on an effect nobody can account for names the call, takes a
-person's answer about what actually happened, and is then judged again by the
-runtime — or written off, in which case what it left standing becomes an audit
-finding rather than leaving with the status
-([answering a quarantine](https://hupe1980.github.io/agentplane/docs/operations/#answering-a-quarantine)).
-A missed obligation is answered the same way, by an account that names who
-looked. The one listing with no verb is dead letters, and it is a *diagnosis*
-rather than a queue — the fix is a correlation key in somebody's emitter — so it
-is ordered newest-first, which is what a page onto a list nothing removes from
-has to be.
-On their **own** listener, off
-unless asked for, and separated from the peer surface by *policy* (`peer` reaches
-`a2a:*`, `operator` reaches `api:*`) rather than by the port. A served plane also
-sweeps deadlines, task expiry, dead letters, due timers **and abandoned runs**
-— a lease that expired while still naming an owner is an instance that died
-holding the run, and the sweep takes it over and resumes it — so a run that
-sleeps, waits or loses its instance actually finishes.
+Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too, on
+its **own** listener, off unless asked for, and separated from the peer surface
+by *policy* (`peer` reaches `a2a:*`, `operator` reaches `api:*`) rather than by
+the port. It serves the worklist and task decisions, plus the backlogs an on-call
+person asks for by question rather than by id: what is quarantined, what is
+escalated, which obligations were missed, which messages reached nobody, which
+webhook receivers stopped accepting
+([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for)).
+
+Every backlog that is *work* has a verb that empties it, including
+[the hard one](https://hupe1980.github.io/agentplane/docs/operations/#answering-a-quarantine)
+— a run stopped on an effect nobody can account for. The one listing with no verb
+is dead letters, because it is a *diagnosis* rather than a queue: the fix is a
+correlation key in somebody's emitter, so it is ordered newest-first. A served
+plane also sweeps deadlines, task expiry, dead letters, due timers **and
+abandoned runs** — a lease that expired while still naming an owner is an
+instance that died holding the run — so a run that sleeps, waits or loses its
+instance actually finishes.
 
 And it **drains** on `SIGTERM`: stop accepting, answer what is in hand, close
 admission, and give the runs still executing `--drain-secs` to reach a journaled

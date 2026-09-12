@@ -26,6 +26,9 @@ pub struct Accumulator {
     calls: std::collections::BTreeMap<u64, PartialCall>,
     finish_reason: Option<String>,
     usage: Option<Value>,
+    /// The model the server says answered. Repeated on every chunk of this
+    /// wire, so the last one wins for the reason `usage` does.
+    model: Option<String>,
     /// Whether any content or tool-call fragment was seen — the judgement the
     /// severed-stream mapping turns on.
     generated: bool,
@@ -78,9 +81,13 @@ impl Accumulator {
         }
         let chunk: Value = serde_json::from_str(data).ok()?;
         // The usage-bearing chunk has an empty `choices` array on the real
-        // wire, so usage is read independently of the choice.
+        // wire, so usage is read independently of the choice — and so is the
+        // model name, which this wire repeats on every chunk.
         if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(usage.clone());
+        }
+        if let Some(model) = chunk.get("model").and_then(Value::as_str) {
+            self.model = Some(model.to_owned());
         }
         let delta = chunk.get("choices")?.get(0).map_or(&Value::Null, |c| {
             if let Some(reason) = c.get("finish_reason").and_then(Value::as_str) {
@@ -195,6 +202,7 @@ impl Accumulator {
                 "finish_reason": self.finish_reason,
             }],
             "usage": self.usage,
+            "model": self.model,
         })
     }
 }

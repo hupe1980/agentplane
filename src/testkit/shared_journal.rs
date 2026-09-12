@@ -50,6 +50,15 @@ impl JournalStore for SharedJournal {
         self.inner.read(run, from).await
     }
 
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: crate::core::Seq,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        self.inner.read_page(run, from, limit).await
+    }
+
     async fn acquire(
         &self,
         run: RunId,

@@ -688,6 +688,21 @@ pub struct ToolCall {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Completion {
     pub text: String,
+    /// The model that actually answered, as the provider reported it.
+    ///
+    /// Not the model that was asked for — that is on the effect's descriptor and
+    /// in its provenance source, and it is hashed into the effect key. This is
+    /// the provider's own word about which weights served the request, and the
+    /// two differ whenever an alias resolves (`claude-opus-latest`), a
+    /// deployment is moved under a pinned name, or a gateway routes elsewhere.
+    /// Without it a run's evidence says only *which model was requested*, and a
+    /// substitution is invisible to the party the journal exists to convince.
+    ///
+    /// `None` where the wire does not say. Bedrock's `Converse` response is the
+    /// shipped case: it carries no model field, and reporting the requested one
+    /// here would hide exactly the substitution this field exists to expose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Tools the model asked to call.
     ///
     /// Empty for an ordinary answer, and empty for the forced-tool path used to
@@ -1614,6 +1629,24 @@ impl Effect for ModelCall {
         crate::core::SourceId::new(format!("model:{}", self.model))
     }
 
+    fn gen_ai_request(&self) -> Option<crate::core::GenAiRequest> {
+        Some(crate::core::GenAiRequest {
+            provider: Some(self.model.provider.clone()),
+            name: self.model.model.clone(),
+        })
+    }
+
+    fn gen_ai_response(&self, output: &Completion) -> Option<crate::core::GenAiResponse> {
+        Some(crate::core::GenAiResponse {
+            model: output.model.clone(),
+            finish_reason: output.stop_reason.clone(),
+            input_tokens: output.usage.input_tokens,
+            output_tokens: output.usage.output_tokens,
+            cache_read_tokens: output.usage.cache_read_tokens,
+            cache_write_tokens: output.usage.cache_write_tokens,
+        })
+    }
+
     fn spend(&self, output: &Completion) -> Spend {
         output.usage.spend()
     }
@@ -1993,6 +2026,7 @@ mod tests {
             *self.0.lock().unwrap() = request.stream.map(|(_, label)| label.clone());
             Ok(Completion {
                 text: "ok".to_owned(),
+                model: None,
                 tool_calls: Vec::new(),
                 usage: Usage::default(),
                 stop_reason: Some("end_turn".to_owned()),
@@ -2144,6 +2178,7 @@ mod tests {
             Ok(Completion {
                 tool_calls: Vec::new(),
                 text: "described".to_owned(),
+                model: None,
                 usage: Usage::default(),
                 stop_reason: Some("stop".to_owned()),
                 truncated: false,

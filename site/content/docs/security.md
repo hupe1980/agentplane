@@ -1227,6 +1227,24 @@ measure them until the payload is sealed or erased. A count is not personal data
 and survives both, because *how much left* has to stay answerable after *what
 left* is destroyed.
 
+### A trace is not a sink {#traces-carry-no-content}
+
+The `GenAI` semantic conventions define Opt-In attributes that carry the content
+of a call — the prompt, the answer, the system instruction, a tool's arguments.
+This plane emits none of them, and it is not a default a deployment may flip.
+
+A prompt is exactly where governed values arrive, the sink gates bound where
+those values may go, and a trace exporter is an egress those gates do not cover:
+sensitivity is a property of a *value*, and a span has nowhere to carry one. What
+traces carry is the **shape** of a call — who was asked, what it cost, which tool
+ran, how it ended — and the journal carries the content, where the same values
+are sealed, labelled and erasable. The two are joined by
+`agentplane.effect.key`, so a span locates the evidence instead of copying it.
+
+The full attribute set, and the three the convention defines that this plane
+leaves empty for reasons of its own, are on the
+[operations page](@/docs/operations.md#no-content-in-traces).
+
 ### A peer endpoint and a card URL refuse plaintext
 
 The outbound A2A call carries the run's payload and, when one is held, a

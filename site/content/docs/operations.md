@@ -901,6 +901,24 @@ changed hands would rehash under a single fresh lease, and those are exactly the
 runs a failover produced. Both backends fence only when a lease row exists, so
 restoring into a store with no leases writes each record under its own epoch.
 
+**The fencing token picks up where the history left off.** The epoch is a
+fencing token, and the lease table that normally holds its high-water mark is
+store-local state an export does not carry — so a restored run has records
+reaching epoch 7 and no lease row at all. A first lease is therefore issued one
+past the highest epoch the run's **own journal** records, not at 1. Restarting
+at 1 would give a run that had already changed hands a second ownership period
+wearing the number of its first, and the two would be indistinguishable in the
+only durable record of either — which matters beyond tidiness, because quota
+settlement decides which pass a spend belongs to by matching that number. The
+rule is checked in the store conformance battery on both backends.
+
+What it cannot see is an epoch that was **issued and never written under**: a
+lease taken by an owner that died before appending leaves no record, so nothing
+durable knows the number was handed out. It bounds every epoch that ever wrote,
+which is every epoch that can conflict with the rebuilt history. The rest is the
+requirement every failover already has and the runbook owns — **the old
+deployment must not reach the restored store.**
+
 What does not survive is named in the report rather than left to be discovered.
 
 **A restored wait is armed by nothing, and this is the entry that costs work.**
@@ -1170,20 +1188,81 @@ JSON logs, a test recorder — without the crate choosing an exporter.
 
 ```
 agentplane.run                     gen_ai.operation.name = invoke_agent
+                                   gen_ai.agent.name, gen_ai.conversation.id
+                                   agentplane.run.id, .mode, .semconv
 └── agentplane.step                agentplane.step.id, .capability; agentplane.phase
-    └── agentplane.effect          .kind, .attempt, .mutates, .replayed
+    └── agentplane.effect          .kind, .key, .attempt, .mutates, .replayed
+                                   agentplane.mode; error.type when it failed
                                    gen_ai.operation.name = execute_tool | chat
+                                   chat:          gen_ai.provider.name,
+                                                  gen_ai.request.model,
+                                                  gen_ai.response.model,
+                                                  gen_ai.response.finish_reasons,
+                                                  gen_ai.usage.{input,output}_tokens,
+                                                  gen_ai.usage.cache_{read,write}.input_tokens
+                                   execute_tool:  gen_ai.tool.name
 ```
 
 Spans follow the **OpenTelemetry GenAI semantic conventions** where they apply:
 a tool call is `execute_tool`, a completion is `chat`. Each effect *declares* its
-own operation rather than having one inferred from its name, so a new effect
-type cannot pick up a label by accident.
+own operation and its own attributes rather than having either inferred from its
+name, so a new effect type cannot pick up a label by accident — and the keys do
+not cross, because a completion naming a tool would make every model call look
+like a tool invocation.
+
+**Where the convention names a fact, the convention's name is what is emitted.**
+An agent's name and a conversation's identity are `gen_ai.agent.name` and
+`gen_ai.conversation.id`, not a second spelling in this crate's namespace that no
+generic tooling reads. The conversation is this plane's **case**, which is also
+what the A2A surface answers `contextId` with.
+
+`gen_ai.response.model` is the one attribute a request cannot stand in for: it is
+the provider's own word about which weights served the call, and it differs from
+the request whenever an alias resolves, a deployment is moved under a pinned name,
+or a gateway routes elsewhere. It is absent where the wire does not say —
+Bedrock's `Converse` names no model on the way back — and it is never filled in
+from the request, which would report that a substitution had been ruled out when
+nothing looked.
+
+`error.type` carries the class of fault on any attempt that failed — `timeout`,
+`refused`, `rate_limited`, `metered`. `agentplane.outcome` says *whether* an
+attempt succeeded and makes a failure countable; this says what went wrong, so
+"which driver fails how" is a group-by rather than a search through rendered
+prose. Without it, a dashboard built on the convention reports a plane with no
+failures at all.
+
+`agentplane.effect.key` is the join between a trace and the evidence. Everything
+else on the span names a category; this is the journal's own identity for that
+attempt, and `GET /runs/{run}/history` serves records under it. It **names** the
+attempt without carrying what it sent — which is the claim worth making, since a
+digest is still a commitment to the values it was taken over.
 
 Effects that are not GenAI operations — reading the clock, arming a timer,
 writing case state — carry no such attribute at all. That is deliberate:
 labelling them would make the attribute useless to the tooling that keys on it,
 which is the whole reason to emit it.
+
+### What is deliberately never emitted {#no-content-in-traces}
+
+The conventions define Opt-In attributes that carry the **content** of a call:
+`gen_ai.input.messages`, `gen_ai.output.messages`, `gen_ai.system_instructions`,
+`gen_ai.tool.definitions` and `gen_ai.tool.call.arguments`. This plane emits none
+of them, and it is not a default to flip. A prompt is exactly where governed
+values arrive; the sink gates exist to keep those values inside a declared
+ceiling; and a trace exporter is an egress those gates do not cover. Sensitivity
+is a property of a value, and a span is not a sink that can carry one.
+
+What a deployment gets instead is the **shape** of every call — who was asked,
+what it cost, which tool ran, how it ended — and the journal for the content,
+where the same values are sealed, labelled and erasable.
+
+Three more the convention defines that this plane does not emit, each for its own
+reason. `gen_ai.response.id`, because no shared part of a completion carries one.
+`gen_ai.provider.name` on the **run** span, because the agent is executed here
+rather than served by anyone — the completion spans beneath it each name the
+provider that answered them. And `server.address`, because a driver's endpoint is
+deployment configuration, identical for every call it makes: that belongs on the
+OTel *resource* your exporter sets, not repeated on every span.
 
 The conventions are still pre-1.0, so the revision targeted is pinned in
 `telemetry::SEMCONV_VERSION` rather than tracked. An upstream change becomes a
@@ -1217,6 +1296,7 @@ Every failure P7 exists to surface has its own event target:
 | `agentplane.run.unreproducible` | A pinned read came back as different content — the durable record is not trustworthy |
 | `agentplane.run.recovered` | The sweep took over a run whose owner died holding it |
 | `agentplane.run.replanned` | A run changed its plan, and the successor names its parent |
+| `agentplane.run.failed` | A run concluded `failed`, with the reason it gives an operator — an ordinary conclusion rather than an incident, and findable under `GET /runs?outcome=failed` |
 | `agentplane.effect.undecidable` | An outcome could not be determined and guessing was forbidden |
 | `agentplane.effect.reconciled` | A probe was asked whether a call landed |
 | `agentplane.budget.refused` | A limit refused an operation |
@@ -1385,17 +1465,27 @@ these catch is exactly that: a tool declaration in the wrong shape for the API
 being called, a plan format no provider with constrained decoding accepts, a
 prompt field mistaken for the wire's own.
 
-### Putting a tenant on your metrics
+### Putting a tenant on your telemetry
 
 Off by default, and the default is the interesting part. A tenant name is
-frequently a customer name, and a metrics backend is usually the least protected
-system in a deployment: sampled into third-party services, on a dashboard nobody
-signs into, retained past every other record. A deployment that has not decided
-where its metrics go has not decided that customer names may travel there.
+frequently a customer name, and an observability backend is usually the least
+protected system in a deployment: sampled into third-party services, on a
+dashboard nobody signs into, retained past every other record. A deployment that
+has not decided where its telemetry goes has not decided that customer names may
+travel there.
 
 ```rust
-.metric_tenant(TenantLabel::Name)
+.tenant_label(TenantLabel::Name)
 ```
+
+**One policy, both signals.** It is the `tenant` field of every metric event and
+`agentplane.tenant` on the run span — because *which tenant is this* answered on
+the metrics and unanswerable on the traces is the same decision honoured on one
+channel. On the run span only: every other span is inside that run's trace, so
+repeating a per-plane constant on each of them is bytes without information.
+
+Under the default the attribute is **absent** rather than blank, so a collector
+cannot read *not disclosed* as *no tenant*.
 
 **Cardinality is bounded by configuration, not by data.** The label is *this
 plane's* tenant, so the number of streams is the number of planes you wired.

@@ -496,7 +496,7 @@ impl Runtime {
             // plane: a witness reporting that this log moved is the one event
             // the party being audited has an interest in nobody hearing.
             tracing::error!(
-                event = crate::runtime::telemetry::WITNESS_INTEGRITY,
+                target: crate::runtime::telemetry::WITNESS_INTEGRITY,
                 witness = index,
                 origin = %checkpoint.origin,
                 size = checkpoint.size,

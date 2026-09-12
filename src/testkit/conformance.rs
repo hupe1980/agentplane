@@ -1155,6 +1155,7 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     an_attestation_survives_the_round_trip(fresh, &mut r).await;
     the_log_only_grows(fresh, &mut r).await;
     a_released_lease_is_free_at_once(fresh, &mut r).await;
+    a_lease_starts_past_every_epoch_the_history_records(fresh, &mut r).await;
     a_release_does_not_forget_the_epoch(fresh, &mut r).await;
     a_fenced_caller_cannot_release_the_new_owners_lease(fresh, &mut r).await;
     the_discovery_index_pages_in_a_total_order(fresh, &mut r).await;
@@ -1598,6 +1599,57 @@ async fn the_discovery_index_pages_in_a_total_order(fresh: Factory<'_>, r: &mut 
                 whole.len()
             ),
         );
+    }
+}
+
+/// A fresh lease starts past every epoch the run's own history records.
+///
+/// The epoch is a fencing token, and a fencing token that can go *backwards*
+/// stops being one. The lease table is where the high-water mark normally
+/// lives — and it is not in an export, so a restore replays a run's records
+/// under their original epochs and leaves no lease row behind. If the next
+/// acquire then started at 1, a run that had already changed hands would get a
+/// second ownership period wearing the number of its first, and the two would
+/// be indistinguishable in the only durable record of either.
+///
+/// That is not hypothetical bookkeeping: quota settlement identifies which pass
+/// a spend belongs to by matching the epoch on the record, so a collision
+/// settles one pass with another's money.
+///
+/// The journal is the answer, because it is the thing that survived: every
+/// record carries the epoch it was written under, so the high-water mark is
+/// recoverable from exactly the evidence a restore rebuilds.
+async fn a_lease_starts_past_every_epoch_the_history_records(fresh: Factory<'_>, r: &mut Report) {
+    // The epoch a restored history reaches, declared before anything runs so it
+    // is not an item in the middle of the body.
+    const RESTORED_AT: crate::core::Epoch = 7;
+
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+
+    // What a restore does: replay the records under the epochs they were
+    // written with, against a store whose lease table knows nothing.
+    if let Err(e) = store.append(RESTORED_AT, vec![admitted(run)]).await {
+        r.record("fencing", format!("appending without a lease failed: {e}"));
+        return;
+    }
+
+    match store.acquire(run, "after-the-restore", LEASE).await {
+        Ok(lease) if lease.epoch <= RESTORED_AT => r.record(
+            "fencing",
+            format!(
+                "a run whose history reaches epoch {RESTORED_AT} was leased at epoch {} — \
+                 the fencing token went backwards, so this ownership period is \
+                 indistinguishable from an earlier one in every record it writes",
+                lease.epoch
+            ),
+        ),
+        Ok(_) => {}
+        Err(e) => r.record(
+            "fencing",
+            format!("a restored run could not be leased at all ({e}) — nothing can resume it"),
+        ),
     }
 }
 
@@ -2902,6 +2954,26 @@ async fn read_starts_where_it_is_told(fresh: Factory<'_>, r: &mut Report) {
             }
         }
         Err(e) => r.record("chaining", format!("read(from=3) failed: {e}")),
+    }
+
+    // The page's bound is applied by the *store*, and it has to be checked here
+    // because no caller can check it: the one surface that pages truncates what
+    // it gets, so a backend that ignored the limit and returned a run's whole
+    // history would serve byte-identical answers and differ only in how much it
+    // read. That is a cost, and a cost is not an assertion anywhere else.
+    match store.read_page(run, 1, 2).await {
+        Ok(records) => {
+            let seqs: Vec<u64> = records.iter().map(Record::seq).collect();
+            if seqs != vec![1, 2] {
+                r.record(
+                    "chaining",
+                    format!(
+                        "read_page(from=1, limit=2) must return exactly seq 1 and 2, got {seqs:?}"
+                    ),
+                );
+            }
+        }
+        Err(e) => r.record("chaining", format!("read_page(limit=2) failed: {e}")),
     }
 }
 

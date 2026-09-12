@@ -66,6 +66,7 @@ impl ModelProvider for EmitsStream {
             ));
         }
         Ok(Completion {
+            model: None,
             text: "hello".to_owned(),
             tool_calls: Vec::new(),
             usage: Usage {
@@ -474,6 +475,7 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
             detail: "connection reset".into(),
         })
         .will_answer(Completion {
+            model: None,
             tool_calls: Vec::new(),
             text: "the second answer".into(),
             usage: Usage {
@@ -753,6 +755,7 @@ fn a_successful_completion_bills_its_usage() {
         json!({}),
     );
     let completion = Completion {
+        model: None,
         tool_calls: Vec::new(),
         text: "hi".into(),
         usage: Usage {
@@ -1053,6 +1056,7 @@ impl ModelProvider for IgnoresSchema {
         _request: agentplane::model::Request<'_>,
     ) -> Result<Completion, ModelError> {
         Ok(Completion {
+            model: None,
             text: "{}".to_owned(),
             tool_calls: Vec::new(),
             usage: Usage {

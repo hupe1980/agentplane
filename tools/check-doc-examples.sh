@@ -112,6 +112,23 @@ for rel, pat, what in [
             if found != msrv:
                 bad.append(f"{rel}:{n}: {what} says {found}, rust-version is {msrv}")
 
+# The landing page's own snippet. It is the first Rust anybody copies and it is
+# not Markdown, so the harness below — which compiles fenced blocks out of
+# `site/content` — never saw it. It shipped a call passing a bare `json!` where
+# the signature takes `Tainted<Value>`: the shortest possible example, and it
+# did not compile. A full compile of a fragment with no `fn main` is not what
+# this can do, so it checks the one shape that went wrong — every `.run(` and
+# `.replay(` in a template hands its input through a wrapper rather than raw.
+for page in sorted((root / "site/templates").rglob("*.html")):
+    for n, line in enumerate(page.read_text().splitlines(), 1):
+        for call in re.findall(r'\.run\(\s*"[^"]*"\s*,\s*([A-Za-z_:]+)', line):
+            if call.startswith("json"):
+                bad.append(
+                    f"{page.relative_to(root)}:{n}: passes a bare `{call}!` to `run`, "
+                    f"which takes `Tainted<Value>` — the first example a reader "
+                    f"copies does not compile"
+                )
+
 if bad:
     print("REFUSED:")
     print("\n".join("  " + b for b in bad))

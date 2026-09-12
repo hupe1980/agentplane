@@ -605,6 +605,15 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
             records.pop();
             Ok(records)
         }
+
+        async fn read_page(
+            &self,
+            run: RunId,
+            from: Seq,
+            _limit: usize,
+        ) -> Result<Vec<Record>, StoreError> {
+            self.read(run, from).await
+        }
         async fn case_history(
             &self,
             case: agentplane::core::CaseId,
@@ -1548,6 +1557,15 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         }
         async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
             self.inner.read(run, from).await
+        }
+
+        async fn read_page(
+            &self,
+            run: RunId,
+            from: Seq,
+            _limit: usize,
+        ) -> Result<Vec<Record>, StoreError> {
+            self.read(run, from).await
         }
         async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
             self.inner.admitted_as(key).await

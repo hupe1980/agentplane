@@ -191,6 +191,7 @@ impl FakeProvider {
         self.will_answer(Completion {
             tool_calls: Vec::new(),
             text,
+            model: None,
             usage,
             stop_reason: Some("end_turn".to_owned()),
             truncated: false,
@@ -213,6 +214,7 @@ impl FakeProvider {
         self.will_answer(Completion {
             tool_calls: Vec::new(),
             text: String::new(),
+            model: None,
             usage,
             stop_reason: Some("end_turn".to_owned()),
             truncated: false,
@@ -238,6 +240,7 @@ impl FakeProvider {
                 arguments,
             }],
             text: String::new(),
+            model: None,
             usage: Usage::default(),
             stop_reason: Some("tool_use".to_owned()),
             truncated: false,
@@ -380,6 +383,7 @@ fn echo(request: &Request<'_>) -> Completion {
             Completion {
                 tool_calls: Vec::new(),
                 text: value.to_string(),
+                model: None,
                 usage,
                 stop_reason,
                 truncated,
@@ -390,6 +394,7 @@ fn echo(request: &Request<'_>) -> Completion {
         None => Completion {
             tool_calls: Vec::new(),
             text: format!("fake answer to {}", request.prompt),
+            model: None,
             usage,
             stop_reason,
             truncated,
@@ -482,7 +487,8 @@ impl ModelProvider for FakeProvider {
         let scripted = self.scripted.lock().expect("fake").pop_front();
         let answer = scripted
             .unwrap_or_else(|| Ok(echo(&request)))
-            .and_then(|completion| honour_schema(completion, request.schema, request.model));
+            .and_then(|completion| honour_schema(completion, request.schema, request.model))
+            .map(|completion| name_the_server(completion, request.model));
 
         // Deltas first, then the whole answer — the order a real driver
         // produces, so an observer that assumes it is exercised rather than
@@ -503,6 +509,22 @@ impl ModelProvider for FakeProvider {
             ));
         }
         answer
+    }
+}
+
+/// Answer as a provider that served what it was asked for.
+///
+/// A real wire names the model on the way back, and the ordinary case is that it
+/// names the one the request asked for — so a stand-in that named none would
+/// leave every offline test unable to see the field at all, and an embedder
+/// asserting on it would have to run against a provider to find out it works.
+///
+/// A scripted completion that already names one is left alone: that is how a
+/// test says *the provider substituted*, which is the case the field exists for.
+fn name_the_server(completion: Completion, model: &ModelId) -> Completion {
+    Completion {
+        model: completion.model.or_else(|| Some(model.model.clone())),
+        ..completion
     }
 }
 

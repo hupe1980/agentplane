@@ -3595,6 +3595,7 @@ spec:
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_say("answer");
     provider.will_answer(agentplane::model::Completion {
+        model: None,
         text: r#"{"memories":[{"key":"language","content":"German"}]}"#.to_owned(),
         structured: Some(json!({
             "memories": [{"key": "language", "content": "German"}]
@@ -3953,6 +3954,7 @@ spec:
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_say("answer");
     provider.will_answer(agentplane::model::Completion {
+        model: None,
         text: r#"{"memories":[{"key":"language","content":"German"}]}"#.to_owned(),
         structured: Some(json!({
             "memories": [{"key": "language", "content": "German"}]

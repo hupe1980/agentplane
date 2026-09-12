@@ -1011,6 +1011,10 @@ impl Bedrock {
         Ok(Completion {
             text,
             tool_calls: calls,
+            // `Converse` names no model on the way back — the request's
+            // `modelId` is all there is, and repeating it here would report a
+            // substitution had been ruled out when nothing looked.
+            model: None,
             usage,
             stop_reason: Some(stop_reason),
             truncated,

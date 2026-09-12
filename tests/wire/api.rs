@@ -1193,6 +1193,30 @@ async fn a_runs_journal_is_readable_and_pages_from_a_cursor() {
         records[0]["record"].is_object(),
         "the record itself, not only its name: {body}"
     );
+
+    // The envelope, not only the payload. Without it a reader sees that an
+    // effect started and not *which* effect, cannot pair a start with its
+    // outcome or one attempt with the next, and cannot carry a row back to the
+    // span that performed it — which is what `agentplane.effect.key` is for.
+    let started = records
+        .iter()
+        .find(|r| r["kind"] == "EffectStarted")
+        .unwrap_or_else(|| panic!("a completed run performed an effect: {body}"));
+    assert!(
+        started["effect_key"]
+            .as_str()
+            .is_some_and(|k| !k.is_empty()),
+        "a record about an effect does not say which effect: {started}"
+    );
+    assert!(
+        started["step"].as_str().is_some_and(|s| !s.is_empty()),
+        "a record written inside a step does not name it: {started}"
+    );
+    assert_eq!(
+        started["phase"], "forward",
+        "a reader must not have to know the default to read the absence: {started}"
+    );
+
     assert_eq!(body["truncated"], false, "this run fits in a page: {body}");
     assert!(
         body["next_from"].is_null(),

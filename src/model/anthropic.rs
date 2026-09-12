@@ -260,6 +260,9 @@ struct ApiUsage {
 struct ApiResponse {
     #[serde(default)]
     content: Vec<Value>,
+    /// Which model served this, as the Messages response names it.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
     #[serde(default)]
@@ -482,6 +485,8 @@ fn system(prompt: &Value) -> Option<Value> {
 /// eight is where one path quietly stops supplying one of them.
 struct Assembled {
     text: String,
+    /// The model the provider says answered, where the wire named one.
+    served_model: Option<String>,
     /// The forced structured-output tool's arguments.
     forced: Option<Value>,
     /// Tool calls the caller may act on, forced tool excluded.
@@ -508,6 +513,7 @@ fn interpret(
 ) -> Result<Completion, ModelError> {
     let Assembled {
         text,
+        served_model,
         forced,
         tool_calls,
         usage,
@@ -604,6 +610,7 @@ fn interpret(
         structured: structured_value,
         tool_calls,
         text,
+        model: served_model,
         usage,
         // Every stop reason meaning "not a finished answer": out of room,
         // out of context window, or a turn the provider paused mid-way.
@@ -812,6 +819,7 @@ impl Anthropic {
             schema,
             emulating,
             Assembled {
+                served_model: parsed.model.clone(),
                 text: parsed.text(),
                 forced: parsed.forced_tool_input().cloned(),
                 tool_calls,
@@ -920,6 +928,7 @@ impl Anthropic {
             schema,
             emulating,
             Assembled {
+                served_model: acc.served_model().map(ToOwned::to_owned),
                 text: acc.text().to_owned(),
                 forced: acc.forced_tool_input(),
                 tool_calls,
@@ -1257,6 +1266,7 @@ mod tests {
             None,
             false,
             Assembled {
+                served_model: None,
                 text: String::new(),
                 forced: None,
                 tool_calls: vec![crate::model::ToolCall {
@@ -1297,6 +1307,7 @@ mod tests {
             None,
             false,
             Assembled {
+                served_model: None,
                 text: String::new(),
                 forced: None,
                 tool_calls: Vec::new(),
@@ -1334,6 +1345,7 @@ mod tests {
             None,
             false,
             Assembled {
+                served_model: None,
                 text: String::new(),
                 forced: None,
                 tool_calls: Vec::new(),
@@ -1612,6 +1624,7 @@ mod continuation_tests {
                 name: "ledger.read".to_owned(),
                 arguments: json!({}),
             }],
+            model: None,
             usage: Usage::default(),
             stop_reason: Some("tool_use".to_owned()),
             truncated: false,

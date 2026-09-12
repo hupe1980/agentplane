@@ -287,6 +287,37 @@ pub trait Effect: Send + Sync {
         None
     }
 
+    /// Who this operation asks, and for what — the request half of the `GenAI`
+    /// span attributes.
+    ///
+    /// `(provider, model)` for a completion; `(None, tool)` for a tool call,
+    /// which has a name but no provider. Defaulted to `None` for the same
+    /// reason [`gen_ai_operation`](Self::gen_ai_operation) is: an effect that
+    /// is not a `GenAI` operation must not carry the convention's attributes.
+    ///
+    /// Separate from the operation name because the span declares its fields
+    /// when it opens, so every attribute the runtime might record has to be
+    /// nameable before the effect runs.
+    fn gen_ai_request(&self) -> Option<GenAiRequest> {
+        None
+    }
+
+    /// What came back, split the way the convention reports it.
+    ///
+    /// The response half, and split from [`gen_ai_request`](Self::gen_ai_request)
+    /// along the convention's own line rather than by what is convenient: the
+    /// request attributes exist before dispatch and the response attributes only
+    /// after it, and a single hook would have to be called twice and answer
+    /// differently each time.
+    ///
+    /// Taken by output, like [`spend`](Self::spend), because that is when the
+    /// figures exist. Only the effect knows which of its own fields the
+    /// convention's counters correspond to.
+    fn gen_ai_response(&self, output: &Self::Output) -> Option<GenAiResponse> {
+        let _ = output;
+        None
+    }
+
     /// Whether this mutates external state.
     ///
     /// Drives the recovery default and the policy engine's `resource.mutates`
@@ -498,6 +529,35 @@ impl GroupOutcome {
     }
 }
 
+/// Who a `GenAI` operation asked, for the span attributes of that name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenAiRequest {
+    /// `openai`, `anthropic` — absent for a tool call, which has no provider.
+    pub provider: Option<String>,
+    /// The model asked for, or the tool named.
+    pub name: String,
+}
+
+/// What a `GenAI` operation answered, for the span attributes of that name.
+///
+/// Every field is optional or zero-valued because a provider may report any
+/// subset: a wire that names no model leaves `model` absent rather than
+/// repeating the request's, which would hide the one substitution the
+/// convention defines `gen_ai.response.model` to expose.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GenAiResponse {
+    /// The model that actually answered, where the wire says.
+    pub model: Option<String>,
+    /// Why generation stopped, in the provider's own words.
+    pub finish_reason: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Of `input_tokens`, how many were served from a provider-managed cache.
+    pub cache_read_tokens: u64,
+    /// Of `input_tokens`, how many were written into one.
+    pub cache_write_tokens: u64,
+}
+
 /// An [`Effect`] whose output type has been erased to [`Value`].
 ///
 /// # Why erasure, when generics are right everywhere else
@@ -523,6 +583,8 @@ pub trait AnyEffect: Send + Sync {
     fn descriptor(&self) -> EffectDescriptor;
     fn attach_erased(&mut self, provenance: &Provenance);
     fn gen_ai_operation(&self) -> Option<&'static str>;
+    fn gen_ai_request(&self) -> Option<GenAiRequest>;
+    fn gen_ai_response_erased(&self, output: &Value) -> Option<GenAiResponse>;
     fn mutates(&self) -> bool;
     fn recovery(&self) -> Recovery;
     fn retry(&self) -> RetryPolicy;
@@ -593,6 +655,16 @@ where
             .map(|o| Effect::spend(self, &o))
             .unwrap_or_default()
     }
+    fn gen_ai_request(&self) -> Option<GenAiRequest> {
+        Effect::gen_ai_request(self)
+    }
+    /// Round-trips the output, for the reason
+    /// [`spend_erased`](AnyEffect::spend_erased) does.
+    fn gen_ai_response_erased(&self, output: &Value) -> Option<GenAiResponse> {
+        serde_json::from_value::<E::Output>(output.clone())
+            .ok()
+            .and_then(|o| Effect::gen_ai_response(self, &o))
+    }
     async fn perform_erased(&self) -> Result<Value, EffectError> {
         let out = Effect::perform(self).await?;
         serde_json::to_value(out).map_err(EffectError::OutputShape)
@@ -627,6 +699,12 @@ impl Effect for Box<dyn AnyEffect + '_> {
     }
     fn gen_ai_operation(&self) -> Option<&'static str> {
         (**self).gen_ai_operation()
+    }
+    fn gen_ai_request(&self) -> Option<GenAiRequest> {
+        (**self).gen_ai_request()
+    }
+    fn gen_ai_response(&self, output: &Value) -> Option<GenAiResponse> {
+        (**self).gen_ai_response_erased(output)
     }
     fn mutates(&self) -> bool {
         (**self).mutates()

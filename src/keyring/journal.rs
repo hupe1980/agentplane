@@ -194,6 +194,16 @@ impl JournalStore for SealedJournal {
         self.open_all(records).await
     }
 
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: crate::core::Seq,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        let records = self.inner.read_page(run, from, limit).await?;
+        self.open_all(records).await
+    }
+
     async fn case_history(
         &self,
         case: crate::core::CaseId,

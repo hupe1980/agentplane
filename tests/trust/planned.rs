@@ -61,6 +61,7 @@ impl ToolClient for Recorder {
 
 fn plan(value: Value) -> agentplane::model::Completion {
     agentplane::model::Completion {
+        model: None,
         text: value.to_string(),
         structured: Some(value),
         tool_calls: Vec::new(),

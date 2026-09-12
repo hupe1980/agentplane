@@ -324,6 +324,10 @@ struct Incomplete {
 struct ApiResponse {
     #[serde(default)]
     status: String,
+    /// Which model served this, as Responses reports it. The streamed path
+    /// reaches the same field: its terminal event carries this whole object.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     /// Raw by design: every field, including fields this SDK version does not
     /// know, must be returned to Responses on a tool continuation.
@@ -825,6 +829,7 @@ impl OpenAi {
             structured: structured_value,
             tool_calls: calls,
             text,
+            model: parsed.model.clone(),
             usage,
             stop_reason: Some(parsed.incomplete_details.as_ref().map_or_else(
                 || parsed.status.clone(),
@@ -1602,6 +1607,7 @@ mod continuation_tests {
                 name: "lookup".to_owned(),
                 arguments: json!({}),
             }],
+            model: None,
             usage: Usage::default(),
             stop_reason: Some("completed".to_owned()),
             truncated: false,

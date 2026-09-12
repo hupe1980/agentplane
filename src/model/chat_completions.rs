@@ -328,6 +328,10 @@ struct ApiChoice {
 struct ApiResponse {
     #[serde(default)]
     choices: Vec<ApiChoice>,
+    /// Which model served this. The accumulator puts it in the same place, so
+    /// one read covers the buffered and streamed paths.
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     usage: Option<ApiUsage>,
 }
@@ -686,6 +690,7 @@ impl ChatCompletions {
             structured: structured_value,
             tool_calls: calls,
             text,
+            model: parsed.model.clone(),
             usage,
             stop_reason: choice.finish_reason.clone(),
             truncated,

@@ -55,6 +55,32 @@
 //! changing an operator's dashboards. So a pinned snapshot is vendored here and
 //! exposed as [`SEMCONV_VERSION`]; upstream movement is a versioned migration,
 //! not something that happens to you.
+//!
+//! # What is deliberately never emitted
+//!
+//! The conventions define Opt-In attributes that carry the content of a call:
+//! `gen_ai.input.messages`, `gen_ai.output.messages`,
+//! `gen_ai.system_instructions`, `gen_ai.tool.definitions` and
+//! `gen_ai.tool.call.arguments`. This crate emits none of them, and the decision
+//! is not a default anyone may flip: a prompt is exactly the place governed
+//! values arrive, the sink gates exist to keep those values inside a declared
+//! ceiling, and a trace exporter is an egress the gates do not cover. Sensitivity
+//! is a property of the value, and a span is not a sink that can carry one.
+//!
+//! What a deployment gets instead is the shape of the call — who was asked, what
+//! it cost, which tool ran, how it ended — and the journal for the content, where
+//! the same values are sealed, labelled and erasable.
+//!
+//! Three more the convention defines that this plane does not emit, each for its
+//! own reason. `gen_ai.response.id`, because no shared part of a [`Completion`]
+//! carries one. `gen_ai.provider.name` on the **run** span, because the agent is
+//! executed here rather than served by anyone — the completion spans beneath it
+//! each name the provider that answered them. And `server.address`, because a
+//! driver's endpoint is deployment configuration that is identical for every call
+//! it makes: that belongs on the `OTel` *resource*, which the embedder owns,
+//! rather than repeated on every span this crate opens.
+//!
+//! [`Completion`]: crate::model::Completion
 
 /// The pinned `GenAI` semantic-convention snapshot these names follow.
 ///
@@ -87,18 +113,64 @@ pub const GEN_AI_CHAT: &str = "chat";
 pub const GEN_AI_PROVIDER: &str = "gen_ai.provider.name";
 /// The model asked for, which is not always the model that answered.
 pub const GEN_AI_REQUEST_MODEL: &str = "gen_ai.request.model";
-/// The model that actually answered, as the provider reported it.
+/// The model that answered, as the provider reported it.
+///
+/// Absent where the wire does not say — never filled from the request, which
+/// would report a substitution had been ruled out when nothing looked.
 pub const GEN_AI_RESPONSE_MODEL: &str = "gen_ai.response.model";
+/// Why generation stopped, in the provider's own words.
+///
+/// The convention's name is plural because a provider may return several
+/// candidates. A [`Completion`](crate::model::Completion) carries exactly one
+/// answer and therefore one reason, so the attribute holds a single value.
+pub const GEN_AI_FINISH_REASON: &str = "gen_ai.response.finish_reasons";
 /// Prompt tokens billed.
 pub const GEN_AI_INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
 /// Completion tokens billed.
 pub const GEN_AI_OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+/// Of the prompt tokens, how many came from a provider-managed cache.
+///
+/// Recorded because the *rate* differs by about a factor of ten: a panel adding
+/// input tokens alone over-states a heavily cached deployment's bill on exactly
+/// the portion it is cheapest on.
+pub const GEN_AI_CACHE_READ_TOKENS: &str = "gen_ai.usage.cache_read.input_tokens";
+/// Of the prompt tokens, how many were written into that cache — billed at a
+/// premium over ordinary input, which is the other half of the same argument.
+pub const GEN_AI_CACHE_WRITE_TOKENS: &str = "gen_ai.usage.cache_write.input_tokens";
 /// The tool a call named, for `execute_tool` spans.
 pub const GEN_AI_TOOL_NAME: &str = "gen_ai.tool.name";
+/// Which declaration a run is executing.
+///
+/// The convention's name for it, rather than one in this crate's namespace: an
+/// agent's name is a fact the convention already defines, and a second spelling
+/// is read by nothing generic.
+pub const GEN_AI_AGENT_NAME: &str = "gen_ai.agent.name";
+/// The thread a run belongs to — this plane's case.
+///
+/// A case is what the A2A surface already answers `contextId` with, and
+/// `contextId` is that protocol's conversation identifier, so the mapping is not
+/// this crate's invention.
+pub const GEN_AI_CONVERSATION_ID: &str = "gen_ai.conversation.id";
+
+/// The class of fault an attempt ended with, from `OpenTelemetry`'s own
+/// cross-signal attribute rather than a `GenAI` one.
+///
+/// Separate from [`OUTCOME`], which says *whether* an attempt succeeded. This
+/// says what went wrong, in the vocabulary [`EffectError`] classifies faults
+/// with — so "which driver fails how" is a group-by rather than a search
+/// through free text.
+///
+/// [`EffectError`]: crate::core::EffectError
+pub const ERROR_TYPE: &str = "error.type";
 
 pub const RUN_ID: &str = "agentplane.run.id";
-pub const CASE_ID: &str = "agentplane.case.id";
-pub const AGENT: &str = "agentplane.agent";
+/// Which tenant's plane produced this run, under [`TenantLabel`].
+///
+/// Absent under the default policy, which is what `Omitted` means — not an empty
+/// string, so a collector cannot mistake *not disclosed* for *no tenant*.
+pub const TENANT: &str = "agentplane.tenant";
+/// Which `GenAI` convention snapshot produced this trace.
+pub const SEMCONV: &str = "agentplane.semconv";
 /// `live` | `resume` | `strict` — see the module docs on why this is on
 /// every span.
 pub const MODE: &str = "agentplane.mode";
@@ -107,6 +179,18 @@ pub const CAPABILITY: &str = "agentplane.step.capability";
 /// `forward` | `compensating`.
 pub const PHASE: &str = "agentplane.phase";
 pub const EFFECT_KIND: &str = "agentplane.effect.kind";
+/// The journal's own identity for this attempt.
+///
+/// The join between a trace and the evidence. Everything else on the span names
+/// a *category* — which run, which step, which kind — and none of them lands a
+/// reader on the record that attempt wrote; `GET /runs/{run}/history` answers by
+/// key. Without it the two histories of one run can only be lined up by eye.
+///
+/// A digest over the step, phase, ordinal, attempt, kind and canonical
+/// arguments. It **names** the attempt without carrying what it sent — which is
+/// the claim to make, since a digest is still a commitment to the values it was
+/// taken over and anyone holding a guess can test it.
+pub const EFFECT_KEY: &str = "agentplane.effect.key";
 pub const EFFECT_ATTEMPT: &str = "agentplane.effect.attempt";
 pub const EFFECT_MUTATES: &str = "agentplane.effect.mutates";
 /// True when the result came from the journal rather than from the world.
@@ -115,6 +199,59 @@ pub const EFFECT_MUTATES: &str = "agentplane.effect.mutates";
 /// reads and means nothing.
 pub const EFFECT_REPLAYED: &str = "agentplane.effect.replayed";
 pub const OUTCOME: &str = "agentplane.outcome";
+
+// ── Tenant attribution ──────────────────────────────────────────────────────
+
+/// Whether and how a tenant appears on what this plane reports about itself.
+///
+/// Two separate problems, and a design that answers only one of them is worse
+/// than none.
+///
+/// **Cardinality.** An unbounded label is what makes a metrics backend fall
+/// over, and a tenant read from a *request* would be exactly that. This label is
+/// the plane's own tenant, so the number of streams is the number of planes an
+/// operator configured — a configuration fact, not a data fact. There is no
+/// input that can grow it.
+///
+/// One policy for **both** signals. A deployment that decides customer names may
+/// travel to its observability stack has decided it once, and answering *which
+/// tenant is this* on the metrics while leaving it unanswerable on the traces is
+/// the same decision honoured on one channel.
+///
+/// **Disclosure.** A tenant name is frequently a customer name, and a metrics
+/// backend is usually the least protected system in a deployment: sampled into
+/// third-party services, on a dashboard nobody signs into, retained past every other
+/// record. So the default is to emit nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TenantLabel {
+    /// No tenant dimension at all. The default.
+    ///
+    /// A single-tenant plane learns nothing from the label, and a deployment
+    /// that has not decided where its telemetry goes has not decided that
+    /// customer names may travel there.
+    #[default]
+    Omitted,
+    /// The tenant's own name.
+    ///
+    /// Appropriate when the tenant id is not itself sensitive — an operator's own
+    /// environments, or ids that were opaque to begin with. On the metrics it is
+    /// the `tenant` field of every event; on the traces it is [`TENANT`] on the
+    /// run span, and only there — every other span is inside that run's trace,
+    /// so repeating a per-plane constant on each of them is bytes without
+    /// information.
+    Name,
+}
+
+impl TenantLabel {
+    /// The label for this tenant under this policy.
+    #[must_use]
+    pub fn render(self, tenant: &crate::core::TenantId) -> String {
+        match self {
+            Self::Omitted => String::new(),
+            Self::Name => tenant.to_string(),
+        }
+    }
+}
 
 // ── Events: the ones P7 exists for ──────────────────────────────────────────
 
@@ -197,6 +334,7 @@ pub const LOUD_EVENTS: &[&str] = &[
     NONDETERMINISM,
     QUARANTINED,
     ABANDONED,
+    RUN_FAILED,
     UNDECIDABLE,
     UNREPRODUCIBLE,
     RECONCILED,

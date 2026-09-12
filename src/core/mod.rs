@@ -57,7 +57,8 @@ pub use case::{
 };
 pub use doubt::{Assertion, Doubt, QuarantineDecision, Undecided};
 pub use effect::{
-    AnyEffect, DeclaredOutput, Effect, EffectDescriptor, GroupOutcome, Reconciliation, Recovery,
+    AnyEffect, DeclaredOutput, Effect, EffectDescriptor, GenAiRequest, GenAiResponse, GroupOutcome,
+    Reconciliation, Recovery,
 };
 pub use error::{
     Disposition, EffectError, PolicyError, REFUSED, RuntimeError, SkillError, StepError, StoreError,

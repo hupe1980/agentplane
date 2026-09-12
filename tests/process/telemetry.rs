@@ -611,6 +611,197 @@ async fn a_model_call_is_reported_as_a_gen_ai_chat() {
         recorded.contains(&want),
         "the model call's span carries no `{want}`; recorded: {recorded:?}"
     );
+
+    // The operation name alone is not a `GenAI` span. Which model, of which
+    // provider, at what cost is the whole reason the convention exists, and a
+    // panel keyed on those reads blank as *no model* rather than *nothing
+    // reports it*.
+    for want in [
+        format!("{}=fake", telemetry::GEN_AI_PROVIDER),
+        format!("{}=m", telemetry::GEN_AI_REQUEST_MODEL),
+    ] {
+        assert!(
+            recorded.contains(&want),
+            "the model call's span carries no `{want}`; recorded: {recorded:?}"
+        );
+    }
+    for key in [
+        telemetry::GEN_AI_INPUT_TOKENS,
+        telemetry::GEN_AI_OUTPUT_TOKENS,
+    ] {
+        assert!(
+            recorded.iter().any(|r| r.starts_with(&format!("{key}="))),
+            "the model call's span carries no `{key}`, so its cost is invisible \
+             to the convention's own attribute; recorded: {recorded:?}"
+        );
+    }
+
+    // And the tool key stays off a completion: `gen_ai.tool.name` on a chat
+    // span would make every model call look like a tool invocation.
+    assert!(
+        !recorded
+            .iter()
+            .any(|r| r.starts_with(&format!("{}=", telemetry::GEN_AI_TOOL_NAME))),
+        "a completion claimed a tool name: {recorded:?}"
+    );
+
+    // What the provider said about its own answer. The response model is the
+    // one attribute the request half cannot stand in for: an alias that
+    // resolves, or a deployment moved under a pinned name, is visible here and
+    // nowhere else in a trace.
+    for want in [
+        format!("{}=m", telemetry::GEN_AI_RESPONSE_MODEL),
+        format!("{}=end_turn", telemetry::GEN_AI_FINISH_REASON),
+    ] {
+        assert!(
+            recorded.contains(&want),
+            "the model call's span carries no `{want}`; recorded: {recorded:?}"
+        );
+    }
+    for key in [
+        telemetry::GEN_AI_CACHE_READ_TOKENS,
+        telemetry::GEN_AI_CACHE_WRITE_TOKENS,
+    ] {
+        assert!(
+            recorded.iter().any(|r| r.starts_with(&format!("{key}="))),
+            "the model call's span carries no `{key}`, so a deployment cannot \
+             tell cached input from fresh — and the two are billed about an \
+             order of magnitude apart; recorded: {recorded:?}"
+        );
+    }
+}
+
+/// **A failed attempt says what class of thing went wrong.**
+///
+/// `agentplane.outcome` says *whether* the attempt succeeded, which makes a
+/// failure countable and nothing more. The convention asks for `error.type` on
+/// any operation that ends in error, and without it every `GenAI` panel reports
+/// a plane with no failures at all — the one claim this runtime exists not to
+/// make. The value is the fault class, so "which driver fails how" is a
+/// group-by rather than a search through rendered prose.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_failed_attempt_names_the_class_of_fault() {
+    let rec = Recorder::default();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let provider = Arc::new(agentplane::testkit::FakeProvider::new());
+    provider.will_fail(agentplane::model::ModelError::Refused {
+        model: agentplane::model::ModelId::new("fake", "m"),
+        detail: "no".to_owned(),
+    });
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Asks(Arc::clone(&provider)))
+        .build();
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let _ = rt.run("demo.asks", Tainted::trusted(json!({}))).await;
+    drop(guard);
+
+    let recorded = rec.recorded();
+    let want = format!("{}=refused", telemetry::ERROR_TYPE);
+    assert!(
+        recorded.contains(&want),
+        "a failed attempt carries no `{want}`, so its span says only that \
+         something went wrong; recorded: {recorded:?}"
+    );
+}
+
+/// **An erased effect reports what a typed one does.**
+///
+/// `Box<dyn AnyEffect>` implements `Effect` so an undo and a group member travel
+/// the same dispatch path as anything else — the module doc says so in those
+/// words. Every `Effect` method has a default, so a seam the erasure does not
+/// forward silently answers that default, and the same call opens a span naming
+/// a model when it is typed and naming nothing when it is boxed.
+///
+/// Asserted through a subscriber rather than by reading the source, because the
+/// sibling guard in `tests/guards/layering.rs` already reads the source and the
+/// question here is whether the value arrives.
+#[tokio::test]
+async fn an_erased_effect_reports_what_a_typed_one_does() {
+    struct Erasable;
+    #[async_trait::async_trait]
+    impl Effect for Erasable {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::nullary("test.erased")
+        }
+        fn mutates(&self) -> bool {
+            false
+        }
+        fn gen_ai_operation(&self) -> Option<&'static str> {
+            Some(telemetry::GEN_AI_CHAT)
+        }
+        fn gen_ai_request(&self) -> Option<agentplane::core::GenAiRequest> {
+            Some(agentplane::core::GenAiRequest {
+                provider: Some("erased".to_owned()),
+                name: "boxed-1".to_owned(),
+            })
+        }
+        fn gen_ai_response(&self, _: &Value) -> Option<agentplane::core::GenAiResponse> {
+            Some(agentplane::core::GenAiResponse {
+                model: Some("boxed-1-served".to_owned()),
+                finish_reason: Some("end_turn".to_owned()),
+                input_tokens: 7,
+                output_tokens: 3,
+                ..agentplane::core::GenAiResponse::default()
+            })
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            Ok(json!("ok"))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Boxes;
+    #[async_trait::async_trait]
+    impl Skill for Boxes {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("boxes").provides("demo.boxes")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let erased: Box<dyn agentplane::core::AnyEffect> = Box::new(Erasable);
+            cx.effect(erased).await?;
+            Ok(Outcome::done(input))
+        }
+    }
+
+    let rec = Recorder::default();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Boxes)
+        .build();
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt
+        .run("demo.boxes", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    drop(guard);
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let recorded = rec.recorded();
+    for want in [
+        format!("{}=erased", telemetry::GEN_AI_PROVIDER),
+        format!("{}=boxed-1", telemetry::GEN_AI_REQUEST_MODEL),
+        format!("{}=boxed-1-served", telemetry::GEN_AI_RESPONSE_MODEL),
+        format!("{}=7", telemetry::GEN_AI_INPUT_TOKENS),
+    ] {
+        assert!(
+            recorded.contains(&want),
+            "an erased effect's span carries no `{want}`, so the erasure answers \
+             the trait's default where a typed effect answers its own; \
+             recorded: {recorded:?}"
+        );
+    }
 }
 
 /// **An effect that is not a `GenAI` operation does not claim to be one.**

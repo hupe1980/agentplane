@@ -693,6 +693,39 @@ where
     }
 }
 
+/// One past the highest epoch this run's records already carry.
+///
+/// The fencing token's high-water mark normally lives in the lease table, and
+/// the lease table is store-local state an export does not carry. Reading it
+/// back from the journal makes the token monotonic across **any** way the lease
+/// row can go missing — a restore, a hand-rebuilt store, a truncated table —
+/// rather than only the one somebody remembered to seed.
+///
+/// One read rather than a scan, because epochs never decrease along a run's own
+/// chain: a lease is only ever issued above the current mark, and a restore
+/// replays bodies in sequence order. An empty journal answers 1.
+///
+/// **What it cannot see** is an epoch issued and never written under — a lease
+/// taken by an owner that died before appending leaves no record. So it bounds
+/// every epoch that ever wrote, which is every epoch that can conflict with the
+/// rebuilt history, and a pre-disaster instance still holding such a lease is
+/// fenced by the runbook rather than by this: the old deployment must not reach
+/// the restored store.
+fn epoch_after_history(w: &redb::WriteTransaction, run: &str) -> Result<Epoch, StoreError> {
+    let t = w.open_table(JOURNAL).map_err(|e| be(&e))?;
+    let last = t
+        .range((run, 0u64)..=(run, u64::MAX))
+        .map_err(|e| be(&e))?
+        .next_back();
+    match last {
+        None => Ok(1),
+        Some(entry) => {
+            let (_, v) = entry.map_err(|e| be(&e))?;
+            Ok(Row::decode(v.value())?.into_record()?.body.epoch + 1)
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 #[async_trait]
 impl JournalStore for RedbStore {
@@ -917,6 +950,17 @@ impl JournalStore for RedbStore {
     }
 
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
+        self.read_page(run, from, usize::MAX).await
+    }
+
+    /// The bounded read, and the one that decodes — `read` is this with no
+    /// ceiling, so the two cannot come to disagree about what a record is.
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: Seq,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
         let key = self.run_key(run);
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
@@ -925,6 +969,7 @@ impl JournalStore for RedbStore {
             for entry in t
                 .range((key.as_str(), from)..=(key.as_str(), u64::MAX))
                 .map_err(|e| be(&e))?
+                .take(limit)
             {
                 let (_, v) = entry.map_err(|e| be(&e))?;
                 out.push(Row::decode(v.value())?.into_record()?);
@@ -997,8 +1042,13 @@ impl JournalStore for RedbStore {
                     });
 
                     let epoch = match existing {
-                        // Fresh run.
-                        None => 1,
+                        // No lease row. Either a genuinely fresh run — in which
+                        // case the journal is empty and this is 1 — or a run
+                        // whose lease table did not survive, which is what a
+                        // restore leaves behind. The journal is the evidence
+                        // that did survive, and every record in it carries the
+                        // epoch it was written under.
+                        None => epoch_after_history(&w, key.as_str())?,
                         // Expired or released: claim and fence whoever held
                         // it, **including this caller**. Checked before any
                         // ownership test on purpose — a lease that has lapsed

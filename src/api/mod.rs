@@ -1065,6 +1065,38 @@ fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("no such {what}"))
 }
 
+/// One record, as an operator surface shows it.
+///
+/// One function for the run history and the case history, which answer the same
+/// question over different selections: two renderers are free to disagree about
+/// what a record *is*, and the one that drifts is whichever surface a deployment
+/// does not read.
+///
+/// The **envelope** belongs here as much as the payload. Without it a reader sees
+/// that an effect started and not which effect, cannot pair a start with its
+/// outcome or one attempt with the next, cannot tell a forward record from a
+/// compensating one, and has no way back to the span that performed it.
+///
+/// It carries no content: a step id, a phase and an effect key are identifiers,
+/// and the key is a digest — it names the call rather than reproducing what it
+/// sent.
+#[cfg(feature = "http")]
+fn record_view(r: &crate::journal::Record) -> Value {
+    json!({
+        "seq": r.seq(),
+        "run": r.body.run.to_string(),
+        "case": r.body.case.map(|c| c.to_string()),
+        "step": r.body.step.map(|s| s.to_string()),
+        // Always, rather than only when compensating: a reader who has to know
+        // the default in order to read the absence is a reader who will not.
+        "phase": r.body.phase.as_str(),
+        // The join to `agentplane.effect.key` on the span that performed it.
+        "effect_key": r.effect_key().map(|k| k.to_string()),
+        "kind": r.kind().kind_str(),
+        "record": serde_json::to_value(r.kind()).unwrap_or(Value::Null),
+    })
+}
+
 /// One run's journal, from a sequence the caller names.
 ///
 /// The gap this fills was an asymmetry with no reason behind it: `GET
@@ -1098,10 +1130,14 @@ async fn run_history(
     // page, which is the truthful answer to "what have I not seen".
     let from = page.from.unwrap_or(1).max(1);
 
+    // One more than the page, exactly as the case history does: the extra record
+    // is how this learns the page was cut, and bounding the read is the point —
+    // a cursored endpoint that loads a run's whole remaining history per page
+    // does work proportional to the run's length for every page of it.
     let mut records = s
         .plane
         .journal()
-        .read(id, from)
+        .read_page(id, from, api.history.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     // An empty history at sequence one is a run nobody has heard of; an empty
@@ -1118,14 +1154,7 @@ async fn run_history(
     Ok(Json(json!({
         "run": id.to_string(),
         "from": from,
-        "records": records
-            .iter()
-            .map(|r| json!({
-                "seq": r.seq(),
-                "kind": r.kind().kind_str(),
-                "record": serde_json::to_value(r.kind()).unwrap_or(Value::Null),
-            }))
-            .collect::<Vec<_>>(),
+        "records": records.iter().map(record_view).collect::<Vec<_>>(),
         "truncated": truncated,
         // Only where there is more to ask for. A cursor handed back on a
         // complete page is one a caller loops on forever.
@@ -1940,15 +1969,7 @@ async fn case_view(
         // Shown with the case because "when does this stop being my problem" is
         // the question that follows "what is this".
         "deadlines": serde_json::to_value(&deadlines).unwrap_or(Value::Null),
-        "history": history
-            .iter()
-            .map(|r| json!({
-                "seq": r.seq(),
-                "run": r.body.run.to_string(),
-                "kind": r.kind().kind_str(),
-                "record": serde_json::to_value(r.kind()).unwrap_or(Value::Null),
-            }))
-            .collect::<Vec<_>>(),
+        "history": history.iter().map(record_view).collect::<Vec<_>>(),
         // Said out loud: a truncated history is shaped exactly like a complete
         // one, and a reader who cannot tell will read absence as evidence.
         "history_truncated": history_truncated,

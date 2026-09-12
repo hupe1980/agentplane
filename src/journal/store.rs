@@ -246,7 +246,34 @@ pub trait JournalStore: Send + Sync + Debug {
     }
 
     /// Read a run's records from `from` (inclusive, 1-based) onward.
+    ///
+    /// Unbounded, because its callers are replay and export and both need the
+    /// whole history. A caller serving a **page** wants
+    /// [`read_page`](Self::read_page) instead.
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError>;
+
+    /// At most `limit` of a run's records from `from` (inclusive, 1-based).
+    ///
+    /// The paging read, and the reason it is required rather than defaulted to
+    /// `read` then truncate: a page bounds what is *returned*, and a cursored
+    /// endpoint needs a bound on what is **read**. Without one, every page of a
+    /// run loads the whole remaining history and walking a long run costs the
+    /// square of its length — while serving byte-identical answers, so nothing
+    /// above the store can tell.
+    ///
+    /// Bounded the way [`case_history`](Self::case_history) is, and with the
+    /// same reading: `limit` records back means there are at least that many,
+    /// not exactly that many.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: Seq,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError>;
 
     /// Concluded runs whose *latest* conclusion is `outcome`, newest first.
     ///

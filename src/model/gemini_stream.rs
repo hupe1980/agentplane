@@ -46,6 +46,9 @@ pub(super) struct Accumulator {
     /// driver may not be able to count.
     generated: bool,
     prompt_feedback: Option<Value>,
+    /// `modelVersion`, as the chunks report it. Gemini repeats it on every
+    /// chunk, so the last one wins for the reason `usage` does.
+    model_version: Option<String>,
 }
 
 impl Accumulator {
@@ -68,6 +71,11 @@ impl Accumulator {
         // to retry forever instead of the refusal the buffered path reports.
         if let Some(usage) = chunk.get("usageMetadata") {
             self.usage = Some(usage.clone());
+        }
+        // Read on the same terms and for the same reason: the chunk naming the
+        // model need not be one carrying a candidate.
+        if let Some(version) = chunk.get("modelVersion").and_then(Value::as_str) {
+            self.model_version = Some(version.to_owned());
         }
         if let Some(feedback) = chunk.get("promptFeedback") {
             self.prompt_feedback = Some(feedback.clone());
@@ -186,6 +194,9 @@ impl Accumulator {
         }
         if let Some(feedback) = self.prompt_feedback {
             response["promptFeedback"] = feedback;
+        }
+        if let Some(version) = self.model_version {
+            response["modelVersion"] = Value::String(version);
         }
         response
     }

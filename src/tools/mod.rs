@@ -950,6 +950,14 @@ impl Effect for ToolCall {
         Some(crate::runtime::telemetry::GEN_AI_EXECUTE_TOOL)
     }
 
+    /// No provider: a tool call names what ran, not who served it.
+    fn gen_ai_request(&self) -> Option<crate::core::GenAiRequest> {
+        Some(crate::core::GenAiRequest {
+            provider: None,
+            name: self.id.reference(),
+        })
+    }
+
     type Output = Value;
 
     fn descriptor(&self) -> EffectDescriptor {

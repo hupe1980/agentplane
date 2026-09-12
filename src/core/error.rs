@@ -541,6 +541,35 @@ impl EffectError {
         }
     }
 
+    /// The class of fault, as one low-cardinality word.
+    ///
+    /// What `error.type` reports on an effect span. Rendered messages carry the
+    /// detail and are useless to group by; the disposition says what the failure
+    /// means for the *world* and deliberately collapses faults that differ for an
+    /// operator — a refused credential and a timed-out socket are both
+    /// `DidNotHappen`. This is the third question, *what went wrong*, and it is
+    /// the one "which driver fails how" is asked in.
+    ///
+    /// Exhaustive rather than defaulted, for the reason
+    /// [`spend`](Self::spend) is: a variant added later would otherwise arrive
+    /// under whatever word the catch-all happened to say.
+    #[must_use]
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Unavailable { .. } => "unavailable",
+            Self::Rejected(_) => "rejected",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Refused(_) => "refused",
+            Self::Timeout { .. } => "timeout",
+            Self::Interrupted { .. } => "interrupted",
+            Self::Metered { .. } => "metered",
+            Self::Performed(_) => "performed",
+            Self::OutputShape(_) => "output_shape",
+            Self::Final { .. } => "final",
+            Self::Other(_) => "other",
+        }
+    }
+
     /// What this failure says about whether the call reached the outside world.
     #[must_use]
     pub fn disposition(&self) -> Disposition {

@@ -280,7 +280,8 @@ impl Admission {
     }
 }
 
-/// What an idempotent [`spawn_once`](Runtime::spawn_once) did.
+/// What an idempotent [`spawn_correlated_once`](Runtime::spawn_correlated_once)
+/// did.
 ///
 /// Separate from [`Admission`] because a spawn returns before the work happens,
 /// so it has no outcome to report.
@@ -934,7 +935,7 @@ impl Runtime {
             semantic: None,
             authorities: None,
             peers: None,
-            metric_tenant: super::metrics::TenantLabel::default(),
+            tenant_label: super::telemetry::TenantLabel::default(),
             quotas: None,
             quota: crate::quota::TenantQuota::default(),
             budget: Budget::unlimited(),
@@ -2382,55 +2383,6 @@ impl Runtime {
         Ok(run)
     }
 
-    pub async fn spawn_in_case(
-        self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-        case: crate::core::CaseId,
-    ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(target, input, RunTerms::bound(CaseBinding::Existing(case)))
-            .await
-    }
-
-    /// [`spawn_in_case`](Self::spawn_in_case), at most once per admission key.
-    ///
-    /// # Panics
-    ///
-    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
-    ///
-    /// # Errors
-    ///
-    /// As [`spawn_in_case`](Self::spawn_in_case).
-    pub async fn spawn_in_case_once(
-        self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-        case: crate::core::CaseId,
-        idempotency_key: &str,
-    ) -> Result<Spawned, RuntimeError> {
-        self.spawn_bound_once(
-            target,
-            input,
-            RunTerms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
-        )
-        .await
-    }
-
-    pub async fn spawn_correlated(
-        self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-        case_kind: &str,
-        keys: &[CorrelationKey],
-    ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(
-            target,
-            input,
-            RunTerms::default().correlated(case_kind, keys),
-        )
-        .await
-    }
-
     /// Start a new immutable run inside a case that already exists.
     pub async fn run_in_case(
         &self,
@@ -2440,26 +2392,6 @@ impl Runtime {
     ) -> Result<RunOutcome, RuntimeError> {
         self.admit(target, input, RunTerms::bound(CaseBinding::Existing(case)))
             .await
-    }
-
-    /// [`run_in_case`](Self::run_in_case), at most once per admission key.
-    ///
-    /// # Errors
-    ///
-    /// As [`run_in_case`](Self::run_in_case).
-    pub async fn run_in_case_once(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-        case: crate::core::CaseId,
-        idempotency_key: &str,
-    ) -> Result<Admission, RuntimeError> {
-        self.admit_once(
-            target,
-            input,
-            RunTerms::bound(CaseBinding::Existing(case)).keyed(idempotency_key),
-        )
-        .await
     }
 
     /// Join or open a case by business key, then run.
@@ -2552,29 +2484,6 @@ impl Runtime {
         .await
     }
 
-    /// Admit under a key and return the run id without waiting for it.
-    ///
-    /// What a webhook handler usually wants: admission is durable before this
-    /// returns, so a 2xx means *this message will be acted on* rather than
-    /// *this message was received*.
-    ///
-    /// # Panics
-    ///
-    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
-    ///
-    /// # Errors
-    ///
-    /// As [`spawn`](Self::spawn).
-    pub async fn spawn_once(
-        self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-        idempotency_key: &str,
-    ) -> Result<Spawned, RuntimeError> {
-        self.spawn_bound_once(target, input, RunTerms::default().keyed(idempotency_key))
-            .await
-    }
-
     /// Correlate and spawn, at most once per admission key.
     ///
     /// # Panics
@@ -2583,7 +2492,7 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// As [`spawn_correlated`](Self::spawn_correlated).
+    /// As [`spawn`](Self::spawn).
     pub async fn spawn_correlated_once(
         self: &Arc<Self>,
         target: &str,
@@ -3770,14 +3679,26 @@ impl Runtime {
             telemetry::RUN_SPAN,
             { telemetry::GEN_AI_OPERATION } = telemetry::GEN_AI_INVOKE_AGENT,
             { telemetry::RUN_ID } = tracing::field::display(plan.run),
+            // Which declaration this run is executing. A plane serving several
+            // agents cannot otherwise separate them, and separating them is
+            // the first thing an operator does.
+            { telemetry::GEN_AI_AGENT_NAME } = plan.agent.as_str(),
             { telemetry::MODE } = telemetry::mode_str(plan.mode),
-            { telemetry::CASE_ID } = plan
+            { telemetry::GEN_AI_CONVERSATION_ID } = plan
                 .case
                 .as_ref()
                 .map(|c| super::ctx::CaseContext::id(c).to_string()),
+            // Empty under the default policy, which is what `Omitted` means.
+            // Recorded rather than declared so the attribute is absent rather
+            // than blank — a collector cannot read *not disclosed* as *no
+            // tenant* if there is no field at all.
+            { telemetry::TENANT } = tracing::field::Empty,
             { telemetry::OUTCOME } = tracing::field::Empty,
-            semconv = telemetry::SEMCONV_VERSION,
+            { telemetry::SEMCONV } = telemetry::SEMCONV_VERSION,
         );
+        if !self.meter.tenant().is_empty() {
+            span.record(telemetry::TENANT, self.meter.tenant());
+        }
         self.execute_inner(plan, cursor).instrument(span).await
     }
 
@@ -6889,7 +6810,7 @@ pub struct RuntimeBuilder {
     semantic: Option<Arc<super::SemanticMemory>>,
     authorities: Option<Arc<dyn crate::authority::AuthorityStore>>,
     peers: Option<Arc<PeerWiring>>,
-    metric_tenant: super::metrics::TenantLabel,
+    tenant_label: super::telemetry::TenantLabel,
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
     quota: crate::quota::TenantQuota,
     budget: Budget,
@@ -6974,18 +6895,20 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Put this plane's tenant on its metrics.
+    /// Put this plane's tenant on what it reports about itself.
     ///
-    /// Off by default. Read [`metrics::TenantLabel`](super::metrics::TenantLabel)
-    /// before turning it on: a tenant name is often a customer name, and a
-    /// metrics backend is usually the least protected system in a deployment.
+    /// Off by default, and one policy for both signals: the `tenant` field of
+    /// every metric event, and `agentplane.tenant` on the run span. Read
+    /// [`telemetry::TenantLabel`](super::telemetry::TenantLabel) before turning
+    /// it on — a tenant name is often a customer name, and an observability
+    /// backend is usually the least protected system in a deployment.
     ///
     /// Cardinality is bounded by construction — the label is *this plane's*
     /// tenant, so the number of streams is the number of planes configured, and
     /// no request can grow it.
     #[must_use]
-    pub const fn metric_tenant(mut self, label: super::metrics::TenantLabel) -> Self {
-        self.metric_tenant = label;
+    pub const fn tenant_label(mut self, label: super::telemetry::TenantLabel) -> Self {
+        self.tenant_label = label;
         self
     }
 
@@ -8362,7 +8285,7 @@ impl RuntimeBuilder {
             published_by,
             #[cfg(feature = "manifest")]
             providers: self.providers,
-            meter: super::metrics::Meter::new(self.metric_tenant, &self.tenant),
+            meter: super::metrics::Meter::new(self.tenant_label, &self.tenant),
             tenant: self.tenant,
             owner: self.owner.unwrap_or_else(default_owner),
             lease_ttl: self.lease_ttl,

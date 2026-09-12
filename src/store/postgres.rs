@@ -953,12 +953,29 @@ impl JournalStore for PostgresStore {
     }
 
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
+        self.read_page(run, from, usize::MAX).await
+    }
+
+    /// The bounded read, and the one that decodes — `read` is this with no
+    /// ceiling, so the two cannot come to disagree about what a record is.
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: Seq,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
                 "SELECT seq, prev_hash, hash, raw, key_id, signature FROM journal
-                  WHERE tenant = $1 AND run_id = $2 AND seq >= $3 ORDER BY seq ASC",
-                &[&self.tenant_name(), &run.to_string(), &from.cast_signed()],
+                  WHERE tenant = $1 AND run_id = $2 AND seq >= $3 ORDER BY seq ASC
+                  LIMIT $4",
+                &[
+                    &self.tenant_name(),
+                    &run.to_string(),
+                    &from.cast_signed(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -1220,13 +1237,22 @@ impl JournalStore for PostgresStore {
         // claim over a lapsed holder takes `run_lease.epoch + 1`, fencing them
         // — including this very caller, because a lapsed lease is not yours to
         // renew (renewal is `renew`, which proves the exact `(owner, epoch)`).
-        // A fresh insert starts at epoch 1. `ON CONFLICT DO UPDATE` serialises
-        // racing claimers on the row (or on the index entry being inserted),
-        // so exactly one of them wins whichever state the row is in.
+        // A fresh insert starts one past whatever the run's **journal** already
+        // records, which is 1 for a run that has none. The lease table is where
+        // the high-water mark normally lives and it is store-local state an
+        // export does not carry, so a restore replays a run's records under
+        // their original epochs and leaves no lease row: starting at a flat 1
+        // would hand a run that had already changed hands a second ownership
+        // period wearing the number of its first. `ON CONFLICT DO UPDATE`
+        // serialises racing claimers on the row (or on the index entry being
+        // inserted), so exactly one of them wins whichever state the row is in.
         let row = client
             .query_opt(
                 "INSERT INTO run_lease (tenant, run_id, owner, epoch, expires_at)
-                 VALUES ($1, $2, $3, 1, $4)
+                 VALUES ($1, $2, $3,
+                         COALESCE((SELECT MAX(epoch) FROM journal
+                                    WHERE tenant = $1 AND run_id = $2), 0) + 1,
+                         $4)
                  ON CONFLICT (tenant, run_id) DO UPDATE SET
                    owner = EXCLUDED.owner,
                    epoch = run_lease.epoch + 1,

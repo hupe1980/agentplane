@@ -360,6 +360,20 @@ impl JournalStore for Faulty {
         self.inner.read(run, from).await
     }
 
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: Seq,
+        limit: usize,
+    ) -> Result<Vec<Record>, StoreError> {
+        if self.schedule.unreadable.contains(&run) {
+            return Err(StoreError::Backend(format!(
+                "injected: run {run} cannot be read"
+            )));
+        }
+        self.inner.read_page(run, from, limit).await
+    }
+
     async fn admitted_as(&self, key: &str) -> Result<Option<crate::core::RunId>, StoreError> {
         self.inner.admitted_as(key).await
     }
@@ -512,6 +526,9 @@ mod tests {
             unreachable!("the test reads capabilities only")
         }
         async fn read(&self, _: RunId, _: Seq) -> Result<Vec<Record>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn read_page(&self, _: RunId, _: Seq, _: usize) -> Result<Vec<Record>, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn runs_by_outcome(&self, _: &str, _: usize) -> Result<Vec<RunId>, StoreError> {

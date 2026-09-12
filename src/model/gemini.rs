@@ -816,6 +816,13 @@ impl Gemini {
             structured: structured_value,
             tool_calls: calls,
             text,
+            // Reported at the top of the response rather than on the candidate,
+            // and on every chunk of a stream — so the accumulator's envelope
+            // carries it and one read covers both paths.
+            model: parsed
+                .get("modelVersion")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             usage,
             stop_reason: finish,
             truncated,

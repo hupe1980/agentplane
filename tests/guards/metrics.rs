@@ -48,11 +48,17 @@ struct Sample {
 #[derive(Debug, Default, Clone)]
 struct Meter {
     samples: Arc<Mutex<Vec<Sample>>>,
+    /// Span attributes as `name=value`, from creation and from later `record`
+    /// calls alike — the tenant arrives by the second route.
+    span_fields: Arc<Mutex<Vec<String>>>,
 }
 
 impl Meter {
     fn samples(&self) -> Vec<Sample> {
         self.samples.lock().unwrap().clone()
+    }
+    fn span_fields(&self) -> Vec<String> {
+        self.span_fields.lock().unwrap().clone()
     }
     fn named(&self, name: &str) -> Vec<Sample> {
         self.samples()
@@ -62,6 +68,19 @@ impl Meter {
     }
     fn total(&self, name: &str) -> u64 {
         self.named(name).iter().map(|s| s.value).sum()
+    }
+}
+
+/// Collects any span field as `name=value`.
+struct Pairs<'a>(&'a Arc<Mutex<Vec<String>>>);
+
+impl tracing::field::Visit for Pairs<'_> {
+    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+        self.0.lock().unwrap().push(format!("{}={v}", f.name()));
+    }
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        let s = format!("{v:?}");
+        self.record_str(f, s.trim_matches('"'));
     }
 }
 
@@ -102,10 +121,13 @@ impl Subscriber for Meter {
     fn enabled(&self, _: &Metadata<'_>) -> bool {
         true
     }
-    fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+    fn new_span(&self, attrs: &span::Attributes<'_>) -> span::Id {
+        attrs.record(&mut Pairs(&self.span_fields));
         span::Id::from_u64(1)
     }
-    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+    fn record(&self, _: &span::Id, values: &span::Record<'_>) {
+        values.record(&mut Pairs(&self.span_fields));
+    }
     fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
     fn event(&self, event: &Event<'_>) {
         if event.metadata().target() != metrics::METRIC {
@@ -467,15 +489,15 @@ async fn every_sample_matches_its_declaration() {
 
 /// A plane emits no tenant label unless asked.
 ///
-/// A tenant name is frequently a customer name, and a metrics backend is
+/// A tenant name is frequently a customer name, and an observability backend is
 /// usually the least protected system in a deployment — sampled into third-party
 /// services, on a dashboard nobody signs into, retained past every other record. A
-/// deployment that has not decided where its metrics go has not decided that
+/// deployment that has not decided where its telemetry goes has not decided that
 /// customer names may travel there.
 #[tokio::test]
 async fn metrics_carry_no_tenant_unless_asked() {
     use agentplane::core::TenantId;
-    use agentplane::runtime::metrics::TenantLabel;
+    use agentplane::runtime::telemetry::TenantLabel;
 
     // Named, not merely relied upon: "no label by default" and "the default is
     // `Omitted`" are different claims, and a new default that also happened to
@@ -494,7 +516,7 @@ async fn metrics_carry_no_tenant_unless_asked() {
             .tenant(TenantId::new("acme-financial").expect("valid"))
             // Stated explicitly here, which is also what a deployment writes
             // when it wants the default behaviour on the record.
-            .metric_tenant(TenantLabel::Omitted)
+            .tenant_label(TenantLabel::Omitted)
             .skill(Pinger)
             .build();
         rt.run("ping", Tainted::trusted(json!({})))
@@ -511,6 +533,45 @@ async fn metrics_carry_no_tenant_unless_asked() {
     );
 }
 
+/// **The same policy reaches the traces.**
+///
+/// One decision about whether customer names may travel to an observability
+/// backend, honoured on both signals. Answered on the metrics and unanswerable
+/// on the traces is the decision kept on one channel — and the run span is where
+/// it goes, because every other span is inside that run's trace.
+#[tokio::test]
+async fn the_tenant_label_reaches_the_run_span_too() {
+    use agentplane::core::TenantId;
+    use agentplane::runtime::telemetry::TenantLabel;
+
+    let recorder = Meter::default();
+    let fields = {
+        let _guard = tracing::subscriber::set_default(recorder.clone());
+        let store = Arc::new(
+            RedbStore::open_in_memory()
+                .unwrap()
+                .for_tenant(TenantId::new("acme").expect("valid")),
+        );
+        let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+            .tenant(TenantId::new("acme").expect("valid"))
+            .tenant_label(TenantLabel::Name)
+            .skill(Pinger)
+            .build();
+        rt.run("ping", Tainted::trusted(json!({})))
+            .await
+            .expect("run");
+        recorder.span_fields()
+    };
+
+    let want = format!("{}=acme", agentplane::runtime::telemetry::TENANT);
+    assert!(
+        fields.contains(&want),
+        "the tenant label was asked for and the run span does not carry `{want}`, \
+         so `which tenant is this trace` is unanswerable while the same question \
+         is answered on every metric; recorded: {fields:?}"
+    );
+}
+
 /// Asked for, the label is the plane's own tenant — which is what bounds it.
 ///
 /// Cardinality is the number of planes an operator configured, not a number any
@@ -519,7 +580,7 @@ async fn metrics_carry_no_tenant_unless_asked() {
 #[tokio::test]
 async fn an_asked_for_tenant_label_is_the_planes_own() {
     use agentplane::core::TenantId;
-    use agentplane::runtime::metrics::TenantLabel;
+    use agentplane::runtime::telemetry::TenantLabel;
 
     let meter = Meter::default();
     let samples = {
@@ -531,7 +592,7 @@ async fn an_asked_for_tenant_label_is_the_planes_own() {
         );
         let rt = Runtime::builder(store as Arc<dyn JournalStore>)
             .tenant(TenantId::new("acme").expect("valid"))
-            .metric_tenant(TenantLabel::Name)
+            .tenant_label(TenantLabel::Name)
             .skill(Pinger)
             .build();
         rt.run("ping", Tainted::trusted(json!({})))

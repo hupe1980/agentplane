@@ -2101,6 +2101,7 @@ spec:
 
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_answer(agentplane::model::Completion {
+        model: None,
         text: String::new(),
         structured: Some(json!({
             // `args` is JSON text on the wire: constrained decoding has no
