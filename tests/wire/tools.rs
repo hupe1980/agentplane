@@ -1225,7 +1225,7 @@ fn a_model_chosen_tool_name_is_matched_exactly_or_refused() {
 
     assert_eq!(
         catalog.resolve("ledger__transfer"),
-        Some(granted.clone()),
+        Some(granted),
         "the exact wire name must resolve, or nothing can be called at all"
     );
     assert!(

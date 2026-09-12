@@ -25,6 +25,29 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## `FakeProvider` refuses a schema constrained decoding cannot enforce
+
+**Affected:** any test or example whose declared schema falls outside the
+strict-decoding subset. Those were already failing against the `OpenAI` driver;
+now they fail offline too.
+
+The stand-in makes the same pre-flight refusal the real drivers make. Close every
+object, list every property in `required`, give arrays `items`, and spell
+optionality as `type: [string, null]` — the same rules
+[`spec.output.schema`](@/docs/manifest.md#spec-output) states.
+
+```rust,ignore
+// A deployment that has chosen a provider which genuinely accepts more —
+// Gemini's `responseJsonSchema` takes any valid JSON Schema.
+let provider = FakeProvider::new();
+provider.without_constrained_decoding();
+```
+
+The default echo also stops at `max_output_tokens`, reporting `truncated` and a
+`max_tokens` stop reason. A test that asserted an uncapped `output_tokens` from
+the echo, or that a small ceiling produced an untruncated answer, sees the real
+behaviour now. Scripted answers are unchanged.
+
 ## A declarative agent's object schemas must be closed
 
 **Affected:** any manifest with an `execution` block declaring

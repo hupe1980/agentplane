@@ -1460,6 +1460,75 @@ fn a_secret_cannot_be_serialized_or_printed() {
     );
 }
 
+/// Every constitutional invariant names evidence, and that evidence exists.
+///
+/// The invariants are what this runtime *has to* do; the mutation table is what
+/// somebody has shown to be falsifiable. Nothing connected the two, so an
+/// invariant could lose its last piece of evidence — to a rename, a deleted
+/// row, a rewritten test — and read exactly as it did when it had some.
+/// Auditing the suite against the invariants rather than against the code found
+/// six such tests, for the announce-act-record protocol and the effect key it
+/// turns on, that no mutation named at all.
+///
+/// A sample, not a census: this proves an invariant has evidence, never that
+/// the evidence is complete. What it cannot be is silently empty.
+#[test]
+fn every_invariant_names_evidence_that_exists() {
+    let table =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/mutants.py"))
+            .expect("the mutation table is readable");
+
+    let map = table
+        .split_once("INVARIANTS: dict[str, tuple[str, list[str]]] = {")
+        .expect("the invariant map is in the mutation table")
+        .1;
+    let map = map.split_once("\n}\n").expect("the map ends").0;
+
+    let mut claimed: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in map.split("    \"I").skip(1) {
+        let Some((number, tail)) = entry.split_once("\": (") else {
+            continue;
+        };
+        // Every quoted word after the human-readable summary is a row name.
+        let names: Vec<String> = tail
+            .split('"')
+            .skip(3)
+            .step_by(2)
+            .map(str::to_owned)
+            .filter(|name| !name.trim().is_empty())
+            .collect();
+        claimed.push((format!("I{number}"), names));
+    }
+
+    assert_eq!(
+        claimed.len(),
+        14,
+        "the map lists {} invariants, and there are fourteen — an entry was \
+         lost, or the map moved and this guard is now inert",
+        claimed.len()
+    );
+
+    let mut bad: Vec<String> = Vec::new();
+    for (invariant, names) in &claimed {
+        if names.is_empty() {
+            bad.push(format!("{invariant} names no evidence"));
+        }
+        for name in names {
+            if !table.contains(&format!("\"{name}\": (")) {
+                bad.push(format!(
+                    "{invariant} names `{name}`, which the mutation table does not define"
+                ));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "an invariant's evidence has gone missing, so it reads as pinned and is \
+         not:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
 /// Every mutation still anchors in the code it claims to break.
 ///
 /// `every_test_the_mutation_table_names_exists` checks the *test* half of each

@@ -80,9 +80,10 @@ impl Calendar for WallClock {
             "minutes" => time::Duration::minutes(n),
             other => return Err(CalendarError::UnknownKind(other.to_owned())),
         };
-        from.checked_add(delta).ok_or(CalendarError::OutOfRange {
-            kind: spec.kind.clone(),
-        })
+        from.checked_add(delta)
+            .ok_or_else(|| CalendarError::OutOfRange {
+                kind: spec.kind.clone(),
+            })
     }
 
     fn digest(&self) -> Digest {

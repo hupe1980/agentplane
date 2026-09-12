@@ -31,13 +31,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agentplane::core::Tainted;
-use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::model::ModelProvider;
 use agentplane::model::fake::FakeProvider;
-use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
-use agentplane::store::RedbStore;
+use agentplane::prelude::*;
+use agentplane::runtime::Agent;
 use agentplane::tools::{Tool, ToolBox, ToolFailure};
 use serde_json::{Value, json};
 
@@ -303,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // which the model asked for.
     let records = store.read(first.run_id, 1).await?;
     let kinds: Vec<&str> = records.iter().map(|r| r.kind().kind_str()).collect();
-    let effects = kinds.iter().filter(|k| **k == "EffectStarted").count();
+    let effects = kinds.iter().filter(|&&k| k == "EffectStarted").count();
     println!(
         "\n5. the first run left {} records, {effects} of them effects — one per \
          model turn and one per tool call",

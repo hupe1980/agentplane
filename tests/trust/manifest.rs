@@ -5178,7 +5178,7 @@ spec:
     assert!(manifest.prompt_grant("templates", "summarize").is_some());
     assert!(manifest.resource_grant("knowledge", "kb://rules").is_some());
     let before = manifest.digest().unwrap();
-    let mut changed = manifest.clone();
+    let mut changed = manifest;
     changed.spec.context.resources[0].output_sensitivity = agentplane::core::Sensitivity::Secret;
     assert_ne!(before, changed.digest().unwrap());
 
@@ -6508,6 +6508,21 @@ spec:
         "{refused}"
     );
     assert!(refused.to_string().contains("improvises"), "{refused}");
+
+    // The **model's** spelling, which is the one an author writing a procedure
+    // reaches for — the tool surface a `tool-calling` agent is offered names
+    // `obsd__list_overdue`, not `tool://obsd/list_overdue`. Checking only the
+    // reference spelling left the likelier mistake unchecked.
+    Manifest::parse(&with("Call obsd__list_overdue, then summarise."))
+        .expect("the granted tool's wire name is a granted tool");
+    let wire = Manifest::parse(&with("First call obsd__close_process, then summarise."))
+        .expect_err("a prompt naming an ungranted wire name must be refused");
+    assert!(wire.to_string().contains("obsd__close_process"), "{wire}");
+
+    // Ordinary prose is left alone, including a word with no separator in it
+    // and one with a doubled underscore that is not a wire name.
+    Manifest::parse(&with("Summarise the overdue_process list."))
+        .expect("an ordinary identifier is not a tool reference");
 
     // The extraction model's own instruction is prose a model reads, and it is
     // offered the same grants — so a tool named there fails the same way, and

@@ -923,20 +923,25 @@ pub mod action {
     pub const RUN_HISTORY: &str = "api:run.history";
     pub const RUN_LIST: &str = "api:run.list";
     pub const RUN_CANCEL: &str = "api:run.cancel";
-    /// Handing a quarantined run back to be judged again. Its own verb rather
-    /// than a widened `run.cancel`: cancelling asks for work to be *undone*,
-    /// and this asks for it to be *continued* — opposite intents, and a
-    /// deployment that grants one has said nothing about the other.
+    /// Handing a quarantined run back to be judged again.
+    ///
+    /// Its own verb rather than a widened `run.cancel`: cancelling asks for
+    /// work to be *undone* and this asks for it to be *continued* — opposite
+    /// intents, and a deployment that grants one has said nothing about the
+    /// other.
     pub const RUN_REOPEN: &str = "api:run.reopen";
-    /// Closing a quarantined run whose outcome will never be established. The
-    /// gravest verb on this surface and deliberately the narrowest: it ends a
-    /// run without unwinding, so whatever it left in the world stays there, and
-    /// the authority to write that off is not the authority to retry.
+    /// Closing a quarantined run whose outcome will never be established.
+    ///
+    /// The gravest verb on this surface and deliberately the narrowest: it
+    /// ends a run without unwinding, so whatever it left in the world stays
+    /// there, and the authority to write that off is not the authority to
+    /// retry.
     pub const RUN_ABANDON: &str = "api:run.abandon";
-    /// Asserting, out of band, what happened to one effect in doubt. Separate
-    /// from both of the above because it is *evidence* rather than a decision —
-    /// the person who can look a charge up in the provider's console is often
-    /// not the person who decides what the run does next.
+    /// Asserting, out of band, what happened to one effect in doubt.
+    ///
+    /// Separate from both of the above because it is *evidence* rather than a
+    /// decision — the person who can look a charge up in the provider's console
+    /// is often not the person who decides what the run does next.
     pub const EFFECT_RECONCILE: &str = "api:effect.reconcile";
     pub const TASK_LIST: &str = "api:task.list";
     pub const TASK_READ: &str = "api:task.read";
@@ -953,15 +958,19 @@ pub mod action {
     /// `case.list`, because the party who must answer for a breach is a
     /// compliance function that has no reason to read matter state.
     pub const OBLIGATION_LIST: &str = "api:obligation.list";
-    /// Accounting for one. Separate from reading the list because it is what
-    /// takes an entry off it, and the party allowed to see what a deployment
-    /// missed is not automatically the party allowed to declare it answered.
+    /// Accounting for one.
+    ///
+    /// Separate from reading the list because it is what takes an entry off
+    /// it, and the party allowed to see what a deployment missed is not
+    /// automatically the party allowed to declare it answered.
     pub const OBLIGATION_ACKNOWLEDGE: &str = "api:obligation.acknowledge";
     pub const EVENT_DELIVER: &str = "api:event.deliver";
-    /// Reading the messages that arrived and reached nobody. Its own verb
-    /// because the audience is whoever owns the *integration* — a dead letter
-    /// means a correlation key does not match what a run subscribed to, which
-    /// is a question about the emitter, not about any matter's contents.
+    /// Reading the messages that arrived and reached nobody.
+    ///
+    /// Its own verb because the audience is whoever owns the *integration* —
+    /// a dead letter means a correlation key does not match what a run
+    /// subscribed to, which is a question about the emitter, not about any
+    /// matter's contents.
     pub const DEADLETTER_LIST: &str = "api:deadletter.list";
     /// Reading the webhook registrations a delivery worker gave up on.
     #[cfg(feature = "push")]

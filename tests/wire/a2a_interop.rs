@@ -65,7 +65,7 @@ impl a2a_server::AgentExecutor for Echo {
     ) -> BoxStream<'static, Result<StreamResponse, a2a::A2AError>> {
         let task = Task {
             id: ctx.task_id.clone(),
-            context_id: ctx.context_id.clone(),
+            context_id: ctx.context_id,
             status: TaskStatus {
                 state: TaskState::Canceled,
                 message: None,

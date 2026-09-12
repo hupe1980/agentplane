@@ -718,7 +718,7 @@ pub struct Runtime {
     /// leak every runtime ever built. It exists because commissioning belongs to
     /// the *runtime* — a skill holding an `Arc<Runtime>` cannot work, since the
     /// runtime needs the skill before the skill can have the runtime.
-    self_ref: std::sync::Weak<Runtime>,
+    self_ref: std::sync::Weak<Self>,
     /// The declaration governing each skill, by skill name.
     ///
     /// Per skill rather than per runtime, because a plane runs several agents
@@ -4016,7 +4016,7 @@ impl Runtime {
             // either depended on it, or will be dispatched when it resumes.
             // Anything already done may need undoing first.
             let mut stopped = apply(&current, outcomes, &mut done, &mut completed, &mut outputs)
-                .or(refused.map(RunStatus::Exhausted));
+                .or_else(|| refused.map(RunStatus::Exhausted));
 
             if let Some(RunStatus::Replanning(reason)) = &stopped {
                 let recorded = recorded_successors.get(replans as usize);
@@ -7562,8 +7562,12 @@ impl RuntimeBuilder {
     }
 
     /// Without the `keyring` feature there is nothing to seal.
+    ///
+    /// `&mut self` matches the sealing arm above, which does mutate. Taking
+    /// `&self` here would make the signature depend on a feature flag, and
+    /// every caller with it.
     #[cfg(not(feature = "keyring"))]
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::unused_self, clippy::needless_pass_by_ref_mut)]
     fn seal_stores(&mut self) {}
 
     /// Supply the store that tracks batch items.

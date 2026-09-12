@@ -837,7 +837,7 @@ mod tests {
         );
         assert!(
             verify(
-                &v.clone().within(std::time::Duration::from_secs(3600)),
+                &v.within(std::time::Duration::from_secs(3600)),
                 &h,
                 BODY,
                 at + 3000

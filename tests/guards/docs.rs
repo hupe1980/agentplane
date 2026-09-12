@@ -1166,7 +1166,7 @@ fn no_doc_comment_has_absorbed_the_one_below_it() {
             if !block.is_empty() {
                 checked += 1;
                 for section in SECTIONS {
-                    let n = block.iter().filter(|l| **l == section).count();
+                    let n = block.iter().filter(|&&l| l == section).count();
                     if n > 1 {
                         merged.push(format!(
                             "{rel}:{start} has {n} `{section}` sections — this block \
@@ -1982,9 +1982,17 @@ fn the_landing_pages_proof_figures_are_the_real_ones() {
 
     // One table entry per line, `    "Name": (` — the same shape both tables use
     // and the same one `mutants.py --check` walks.
+    // Bounded to the mutation table itself. The file also holds the map from
+    // each invariant to the rows that pin it, whose entries are the same shape
+    // — and counting those as mutations overstated the figure by fourteen on
+    // the one page arguing the project does not overstate.
     let rows = |table: &str| -> u64 {
-        read(table)
-            .lines()
+        let text = read(table);
+        let text = text
+            .split_once("= {\n")
+            .map_or(text.as_str(), |(_, rest)| rest);
+        let text = text.split_once("\n}\n").map_or(text, |(first, _)| first);
+        text.lines()
             .filter(|l| {
                 let t = l.trim_start();
                 l.starts_with("    \"")

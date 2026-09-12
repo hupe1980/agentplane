@@ -1724,7 +1724,7 @@ impl<'a> StepCtx<'a> {
     /// *recorded* — so a replayed run reaches the same budget verdict at the
     /// same point as the original.
     fn replayed_done(
-        &mut self,
+        &self,
         kind: &str,
         attempt: u32,
         spend: crate::core::Spend,
@@ -2327,7 +2327,7 @@ impl<'a> StepCtx<'a> {
     /// stopped here — which is the faithful outcome, not a fault.
     #[allow(clippy::too_many_arguments)]
     fn recorded_failure(
-        &mut self,
+        &self,
         descriptor: &EffectDescriptor,
         ordinal: u32,
         attempt: u32,
@@ -3298,7 +3298,7 @@ impl<'a> StepCtx<'a> {
     /// failure is part of what the original run spent.
     #[allow(clippy::too_many_arguments)]
     fn replay_recorded_failure(
-        &mut self,
+        &self,
         descriptor: &EffectDescriptor,
         ordinal: u32,
         attempt: u32,

@@ -85,7 +85,7 @@ impl Subscriber for Recorder {
         let name = attrs.metadata().name().to_owned();
         self.spans.lock().unwrap().push(name.clone());
         let parent = self.stack.lock().unwrap().last().map(|(_, n)| n.clone());
-        self.tree.lock().unwrap().push((name.clone(), parent));
+        self.tree.lock().unwrap().push((name, parent));
 
         let mut next = self.next.lock().unwrap();
         *next += 1;

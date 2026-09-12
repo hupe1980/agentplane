@@ -1258,6 +1258,8 @@ fn trim_descriptions(value: &mut serde_json::Value) {
 /// the reference parser then refuses is skipped rather than reported: prose
 /// containing the literal text `tool://` in a sentence about the scheme itself
 /// is not a grant somebody forgot.
+///
+/// The reviewer's spelling; [`wire_names_in`] finds the model's.
 fn tool_references_in(text: &str) -> Vec<String> {
     let mut found = Vec::new();
     let mut rest = text;
@@ -1274,6 +1276,37 @@ fn tool_references_in(text: &str) -> Vec<String> {
         // Advance past the scheme, never past the candidate: two references
         // written back to back must both be seen.
         rest = &rest[at + crate::tools::TOOL_SCHEME.len()..];
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Every `server__name` a piece of reviewed prose spells out.
+///
+/// The model's spelling, and the one an author writing a procedure reaches for,
+/// because it is what a `tool-calling` or `planned` agent is offered.
+///
+/// Separate from [`tool_references_in`] because the two are matched against
+/// different things: a reference against the grant's `ref`, a wire name against
+/// what the model is shown. Both are mechanical, which is what separates them
+/// from prose — a paragraph saying *"search the ledger"* names a tool in a way
+/// no checker can tell from an ordinary verb.
+fn wire_names_in(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for word in text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))) {
+        // `__` is the separator and cannot occur inside a component, so a word
+        // carrying exactly one is a wire name and a word carrying none is
+        // ordinary prose.
+        if word.matches("__").count() == 1
+            && !word.starts_with("__")
+            && !word.ends_with("__")
+            && word.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.')
+            })
+        {
+            found.push(word.to_owned());
+        }
     }
     found.sort();
     found.dedup();
@@ -1988,6 +2021,16 @@ impl Manifest {
                 formation.instruction.as_str(),
             ));
         }
+        // The model is offered wire names, so that is the spelling an author
+        // writing a procedure reaches for — and it was the one spelling nothing
+        // checked.
+        let offered: std::collections::BTreeSet<String> = self
+            .spec
+            .tools
+            .iter()
+            .filter_map(|g| crate::tools::ToolId::parse(&g.reference))
+            .map(|id| id.wire_name())
+            .collect();
         for (field, text) in prose {
             for reference in tool_references_in(text) {
                 if !granted.contains(reference.as_str()) {
@@ -1997,6 +2040,17 @@ impl Manifest {
                          model as a failed call, so the model improvises and the \
                          instruction silently does not happen — grant the tool, or stop \
                          naming it"
+                    )));
+                }
+            }
+            for wire in wire_names_in(text) {
+                if !offered.contains(&wire) {
+                    return Err(ManifestError::Syntax(format!(
+                        "{field} instructs the agent to call '{wire}', which is the \
+                         spelling a model is offered and `spec.tools` grants no tool \
+                         under. The model is told of no such tool, so it improvises and \
+                         the instruction silently does not happen — grant the tool, or \
+                         stop naming it"
                     )));
                 }
             }
@@ -2128,14 +2182,8 @@ impl Manifest {
 
     /// A grant that asks for a human needs somewhere for that request to go.
     fn validate_tool_approval(&self) -> Result<(), ManifestError> {
-        let asking: Vec<&str> = self
-            .spec
-            .tools
-            .iter()
-            .filter(|grant| grant.requires_approval)
-            .map(|grant| grant.reference.as_str())
-            .collect();
-        if asking.is_empty() {
+        // Only whether *any* grant asks, so no list is built to be thrown away.
+        if !self.spec.tools.iter().any(|grant| grant.requires_approval) {
             return Ok(());
         }
         if self.spec.oversight.is_none() {

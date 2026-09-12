@@ -21,17 +21,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentplane::blob::{BlobError, BlobStore, MemoryBlobs};
-use agentplane::core::{
-    Digest, Effect, Outcome, Sensitivity, Skill, SkillDescriptor, SkillError, SourceId, Tainted,
-    Timestamp, Trust,
-};
-use agentplane::journal::JournalStore;
+use agentplane::core::{Digest, Effect, SourceId, Timestamp};
 use agentplane::media::{FetchedMedia, MediaRetention};
 use agentplane::model::fake::FakeProvider;
 use agentplane::model::{ModelCall, ModelId, ModelProvider};
-use agentplane::runtime::{Mode, Runtime, StepCtx};
-use agentplane::store::RedbStore;
-use async_trait::async_trait;
+use agentplane::prelude::*;
 use base64::Engine as _;
 use serde_json::{Value, json};
 
@@ -199,6 +193,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("2. live model dispatch                → {:?}", live.status);
     println!("   journaled media identity           → {digest}");
     println!("   blob reads / provider calls        → 1 / 1");
+    // One of the numbered claims in this file's header, and a claim a reader
+    // cannot see hold is one they have to take on trust.
+    println!(
+        "   the answer's label                 → {:?} — a model read the bytes, \
+         so what it says about them is not evidence",
+        live.output.as_ref().expect("an answer").label().trust
+    );
 
     let replay = runtime.replay(live.run_id, Mode::Strict).await?;
     assert_eq!(replay.output, live.output);

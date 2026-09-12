@@ -85,10 +85,126 @@ otherwise the prompt is content and is serialized whole. Fixed in the `OpenAI`,
 Anthropic, Gemini, Bedrock and Chat Completions drivers together, since all five
 carried it.
 
-### Assurance — four new mutations, and the count is 708
+### Fixed — one refusal written three times, and implemented by the stand-in nowhere
 
-The plan format, the open-object refusal at both depths, and a level's name in a
-refusal each break on purpose now, and each names the one test that must fail.
+**A continuation with no tool exchanges behind it is now refused in one place.**
+
+`continuation.is_some() && exchanges.is_empty()` appeared byte-identical in the
+`OpenAI`, Anthropic and Chat Completions drivers, each carrying its own copy of
+the reasoning — and `FakeProvider` carried none, so a test could hand it that
+shape, get a cheerful answer, and fail against every real provider. It joins the
+two refusals already shared, where the stand-in reads them from the same place
+the drivers do.
+
+This is the answer to whether the stand-in should grow per-driver profiles: no.
+A profile would be a second copy of what a driver does, drifting the moment the
+driver changed, and a stand-in that claims to model a driver and no longer does
+is worse than one that makes no claim. Where the drivers genuinely agree, the
+rule moves to the shared layer and the fake gets it for free; where they
+genuinely differ — only constrained decoding does — one knob opts out.
+
+### Changed — seven lints turned on, and what they found
+
+**Idiom neither `all` nor `pedantic` covers, starting from a double dereference
+nobody could read.**
+
+`filter(|k| **k == "EffectStarted")` peels two references by hand where the
+pattern should: `filter(|&&k| k == …)`. The rest of that class was audited by
+enabling `nursery` and triaging what came back, rather than by guessing.
+
+Seven are now on, with the reason beside them in `Cargo.toml`: `or_fun_call`,
+`redundant_clone`, `needless_collect`, `needless_pass_by_ref_mut`,
+`string_lit_as_bytes`, `use_self` and `too_long_first_doc_paragraph`.
+
+What they found: sixteen needless clones; `ToolSafety::from_grant` building two
+whole `Self::default()` values to read one field from one of them; a `String`
+allocated on every A2A task listing and used on none of them; three `StepCtx`
+methods claiming `&mut self` while mutating nothing — the innermost mutates
+through a mutex, so the false claim had propagated three levels up; and five doc
+comments whose first paragraph, which is the whole summary rustdoc shows in an
+index, ran four sentences.
+
+`suspicious_operation_groupings` is **not** enabled: its one finding here is a
+false positive worth recording, since it will be found again.
+`k.note_key_id == line.key_id` compares a `TrustedWitness` against a
+`NoteSignature` — two types that spell one concept with different field names.
+
+### Assurance — every constitutional invariant now names the evidence for it
+
+**Reading the suite against what the runtime is *required* to do, rather than
+against what it does, found six tests that no mutation named — for the
+announce-act-record protocol and the effect key it turns on.**
+
+They passed, and nobody had checked they could fail. Four mutations pin them
+now: a mutating call whose attempts run out with the outcome still unknown
+reaches an operator rather than being unwound; an announcement with no terminal
+record counts as possibly landed; and the attempt and ordinal each stay in the
+effect key, without which a retry reuses the previous attempt's identity and two
+effects in one step collide on one record.
+
+Each of the fourteen invariants now names mutations that break *its* rule on
+purpose, and a guard holds every one to naming at least one that exists — so an
+invariant cannot lose its last evidence to a rename and still read as pinned. A
+sample rather than a census: it proves an invariant is falsifiable somewhere,
+never that its evidence is complete.
+
+The second is worth recording. Aimed at the test whose *name* claims the rule,
+`--verify` reported **WEAK** — caught only by three unrelated tests. That name
+was accurate for what it does (a retryable orphan resolving on resume); the
+unwind rule is owned by a compensation test, which the mutation names now. A
+claim read off test names would have been wrong, which is why `--verify`
+separates *killed* from *caught by something else*.
+
+### Fixed — a prompt could name a tool in the model's own spelling, unchecked
+
+**`spec.identity` and `spec.memory.formation.instruction` are now checked for
+`server__tool` as well as `tool://server/tool`.**
+
+A reviewed prompt naming an ungranted tool is refused, because the model is told
+of no such tool, improvises, and the instruction silently does not happen. The
+check only ever saw the *reference* spelling — but a `tool-calling` or `planned`
+agent is offered **wire names**, so that is the spelling an author writing a
+procedure reaches for, and it was the one shape nothing verified. Found by
+auditing this crate's own fixtures: the new `camel_live` example names all three
+of its tools that way, and nothing was checking them.
+
+Both spellings are mechanical, which is what still separates them from prose — a
+paragraph saying *"search the ledger"* names a tool in a way no checker can tell
+from an ordinary verb.
+
+### Changed — the stand-in refuses what a real driver refuses
+
+**`FakeProvider` now rejects a schema constrained decoding cannot enforce,
+before generating anything, exactly as the `OpenAI` driver does.**
+
+This is the hole every defect above came through. A stand-in that enforces any
+schema it is handed stands in for the most forgiving provider imaginable and
+proves the least: `planned` shipped a plan format the driver refused outright,
+and every offline test of it passed. The fake already made the two refusals
+every driver makes — a provider-side media URL, an instruction hidden in the
+turn list — and this is the third.
+
+Re-breaking the plan format now fails the ordinary offline `planned` tests
+rather than only the one test written after the bug was found by hand. Running
+it against the whole suite turned up one more agent that could not have run
+against a real provider, in a fixture nothing else covered.
+
+`FakeProvider::without_constrained_decoding()` opts out for a deployment that
+has chosen a provider which genuinely accepts more — Gemini's
+`responseJsonSchema` takes any valid JSON Schema, and Anthropic degrades to
+unconstrained rather than refusing.
+
+The echo also stops at `max_output_tokens` now, reporting `truncated` and a
+`max_tokens` stop reason. A fake that bills more output than it was allowed is
+the one provider in the world that does, and it left the ceiling a field the
+runtime could stop forwarding with nothing offline to notice. Scripted answers
+are untouched: those are the author stating what the provider returned.
+
+### Assurance — eleven new mutations, and the count is 715
+
+The plan format, the open-object refusal at both depths, a level's name in a
+refusal, the stand-in's own schema check, and the model's spelling of a tool
+name each break on purpose now, and each names the one test that must fail.
 Every one `--verify`'d.
 
 ### Changed — an open object schema is refused at parse

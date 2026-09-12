@@ -508,7 +508,7 @@ mod tests {
     fn removing_a_leaf_changes_the_root() {
         let l = leaves(8);
         let before = root(&l);
-        let mut without = l.clone();
+        let mut without = l;
         without.remove(3);
         assert_ne!(
             before,

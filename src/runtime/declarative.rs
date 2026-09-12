@@ -1987,10 +1987,7 @@ mod tests {
     /// only against fakes. It did, until this test.
     #[test]
     fn the_plan_format_survives_constrained_decoding() {
-        assert_eq!(
-            crate::model::wire::strict_schema_problem(&plan_schema(4)),
-            None
-        );
+        assert_eq!(crate::model::strict_schema_problem(&plan_schema(4)), None);
     }
 
     /// The planner writes the parse schema, so it is not a reviewed artefact —
@@ -2009,7 +2006,7 @@ mod tests {
             }
         });
         let bounded = bounded_parse_schema(&loose).expect("an object schema is bounded");
-        assert_eq!(crate::model::wire::strict_schema_problem(&bounded), None);
+        assert_eq!(crate::model::strict_schema_problem(&bounded), None);
         let mut required: Vec<&str> = bounded["required"]
             .as_array()
             .expect("required is a list")

@@ -690,9 +690,7 @@ impl PeerTaskCall {
         task: PeerTask,
     ) -> Result<Self, PeerError> {
         let Some(grant) = registry.grant(&task.peer).cloned() else {
-            return Err(PeerError::Unknown {
-                peer: task.peer.clone(),
-            });
+            return Err(PeerError::Unknown { peer: task.peer });
         };
         let credential = registry.credential_for(&task.peer)?.cloned();
         Ok(Self {
@@ -808,9 +806,7 @@ impl PeerTaskCancel {
         task: PeerTask,
     ) -> Result<Self, PeerError> {
         let Some(grant) = registry.grant(&task.peer).cloned() else {
-            return Err(PeerError::Unknown {
-                peer: task.peer.clone(),
-            });
+            return Err(PeerError::Unknown { peer: task.peer });
         };
         let credential = registry.credential_for(&task.peer)?.cloned();
         Ok(Self {

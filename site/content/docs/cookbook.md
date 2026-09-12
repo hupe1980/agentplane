@@ -2458,8 +2458,14 @@ assert!(provider.script_exhausted(), "the run made fewer calls than this test as
 
 **The trap:** a fake that answers for free. Every budget test then passes over a
 runtime that has stopped counting. `FakeProvider` derives usage from the prompt —
-monotonic, never zero — and scripted failures carry usage of their own, which is
-what makes the metered-failure path testable at all.
+monotonic, never zero — scripted failures carry usage of their own, and the echo
+stops at `max_output_tokens` as a real generator does, which is what makes the
+metered-failure path testable at all.
+
+**The other trap:** a fake that refuses nothing. It stands in for the most
+forgiving provider imaginable and proves the least. This one makes the same
+pre-flight refusals every real driver makes, so an agent that could not be asked
+for fails offline rather than on its first real call.
 
 It refuses to answer as a real provider (`fake/gpt-5`, not
 `anthropic/claude-opus-5`), because the provider slug is in the hash-chained

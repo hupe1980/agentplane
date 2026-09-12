@@ -133,13 +133,6 @@ mod openai_stream;
 mod sse;
 #[cfg(feature = "providers")]
 pub(crate) mod wire;
-/// Why a schema cannot be used with constrained decoding, if it cannot.
-///
-/// Public because the answer belongs to whoever wrote the schema — a manifest's
-/// `spec.output.schema`, a tool's `arguments` — and finding out by running the
-/// agent is finding out late.
-#[cfg(feature = "providers")]
-pub use wire::strict_schema_problem;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -236,6 +229,159 @@ fn provider_side_media_refusal(kind: &str) -> String {
          this plane's egress policy and journal; inline the media bytes, or fetch them \
          through an explicit governed effect first"
     )
+}
+
+/// Why a schema cannot be used with strict constrained decoding, if it cannot.
+///
+/// `OpenAI`'s strict mode accepts a **subset** of JSON Schema, and a schema that
+/// is perfectly valid elsewhere is rejected with a 400 that does not say which
+/// rule it broke. Checking here turns that into a refusal naming the exact
+/// problem, before anything is sent and before anything is billed.
+///
+/// Deliberately **not** auto-corrected. Rewriting the caller's schema would mean
+/// the effect key records one shape and the wire carries another — and a run
+/// whose journal disagrees with what it asked for is exactly the class of quiet
+/// divergence this crate exists to prevent. The caller fixes the schema.
+#[cfg(any(
+    feature = "providers",
+    feature = "bedrock",
+    feature = "fake-model",
+    feature = "manifest"
+))]
+pub fn strict_schema_problem(schema: &serde_json::Value) -> Option<String> {
+    fn walk(node: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+        let Some(obj) = node.as_object() else { return };
+
+        if obj.contains_key("default") {
+            out.push(format!(
+                "`{path}` uses `default`, which strict mode rejects"
+            ));
+        }
+
+        // `anyOf` is the one union strict mode takes; the other two are
+        // rejected outright, and walking into them as if they were fine let a
+        // schema through that came back as a 400.
+        for combinator in ["oneOf", "allOf"] {
+            if obj.contains_key(combinator) {
+                out.push(format!(
+                    "`{path}` uses `{combinator}`, which strict mode does not permit — \
+                     `anyOf` is the union it takes"
+                ));
+            }
+        }
+
+        // Every subschema must say what it is. `anyOf` says it by branching,
+        // `$ref` by pointing, `enum` and `const` by enumerating; a bare
+        // `{ "description": ... }` says nothing and is refused.
+        if !["type", "anyOf", "$ref", "enum", "const"]
+            .iter()
+            .any(|key| obj.contains_key(*key))
+        {
+            out.push(format!(
+                "`{path}` has no `type`, which strict mode requires"
+            ));
+        }
+
+        let is_array = match obj.get("type") {
+            Some(serde_json::Value::String(name)) => name == "array",
+            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "array"),
+            _ => false,
+        };
+        if is_array && !obj.contains_key("items") {
+            out.push(format!(
+                "`{path}` is an array without `items`, which strict mode requires"
+            ));
+        }
+
+        // `["object", "null"]` is how strict mode spells an optional object,
+        // and it is still an object: reading only the string form let a
+        // nullable one skip both checks below and reach the provider as a 400.
+        let is_object = match obj.get("type") {
+            Some(serde_json::Value::String(name)) => name == "object",
+            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "object"),
+            _ => false,
+        };
+        if is_object {
+            if obj.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
+                out.push(format!(
+                    "`{path}` is an object without `additionalProperties: false`"
+                ));
+            }
+            let properties = obj.get("properties").and_then(|p| p.as_object());
+            if let Some(properties) = properties {
+                let required: Vec<&str> = obj
+                    .get("required")
+                    .and_then(|r| r.as_array())
+                    .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+                for key in properties.keys() {
+                    if !required.contains(&key.as_str()) {
+                        out.push(format!(
+                            "`{path}.{key}` is optional; strict mode requires every \
+                             property to be listed in `required`"
+                        ));
+                    }
+                }
+            }
+        }
+
+        for (key, child) in obj {
+            match key.as_str() {
+                "properties" | "$defs" | "definitions" => {
+                    if let Some(map) = child.as_object() {
+                        for (name, sub) in map {
+                            walk(sub, &format!("{path}.{name}"), out);
+                        }
+                    }
+                }
+                "items" | "not" => walk(child, &format!("{path}.{key}"), out),
+                "anyOf" | "oneOf" | "allOf" => {
+                    if let Some(list) = child.as_array() {
+                        for (i, sub) in list.iter().enumerate() {
+                            walk(sub, &format!("{path}.{key}[{i}]"), out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut problems = Vec::new();
+    walk(schema, "schema", &mut problems);
+    if problems.is_empty() {
+        return None;
+    }
+    Some(problems.join("; "))
+}
+
+/// A continuation with no tool exchanges behind it.
+///
+/// Every wire that carries a continuation carries it as *the turn that already
+/// happened*: the model's own tool-call items, followed by their outputs.
+/// Without exchanges there is no request for it to follow, and honouring it
+/// would journal an effect key recording a continuation the wire never carried.
+///
+/// Shared because it is one rule: a driver-local copy drifts, and a stand-in
+/// that does not make it lets a test pass on a shape no provider accepts.
+// Not `bedrock`: Converse has no continuation of this shape, so gating it in
+// would be a function that driver never calls.
+#[cfg(any(feature = "providers", feature = "fake-model"))]
+pub(crate) fn refuse_dangling_continuation(
+    continuation: Option<&ProviderContinuation>,
+    exchanges: &[ToolExchange],
+    model: &ModelId,
+) -> Result<(), ModelError> {
+    if continuation.is_some() && exchanges.is_empty() {
+        return Err(ModelError::Refused {
+            model: model.clone(),
+            detail: "a continuation without tool exchanges has no request to follow — \
+                     a continuation is the turn that already happened, and without the \
+                     calls it answered there is nothing for it to continue"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// The wire's own turn list, when the caller handed one over.

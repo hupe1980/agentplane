@@ -140,8 +140,8 @@ impl Quorum {
     /// panel did not run.
     #[must_use]
     pub fn tally(&self, verdicts: &[Verdict]) -> Outcome {
-        let passed = verdicts.iter().filter(|v| **v == Verdict::Pass).count();
-        let failed = verdicts.iter().filter(|v| **v == Verdict::Fail).count();
+        let passed = verdicts.iter().filter(|&&v| v == Verdict::Pass).count();
+        let failed = verdicts.iter().filter(|&&v| v == Verdict::Fail).count();
         let tally = Tally {
             passed: u32::try_from(passed).unwrap_or(u32::MAX),
             failed: u32::try_from(failed).unwrap_or(u32::MAX),

@@ -1883,6 +1883,78 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        let url = format!(\"{}/add-checkpoint\", self.prefix);",
         "        let old_size = checkpoint.size.saturating_sub(proof.len() as u64);\n        let url = format!(\"{}/add-checkpoint\", self.prefix);",
     ),
+    "AnAttemptDoesNotChangeAnEffectsIdentity": (
+        "src/core/id.rs",
+        "effect_key_separates_step_phase_ordinal_and_attempt",
+        "the attempt number leaves the effect key, so a retry reuses the "
+        "identity of the attempt before it — a replay reads back the earlier "
+        "outcome as though it were this call's, and two dispatches share one "
+        "record (I3)",
+        """        h.update(attempt.to_be_bytes());""",
+        """        h.update(0u32.to_be_bytes());""",
+    ),
+    "TwoEffectsInAStepCollideOnOneKey": (
+        "src/core/id.rs",
+        "effect_key_separates_step_phase_ordinal_and_attempt",
+        "the ordinal leaves the effect key, so two effects of the same kind "
+        "in one step derive the same identity and the second reads back the "
+        "first's outcome instead of being performed (I3)",
+        """        h.update(ordinal.to_be_bytes());""",
+        """        h.update(0u32.to_be_bytes());""",
+    ),
+    "AMutatingDoubtUnwindsInsteadOfAsking": (
+        "src/runtime/ctx.rs",
+        "a_mutating_effect_that_ends_in_doubt_quarantines",
+        "a mutating call whose attempts run out with the outcome still unknown "
+        "is classified as an ordinary failure, so the unwind compensates every "
+        "step around a call that may have landed — the refund for money nobody "
+        "took, issued because the retry policy gave up (I5)",
+        """                    if mutates && !policy.permits(attempt) {""",
+        """                    if false && mutates && !policy.permits(attempt) {""",
+    ),
+    "AnAnnouncementWithNoOutcomeIsAssumedHarmless": (
+        "src/runtime/executor.rs",
+        "a_failed_steps_landed_mutation_is_undone_and_its_rejected_one_is_not",
+        "an `EffectStarted` with no terminal record is treated as having "
+        "changed nothing, so the unwind skips the one call it cannot account "
+        "for — which is the whole reason the announcement is durable before "
+        "dispatch (I2)",
+        """                        touching.insert(key, (step, true));""",
+        """                        touching.insert(key, (step, false));""",
+    ),
+    "TheModelsSpellingOfAToolIsUnchecked": (
+        "src/manifest/mod.rs",
+        "a_prompt_naming_an_ungranted_tool_is_refused",
+        "a reviewed prompt may name a tool in the spelling the model is "
+        "actually offered — `server__tool` — without that name being granted, "
+        "so the model is told of no such tool, improvises, and the instruction "
+        "silently does not happen",
+        """            for wire in wire_names_in(text) {
+                if !offered.contains(&wire) {""",
+        """            for wire in wire_names_in(text) {
+                if false && !offered.contains(&wire) {""",
+    ),
+    "ADanglingContinuationIsHonoured": (
+        "src/model/mod.rs",
+        "a_continuation_with_no_exchanges_behind_it_is_refused",
+        "a continuation with no tool exchanges behind it is sent, so the "
+        "effect key records a continuation the wire never carried and the "
+        "provider is asked to continue a turn that never happened",
+        """    if continuation.is_some() && exchanges.is_empty() {""",
+        """    if false && continuation.is_some() && exchanges.is_empty() {""",
+    ),
+    "TheStandInEnforcesAnySchema": (
+        "src/model/fake.rs",
+        "a_schema_no_provider_could_enforce_is_refused_offline",
+        "the stand-in accepts a schema no provider with constrained decoding "
+        "would, so an agent whose result contract or plan format cannot be "
+        "asked for passes every offline test and is refused on its first real "
+        "call — the gap that let `planned` ship unable to run at all",
+        """        if *self.constrained.lock().expect("fake")
+            && let Some(schema) = request.schema""",
+        """        if false
+            && let Some(schema) = request.schema""",
+    ),
     "AnOpenObjectSchemaIsAccepted": (
         "src/manifest/mod.rs",
         "an_object_schema_a_model_may_add_to_is_refused",
@@ -2492,7 +2564,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if let Some(problem) = None::<String> {",
     ),
     "TheSchemaIsRewrittenOnTheWayOut": (
-        "src/model/wire.rs",
+        "src/model/mod.rs",
         "a_conformant_schema_is_not_rewritten",
         "a conformant schema is rejected, making structured output unusable",
         "    let mut problems = Vec::new();\n    walk(schema, \"schema\", &mut problems);",
@@ -7745,6 +7817,97 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     "succeeded",
     "cancelled",
     "abandoned",""",
+    ),
+}
+
+
+# Which constitutional invariant each guarantee serves.
+#
+# The invariants are what this runtime *has to* do; the table above is what
+# somebody has shown to be falsifiable. Nothing connected the two, so an
+# invariant could lose its last piece of evidence — to a rename, a deleted row,
+# a rewritten test — and read exactly as it did when it had some. Reading the
+# suite against the invariants rather than against the code found six tests, for
+# the announce-act-record protocol and the effect key it turns on, that no
+# mutation named at all.
+#
+# Beside the mutations rather than in the design document, so the names cannot
+# drift from the rows they point at, and `--check` reads both in one pass.
+#
+# A sample, not a census: a row proves an invariant is falsifiable somewhere,
+# never that its evidence is complete.
+INVARIANTS: dict[str, tuple[str, list[str]]] = {
+    "I1": (
+        "the journal is the execution truth",
+        ["ReplayRePerforms", "DenialNotJournaled", "PolicyOnReplay"],
+    ),
+    "I2": (
+        "intent precedes action",
+        ["AnAnnouncementWithNoOutcomeIsAssumedHarmless", "RetryWhatLanded"],
+    ),
+    "I3": (
+        "effect identity is runtime-owned",
+        [
+            "AnAttemptDoesNotChangeAnEffectsIdentity",
+            "TwoEffectsInAStepCollideOnOneKey",
+            "ACanonRuleChangeReadsAsDivergence",
+        ],
+    ),
+    "I4": (
+        "replay divergence is quarantined",
+        ["IgnoreKeyMismatch", "ReleaseReplayDriftIgnored"],
+    ),
+    "I5": (
+        "unknown outcomes remain unknown",
+        [
+            "AMutatingDoubtUnwindsInsteadOfAsking",
+            "AnInDoubtEffectIsAnApology",
+            "AGroupReversesThroughDoubt",
+        ],
+    ),
+    "I6": (
+        "authority only narrows",
+        ["DelegationCanWiden", "ValidityCanWiden", "AudienceCanWiden"],
+    ),
+    "I7": (
+        "authorization is about data as well as action",
+        ["TrustToolOutput", "ReadOnlyProtectedFieldsIgnored", "AnOpenObjectSchemaIsAccepted"],
+    ),
+    "I8": (
+        "plans are frozen authorization graphs",
+        ["PlanFieldLabelsFlattened", "NoScopeGate", "APlanFormatNoProviderWillAccept"],
+    ),
+    "I9": (
+        "ownership and shared state use different protocols",
+        [
+            "EveryInstanceSharesALeaseOwner",
+            "ReleasingALeaseForgetsTheEpoch",
+            "ARestoreFlattensTheEpoch",
+        ],
+    ),
+    "I10": (
+        "completion is structural",
+        ["ARequiredVerifierIsAdvisory", "UnwindForwards"],
+    ),
+    "I11": (
+        "integrity claims are narrow and explicit",
+        ["AnExpiredChainIsAdmitted", "TheProofsStartingSizeIsGuessed"],
+    ),
+    "I12": (
+        "no declared control may be advisory",
+        [
+            "TheStandInEnforcesAnySchema",
+            "TheModelsSpellingOfAToolIsUnchecked",
+            "ADanglingContinuationIsHonoured",
+        ],
+    ),
+    "I13": (
+        "a finding must be findable",
+        ["AQuarantineIsUnfindable", "AGroupCommitsByBeingForgotten"],
+    ),
+    "I14": (
+        "conclusion is not closure",
+        ["AQuarantineSealsTheJournal", "UnknownOutcomeResumes"],
     ),
 }
 

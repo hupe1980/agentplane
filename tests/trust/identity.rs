@@ -587,7 +587,7 @@ fn a_delegate_cannot_outlive_its_delegator() {
         let ok = chain
             .delegate(link)
             .expect("narrowing validity is permitted");
-        assert_eq!(ok.not_after(), Some(later.unwrap_or(at(1_000))));
+        assert_eq!(ok.not_after(), Some(later.unwrap_or_else(|| at(1_000))));
     }
     // A chain in which nobody set a bound has none, and a later link may set
     // one — that is narrowing from unbounded.

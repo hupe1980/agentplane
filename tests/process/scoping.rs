@@ -45,7 +45,7 @@ spec:
     schema:
       type: object
       additionalProperties: false
-      required: [deadline_status]
+      required: [deadline_status, days_left]
       properties:
         deadline_status: {{ type: string }}
         days_left: {{ type: number }}
@@ -100,7 +100,10 @@ fn malo(value: &str) -> CorrelationKey {
 #[tokio::test]
 async fn a_correlation_binding_files_each_party_under_its_own_subject() {
     let manifest = Manifest::parse(&agent_yaml("$correlation/malo", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
 
     let out =
         p.rt.run_correlated(
@@ -178,7 +181,10 @@ spec:
 "#,
     )
     .expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
 
     let out =
         p.rt.run("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
@@ -219,7 +225,10 @@ spec:
 #[tokio::test]
 async fn an_unresolvable_binding_fails_the_run() {
     let manifest = Manifest::parse(&agent_yaml("$correlation/meter", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
 
     let out =
         p.rt.run_correlated(
@@ -249,7 +258,10 @@ async fn an_unresolvable_binding_fails_the_run() {
 #[tokio::test]
 async fn an_untrusted_input_may_not_choose_the_subject() {
     let manifest = Manifest::parse(&agent_yaml("$input/malo", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
 
     let untrusted = Tainted::object([(
         "malo",
@@ -270,7 +282,10 @@ async fn an_untrusted_input_may_not_choose_the_subject() {
     // The trusted twin is accepted, so the refusal is about the label and not
     // about input bindings being unimplemented.
     let manifest = Manifest::parse(&agent_yaml("$input/malo", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
     let out =
         p.rt.run_correlated(
             "watch.deadline",
@@ -300,7 +315,10 @@ async fn an_untrusted_input_may_not_choose_the_subject() {
 #[tokio::test]
 async fn a_replay_resolves_the_subject_the_live_run_resolved() {
     let manifest = Manifest::parse(&agent_yaml("$correlation/malo", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
 
     let out =
         p.rt.run_correlated(
@@ -362,7 +380,10 @@ async fn a_skill_can_scope_its_own_recall_to_the_runs_correlation() {
     }
 
     let manifest = Manifest::parse(&agent_yaml("$correlation/malo", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
     p.rt.run_correlated(
         "watch.deadline",
         Tainted::trusted(json!({ "q": "x" })),
@@ -542,7 +563,10 @@ async fn a_replay_does_not_open_the_task_again() {
 #[tokio::test]
 async fn an_untrusted_finding_still_reaches_the_worklist() {
     let manifest = Manifest::parse(&agent_yaml("$correlation/malo", TRIAGE)).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "BREACH" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "BREACH", "days_left": 0 }),
+    );
 
     let out =
         p.rt.run_correlated(
@@ -629,7 +653,10 @@ async fn a_run_with_no_case_has_no_correlation() {
 #[tokio::test]
 async fn an_input_binding_resolves_against_the_runs_input() {
     let manifest = Manifest::parse(&agent_yaml("$input/party/id", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
     let out =
         p.rt.run_correlated(
             "watch.deadline",
@@ -658,7 +685,10 @@ async fn an_input_binding_resolves_against_the_runs_input() {
 #[tokio::test]
 async fn a_scoped_memory_is_still_untrusted() {
     let manifest = Manifest::parse(&agent_yaml("$correlation/malo", "")).expect("manifest");
-    let p = plane(&manifest, json!({ "deadline_status": "OK" }));
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
     p.rt.run_correlated(
         "watch.deadline",
         Tainted::trusted(json!({ "q": "x" })),

@@ -472,14 +472,7 @@ impl ChatCompletions {
                 detail: "the continuation was not a chat-completions message array".to_owned(),
             });
         }
-        if continuation.is_some() && exchanges.is_empty() {
-            // Silently dropping it would journal an effect key that records a
-            // continuation the wire never carried.
-            return Err(ModelError::Refused {
-                model: model.clone(),
-                detail: "a continuation without tool exchanges has no request to follow".to_owned(),
-            });
-        }
+        super::refuse_dangling_continuation(continuation, exchanges, model)?;
         let mut msgs = messages(prompt);
         continue_with(&mut msgs, exchanges, continuation);
         let mut body = json!({

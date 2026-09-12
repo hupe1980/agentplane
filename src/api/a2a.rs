@@ -1634,7 +1634,7 @@ impl A2aServer {
 /// manifest, so it cannot describe a capability the plane would refuse to
 /// dispatch, which is what makes publishing it safe.
 async fn agent_card(State(server): State<A2aServer>) -> Json<AgentCard> {
-    Json(server.card.clone())
+    Json(server.card)
 }
 
 /// One agent's own card.
@@ -2765,7 +2765,7 @@ fn task_from_records(
     // reported as working rather than refused, because this builds a row in a
     // listing where a single unreadable run must not fail the page.
     let (state, detail) =
-        state_from_history(records).unwrap_or((TaskState::Working, "running".to_owned()));
+        state_from_history(records).unwrap_or_else(|| (TaskState::Working, "running".to_owned()));
     let case = records
         .iter()
         .find_map(|record| record.body.case.map(|case| case.to_string()));

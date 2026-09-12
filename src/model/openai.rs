@@ -47,9 +47,8 @@ use crate::core::Secret;
 
 #[cfg(test)]
 use super::ModelCall;
-use super::wire::{
-    RESPOND_TOOL, classify_status, classify_transport, strict_schema_problem, structured,
-};
+use super::strict_schema_problem;
+use super::wire::{RESPOND_TOOL, classify_status, classify_transport, structured};
 use super::{
     Completion, ModelError, ModelId, ModelProvider, Request, SchemaMode, Usage, openai_stream, sse,
 };
@@ -632,15 +631,7 @@ impl OpenAi {
                     .to_owned(),
             });
         }
-        if continuation.is_some() && exchanges.is_empty() {
-            // Silently dropping it would journal an effect key that records a
-            // continuation the wire never carried. OpenAI continuations carry
-            // a model turn only across tool calls.
-            return Err(ModelError::Refused {
-                model: model.clone(),
-                detail: "a continuation without tool exchanges has no request to follow".to_owned(),
-            });
-        }
+        super::refuse_dangling_continuation(continuation, exchanges, model)?;
         let mut body = json!({
             "model": model.model,
             "max_output_tokens": max_output_tokens,

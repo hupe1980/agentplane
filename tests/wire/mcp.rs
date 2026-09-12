@@ -756,7 +756,7 @@ impl ServerHandler for Watching {
     ) -> Result<CallToolResponse, ErrorData> {
         // rmcp lifts `_meta` off the params and onto the request context, so a
         // handler reads it here rather than from the params it was sent with.
-        *self.0.lock().unwrap() = Some(cx.meta.0.0.clone());
+        *self.0.lock().unwrap() = Some(cx.meta.0.0);
         Ok(CallToolResult::success(vec![ContentBlock::text("ok")]).into())
     }
 }

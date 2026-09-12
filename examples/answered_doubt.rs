@@ -4,13 +4,33 @@
 //! cargo run --example answered_doubt
 //! ```
 //!
+//! ```text
+//! 1. the capture timed out and the provider could not say
+//!    run            → quarantined
+//!    in doubt       → payments.capture at step s1 (inconclusive) — key ek:…
+//!    the booking    → ["booked"], standing: nothing is unwound around an unknown outcome
+//!
+//! 2. reopened without answering anything
+//!    run            → quarantined
+//!    captures sent  → 1
+//!
+//! 3. the effect is answered, and the run is judged again
+//!    run            → succeeded
+//!    captures sent  → 1 — the whole point: never twice
+//!
+//! 4. a second run, abandoned because nobody could ever tell
+//!    run            → abandoned
+//!    the booking    → ["booked"], still standing: abandoning is not cancelling
+//!    quarantined    → 0 (the backlog cleared)
+//! ```
+//!
 //! A payment times out. The provider is asked and cannot say. The runtime
 //! refuses to guess, so the run is **quarantined**: nothing is unwound,
 //! because compensating around a call that may have landed is a refund for
 //! money nobody took.
 //!
 //! Every durable engine reaches that wall. What happens next is the part worth
-//! watching:
+//! watching, and these are the four sections above:
 //!
 //! 1. **The doubt is named, not described.** The run says which effect, which
 //!    step, and whether it never heard back or heard back and was told nothing.
@@ -28,13 +48,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentplane::core::{
-    ArgSource, Assertion, Compensation, Effect, EffectDescriptor, EffectError, Outcome, PlanIR,
-    PlanNode, QuarantineDecision, Reconciliation, Recovery, RetryPolicy, RunId, Skill,
-    SkillDescriptor, SkillError, StepId, Tainted,
+    ArgSource, Assertion, Compensation, Effect, EffectDescriptor, EffectError, PlanIR, PlanNode,
+    QuarantineDecision, Reconciliation, Recovery, RetryPolicy, RunId, StepId,
 };
-use agentplane::journal::JournalStore;
-use agentplane::runtime::{RunStatus, Runtime, StepCtx};
-use agentplane::store::RedbStore;
+use agentplane::prelude::*;
 use serde_json::{Value, json};
 
 /// A capture that times out, and a provider that cannot say what happened.

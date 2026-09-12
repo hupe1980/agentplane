@@ -463,7 +463,7 @@ impl Embedder for BedrockEmbedder {
     fn revision(&self) -> String {
         let base = format!("bedrock:{}/{}", self.region, self.model);
         self.dimensions
-            .map_or(base.clone(), |d| format!("{base}@{d}"))
+            .map_or_else(|| base.clone(), |d| format!("{base}@{d}"))
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, StoreError> {
@@ -631,7 +631,7 @@ impl Embedder for GeminiEmbedder {
     fn revision(&self) -> String {
         let base = format!("gemini:{}", self.model);
         self.dimensions
-            .map_or(base.clone(), |d| format!("{base}@{d}"))
+            .map_or_else(|| base.clone(), |d| format!("{base}@{d}"))
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, StoreError> {

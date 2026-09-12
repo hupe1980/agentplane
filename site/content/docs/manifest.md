@@ -285,14 +285,15 @@ name comes back to the model as a *failed call* — deliberately, so it can corr
 itself and never gets the tool it nearly named. The cost is that a **procedure**
 naming an ungranted tool fails quietly: the model asks, is refused, improvises,
 and the step silently does not happen, with nothing in the journal saying the
-instruction was unfollowable. So any `tool://server/name` written in `role` or
-`constraints` must be a tool `spec.tools` grants.
+instruction was unfollowable. So a tool named in `role`, `constraints` or
+`memory.formation.instruction` must be one `spec.tools` grants — in **either**
+spelling: `tool://server/name`, which is the reviewer's, and `server__name`,
+which is the model's, and therefore the one an author writing a procedure
+reaches for.
 
-It only sees references spelled as references. *"call `list_overdue_processes`"*
-names a tool in prose, and prose is not something this crate can tell from an
-ordinary noun — a check that guessed would refuse manifests over the word
-"search". Writing the grant's own `ref` in the prompt is therefore both the
-spelling that gets checked and the spelling a reviewer can follow.
+It only sees those two. *"call `list_overdue_processes`"* names a tool in prose,
+and prose is not something this crate can tell from an ordinary noun — a check
+that guessed would refuse manifests over the word "search".
 
 ## `spec.topology`
 

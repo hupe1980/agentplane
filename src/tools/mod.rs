@@ -272,13 +272,12 @@ impl ToolSafety {
     #[cfg(feature = "manifest")]
     #[must_use]
     pub fn from_grant(grant: &crate::manifest::ToolGrant) -> Self {
+        let defaults = Self::default();
         Self {
             mutates: grant.mutates,
             protected_fields: grant.protected_fields.clone(),
-            max_sensitivity: grant
-                .max_sensitivity
-                .unwrap_or(Self::default().max_sensitivity),
-            ..Self::default()
+            max_sensitivity: grant.max_sensitivity.unwrap_or(defaults.max_sensitivity),
+            ..defaults
         }
     }
 
@@ -792,10 +791,14 @@ impl ToolRouter {
     /// twice.
     #[must_use]
     pub fn toolbox(self, tools: &Arc<ToolBox>) -> Self {
-        let servers: Vec<String> = tools.servers().map(ToOwned::to_owned).collect();
-        servers.into_iter().fold(self, |router, name| {
-            router.server(name, Arc::clone(tools) as Arc<dyn ToolClient>)
-        })
+        tools
+            .servers()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<String>>()
+            .into_iter()
+            .fold(self, |router, name| {
+                router.server(name, Arc::clone(tools) as Arc<dyn ToolClient>)
+            })
     }
 
     /// The servers this router can reach.

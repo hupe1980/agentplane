@@ -16,7 +16,7 @@
 //! Selecting it is never implicit: a manifest has to say `provider: fake`, and
 //! `agentplane run` refuses any provider name this build cannot construct.
 //!
-//! # Two traps, both of which make a fake worse than useless
+//! # Three traps, all of which make a fake worse than useless
 //!
 //! **A fake that is not deterministic destroys the property under test.** This
 //! crate exists so a run replays to the same answer; a fake returning arbitrary
@@ -27,8 +27,34 @@
 //! **A fake that reports zero usage makes every budget test vacuous.** Token
 //! ceilings, cost ceilings, the metered-failure path — all of them read
 //! [`Usage`], and a provider that always answers "free" lets them pass over a
-//! runtime that has stopped counting. So usage is derived from the prompt, and
-//! scripted failures can carry usage of their own.
+//! runtime that has stopped counting. So usage is derived from the prompt,
+//! scripted failures can carry usage of their own, and the echo stops at
+//! `max_output_tokens` the way a real generator does.
+//!
+//! **A fake that refuses nothing stands in for the most forgiving provider,
+//! and proves the least.** Every real driver checks a request before it sends
+//! one, so this one makes the refusals they all make: a provider-side media
+//! URL, an instruction hidden in the turn list, a continuation with no calls
+//! behind it, and a schema outside the subset constrained decoding accepts.
+//! The last is how this crate's own `planned` execution kind shipped a plan
+//! format the `OpenAI` driver refused outright — every test of it passed
+//! against a stand-in that would enforce any schema it was handed.
+//!
+//! It models **the strictest provider you might deploy against**, not any
+//! particular one. A per-driver profile would be a second copy of what the
+//! driver does, drifting the moment the driver changed — a stand-in that
+//! claims to model a driver and no longer does is worse than one that makes no
+//! claim. Where the shipped drivers genuinely disagree, the rule moves into
+//! this crate's shared layer so both read it from one place. Where one
+//! genuinely accepts more, there is one knob — see
+//! [`FakeProvider::without_constrained_decoding`](crate::model::fake::FakeProvider::without_constrained_decoding).
+//!
+//! A **tool's** schema is deliberately not refused, because no driver refuses
+//! one: they drop to unconstrained generation instead, which is a guarantee
+//! quietly lost rather than a call that fails. The stand-in loses it the same
+//! way. [`strict_schema_problem`](crate::model::strict_schema_problem) over
+//! [`Ask::tools`](crate::model::fake::Ask::tools) is how a test asks whether
+//! its tools actually bind.
 //!
 //! # What it does not fake
 //!
@@ -68,7 +94,7 @@ pub struct Ask {
 }
 
 /// A `ModelProvider` that answers without a model.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FakeProvider {
     /// Answers handed out in order, before the default takes over.
     scripted: Mutex<std::collections::VecDeque<Result<Completion, ModelError>>>,
@@ -76,6 +102,24 @@ pub struct FakeProvider {
     asked: Mutex<Vec<Ask>>,
     /// Whether to emit text deltas to a caller's observer before answering.
     streaming: Mutex<bool>,
+    /// Whether a declared schema must be one constrained decoding can enforce.
+    constrained: Mutex<bool>,
+}
+
+/// Constrained decoding **on**, which `derive(Default)` could not express.
+///
+/// The one field whose default is a decision rather than a zero: a stand-in
+/// that accepts every schema stands in for the most forgiving provider, and
+/// proves the least.
+impl Default for FakeProvider {
+    fn default() -> Self {
+        Self {
+            scripted: Mutex::default(),
+            asked: Mutex::default(),
+            streaming: Mutex::new(false),
+            constrained: Mutex::new(true),
+        }
+    }
 }
 
 impl FakeProvider {
@@ -223,6 +267,22 @@ impl FakeProvider {
         self
     }
 
+    /// Apply a declared schema loosely, the way a provider with no constrained
+    /// decoding does.
+    ///
+    /// The default is the other way round, and the default is the point: a
+    /// stand-in that accepts every schema stands in for the *most* forgiving
+    /// provider, and proves the least.
+    ///
+    /// This opts out for a deployment that has chosen a provider which
+    /// genuinely accepts more — Gemini's `responseJsonSchema` takes any valid
+    /// JSON Schema, and Anthropic degrades to unconstrained rather than
+    /// refusing.
+    pub fn without_constrained_decoding(&self) -> &Self {
+        *self.constrained.lock().expect("fake") = false;
+        self
+    }
+
     /// Everything it was asked, in order.
     #[must_use]
     pub fn asked(&self) -> Vec<Ask> {
@@ -293,6 +353,23 @@ fn usage_for(prompt: &Value) -> Usage {
 /// thing a real provider will never reproduce.
 fn echo(request: &Request<'_>) -> Completion {
     let usage = usage_for(request.prompt);
+    // A generator stops at its ceiling, so this one does too. Without it the
+    // fake is the only provider that bills more output than it was allowed —
+    // which makes `max_output_tokens` a field the runtime could stop passing
+    // with nothing offline to notice. Only the *echo* is capped: a scripted
+    // answer is the author stating what the provider returned, and
+    // second-guessing that would make `will_say` unpredictable.
+    let (usage, truncated) = match u64::from(request.max_output_tokens) {
+        allowed if usage.output_tokens > allowed => (
+            Usage {
+                output_tokens: allowed,
+                ..usage
+            },
+            true,
+        ),
+        _ => (usage, false),
+    };
+    let stop_reason = Some(if truncated { "max_tokens" } else { "end_turn" }.to_owned());
     match request.schema {
         // A schema was asked for, so the answer must satisfy the *shape*
         // contract: valid JSON. Built from the schema's declared properties so
@@ -304,8 +381,8 @@ fn echo(request: &Request<'_>) -> Completion {
                 tool_calls: Vec::new(),
                 text: value.to_string(),
                 usage,
-                stop_reason: Some("end_turn".to_owned()),
-                truncated: false,
+                stop_reason,
+                truncated,
                 structured: Some(value),
                 continuation: None,
             }
@@ -314,8 +391,8 @@ fn echo(request: &Request<'_>) -> Completion {
             tool_calls: Vec::new(),
             text: format!("fake answer to {}", request.prompt),
             usage,
-            stop_reason: Some("end_turn".to_owned()),
-            truncated: false,
+            stop_reason,
+            truncated,
             structured: None,
             continuation: None,
         },
@@ -375,6 +452,32 @@ impl ModelProvider for FakeProvider {
         // control exists so those URLs never reach a provider's network, and a
         // harness exempt from it is a harness that cannot prove the control.
         crate::model::refuse_provider_side_media(request.prompt, request.model)?;
+        // The third shared refusal: a continuation is the turn that already
+        // happened, and without the calls it answered there is nothing for it
+        // to continue. Every wire that carries one refuses this shape.
+        crate::model::refuse_dangling_continuation(
+            request.continuation,
+            request.exchanges,
+            request.model,
+        )?;
+
+        // The other refusal a real driver makes before it sends anything, and
+        // the one no stand-in had: a schema outside the subset constrained
+        // decoding accepts. Without it the fake is the only provider in the
+        // world that will enforce any schema you hand it, so an agent whose
+        // result contract or plan format cannot be asked for passes every
+        // offline test and fails on its first real call.
+        if *self.constrained.lock().expect("fake")
+            && let Some(schema) = request.schema
+            && let Some(problem) = crate::model::strict_schema_problem(schema)
+        {
+            return Err(ModelError::Refused {
+                model: request.model.clone(),
+                detail: format!(
+                    "the schema cannot be used with strict constrained decoding: {problem}"
+                ),
+            });
+        }
 
         let scripted = self.scripted.lock().expect("fake").pop_front();
         let answer = scripted
@@ -506,6 +609,7 @@ mod tests {
     async fn a_declared_schema_binds_the_fake_the_way_it_binds_a_driver() {
         let schema = json!({
             "type": "object",
+            "additionalProperties": false,
             "properties": { "balance": { "type": "number" } },
             "required": ["balance"],
         });
@@ -711,10 +815,95 @@ mod tests {
         assert_eq!(e.usage().spend().tokens, 400);
     }
 
+    /// The refusal the real drivers make, made here — the whole reason a
+    /// stand-in is worth having.
+    ///
+    /// This is the check that was missing while `execution.kind: planned`
+    /// shipped a plan format the `OpenAI` driver refused outright: every test
+    /// of it ran against a fake that enforced any schema handed to it, so the
+    /// execution kind had never once been asked for from something that could
+    /// say no. The schema below is the shape that failed — an object a model
+    /// may add to — and the assertion is that offline is now enough to find it.
+    #[tokio::test]
+    async fn a_schema_no_provider_could_enforce_is_refused_offline() {
+        let open = json!({
+            "type": "object",
+            "properties": { "severity": { "type": "string" } },
+            "required": ["severity"],
+        });
+        let fake = FakeProvider::new();
+        let error = fake
+            .complete(ask(Some(&open)))
+            .await
+            .expect_err("a schema constrained decoding cannot enforce was accepted");
+        let text = error.to_string();
+        assert!(
+            text.contains("additionalProperties"),
+            "the refusal must name the rule, or it is a wall rather than a \
+             diagnostic: {text}"
+        );
+
+        // Nothing is billed for it: the refusal happens before generation, as
+        // it does in the driver, so a test cannot conclude a bad schema costs
+        // money when it does not.
+        assert_eq!(error.usage().spend().tokens, 0);
+
+        // And the opt-out, for a deployment that has chosen a provider which
+        // genuinely accepts more.
+        let lenient = FakeProvider::new();
+        lenient.without_constrained_decoding();
+        lenient
+            .complete(ask(Some(&open)))
+            .await
+            .expect("`without_constrained_decoding` did not lift the refusal");
+    }
+
+    /// A continuation with nothing behind it is refused here as on every wire.
+    ///
+    /// Three drivers implement this rule, each with its own copy of the
+    /// reasoning; the stand-in implemented it nowhere, so a test could hand it
+    /// this shape, get a cheerful answer, and fail against every real provider.
+    #[tokio::test]
+    async fn a_continuation_with_no_exchanges_behind_it_is_refused() {
+        let mut request = ask(None);
+        let dangling: &'static crate::model::ProviderContinuation = Box::leak(Box::new(
+            crate::model::ProviderContinuation::new("fake", json!([])),
+        ));
+        request.continuation = Some(dangling);
+        let error = FakeProvider::new()
+            .complete(request)
+            .await
+            .expect_err("a continuation with no request to follow was accepted");
+        assert!(
+            error.to_string().contains("nothing for it to continue"),
+            "the refusal must say why: {error}"
+        );
+    }
+
+    /// A generator stops at its ceiling, and so does this one.
+    ///
+    /// Without it the fake is the only provider that bills more output than it
+    /// was allowed — which makes `max_output_tokens` a field the runtime could
+    /// stop forwarding with nothing offline to notice.
+    #[tokio::test]
+    async fn the_echo_stops_at_the_output_ceiling() {
+        let mut request = ask(None);
+        request.max_output_tokens = 1;
+        let answer = FakeProvider::new()
+            .complete(request)
+            .await
+            .expect("a capped call still answers");
+        assert_eq!(answer.usage.output_tokens, 1, "the ceiling was not applied");
+        assert!(answer.truncated, "a capped answer is a cut-off answer");
+        assert_eq!(answer.stop_reason.as_deref(), Some("max_tokens"));
+    }
+
     #[tokio::test]
     async fn a_schema_gets_json_shaped_like_it() {
         let schema = json!({
             "type": "object",
+            "additionalProperties": false,
+            "required": ["verdict", "score", "flags"],
             "properties": {
                 "verdict": {"type": "string"},
                 "score":   {"type": "integer"},

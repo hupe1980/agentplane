@@ -1088,7 +1088,14 @@ impl Skill for AsksForAnObject {
         )
         .expecting(json!({
             "type": "object",
-            "properties": { "items": { "type": "array" } },
+            // `items` here is the *property's* name; the inner `items` is the
+            // keyword, and an array without one is a schema no provider with
+            // constrained decoding accepts.
+            // The outer `items` is the property's name; the inner one is the
+            // keyword. Numbers, because the conforming answer below is `[1, 2]`
+            // — an element type that disagreed with the fixture's own data
+            // would make the positive half fail for the wrong reason.
+            "properties": { "items": { "type": "array", "items": { "type": "number" } } },
             "required": ["items"],
             "additionalProperties": false
         }));

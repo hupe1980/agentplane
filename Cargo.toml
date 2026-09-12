@@ -477,3 +477,21 @@ missing_panics_doc      = "allow"
 # then; the lint is right about the readability.
 duration_suboptimal_units = "allow"
 must_use_candidate      = "allow"
+
+# Seven from `nursery`, named individually rather than by group, because each
+# catches something *wrong* rather than merely unusual: work done on a path that
+# discards it, a clone nothing needs, a `&mut` that does not mutate, a doc
+# summary too long to read in an index.
+#
+# The group itself is not enabled. Most of its volume here is
+# `missing_const_for_fn`, which is a promise about a function's future as much
+# as its present, and `derive_partial_eq_without_eq`, where `Eq` is a claim
+# about the type rather than a formality; `option_if_let_else` and
+# `redundant_pub_crate` argue for spellings this codebase does not use.
+needless_collect             = "warn"
+needless_pass_by_ref_mut     = "warn"
+or_fun_call                  = "warn"
+redundant_clone              = "warn"
+string_lit_as_bytes          = "warn"
+too_long_first_doc_paragraph = "warn"
+use_self                     = "warn"

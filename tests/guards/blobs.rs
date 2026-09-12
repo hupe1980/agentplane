@@ -98,7 +98,7 @@ async fn altered_bytes_are_detected_rather_than_served() {
     let store = MemoryBlobs::new();
     let digest = store.put("€4,200 refund".as_bytes()).await.expect("put");
 
-    store.tamper_for_test(digest, "$42,000 refund".as_bytes().to_vec());
+    store.tamper_for_test(digest, b"$42,000 refund".to_vec());
 
     match store.get(digest).await {
         Err(BlobError::Corrupt { expected, actual }) => {
@@ -124,7 +124,7 @@ async fn altered_bytes_are_detected_rather_than_served() {
 #[tokio::test]
 async fn an_expired_blob_is_not_reported_as_missing() {
     for (name, store) in stores() {
-        let digest = store.put("personal data".as_bytes()).await.expect("put");
+        let digest = store.put(b"personal data").await.expect("put");
         store
             .expire(digest, ts(1_700_000_000), "art-17 erasure request")
             .await
@@ -172,7 +172,7 @@ async fn a_blob_that_never_existed_is_still_not_found() {
 #[tokio::test]
 async fn a_repeated_expiry_keeps_the_first_tombstone() {
     for (name, store) in stores() {
-        let digest = store.put("twice".as_bytes()).await.expect("put");
+        let digest = store.put(b"twice").await.expect("put");
         store
             .expire(digest, ts(1_000), "first")
             .await
@@ -246,7 +246,7 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     let shared = "the same PDF, fetched in both matters".as_bytes();
     let a = mine_blobs.put(shared).await.expect("put");
     let b = mine_blobs
-        .put("subject one, document b".as_bytes())
+        .put(b"subject one, document b")
         .await
         .expect("put");
     // The other matter holds the identical bytes: one digest, two objects.
@@ -258,7 +258,7 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     // would be invisible against the shared digest alone, because the extra
     // entry is one the erasing case already holds.
     let only_theirs = their_blobs
-        .put("subject two, their own document".as_bytes())
+        .put(b"subject two, their own document")
         .await
         .expect("put");
     cases.link_blob(mine, a, ts(11)).await.expect("link");

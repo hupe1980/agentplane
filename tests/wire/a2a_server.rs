@@ -3252,7 +3252,7 @@ async fn a_published_card_can_be_signed_and_verified() {
     );
 
     // Round-tripped through the wire, which is the only form a peer ever sees.
-    let card: AgentCard = serde_json::from_value(body.clone()).expect("parse the served card");
+    let card: AgentCard = serde_json::from_value(body).expect("parse the served card");
     assert_eq!(
         card.verify(&verifier as &dyn CardVerifier)
             .expect("the served card did not verify")
@@ -4468,7 +4468,7 @@ spec:
     // An empty plane has nothing for the well-known path to answer with.
     assert!(matches!(
         A2aServer::hosting(
-            f.rt.clone(),
+            f.rt,
             Arc::new(HeaderAuth),
             &card_security(),
             &[],

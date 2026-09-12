@@ -981,7 +981,7 @@ impl Record {
     /// which the per-record hash alone would not catch.
     pub fn verify_chain(records: &[Self], from: Digest) -> Result<Digest, StoreError> {
         let mut prev = from;
-        let start = records.first().map_or(1, Record::seq);
+        let start = records.first().map_or(1, Self::seq);
         for (expect_seq, r) in (start..).zip(records.iter()) {
             if r.seq() != expect_seq {
                 return Err(StoreError::Corrupt {
@@ -1289,7 +1289,7 @@ mod tests {
     #[test]
     fn tampered_payload_is_detected() {
         let records = chain_of(3);
-        let mut tampered = records.clone();
+        let mut tampered = records;
         // Rewrite the bytes without updating the hash — the classic edit.
         tampered[1].raw = b"{\"seq\":2,\"tampered\":true}".to_vec();
         let err = Record::verify_chain(&tampered, Digest::ZERO).unwrap_err();
@@ -1302,7 +1302,7 @@ mod tests {
     #[test]
     fn deleted_record_is_detected_as_a_gap() {
         let records = chain_of(4);
-        let mut with_hole = records.clone();
+        let mut with_hole = records;
         with_hole.remove(2);
         let err = Record::verify_chain(&with_hole, Digest::ZERO).unwrap_err();
         assert!(matches!(err, StoreError::Corrupt { .. }));
