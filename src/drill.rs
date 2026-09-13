@@ -249,6 +249,15 @@ async fn check_blobs(
                 "case {case}, blob {digest}: {e} — content that cannot be trusted is \
                  worse than content that is missing, because it is used"
             )),
+            // A finding, not an erasure. The tombstone is the only evidence an
+            // erasure happened that outlives the bytes, so one that does not
+            // read leaves the drill unable to say whether retention ran — and
+            // counting it as `blobs_erased` would be this report vouching for a
+            // date and a reason it never saw.
+            Err(e @ BlobError::UnreadableTombstone { .. }) => report.findings.push(format!(
+                "case {case}, blob {digest}: {e} — the bytes are gone and nothing here \
+                 can say whether that was retention doing its job"
+            )),
             Err(BlobError::Backend(e)) => report.not_checked.push(format!(
                 "case {case}, blob {digest}: the blob store could not be reached ({e}) — \
                  presence was not established either way"

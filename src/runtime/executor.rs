@@ -8726,14 +8726,18 @@ impl Runtime {
     /// subscription with nothing left to re-register it, and that window
     /// stays what it always was — recorded rather than closed, with later
     /// events for the same correlation dead-lettering as its symptom.
-    pub(crate) async fn redeliver_claimed(&self, limit: usize) -> Result<usize, RuntimeError> {
+    pub(crate) async fn redeliver_claimed(
+        &self,
+        limit: usize,
+    ) -> Result<crate::runtime::Redelivered, RuntimeError> {
         let Some(events) = self.events.as_ref() else {
-            return Ok(0);
+            return Ok(crate::runtime::Redelivered::default());
         };
         let waiting = events
             .waiting(limit)
             .await
             .map_err(RuntimeError::from_store)?;
+        let examined = waiting.len();
         let mut delivered = 0usize;
         for sub in waiting {
             let Some(buffered) = events
@@ -8760,7 +8764,10 @@ impl Runtime {
                 }
             }
         }
-        Ok(delivered)
+        Ok(crate::runtime::Redelivered {
+            finished: delivered,
+            examined,
+        })
     }
 
     /// Retire events that nobody claimed within `grace`.
@@ -8779,12 +8786,18 @@ impl Runtime {
             .events
             .as_ref()
             .ok_or_else(|| RuntimeError::PlanContract("this runtime has no event store".into()))?;
-        // Saturating rather than fallible: a grace window beyond what the
-        // calendar type can hold means "retire nothing", which is what
-        // `Duration::MAX` gives, and refusing the call would be a worse answer
-        // to a caller asking for a longer hold.
+        // Saturating rather than fallible, at both steps: a grace window
+        // beyond what the calendar can hold means "retire nothing", and
+        // refusing the call would be a worse answer to a caller asking for a
+        // longer hold. The subtraction has to saturate too — `time` panics on
+        // underflow, so converting the window to `Duration::MAX` and then
+        // subtracting it aborts the tick that also breaches obligations and
+        // recovers abandoned runs. The first instant the calendar can name is
+        // a cutoff nothing is older than, which is exactly "retire nothing".
         let grace = time::Duration::try_from(grace).unwrap_or(time::Duration::MAX);
-        let cutoff = now_for_admission() - grace;
+        let cutoff = now_for_admission()
+            .checked_sub(grace)
+            .unwrap_or_else(crate::core::first_instant);
         let retired = events
             .sweep_unclaimed(cutoff, "no run claimed this event within the grace window")
             .await

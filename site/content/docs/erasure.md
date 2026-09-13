@@ -284,7 +284,36 @@ none: a retention period is a legal and business decision, and a crate that
 picked one would be choosing somebody else's. `--reason` is required and lands
 on every tombstone and key destruction, so a later read says *expired, on this
 date, for this reason* rather than *missing* — which is the distinction the
-recovery drill's three-way verdict is built on.
+recovery drill's verdict is built on.
+
+### An expired address stays expired {#an-expired-address-stays-expired}
+
+A blob's address *is* its content, which makes one rule non-obvious and
+load-bearing: **a write to an erased address is refused.** Without it, a run
+producing the same bytes a second time lands on the erased object and puts the
+data back — silently, under a tombstone that still records when and why it
+went. That is not an exotic sequence. A resumed run re-stores what it stored
+before; a second run of the same matter does the same work.
+
+The refusal is typed, `StoreError::BlobErased`, because retrying cannot help
+and the store is healthy. A skill reaching `cx.store_blob` gets it; a governed
+media fetch gets `Rejected` rather than the *try again* classification, so it
+stops re-fetching a URL whose artifact somebody removed.
+
+A *different* matter storing the same bytes is unaffected: the erasure unit
+leads the storage address, so those are two objects. On a sealed plane the rule
+is belt and braces — `erase_case` destroys the scope's wrapping key, so the
+write fails before it reaches the store at all — and on an unsealed one it is
+the whole guarantee.
+
+### A tombstone is read or refused, never guessed {#a-tombstone-is-read-or-refused}
+
+A tombstone is the only evidence an erasure happened that outlives the bytes it
+describes, so it is a durable format and carries its own version like every
+other one here. A reader that cannot interpret one answers
+`BlobError::UnreadableTombstone` — a **fourth** state beside missing, expired
+and altered — and the recovery drill reports it as a finding rather than
+counting an erasure it never saw.
 
 ### `not_erasable` is the half that matters
 

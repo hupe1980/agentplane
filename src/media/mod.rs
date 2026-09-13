@@ -33,6 +33,26 @@ use crate::core::{
 const DEFAULT_MAX_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How a blob-store failure is classified for a media fetch.
+///
+/// An erased address is **permanent**, and `Unavailable` is the classification
+/// that says *try again*: a fetch refused because somebody removed this
+/// artifact would otherwise re-fetch the URL and re-attempt the write for as
+/// long as the retry policy allows. Everything else a blob store reports is a
+/// store that is having a bad day, which is exactly what `Unavailable` is for.
+fn blob_failure(error: crate::blob::BlobError) -> EffectError {
+    match error {
+        crate::blob::BlobError::Expired { digest, at, reason } => EffectError::Rejected(format!(
+            "blob {digest} was erased at {at} ({reason}); fetching this media again \
+             would put back what somebody asked to have removed"
+        )),
+        error => EffectError::Unavailable {
+            driver: "blob.store".to_owned(),
+            detail: error.to_string(),
+        },
+    }
+}
 const MAX_URL_BYTES: usize = 8_192;
 
 /// The complete, digest-covered policy for one media fetch.
@@ -816,14 +836,7 @@ impl GovernedFetch {
                     detail: error.to_string(),
                 })?;
         }
-        let stored =
-            self.blobs
-                .put(&fetched.bytes)
-                .await
-                .map_err(|error| EffectError::Unavailable {
-                    driver: "blob.store".to_owned(),
-                    detail: error.to_string(),
-                })?;
+        let stored = self.blobs.put(&fetched.bytes).await.map_err(blob_failure)?;
         // The digest computed here is the single truth: it is what the case
         // link above committed to, and what the journal will carry. A store
         // answering with a different address has broken the content-addressing

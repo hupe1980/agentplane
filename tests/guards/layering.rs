@@ -2240,6 +2240,68 @@ fn every_state_literal_in_sql_is_one_the_vocabulary_still_spells() {
     );
 }
 
+/// The obligation listing's membership rule is one rule, in three places.
+///
+/// [`DeadlineState::is_unaccounted`] carries it for the two Rust readers. The
+/// third is `PostgreSQL`, which cannot call it — a partial index predicate has
+/// to be immutable — so the rule is spelled there as two conjuncts, and losing
+/// either one is invisible: drop the acknowledgement half and an accounted-for
+/// breach comes back onto the page nobody can empty; drop the state half and
+/// every pending obligation joins it.
+///
+/// What this does NOT check: that the two Rust readers agree with the
+/// vocabulary — they call it, so the compiler does. This is only about the
+/// copy the compiler cannot see.
+#[test]
+fn every_unaccounted_predicate_in_sql_states_both_of_its_halves() {
+    use agentplane::core::DeadlineState;
+
+    let breached = format!("state = '{}'", DeadlineState::Breached.as_str());
+    let accounted = "acknowledged_at IS NULL";
+    let src = read("src/store/postgres_cases.rs");
+
+    // Per statement, not per literal: the schema is one long literal holding
+    // every DDL statement, so a partial index missing a conjunct would be
+    // excused by an unrelated statement three tables away.
+    let mut checked = 0usize;
+    for literal in string_literals(&src) {
+        for statement in literal.split(';') {
+            let names_state = statement.contains(&breached);
+            let names_note = statement.contains(accounted);
+            if !names_state && !names_note {
+                continue;
+            }
+            assert!(
+                names_state && names_note,
+                "this statement names one half of the unaccounted-breach rule and \
+                 not the other:\n{}",
+                statement.trim()
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 3,
+        "expected the index, the listing and the gauge; found {checked} statement(s)"
+    );
+}
+
+/// Every double-quoted string literal in a Rust source file.
+///
+/// Enough for SQL held in this crate: the statements carry no escaped quote,
+/// and their own literals are single-quoted.
+fn string_literals(src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = src;
+    while let Some(open) = rest.find('"') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find('"') else { break };
+        out.push(rest[..close].to_owned());
+        rest = &rest[close + 1..];
+    }
+    out
+}
+
 /// A journaled record names only `core` vocabulary.
 ///
 /// The journal is the durable contract. Every type inside a `RecordKind` is a

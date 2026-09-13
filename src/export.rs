@@ -1501,9 +1501,22 @@ pub struct RestoreReport {
 
 impl RestoreReport {
     /// Whether the rebuilt store commits to exactly the history the export did.
+    ///
+    /// **The commitment, not the label.** A checkpoint carries a log *identity*
+    /// beside its size and root, and a recovery routinely changes that: the
+    /// realistic restore is into another tenant of a database somebody else is
+    /// already using, which is the topology `for_tenant` exists for. Comparing
+    /// the identity made a byte-perfect restore report as a failed one exactly
+    /// in the case a disaster puts an operator in — and `agentplane restore`
+    /// exits on this predicate.
+    ///
+    /// A relabelling is not silent for being excluded: it is a sentence in
+    /// [`not_carried`](Self::not_carried), beside every other thing the file
+    /// could not bring across, and both checkpoints are on the report for a
+    /// reader who wants to see the names.
     #[must_use]
     pub fn is_faithful(&self) -> bool {
-        self.expected == self.rebuilt
+        self.expected.size == self.rebuilt.size && self.expected.root == self.rebuilt.root
     }
 }
 
@@ -1663,9 +1676,21 @@ pub async fn from_jsonl<R: std::io::BufRead>(
 
     let awaiting = awaiting_runs(store, &parsed.runs).await?;
 
+    let rebuilt = store.checkpoint().await?;
+    if rebuilt.origin != parsed.checkpoint.origin {
+        not_carried.push(format!(
+            "the log identity — this history was written by '{}' and is now held by '{}'. \
+             A legitimate recovery: a restore is pointed at a store, and one tenant's \
+             history put back under another tenant's name is a different log with the \
+             same contents. It is named because a checkpoint an auditor holds from \
+             before the disaster will report the new log as the wrong one",
+            parsed.checkpoint.origin, rebuilt.origin
+        ));
+    }
+
     Ok(RestoreReport {
         expected: parsed.checkpoint,
-        rebuilt: store.checkpoint().await?,
+        rebuilt,
         runs: parsed.runs.len(),
         records,
         cases: imported,

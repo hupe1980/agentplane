@@ -75,8 +75,78 @@ impl OpenDalBlobs {
     }
 }
 
+impl OpenDalBlobs {
+    /// Why nothing is at this address: erased, never written, or a tombstone
+    /// that does not read.
+    ///
+    /// One reader, called from both read paths and from the write refusal, so
+    /// none of the three can come to a different answer about what a tombstone
+    /// means. Returns the error rather than a value, because every caller wants
+    /// one.
+    async fn absent(&self, digest: Digest) -> BlobError {
+        let raw = match self.op.read(&self.tomb(digest)).await {
+            Ok(raw) => raw.to_vec(),
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
+                return BlobError::NotFound(digest.to_hex());
+            }
+            Err(e) => return backend(&e),
+        };
+        let unreadable = |detail: String| BlobError::UnreadableTombstone {
+            digest: digest.to_hex(),
+            detail,
+        };
+        // The version is read before any field is trusted, so a tombstone a
+        // later build wrote is refused by name rather than half-parsed.
+        let stone: Tombstone = match serde_json::from_slice(&raw) {
+            Ok(stone) => stone,
+            Err(e) => return unreadable(e.to_string()),
+        };
+        if stone.v != TOMBSTONE_FORMAT_VERSION {
+            return unreadable(format!(
+                "written under tombstone format {}, and this build reads {TOMBSTONE_FORMAT_VERSION}",
+                stone.v
+            ));
+        }
+        BlobError::Expired {
+            digest: digest.to_hex(),
+            at: stone.at,
+            reason: stone.reason,
+        }
+    }
+}
+
 fn backend(e: &opendal::Error) -> BlobError {
     BlobError::Backend(e.to_string())
+}
+
+/// The tombstone layout this build writes and reads.
+///
+/// One number naming the whole thing, on the same terms as every other durable
+/// format here: a reader that cannot interpret a tombstone must refuse rather
+/// than guess, and "which shape is this" has to be answerable from the bytes.
+/// A tombstone outlives the object it describes by design, so it is the one
+/// artifact in this store that a future build is certain to meet.
+pub const TOMBSTONE_FORMAT_VERSION: u8 = 1;
+
+/// What a tombstone records.
+///
+/// Serialised through [`canon`](crate::core::canon) rather than as a delimited
+/// line, so the bytes do not depend on field order and a reason containing a
+/// space, a newline or a quote survives a round trip. A delimited form has to
+/// decide what an absent half means, and the only safe answer — refuse — is
+/// what a parser gives for free.
+/// Strict in both directions, as every durable format here is: a tombstone is
+/// evidence, and a reader that drops a member it does not recognise reaches a
+/// verdict over evidence it did not see. An added member is a format bump.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Tombstone {
+    /// The format this was written under. Read before anything else is trusted.
+    v: u8,
+    /// When the bytes were expired, as a Unix second.
+    at: i64,
+    /// Why, in the words of whoever asked.
+    reason: String,
 }
 
 #[async_trait]
@@ -87,17 +157,23 @@ impl BlobStore for OpenDalBlobs {
 
     async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
         let digest = Digest::of(bytes);
-        // No read-before-write: the address is the content, so re-writing is
-        // writing the same bytes to the same place. Checking first would buy a
-        // round trip to avoid an operation that cannot do harm.
-        self.op
-            .write(&self.path(digest), bytes.to_vec())
-            .await
-            .map_err(|e| backend(&e))?;
+        self.put_at(digest, bytes).await?;
         Ok(digest)
     }
 
     async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
+        // One read before the write, and it is the tombstone rather than the
+        // object. Re-writing the bytes themselves cannot do harm — the address
+        // is the content — but writing them over an *erased* address puts the
+        // data back, silently, under a tombstone that still says when it went.
+        // So the round trip buys the one thing a content-addressed store cannot
+        // get for free.
+        match self.absent(digest).await {
+            // Nothing has been erased here, which is what "no tombstone" means
+            // on the read path and the only answer that licenses a write.
+            BlobError::NotFound(_) => {}
+            refusal => return Err(refusal),
+        }
         self.op
             .write(&self.path(digest), bytes.to_vec())
             .await
@@ -108,23 +184,7 @@ impl BlobStore for OpenDalBlobs {
     async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
         match self.op.read(&self.path(digest)).await {
             Ok(buf) => Ok(buf.to_vec()),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                match self.op.read(&self.tomb(digest)).await {
-                    Ok(raw) => {
-                        let text = String::from_utf8_lossy(&raw.to_vec()).into_owned();
-                        let (at, reason) = text.split_once(' ').unwrap_or(("0", "expired"));
-                        Err(BlobError::Expired {
-                            digest: digest.to_hex(),
-                            at: at.parse().unwrap_or(0),
-                            reason: reason.to_owned(),
-                        })
-                    }
-                    Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                        Err(BlobError::NotFound(digest.to_hex()))
-                    }
-                    Err(e) => Err(backend(&e)),
-                }
-            }
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Err(self.absent(digest).await),
             Err(e) => Err(backend(&e)),
         }
     }
@@ -132,26 +192,10 @@ impl BlobStore for OpenDalBlobs {
     async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
         match self.op.read(&self.path(digest)).await {
             Ok(buf) => verify(digest, buf.to_vec()),
-            Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                // Only now look for a tombstone: while the bytes are live it
-                // would be a contradiction, and answering from it would hide
-                // data that is still there.
-                match self.op.read(&self.tomb(digest)).await {
-                    Ok(raw) => {
-                        let text = String::from_utf8_lossy(&raw.to_vec()).into_owned();
-                        let (at, reason) = text.split_once(' ').unwrap_or(("0", "expired"));
-                        Err(BlobError::Expired {
-                            digest: digest.to_hex(),
-                            at: at.parse().unwrap_or(0),
-                            reason: reason.to_owned(),
-                        })
-                    }
-                    Err(e) if e.kind() == opendal::ErrorKind::NotFound => {
-                        Err(BlobError::NotFound(digest.to_hex()))
-                    }
-                    Err(e) => Err(backend(&e)),
-                }
-            }
+            // Only now look for a tombstone: while the bytes are live it would
+            // be a contradiction, and answering from it would hide data that is
+            // still there.
+            Err(e) if e.kind() == opendal::ErrorKind::NotFound => Err(self.absent(digest).await),
             Err(e) => Err(backend(&e)),
         }
     }
@@ -168,9 +212,15 @@ impl BlobStore for OpenDalBlobs {
             .await
             .map_err(|e| backend(&e))?;
         if !existing {
-            let line = format!("{} {}", at.unix_timestamp(), reason.replace('\n', " "));
+            let stone = Tombstone {
+                v: TOMBSTONE_FORMAT_VERSION,
+                at: at.unix_timestamp(),
+                reason: reason.to_owned(),
+            };
+            let bytes = crate::core::canon::to_bytes(&stone)
+                .map_err(|e| BlobError::Backend(format!("a tombstone did not serialize: {e}")))?;
             self.op
-                .write(&self.tomb(digest), line.into_bytes())
+                .write(&self.tomb(digest), bytes)
                 .await
                 .map_err(|e| backend(&e))?;
         }

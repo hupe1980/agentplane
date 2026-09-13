@@ -17,6 +17,91 @@ use agentplane::journal::JournalStore;
 use agentplane::store::RedbStore;
 use agentplane::testkit::conformance;
 
+/// **The built-in calendar against the contract every calendar carries.**
+///
+/// This is the seam most likely to be replaced: a real regulatory deadline is
+/// working days in a named timezone with a holiday table, and none of that
+/// belongs in a domain-agnostic engine. The replacement computes a legally
+/// binding instant that nothing above it can check, so the battery is what an
+/// implementer gets instead of a review.
+#[test]
+fn the_built_in_calendar_satisfies_the_contract() {
+    use agentplane::core::{DeadlineSpec, WallClock};
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_calendar;
+
+    let mut report = Report::default();
+    conformance_calendar::check(
+        &WallClock,
+        &[
+            DeadlineSpec::hours(24),
+            DeadlineSpec::days(5),
+            DeadlineSpec::new("minutes", serde_json::json!({ "n": 90 })),
+        ],
+        &mut report,
+    );
+    report.assert_conforms("WallClock");
+}
+
+/// **And the battery refuses a calendar that guesses.**
+///
+/// A conformance suite nothing can fail is the shape this project catalogues.
+/// The double here is the calendar an implementer writes by accident: it
+/// approximates a rule it does not know, and it hands a hostile count straight
+/// to `time`'s arithmetic — which is the defect the built-in calendar shipped
+/// with until it was found.
+#[test]
+fn the_calendar_battery_rejects_one_that_approximates() {
+    use agentplane::core::{Calendar, CalendarError, DeadlineSpec, Digest, Timestamp};
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_calendar;
+
+    #[derive(Debug)]
+    struct Guesses;
+
+    impl Calendar for Guesses {
+        fn resolve(
+            &self,
+            from: Timestamp,
+            spec: &DeadlineSpec,
+        ) -> Result<Timestamp, CalendarError> {
+            let n = spec
+                .params
+                .get("n")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(1);
+            // Everything it does not know becomes days, and a count it finds
+            // implausible is quietly clamped into range. Both are failures the
+            // battery names: the first answers a rule it does not implement,
+            // and the second turns a typo with no correct reading into an
+            // obligation nobody will ever be warned about.
+            let seconds = n.clamp(-3_650, 3_650).saturating_mul(86_400);
+            from.checked_add(time::Duration::seconds(seconds))
+                .ok_or_else(|| CalendarError::OutOfRange {
+                    kind: spec.kind.clone(),
+                })
+        }
+
+        fn digest(&self) -> Digest {
+            Digest::of(b"guesses")
+        }
+    }
+
+    let mut report = Report::default();
+    conformance_calendar::check(&Guesses, &[DeadlineSpec::days(5)], &mut report);
+    let named: Vec<&str> = report.violations.iter().map(|v| v.invariant).collect();
+    assert!(
+        named.contains(&"an unknown rule is refused, never approximated"),
+        "the battery accepted a calendar that answers rules it does not implement: \
+         {named:?}"
+    );
+    assert!(
+        named.contains(&"a count no instant can carry is refused"),
+        "the battery accepted a calendar that clamps a count into range, so the \
+         hostile half of it reaches nothing: {named:?}"
+    );
+}
+
 #[tokio::test]
 async fn redb_satisfies_the_journal_store_contract() {
     // Signing is switched on for the whole battery, not only for the check that

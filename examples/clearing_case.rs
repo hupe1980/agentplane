@@ -60,7 +60,7 @@ impl Calendar for WorkingDays {
         let mut at = from;
         let mut left = n;
         while left > 0 {
-            at += std::time::Duration::from_secs(86_400);
+            at += std::time::Duration::from_hours(24);
             if !matches!(
                 at.weekday(),
                 time::Weekday::Saturday | time::Weekday::Sunday
@@ -109,7 +109,7 @@ impl Skill for SendRequest {
             .deadline(
                 "acknowledgement",
                 &DeadlineSpec::new("working-days", json!({ "n": 5 })),
-                Some(std::time::Duration::from_secs(86_400)),
+                Some(std::time::Duration::from_hours(24)),
             )
             .await?;
 

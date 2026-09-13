@@ -21,6 +21,88 @@ describes and cannot rot unnoticed. What exists is answered by
 [concepts](@/docs/concepts.md), the [API reference](https://docs.rs/agentplane),
 and the test suite.
 
+## 📌 What to pin, and what will move {#what-to-pin-and-what-will-move}
+
+Pre-alpha means every one of these can change. It does not mean they are all
+equally likely to, and an adopter deciding what to build against deserves the
+difference rather than one blanket warning.
+
+Nothing here is a compatibility promise. It is a statement about where the
+remaining design pressure is.
+
+| Surface | Expect | Why |
+|---|---|---|
+| **Effect / disposition / recovery vocabulary** | stable | `DidNotHappen`/`InDoubt`/`Landed` and the recovery classes are the load-bearing idea; changing them would be a different system |
+| **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
+| **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
+| **Journal record format** | **will change** | not frozen. Upcasters exist, but a format-freeze milestone has not happened and hard cuts are preferred until it does — see the freeze conditions below for what has to land first, and for the export-as-the-durable-artifact position in the meantime |
+| **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. A reference names a server and a tool, never a transport, so the key does not move when the transport does |
+| **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` means an added field is safe and a *removed* one is a hard failure. A field the runtime cannot enforce is removed rather than kept as a declaration nothing honours. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
+| **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
+| **Error enums** | additive; `#[non_exhaustive]` | they gain variants as the runtime learns to say more — a rate limit is its own variant rather than a generic rejection, and the next distinction will be too. Match with a `_` arm |
+| **`RetryPolicy` fields** | additive | it is a plain struct, so a literal breaks when a field lands. Build with `RetryPolicy::attempts(n)` and the builder methods, or spread `..RetryPolicy::default()` |
+| **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled. `context` gains attributes as the runtime learns to say more; a `forbid` reading one that does not exist is an evaluation error, and the Cedar adapter **denies an `Allow` that arrives with evaluation errors** rather than letting a broken rule disappear — see [security](@/docs/security.md#the-authorization-context) |
+| **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
+| **Store schemas — SQL, redb, and what a blob store writes** | **will change without migration** | pre-alpha, and there is no migration tooling. Recreate rather than migrate. All three deliberately: a redb `TableDefinition` pins its value types, so widening one fails at open rather than at read, and an object store's tombstones carry a version a later build refuses rather than guesses at |
+| **A2A / MCP wire behaviour** | tracks the specs | exact released versions, not a compatibility range: a version this crate has not been held to is one it does not claim |
+| **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
+
+## 🧊 Format freeze: the conditions, and where they stand {#format-freeze}
+
+The single question that decides whether this can be recommended for anything
+regulated, asked directly enough to deserve a direct answer: **the strongest
+control here — a tamper-evident, offline-verifiable audit trail — cannot be
+signed off as a long-term record while its format may break with no migration
+path.** Every other gap an adopter finds is closable with integration work.
+This one is not.
+
+There is no date, and inventing one would be the kind of claim this page exists
+to avoid. What there is instead is a **condition list**: freeze happens when
+every row below is met, and each row is checkable rather than a matter of
+judgement. An adopter tracking this page can see how far along it is without
+asking.
+
+✅ met · 🟨 half, and the remaining half is named · ⬜ open. A half is a row
+whose *mechanics* are built and whose remaining work is a document or an
+exercise — stated as its own state rather than rounded to either neighbour,
+because rounding up is how a condition list stops being checkable.
+
+| # | Condition | State |
+|---|---|---|
+| 1 | **Canonicalization is versioned and vector-checked.** A rule change must read as *unverifiable* rather than as a divergence | ✅ done — versioned at the run, a complete RFC 8785 implementation held to the standard's own number vectors |
+| 2 | **Golden corpora for the journal record format.** A fixed set of records, byte-for-byte, that every future build must still read and still hash identically | ✅ done — one canonical record per kind and its chain digest in `tests/golden/records.jsonl`, sealed through the same function every backend appends through, with a guard holding the corpus to the record vocabulary so a new kind cannot ship unpinned |
+| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | ✅ done — a sealed export with its case layer is checked in, and `tools/verify_export.py` verifies it from the [published specification](@/docs/format.md) alone, re-deriving all 27 record vectors rather than only accepting them |
+| 4 | **A stated unknown-field policy per durable format.** | ✅ done, and strict in both directions — a record is *evidence*, so a reader that drops a field reaches a verdict over evidence it did not see. Refusals are classified as build skew rather than damage, with the deployment order they imply written down beside them |
+| 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — consulted on *every* record read, with a test lifting a record whose shape this build cannot parse and asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump |
+| 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down (readers before writers; rollback bounded by a *time window*), and the reader's half is pinned: a record from a shape this build does not know is refused as skew, not damage. What is left is the two-build exercise, which needs a version bump to have two builds to run |
+| 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility), and already implemented: hashes are agile by version, signatures by key, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
+| 8 | **The deferred format questions are settled**, because each one moves a record or a wire: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open — **eight** questions, each with an answer that changes a durable format or a protocol. Four more that had accumulated here turned out to change neither, whichever way they go, and no longer count against the freeze |
+
+**7 and 8 are independent, with one join.** They can be worked in parallel:
+agility is about how a digest says *which function produced it* and how a
+verifier meets an older one, while the deferred questions add **fields** to
+record kinds that are already hashed — a field on `EffectFailed` changes the
+bytes, not the scheme that covers them. The join is the policy-bundle canonical
+format, which is itself a hashed artifact: agility enumerates every durable or
+signed format, and that enumeration is not complete until the bundle's format
+exists. So 8 does not gate 7's *design*, only the last line of its inventory.
+
+Two things follow that are worth stating plainly.
+
+**Freezing the journal does not freeze everything.** Store schemas are a
+separate promise, and a weaker one on purpose: the journal is the record, the
+stores are indexes derived from it. A store rebuilt from an export is not a
+migration and does not need one, which is why `export`/`restore` are built and
+`ALTER TABLE` is not.
+
+**Until then, the honest position for an adopter is:** treat the export as the
+long-term artifact and the store as disposable. `agentplane export` produces
+framed JSON Lines with a checkpoint, `agentplane verify` recomputes it from its
+own bytes, and `agentplane restore` rebuilds a store from it — three verbs that
+already work, and the reason a format change is a rebuild rather than a loss.
+That is a real answer, not a promise: an export taken today is verifiable today
+by a party who has never run this crate.
+
 ## ⬜ Deliberately not built {#deliberately-not-built}
 
 Each entry says *why*, because the distinction a status page exists to make is
@@ -68,7 +150,7 @@ that is answered would be shipping the second one by accident.
 [record format](@/docs/format.md) is specified, and a second implementation
 reads that specification and derives the same bytes. What is left is
 algorithm agility and the deferred questions that would each move a record —
-enumerated in [Format freeze](#format-freeze) below.
+enumerated in [Format freeze](#format-freeze) above.
 
 **A measured containment claim.** The runtime claims injection *containment*, not
 immunity, and no external measurement is attached to it. A static attack set
@@ -94,88 +176,6 @@ between the records and the wire would drift from both. Live in-process deltas
 stay advisory (`ModelCall::streaming_to`): none is journaled and strict replay
 emits none, because a durable delta stream is a second truth beside the one
 terminal `Completion`.
-
-## 🧊 Format freeze: the conditions, and where they stand {#format-freeze}
-
-The single question that decides whether this can be recommended for anything
-regulated, asked directly enough to deserve a direct answer: **the strongest
-control here — a tamper-evident, offline-verifiable audit trail — cannot be
-signed off as a long-term record while its format may break with no migration
-path.** Every other gap an adopter finds is closable with integration work.
-This one is not.
-
-There is no date, and inventing one would be the kind of claim this page exists
-to avoid. What there is instead is a **condition list**: freeze happens when
-every row below is met, and each row is checkable rather than a matter of
-judgement. An adopter tracking this page can see how far along it is without
-asking.
-
-✅ met · 🟨 half, and the remaining half is named · ⬜ open. A half is a row
-whose *mechanics* are built and whose remaining work is a document or an
-exercise — stated as its own state rather than rounded to either neighbour,
-because rounding up is how a condition list stops being checkable.
-
-| # | Condition | State |
-|---|---|---|
-| 1 | **Canonicalization is versioned and vector-checked.** A rule change must read as *unverifiable* rather than as a divergence | ✅ done — versioned at the run, a complete RFC 8785 implementation held to the standard's own number vectors |
-| 2 | **Golden corpora for the journal record format.** A fixed set of records, byte-for-byte, that every future build must still read and still hash identically | ✅ done — one canonical record per kind and its chain digest in `tests/golden/records.jsonl`, sealed through the same function every backend appends through, with a guard holding the corpus to the record vocabulary so a new kind cannot ship unpinned |
-| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | ✅ done — a sealed export with its case layer is checked in, and `tools/verify_export.py` verifies it from the [published specification](@/docs/format.md) alone, re-deriving all 27 record vectors rather than only accepting them |
-| 4 | **A stated unknown-field policy per durable format.** | ✅ done, and strict in both directions — a record is *evidence*, so a reader that drops a field reaches a verdict over evidence it did not see. Refusals are classified as build skew rather than damage, with the deployment order they imply written down beside them |
-| 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — consulted on *every* record read, with a test lifting a record whose shape this build cannot parse and asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump |
-| 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down: readers before writers, and rollback bounded by a *time window* rather than a version, because records written after the new writer was enabled strand an older reader. Missing is the rehearsal, which belongs with the disaster-recovery drill |
-| 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ⬜ open |
-| 8 | **The deferred format questions are settled**, because each one moves a record: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open |
-
-**7 and 8 are independent, with one join.** They can be worked in parallel:
-agility is about how a digest says *which function produced it* and how a
-verifier meets an older one, while the deferred questions add **fields** to
-record kinds that are already hashed — a field on `EffectFailed` changes the
-bytes, not the scheme that covers them. The join is the policy-bundle canonical
-format, which is itself a hashed artifact: agility enumerates every durable or
-signed format, and that enumeration is not complete until the bundle's format
-exists. So 8 does not gate 7's *design*, only the last line of its inventory.
-
-Two things follow that are worth stating plainly.
-
-**Freezing the journal does not freeze everything.** Store schemas are a
-separate promise, and a weaker one on purpose: the journal is the record, the
-stores are indexes derived from it. A store rebuilt from an export is not a
-migration and does not need one, which is why `export`/`restore` are built and
-`ALTER TABLE` is not.
-
-**Until then, the honest position for an adopter is:** treat the export as the
-long-term artifact and the store as disposable. `agentplane export` produces
-framed JSON Lines with a checkpoint, `agentplane verify` recomputes it from its
-own bytes, and `agentplane restore` rebuilds a store from it — three verbs that
-already work, and the reason a format change is a rebuild rather than a loss.
-That is a real answer, not a promise: an export taken today is verifiable today
-by a party who has never run this crate.
-
-## 📌 What to pin, and what will move {#what-to-pin-and-what-will-move}
-
-Pre-alpha means every one of these can change. It does not mean they are all
-equally likely to, and an adopter deciding what to build against deserves the
-difference rather than one blanket warning.
-
-Nothing here is a compatibility promise. It is a statement about where the
-remaining design pressure is.
-
-| Surface | Expect | Why |
-|---|---|---|
-| **Effect / disposition / recovery vocabulary** | stable | `DidNotHappen`/`InDoubt`/`Landed` and the recovery classes are the load-bearing idea; changing them would be a different system |
-| **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
-| **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
-| **Journal record format** | **will change** | not frozen. Upcasters exist, but a format-freeze milestone has not happened and hard cuts are preferred until it does — see the freeze conditions above for what has to land first, and for the export-as-the-durable-artifact position in the meantime |
-| **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. A reference names a server and a tool, never a transport, so the key does not move when the transport does |
-| **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` means an added field is safe and a *removed* one is a hard failure. A field the runtime cannot enforce is removed rather than kept as a declaration nothing honours. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
-| **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
-| **Error enums** | additive; `#[non_exhaustive]` | they gain variants as the runtime learns to say more — a rate limit is its own variant rather than a generic rejection, and the next distinction will be too. Match with a `_` arm |
-| **`RetryPolicy` fields** | additive | it is a plain struct, so a literal breaks when a field lands. Build with `RetryPolicy::attempts(n)` and the builder methods, or spread `..RetryPolicy::default()` |
-| **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled. `context` gains attributes as the runtime learns to say more; a `forbid` reading one that does not exist is an evaluation error, and the Cedar adapter **denies an `Allow` that arrives with evaluation errors** rather than letting a broken rule disappear — see [security](@/docs/security.md#the-authorization-context) |
-| **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
-| **Store schemas, SQL *and* redb** | **will change without migration** | pre-alpha, and there is no migration tooling. Recreate rather than migrate. This covers both backends deliberately: a redb `TableDefinition` pins its value types, so widening a column is as breaking as an `ALTER TABLE`, and it fails at open rather than at read |
-| **A2A / MCP wire behaviour** | tracks the specs | exact released versions, not a compatibility range — see the open protocol-support question in the design decisions above |
-| **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
 
 ## 🔍 How to check any of this {#how-to-check-any-of-this}
 

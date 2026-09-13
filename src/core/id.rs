@@ -55,6 +55,60 @@ use sha2::{Digest as _, Sha256};
 /// check those.
 pub type Timestamp = time::OffsetDateTime;
 
+/// The longest window of seconds this crate will turn into an instant.
+///
+/// Derived from [`Timestamp`] rather than picked: it is the distance between
+/// the first and last instant the type can name, so a window past it is one
+/// there is no `now` to add it to. A declaration carrying such a number has no
+/// correct reading, and refusing it where the document is read is the only
+/// place a person is still holding the file.
+///
+/// `time`'s own arithmetic is why this is a refusal rather than a clamp: the
+/// duration constructors multiply and the instant operators add, and both
+/// **panic** on overflow. A plane hosting many agents aborts the process to
+/// report one document's typo.
+pub const MAX_WINDOW_SECONDS: u64 = 631_107_417_599;
+
+/// The instant `seconds` after `from`, or `None` where that is not an instant.
+///
+/// One spelling, because the conversion fails two ways — a count too large to
+/// be a [`time::Duration`], and a duration too large to add to `from` — and a
+/// caller that remembers one of them panics on the other. Both constructors
+/// panic rather than return, so there is no form of this that is safe by
+/// accident.
+///
+/// Callers that must produce a value rather than a refusal state their own
+/// fallback at the call site; there is deliberately no saturating twin, because
+/// two functions would be two answers to *what does a window that long mean*.
+#[must_use]
+pub fn seconds_after(from: Timestamp, seconds: u64) -> Option<Timestamp> {
+    i64::try_from(seconds)
+        .ok()
+        .map(time::Duration::seconds)
+        .and_then(|delta| from.checked_add(delta))
+}
+
+/// The last instant a [`Timestamp`] can name.
+///
+/// The saturation target for a caller that owes an index an entry rather than a
+/// refusal — see [`seconds_after`].
+#[must_use]
+pub fn last_instant() -> Timestamp {
+    time::PrimitiveDateTime::MAX.assume_utc()
+}
+
+/// The first instant a [`Timestamp`] can name.
+///
+/// The other saturation target: a cutoff that reaches back further than the
+/// calendar goes selects nothing, which is what a caller asking to hold
+/// something *indefinitely* means. Subtracting a duration from an instant
+/// panics on underflow, so a caller computing such a cutoff needs somewhere to
+/// land rather than a `checked_sub` it can forget.
+#[must_use]
+pub fn first_instant() -> Timestamp {
+    time::PrimitiveDateTime::MIN.assume_utc()
+}
+
 /// One instant, RFC 3339, for a place that is not a struct field.
 ///
 /// `#[serde(with = "time::serde::rfc3339")]` is the answer wherever there is a
@@ -438,7 +492,39 @@ impl fmt::Debug for EffectKey {
 
 #[cfg(test)]
 mod tests {
+    use time::macros::datetime;
+
     use super::*;
+
+    /// The ceiling is computed from the type, never asserted against itself.
+    ///
+    /// A hand-written figure beside a `Timestamp` whose range changed under it
+    /// would read as derived and be wrong, which is the failure mode this
+    /// project catalogues for every number a document states.
+    #[test]
+    fn the_window_ceiling_is_the_span_the_type_can_name() {
+        let first = time::PrimitiveDateTime::MIN.assume_utc();
+        let span = last_instant().unix_timestamp() - first.unix_timestamp();
+        assert_eq!(
+            MAX_WINDOW_SECONDS,
+            u64::try_from(span).expect("the span of a calendar is positive")
+        );
+    }
+
+    /// Both halves of the conversion refuse rather than panic, and the panics
+    /// are real: `time::Duration::seconds` is total, but the addition is not,
+    /// and a `u64` past `i64` is not a duration at all.
+    #[test]
+    fn a_window_no_instant_can_carry_is_none_not_a_panic() {
+        let now = datetime!(2026-09-13 12:00:00 UTC);
+        assert!(seconds_after(now, 3_600).is_some());
+        assert_eq!(seconds_after(now, MAX_WINDOW_SECONDS), None);
+        assert_eq!(seconds_after(now, u64::MAX), None);
+        // The ceiling is the span of the calendar, so it is reachable from the
+        // first instant and from nowhere later.
+        let first = time::PrimitiveDateTime::MIN.assume_utc();
+        assert!(seconds_after(first, MAX_WINDOW_SECONDS).is_some());
+    }
 
     #[test]
     fn chain_is_order_sensitive() {

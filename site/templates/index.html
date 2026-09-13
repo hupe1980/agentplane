@@ -93,7 +93,7 @@
   <dl class="stats">
     <div><dt>7</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
     <div><dt>28</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
-    <div><dt>725</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>738</dt><dd>code mutations, each naming the one test that must fail</dd></div>
     <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
   </dl>
   <p class="fine">
@@ -189,8 +189,8 @@ assert_eq!(out.output, replayed.output);</code></pre>
     <p>No, and the honest reason is a format rather than a feature: the durable
       record format is not frozen, so a shape change is a hard cut with no
       migration. The crate is published and pre-alpha.
-      <a href="{{ get_url(path='@/docs/status.md') }}">Status</a> lists what is
-      built, what is deliberately absent, and the checkable conditions the
+      <a href="{{ get_url(path='@/docs/status.md') }}">Status</a> lists what will
+      move, what is deliberately absent, and the checkable conditions the
       freeze is waiting on. The workable position today is to treat the export
       as the long-term artifact and the store as disposable.</p>
   </details>
@@ -237,7 +237,7 @@ assert_eq!(out.output, replayed.output);</code></pre>
     </tbody>
   </table>
   <p class="fine">
-    <a href="{{ get_url(path='@/docs/status.md') }}">Status</a> lists what is built
+    <a href="{{ get_url(path='@/docs/status.md') }}">Status</a> lists what will move
     and what is deliberately deferred, and
     <a href="{{ get_url(path='@/docs/security.md') }}">the security model</a> is
     explicit about what it does not cover.

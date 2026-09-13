@@ -38,6 +38,62 @@ fn stores() -> Vec<(&'static str, Arc<dyn BlobStore>)> {
     out
 }
 
+/// **Every shipped blob store against one contract, including the composed
+/// handles a real deployment reads and writes through.**
+///
+/// The bare backends are the obvious half. The other three are the ones a
+/// plane actually holds: `ScopedBlobs` is what makes one case's erasure reach
+/// exactly its own copies, `EncryptedBlobs` is what a sealed deployment writes
+/// through, and the two together are the shape `Runtime::drill` derives per
+/// case. A decorator that dropped a refusal on the way through would leave the
+/// guarantee true of the backend and false of the deployment.
+// The battery and the in-process key ring both live behind `testkit`, which a
+// default build does not enable — and `just lint` compiles this target without
+// it, which is the configuration `--all-features` can never show you.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn every_blob_store_satisfies_the_contract() {
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_blob;
+
+    let mut report = Report::default();
+    for (name, store) in stores() {
+        conformance_blob::check(&store, name, &mut report).await;
+        conformance_blob::check_backing(&store, name, &mut report).await;
+
+        let scope = format!("conformance/{name}");
+        let scoped: Arc<dyn BlobStore> = Arc::new(agentplane::blob::ScopedBlobs::new(
+            Arc::clone(&store),
+            scope.clone(),
+        ));
+        conformance_blob::check(&scoped, &format!("{name}-scoped"), &mut report).await;
+        // Also a backing store: `EncryptedBlobs` composes on top of it, so its
+        // envelope pair has to work or a scoped *and* sealed deployment has no
+        // write path at all.
+        conformance_blob::check_backing(&scoped, &format!("{name}-scoped"), &mut report).await;
+
+        #[cfg(feature = "keyring")]
+        {
+            let keys: Arc<dyn agentplane::keyring::KeyRing> =
+                Arc::new(agentplane::testkit::MemoryKeyRing::new());
+            let sealed: Arc<dyn BlobStore> = Arc::new(agentplane::keyring::EncryptedBlobs::new(
+                Arc::clone(&store),
+                Arc::clone(&keys),
+                format!("{scope}/sealed"),
+            ));
+            conformance_blob::check(&sealed, &format!("{name}-sealed"), &mut report).await;
+
+            let both: Arc<dyn BlobStore> = Arc::new(agentplane::keyring::EncryptedBlobs::new(
+                Arc::clone(&scoped),
+                keys,
+                format!("{scope}/both"),
+            ));
+            conformance_blob::check(&both, &format!("{name}-scoped-sealed"), &mut report).await;
+        }
+    }
+    report.assert_conforms("the shipped blob stores");
+}
+
 #[tokio::test]
 async fn bytes_come_back_from_the_address_they_went_to() {
     for (name, store) in stores() {
@@ -195,6 +251,214 @@ async fn a_repeated_expiry_keeps_the_first_tombstone() {
 /// **Erasure is scoped to the case, which is the only unit anyone asks about.**
 ///
 /// Nobody requests that a digest be forgotten; they name a person, and that
+/// **A tombstone is read or refused, never guessed.**
+///
+/// It is the only evidence an erasure happened that outlives the bytes it
+/// describes, so a reader that fills in a default answers *expired at the
+/// epoch, reason "expired"* — a completed erasure it invented — and
+/// `Runtime::drill` counts it under `blobs_erased`, which is the verdict that
+/// pages nobody.
+///
+/// Three damaged shapes, because they fail in different places: bytes that are
+/// not the format at all, a well-formed record from a version this build does
+/// not read, and an empty object — which is what a partial write leaves.
+#[cfg(feature = "opendal")]
+#[tokio::test]
+async fn a_tombstone_that_does_not_read_is_a_finding_not_an_erasure() {
+    use agentplane::blob::OpenDalBlobs;
+
+    let dir = std::env::temp_dir().join(format!("agentplane-tombs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let op = opendal::Operator::new(opendal::services::Fs::default().root(&dir.to_string_lossy()))
+        .expect("fs operator");
+    let store = OpenDalBlobs::new(op.clone(), "blobs");
+
+    for (what, damage) in [
+        (
+            "not the format at all",
+            "1760000000 art-17 request".to_owned(),
+        ),
+        (
+            "a version this build does not read",
+            r#"{"at":1760000000,"reason":"art-17 request","v":99}"#.to_owned(),
+        ),
+        ("an empty object", String::new()),
+    ] {
+        let payload = format!("filing for {what}").into_bytes();
+        let digest = store.put(&payload).await.expect("put");
+        store
+            .expire(digest, ts(1_760_000_000), "art-17 request")
+            .await
+            .expect("expire");
+
+        // A healthy tombstone first, so the damage below is the only difference.
+        assert!(
+            matches!(store.get(digest).await, Err(BlobError::Expired { .. })),
+            "{what}: the fixture did not produce a readable tombstone"
+        );
+
+        let hex = digest.to_hex();
+        let tomb = format!("blobs/default/{}/{}/{hex}.tomb", &hex[0..2], &hex[2..4]);
+        op.write(&tomb, damage.into_bytes())
+            .await
+            .expect("damage the tombstone");
+
+        match store.get(digest).await {
+            Err(BlobError::UnreadableTombstone { .. }) => {}
+            other => panic!(
+                "{what}: the bytes are gone and the record of why does not read, and this \
+                 answered {other:?} — a drill would count an erasure nobody can vouch for"
+            ),
+        }
+        // The raw read is the same reader, so the two cannot disagree about
+        // what a tombstone means.
+        assert!(
+            matches!(
+                store.get_raw(digest).await,
+                Err(BlobError::UnreadableTombstone { .. })
+            ),
+            "{what}: the raw read reached a different verdict than get"
+        );
+        // And a write is still refused: the bytes were removed, whatever the
+        // record of it now says.
+        assert!(
+            matches!(
+                store.put(&payload).await,
+                Err(BlobError::UnreadableTombstone { .. })
+            ),
+            "{what}: an unreadable tombstone licensed the write it was standing over"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **Ordinary work does not undo an erasure, and the refusal says so.**
+///
+/// Content addressing makes the address the content, so a run producing the
+/// same bytes a second time lands on the erased object. This is the ordinary
+/// shape rather than an exotic one: a resumed run re-storing what it stored
+/// before, or a second run of the same matter doing the same work.
+///
+/// The plane here is deliberately **unsealed**, because that is the half that
+/// was open. On a sealed deployment the destroyed wrapping key refuses the
+/// write first, so the hazard was invisible in exactly the configuration a
+/// reviewer would reach for to check it.
+///
+/// The refusal's *type* is the second half. `StoreError::BlobErased` rather
+/// than a backend string: retrying cannot help, the store is healthy, and a
+/// business rule wearing a storage fault's type is read as an outage by
+/// everything that classifies one.
+#[tokio::test]
+async fn a_run_cannot_put_back_what_an_erasure_removed() {
+    use agentplane::blob::erase_case;
+    use agentplane::case::CaseStore;
+    use agentplane::core::{
+        CorrelationKey, Outcome, Skill, SkillDescriptor, SkillError, StoreError, Tainted, TenantId,
+    };
+    use agentplane::runtime::{RunStatus, Runtime, StepCtx};
+    use agentplane::store::RedbStore;
+    use serde_json::{Value, json};
+
+    const FILING: &[u8] = b"the signed filing";
+
+    #[derive(Debug)]
+    struct Files;
+
+    #[async_trait::async_trait]
+    impl Skill for Files {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("files").provides("records.file")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let digest = cx.store_blob(FILING).await?;
+            Ok(Outcome::done(Tainted::trusted(json!(digest.to_hex()))))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+    let keys = [CorrelationKey::new("claim", "CLM-9")];
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .blobs(Arc::clone(&blobs))
+        .skill(Files)
+        .build();
+
+    let first = rt
+        .run_correlated("records.file", Tainted::trusted(json!({})), "claim", &keys)
+        .await
+        .expect("the first run");
+    assert!(
+        matches!(first.status, RunStatus::Succeeded),
+        "{:?}",
+        first.status
+    );
+
+    let cases: Arc<dyn CaseStore> = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let case = cases
+        .correlate(&keys)
+        .await
+        .expect("correlate")
+        .expect("a case");
+    let tenant = TenantId::default();
+    let erased = erase_case(
+        Some(blobs.as_ref()),
+        store.as_ref(),
+        #[cfg(feature = "keyring")]
+        None,
+        &tenant,
+        case,
+        ts(9_000),
+        "art-17 request",
+    )
+    .await
+    .expect("erase");
+    assert_eq!(
+        erased, 1,
+        "the run's blob was not linked, so nothing was erased"
+    );
+
+    // The same matter, the same work, the same bytes.
+    let again = rt
+        .run_correlated("records.file", Tainted::trusted(json!({})), "claim", &keys)
+        .await
+        .expect("the second run is admitted");
+    assert!(
+        !matches!(again.status, RunStatus::Succeeded),
+        "the second run stored the erased bytes again, so an erasure reported as \
+         discharged was undone by ordinary work"
+    );
+
+    // And what reached the store is still a tombstone rather than the filing.
+    let scope = agentplane::core::erasure_scope(&tenant, &case.to_string());
+    let address = agentplane::blob::unit_address(&scope, Digest::of(FILING));
+    match blobs.get(address).await {
+        Err(BlobError::Expired { reason, .. }) => {
+            assert_eq!(reason, "art-17 request", "the tombstone was rewritten");
+        }
+        other => panic!("the bytes are back: {other:?}"),
+    }
+
+    // The refusal is typed, so a caller classifying it does not read an
+    // enforced rule as a store having a bad day.
+    let refused = agentplane::blob::ScopedBlobs::new(Arc::clone(&blobs), scope)
+        .put(FILING)
+        .await
+        .expect_err("the write is refused");
+    assert!(
+        matches!(
+            agentplane::blob::refusal_for_test(refused),
+            StoreError::BlobErased { .. }
+        ),
+        "an erased write must not be classified as a backend fault"
+    );
+}
+
 /// resolves to a matter. So the link from case to bytes has to be recorded when
 /// the bytes are written — a digest cannot be reversed to find its case, and
 /// nothing can reconstruct it afterwards.

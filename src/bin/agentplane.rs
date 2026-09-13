@@ -1113,6 +1113,26 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// The instant a retention window of `days` reaches back to.
+///
+/// Checked, and the refusal is the point: subtracting a duration from an
+/// instant **panics** in `time` when the result leaves the representable range,
+/// so a typed-in day count large enough would abort the command rather than
+/// explain itself. The two verbs that take such a window share this so they
+/// cannot come to disagree about where the edge is.
+fn cutoff_before(
+    now: agentplane::core::Timestamp,
+    days: u32,
+) -> Result<agentplane::core::Timestamp, String> {
+    now.checked_sub(time::Duration::days(i64::from(days)))
+        .ok_or_else(|| {
+            format!(
+                "--older-than-days {days} reaches back past the first instant this \
+                 runtime can name"
+            )
+        })
+}
+
 /// Retire admission keys past a window the operator chose.
 ///
 /// Prints the count, because a retention pass that says nothing is
@@ -1132,7 +1152,7 @@ fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, String> {
         // observation of a run.
         #[allow(clippy::disallowed_methods)]
         let now = time::OffsetDateTime::now_utc();
-        let cutoff = now - std::time::Duration::from_secs(u64::from(opts.older_than_days) * 86_400);
+        let cutoff = cutoff_before(now, opts.older_than_days)?;
         let retired = store
             .forget_admissions(cutoff)
             .await
@@ -1187,7 +1207,7 @@ fn retain_verb(opts: &RetainArgs) -> Result<ExitCode, String> {
         // observation of a run.
         #[allow(clippy::disallowed_methods)]
         let now = time::OffsetDateTime::now_utc();
-        let cutoff = now - std::time::Duration::from_secs(u64::from(opts.older_than_days) * 86_400);
+        let cutoff = cutoff_before(now, opts.older_than_days)?;
         let plan = agentplane::retention::plan(cases.as_ref(), cutoff)
             .await
             .map_err(|e| e.to_string())?;
@@ -2773,4 +2793,23 @@ fn shipped_providers() -> Vec<&'static str> {
 fn key(var: &str) -> Result<String, String> {
     std::env::var(var)
         .map_err(|_| format!("{var} is not set, and the manifest names a provider that needs it"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cutoff_before;
+
+    /// A window a person could type is answered; one that reaches past the
+    /// calendar is a message rather than an abort.
+    ///
+    /// The subtraction `time` performs panics on underflow, so the unchecked
+    /// form ended a retention command with `overflow subtracting duration from
+    /// date` and no mention of the flag that caused it.
+    #[test]
+    fn a_retention_window_past_the_calendar_is_a_message_not_an_abort() {
+        let now = time::macros::datetime!(2026-09-13 12:00:00 UTC);
+        assert!(cutoff_before(now, 90).is_ok());
+        let err = cutoff_before(now, u32::MAX).expect_err("a window of 11m years");
+        assert!(err.contains("--older-than-days"), "{err}");
+    }
 }

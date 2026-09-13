@@ -1173,8 +1173,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/api/mod.rs",
         "a_caller_sees_only_the_queue_their_roles_entitle_them_to",
         "the worklist is filtered by a role the caller need not hold",
-        "        .queue(&s.caller.roles, api.limit + 1)",
-        '        .queue(&["compliance-officer".to_owned()], api.limit + 1)',
+        "        .queue(&s.caller.roles, api.limit.saturating_add(1))",
+        '        .queue(&["compliance-officer".to_owned()], api.limit.saturating_add(1))',
     ),
     "DecidableIgnoresExclusion": (
         "src/api/mod.rs",
@@ -1482,22 +1482,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                     detail: error.to_string(),
                 })?;
         }
-        let stored =
-            self.blobs
-                .put(&fetched.bytes)
-                .await
-                .map_err(|error| EffectError::Unavailable {
-                    driver: "blob.store".to_owned(),
-                    detail: error.to_string(),
-                })?;""",
-        """        let stored =
-            self.blobs
-                .put(&fetched.bytes)
-                .await
-                .map_err(|error| EffectError::Unavailable {
-                    driver: "blob.store".to_owned(),
-                    detail: error.to_string(),
-                })?;
+        let stored = self.blobs.put(&fetched.bytes).await.map_err(blob_failure)?;
+""",
+        """        let stored = self.blobs.put(&fetched.bytes).await.map_err(blob_failure)?;
         if let Some(link) = &self.case_link {
             link.cases
                 .link_blob(link.case, digest, link.at)
@@ -1506,7 +1493,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                     driver: "case.store".to_owned(),
                     detail: error.to_string(),
                 })?;
-        }""",
+        }
+""",
     ),
     "BlobDurableBeforeCaseLink": (
         "src/runtime/ctx.rs",
@@ -1516,18 +1504,26 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             .link_blob(cx.case_id, digest, at)
             .await
             .map_err(StepError::Store)?;
+        // An erased address refuses as itself rather than as a backend string:
+        // a run re-producing bytes an operator had removed is a rule this
+        // runtime enforces, not a store that is having a bad day.
         let stored = blobs
             .put(bytes)
             .await
-            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;""",
-        """        let stored = blobs
+            .map_err(|e| StepError::Store(crate::blob::refusal(e)))?;
+""",
+        """        // An erased address refuses as itself rather than as a backend string:
+        // a run re-producing bytes an operator had removed is a rule this
+        // runtime enforces, not a store that is having a bad day.
+        let stored = blobs
             .put(bytes)
             .await
-            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;
+            .map_err(|e| StepError::Store(crate::blob::refusal(e)))?;
         cx.cases
             .link_blob(cx.case_id, digest, at)
             .await
-            .map_err(StepError::Store)?;""",
+            .map_err(StepError::Store)?;
+""",
     ),
     "AnthropicReceivesRemoteMediaUrls": (
         "src/model/anthropic.rs",
@@ -2760,6 +2756,161 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             lenses: d.lenses,
         })""",
     ),
+    # Arithmetic on a number the runtime did not choose. `time`'s duration
+    # constructors multiply and its instant operators add, and **both panic**
+    # rather than return — so the unchecked form of each of these turned a
+    # typo in somebody's YAML into a process abort, in a plane hosting every
+    # other tenant's in-flight run.
+    "ARestoreIsJudgedByItsLabel": (
+        "src/export.rs",
+        "a_restore_writes_only_into_the_tenant_it_was_pointed_at",
+        "a restore's verdict compares the log's *name* beside its commitment, so "
+        "the recovery everybody actually performs — one tenant's history put "
+        "back beside another's, in the database that survived — reports a "
+        "byte-perfect restore as a failed one, and `agentplane restore` exits on it",
+        "        self.expected.size == self.rebuilt.size && self.expected.root == self.rebuilt.root",
+        "        self.expected == self.rebuilt",
+    ),
+    "AGraceWindowIsSubtractedUnchecked": (
+        "src/runtime/executor.rs",
+        "a_grace_window_past_the_calendar_retires_nothing",
+        "the dead-letter cutoff subtracts its grace window from the clock "
+        "without a check, so a caller asking to hold events indefinitely ends "
+        "the tick that also breaches obligations and recovers abandoned runs",
+        """        let cutoff = now_for_admission()
+            .checked_sub(grace)
+            .unwrap_or_else(crate::core::first_instant);""",
+        "        let cutoff = now_for_admission() - grace;",
+    ),
+    "ACappedRedeliveryReadsAsAnOrdinaryTick": (
+        "src/runtime/sweeper.rs",
+        "a_capped_redelivery_pass_says_so",
+        "the one backlog whose entries block their own retries is the one "
+        "capped sweep that cannot say it is behind, so it drains a batch a "
+        "tick while every counter reads normal",
+        "                report.saturated.redeliveries = again.examined >= EVENT_BATCH;",
+        "                report.saturated.redeliveries = false;",
+    ),
+    # Content-addressed erasure. The address is the content, so every one of
+    # these turns "this was erased" into "this was erased, until somebody
+    # produced the same bytes again".
+    "ATombstoneIsGuessedAt": (
+        "src/blob/opendal_store.rs",
+        "a_tombstone_that_does_not_read_is_a_finding_not_an_erasure",
+        "an unreadable tombstone is answered with a made-up date and reason, so "
+        "a drill counts a completed erasure nobody can vouch for — the one "
+        "verdict in that report that pages nobody",
+        """        let stone: Tombstone = match serde_json::from_slice(&raw) {
+            Ok(stone) => stone,
+            Err(e) => return unreadable(e.to_string()),
+        };""",
+        """        let stone: Tombstone = serde_json::from_slice(&raw).unwrap_or(Tombstone {
+            v: TOMBSTONE_FORMAT_VERSION,
+            at: 0,
+            reason: "expired".to_owned(),
+        });""",
+    ),
+    "ATombstoneFromAnotherFormatIsRead": (
+        "src/blob/opendal_store.rs",
+        "a_tombstone_that_does_not_read_is_a_finding_not_an_erasure",
+        "a tombstone written under a format this build does not implement is "
+        "read field by field anyway, which is a verdict over evidence the "
+        "reader did not understand",
+        """        if stone.v != TOMBSTONE_FORMAT_VERSION {""",
+        """        if false {""",
+    ),
+    "AnUnlimitedTaskRetentionReadsAsUnstated": (
+        "src/tools/mcp.rs",
+        "an_unlimited_retention_is_not_an_unstated_one",
+        "`ttlMs: null` — the tasks extension's way of saying *no deadline* — is "
+        "reported as *the server did not say*, which is the opposite "
+        "instruction to a poll loop choosing how cautious to be",
+        """            Some(Value::Null) => TaskRetention::Unlimited,""",
+        """            Some(Value::Null) => TaskRetention::Unstated,""",
+    ),
+    "AWriteUndoesAnErasure": (
+        "src/blob/memory.rs",
+        "every_blob_store_satisfies_the_contract",
+        "a write to an erased address is taken, so an Article 17 request "
+        "reported as discharged is reversed by the next run that produces the "
+        "same bytes — under a tombstone that still says when they went",
+        """    async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
+        // An expired address stays expired: the address is the content, so
+        // writing the same bytes again lands on the erased object and puts the
+        // data back under a tombstone that still says when it went.
+        self.tombstone(digest)?;""",
+        """    async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {""",
+    ),
+    "AnObjectStoreWriteUndoesAnErasure": (
+        "src/blob/opendal_store.rs",
+        "every_blob_store_satisfies_the_contract",
+        "the object-store backend takes a write to an erased address — the "
+        "embedded one's refusal says nothing about the backend a deployment "
+        "actually erases in",
+        """        match self.absent(digest).await {
+            // Nothing has been erased here, which is what "no tombstone" means
+            // on the read path and the only answer that licenses a write.
+            BlobError::NotFound(_) => {}
+            refusal => return Err(refusal),
+        }""",
+        "",
+    ),
+    "AnErasedWriteIsAStoreFault": (
+        "src/blob/mod.rs",
+        "a_run_cannot_put_back_what_an_erasure_removed",
+        "a refusal to resurrect erased bytes is classified as a backend "
+        "failure, so every caller that tells an outage from a rule reads an "
+        "enforced erasure as a store having a bad day",
+        """        BlobError::Expired { digest, at, reason } => {
+            crate::core::StoreError::BlobErased { digest, at, reason }
+        }""",
+        "",
+    ),
+    "ACalendarCountIsMultipliedUnchecked": (
+        "src/core/calendar.rs",
+        "a_count_that_cannot_be_a_duration_is_refused_not_a_panic",
+        "a deadline's count is multiplied into a duration without a check, so "
+        "`{kind: hours, params: {n: <large>}}` in a manifest aborts the process "
+        "from inside the calendar instead of refusing the document",
+        """        let seconds = match spec.kind.as_str() {
+            "hours" => n.checked_mul(3_600),
+            "days" => n.checked_mul(86_400),
+            "minutes" => n.checked_mul(60),""",
+        """        let seconds = match spec.kind.as_str() {
+            "hours" => Some(time::Duration::hours(n).whole_seconds()),
+            "days" => Some(time::Duration::days(n).whole_seconds()),
+            "minutes" => Some(time::Duration::minutes(n).whole_seconds()),""",
+    ),
+    "AWindowIsAddedToAnInstantUnchecked": (
+        "src/core/id.rs",
+        "a_window_no_instant_can_carry_is_none_not_a_panic",
+        "the one conversion from a window of seconds to an instant adds without "
+        "a check, so every caller that believed it was refused instead aborts",
+        """        .map(time::Duration::seconds)
+        .and_then(|delta| from.checked_add(delta))""",
+        """        .map(time::Duration::seconds)
+        .map(|delta| from + delta)""",
+    ),
+    "ARetentionWindowIsUnbounded": (
+        "src/manifest/mod.rs",
+        "a_retention_window_no_instant_can_carry_is_refused_at_parse",
+        "a declared retention window is bounded below and not above, so a "
+        "document naming a window no instant can carry parses and fails later, "
+        "at the step that forms memory",
+        "            if seconds.is_some_and(|s| s > crate::core::MAX_WINDOW_SECONDS) {",
+        "            if seconds.is_some_and(|s| s > u64::MAX) {",
+    ),
+    "ARetentionFlagIsSubtractedUnchecked": (
+        "src/bin/agentplane.rs",
+        "a_retention_window_past_the_calendar_is_a_message_not_an_abort",
+        "a retention verb subtracts its operator's day count from the clock "
+        "without a check, so a mistyped flag ends the command with `overflow "
+        "subtracting duration from date` and no mention of the flag",
+        """    now.checked_sub(time::Duration::days(i64::from(days)))
+        .ok_or_else(|| {""",
+        """    Some(now - time::Duration::days(i64::from(days)))
+        .ok_or_else(|| {""",
+    ),
     "AJudgeNeedsASubject": (
         "src/plan/mod.rs",
         "a_panel_is_judges_over_a_subject_and_an_aggregator_over_the_judges",
@@ -3148,7 +3299,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     ),
     "InternalSectionRefsAreAllowedToShip": (
         "tests/guards/docs.rs",
-        "nothing_a_reader_sees_cites_an_internal_section_number",
+        "the_internal_reference_detectors_recognise_what_they_are_for",
         "rustdoc may cite sections of the internal design document, which a "
         "docs.rs reader cannot resolve and which go stale silently",
         "    if NAMED_EXTERNAL.iter().any(|doc| before.contains(doc)) {",
@@ -3959,17 +4110,17 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the breach listing answers empty, so a missed obligation is reachable "
         "only through the case that produced it — and `close` retires that "
         "handle at the moment people stop looking",
-        "    state == DeadlineState::Breached.as_str() && has_ack == 0",
-        "    state == DeadlineState::Pending.as_str() && has_ack == 0",
+        "    DeadlineState::parse(state).is_some_and(|s| s.is_unaccounted(has_ack != 0))",
+        "    DeadlineState::parse(state).is_some_and(|s| s.is_unaccounted(true))",
     ),
     "AnAcknowledgedBreachStaysListed": (
-        "src/store/redb_cases.rs",
+        "src/core/case.rs",
         "redb_satisfies_the_case_layer_contracts",
         "an answered breach stays on the listing, so the page is ordered "
         "oldest-first over entries nothing removes — its head is permanent and "
         "every later breach is unreachable",
-        "    state == DeadlineState::Breached.as_str() && has_ack == 0",
-        "    state == DeadlineState::Breached.as_str()",
+        "        matches!(self, Self::Breached) && !accounted",
+        "        matches!(self, Self::Breached)",
     ),
     "AnObligationLandsOnAClosedCase": (
         "src/store/redb_cases.rs",
@@ -6201,11 +6352,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "findable only by somebody who already knows its id, which is the group "
         "that does not need to ask",
         """    let mut found = cases
-        .by_status(status, api.limit + 1)
+        .by_status(status, api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;""",
         """    let mut found = cases
-        .by_status(status, api.limit + 1)
+        .by_status(status, api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     found.clear();""",
@@ -8176,6 +8327,15 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
         return target, feats
 
 
+    # A unit test inside a binary. Named before the library sweep below,
+    # because `--lib` does not compile `src/bin` at all: located as a library
+    # test, such a row runs a selector matching **no test**, and cargo's
+    # `0 passed` reads as a mutation nothing caught rather than as a row this
+    # tool could not place.
+    for path in sorted((root / "src" / "bin").glob("*.rs")):
+        if f"fn {test}(" in path.read_text():
+            return f"bin:{path.stem}", None
+
     # A unit test inside the library.
     #
     # `None` for the features, meaning *all of them*. A module's gate lives on
@@ -8206,6 +8366,7 @@ def _locate(test: str) -> tuple[str | None, set[str] | None] | None:
 # rest — a matrix finishes when its slowest job does.
 _SECONDS_BY_TARGET: dict[str | None, int] = {
     None: 160,  # --all-features --lib
+    "bin:agentplane": 160,  # --all-features --bin: the same library build
     "wire": 54,
     "guards": 45,
     "process": 45,
@@ -8281,7 +8442,7 @@ def _build_key(test: str) -> tuple[str, str]:
         return ("~~missing", test)
     target, feats = found
     if feats is None:
-        return ("all", "")
+        return ("all", target or "")
     return (",".join(sorted(set(feats) | {"redb", "testkit"})), target or "")
 
 
@@ -8322,9 +8483,11 @@ def verify(name: str) -> int:
         return 2
     target, feats = found
     if feats is None:
-        # A library unit test: build everything, because the gate that decides
-        # whether this test exists is not in the file it lives in.
-        selector = ["--all-features", "--lib"]
+        # A unit test in the library or in a binary: build everything, because
+        # the gate that decides whether this test exists is not in the file it
+        # lives in. The binary needs naming — `--lib` does not compile one.
+        unit = ["--bin", target.removeprefix("bin:")] if target else ["--lib"]
+        selector = ["--all-features", *unit]
         features = "all"
     else:
         # `redb` and `testkit` are what a test needs to stand up a plane at all.

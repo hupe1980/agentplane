@@ -25,6 +25,104 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## `McpTaskSnapshot::ttl_ms` is `retention()`
+
+**Affected:** anyone polling an MCP task handle.
+
+`ttlMs` is **nullable** in the tasks extension, and `null` means *unlimited* —
+so `Option<u64>` reported *there is no deadline* and *the server did not say*
+with the same `None`, which are opposite instructions to a loop choosing how
+long it may sleep. `retention()` answers `TaskRetention::Until { ms }`,
+`Unlimited`, or `Unstated`; treat the last as if a deadline exists, because a
+loop that sleeps past a real TTL finds the task discarded, and the answer to a
+discarded id is indistinguishable from *never existed*.
+
+## A write to an erased blob address is refused
+
+**Affected:** anyone with their own `BlobStore`, any skill calling
+`cx.store_blob`, and any deployment whose object store holds tombstones written
+by an earlier build.
+
+Two changes, one rule.
+
+**`put` and `put_at` refuse an address that holds a tombstone**, with
+`BlobError::Expired`. A blob's address is its content, so a run producing the
+same bytes again used to land on the object an erasure removed and put the data
+back — under a tombstone that still said when it went. A skill sees
+`StoreError::BlobErased`; a governed media fetch sees `EffectError::Rejected`
+rather than the *try again* classification. A custom store is told by the
+conformance battery:
+
+```
+a write cannot undo an erasure: re-writing the erased bytes was accepted, so
+the data is back while the tombstone still says when it went
+```
+
+**The object-store tombstone format changed.** It is a versioned canonical-JSON
+record rather than a space-separated line, because the line form split on the
+first space and defaulted both halves — so a truncated file read as *expired at
+the epoch*. A tombstone this build cannot interpret is now
+`BlobError::UnreadableTombstone`, a fourth state beside missing, expired and
+altered, and a drill finding rather than a counted erasure. Pre-alpha means
+there is no migration: an existing store's tombstones read as unreadable, which
+is the honest answer and the loud one.
+
+`BlobError` gains a variant, so an exhaustive match over it needs a new arm —
+which is deliberate, because the two existing readers (`Runtime::drill` and
+`ScopedBlobs`) both had a decision to make about it.
+
+## `Saturation` names a fifth capped sweep
+
+**Affected:** anyone matching exhaustively on `agentplane::runtime::Saturation`.
+
+`redeliveries` is a new field: claimed-but-undelivered events examined up to the
+cap. It was the one capped sweep with no flag, and the one that needs it most —
+a delivery that died between the claim and the resume blocks every deduplicated
+retry of itself, so that pass is the only driver left for a message that
+arrived in time.
+
+`needs_attention()` and `is_quiet()` already read every flag, so a deployment
+alerting through them gains the signal with no change.
+
+## A restore is judged by its commitment, not by the log's name
+
+**Affected:** anyone reading `RestoreReport::is_faithful`, and anyone whose
+recovery script gates on `agentplane restore`'s exit code.
+
+`is_faithful` compares the rebuilt checkpoint's **size and root** against the
+export's. It used to compare the whole checkpoint, which also carries the log's
+identity — so the restore everybody actually performs, one tenant's history put
+back into another tenant of whichever database survived, reported a
+byte-perfect rebuild as a failure and the CLI exited non-zero on it.
+
+Nothing becomes quieter: a relabelling is a sentence in
+`RestoreReport::not_carried` beside every other thing the file could not bring
+across, and both checkpoints stay on the report for a reader who wants the
+names. The sentence is worth reading, because a checkpoint an auditor holds
+from before the disaster will report the new log as the wrong one.
+
+## A declared retention window is bounded at both ends
+
+**Affected:** manifests declaring `spec.memory.formation.retention_seconds` or
+`access_retention_seconds`, and anyone calling `WallClock` with a large count.
+
+A window longer than the span between the first and last instant a timestamp
+can name is refused at parse:
+
+```
+spec.memory.formation.retention_seconds is longer than the 631107417599
+seconds between the first and last instant this runtime can name
+```
+
+The zero refusal is unchanged. What is new is the upper bound, and it is not
+tidiness: `time`'s duration constructors multiply and its instant operators
+add, and **both panic** rather than return — so the arithmetic that would have
+discovered the problem aborted the process, in a plane hosting every other
+tenant's in-flight run. The same rule reaches the built-in calendar, where a
+deadline's `params: { n: … }` is now a `CalendarError::OutOfRange` instead, and
+the retention verbs, where `--older-than-days` too large is a message naming
+the flag.
+
 ## A first lease starts past the run's own history
 
 **Affected:** anyone with their own `JournalStore`, and anyone asserting on
@@ -1229,8 +1327,8 @@ tool call answered later, and a poll that defaulted to `Public` declassified
 the same payload the synchronous path protects. Also additive: `mcp-http`
 compiles rmcp's streamable-HTTP transport, `pub use agentplane::tools::rmcp`
 re-exports the SDK your transport wiring needs, and
-`McpTaskSnapshot::{ttl_ms, poll_interval_ms}` surface the server's retention
-and cadence hints.
+`McpTaskSnapshot` surfaces the server's retention and cadence hints — see the
+entry at the top of this page for the shape they have now.
 
 ## MCP context gates compare the wiring's ceilings, and `tasks/update` needs a manifest grant
 

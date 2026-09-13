@@ -83,6 +83,17 @@ impl MemoryBlobs {
     /// Consulted only once the bytes are gone — a tombstone beside live bytes
     /// would be a contradiction, and answering from it would hide them.
     fn absent<T>(&self, digest: Digest) -> Result<T, BlobError> {
+        self.tombstone(digest)?;
+        Err(BlobError::NotFound(digest.to_hex()))
+    }
+
+    /// `Err(Expired)` if this address has been erased, `Ok(())` if it has not.
+    ///
+    /// Shaped as a refusal rather than as a lookup because both callers want it
+    /// that way: the read path turns an absent blob into the reason it is
+    /// absent, and the write path refuses to undo an erasure. One function, so
+    /// the two cannot come to disagree about what a tombstone means.
+    fn tombstone(&self, digest: Digest) -> Result<(), BlobError> {
         let stone = self
             .tombstones
             .lock()
@@ -95,7 +106,7 @@ impl MemoryBlobs {
                 at,
                 reason,
             }),
-            None => Err(BlobError::NotFound(digest.to_hex())),
+            None => Ok(()),
         }
     }
 }
@@ -109,14 +120,15 @@ impl BlobStore for MemoryBlobs {
     async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
         // The store hashes; the caller does not get to say where its bytes live.
         let digest = Digest::of(bytes);
-        self.blobs
-            .lock()
-            .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?
-            .insert(digest.as_bytes().to_owned(), bytes.to_vec());
+        self.put_at(digest, bytes).await?;
         Ok(digest)
     }
 
     async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
+        // An expired address stays expired: the address is the content, so
+        // writing the same bytes again lands on the erased object and puts the
+        // data back under a tombstone that still says when it went.
+        self.tombstone(digest)?;
         self.blobs
             .lock()
             .map_err(|_| BlobError::Backend("blob mutex poisoned".into()))?

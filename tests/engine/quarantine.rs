@@ -782,6 +782,59 @@ async fn an_abandoned_doubt_is_reportable_from_the_journal_forever() {
     );
 }
 
+/// **A finding does not withhold the evidence beside it.**
+///
+/// The run carrying `EffectUndecided` is the one an investigator opens the
+/// report for, and the two things they need next are what it was authorized to
+/// do and what it declassified. Collecting those only for runs with no finding
+/// answers *this run left the world in an unknown state* and then declines to
+/// say under what warrant — which is the report checking the letter and not the
+/// warrant, one level in from the argument `warrants` exists to make.
+///
+/// What this does NOT cover: a run whose **chain** did not verify, which is
+/// deliberately the opposite case. Nothing drawn from records whose integrity
+/// failed may be shown at all.
+#[tokio::test]
+async fn a_run_with_a_finding_still_reports_what_authorized_it() {
+    let f = fixture();
+    let run = quarantined(&f).await;
+
+    f.rt.decide_quarantine(run, "ada", "written off", QuarantineDecision::Abandon)
+        .await
+        .expect("abandon");
+
+    let store = f.store.clone() as Arc<dyn JournalStore>;
+    let report = agentplane::audit::audit(&store, &[run], &agentplane::audit::Evidence::default())
+        .await
+        .expect("audit");
+
+    assert!(
+        !report.findings.is_empty(),
+        "the fixture stopped producing a finding, so this proves nothing"
+    );
+    assert!(
+        !report.sound.contains(&run),
+        "a run with a finding was also reported sound"
+    );
+    let warrant = report
+        .warrants
+        .iter()
+        .find(|w| w.run == run)
+        .unwrap_or_else(|| {
+            panic!(
+                "the run that left the world undecided has no warrant on the \
+                 report, so an auditor cannot tell a governed plane from an \
+                 ungoverned one for exactly the run they came to read about: \
+                 {report:#?}"
+            )
+        });
+    assert!(
+        warrant.policy.is_none(),
+        "this fixture wires no engine, so `None` is the honest answer and a \
+         warrant claiming otherwise would be worse than none"
+    );
+}
+
 /// A run that was *answered* and finished leaves no finding: the doubt is gone,
 /// not merely closed over.
 #[tokio::test]

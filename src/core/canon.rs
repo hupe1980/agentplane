@@ -87,6 +87,16 @@ use serde_json::Value;
 /// different sentence from *this run diverged* and the one the evidence
 /// supports. That distinction is the whole point: an audit must report unknown
 /// scope as prominently as corruption, and never as corruption.
+///
+/// # It names the digest algorithm too
+///
+/// This number governs the whole derivation — the canonicalization rule *and*
+/// the hash applied to it — because the two only ever move together: a reader
+/// that cannot reproduce a digest cannot check a chain, whichever half changed.
+/// So replacing SHA-256 is a bump here rather than a migration anywhere, and
+/// history written under the old pair stays verifiable under it, because
+/// nothing rehashes stored bytes. Signatures are agile on their own terms, not
+/// on this one.
 pub const VERSION: u16 = 1;
 
 /// Serialize to canonical bytes.

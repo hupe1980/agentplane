@@ -744,12 +744,15 @@ envelope when a ring is wired — then re-hashed (`get`, never `has` — presenc
 without integrity passes over altered bytes), and sealed state proven to open
 with the plaintext dropped on the spot. Reading any other way would hold the
 references against a store the deployment does not use: on a sealed plane,
-every intact envelope would report as corrupt, the one verdict that pages. The report's verdict is
-three-way, and the middle answer is the one worth trusting the tooling for:
-**intact**, **erased by design** — a tombstone or a destroyed key is retention
-reporting itself, counted and never a finding — and **lost**, which is the only
-one that pages. A drill that alarmed on erasure would teach you its findings
-are noise, and that is how a real loss gets ignored six months later.
+every intact envelope would report as corrupt, the one verdict that pages. The report's verdict has
+four answers, and the second is the one worth trusting the tooling for:
+**intact**; **erased by design** — a tombstone or a destroyed key is retention
+reporting itself, counted and never a finding; **lost**, which pages; and **the
+bytes are gone and their tombstone does not read**, which pages too — the
+erasure may well have run, and nothing left in the store can say so. A drill
+that alarmed on erasure
+would teach you its findings are noise, and that is how a real loss gets ignored
+six months later.
 
 The same rehearsal has a CLI verb for deployments that never write Rust:
 `agentplane drill` opens the store the flags name, prints the report as JSON,
@@ -757,6 +760,13 @@ and exits non-zero **only on loss** — erased-by-design counts stay informative
 A store file holds no blob backend and no key ring, so those halves land in
 the report's unchecked list rather than being silently passed; the library
 call on the running plane remains the complete form.
+
+The report also carries `releases` and `warrants` — every point at which a label
+was raised, and what authorized each run. The gate on both is **integrity, not
+innocence**: a run whose chain did not verify shows neither, because nothing
+drawn from those records can be trusted, and a run that verified and then failed
+a check shows both, because that is the run an investigator opened the report
+for.
 
 `audit` prints the report as JSON and exits non-zero on findings — but **not** on
 `not_checked`, which is a separate list and the one worth reading. An audit given
@@ -1082,9 +1092,10 @@ what it decided is on its records, not in a one-line summary.
 ### A capped tick says it was capped
 
 Each sweep takes a bounded batch — 128 timers, 512 obligations, 512 expired
-tasks — so one tick is bounded. A sweeper still working through a backlog is a
-sweeper not noticing the *next* obligation, which is the failure the whole
-mechanism exists against.
+tasks, 128 stalled deliveries, and 32 abandoned runs, the smallest because
+recovering one executes live from the frontier — so one tick is bounded. A
+sweeper still working through a backlog is a sweeper not noticing the *next*
+obligation, which is the failure the whole mechanism exists against.
 
 The hazard is that a bounded query returns a list shaped exactly like a complete
 one. A tick that handled its cap and a tick that handled everything produce the
@@ -1366,31 +1377,30 @@ should not open a port unless asked.
 ### Serving it
 
 Embedders wire `Api` into their own process; the `agentplane` binary's `serve`
-verb does the same wiring from flags, hosting exactly one manifest per process
-with its journal on disk (`--store`). The peer surface binds to `--addr`
-(default `127.0.0.1:8080` — loopback until you say otherwise), and the operator
-surface this section documents is opt-in beside it: `--operator-addr` puts the
-worklist, task decisions and `GET /runs?outcome=quarantined` on its **own**
-listener, so a network policy can treat the two audiences differently.
-`--policy` names the Cedar policy set and has no default, because a permissive
-engine and no engine are the same behaviour and only one of them looks
-governed; `--tokens` names the bearer tokens of the callers this plane accepts,
-each optionally carrying the `scope` and `not_after` of the chain that caller's
-runs act under.
-`--peer NAME=URL` wires an A2A peer the manifest grants under `tool://NAME/…`,
-with its bearer token read from `AGENTPLANE_PEER_TOKEN_<NAME>` rather than
-the command line (needs the `a2a` feature). `--sweep-every` sets how often
-deadlines, task expiry, dead letters and due timers are swept, and `0` runs
-the sweep from your own scheduler instead.
-`--push-host` permits A2A push notifications to that exact host and is
-repeatable — without one, push is not wired and the Agent Card advertises it as
-absent rather than claiming a capability nothing serves.
-`--drain-secs` bounds the stop: see [stopping an
-instance](#stopping-an-instance). Every flag but `--push-host` is also an
-environment variable (`AGENTPLANE_ADDR`, `AGENTPLANE_OPERATOR_ADDR`,
-`AGENTPLANE_POLICY`, `AGENTPLANE_TOKENS`, `AGENTPLANE_SWEEP_EVERY`,
-`AGENTPLANE_DRAIN_SECS`, `AGENTPLANE_STORE`), which is how a container image is
-configured without editing its command line.
+verb does the same wiring from flags, hosting exactly one manifest per process.
+
+**Two listeners, because there are two audiences.** The peer surface binds to
+`--addr`; the operator surface this section documents is opt-in beside it on
+`--operator-addr`, so a network policy can treat *another agent calling in* and
+*a person deciding a task* differently rather than trusting one port with both.
+
+| Flag | Default | What it decides | Env |
+|---|---|---|---|
+| `--store` | **required** | Where the journal lives on disk. | `AGENTPLANE_STORE` |
+| `--addr` | `127.0.0.1:8080` | The peer surface. Loopback until you say otherwise. | `AGENTPLANE_ADDR` |
+| `--operator-addr` | off | The worklist, task decisions and `GET /runs?outcome=quarantined`, on their own listener. | `AGENTPLANE_OPERATOR_ADDR` |
+| `--policy` | **no default** | The Cedar policy set. No default, because a permissive engine and no engine are the same behaviour and only one of them looks governed. | `AGENTPLANE_POLICY` |
+| `--tokens` | none | The bearer tokens this plane accepts, each optionally carrying the `scope` and `not_after` of the chain that caller's runs act under. | `AGENTPLANE_TOKENS` |
+| `--url` | none | Where callers reach this plane. Goes on the Agent Card, so it is the public URL rather than what you bind. | `AGENTPLANE_URL` |
+| `--sweep-every` | 30s | How often deadlines, task expiry, dead letters and due timers are swept. `0` runs the sweep from your own scheduler instead. | `AGENTPLANE_SWEEP_EVERY` |
+| `--drill-every` | off | How often the recovery rehearsal runs — see [disaster recovery](#disaster-recovery). | `AGENTPLANE_DRILL_EVERY` |
+| `--drain-secs` | 25s | Bounds the stop — see [stopping an instance](#stopping-an-instance). | `AGENTPLANE_DRAIN_SECS` |
+| `--mcp NAME=COMMAND` | none | An MCP server to run and wire under `NAME`. Repeatable. | — |
+| `--peer NAME=URL` | none | An A2A peer the manifest grants under `tool://NAME/…`; its token comes from `AGENTPLANE_PEER_TOKEN_<NAME>` rather than the command line. Needs the `a2a` feature. | — |
+| `--push-host` | none | Permits A2A push notifications to that exact host. Repeatable. Without one, push is not wired and the Agent Card advertises it as absent rather than claiming a capability nothing serves. | — |
+
+The three repeatable flags take no environment variable; everything else does,
+which is how a container image is configured without editing its command line.
 
 ### Identity comes from the request, never from its body
 
@@ -1970,6 +1980,96 @@ The 1 MiB record refusal pushes *bulk* content out by construction, but a name,
 an address and an IBAN are a few hundred bytes and fit comfortably.
 [Erasure](@/docs/erasure.md) has the full table of what lands where;
 [regulation](@/docs/regulation.md) says the same in the obligations' own terms.
+
+## 🧯 Disaster recovery {#disaster-recovery}
+
+Two numbers and a rehearsal. The numbers are properties of *your* backup
+schedule; what this page can state is where each one comes from and what the
+runtime contributes to it.
+
+**RPO — how much history a failure can cost.** An effect's intent is durable
+*before* it is dispatched, so the plane itself loses nothing it acknowledged.
+The exposure is entirely the gap between your last durable copy and the failure,
+which makes RPO a property of whichever of these you rely on:
+
+| Copy | RPO |
+|---|---|
+| `PostgreSQL` streaming replication with a synchronous standby | ~0 |
+| `PostgreSQL` WAL archiving / point-in-time recovery | the archive interval |
+| `agentplane export` on a schedule | the export interval |
+| Embedded `redb` file snapshots | the snapshot interval |
+
+An export is **not** a substitute for the first two. It carries the journal and
+the case layer and nothing else, by design — see *what an operator
+re-establishes*, below.
+
+**RTO — how long until the plane serves again.** Four terms, and only the last
+grows with how much work was in flight:
+
+1. Stand the store back up (restore, replica promotion, or `agentplane restore`).
+2. Verify it. `agentplane verify` checks an export offline against its own
+   checkpoint; `agentplane restore` reports whether the rebuilt store commits to
+   the same root at the same size, and exits non-zero when it does not.
+3. Start the plane. Nothing is replayed at startup; a run is replayed when it is
+   resumed.
+4. **Re-arm the suspended runs.** Resuming each one is what repairs its waits.
+
+### The drill {#recovery-drill}
+
+```sh
+agentplane export  --store ./journal.redb --out plane.jsonl
+agentplane verify  --file plane.jsonl --anchor ./checkpoint.json
+agentplane restore --store ./restored.redb --file plane.jsonl
+agentplane drill   --store ./restored.redb      # every case's references, live
+```
+
+`verify` given no anchor reports *deletion — not checked*, and means it: a
+rebuild against the file's own header proves self-consistency, which is exactly
+what an editor who dropped a run and rewrote the header achieves. Keep a
+checkpoint somewhere the plane cannot reach — an earlier audit's output, or a
+[witness](@/docs/journal.md).
+
+`restore` writes into the store it is pointed at, which is normally a *different*
+tenant of a database that survived. That relabels the log, and the report says
+so in `not_carried` — the verdict is the commitment, not the name.
+
+### What an operator re-establishes {#recovery-by-hand}
+
+An export carries the journal and the case layer. Everything below lives in
+stores it does not travel with, and is listed so that none of it is discovered
+during an incident:
+
+| Not carried | What re-establishes it |
+|---|---|
+| Timers, event subscriptions, worklist rows | **Resuming the run.** Replay reaches the announced wait, finds no terminal record, and re-arms from the journal. `RestoreReport::awaiting` names every run this applies to |
+| Leases | Nothing: a first lease starts one past the highest epoch the run's own journal records, so a fencing token cannot go backwards across a restore |
+| Webhook delivery cursors | Re-registration, then `POST /push/rearm`. A cursor is how far a receiver got and nothing journals it |
+| Record signatures | The restoring store attests as its own signer. Hashes and the Merkle root are unaffected; authorship is not |
+| Activity timestamps | Nothing — the index is rebuilt, the original instants are not |
+| **Blob bytes** | Restoring the object store. The file carries each case's blob *digests*, which is what keeps erasure reachable, and never the objects |
+| **Key material** | Your key management. A sealed plane restored without its ring holds ciphertext, and `agentplane drill` reports a sealed state that neither opens nor was destroyed as a finding |
+
+`agentplane drill` is what turns the last two rows into an answer rather than an
+assumption: it walks every case, holds each reference against the live stores,
+and reports *unchecked* for a store it was not given. A restore that reads as
+sound while every artifact is unreachable is the outcome it exists to prevent.
+
+A message delivered to a restored plane **before** its run is resumed buffers,
+and a buffered message nobody claims dead-letters. So the order is: restore,
+resume everything `awaiting` names, then open the gates.
+
+### Evidence {#recovery-evidence}
+
+The drill is a test, not a procedure somebody remembers. `postgres_restores_a_plane_that_then_serves`
+runs the whole sequence against a real `PostgreSQL` server, restoring into a
+tenant of a database another tenant is already using, and asserts each claim
+above: equal roots at equal size, records hash-for-hash, the matter and its
+obligation and its artifact, isolation in both directions, a lease past the
+journal's highest epoch, a wait repaired by a resume — and then the part that
+separates a recovery from a backup, which is that the restored plane admits new
+work whose seal extends the log it restored. It ends by drilling the restored
+case layer without a blob store, because a report that said *sound* there would
+be saying it about bytes nobody had put back yet.
 
 ## 🚑 Runbook {#runbook}
 

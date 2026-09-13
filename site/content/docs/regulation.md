@@ -141,7 +141,7 @@ a retention policy nothing enforces is a document.
 
 | Requirement | Mechanism |
 |---|---|
-| Rehearse recovery | `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores, telling *intact* from *erased by design* from *lost*. `agentplane serve --drill-every 86400` runs it on a timer; `agentplane drill` runs one pass |
+| Rehearse recovery | `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores, sorting them into *intact*, *erased by design*, *lost*, and *erased with no readable record of it*. `agentplane serve --drill-every 86400` runs it on a timer; `agentplane drill` runs one pass |
 | Prove a copy without this crate | `agentplane verify history.jsonl --checkpoint cp.note` recomputes an export from its own bytes; `restore` rebuilds a store and proves it by its own checkpoint |
 | Enforce a retention window | `Runtime::retain(older_than, at, reason)` erases every **closed** case opened before the window: blob tombstones, and the case's key scope destroyed, which reaches every replica and backup at once. `agentplane retain --older-than-days N --reason ... --dry-run` lists what that pass would erase, through the same selection rule, from a binary that wires no store able to erase |
 | Know what retention did *not* reach | Every pass returns `not_erasable`, and it is the half that matters: without a key ring, journal payloads stay verbatim. A count with no coverage statement beside it is how a deployment comes to believe an obligation is discharged |
@@ -189,9 +189,13 @@ surviving chain is internally consistent, because a chain links records *within*
 a run and knows nothing about its neighbours.
 
 `restore` is the other direction, and it proves itself the same way: the rebuilt
-store must report the checkpoint the export claimed. Signatures do not survive
-unless the restoring store holds the original key, which the report says rather
-than leaves to be found.
+store must commit to the same root at the same size as the export claimed. The
+log's *name* is deliberately not part of that verdict — a recovery is normally
+into another tenant of whichever database survived, and a relabelled log with
+identical contents is still the history. The report names the relabelling
+beside everything else the file could not carry. Signatures do not survive
+unless the restoring store holds the original key, which the report also says
+rather than leaves to be found.
 
 It exports what the chain committed to, which with a key ring configured is
 ciphertext. That is deliberate: an export of plaintext would put a copy beyond

@@ -380,6 +380,13 @@ doc-examples:
 site-check:
     cd site && zola check
 
+# Private, and `_`-prefixed so `just --list` does not advertise it: what it
+# checks is untracked and is not part of what this repository publishes. Not in
+# `ci` for the same reason — a clean checkout has nothing to check, and a stage
+# that passes by finding nothing is the shape this project treats as a defect.
+_concepts-check:
+    python3 tools/check-concepts.py
+
 # build the docs site into site/public
 site: site-check
     cd site && zola build

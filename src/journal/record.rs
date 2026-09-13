@@ -113,7 +113,9 @@ pub enum RecordKind {
         /// **required**: a record without it is malformed, because reading
         /// absence as "today's rule" is the one wrong answer available.
         ///
-        /// See [`canon::VERSION`](crate::core::canon::VERSION) for what the
+        /// Names the whole derivation: the canonicalization rule *and* the
+        /// digest algorithm applied to it. See
+        /// [`canon::VERSION`](crate::core::canon::VERSION) for what the
         /// distinction buys — a run under another rule is *unverifiable*, not
         /// *divergent*, and reporting the second for the first quarantines
         /// healthy history.

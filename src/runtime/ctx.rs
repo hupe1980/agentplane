@@ -4644,10 +4644,13 @@ impl StepCtx<'_> {
             .link_blob(cx.case_id, digest, at)
             .await
             .map_err(StepError::Store)?;
+        // An erased address refuses as itself rather than as a backend string:
+        // a run re-producing bytes an operator had removed is a rule this
+        // runtime enforces, not a store that is having a bad day.
         let stored = blobs
             .put(bytes)
             .await
-            .map_err(|e| StepError::Store(crate::core::StoreError::Backend(e.to_string())))?;
+            .map_err(|e| StepError::Store(crate::blob::refusal(e)))?;
         debug_assert_eq!(stored, digest, "blob stores compute the content digest");
         Ok(digest)
     }

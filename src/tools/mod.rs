@@ -43,7 +43,7 @@ mod typed;
 #[cfg(feature = "mcp")]
 pub use mcp::{
     McpAccess, McpClient, McpDataSafety, McpPrompt, McpResource, McpTask, McpTaskCancel,
-    McpTaskPoll, McpTaskSnapshot, McpTaskState, McpTaskUpdate,
+    McpTaskPoll, McpTaskSnapshot, McpTaskState, McpTaskUpdate, TaskRetention,
 };
 /// The MCP SDK this host is built on, re-exported because it is public API:
 /// [`McpClient::new`] takes an rmcp `RunningService`, so a caller wiring a

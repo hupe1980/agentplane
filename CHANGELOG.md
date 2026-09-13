@@ -16,7 +16,95 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.35.0] — unreleased
+## [0.36.0] — unreleased
+
+### Added
+
+- **`core::seconds_after`** — the one conversion from a window of seconds to an
+  instant, failing both ways it can. With `core::MAX_WINDOW_SECONDS`,
+  `first_instant()` and `last_instant()`.
+- **`memory::access_expiry`** — where a sliding access window lapses, public
+  because a custom `MemoryStore` indexes on the same instant.
+- **`DeadlineState::is_unaccounted`** — the obligation listing's membership
+  rule, on the vocabulary rather than beside one reader.
+- **`runtime::Redelivered`** — what a redelivery pass finished, and how much of
+  the waiting list it examined.
+- **A conformance battery for `BlobStore`**: `testkit::conformance_blob`.
+  `check` is the contract every store carries; `check_backing` adds the
+  envelope pair, which a sealing decorator refuses on purpose. Run it against
+  your composed handles, not only your backend.
+- **A conformance battery for `Calendar`**: `testkit::conformance_calendar`.
+  Hostile counts are derived from the specs you declare supported.
+- **`BlobError::UnreadableTombstone`** and **`StoreError::BlobErased`**.
+- **`tools::TaskRetention`**, replacing `McpTaskSnapshot::ttl_ms` — **BREAKING**,
+  because `ttlMs` is nullable and `null` means *unlimited*, which an `Option`
+  could not tell from *unstated*.
+
+### Fixed
+
+- **An erasure could be undone by ordinary work.** A blob's address is its
+  content, so a run producing the same bytes again landed on the object an
+  erasure removed and put the data back. `put` and `put_at` now refuse an
+  erased address.
+- **An unreadable tombstone read as a completed erasure.** The object-store
+  backend defaulted both halves of a damaged tombstone to *expired at the
+  epoch*, which the recovery drill counted as retention working. It is a
+  versioned record with a fallible reader now, and a finding when it does not
+  read. **BREAKING** on disk: recreate rather than migrate.
+- **A refused erasure-undo was classified as a store outage**, so a media fetch
+  kept re-fetching an artifact somebody had removed.
+- **BREAKING — a restore was judged by the log's name.**
+  `RestoreReport::is_faithful` compared the whole checkpoint, so a byte-perfect
+  restore into another tenant reported as a failure and `agentplane restore`
+  exited non-zero on it. The verdict is the commitment: same root at same size.
+- **A manifest could abort the process.** A declared retention window, a
+  deadline's `params`, and `--older-than-days` each reached `time` arithmetic
+  that panics rather than returning. All three refuse now.
+- **A grace window a caller could not subtract ended the sweep tick.**
+- **An audit withheld a run's warrant because the run had a finding.**
+  `releases` and `warrants` are collected once the chain verifies, so the run an
+  investigator opened the report for carries both. A run's faults are reported
+  together rather than at the first one.
+- **The redelivery pass could not say it was behind** — five capped sweeps, four
+  saturation flags. **BREAKING**: `Saturation` gains `redeliveries`.
+- **A listing page's read could wrap to nothing** at a ceiling of `usize::MAX`.
+
+### Changed
+
+- **BREAKING — a declared retention window is bounded above as well as below.**
+  `spec.memory.formation.retention_seconds` and `access_retention_seconds` are
+  refused past the span a timestamp can name.
+- **The obligation listing's membership rule is one rule.** Two functions each
+  documented themselves as the only one, and the one in `core` had no caller;
+  a guard now holds the SQL copy to naming both of its conjuncts.
+- `clippy::duration_suboptimal_units` is no longer allowed: the unstable
+  constructors it asks for reached the declared MSRV.
+
+### Assurance
+
+- **The disaster-recovery release blocker is discharged, and the roadmap's
+  release-blocker list is empty.** The drill now runs against a real
+  `PostgreSQL` server, restores into a tenant of a database another tenant is
+  using, and ends by admitting new work whose seal extends the restored log.
+  RPO/RTO targets are on the operations page.
+- **Format-freeze condition 7 is met**: the algorithm-agility plan is
+  [written down](https://hupe1980.github.io/agentplane/docs/format/#algorithm-agility)
+  and was already implemented — signatures agile by key, hashes by version,
+  nothing rehashing stored bytes. `canon` is stated to name the digest
+  algorithm as well as the canonicalization rule, which is what makes a hash
+  replacement a bump rather than a migration.
+- **The open-before-freeze list was tested against its own membership rule.**
+  Four of twelve questions change no durable format and no protocol whichever
+  way they are answered; they moved out, so the freeze is not shown as blocked
+  on work that cannot block it. Eight remain.
+- **The design is graded against the OWASP Top 10 for Agentic Applications.**
+  Five of ten rows carry no residual, four carry one that is now written down,
+  and one states a non-goal — and the residuals are what the roadmap's
+  milestones are made of. Internal documents only; nothing in the crate moved.
+- The mutation harness can anchor a unit test inside a binary.
+- Mutation count **738**.
+
+## [0.35.0] — 2026-09-13
 
 ### Added
 
@@ -25,20 +113,13 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
   `gen_ai.response.finish_reasons`, `gen_ai.usage.{input,output}_tokens` and the
   cache split `gen_ai.usage.cache_{read,write}.input_tokens`; a tool call carries
   `gen_ai.tool.name`; the run span carries `gen_ai.agent.name` and
-  `gen_ai.conversation.id`. Two new `Effect` seams supply them —
-  `gen_ai_request` before dispatch and `gen_ai_response` after the answer — split
-  along the convention's own line, since the request attributes exist before the
-  call and the response attributes only after it. Both default to `None`, so an
-  effect that is not a `GenAI` operation claims none of the convention's
-  attributes.
+  `gen_ai.conversation.id`. Two new `Effect` seams supply them,
+  `gen_ai_request` before dispatch and `gen_ai_response` after the answer. Both
+  default to `None`, so a non-`GenAI` effect claims none of them.
 - **`Completion::model` — the model that answered.** Filled by every driver whose
-  wire names one: `OpenAI` and the `OpenAI`-compatible route from the response's
-  `model`, Anthropic from `message_start` and the buffered twin, Gemini from
-  `modelVersion`, and on the streamed path of each. `None` where the wire does not
-  say, which today is Bedrock's `Converse` — reporting the *requested* model there
-  would state that a substitution had been ruled out when nothing looked. It is a
-  journaled effect output, so the evidence a run leaves now answers *which weights
-  served this*, not only which were asked for.
+  wire names one, buffered and streamed; `None` for Bedrock's `Converse`, which
+  names none. A journaled effect output, so a run's evidence answers *which
+  weights served this* rather than which were asked for.
 - **`error.type` on a failed attempt**, carrying the fault class — `timeout`,
   `refused`, `rate_limited`, `metered`, and the rest of `EffectError::class()`.
 - **`agentplane.effect.key` on an effect span** — the join between a trace and the
@@ -55,52 +136,33 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
   case binding, correlation keys, an idempotency key and a per-run chain.
 - **BREAKING — where the convention names a fact, its name is what is emitted.**
   `agentplane.agent` is `gen_ai.agent.name`; `agentplane.case.id` is
-  `gen_ai.conversation.id`. A second spelling in this crate's namespace is read by
-  nothing generic, and the conversation is this plane's case — which is also what
-  the A2A surface answers `contextId` with. The bare `semconv` field is
-  `agentplane.semconv`, the one span attribute key that was not taken from the
-  vocabulary the module exists to be.
+  `gen_ai.conversation.id`, because a second spelling in this crate's namespace
+  is read by nothing generic. The bare `semconv` field is `agentplane.semconv`.
 - **BREAKING — `JournalStore` gained a required method.** `read_page` is required
   rather than defaulted to read-then-truncate, because that default is the defect.
 
 ### Fixed
 
-- **A restore reset the fencing token.** The epoch is a fencing token and the
-  lease table is where its high-water mark lives — and the lease table is
-  store-local state an export does not carry. So a restored run had records
-  reaching epoch 7 and no lease row, and the first lease was issued at **1**: a
-  run that had already changed hands got a second ownership period wearing the
-  number of its first, indistinguishable from it in the only durable record of
-  either. Not merely untidy — `settle_recorded_quota_passes` decides which pass
-  a spend belongs to by matching that number, and `spend_recorded_in_epoch` sums
-  *every* record carrying it, so a restored run's quota pass was settled with
-  its predecessor's money on top of its own. A first lease now starts one past
-  the highest epoch the run's own journal records, on both backends. The one
-  thing no durable evidence can bound is an epoch **issued and never written
-  under**; that residue is the runbook's, and it is the requirement every
-  failover already has — the old deployment must not reach the restored store.
+- **A restore reset the fencing token.** An export carries no lease table, so a
+  restored run whose records reached epoch 7 was leased at **1** — and quota
+  settlement identifies a pass by that number. A first lease now starts one past
+  the highest epoch the run's journal records, on both backends. An epoch issued
+  and never written under stays the runbook's: the old deployment must not reach
+  the restored store.
 - **An erased effect answered the trait's defaults for the two `GenAI` seams.**
-  `Box<dyn AnyEffect>` implements `Effect` so an undo or a group member travels
-  the same dispatch path as anything else — the module doc says so in those
-  words — but the forwarding impl carried 16 of the trait's 18 methods. Every
-  `Effect` method has a default, so the two that were missing compiled, ran, and
-  silently answered *nothing*: the identical call opened a span naming a model
-  when typed and naming none when boxed. The same hole left both new `AnyEffect`
-  methods with no caller anywhere in the crate, because the forwarding that would
-  have called them was the thing that was absent. A guard now holds the three
-  method lists to each other.
+  `Box<dyn AnyEffect>` forwarded 16 of `Effect`'s 18 methods, and every `Effect`
+  method has a default — so the same call opened a span naming a model when
+  typed and naming none when boxed. A guard now holds the three method lists to
+  each other.
 - **`agentplane.run.failed` was emitted and published nowhere.** It is the event
   added *because* an operator running the shipped server had no way to learn why
   a run failed — and it was in neither `telemetry::LOUD_EVENTS`, the list a
   deployment wires its alerts from, nor the operations page's table headed
   *every*. The delivery it exists for routed around it.
 - **`agentplane.witness.integrity` was emitted as a field, not a target.** Every
-  other event carries its identity in its `target`, the page publishes the table
-  as *every failure has its own event target*, and a subscriber filtering by
-  target — which is what that page tells an operator to do — received nothing.
-  It matters most for this one: a witness refusing this plane's checkpoint is the
-  single event whose audience is not the operator running the plane, and the one
-  they have the strongest interest in nobody hearing.
+  other event carries its identity in its `target`, so a subscriber filtering the
+  way the operations page prescribes received nothing — for the one event whose
+  audience is not the operator running the plane.
 - **The effect span carried no `agentplane.mode`**, while the module doc says
   every span carries it and makes that argument about effect latency specifically.
 - **A failed span said only that something failed.** `agentplane.outcome` makes a
@@ -109,10 +171,9 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
   runtime exists not to make.
 - **`GET /runs/{run}/history` read a run's whole remaining journal per page.**
   The page bounded what was returned; nothing bounded what was read, so walking a
-  long run cost the square of its length. The sibling case history had bounded its
-  read at the store all along. Checked in the store contract battery, because no
-  caller can check it: the handler truncates, so a backend ignoring the limit
-  serves byte-identical answers and differs only in what it costs.
+  long run cost the square of its length. Checked in the store contract battery,
+  because a backend ignoring the limit serves byte-identical answers and differs
+  only in what it costs.
 - **Both record-serving surfaces dropped the envelope.** A reader could see that
   an effect started and not which effect, could not pair a start with its outcome
   or one attempt with the next, and could not tell a forward record from a
@@ -131,15 +192,11 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 ### Assurance
 
 - **The three properties the disaster-recovery blocker named as unasserted now
-  have tests**, and writing them is what found the fencing defect above.
-  *Lease reset* is a store-contract check on both backends. *Tenant isolation*
-  restores into one tenant of a database holding another's rows and asserts
-  neither can read the other, in both directions. *Wait recovery* gains the
-  **event** half of the sequence the timer already had — export a run awaiting a
-  message, restore, observe that nothing subscribed it and the recovery pass
-  does not see it, resume, and watch the ordinary delivery path finish it. That
-  test also pins the loss it prevents: a message delivered before the repair
-  buffers, and a buffered message nobody claims dead-letters.
+  have tests**, and writing them is what found the fencing defect above: lease
+  reset on both backends, tenant isolation in both directions, and the event
+  half of wait recovery — including the loss it prevents, since a message
+  delivered before the repair buffers and a buffered message nobody claims
+  dead-letters.
 - Mutation count **725**.
 
 ## [0.34.0] — 2026-09-11

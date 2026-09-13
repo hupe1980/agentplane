@@ -16,6 +16,15 @@
 
 pub mod backstop;
 pub mod conformance;
+// Ungated: `BlobStore` is in `core`'s own layer, every implementation of it
+// ships in the default build, and the contract this checks is the one an
+// erasure request lands on.
+pub mod conformance_blob;
+// Ungated for the reason the blob battery is: `Calendar` is a `core` seam, and
+// it is the one this crate is most likely to be *replaced* at — the built-in
+// calendar understands hours, days and minutes, and a real regulatory deadline
+// does not.
+pub mod conformance_calendar;
 // The case-layer battery is backend-agnostic — it names no `redb` type — so the
 // gate has to be "a backend exists", not "the embedded one does". Read as `redb`
 // it made the *shared-store* backend's own contract untestable without linking

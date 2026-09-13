@@ -1733,3 +1733,605 @@ async fn a_url_demanding_tls_is_refused_not_downgraded() {
         .await
         .ok();
 }
+
+// ── The disaster-recovery drill ─────────────────────────────────────────────
+//
+// The restore path had every one of its properties asserted against the
+// embedded store and none against the one a deployment restores into. That is
+// the weaker half in both directions: `PostgreSQL` is where several instances
+// share a history, where a lease is the only thing keeping two of them apart,
+// and where the tenant column rather than a separate file is what keeps one
+// customer's rows out of another's restore.
+
+/// Fixtures for the drill: a completed run, and one that came back waiting.
+mod recovery_fixtures {
+    use agentplane::core::{
+        AwaitSpec, CorrelationKey, DeadlineSpec, Outcome, Skill, SkillDescriptor, SkillError,
+        Tainted,
+    };
+    use agentplane::runtime::StepCtx;
+    use serde_json::Value;
+
+    /// Does one thing and concludes. The run whose history must come back
+    /// byte-identical.
+    #[derive(Debug)]
+    pub struct Files;
+
+    #[async_trait::async_trait]
+    impl Skill for Files {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("files").provides("demo.file")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let at = cx.now().await?;
+            Ok(Outcome::done(Tainted::trusted(serde_json::json!({
+                "filed": input.peek().clone(),
+                "at": agentplane::core::format_timestamp(at),
+            }))))
+        }
+    }
+
+    /// What a disaster took, and the file that is all anybody has left of it.
+    #[derive(Debug)]
+    pub struct Taken {
+        /// The run that concluded, and whose history must come back
+        /// byte-identical.
+        pub sealed: agentplane::core::RunId,
+        /// The run that came back waiting, and that nothing will wake.
+        pub waiting: agentplane::core::RunId,
+        pub case: agentplane::core::CaseId,
+        pub artifact: agentplane::core::Digest,
+        /// The checkpoint the origin reported before the disaster — the anchor
+        /// an auditor would be holding.
+        pub checkpoint: agentplane::journal::Checkpoint,
+        pub bytes: Vec<u8>,
+    }
+
+    impl Taken {
+        /// The correlation the matter was opened under.
+        pub fn keys() -> [CorrelationKey; 1] {
+            [CorrelationKey::new("matter", "DR-1")]
+        }
+    }
+
+    /// A plane with a concluded run, a matter carrying an obligation and an
+    /// artifact, and a run suspended on a message that is not coming.
+    ///
+    /// The fixture builds the state; nothing here is the thing being asserted.
+    pub async fn a_plane_with_work_in_flight(
+        origin: &std::sync::Arc<agentplane::store::PostgresStore>,
+    ) -> Taken {
+        use agentplane::case::{CaseStore, EventStore};
+        use agentplane::core::{Digest, TenantId, Timestamp};
+        use agentplane::journal::JournalStore;
+        use agentplane::runtime::Runtime;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let keys = [CorrelationKey::new("matter", "DR-1")];
+        let plane = Runtime::builder(Arc::clone(origin) as Arc<dyn JournalStore>)
+            .owner("origin")
+            .tenant(TenantId::new("dr-origin").expect("a legal tenant id"))
+            .cases(Arc::clone(origin) as Arc<dyn CaseStore>)
+            .events(Arc::clone(origin) as Arc<dyn EventStore>)
+            .skill(Files)
+            .skill(AwaitsApproval)
+            .build();
+
+        let sealed = plane
+            .run_once(
+                "demo.file",
+                Tainted::trusted(json!({ "doc": 7 })),
+                "DR-IDEM",
+            )
+            .await
+            .expect("a run concludes")
+            .run_id();
+        let waiting = plane
+            .run_correlated("demo.await", Tainted::trusted(json!({})), "matter", &keys)
+            .await
+            .expect("a run suspends");
+        assert!(
+            waiting.status.is_suspended(),
+            "the fixture did not leave a run waiting: {:?}",
+            waiting.status
+        );
+        let waiting = waiting.run_id;
+
+        let cases: Arc<dyn CaseStore> = Arc::clone(origin) as Arc<dyn CaseStore>;
+        let case = cases
+            .correlate(&keys)
+            .await
+            .expect("correlate")
+            .expect("the matter exists");
+        let artifact = Digest::of(b"the signed filing");
+        cases
+            .link_blob(
+                case,
+                artifact,
+                Timestamp::from_unix_timestamp(1_800_000_000).expect("instant"),
+            )
+            .await
+            .expect("blob link");
+
+        let journal: Arc<dyn JournalStore> = Arc::clone(origin) as Arc<dyn JournalStore>;
+        let checkpoint = journal.checkpoint().await.expect("checkpoint");
+        let mut bytes = Vec::new();
+        let trailer =
+            agentplane::export::to_jsonl(&journal, Some(&cases), &[sealed, waiting], &mut bytes)
+                .await
+                .expect("export");
+        assert_eq!(trailer.cases, 1, "the matter did not travel");
+
+        Taken {
+            sealed,
+            waiting,
+            case,
+            artifact,
+            checkpoint,
+            bytes,
+        }
+    }
+
+    /// A run belonging to somebody the restore has no business touching.
+    pub async fn a_neighbours_run(
+        bystander: &std::sync::Arc<agentplane::store::PostgresStore>,
+    ) -> agentplane::core::RunId {
+        use agentplane::core::TenantId;
+        use agentplane::journal::JournalStore;
+        use agentplane::runtime::Runtime;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        Runtime::builder(Arc::clone(bystander) as Arc<dyn JournalStore>)
+            .owner("bystander")
+            .tenant(TenantId::new("dr-bystander").expect("a legal tenant id"))
+            .skill(Files)
+            .build()
+            .run("demo.file", Tainted::trusted(json!({ "doc": "theirs" })))
+            .await
+            .expect("the bystander runs")
+            .run_id
+    }
+
+    /// Registers an obligation and then waits for a message that is not coming
+    /// before the export is taken. The run a restore has to name.
+    #[derive(Debug)]
+    pub struct AwaitsApproval;
+
+    #[async_trait::async_trait]
+    impl Skill for AwaitsApproval {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("awaits").provides("demo.await")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.deadline("respond-by", &DeadlineSpec::days(1), None)
+                .await?;
+            let v = cx
+                .await_event(
+                    &AwaitSpec::new("go.ahead", "respond-by")
+                        .correlate(CorrelationKey::new("matter", "DR-1")),
+                )
+                .await?;
+            Ok(Outcome::done(v))
+        }
+    }
+}
+
+/// **The restore drill, on the topology a deployment actually restores into.**
+///
+/// The release blocker this discharges names eight things, and each is a
+/// question the embedded backend answers for free and this one does not: one
+/// file versus a tenant column, one writer versus a fence, a fresh database
+/// versus rows that are already there. So the drill runs against a real server,
+/// restores into a tenant of a database **another tenant is already using**,
+/// and ends by asking the restored plane to take new work — because a store
+/// that reads correctly and cannot be written to is a backup, not a recovery.
+///
+/// What this does NOT cover: RPO and RTO, which are properties of a
+/// deployment's backup schedule rather than of this code, and are documented
+/// with the runbook instead.
+#[tokio::test]
+async fn postgres_restores_a_plane_that_then_serves() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::TenantId;
+    use agentplane::journal::JournalStore;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let base = PostgresStore::connect(&url).await.expect("connect");
+    let tenant = |name: &str| {
+        Arc::new(
+            base.clone()
+                .for_tenant(TenantId::new(name).expect("a legal tenant id")),
+        )
+    };
+    let origin = tenant("dr-origin");
+    let restored = tenant("dr-restored");
+    let bystander = tenant("dr-bystander");
+
+    let taken = recovery_fixtures::a_plane_with_work_in_flight(&origin).await;
+    // Another tenant's run, in the same database, written before the restore
+    // so that a restore reaching outside its own tenant has something to reach.
+    let untouched = recovery_fixtures::a_neighbours_run(&bystander).await;
+
+    // ── Putting it back, beside somebody else's rows ───────────────────────
+    let fresh: Arc<dyn JournalStore> = Arc::clone(&restored) as Arc<dyn JournalStore>;
+    let fresh_cases: Arc<dyn CaseStore> = Arc::clone(&restored) as Arc<dyn CaseStore>;
+    let report = agentplane::export::from_jsonl(
+        &fresh,
+        Some(&fresh_cases),
+        std::io::Cursor::new(&taken.bytes),
+    )
+    .await
+    .expect("restore");
+
+    assert!(
+        report.is_faithful(),
+        "the rebuilt history commits to a different root:\n  expected {:?}\n  rebuilt  {:?}",
+        report.expected,
+        report.rebuilt
+    );
+    assert_eq!(
+        report.expected.size, taken.checkpoint.size,
+        "the export drifted from the source"
+    );
+    assert_eq!(report.expected.root, taken.checkpoint.root);
+    assert_eq!(report.runs, 2);
+    assert_eq!(report.cases, 1);
+    assert_eq!(
+        report.awaiting,
+        vec![taken.waiting],
+        "the restore did not name the run an operator has to act on"
+    );
+
+    the_records_came_back(
+        &(Arc::clone(&origin) as Arc<dyn JournalStore>),
+        &fresh,
+        &taken,
+    )
+    .await;
+    the_matter_came_back(&fresh_cases, &taken).await;
+    the_tenants_stayed_apart(&fresh, &fresh_cases, &bystander, &taken, untouched).await;
+    the_fencing_token_did_not_go_backwards(&fresh, taken.sealed).await;
+    the_drill_says_what_the_file_could_not_bring(&fresh_cases).await;
+    the_restored_plane_serves(&restored, &fresh, &fresh_cases, &taken, &report).await;
+}
+
+/// Journal chains. The checkpoint covers terminal hashes, so every record
+/// between them is proven only by comparison.
+async fn the_records_came_back(
+    origin: &Arc<dyn agentplane::journal::JournalStore>,
+    fresh: &Arc<dyn agentplane::journal::JournalStore>,
+    taken: &recovery_fixtures::Taken,
+) {
+    for run in [taken.sealed, taken.waiting] {
+        let a = origin.read(run, 1).await.expect("origin");
+        let b = fresh.read(run, 1).await.expect("restored");
+        assert_eq!(a.len(), b.len(), "run {run} lost records");
+        assert!(!a.is_empty(), "the fixture wrote no records for run {run}");
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.hash, y.hash, "run {run} record {} rehashed", x.seq());
+            assert_eq!(x.body, y.body, "run {run} record {} differs", x.seq());
+        }
+    }
+}
+
+/// Case versions, obligations and blob digests — the layer beside the journal,
+/// which no chain and no root would notice the loss of.
+async fn the_matter_came_back(
+    fresh_cases: &Arc<dyn agentplane::case::CaseStore>,
+    taken: &recovery_fixtures::Taken,
+) {
+    use agentplane::core::CaseStatus;
+
+    let matter = fresh_cases
+        .case(taken.case)
+        .await
+        .expect("read")
+        .expect("the matter is back");
+    assert_eq!(matter.kind, "matter");
+    assert_eq!(matter.status, CaseStatus::Open);
+    assert!(matter.runs.contains(&taken.waiting));
+    assert_eq!(
+        fresh_cases
+            .correlate(&recovery_fixtures::Taken::keys())
+            .await
+            .expect("correlate"),
+        Some(taken.case),
+        "the next message about this matter would open a duplicate"
+    );
+    let obligations = fresh_cases.deadlines(taken.case).await.expect("deadlines");
+    assert_eq!(obligations.len(), 1);
+    assert_eq!(obligations[0].name, "respond-by");
+    assert!(
+        fresh_cases
+            .blobs_of(taken.case)
+            .await
+            .expect("blobs")
+            .contains(&taken.artifact),
+        "erasure can no longer reach the artifact from the matter that names it"
+    );
+}
+
+/// Isolation in both directions, on the one topology where it is a column
+/// rather than a separate file.
+async fn the_tenants_stayed_apart(
+    fresh: &Arc<dyn agentplane::journal::JournalStore>,
+    fresh_cases: &Arc<dyn agentplane::case::CaseStore>,
+    bystander: &Arc<PostgresStore>,
+    taken: &recovery_fixtures::Taken,
+    untouched: agentplane::core::RunId,
+) {
+    use agentplane::case::CaseStore;
+    use agentplane::journal::JournalStore;
+
+    let theirs: Arc<dyn JournalStore> = Arc::clone(bystander) as Arc<dyn JournalStore>;
+    assert!(
+        !theirs.read(untouched, 1).await.expect("read").is_empty(),
+        "the fixture's neighbour has no history, so isolation is vacuous here"
+    );
+    assert!(
+        fresh.read(untouched, 1).await.expect("read").is_empty(),
+        "the restored tenant read the bystander's run"
+    );
+    assert!(
+        theirs.read(taken.sealed, 1).await.expect("read").is_empty(),
+        "the bystander read a restored run"
+    );
+    assert!(
+        (Arc::clone(bystander) as Arc<dyn CaseStore>)
+            .case(taken.case)
+            .await
+            .expect("read")
+            .is_none(),
+        "the bystander read the restored matter"
+    );
+    assert_ne!(
+        fresh_cases
+            .correlate(&recovery_fixtures::Taken::keys())
+            .await
+            .expect("correlate"),
+        None,
+        "the restored tenant lost the matter it was just given"
+    );
+    assert_ne!(
+        fresh.checkpoint().await.expect("checkpoint").origin,
+        theirs.checkpoint().await.expect("checkpoint").origin,
+        "two tenants share one log identity, so one checkpoint speaks for both"
+    );
+}
+
+/// **An export carries no lease table.**
+///
+/// A first lease issued at 1 over a history that already reached further hands
+/// a run a second ownership period wearing the number of its first, and quota
+/// settlement identifies a pass by that number.
+async fn the_fencing_token_did_not_go_backwards(
+    fresh: &Arc<dyn agentplane::journal::JournalStore>,
+    sealed: agentplane::core::RunId,
+) {
+    let highest = fresh
+        .read(sealed, 1)
+        .await
+        .expect("read")
+        .iter()
+        .map(|r| r.body.epoch)
+        .max()
+        .expect("a restored run has records");
+    let lease = fresh
+        .acquire(
+            sealed,
+            "restored-worker",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("the restored store issues a lease");
+    assert!(
+        lease.epoch > highest,
+        "a lease over restored history was issued at {} against a journal that \
+         already records {highest} — a fencing token that goes backwards is not one",
+        lease.epoch
+    );
+    fresh
+        .release_lease(sealed, lease.epoch)
+        .await
+        .expect("release");
+}
+
+/// **An export carries digests, never bytes.**
+///
+/// A restored case still names its artifact — that link is what makes erasure
+/// reachable — and the object behind it lives in a store the file did not
+/// travel with. The drill is the verb that holds the references against the
+/// live stores, and on a plane whose blobs have not been restored yet it must
+/// report *unchecked* rather than sound: a recovery that read as complete while
+/// every artifact was unreachable is the failure this whole report exists to
+/// rule out.
+async fn the_drill_says_what_the_file_could_not_bring(
+    fresh_cases: &Arc<dyn agentplane::case::CaseStore>,
+) {
+    use agentplane::core::TenantId;
+
+    let tenant = TenantId::new("dr-restored").expect("a legal tenant id");
+    let report = agentplane::drill::drill(&agentplane::drill::Stores {
+        cases: fresh_cases,
+        blobs: None,
+        // Gated exactly as the field is: a build without the ring has no key
+        // half to report on, and naming it unconditionally is a test that only
+        // compiles under the feature set somebody happened to run it with.
+        #[cfg(feature = "keyring")]
+        keys: None,
+        tenant: &tenant,
+    })
+    .await
+    .expect("the restored case layer enumerates");
+
+    assert_eq!(
+        report.cases, 1,
+        "the drill walked the wrong number of matters"
+    );
+    assert!(
+        report.is_sound(),
+        "the drill reported the restored matter as damaged: {:#?}",
+        report.findings
+    );
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.to_lowercase().contains("blob")),
+        "a restore with no blob store read as fully checked, so an operator \
+         would close the incident with every artifact unreachable: {report:#?}"
+    );
+}
+
+/// **The rehearsal.** Reading correctly is a backup; taking work forward is a
+/// recovery.
+async fn the_restored_plane_serves(
+    restored: &Arc<PostgresStore>,
+    fresh: &Arc<dyn agentplane::journal::JournalStore>,
+    fresh_cases: &Arc<dyn agentplane::case::CaseStore>,
+    taken: &recovery_fixtures::Taken,
+    report: &agentplane::export::RestoreReport,
+) {
+    use agentplane::case::EventStore;
+    use agentplane::core::{CorrelationKey, Delivery, InboundEvent, Tainted, TenantId};
+    use agentplane::runtime::{Mode, Runtime};
+    use recovery_fixtures::{AwaitsApproval, Files};
+    use serde_json::json;
+
+    let serving = Runtime::builder(Arc::clone(fresh))
+        .owner("restored")
+        .tenant(TenantId::new("dr-restored").expect("a legal tenant id"))
+        .cases(Arc::clone(fresh_cases))
+        .events(Arc::clone(restored) as Arc<dyn EventStore>)
+        .skill(Files)
+        .skill(AwaitsApproval)
+        .build();
+
+    let replayed = serving
+        .replay(taken.sealed, Mode::Strict)
+        .await
+        .expect("a restored run strict-replays");
+    assert!(
+        matches!(replayed.status, agentplane::runtime::RunStatus::Succeeded),
+        "a run restored into PostgreSQL did not strict-replay: {:?}",
+        replayed.status
+    );
+
+    // Nothing is subscribed until the resume repairs it, and a message
+    // delivered before that buffers rather than waking anybody — which is the
+    // loss a restored plane's waits would take silently.
+    let early = serving
+        .deliver(
+            &InboundEvent::new("urn:test:approver", "EV-early", "go.ahead", json!({}))
+                .correlate(CorrelationKey::new("matter", "DR-1")),
+        )
+        .await
+        .expect("deliver");
+    assert_eq!(
+        early,
+        Delivery::Buffered,
+        "a restored plane claimed a waiter before anything re-subscribed"
+    );
+    let repaired = serving
+        .replay(taken.waiting, Mode::Resume)
+        .await
+        .expect("resume the restored run");
+    if repaired.status.is_suspended() {
+        let delivery = serving
+            .deliver(
+                &InboundEvent::new("urn:test:approver", "EV-2", "go.ahead", json!({"ok": true}))
+                    .correlate(CorrelationKey::new("matter", "DR-1")),
+            )
+            .await
+            .expect("deliver");
+        assert_eq!(
+            delivery,
+            Delivery::Resumed { run: taken.waiting },
+            "the delivery found no waiter, so every message for this run buffers \
+             until it dead-letters"
+        );
+    } else {
+        assert!(
+            matches!(repaired.status, agentplane::runtime::RunStatus::Succeeded),
+            "the resumed run neither waited again nor finished: {:?}",
+            repaired.status
+        );
+    }
+
+    // New work, admitted after the restore and sealing into the rebuilt log.
+    let after = serving
+        .run("demo.file", Tainted::trusted(json!({ "doc": "after" })))
+        .await
+        .expect("the restored plane admits new work")
+        .run_id;
+    assert_ne!(after, taken.sealed, "a new run reused an id");
+    the_log_grew_from_the_one_restored(fresh, fresh_cases, taken, report, after).await;
+}
+
+/// The restored log is one history, extended — not a second one beside it.
+async fn the_log_grew_from_the_one_restored(
+    fresh: &Arc<dyn agentplane::journal::JournalStore>,
+    fresh_cases: &Arc<dyn agentplane::case::CaseStore>,
+    taken: &recovery_fixtures::Taken,
+    report: &agentplane::export::RestoreReport,
+    after: agentplane::core::RunId,
+) {
+    let grown = fresh.checkpoint().await.expect("checkpoint");
+    assert!(
+        grown.size > report.rebuilt.size,
+        "the restored log did not grow: {} then {}",
+        report.rebuilt.size,
+        grown.size
+    );
+    let proof = fresh
+        .consistency_proof(report.rebuilt.size)
+        .await
+        .expect("consistency proof");
+    assert!(
+        agentplane::core::merkle::verify_consistency(
+            usize::try_from(report.rebuilt.size).expect("a size fits"),
+            &report.rebuilt.root,
+            usize::try_from(grown.size).expect("a size fits"),
+            &grown.root,
+            &proof,
+        ),
+        "the log the restored plane wrote into does not extend the one it restored"
+    );
+
+    // And the restored history verifies offline, on its own terms. Every
+    // sealed run, not a sample: a file naming fewer runs than its own header
+    // commits to is a finding, and rightly so.
+    let mut again = Vec::new();
+    agentplane::export::to_jsonl(
+        fresh,
+        Some(fresh_cases),
+        &[taken.sealed, taken.waiting, after],
+        &mut again,
+    )
+    .await
+    .expect("re-export");
+    let verified =
+        agentplane::export::verify(std::io::Cursor::new(&again), None, None).expect("verify");
+    assert!(
+        verified.is_sound(),
+        "a restored store exported something that does not verify: {:#?}",
+        verified.findings
+    );
+}

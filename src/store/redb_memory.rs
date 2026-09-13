@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::core::StoreError;
-use crate::memory::{MemoryItem, MemoryStore, Recall};
+use crate::memory::{MemoryItem, MemoryStore, Recall, access_expiry};
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
@@ -371,8 +371,7 @@ impl MemoryStore for RedbStore {
                 let mut access = w.open_table(ACCESS_EXPIRY).map_err(|e| be(&e))?;
                 match item.access_retention_seconds {
                     Some(window) => {
-                        let expiry =
-                            created.saturating_add(i64::try_from(window).unwrap_or(i64::MAX));
+                        let expiry = access_expiry(item.created_at, window);
                         let prior = access
                             .get((tenant.as_str(), id.as_str()))
                             .map_err(|e| be(&e))?
@@ -1357,8 +1356,7 @@ impl MemoryStore for RedbStore {
                     let Some(window) = item.access_retention_seconds else {
                         continue;
                     };
-                    let window = i64::try_from(window).unwrap_or(i64::MAX);
-                    let expiry = at.unix_timestamp().saturating_add(window);
+                    let expiry = access_expiry(at, window);
                     let prior = access
                         .get((tenant.as_str(), id.as_str()))
                         .map_err(|e| be(&e))?

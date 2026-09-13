@@ -132,10 +132,14 @@ fn is_outstanding(state: &str) -> bool {
 
 /// Whether a stored obligation is a breach nobody has accounted for.
 ///
-/// The membership rule for [`DEADLINES_UNACCOUNTED`], written once so the
-/// listing, the gauge and the four writers cannot each decide it.
+/// Takes the stored spelling and the column for the same reason
+/// [`is_outstanding`] does — every writer here holds a row rather than a
+/// decoded obligation — and defers to [`DeadlineState::is_unaccounted`], which
+/// is where the rule lives. A state this build cannot spell is not `Breached`
+/// and so is not on the listing; the row is still outstanding by
+/// [`is_outstanding`], which is the half that fails closed.
 fn unaccounted(state: &str, has_ack: u8) -> bool {
-    state == DeadlineState::Breached.as_str() && has_ack == 0
+    DeadlineState::parse(state).is_some_and(|s| s.is_unaccounted(has_ack != 0))
 }
 
 /// Keep [`DEADLINES_UNACCOUNTED`] in step with one obligation's row, inside the
@@ -666,7 +670,7 @@ impl CaseStore for RedbStore {
                         &deadline.name,
                         resolved,
                         false,
-                        unaccounted(state, has_ack),
+                        deadline.is_unaccounted(),
                     )?;
                 }
 
@@ -1027,6 +1031,7 @@ impl CaseStore for RedbStore {
         let digest = deadline.calendar_digest.as_bytes().to_vec();
         let state = deadline.state.as_str();
         let ack = deadline.acknowledged.clone();
+        let listed = deadline.is_unaccounted();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
@@ -1079,15 +1084,7 @@ impl CaseStore for RedbStore {
                             .map_err(|e| be(&e))?;
                     }
                     drop(d);
-                    reindex_unaccounted(
-                        &w,
-                        &tenant,
-                        &case,
-                        &name,
-                        resolved,
-                        false,
-                        unaccounted(state, has_ack),
-                    )?;
+                    reindex_unaccounted(&w, &tenant, &case, &name, resolved, false, listed)?;
                 }
             }
             w.commit().map_err(|e| be(&e))?;

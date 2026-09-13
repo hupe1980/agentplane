@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use tokio_postgres::Row;
 
 use crate::core::StoreError;
-use crate::memory::{MemoryItem, MemoryStore, Recall};
+use crate::memory::{MemoryItem, MemoryStore, Recall, access_expiry};
 
 use super::postgres::{PostgresStore, be};
 
@@ -289,10 +289,7 @@ impl MemoryStore for PostgresStore {
         // currently believed.
         match stored.access_retention_seconds {
             Some(window) => {
-                let expiry = stored
-                    .created_at
-                    .unix_timestamp()
-                    .saturating_add(i64::try_from(window).unwrap_or(i64::MAX));
+                let expiry = access_expiry(stored.created_at, window);
                 tx.execute(
                     "INSERT INTO memory_access_expiry (tenant, id, expires_at)
                      VALUES ($1, $2, $3)
@@ -967,9 +964,7 @@ impl MemoryStore for PostgresStore {
             let Some(window) = item.access_retention_seconds else {
                 continue;
             };
-            let expiry = at
-                .unix_timestamp()
-                .saturating_add(i64::try_from(window).unwrap_or(i64::MAX));
+            let expiry = access_expiry(at, window);
             tx.execute(
                 "INSERT INTO memory_access_expiry (tenant, id, expires_at)
                  VALUES ($1, $2, $3)

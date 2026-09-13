@@ -271,6 +271,27 @@ impl DeadlineState {
         matches!(self, Self::Pending | Self::Warned)
     }
 
+    /// Whether an obligation in this state is a breach still on the listing.
+    ///
+    /// The membership rule for that listing, on the vocabulary rather than
+    /// beside any one reader, because its readers hold different things: the
+    /// index that maintains it holds a stored spelling and a column, the
+    /// listing holds a decoded obligation, and a gauge counts rows. Each
+    /// deciding for itself is how a breach ends up on one backend's page and
+    /// not the other's.
+    ///
+    /// The state is only half of it, which is the part that is easy to lose:
+    /// what ends the *question* is somebody accounting for the breach, and the
+    /// breach itself stays [`Breached`](Self::Breached) forever.
+    ///
+    /// `PostgreSQL` cannot call this — a partial index predicate must be
+    /// immutable — so the SQL spells both conjuncts and a guard holds the two
+    /// spellings to each other.
+    #[must_use]
+    pub const fn is_unaccounted(self, accounted: bool) -> bool {
+        matches!(self, Self::Breached) && !accounted
+    }
+
     /// Whether an obligation in this state may be moved to `to`.
     ///
     /// The three ways an obligation ends — met, missed, withdrawn — are
@@ -372,12 +393,14 @@ impl Deadline {
 
     /// A breach nobody has accounted for yet.
     ///
-    /// The predicate behind the obligation listing, written once so the two
-    /// backends compare the same two things rather than each deciding what
-    /// "still on the list" means.
+    /// The decoded form of [`DeadlineState::is_unaccounted`], which carries the
+    /// rule. What a caller holding a whole obligation asks — including the
+    /// embedded backend's own listing, which reads an index and then holds the
+    /// row it decoded to this, because an index is a hint and the row is the
+    /// record.
     #[must_use]
     pub const fn is_unaccounted(&self) -> bool {
-        matches!(self.state, DeadlineState::Breached) && self.acknowledged.is_none()
+        self.state.is_unaccounted(self.acknowledged.is_some())
     }
 
     #[must_use]

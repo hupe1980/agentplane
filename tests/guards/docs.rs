@@ -538,7 +538,18 @@ const INTERNAL_DOCUMENTS: &[&str] = &[
     "DECISIONS.md",
     "REFERENCES.md",
     "ROADMAP.md",
+    "SHAPES.md",
 ];
+
+/// The internal folder itself, which no future document can escape.
+///
+/// The list above is a closed enumeration and a new design document falsifies
+/// it — which happened. This catches the containing path instead, so a
+/// reference to anything in it is flagged whether or not the filename was ever
+/// added here. It also catches the half the filename list cannot see at all: a
+/// line naming the *folder*, or a tool that operates on it, points readers at
+/// something their checkout does not have just as surely as a dead link does.
+const INTERNAL_FOLDER: &str = "concepts/";
 
 /// Whether a line names one of the internal design documents.
 ///
@@ -550,7 +561,17 @@ const INTERNAL_DOCUMENTS: &[&str] = &[
 /// and resolves fine there — which is precisely why a guard rather than a
 /// habit.
 fn names_internal_document(line: &str) -> bool {
-    INTERNAL_DOCUMENTS.iter().any(|doc| line.contains(doc))
+    if INTERNAL_DOCUMENTS.iter().any(|doc| line.contains(doc)) {
+        return true;
+    }
+    // The folder, minus the one spelling that is *not* it: `docs/concepts/` and
+    // `concepts.md` are the published page of that name, which every reader can
+    // follow. Checked by what precedes the match rather than by a denylist of
+    // URLs, because a new link shape would slip past a denylist.
+    line.match_indices(INTERNAL_FOLDER).any(|(at, _)| {
+        let before = &line[..at];
+        !before.ends_with("docs/") && !before.ends_with('.')
+    })
 }
 
 /// Whether a line cites a section of a document the reader does not have.
@@ -579,24 +600,14 @@ fn cites_internal_section(line: &str) -> bool {
         _ => false,
     }
 }
-
-/// Shipped source must not cite sections of the internal design document.
+/// The two detectors recognise what they exist to find, and nothing else.
 ///
-/// The packaging guard checks that the internal document is not in the release
-/// tarball. A bare `§11.1` slips straight past that while being the same leak:
-/// this crate's
-/// rustdoc goes to docs.rs, where a reader has no document to resolve that
-/// number against. It is also the reference most likely to be *wrong* — the
-/// design document gets renumbered, and nothing recompiles a comment. Seventeen
-/// of these had accumulated, and several pointed at sections that had since
-/// become something else entirely or no longer existed at all.
-///
-/// The detector is exercised on known inputs **before** it is run over the
-/// tree. Without that this test cannot fail for the right reason: on a clean
-/// tree a working detector and a disabled one both report nothing, so deleting
-/// the rule would leave a green test guarding an empty set.
+/// Split from the scan below because they answer different questions: this one
+/// asks whether the detectors work, and that one asks whether any artifact a
+/// reader can see trips them. A detector that recognised nothing would make the
+/// scan pass over every leak in the repository.
 #[test]
-fn nothing_a_reader_sees_cites_an_internal_section_number() {
+fn the_internal_reference_detectors_recognise_what_they_are_for() {
     assert!(
         !cites_internal_section("/// the A2A specification §5.5 requires camelCase"),
         "a named external specification's section is resolvable and must not be flagged"
@@ -643,7 +654,45 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
         !names_internal_document("/// the release notes are in CHANGELOG.md"),
         "the detector flags a document that ships"
     );
+    assert!(
+        names_internal_document("| `just x` | after editing `concepts/` |"),
+        "the detector misses the internal folder named on its own, which is how \
+         a reference to it reached a public page while every filename was absent"
+    );
+    assert!(
+        names_internal_document("see concepts/SOMETHING-NEW.md for the reasoning"),
+        "a design document added later must be caught by the folder, because the \
+         filename list is a closed enumeration and adding one falsifies it"
+    );
+    assert!(
+        !names_internal_document(
+            "[Concepts](https://hupe1980.github.io/agentplane/docs/concepts/)"
+        ),
+        "the published page of that name is a link every reader can follow"
+    );
+    assert!(
+        !names_internal_document("see @/docs/concepts.md for the ideas"),
+        "the site's own page must not be mistaken for the internal folder"
+    );
+}
 
+/// Shipped source must not cite sections of the internal design document.
+///
+/// The packaging guard checks that the internal document is not in the release
+/// tarball. A bare `§11.1` slips straight past that while being the same leak:
+/// this crate's
+/// rustdoc goes to docs.rs, where a reader has no document to resolve that
+/// number against. It is also the reference most likely to be *wrong* — the
+/// design document gets renumbered, and nothing recompiles a comment. Seventeen
+/// of these had accumulated, and several pointed at sections that had since
+/// become something else entirely or no longer existed at all.
+///
+/// The detectors are exercised on known inputs by the sibling test above, and
+/// that is not a convenience: on a clean tree a working detector and a disabled
+/// one both report nothing, so without it deleting the rule would leave a green
+/// test guarding an empty set.
+#[test]
+fn nothing_a_reader_sees_cites_an_internal_section_number() {
     // `src` is what reaches docs.rs, but the repository is public and an
     // evaluator reads `tests` and `examples` to see what the crate can do. A
     // pointer into a document they do not have is the same dead reference
@@ -656,6 +705,9 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
     }
     files.push(root.join("README.md"));
     files.push(root.join("CONTRIBUTING.md"));
+    // Ships *inside the crate tarball*, so a dead reference here travels
+    // further than one on the site and was the file this scan did not read.
+    files.push(root.join("CHANGELOG.md"));
     assert!(
         files.len() > 60,
         "the scan found only {} files — this guard is now inert",

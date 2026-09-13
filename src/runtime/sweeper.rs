@@ -219,6 +219,20 @@ pub struct WokenRuns {
     pub failed: usize,
 }
 
+/// What one redelivery pass finished, and how much of the waiting list it saw.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Redelivered {
+    /// Deliveries this pass completed.
+    pub finished: usize,
+    /// Waiting subscriptions this pass examined.
+    ///
+    /// The cap is judged on this rather than on `finished`, for the reason the
+    /// timer pass counts failed wakes: a tick whose whole batch was still
+    /// live-owned has seen as little of the backlog as one that finished
+    /// every delivery in it.
+    pub examined: usize,
+}
+
 /// Which sweeps hit their cap this tick.
 ///
 /// A bounded query returns a list shaped exactly like a complete one, so a tick
@@ -227,15 +241,14 @@ pub struct WokenRuns {
 /// to tell apart, because the first means the backlog is growing while the
 /// report looks normal.
 ///
-/// Three named flags rather than a list of strings: a caller that wants to alert
-/// on deadlines specifically should not be matching on a message, and a field
+/// Named flags rather than a list of strings: a caller that wants to alert on
+/// deadlines specifically should not be matching on a message, and a field
 /// added here is a field the compiler makes every reader consider.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-// Four bools is what this struct *is*: one independent yes/no per capped
-// sweep, each meaning "that backlog may be deeper than this tick saw". They
-// are not a state machine wearing flags — no combination is invalid — and an
-// enum over sixteen combinations would be the lint satisfied at the reader's
-// expense.
+// A bool per capped sweep is what this struct *is*: one independent yes/no
+// each, meaning "that backlog may be deeper than this tick saw". They are not
+// a state machine wearing flags — no combination is invalid — and an enum over
+// every combination would be the lint satisfied at the reader's expense.
 #[allow(clippy::struct_excessive_bools)]
 pub struct Saturation {
     /// Timers fired up to the cap; more may have been due.
@@ -246,6 +259,14 @@ pub struct Saturation {
     pub tasks: bool,
     /// Abandoned runs recovered up to the cap; more may have been stranded.
     pub recovery: bool,
+    /// Claimed-but-undelivered events examined up to the cap; more may have
+    /// been parked.
+    ///
+    /// The pass with the least tolerance for going unreported: a delivery that
+    /// died between the claim and the resume blocks every deduplicated retry of
+    /// itself, so this sweep is the only driver left for a message that arrived
+    /// in time.
+    pub redeliveries: bool,
 }
 
 impl Saturation {
@@ -255,7 +276,7 @@ impl Saturation {
     /// cap was all there was.
     #[must_use]
     pub const fn any(self) -> bool {
-        self.timers || self.deadlines || self.tasks || self.recovery
+        self.timers || self.deadlines || self.tasks || self.recovery || self.redeliveries
     }
 }
 
@@ -549,7 +570,9 @@ impl Runtime {
                 // dedup'd retry of itself, so this pass is the only driver
                 // left; without it the message that arrived in time is parked
                 // forever behind its own claim.
-                report.events_redelivered = self.redeliver_claimed(EVENT_BATCH).await?;
+                let again = self.redeliver_claimed(EVENT_BATCH).await?;
+                report.events_redelivered = again.finished;
+                report.saturated.redeliveries = again.examined >= EVENT_BATCH;
                 report.dead_lettered = self.sweep_events(event_grace).await?;
             }
             if self.timers().is_some() {

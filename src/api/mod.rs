@@ -791,6 +791,13 @@ impl Api {
         })
     }
 
+    /// How many entries one listing page returns.
+    ///
+    /// Every listing reads one past this and truncates, so *there is more* is a
+    /// fact rather than an inference from a full page. The read is saturating:
+    /// a ceiling set at the type's own maximum would otherwise wrap the
+    /// request to zero, and a backlog that answers empty is the one failure a
+    /// listing must not have.
     #[must_use]
     pub const fn limit(mut self, limit: usize) -> Self {
         self.limit = limit;
@@ -1457,7 +1464,7 @@ async fn runs_by_outcome(
     let mut found = s
         .plane
         .journal()
-        .runs_by_outcome(&outcome, api.limit + 1)
+        .runs_by_outcome(&outcome, api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     let truncated = found.len() > api.limit;
@@ -1488,7 +1495,7 @@ async fn worklist(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Wor
     // distinguishable. Inferring it from `len() == limit` would call a queue of
     // exactly 100 truncated.
     let mut queued = tasks
-        .queue(&s.caller.roles, api.limit + 1)
+        .queue(&s.caller.roles, api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     let truncated = queued.len() > api.limit;
@@ -1715,7 +1722,7 @@ async fn cases_by_status(
     // distinguishable — a backlog of 140 shown as 100 reads as a backlog of 100,
     // and the cases that fell off the end are the ones nobody clears.
     let mut found = cases
-        .by_status(status, api.limit + 1)
+        .by_status(status, api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     let truncated = found.len() > api.limit;
@@ -1757,7 +1764,7 @@ async fn breached_obligations(
     // One more than the page, for the reason the sibling routes take one more:
     // a backlog of 140 shown as 100 reads as a backlog of 100.
     let mut found = cases
-        .breached(api.limit + 1)
+        .breached(api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     let truncated = found.len() > api.limit;
@@ -1788,7 +1795,7 @@ async fn dead_letters(State(api): State<Api>, headers: HeaderMap) -> Result<Json
     // One more than the page, for the reason every sibling listing takes one
     // more: a backlog of 140 shown as 100 reads as a backlog of 100.
     let mut found = events
-        .dead_letters(api.limit + 1)
+        .dead_letters(api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     let truncated = found.len() > api.limit;
@@ -1879,7 +1886,7 @@ async fn parked_push(State(api): State<Api>, headers: HeaderMap) -> Result<Json<
     let push = s.plane.push().ok_or_else(|| unavailable("push"))?;
 
     let mut found = push
-        .parked(api.limit + 1)
+        .parked(api.limit.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     let truncated = found.len() > api.limit;

@@ -717,6 +717,32 @@ async fn a_restore_writes_only_into_the_tenant_it_was_pointed_at() {
         .expect("restore");
     assert!(report.runs > 0, "nothing was restored: {report:?}");
 
+    // **The result of a restore is available in the case a restore is for.**
+    // `agentplane restore` exits on this predicate, and the realistic recovery
+    // — one tenant's history put back beside another's, in the database that
+    // survived — is exactly the shape that changes a log's name. A byte-perfect
+    // restore must not report as a failed one for being relabelled.
+    assert!(
+        report.is_faithful(),
+        "a byte-perfect restore into another tenant reported as unfaithful:\n  \
+         expected {:?}\n  rebuilt  {:?}",
+        report.expected,
+        report.rebuilt
+    );
+    assert_ne!(
+        report.expected.origin, report.rebuilt.origin,
+        "the fixture did not actually relabel the log, so the check above is vacuous"
+    );
+    assert!(
+        report
+            .not_carried
+            .iter()
+            .any(|s| s.contains("the log identity")),
+        "the relabelling was excluded from the verdict and not named anywhere, \
+         so an auditor's pre-disaster checkpoint reports the wrong log with no \
+         explanation: {report:#?}"
+    );
+
     assert!(
         !target.read(run, 1).await.expect("read").is_empty(),
         "the restore did not land in the tenant it was pointed at"

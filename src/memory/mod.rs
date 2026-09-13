@@ -195,6 +195,25 @@ impl MemoryWrite {
     }
 }
 
+/// The unix second a sliding access window lapses at, counted from one touch.
+///
+/// The one spelling of that arithmetic, because two copies of a retention rule
+/// are two dates a deployment can be told — and **public**, because a store
+/// implementing [`MemoryStore::touch`] has to index on the same instant this
+/// crate's own do.
+///
+/// Saturates at the last instant a [`Timestamp`] can name rather than refusing:
+/// the caller owes an index an entry and has nowhere to put a refusal. A
+/// declared window that long is already refused where the document is parsed;
+/// one built in code reaches here, and *effectively never* is the only reading
+/// of it that is not a lie.
+#[must_use]
+pub fn access_expiry(from: Timestamp, window: u64) -> i64 {
+    crate::core::seconds_after(from, window)
+        .unwrap_or_else(crate::core::last_instant)
+        .unix_timestamp()
+}
+
 impl MemoryItem {
     /// The label a recalled value carries.
     ///

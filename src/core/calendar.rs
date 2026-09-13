@@ -74,16 +74,25 @@ impl WallClock {
 impl Calendar for WallClock {
     fn resolve(&self, from: Timestamp, spec: &DeadlineSpec) -> Result<Timestamp, CalendarError> {
         let n = Self::count(spec)?;
-        let delta = match spec.kind.as_str() {
-            "hours" => time::Duration::hours(n),
-            "days" => time::Duration::days(n),
-            "minutes" => time::Duration::minutes(n),
+        // The multiplication is the boundary, and it is checked for the same
+        // reason the addition below it is. `time::Duration::hours` multiplies
+        // by 3600 and panics on overflow, so a count near `i64`'s edge would
+        // abort inside a constructor rather than return an error — and the
+        // count is read out of a manifest's `params`, which is a document a
+        // reviewer typed and this code has never seen.
+        let seconds = match spec.kind.as_str() {
+            "hours" => n.checked_mul(3_600),
+            "days" => n.checked_mul(86_400),
+            "minutes" => n.checked_mul(60),
             other => return Err(CalendarError::UnknownKind(other.to_owned())),
         };
-        from.checked_add(delta)
-            .ok_or_else(|| CalendarError::OutOfRange {
-                kind: spec.kind.clone(),
-            })
+        let out_of_range = || CalendarError::OutOfRange {
+            kind: spec.kind.clone(),
+        };
+        let delta = seconds
+            .map(time::Duration::seconds)
+            .ok_or_else(out_of_range)?;
+        from.checked_add(delta).ok_or_else(out_of_range)
     }
 
     fn digest(&self) -> Digest {
@@ -131,6 +140,37 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, CalendarError::UnknownKind(_)));
+    }
+
+    /// A count near the boundary of its own type resolves to a refusal.
+    ///
+    /// `time::Duration::hours` multiplies before it constructs and panics on
+    /// overflow, so the unchecked form aborted the process from inside a
+    /// calendar — on a number read out of a manifest. What this does NOT
+    /// cover: a negative count, which resolves to an instant in the past and is
+    /// legitimate (an obligation imported already overdue).
+    #[test]
+    fn a_count_that_cannot_be_a_duration_is_refused_not_a_panic() {
+        let base = datetime!(2026-07-30 09:00:00 UTC);
+        for kind in ["hours", "days", "minutes"] {
+            let spec = DeadlineSpec::new(kind, serde_json::json!({ "n": i64::MAX }));
+            let err = WallClock.resolve(base, &spec).unwrap_err();
+            assert!(
+                matches!(err, CalendarError::OutOfRange { .. }),
+                "{kind}: expected a refusal, got {err:?}"
+            );
+        }
+    }
+
+    /// The addition is checked as well as the multiplication: a count small
+    /// enough to be a duration can still land past the last instant a
+    /// `Timestamp` can name.
+    #[test]
+    fn an_instant_past_the_representable_range_is_refused() {
+        let base = datetime!(2026-07-30 09:00:00 UTC);
+        let spec = DeadlineSpec::days(4_000_000);
+        let err = WallClock.resolve(base, &spec).unwrap_err();
+        assert!(matches!(err, CalendarError::OutOfRange { .. }), "{err:?}");
     }
 
     #[test]

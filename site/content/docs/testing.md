@@ -173,10 +173,45 @@ let report = check_journal_store(|| my_store()).await;
 assert!(report.violations.is_empty(), "{report:#?}");
 ```
 
-There are matching batteries for the case layer, the quota store and the key
-ring. They exist as shipped code rather than as this crate's private tests for
-one reason: rebuilding a conformance suite per project is how each one ends up
-checking a slightly different, slightly weaker thing.
+There are matching batteries for the case layer, the quota store, the registry,
+the push store, the key ring, **blob storage** and **the calendar**. They exist
+as shipped code rather than as this crate's private tests for one reason:
+rebuilding a conformance suite per project is how each one ends up checking a
+slightly different, slightly weaker thing.
+
+The blob battery has two entry points, and the split is worth knowing before
+you write a store:
+
+```rust
+use agentplane::testkit::conformance::Report;
+use agentplane::testkit::conformance_blob;
+
+let mut report = Report::default();
+conformance_blob::check(&store, "mine", &mut report).await;
+// …and this one only if something may seal *onto* your store:
+conformance_blob::check_backing(&store, "mine", &mut report).await;
+report.assert_conforms("MyBlobs");
+```
+
+`put_at` and `get_raw` are the **envelope pair** — bytes deliberately stored at
+an address they do not hash to, read back without the verification that would
+reject them. They belong to a backing store; a sealing decorator refuses both
+on purpose, because exposing them through it is an unsealed side door. So a
+store that refuses the pair is not incomplete, and a battery demanding it of
+everything would fail the one implementation whose refusal is the guarantee.
+
+The calendar battery matters for the same reason in sharper form: a real
+deadline forces you to replace that seam — working days in a named timezone
+with a holiday table do not belong in a domain-agnostic engine — and the instant
+your replacement returns is binding and unreviewable from above. It checks that
+resolution is pure, that a rule the calendar does not implement is refused
+rather than approximated, that the digest identifies the ruleset, and that a
+count at the edge of its type is an error rather than an abort. The hostile
+counts are **derived** from the specs you declare supported, so you cannot hand
+the battery the inputs your code already handles.
+
+The blob rule that is least obvious — an expired address stays expired — is
+argued where its reader is, on [erasure](@/docs/erasure.md#an-expired-address-stays-expired).
 
 ## Testing a policy against the *real* context
 

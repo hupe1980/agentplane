@@ -761,41 +761,47 @@ pub async fn audit(
             }
         };
 
-        if !seal_claim_holds(&records) {
-            findings.push(Finding::SealClaim { run });
-            continue;
-        }
+        // Collected as soon as the chain verifies, and **before** any finding
+        // this run may carry. The gate is integrity, not innocence: a reader
+        // must never be shown a decision drawn from records whose chain did not
+        // hold — a forged `RunAdmitted` naming a policy bundle nobody
+        // configured is exactly the claim an auditor must not be handed — but a
+        // run that verified and then failed a check is the one an investigator
+        // most needs the warrant and the releases for. Withholding them with
+        // the finding answers *this run left the world in an unknown state*
+        // and declines to say what it was authorized to do.
+        releases.extend(releases_in(run, &records));
+        warrants.extend(warrant_in(run, &records));
 
+        // Every fault this run has, not the first one. A sealed run may both
+        // claim a foreign chain head and be missing from the log, and the two
+        // send an investigator to different places.
+        let mut faults = Vec::new();
+        if !seal_claim_holds(&records) {
+            faults.push(Finding::SealClaim { run });
+        }
         // Only under a sealing conclusion — an open run's unsettled group
         // is the crash shape a resume repairs, and flagging it would teach
         // the reader this finding is weather. `Finding::GroupUnsettled`
         // carries the argument.
-        let undecided = permanently_undecided(run, &records);
-        if !undecided.is_empty() {
-            findings.extend(undecided);
-            continue;
-        }
-
-        // Collected after the chain verified, so a reader is never shown a
-        // decision — or a warrant — drawn from records whose integrity did not
-        // hold. A forged `RunAdmitted` naming a policy bundle nobody configured
-        // is exactly the claim an auditor must not be handed.
-        releases.extend(releases_in(run, &records));
-        warrants.extend(warrant_in(run, &records));
+        faults.extend(permanently_undecided(run, &records));
 
         match placement(store, run, &records, head, &mut current).await? {
-            Placement::Sound => sound.push(run),
-            Placement::Open => {
-                open_runs += 1;
-                sound.push(run);
-            }
-            Placement::NotInLog => findings.push(Finding::NotInLog { run }),
-            Placement::LeafMismatch => findings.push(Finding::LeafMismatch { run }),
-            Placement::BadInclusion => findings.push(Finding::BadInclusion { run }),
+            Placement::Sound => {}
+            Placement::Open => open_runs += 1,
+            Placement::NotInLog => faults.push(Finding::NotInLog { run }),
+            Placement::LeafMismatch => faults.push(Finding::LeafMismatch { run }),
+            Placement::BadInclusion => faults.push(Finding::BadInclusion { run }),
             Placement::Unpinned => not_checked.push(format!(
                 "run {run}: the log grew throughout the audit, so this run's inclusion \
                  could not be pinned to one checkpoint — re-run against a quiesced store"
             )),
+        }
+
+        if faults.is_empty() {
+            sound.push(run);
+        } else {
+            findings.extend(faults);
         }
     }
 

@@ -718,22 +718,120 @@ pub struct McpTaskSnapshot {
     pub value: Value,
 }
 
+/// How long a server says it will keep a task.
+///
+/// Three answers rather than an `Option`, because the wire form has three and
+/// two of them are opposites. `ttlMs` is **nullable** in the tasks extension —
+/// `null` means unlimited — so collapsing absence and null into `None` tells a
+/// poll loop *there is no deadline* and *the deadline is unknown* in the same
+/// word. A loop sleeping past a real TTL finds the task discarded, and the
+/// answer to a discarded id is indistinguishable from "never existed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRetention {
+    /// The server states a deadline, in milliseconds from creation.
+    Until { ms: u64 },
+    /// The server states there is none: `"ttlMs": null` on the wire.
+    Unlimited,
+    /// The server did not say. Poll as if a deadline exists.
+    Unstated,
+}
+
 impl McpTaskSnapshot {
-    /// How many milliseconds from creation the server retains this task, when
-    /// it says. A poll loop that sleeps past it finds the task discarded — and
-    /// the answer to a discarded id is indistinguishable from "never existed",
-    /// so the deadline is worth reading before choosing a cadence.
+    /// How long this server says it will keep the task.
+    ///
+    /// The value MAY change over a task's lifetime, so it is read from each
+    /// snapshot rather than remembered from the first.
     #[must_use]
-    pub fn ttl_ms(&self) -> Option<u64> {
-        self.value.get("ttlMs").and_then(Value::as_u64)
+    pub fn retention(&self) -> TaskRetention {
+        match self.value.get("ttlMs") {
+            None => TaskRetention::Unstated,
+            Some(Value::Null) => TaskRetention::Unlimited,
+            Some(value) => value
+                .as_u64()
+                .map_or(TaskRetention::Unstated, |ms| TaskRetention::Until { ms }),
+        }
     }
 
     /// The polling cadence the server asks for, in milliseconds, when it says.
+    ///
     /// Each poll is a journaled effect; a loop that ignores this hammers the
-    /// server and the journal alike.
+    /// server and the journal alike. Not nullable on the wire, so absence is
+    /// the only way it goes unstated and an `Option` says everything there is
+    /// to say.
     #[must_use]
     pub fn poll_interval_ms(&self) -> Option<u64> {
         self.value.get("pollIntervalMs").and_then(Value::as_u64)
+    }
+}
+
+#[cfg(test)]
+mod task_codec_tests {
+    use super::*;
+
+    /// **The tasks extension's own field names, pinned to its schema.**
+    ///
+    /// `CreateTaskResult` is `Result & Task & { resultType: "task" }` — *flat*,
+    /// so every field a poll loop reads is top-level rather than nested under
+    /// a `task` key. A reader that guessed wrong here answers `None` forever
+    /// and the loop silently ignores the cadence the server asked for, which is
+    /// a fault nothing in this crate can observe.
+    #[test]
+    fn a_task_handle_reads_the_fields_the_extension_spells() {
+        let create = serde_json::json!({
+            "resultType": "task",
+            "taskId": "task-7",
+            "status": "working",
+            "createdAt": "2026-07-28T09:00:00Z",
+            "lastUpdatedAt": "2026-07-28T09:00:00Z",
+            "ttlMs": 60_000,
+            "pollIntervalMs": 2_500
+        });
+        let task = McpTask::from_result("tickets", &create).expect("a task handle");
+        assert_eq!(task.id(), "task-7");
+        assert_eq!(
+            McpTaskState::parse(&create).expect("a status"),
+            McpTaskState::Working
+        );
+
+        let snapshot = McpTaskSnapshot {
+            task,
+            state: McpTaskState::Working,
+            value: create,
+        };
+        assert_eq!(snapshot.retention(), TaskRetention::Until { ms: 60_000 });
+        assert_eq!(snapshot.poll_interval_ms(), Some(2_500));
+    }
+
+    /// `ttlMs` is nullable, and null is the opposite of absent.
+    ///
+    /// Null says *no deadline*; absence says *the server did not say*, and a
+    /// loop must treat the second as if a deadline exists. One `Option` cannot
+    /// carry both.
+    #[test]
+    fn an_unlimited_retention_is_not_an_unstated_one() {
+        let snapshot = |ttl: Value| McpTaskSnapshot {
+            task: McpTask {
+                server: "tickets".to_owned(),
+                id: "task-7".to_owned(),
+            },
+            state: McpTaskState::Working,
+            value: serde_json::json!({ "taskId": "task-7", "status": "working", "ttlMs": ttl }),
+        };
+        assert_eq!(snapshot(Value::Null).retention(), TaskRetention::Unlimited);
+        assert_eq!(
+            snapshot(serde_json::json!(1)).retention(),
+            TaskRetention::Until { ms: 1 }
+        );
+
+        let absent = McpTaskSnapshot {
+            task: McpTask {
+                server: "tickets".to_owned(),
+                id: "task-7".to_owned(),
+            },
+            state: McpTaskState::Working,
+            value: serde_json::json!({ "taskId": "task-7", "status": "working" }),
+        };
+        assert_eq!(absent.retention(), TaskRetention::Unstated);
     }
 }
 

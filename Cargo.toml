@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.35.0"
+version      = "0.36.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -465,17 +465,6 @@ pedantic  = { level = "warn", priority = -1 }
 module_name_repetitions = "allow"
 missing_errors_doc      = "allow"
 missing_panics_doc      = "allow"
-# `duration_suboptimal_units` asks for `Duration::from_hours` / `from_days`,
-# which are **unstable** — `duration_constructors`, still not stabilised on the
-# declared MSRV, while `from_secs` and `from_mins` are. So the lint's advice is
-# uncompilable here rather than merely unwanted, and following it would trade a
-# readability nit for a nightly dependency.
-#
-# The premise is checkable, which is what keeps this from becoming a decision
-# whose reason expired: `rustc +1.94.1 -e 'fn main(){std::time::Duration::from_hours(1);}'`
-# fails today and will stop failing when the feature lands. Remove this line
-# then; the lint is right about the readability.
-duration_suboptimal_units = "allow"
 must_use_candidate      = "allow"
 
 # Seven from `nursery`, named individually rather than by group, because each

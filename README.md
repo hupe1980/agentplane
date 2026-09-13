@@ -11,7 +11,7 @@
 **[Documentation](https://hupe1980.github.io/agentplane/docs/) ·
 [Getting started](https://hupe1980.github.io/agentplane/docs/getting-started/) ·
 [API reference](https://docs.rs/agentplane) ·
-[What is built](https://hupe1980.github.io/agentplane/docs/status/)**
+[What will move](https://hupe1980.github.io/agentplane/docs/status/)**
 
 Not a prompt framework. Not an agent library. The layer *beneath* those — the
 thing that makes an agent's actions survivable, auditable, and governable when it
@@ -340,6 +340,18 @@ its own canonicalizer and chain digest, verifies the sealed export end to end,
 and then damages that export six ways and asserts each is reported. Vectors a
 project generates and then checks are that project agreeing with itself; this
 is the part that is not.
+
+**🧯 A recovery drill, not a backup.** The restore path is exercised against a
+real `PostgreSQL` server — restoring one tenant's history into another tenant of
+a database somebody else is already using, which is the shape a disaster
+actually puts an operator in. It asserts equal roots at equal size, records
+hash-for-hash, the matter with its obligation and its artifact, isolation in
+both directions, and a first lease past the journal's highest epoch. Then it
+asks the restored plane to take **new work**, and checks that the seal extends
+the log it restored: a store that reads correctly and cannot be written to is a
+backup. The RPO/RTO tables, and the list of what an operator re-establishes by
+hand, are on the
+[operations page](https://hupe1980.github.io/agentplane/docs/operations/#disaster-recovery).
 
 **🔗 An anchor from a party this plane does not control.** The hash chain, the
 signatures and the Merkle log all draw both halves of their comparison from

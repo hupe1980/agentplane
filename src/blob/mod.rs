@@ -90,9 +90,41 @@ pub enum BlobError {
         at: i64,
         reason: String,
     },
+
+    /// The bytes are gone and the record of *why* cannot be read.
+    ///
+    /// A fourth state, and the one a lax reader hides. A tombstone is the only
+    /// evidence an erasure happened that outlives the bytes it describes, so a
+    /// reader that filled in a default — epoch zero, the reason "expired" —
+    /// would answer [`Expired`](Self::Expired) with a date and a reason it made
+    /// up, and a compliance drill would count a completed erasure it never saw.
+    ///
+    /// Reported as a finding rather than as a backend fault: the store *was*
+    /// reached, and what came back was unreadable.
+    #[error("blob at {digest}: the bytes are gone and their tombstone does not read ({detail})")]
+    UnreadableTombstone { digest: String, detail: String },
 }
 
 /// Bytes addressed by their own hash.
+///
+/// # Two roles, and only one of them answers every method
+///
+/// Most of this trait is the contract every implementation carries: `put`,
+/// `get`, `expire`, `has`, and the rule that an expired address stays expired.
+///
+/// [`put_at`](Self::put_at) and [`get_raw`](Self::get_raw) are the **envelope
+/// pair**, and they belong to a *backing* store — one something may seal onto.
+/// A sealing decorator refuses both on purpose
+/// ([`EncryptedBlobs`](crate::keyring::EncryptedBlobs) does), because exposing
+/// them through it is an unsealed side door: a caller reaching `put_at` on a
+/// deployment that asked for sealing writes plaintext under a scope whose
+/// erasure can never reach it. So a store that refuses the pair is not
+/// incomplete, and a battery demanding it of everything would fail the one
+/// implementation whose refusal is the guarantee — which is why
+/// `testkit::conformance_blob` has two entry points rather than one.
+///
+/// Stated here rather than only at the decorator that refuses, because the
+/// reader who needs it is writing the *next* implementation.
 #[async_trait]
 pub trait BlobStore: Send + Sync + Debug {
     /// Whose bytes this handle can reach.
@@ -126,9 +158,25 @@ pub trait BlobStore: Send + Sync + Debug {
     ///
     /// Writing the same bytes twice is the same write.
     ///
+    /// **An expired address stays expired.** A store MUST refuse a write to an
+    /// address it holds a tombstone for, with
+    /// [`BlobError::Expired`](BlobError::Expired). Content addressing makes
+    /// this the one rule that is not obvious: the address *is* the bytes, so a
+    /// later write of the same bytes lands on the erased object and puts the
+    /// data back — silently, under a tombstone that still says when and why it
+    /// went. An erasure a subsequent write reverses is worse than one that
+    /// never ran, because the first was reported as discharged. It is reachable
+    /// through the ordinary API: a resumed run re-storing what it stored
+    /// before, or a second run of the same matter doing the same work.
+    ///
+    /// A *different* erasure unit writing the same bytes is unaffected —
+    /// [`ScopedBlobs`] gives it another address, which is what that type is
+    /// for.
+    ///
     /// # Errors
     ///
-    /// If the backing store rejects the write.
+    /// [`BlobError::Expired`] if the address holds a tombstone, or
+    /// [`BlobError::Backend`] if the backing store rejects the write.
     async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError>;
 
     /// Store bytes at an address that is **not** their own digest.
@@ -144,9 +192,14 @@ pub trait BlobStore: Send + Sync + Debug {
     /// describe its contents is a content-addressed store with its defining
     /// property switched off, and [`get`](Self::get) can no longer verify.
     ///
+    /// Carries [`put`](Self::put)'s tombstone rule, and needs it more: this is
+    /// the write path a sealed deployment takes, so the refusal has to be here
+    /// or sealing is the configuration that loses it.
+    ///
     /// # Errors
     ///
-    /// If the backing store rejects the write.
+    /// [`BlobError::Expired`] if the address holds a tombstone, or
+    /// [`BlobError::Backend`] if the backing store rejects the write.
     async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError>;
 
     /// Fetch exactly what is stored, without verifying it against the address.
@@ -159,7 +212,9 @@ pub trait BlobStore: Send + Sync + Debug {
     ///
     /// # Errors
     ///
-    /// [`BlobError::NotFound`] if nothing is stored there.
+    /// [`BlobError::NotFound`] if nothing is stored there,
+    /// [`BlobError::Expired`] if a tombstone says the bytes were erased, and
+    /// [`BlobError::UnreadableTombstone`] if one is there and does not read.
     async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError>;
 
     /// Fetch bytes, verifying them against the address before returning.
@@ -167,7 +222,9 @@ pub trait BlobStore: Send + Sync + Debug {
     /// # Errors
     ///
     /// [`BlobError::NotFound`] if nothing is stored there,
-    /// [`BlobError::Corrupt`] if what is stored does not hash to `digest`.
+    /// [`BlobError::Corrupt`] if what is stored does not hash to `digest`,
+    /// [`BlobError::Expired`] if a tombstone says the bytes were erased, and
+    /// [`BlobError::UnreadableTombstone`] if one is there and does not read.
     async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError>;
 
     /// Drop a blob's bytes, leaving a tombstone that says it was deliberate.
@@ -311,6 +368,33 @@ pub async fn erase_run(
         .destroy(&crate::keyring::scope(tenant, &run.to_string()), at, reason)
         .await
         .map_err(|e| BlobError::Backend(e.to_string()))
+}
+
+/// Re-state a blob failure in the vocabulary a step is refused in.
+///
+/// Only one variant changes shape, and it is the one that is not a fault:
+/// [`BlobError::Expired`] on a *write* means the address was erased, which is a
+/// rule rather than an outage and must not be classified as one. Everything
+/// else keeps its own words inside a backend error, because to a caller holding
+/// a step there is nothing else to do about them.
+pub(crate) fn refusal(e: BlobError) -> crate::core::StoreError {
+    match e {
+        BlobError::Expired { digest, at, reason } => {
+            crate::core::StoreError::BlobErased { digest, at, reason }
+        }
+        other => crate::core::StoreError::Backend(other.to_string()),
+    }
+}
+
+/// [`refusal`] under a name a test may call.
+///
+/// The classification is the half of the rule a caller sees, and it is not
+/// otherwise reachable: `StepCtx::store_blob` is the only in-crate caller and
+/// its own error is wrapped twice by the time a test could read it.
+#[doc(hidden)]
+#[must_use]
+pub fn refusal_for_test(e: BlobError) -> crate::core::StoreError {
+    refusal(e)
 }
 
 /// Check fetched bytes against the address they came from.

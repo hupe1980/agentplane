@@ -2627,6 +2627,27 @@ impl Manifest {
                 "memory formation retention windows must be greater than zero".to_owned(),
             ));
         }
+        // And an upper bound, for a reason the lower one does not share: a
+        // window past the span of the calendar is one there is no instant to
+        // add it to, and the arithmetic that would find that out **panics**
+        // rather than returning. A plane hosting many agents must not abort to
+        // report one document's typo, so the number is refused where somebody
+        // is still holding the file.
+        for (field, seconds) in [
+            ("retention_seconds", formation.retention_seconds),
+            (
+                "access_retention_seconds",
+                formation.access_retention_seconds,
+            ),
+        ] {
+            if seconds.is_some_and(|s| s > crate::core::MAX_WINDOW_SECONDS) {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.memory.formation.{field} is longer than the {} seconds \
+                     between the first and last instant this runtime can name",
+                    crate::core::MAX_WINDOW_SECONDS
+                )));
+            }
+        }
         Ok(())
     }
 

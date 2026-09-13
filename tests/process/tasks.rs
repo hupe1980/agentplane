@@ -416,9 +416,9 @@ async fn an_unanswered_task_denies_by_default() {
     assert!(out.status.is_suspended());
 
     // Long after the window closed.
-    let later = Timestamp::now_utc() + std::time::Duration::from_secs(2_592_000);
+    let later = Timestamp::now_utc() + std::time::Duration::from_hours(720);
     let report =
-        f.rt.sweep(later, std::time::Duration::from_secs(31_536_000))
+        f.rt.sweep(later, std::time::Duration::from_hours(8760))
             .await
             .unwrap();
 
@@ -480,8 +480,8 @@ async fn a_pre_authorised_task_proceeds_unattended() {
         .unwrap();
     assert!(out.status.is_suspended());
 
-    let later = Timestamp::now_utc() + std::time::Duration::from_secs(2_592_000);
-    f.rt.sweep(later, std::time::Duration::from_secs(31_536_000))
+    let later = Timestamp::now_utc() + std::time::Duration::from_hours(720);
+    f.rt.sweep(later, std::time::Duration::from_hours(8760))
         .await
         .unwrap();
 
@@ -512,9 +512,9 @@ async fn an_escalating_task_is_escalated_once() {
     .await
     .unwrap();
 
-    let later = Timestamp::now_utc() + std::time::Duration::from_secs(2_592_000);
+    let later = Timestamp::now_utc() + std::time::Duration::from_hours(720);
     let first =
-        f.rt.sweep(later, std::time::Duration::from_secs(31_536_000))
+        f.rt.sweep(later, std::time::Duration::from_hours(8760))
             .await
             .unwrap();
     assert_eq!(first.tasks_escalated, 1);
@@ -526,7 +526,7 @@ async fn an_escalating_task_is_escalated_once() {
         "an escalated task must leave the overdue scan"
     );
     let second =
-        f.rt.sweep(later, std::time::Duration::from_secs(31_536_000))
+        f.rt.sweep(later, std::time::Duration::from_hours(8760))
             .await
             .unwrap();
     assert_eq!(second.tasks_escalated, 0, "escalating twice is a no-op");
@@ -670,7 +670,7 @@ async fn a_breached_obligation_escalates_the_case() {
             cx.deadline(
                 "acknowledgement",
                 &DeadlineSpec::days(5),
-                Some(std::time::Duration::from_secs(86_400)),
+                Some(std::time::Duration::from_hours(24)),
             )
             .await?;
             Ok(Outcome::done(input))
@@ -700,10 +700,10 @@ async fn a_breached_obligation_escalates_the_case() {
 
     // A day in: the warning threshold has passed but the window has not.
     let warn_time = Timestamp::now_utc()
-        + std::time::Duration::from_secs(345_600)
-        + std::time::Duration::from_secs(43_200);
+        + std::time::Duration::from_hours(96)
+        + std::time::Duration::from_hours(12);
     let warned = rt
-        .sweep(warn_time, std::time::Duration::from_secs(31_536_000))
+        .sweep(warn_time, std::time::Duration::from_hours(8760))
         .await
         .unwrap();
     assert_eq!(warned.warned, 1);
@@ -714,9 +714,9 @@ async fn a_breached_obligation_escalates_the_case() {
     );
 
     // Past the window with the obligation unmet.
-    let after = Timestamp::now_utc() + std::time::Duration::from_secs(2_592_000);
+    let after = Timestamp::now_utc() + std::time::Duration::from_hours(720);
     let breached = rt
-        .sweep(after, std::time::Duration::from_secs(31_536_000))
+        .sweep(after, std::time::Duration::from_hours(8760))
         .await
         .unwrap();
     assert_eq!(breached.breached, 1);
@@ -772,8 +772,8 @@ async fn a_met_obligation_is_not_breached() {
 
     let report = rt
         .sweep(
-            Timestamp::now_utc() + std::time::Duration::from_secs(31_536_000),
-            std::time::Duration::from_secs(31_536_000),
+            Timestamp::now_utc() + std::time::Duration::from_hours(8760),
+            std::time::Duration::from_hours(8760),
         )
         .await
         .unwrap();
@@ -786,12 +786,9 @@ async fn a_met_obligation_is_not_breached() {
 async fn a_quiet_plane_sweeps_quietly() {
     let f = fixture(ProposesRefund::new(OnExpiry::Deny));
     let report =
-        f.rt.sweep(
-            Timestamp::now_utc(),
-            std::time::Duration::from_secs(31_536_000),
-        )
-        .await
-        .unwrap();
+        f.rt.sweep(Timestamp::now_utc(), std::time::Duration::from_hours(8760))
+            .await
+            .unwrap();
     assert!(report.is_quiet());
     assert!(!report.needs_attention());
 }

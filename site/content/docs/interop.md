@@ -179,7 +179,11 @@ Three data paths are built:
   `McpTaskCancel` expose `tasks/get`, `tasks/update` and `tasks/cancel` as
   separate effects. Polling is a replayable read, updates bind the exact
   labelled responses and default to operator recovery, and cooperative cancel
-  is idempotent but never mistaken for proof that work stopped.
+  is idempotent but never mistaken for proof that work stopped. A snapshot
+  carries the server's own cadence hint and `TaskRetention`, which keeps
+  *unlimited* apart from *the server did not say* — poll the second as if a
+  deadline exists, because the answer to a discarded task id is
+  indistinguishable from one that never existed.
 
 For manifested agents, `spec.context` — prompts, resources, and `task_input`
 for answering a server's input requests — is the review artifact and

@@ -29,7 +29,7 @@ unrecognised value as the current one.
 
 | Number | Where it appears | What it governs |
 |---|---|---|
-| `canon` | `RunAdmitted.canon`, export header | The canonical-JSON rule the run's derived digests were computed under |
+| `canon` | `RunAdmitted.canon`, export header | The derivation the run's digests were computed under: the canonical-JSON rule **and** the digest algorithm — see [algorithm agility](#algorithm-agility) |
 | `v` | every record body | The record body's own shape |
 | export `version` | export header | The export file's framing |
 | envelope byte 0 | every sealed payload | The sealed-envelope layout |
@@ -488,6 +488,50 @@ implements this document, reads none of the crate's Rust, verifies the export
 and **re-derives** every record vector from its parsed value. `just
 verify-golden` runs it.
 
+## 12. Algorithm agility {#algorithm-agility}
+
+Every hash and signature here is fixed by this version of the format. Replacing
+one is a **version bump, never an in-place rewrite**: a reader dispatches on the
+version an artifact carries, and stored bytes are never rehashed, so history
+stays verifiable under the algorithm that wrote it.
+
+**Hashes are agile by version**, because a hash belongs to a construction rather
+than to anybody's key:
+
+| Construction | Governed by |
+|---|---|
+| Record digests, the chain, effect keys | `canon`, on `RunAdmitted` |
+| Sealed envelopes | envelope byte 0 |
+| Export framing | the export header's `version` |
+| Merkle leaf, node and root | the checkpoint's `origin` |
+
+`canon` names the whole derivation — the canonical-JSON rule **and** the digest
+algorithm — because the two only ever move together: a reader that cannot
+reproduce a digest cannot check a chain, whichever half changed. A run under an
+unrecognised `canon` is *unverifiable by that reader*, never divergent.
+
+A log's parameters are fixed for the life of its origin, which is what the
+checkpoint format assumes, so a new Merkle hash is a new origin and the old log
+stays checkable under the old one.
+
+**Signatures are agile three different ways**, and the differences are
+deliberate rather than accidental:
+
+- **By key**, for record attestations and checkpoint cosignatures. An
+  attestation names a `key_id` and *not* an algorithm, because an artifact that
+  declares its own is a downgrade waiting to be written; a verifier knows which
+  algorithm each key it accepts carries.
+- **By a named scheme**, for webhook signatures: `v1,` *is* HMAC-SHA256, and a
+  sender mid-rotation offers more than one.
+- **Not at all**, for the Agent Card's JWS. `alg` is compared against a
+  constant, never read from the card, so a card declaring another algorithm is
+  refused rather than honoured. Changing it is a release of this crate.
+
+**Content addresses do not migrate.** A blob's address *is* its digest, so a new
+algorithm yields new addresses and existing blobs keep theirs — nothing needs
+re-addressing, because a record names the digest it always named and that run's
+`canon` says what produced it.
+
 ## Vocabulary {#vocabulary}
 
 Twenty-seven record kinds. A verifier does not interpret them; a reader that
@@ -508,9 +552,12 @@ the second one.
 
 ## What this format does not promise {#not-promised}
 
-**Store row encodings carry no version and are not specified.** The journal is
-the record and the stores are indexes derived from it; a store is rebuilt by
+**Store encodings are not specified here.** The journal is the record and the
+stores are indexes derived from it; a store is rebuilt by
 [`restore`](@/docs/operations.md), which reads this format and proves the
 result by equal Merkle roots at equal size. That is a weaker promise on
 purpose, and it is written down here rather than left to be inferred from
-silence.
+silence. What a store writes beside the data it indexes is its own business:
+the object store's erasure tombstone, for one, does carry a version, because it
+outlives the bytes it describes and a reader that cannot interpret one must say
+so rather than report an erasure it invented.

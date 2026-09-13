@@ -78,9 +78,16 @@ impl ScopedBlobs {
     }
 
     /// Re-state an inner error in terms of the content digest the caller asked
-    /// about. The derived address in a `NotFound` or an `Expired` identifies
-    /// nothing anybody can look up, and leaking it would send an operator
-    /// searching for a digest that is not in any journal.
+    /// about. The derived address identifies nothing anybody can look up, and
+    /// leaking it would send an operator searching for a digest that is not in
+    /// any journal.
+    ///
+    /// Exhaustive over the variants that **carry a digest**, and written so it
+    /// stays that way: a wildcard here is silent about the next variant that
+    /// gains one, which is the same reason `journal::payload::payloads` has no
+    /// catch-all arm. `Corrupt` names both digests it compared and is a
+    /// statement about bytes rather than about an address, so it passes
+    /// through as written.
     fn named(digest: Digest, e: BlobError) -> BlobError {
         match e {
             BlobError::NotFound(_) => BlobError::NotFound(digest.to_hex()),
@@ -89,7 +96,11 @@ impl ScopedBlobs {
                 at,
                 reason,
             },
-            other => other,
+            BlobError::UnreadableTombstone { detail, .. } => BlobError::UnreadableTombstone {
+                digest: digest.to_hex(),
+                detail,
+            },
+            e @ (BlobError::Backend(_) | BlobError::Corrupt { .. }) => e,
         }
     }
 }

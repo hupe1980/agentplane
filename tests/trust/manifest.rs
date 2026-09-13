@@ -3560,6 +3560,63 @@ spec:
     );
 }
 
+/// A retention window is bounded at both ends, and the upper bound is the one
+/// that is not tidiness.
+///
+/// Zero is a window that expires what it just wrote. A window past the span of
+/// the calendar is one there is no instant to add it to — and the arithmetic
+/// that finds that out panics rather than returning, so the refusal has to
+/// happen where somebody is still holding the file. What this does NOT cover:
+/// the second half of the same rule, at the step that forms memory, where a
+/// window inside the ceiling can still land past the last instant because the
+/// run's clock is already near it.
+#[test]
+fn a_retention_window_no_instant_can_carry_is_refused_at_parse() {
+    let agent = |formation: &str| {
+        format!(
+            r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: remembering, version: '1.0.0' }}
+spec:
+  capabilities: {{ provides: [remember.answer] }}
+  models: {{ privileged: {{ provider: fake, model: memory-1 }} }}
+  execution: {{ kind: completion }}
+  memory:
+    formation:
+      subject: team/support
+      purpose: learned-facts
+      instruction: Extract stable facts only.
+      max_items: 2
+{formation}
+  budgets: {{}}
+"
+        )
+    };
+
+    // The legal column is what proves each refusal is about the number and not
+    // about the field being present at all.
+    for field in ["retention_seconds", "access_retention_seconds"] {
+        let ok = agent(&format!("      {field}: 3600"));
+        Manifest::parse(&ok).unwrap_or_else(|e| panic!("{field}: a legal window parses: {e}"));
+
+        for bad in [
+            "0".to_owned(),
+            (agentplane::core::MAX_WINDOW_SECONDS + 1).to_string(),
+            u64::MAX.to_string(),
+        ] {
+            let doc = agent(&format!("      {field}: {bad}"));
+            match Manifest::parse(&doc) {
+                Err(ManifestError::Syntax(detail)) => assert!(
+                    detail.contains("retention"),
+                    "{field}={bad}: refused for the wrong reason: {detail}"
+                ),
+                other => panic!("{field}={bad} was not refused: {other:?}"),
+            }
+        }
+    }
+}
+
 #[cfg(all(feature = "redb", feature = "testkit"))]
 #[tokio::test]
 async fn declared_memory_formation_extracts_and_writes_bounded_facts() {

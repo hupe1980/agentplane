@@ -110,7 +110,7 @@ impl Calendar for WorkingDays {
         let mut at = from;
         let mut left = n;
         while left > 0 {
-            at += std::time::Duration::from_secs(86_400);
+            at += std::time::Duration::from_hours(24);
             if !matches!(
                 at.weekday(),
                 time::Weekday::Saturday | time::Weekday::Sunday
@@ -133,7 +133,7 @@ struct Corrected;
 
 impl Calendar for Corrected {
     fn resolve(&self, from: Timestamp, _s: &DeadlineSpec) -> Result<Timestamp, CalendarError> {
-        Ok(from + std::time::Duration::from_secs(86_313_600))
+        Ok(from + std::time::Duration::from_hours(23976))
     }
     fn digest(&self) -> Digest {
         Digest::of(b"test.calendar.corrected")
@@ -543,7 +543,7 @@ async fn the_sweep_surfaces_due_and_approaching_obligations() {
     let future = agentplane::core::Deadline {
         case,
         name: "distant".into(),
-        resolved_at: now + std::time::Duration::from_secs(2_592_000),
+        resolved_at: now + std::time::Duration::from_hours(720),
         calendar_digest: Digest::of(b"c"),
         warn_at: None,
         state: DeadlineState::Pending,

@@ -274,7 +274,7 @@ async fn a_fired_timer_is_reported_but_is_not_an_incident() {
         .unwrap();
 
     let report =
-        f.rt.sweep(later(120), std::time::Duration::from_secs(86_400))
+        f.rt.sweep(later(120), std::time::Duration::from_hours(24))
             .await
             .unwrap();
     assert_eq!(report.timers_fired, 1);

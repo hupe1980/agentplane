@@ -512,7 +512,19 @@ impl WebhookVerifier {
         // binding the timestamp into the signed content — and checking it first
         // means a flood of replayed captures costs a subtraction each rather
         // than an HMAC each.
-        let skew = now.unix_timestamp() - i64::try_from(at).unwrap_or(i64::MAX);
+        // Saturating rather than bare, and **not** because an overflow is
+        // reachable: `now` is a unix second within the calendar's own range, so
+        // the clamped operand cannot take the difference past `i64` from any
+        // instant this type can name. Written this way so a reader does not
+        // have to do that arithmetic to be sure, and because the clamp feeding
+        // a bare `-` is the shape that reaches an overflow by way of the line
+        // written to prevent one — here it does not, and it is one edit away
+        // from doing so. No test pins it, because none can construct the
+        // difference; what the tests pin is that a timestamp at either edge of
+        // its type is refused as stale.
+        let skew = now
+            .unix_timestamp()
+            .saturating_sub(i64::try_from(at).unwrap_or(i64::MAX));
         let tolerance_secs = self.tolerance.as_secs();
         if skew.unsigned_abs() > tolerance_secs {
             return Err(WebhookRejected::Stale {
@@ -845,6 +857,32 @@ mod tests {
             .is_ok(),
             "a receiver behind a slow queue must be able to widen the window deliberately rather than discover it at the far end of a backlog"
         );
+    }
+
+    /// **A timestamp at the edge of its type is stale, not an overflow.**
+    ///
+    /// `webhook-timestamp` is whatever the sender wrote, and the freshness
+    /// check is the first thing a flood of replayed captures reaches — it runs
+    /// before the MAC precisely so it is cheap. A clamp feeding a bare `-` is
+    /// the shape that reaches an overflow by way of the line written to prevent
+    /// one, so both ends of the range are asserted rather than the plausible
+    /// middle.
+    #[test]
+    fn a_timestamp_at_the_edge_of_its_type_is_stale() {
+        let v = verifier();
+        let sig = signing(KEY).value_for("msg-1", AT, BODY);
+        let now = AT.cast_signed();
+
+        for hostile in [u64::MAX, i64::MAX.unsigned_abs(), 0] {
+            let h = headers("msg-1", hostile, &sig);
+            assert!(
+                matches!(
+                    verify(&v, &h, BODY, now).unwrap_err(),
+                    WebhookRejected::Stale { .. }
+                ),
+                "a timestamp of {hostile} must be refused as stale"
+            );
+        }
     }
 
     /// A missing signature header is a refusal, not a pass.

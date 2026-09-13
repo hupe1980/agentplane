@@ -319,6 +319,122 @@ async fn unclaimed_events_are_dead_lettered_by_the_sweep_not_on_arrival() {
     );
 }
 
+/// **The redelivery pass says when it is behind.**
+///
+/// Every other capped sweep reports saturation, and this is the pass with the
+/// least tolerance for going unreported: a delivery that died between the claim
+/// and the resume blocks every deduplicated retry of itself, so this sweep is
+/// the only driver left for a message that arrived in time. A backlog deeper
+/// than the batch drains a batch per tick while the counters read normal.
+///
+/// The cap is judged on what the pass *examined*, not on what it finished —
+/// a tick whose whole batch is still live-owned has seen as little of the
+/// backlog as one that finished every delivery in it, which is why the fixture
+/// registers waits nothing is buffering for.
+#[tokio::test]
+async fn a_capped_redelivery_pass_says_so() {
+    use agentplane::core::{EffectDescriptor, EffectKey, Phase, RunId, StepId, Subscription};
+
+    let f = fixture("D-6c");
+    let at = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+
+    // One more than a tick will look at.
+    for i in 0..=128u32 {
+        let run = RunId::generate();
+        f.store
+            .subscribe(
+                &Subscription {
+                    run,
+                    case: None,
+                    effect: EffectKey::for_effect(
+                        StepId(0),
+                        Phase::Forward,
+                        0,
+                        1,
+                        &EffectDescriptor::new("event.await", json!({ "n": i })),
+                    ),
+                    step: StepId(0),
+                    phase: Phase::Forward,
+                    kind: "never.arrives".to_owned(),
+                    correlation: vec![key(&format!("W-{i}"))],
+                },
+                at,
+            )
+            .await
+            .unwrap();
+    }
+
+    let report =
+        f.rt.sweep(at, std::time::Duration::from_mins(5))
+            .await
+            .unwrap();
+    assert!(
+        report.saturated.redeliveries,
+        "the pass took its full batch and reported an ordinary tick — the one \
+         backlog whose entries block their own retries grows while the numbers \
+         look normal: {report:?}"
+    );
+    assert!(
+        report.needs_attention(),
+        "a saturated sweep is exactly when a human should look"
+    );
+
+    // And a plane with a handful of waits is not flagged, so the signal means
+    // something. A second sweep here would still be saturated — nothing
+    // consumes a subscription nobody is delivering to — so the negative half
+    // needs its own plane.
+    let quiet = fixture("D-6d");
+    let ordinary = quiet
+        .rt
+        .sweep(at, std::time::Duration::from_mins(5))
+        .await
+        .unwrap();
+    assert!(
+        !ordinary.saturated.redeliveries,
+        "an ordinary tick reported a capped redelivery pass: {ordinary:?}"
+    );
+}
+
+/// **A grace window longer than the calendar retires nothing, rather than
+/// ending the tick.**
+///
+/// The conversion to the calendar's own duration type already saturated, with a
+/// comment saying a window that long means *retire nothing*. The subtraction
+/// under it did not, and `time` panics on underflow — so the saturation was the
+/// line that guaranteed the abort, in the pass that shares a tick with breaching
+/// obligations and recovering abandoned runs.
+///
+/// The short-grace half is what makes this a test rather than a smoke check: the
+/// same event the long window spares is retired the moment the window is one a
+/// person would type.
+#[tokio::test]
+async fn a_grace_window_past_the_calendar_retires_nothing() {
+    let f = fixture("D-6b");
+
+    let orphan = reply("EV-6b", "NOBODY-WAITS-FOR-THIS", json!({}));
+    assert_eq!(f.rt.deliver(&orphan).await.unwrap(), Delivery::Buffered);
+
+    let retired =
+        f.rt.sweep_events(std::time::Duration::MAX)
+            .await
+            .expect("a window nobody can subtract is an answer, not an abort");
+    assert_eq!(
+        retired, 0,
+        "a grace window past the calendar retired something"
+    );
+    assert!(
+        f.store.dead_letters(10).await.unwrap().is_empty(),
+        "the event was held, which is what an unbounded hold means"
+    );
+
+    assert_eq!(
+        f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap(),
+        1,
+        "and the same event ages out under a window somebody would type, so \
+         the check above is about the window and not about the event"
+    );
+}
+
 /// The sweep does not retire an event a run is actively waiting for.
 #[tokio::test]
 async fn the_sweep_leaves_claimed_events_alone() {
@@ -540,7 +656,7 @@ async fn the_grace_window_is_respected() {
         .unwrap();
 
     let retired =
-        f.rt.sweep_events(std::time::Duration::from_secs(2_592_000))
+        f.rt.sweep_events(std::time::Duration::from_hours(720))
             .await
             .unwrap();
     assert_eq!(retired, 0, "recent events are still claimable");

@@ -67,8 +67,8 @@ pub use event::{
     AwaitSpec, DeadLetter, Delivery, InboundEvent, Subscription, SuspendReason, Timer,
 };
 pub use id::{
-    BatchId, CaseId, Digest, EffectKey, Epoch, Phase, RunId, Seq, StepId, Timestamp,
-    format_timestamp,
+    BatchId, CaseId, Digest, EffectKey, Epoch, MAX_WINDOW_SECONDS, Phase, RunId, Seq, StepId,
+    Timestamp, first_instant, format_timestamp, last_instant, seconds_after,
 };
 pub use identity::{Delegation, DelegationError, MAX_DELEGATION_DEPTH, Principal, Scope};
 pub use label::{

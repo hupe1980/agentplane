@@ -784,13 +784,20 @@ declared `privileged` model.
 | `purpose` | **required** | Mandatory retrieval partition. |
 | `instruction` | **required** | What the extraction model is asked to record. |
 | `max_items` | `3` | Between 1 and 10. |
-| `retention_seconds` | none | Fixed expiry. |
-| `access_retention_seconds` | none | Sliding expiry, refreshed by an explicit journaled touch. |
+| `retention_seconds` | none | Fixed expiry. Seconds, and the window is bounded at both ends — see below. |
+| `access_retention_seconds` | none | Sliding expiry, refreshed by an explicit journaled touch. Same bounds. |
 | `max_sensitivity` | `public` | Ceiling on what the forming model may be shown. |
 
 The model proposes bounded key/content pairs, both strings; the **runtime**
 derives ids, taint, provenance and retention. Trust is never taken from what
 the content says.
+
+**Both retention windows are bounded at each end.** Zero is refused, because it
+expires what it just wrote. So is anything longer than the span between the
+first and last instant a timestamp can name (631,107,417,599 seconds), which is
+a window there is no `now` to add it to. A window inside the bound can still
+land past the last instant when the run's own clock is near it, and the step
+that forms the memory refuses that too.
 
 ### Binding the subject to the party a run is about
 

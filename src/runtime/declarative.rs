@@ -601,7 +601,17 @@ impl Declarative {
         };
         let expires_at = if let Some(seconds) = declaration.retention_seconds {
             let now = cx.now().await?;
-            Some(now + time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX)))
+            // The parser refuses a window no instant can carry, so this is the
+            // second half of that rule rather than the whole of it: a window
+            // inside the ceiling can still land past the last instant when the
+            // run's own clock is already near it.
+            Some(crate::core::seconds_after(now, seconds).ok_or_else(|| {
+                SkillError::Other(format!(
+                    "a retention window of {seconds}s from {} is past the last instant \
+                     this runtime can name",
+                    crate::core::format_timestamp(now)
+                ))
+            })?)
         } else {
             None
         };

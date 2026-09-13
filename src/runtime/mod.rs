@@ -53,4 +53,4 @@ pub struct SemanticMemory {
     pub(crate) embedder: std::sync::Arc<dyn crate::memory::Embedder>,
     pub(crate) retriever: std::sync::Arc<dyn crate::memory::SemanticRetriever>,
 }
-pub use sweeper::{Saturation, SweepReport, WokenRuns};
+pub use sweeper::{Redelivered, Saturation, SweepReport, WokenRuns};

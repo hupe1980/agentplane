@@ -1150,6 +1150,28 @@ pub enum StoreError {
     )]
     CaseClosed { case: String },
 
+    /// A write was refused because the address it names has been erased.
+    ///
+    /// Content addressing makes the address the content, so a run producing the
+    /// same bytes a second time lands on the erased object. Taking the write
+    /// would put the data back — silently, under a tombstone that still records
+    /// when and why it went — which is an erasure reported as discharged and
+    /// then reversed by ordinary work.
+    ///
+    /// Typed rather than a [`Backend`](Self::Backend) string for the reason
+    /// every refusal here is: retrying cannot help, the store is healthy, and a
+    /// business rule wearing a storage fault's type is read as an outage by
+    /// everything that classifies one.
+    #[error(
+        "blob {digest} was erased at {at} ({reason}); storing these bytes again would \
+         put back what somebody asked to have removed"
+    )]
+    BlobErased {
+        digest: String,
+        at: i64,
+        reason: String,
+    },
+
     /// An obligation was moved out of a state it may not leave.
     ///
     /// Met, breached and withdrawn are the three ways an obligation ends, and
