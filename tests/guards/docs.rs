@@ -1233,12 +1233,36 @@ fn no_doc_comment_has_absorbed_the_one_below_it() {
                              `{}` closes a paragraph directly after another complete \
                              sentence, which is what an absorbed doc comment looks \
                              like. If it belongs to the item below, move it there; if \
-                             it is a punchline for the paragraph above, give it its \
-                             own `///` blank line",
+                             it is a punchline for the paragraph above, join it to \
+                             that paragraph. Do **not** separate it with a blank \
+                             `///` line to quieten this: that is the shape the \
+                             no-summary check below exists to catch, and moving a \
+                             defect between two detectors is not fixing it",
                             start + k,
                             block[k]
                         ));
                     }
+                }
+                // The other half, and the one the typographic check above
+                // cannot reach. An absorbed doc block leaves a footprint at the
+                // item *below* it: that item is left with only its `# Errors`
+                // or `# Panics` section and no summary, which rustdoc renders
+                // as an empty description. Checking for that is sound where the
+                // paragraph shape is a heuristic — there is no legitimate
+                // reason for a documented item to open on a section header —
+                // and it catches the absorption whether or not a blank line
+                // separates the two halves. The netguard SSRF gate was absorbed
+                // into the error enum below it with a blank line between, which
+                // is precisely the case `absorbed_summary` returns false for.
+                if let Some(first) = block.iter().find(|l| !l.is_empty())
+                    && SECTIONS.iter().any(|s| first.starts_with(s))
+                {
+                    merged.push(format!(
+                        "{rel}:{start} opens on `{first}` and has no summary — \
+                         rustdoc renders this item with an empty description. \
+                         Either its summary was absorbed by the doc comment \
+                         above it, or it never had one; both want the same fix"
+                    ));
                 }
                 block.clear();
             }
@@ -1785,13 +1809,29 @@ fn the_published_no_provider_message_is_the_one_the_runtime_writes() {
 /// would let real drift hide behind whichever page carried the exemption, so
 /// the guard asserts the *absence* instead: adding one of these fails, which is
 /// correct, because two documents would then be wrong the other way.
-const ABSENT_BY_DESIGN: &[(&str, &str)] = &[("Egress", "allow_all")];
+const ABSENT_BY_DESIGN: &[(&str, &str)] = &[
+    ("Egress", "allow_all"),
+    // Names the **upgrading** page cites because they were removed or renamed.
+    // That page is a historical record: its job is to say *this used to be X*,
+    // so the old spelling appearing there is correct and the guard asserts the
+    // absence rather than exempting the page. Re-adding one of these would make
+    // an upgrade note wrong in the other direction, which is why this list
+    // fails on resurrection instead of on mention.
+    ("McpTaskSnapshot", "ttl_ms"),
+    ("PlanNode", "with_quorum"),
+    ("Spend", "is_zero"),
+    ("Runtime", "halted"),
+    ("QuotaStore", "accrue"),
+    ("PushSweepReport", "abandoned"),
+    ("KeyRing", "rewrap"),
+];
 
 /// Types this crate does not own.
 ///
 /// Named rather than pattern-matched: an "anything not in `src/`" rule would
 /// silently grow to cover the crate's own types the moment one was renamed.
 const FOREIGN_TYPES: &[&str] = &[
+    "Span",
     "Duration",
     "Value",
     "String",
@@ -1864,6 +1904,39 @@ fn declared_function_names(root: &Path) -> std::collections::BTreeSet<String> {
             let line = line.trim_start();
             if let Some(name) = name_after("pub ", line).or_else(|| name_after("", line)) {
                 declared.insert(name);
+            }
+            // Public fields, consts and enum variants. A page cites
+            // `Justification::summary` and `AuditReport::warrants` the same way
+            // it cites a method, and a scan that knew only about `fn` would
+            // report both as invented the moment the parenthesis rule below
+            // stopped hiding them.
+            if let Some(rest) = line.strip_prefix("pub ") {
+                let field: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !field.is_empty() && rest[field.len()..].starts_with(':') {
+                    declared.insert(field);
+                }
+                let konst: String = rest
+                    .strip_prefix("const ")
+                    .unwrap_or("")
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !konst.is_empty() {
+                    declared.insert(konst);
+                }
+            }
+            // An enum variant, wherever the crate names one by path.
+            if let Some((_, after)) = line.split_once("::") {
+                let variant: String = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if variant.chars().next().is_some_and(char::is_uppercase) {
+                    declared.insert(variant);
+                }
             }
         }
     }
@@ -1964,12 +2037,15 @@ fn every_documented_associated_function_exists() {
                         j += 1;
                     }
                     let member: String = bytes[i + 2..j].iter().collect();
-                    let followed_by_call = bytes.get(j).is_some_and(|c| *c == '(');
                     let is_type = ty.chars().next().is_some_and(char::is_uppercase);
                     let is_fn = member.chars().next().is_some_and(char::is_lowercase);
+                    // **No parenthesis requirement.** It used to be one, and it
+                    // was the blind spot: these pages cite a member as
+                    // `BlobStore::expire` far more often than as a call, so the
+                    // rule checked the minority spelling and let an invented
+                    // name through in the majority one.
                     if is_type
                         && is_fn
-                        && followed_by_call
                         && !FOREIGN_TYPES.contains(&ty.as_str())
                         && !ABSENT_BY_DESIGN.contains(&(ty.as_str(), member.as_str()))
                         && !declared.contains(&member)
@@ -2762,4 +2838,241 @@ fn the_second_implementation_is_run_and_stays_independent() {
              of the first one"
         );
     }
+}
+
+/// **The changelog's newest entry is this version, and a released version is
+/// not still "unreleased".**
+///
+/// Two ways this drifts, and both happened. A section headed `unreleased` stays
+/// headed that way after the tag is cut, so the next round's entries land in a
+/// version somebody already depends on — the one document written for a reader
+/// who has pinned a version, describing changes that are not in it. And
+/// `Cargo.toml` moves without the changelog gaining a section, or the reverse,
+/// so the top of the file names a version that was never published.
+///
+/// The tag is the authority on *released*: it is what a reader can check out.
+/// Skipped rather than failed where git cannot answer — a packaged crate has no
+/// repository, and a red suite for a missing tool teaches people to ignore red
+/// suites.
+#[test]
+fn the_changelog_top_entry_is_this_version_and_released_ones_are_dated() {
+    let log = read("CHANGELOG.md");
+    let version = env!("CARGO_PKG_VERSION");
+
+    let headings: Vec<&str> = log.lines().filter(|l| l.starts_with("## [")).collect();
+    assert!(
+        headings.len() > 5,
+        "only {} version headings were found — the changelog's format changed and \
+         this guard is now inert",
+        headings.len()
+    );
+
+    // **One section per kind per release.** Keep a Changelog's sections are a
+    // reader's index: two `### Security` blocks under one version means the
+    // entries a deployment must act on are split across a page, and the second
+    // block is the one nobody scrolls to. Easy to introduce by adding a section
+    // that already exists further down, and invisible in review.
+    let mut version_starts: Vec<usize> =
+        log.match_indices("\n## [").map(|(at, _)| at + 1).collect();
+    version_starts.push(log.len());
+    for pair in version_starts.windows(2) {
+        let section = &log[pair[0]..pair[1]];
+        let name = section.lines().next().unwrap_or_default();
+        let mut kinds: Vec<&str> = section
+            .lines()
+            .filter_map(|l| l.strip_prefix("### "))
+            .collect();
+        let total = kinds.len();
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(
+            kinds.len(),
+            total,
+            "{name} repeats a section heading — a reader's index for that release \
+             is split, and the half nobody scrolls to is the half they miss"
+        );
+    }
+
+    let top = headings[0];
+    assert!(
+        top.contains(&format!("[{version}]")),
+        "the changelog's newest entry is {top:?} but this crate is {version} — \
+         either the bump did not reach the changelog or the changelog names a \
+         version that was never published"
+    );
+
+    let Ok(tags) = std::process::Command::new("git")
+        .args(["tag", "--list"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+    else {
+        return; // No git: nothing to check released-ness against.
+    };
+    if !tags.status.success() {
+        return;
+    }
+    let tags = String::from_utf8_lossy(&tags.stdout);
+    let tagged: Vec<&str> = tags.lines().map(str::trim).collect();
+
+    assert!(
+        !tagged.iter().any(|t| *t == format!("v{version}")),
+        "v{version} is tagged, so it is released, and `Cargo.toml` still says \
+         {version} — the next change would be written into a version somebody \
+         already depends on. Bump first."
+    );
+    for heading in &headings {
+        if !heading.contains("unreleased") {
+            continue;
+        }
+        let named = heading
+            .split_once('[')
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(v, _)| v)
+            .unwrap_or_default();
+        assert!(
+            !tagged.iter().any(|t| *t == format!("v{named}")),
+            "the changelog calls {named} unreleased and v{named} is tagged — a \
+             reader who pinned it is being told about changes it does not contain"
+        );
+    }
+}
+
+/// **A documented `agentplane` command line actually parses.**
+///
+/// The recovery drill is the block an operator copies during an incident, and a
+/// flag that does not exist fails there rather than in review. Every command in
+/// it had drifted — a positional documented as `--file`, `--anchor` for what is
+/// spelled `--checkpoint`, an `--out` that was never a flag — while the same
+/// page spelled `export` correctly two hundred lines earlier.
+///
+/// Read out of the source rather than by running the binary, for the reason
+/// the route walk is: a test that shells out is a test that is skipped wherever
+/// the binary is not built.
+///
+/// `upgrading.md` is exempt. Showing the old spelling beside the new one is
+/// that page's whole content.
+#[test]
+fn every_documented_command_line_uses_flags_the_cli_has() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cli = std::fs::read_to_string(root.join("src/bin/agentplane.rs")).expect("the cli");
+
+    // `Verb::Retain(RetainArgs)` → which struct carries a verb's flags.
+    let mut verb_args: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for line in cli.lines().map(str::trim) {
+        if let Some((name, rest)) = line.split_once('(') {
+            let name = name.trim();
+            let ty = rest
+                .trim_end_matches("),")
+                .replace("Box<", "")
+                .replace('>', "");
+            if !name.is_empty()
+                && name.chars().next().is_some_and(char::is_uppercase)
+                && name.chars().all(char::is_alphanumeric)
+                && ty.ends_with("Args")
+            {
+                verb_args.insert(kebab(name), ty);
+            }
+        }
+    }
+    assert!(
+        verb_args.len() > 8,
+        "only {} verbs were parsed out of the CLI — its shape moved and this \
+         guard is now inert",
+        verb_args.len()
+    );
+
+    // Each struct's long flags, including the renamed ones.
+    let flags_of = |ty: &str| -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        let Some(at) = cli.find(&format!("struct {ty} {{")) else {
+            return out;
+        };
+        let body = &cli[at..];
+        let end = body.find("\n}").map_or(body.len(), |e| e + 2);
+        let body = &body[..end];
+        let mut renamed = None;
+        for line in body.lines().map(str::trim) {
+            if line.starts_with("#[arg(") {
+                renamed = line
+                    .split("long = \"")
+                    .nth(1)
+                    .and_then(|r| r.split('"').next())
+                    .map(str::to_owned);
+                if line.contains("long") {
+                    continue;
+                }
+            }
+            if let Some((field, _)) = line.split_once(':')
+                && !field.starts_with("//")
+                && !field.starts_with('#')
+                && field.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && !field.is_empty()
+            {
+                let name = renamed.take().unwrap_or_else(|| kebab_field(field));
+                out.insert(format!("--{name}"));
+            }
+        }
+        out.insert("--help".to_owned());
+        out
+    };
+
+    let mut pages: Vec<std::path::PathBuf> = walk(&root.join("site/content/docs"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "md") && !p.ends_with("upgrading.md"))
+        .collect();
+    pages.push(root.join("README.md"));
+
+    let mut missing = Vec::new();
+    for page in &pages {
+        let text = std::fs::read_to_string(page).expect("a readable page");
+        // Shell continuations, so a multi-line invocation is read whole.
+        let joined = text.replace("\\\n", " ");
+        let rel = page.strip_prefix(root).unwrap_or(page).display();
+        for (number, line) in joined.lines().enumerate() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("agentplane ") else {
+                continue;
+            };
+            let Some(verb) = rest.split_whitespace().next() else {
+                continue;
+            };
+            let Some(ty) = verb_args.get(verb) else {
+                continue; // prose, or a verb that takes no flags
+            };
+            let have = flags_of(ty);
+            // Inline `# …` annotations are documentation, not arguments.
+            let args: String = rest.split('`').step_by(2).collect::<Vec<_>>().join(" ");
+            for word in args.split_whitespace() {
+                let word = word.trim_end_matches(['\\', ',']);
+                if word.starts_with("--") && !have.contains(word) {
+                    missing.push(format!("{rel}:{}: `agentplane {verb} {word}`", number + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these pages document a flag the CLI does not have — an operator copying \
+         the line gets a parse error, and the block they copy under pressure is \
+         the recovery drill:\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// `Run` → `run`, for a verb name.
+fn kebab(variant: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in variant.char_indices() {
+        if c.is_uppercase() && i > 0 {
+            out.push('-');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
+/// `older_than_days` → `older-than-days`, clap's default long-flag spelling.
+fn kebab_field(field: &str) -> String {
+    field.replace('_', "-")
 }

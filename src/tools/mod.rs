@@ -36,6 +36,10 @@
 
 #[cfg(feature = "mcp")]
 mod mcp;
+/// Serving MCP: the other direction from the host side of this module, where a
+/// model's host calls in and a governed run happens.
+#[cfg(feature = "mcp-server")]
+pub mod serve;
 // Not gated on a transport: a typed tool is a tool this process implements, and
 // needs no wire at all.
 mod typed;

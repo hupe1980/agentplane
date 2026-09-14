@@ -1204,6 +1204,41 @@ impl MemoryStore for RedbStore {
         .await
     }
 
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let tenant = self.tenant_name();
+        let after = after.map(ToOwned::to_owned);
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            // An absent table is an empty listing, not a fault: nothing has ever
+            // been held on this store.
+            let Ok(holds) = r.open_table(HOLDS) else {
+                return Ok(Vec::new());
+            };
+            let lo = after.as_deref().unwrap_or("");
+            let mut out = Vec::new();
+            for e in holds
+                .range((tenant.as_str(), lo)..=(tenant.as_str(), MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, _) = e.map_err(|e| be(&e))?;
+                let id = k.value().1;
+                if after.as_deref() == Some(id) {
+                    continue;
+                }
+                out.push(id.to_owned());
+            }
+            Ok(out)
+        })
+        .await
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn sweep_expired(&self, at: crate::core::Timestamp) -> Result<usize, StoreError> {
         let tenant = self.tenant_name();

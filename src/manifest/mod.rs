@@ -260,6 +260,12 @@ pub struct Spec {
     /// silence that costs money, not the silence that costs nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Models>,
+    /// The shape of what this agent takes.
+    ///
+    /// Optional, because a caller writing Rust against a skill it also wrote
+    /// needs no declaration. See [`Input`] for the caller that does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<Input>,
     /// The shape of what this agent returns.
     ///
     /// Optional, because not every agent has a machine-readable result. See
@@ -935,6 +941,26 @@ fn role(r: &ModelRef) -> crate::model::ModelRole {
     }
 }
 
+/// The shape a caller must send.
+///
+/// The mirror of [`Output`], for the caller a result contract never had to
+/// consider: **a model composing the arguments.** An embedder calling
+/// `run_under` holds the shape in its own code on both sides and an A2A peer's
+/// message is the sender's problem — neither is true once an agent is offered
+/// as a tool to somebody else's model.
+///
+/// Covered by [`Manifest::digest`], so the schema a model was offered on a
+/// given run is the schema somebody approved. Held to the rule
+/// [`Output::schema`] is held to: `{}` permits anything while reading as a
+/// declaration, so an agent that genuinely takes anything omits `input`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Input {
+    /// A JSON Schema, carried opaquely — never parsed as a schema by this
+    /// crate, only checked to be a non-empty object.
+    pub schema: serde_json::Value,
+}
+
 /// The shape an agent promises its callers.
 ///
 /// `capabilities.provides` names a capability; this says what comes back. A
@@ -1563,6 +1589,7 @@ impl Manifest {
         self.validate_context_grants()?;
         self.validate_topology()?;
         self.validate_models()?;
+        self.validate_input()?;
         self.validate_output()?;
         self.validate_declared_schemas()?;
         self.validate_memory()?;
@@ -2721,31 +2748,44 @@ impl Manifest {
     }
 
     /// A result contract that constrains nothing is not a contract.
+    fn validate_input(&self) -> Result<(), ManifestError> {
+        let Some(input) = &self.spec.input else {
+            return Ok(());
+        };
+        Self::schema_is_a_constraint(&input.schema, "spec.input.schema")
+    }
+
+    /// One rule for both schema declarations, because they are one rule.
+    ///
+    /// Written once rather than twice: two copies of *a declared schema must
+    /// constrain something* agree until somebody fixes one of them.
+    fn schema_is_a_constraint(
+        schema: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<(), ManifestError> {
+        match schema {
+            serde_json::Value::Object(m) if !m.is_empty() => Ok(()),
+            // `{}` parses as JSON Schema and permits everything, so it
+            // reads as a declared contract while promising nothing.
+            serde_json::Value::Object(_) => Err(ManifestError::Empty(field)),
+            other => Err(ManifestError::NotASchema {
+                found: match other {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "a boolean",
+                    serde_json::Value::Number(_) => "a number",
+                    serde_json::Value::String(_) => "a string",
+                    serde_json::Value::Array(_) => "an array",
+                    serde_json::Value::Object(_) => unreachable!(),
+                },
+            }),
+        }
+    }
+
     fn validate_output(&self) -> Result<(), ManifestError> {
         let Some(output) = &self.spec.output else {
             return Ok(());
         };
-        match &output.schema {
-            serde_json::Value::Object(m) if !m.is_empty() => {}
-            // `{}` parses as JSON Schema and permits everything, so it
-            // reads as a declared contract while promising nothing.
-            serde_json::Value::Object(_) => {
-                return Err(ManifestError::Empty("spec.output.schema"));
-            }
-            other => {
-                return Err(ManifestError::NotASchema {
-                    found: match other {
-                        serde_json::Value::Null => "null",
-                        serde_json::Value::Bool(_) => "a boolean",
-                        serde_json::Value::Number(_) => "a number",
-                        serde_json::Value::String(_) => "a string",
-                        serde_json::Value::Array(_) => "an array",
-                        serde_json::Value::Object(_) => unreachable!(),
-                    },
-                });
-            }
-        }
-        Ok(())
+        Self::schema_is_a_constraint(&output.schema, "spec.output.schema")
     }
 
     /// The manifest format, as one JSON Schema document (draft-07).
@@ -2888,6 +2928,16 @@ impl Manifest {
     #[must_use]
     pub fn output_schema(&self) -> Option<&serde_json::Value> {
         self.spec.output.as_ref().map(|o| &o.schema)
+    }
+
+    /// The reviewed shape this agent takes, when it declares one.
+    ///
+    /// This is what a catalogue offers a model — an MCP tool's `inputSchema`,
+    /// an Agent Card's skill declaration — so that the shape a model composed
+    /// arguments against is one somebody approved, under a digest.
+    #[must_use]
+    pub fn input_schema(&self) -> Option<&serde_json::Value> {
+        self.spec.input.as_ref().map(|i| &i.schema)
     }
 
     /// The budget this manifest declares.

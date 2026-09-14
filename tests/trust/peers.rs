@@ -1230,3 +1230,127 @@ spec:
         .expect("a coherent peer grant builds");
     }
 }
+
+/// A skill reaching a peer task through the `StepCtx` wrappers rather than by
+/// building the effect itself.
+#[derive(Debug)]
+struct UsesTheWrappers {
+    cancel: bool,
+}
+
+#[async_trait::async_trait]
+impl Skill for UsesTheWrappers {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("wrappers").provides("peer.wrappers")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let task = PeerTask {
+            peer: reviewer(),
+            id: "remote-task-42".to_owned(),
+            context_id: Some("matter-1".to_owned()),
+        };
+        let snapshot = if self.cancel {
+            cx.cancel_peer_task(task).await?
+        } else {
+            cx.peer_task(task).await?
+        };
+        Ok(Outcome::done(snapshot.map(|value| {
+            serde_json::to_value(value).expect("task snapshot serializes")
+        })))
+    }
+}
+
+/// **The peer-task wrappers refuse when no peers are wired, rather than at the
+/// socket.**
+///
+/// `cx.peer_task` and `cx.cancel_peer_task` are the surface an embedder writes
+/// against, and the effects underneath them are covered elsewhere. What is only
+/// theirs is the wiring lookup: a plane built without `.peers(..)` has no
+/// registry and no client, and the documented answer is a refusal before
+/// anything is dispatched. The failure this rules out is a wrapper that reaches
+/// dispatch with nothing behind it and surfaces as a transport error, which
+/// classifies as *in doubt* and sends an operator looking for a network.
+#[tokio::test]
+async fn the_peer_task_wrappers_refuse_a_plane_with_no_peers() {
+    for cancel in [false, true] {
+        let rt = Runtime::builder(store())
+            .owner("peers")
+            .skill(UsesTheWrappers { cancel })
+            .build();
+        let out = rt
+            .run("peer.wrappers", Tainted::trusted(json!({})))
+            .await
+            .expect("the run is admitted; the refusal is inside the step");
+        assert!(
+            matches!(out.status, RunStatus::Failed(_)),
+            "a plane with no peers wired must refuse the call, not attempt it \
+             (cancel = {cancel}): {:?}",
+            out.status
+        );
+    }
+}
+
+/// **And with peers wired they dispatch through the registry to the client.**
+///
+/// The positive half, so the test above cannot pass by the wrappers being
+/// broken in every configuration. The two verbs end differently here and both
+/// endings are the point: the read reaches the peer and succeeds, and the
+/// cancel reaches the peer and is refused *by the transport* — a refusal that
+/// can only be produced past the wiring lookup, which is the step being tested.
+#[tokio::test]
+async fn the_peer_task_wrappers_dispatch_through_the_registry() {
+    let spy = Arc::new(Spy::default());
+    let registry = PeerRegistry::new().allow(
+        reviewer(),
+        PeerGrant::new(Scope::of(["audit.check"])).read_only(),
+    );
+    let rt = Runtime::builder(store())
+        .owner("peers")
+        .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+        .skill(UsesTheWrappers { cancel: false })
+        .build();
+
+    let out = rt
+        .run("peer.wrappers", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    assert_eq!(
+        out.status,
+        RunStatus::Succeeded,
+        "cx.peer_task did not reach the peer"
+    );
+    assert_eq!(
+        spy.task_reads.lock().unwrap().len(),
+        1,
+        "exactly one peer task read left the plane"
+    );
+
+    // The cancel wrapper, against a transport that does not offer cancellation.
+    let spy = Arc::new(Spy::default());
+    let registry = PeerRegistry::new().allow(
+        reviewer(),
+        PeerGrant::new(Scope::of(["audit.check"])).read_only(),
+    );
+    let rt = Runtime::builder(store())
+        .owner("peers")
+        .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+        .skill(UsesTheWrappers { cancel: true })
+        .build();
+    let out = rt
+        .run("peer.wrappers", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    let RunStatus::Failed(reason) = &out.status else {
+        panic!("expected the transport's refusal, got {:?}", out.status);
+    };
+    assert!(
+        reason.contains("does not support task cancellation"),
+        "cx.cancel_peer_task did not reach the transport — this refusal is only \
+         reachable past the wiring lookup: {reason}"
+    );
+}

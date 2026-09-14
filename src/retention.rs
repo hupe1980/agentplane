@@ -28,6 +28,16 @@
 //! the design, not a shortfall — the chain committed to ciphertext precisely so
 //! an auditor with no keys can still verify a run whose payloads are gone.
 //!
+//! # What stops it
+//!
+//! A [`LegalHold`](crate::core::LegalHold) on a case, and nothing else. It is
+//! the only thing in this crate that makes an erasure fail rather than succeed,
+//! and it exists because a retention pass is *automatic*: it runs on a window
+//! nobody re-reads, and the matter somebody has been ordered to preserve looks
+//! exactly like every other closed case old enough to sweep. A held case is
+//! reported in [`RetentionReport::held`] — never in `failures`, because the
+//! sweep did what it was told.
+//!
 //! **Without a key ring, journal payloads are permanent.** Blob tombstones
 //! still land, and they cover the live store only. This is the residual the
 //! erasure page names, and this pass reports it in
@@ -67,6 +77,15 @@ pub struct RetentionReport {
     /// believe an erasure obligation is discharged when the journal still holds
     /// the payload verbatim.
     pub not_erasable: Vec<String>,
+    /// Cases that were past the window and are **preserved on instruction**,
+    /// with the reason each hold was placed for.
+    ///
+    /// Its own field rather than an entry in [`failures`](Self::failures): a
+    /// failure is the pass not working, a hold is the pass working. Folding
+    /// them together pages somebody about a control doing its job — and once
+    /// that noise is filtered, hides a real failure among entries everyone has
+    /// learned to ignore.
+    pub held: Vec<String>,
 }
 
 impl RetentionReport {
@@ -75,6 +94,11 @@ impl RetentionReport {
     /// Deliberately **not** "everything is gone": see
     /// [`not_erasable`](Self::not_erasable), which is a separate answer and the
     /// one an erasure request actually turns on.
+    ///
+    /// A held case does not make a pass incomplete. The sweep did exactly what
+    /// it was told; reporting otherwise would make a legal hold look like a
+    /// malfunction, and the first thing a deployment does with a pass that
+    /// always reports incomplete is stop reading its output.
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.failures.is_empty()
@@ -91,8 +115,16 @@ impl RetentionReport {
 pub struct RetentionPlan {
     /// Cases considered.
     pub scanned: usize,
-    /// Closed cases opened before the cutoff, in walk order.
+    /// Closed cases opened before the cutoff **and not under hold**, in walk
+    /// order. What a pass would actually erase.
     pub due: Vec<crate::core::CaseId>,
+    /// Cases that met the window and are preserved on instruction.
+    ///
+    /// Listed rather than dropped, because the operator planning a sweep is
+    /// exactly the person who needs to know a hold is why a matter they expected
+    /// to go is staying — and a dry run that silently omitted them would answer
+    /// *nothing is due* for a window full of held cases.
+    pub held: Vec<crate::core::CaseId>,
 }
 
 /// Select every closed case opened before `older_than`, erasing nothing.
@@ -107,6 +139,7 @@ pub async fn plan(
     let mut plan = RetentionPlan {
         scanned: 0,
         due: Vec::new(),
+        held: Vec::new(),
     };
     let mut after = None;
     loop {
@@ -121,7 +154,16 @@ pub async fn plan(
             // A case still open is a matter still running. Erasing underneath a
             // live run turns a retention pass into an outage.
             if case.status == CaseStatus::Closed && case.opened_at < older_than {
-                plan.due.push(case.id);
+                // The hold is read here so a dry run and a pass agree about what
+                // would happen. It is read *again* inside `erase_case`, and that
+                // is not redundancy: a hold placed between the two reads has to
+                // be honoured, and only the check that sits against the
+                // destruction can honour it.
+                if cases.hold(case.id).await?.is_some() {
+                    plan.held.push(case.id);
+                } else {
+                    plan.due.push(case.id);
+                }
             }
         }
         if !full {
@@ -180,6 +222,7 @@ pub async fn retain(
         blobs_expired: 0,
         failures: Vec::new(),
         not_erasable: Vec::new(),
+        held: Vec::new(),
     };
 
     // Stated before anything is erased, so a report that fails early still
@@ -216,6 +259,19 @@ pub async fn retain(
 
     let selected = plan(stores.cases.as_ref(), older_than).await?;
     report.scanned = selected.scanned;
+    // Held cases are named from the plan, so the report says which matters were
+    // preserved even when no erasure was attempted for them. The
+    // `UnderLegalHold` arm below still fires — for a hold placed after the plan
+    // was taken, which is the only way one reaches `erase_case`.
+    for case in &selected.held {
+        let reason = stores.cases.hold(*case).await.ok().flatten().map_or_else(
+            || "hold released while this pass ran".to_owned(),
+            |h| format!("placed at {} — {}", h.placed_at, h.reason),
+        );
+        report.held.push(format!(
+            "case {case}: preserved under a legal hold, {reason}"
+        ));
+    }
     for case in selected.due {
         let erased = crate::blob::erase_case(
             stores.blobs.map(std::convert::AsRef::as_ref),
@@ -233,6 +289,16 @@ pub async fn retain(
                 report.erased += 1;
                 report.blobs_expired += n;
             }
+            // The control working, not the pass failing — and nothing was
+            // destroyed, because `erase_case` checks the hold before it writes
+            // the first tombstone.
+            Err(crate::blob::EraseError::UnderLegalHold {
+                case,
+                placed_at,
+                reason,
+            }) => report.held.push(format!(
+                "case {case}: preserved under a legal hold placed at {placed_at} — {reason}"
+            )),
             Err(e) => report
                 .failures
                 .push(format!("case {case} could not be erased: {e}")),

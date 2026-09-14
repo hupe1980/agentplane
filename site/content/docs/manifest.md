@@ -594,6 +594,25 @@ declares, so a coded agent whose `McpDataSafety` disagrees with the reviewed
 manifest is refused at dispatch — in both directions, looser and tighter,
 because two artifacts stating one decision must agree.
 
+## `spec.input`
+
+| Field | Notes |
+|---|---|
+| `schema` | JSON Schema, digest-covered. The shape a **caller** must send. Optional; `schema: {}` is refused for the same reason it is on `spec.output` — it permits anything while looking answered. |
+
+The mirror of `spec.output`, for a caller the result contract never had to
+consider: **a model composing the arguments.** Calling `run_under` from your own
+Rust, you hold the shape on both sides; an A2A peer's message is the sender's
+problem. Neither stays true once the agent is offered as a tool to somebody
+else's model — an MCP catalogue, an Agent Card's skill declaration — because
+then the model is *handed* a shape and composes against it.
+
+Declared here, that shape is covered by the manifest digest: the schema a model
+was offered on a given run is the schema somebody approved, and narrowing it is
+a version bump a consumer can pin against rather than a deploy nothing records.
+An agent that genuinely takes anything omits the block, which is the honest way
+to say so.
+
 ## `spec.output`
 
 | Field | Notes |

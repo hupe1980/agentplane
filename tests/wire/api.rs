@@ -756,6 +756,27 @@ fn push_routes(actor: Option<&str>) -> Vec<Request<Body>> {
     }
 }
 
+/// The preservation-register routes.
+///
+/// Extracted for the reason `push_routes` is: the walks below are a list of
+/// claims, and three more inline request literals in each of them pushes the
+/// test past the point where the claim is what a reader sees.
+fn hold_routes(actor: Option<&str>) -> Vec<Request<Body>> {
+    vec![
+        get("/holds", actor),
+        post(
+            "/holds",
+            actor,
+            &json!({ "case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "order" }),
+        ),
+        post(
+            "/holds/release",
+            actor,
+            &json!({ "case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+        ),
+    ]
+}
+
 /// No credentials, no answer — on every route.
 #[tokio::test]
 async fn an_unauthenticated_request_is_refused_everywhere() {
@@ -812,6 +833,7 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
             &json!({ "case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "obligation": "ack" }),
         ),
     ];
+    requests.extend(hold_routes(None));
     requests.extend(push_routes(None));
     for req in requests {
         let uri = req.uri().to_string();
@@ -907,6 +929,7 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         ),
         get("/dead-letters", Some("bob")),
     ];
+    requests.extend(hold_routes(Some("bob")));
     requests.extend(push_routes(Some("bob")));
     for req in requests {
         let uri = req.uri().to_string();
@@ -2292,5 +2315,118 @@ async fn an_unrecognised_outcome_is_quarantined_rather_than_echoed() {
             .as_str()
             .is_some_and(|r| r.contains("settled-ish")),
         "the refusal does not name the outcome it could not read: {body}"
+    );
+}
+
+/// **The preservation register, over the wire.**
+///
+/// A hold that can only be read by naming the case it is on delivers nothing to
+/// the person whose job is to certify what a deployment is still keeping — so
+/// the listing is the half under test here, and it has to carry the *reason*,
+/// because that sentence is the whole of what somebody acts on two years later.
+///
+/// The idempotency half matters on this surface more than on the store's: a
+/// second placement does not move the instant or rewrite the reason, and a
+/// caller who assumed theirs won would report an instruction the plane is not
+/// acting on. So the response says what is actually in force, not what was sent.
+#[tokio::test]
+async fn a_hold_is_placed_listed_with_its_reason_and_released() {
+    use agentplane::case::CaseStore;
+
+    let f = fixture();
+    let cases = f.store.clone() as Arc<dyn CaseStore>;
+    let case = cases
+        .correlate_or_open(
+            "dispute",
+            &[CorrelationKey::new("document", "INV-HOLD")],
+            agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap(),
+        )
+        .await
+        .unwrap()
+        .case_id();
+
+    let router = f.router();
+    let (status, body) = send(
+        &router,
+        post(
+            "/holds",
+            Some("bob"),
+            &json!({ "case": case.to_string(), "reason": "preservation order 2026-114" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["placed"], true);
+
+    // A second placement is refused the right way round: accepted, ignored, and
+    // honest about which instruction stands.
+    let (_, body) = send(
+        &router,
+        post(
+            "/holds",
+            Some("bob"),
+            &json!({ "case": case.to_string(), "reason": "a retry that must not win" }),
+        ),
+    )
+    .await;
+    assert_eq!(body["placed"], false, "a retry claimed to place the hold");
+    assert_eq!(
+        body["in_force"]["reason"], "preservation order 2026-114",
+        "the response reports an instruction the plane is not acting on: {body}"
+    );
+
+    let (status, body) = send(&router, get("/holds", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let listed = &body["holds"][0];
+    assert_eq!(listed["case"], case.to_string());
+    assert_eq!(
+        listed["reason"], "preservation order 2026-114",
+        "the register does not say on whose instruction the matter is kept"
+    );
+
+    // A reason nobody can account for is refused, not stored blank.
+    let (status, _) = send(
+        &router,
+        post(
+            "/holds",
+            Some("bob"),
+            &json!({ "case": case.to_string(), "reason": "   " }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a blank reason was accepted"
+    );
+
+    // A matter that is not there is told apart from a store that broke.
+    let (status, _) = send(
+        &router,
+        post(
+            "/holds",
+            Some("bob"),
+            &json!({ "case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "on nothing" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body) = send(
+        &router,
+        post(
+            "/holds/release",
+            Some("bob"),
+            &json!({ "case": case.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lifted"], true);
+
+    let (_, body) = send(&router, get("/holds", Some("bob"))).await;
+    assert!(
+        body["holds"].as_array().is_some_and(Vec::is_empty),
+        "a released hold is still in the register: {body}"
     );
 }

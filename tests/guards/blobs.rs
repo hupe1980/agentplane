@@ -1320,3 +1320,259 @@ async fn one_tenants_dead_runs_are_not_another_tenants_to_recover() {
          removed the feature rather than isolating it"
     );
 }
+
+/// Two closed matters past any window, each with bytes of its own.
+///
+/// Separate from the test because what it sets up is not what the test claims:
+/// the claims are about what a sweep does, and burying them under a fixture is
+/// how a test stops reading as a statement about behaviour.
+#[cfg(feature = "redb")]
+#[allow(clippy::type_complexity)]
+async fn two_closed_matters_one_of_them_held() -> (
+    Arc<dyn agentplane::case::CaseStore>,
+    Arc<dyn BlobStore>,
+    agentplane::core::TenantId,
+    agentplane::core::CaseId,
+    agentplane::core::CaseId,
+    agentplane::blob::ScopedBlobs,
+    agentplane::core::Digest,
+    agentplane::blob::ScopedBlobs,
+    agentplane::core::Digest,
+) {
+    use agentplane::blob::ScopedBlobs;
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, erasure_scope};
+    use agentplane::store::RedbStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let cases: Arc<dyn CaseStore> = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+    let tenant = agentplane::core::TenantId::default();
+
+    let held = cases
+        .correlate_or_open(
+            "matter",
+            &[CorrelationKey::new("ns", "UNDER-ORDER")],
+            ts(10),
+        )
+        .await
+        .expect("open")
+        .case_id();
+    let ordinary = cases
+        .correlate_or_open("matter", &[CorrelationKey::new("ns", "ROUTINE")], ts(10))
+        .await
+        .expect("open")
+        .case_id();
+
+    let held_blobs = ScopedBlobs::new(
+        Arc::clone(&blobs),
+        erasure_scope(&tenant, &held.to_string()),
+    );
+    let ordinary_blobs = ScopedBlobs::new(
+        Arc::clone(&blobs),
+        erasure_scope(&tenant, &ordinary.to_string()),
+    );
+    let kept = held_blobs
+        .put(b"evidence in a live dispute")
+        .await
+        .expect("put");
+    let doomed = ordinary_blobs
+        .put(b"a routine attachment")
+        .await
+        .expect("put");
+    cases.link_blob(held, kept, ts(11)).await.expect("link");
+    cases
+        .link_blob(ordinary, doomed, ts(11))
+        .await
+        .expect("link");
+    cases.close(held).await.expect("close");
+    cases.close(ordinary).await.expect("close");
+    (
+        cases,
+        blobs,
+        tenant,
+        held,
+        ordinary,
+        held_blobs,
+        kept,
+        ordinary_blobs,
+        doomed,
+    )
+}
+
+/// **A held matter survives the sweep that would otherwise have erased it.**
+///
+/// The one control in this crate that makes an erasure *fail*, checked where it
+/// has to hold: the automatic pass. A retention sweep runs on a window nobody
+/// re-reads, and the matter somebody has been ordered to preserve looks exactly
+/// like every other closed case old enough to go.
+///
+/// Four claims, and the last two are the ones a store could pass the first two
+/// without honouring. The bytes are still readable afterwards. The pass reports
+/// the matter as *held* rather than as *failed* — the two mean opposite things
+/// and an operator acts on them differently. Nothing was half-done: the hold is
+/// checked before the first tombstone, so a held case has no expired blobs. And
+/// once the hold is lifted the same sweep erases it, which is what makes the
+/// hold a pause rather than an exemption.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_legal_hold_stops_the_retention_sweep_and_lifting_it_lets_the_sweep_through() {
+    use agentplane::core::LegalHold;
+
+    let (cases, blobs, tenant, held, ordinary, held_blobs, kept, ordinary_blobs, doomed) =
+        two_closed_matters_one_of_them_held().await;
+
+    cases
+        .place_hold(
+            held,
+            &LegalHold {
+                placed_at: ts(12),
+                reason: "preservation order 2026-114".to_owned(),
+            },
+        )
+        .await
+        .expect("place hold");
+
+    // Both matters are closed and past the window; only one may go.
+    let plan = agentplane::retention::plan(cases.as_ref(), ts(1_000))
+        .await
+        .expect("plan");
+    assert_eq!(
+        plan.due,
+        vec![ordinary],
+        "the dry run would erase a held matter"
+    );
+    assert_eq!(
+        plan.held,
+        vec![held],
+        "the dry run does not say why it is staying"
+    );
+
+    let stores = agentplane::retention::Stores {
+        cases: &cases,
+        blobs: Some(&blobs),
+        #[cfg(feature = "keyring")]
+        keys: None,
+        tenant: &tenant,
+    };
+    let report = agentplane::retention::retain(&stores, ts(1_000), ts(20), "retention")
+        .await
+        .expect("retain");
+
+    assert_eq!(
+        report.erased, 1,
+        "the sweep did not erase the unheld matter"
+    );
+    assert!(
+        report.failures.is_empty(),
+        "a hold was reported as a failure, which pages somebody about a \
+         control doing its job: {:?}",
+        report.failures
+    );
+    assert!(
+        report
+            .held
+            .iter()
+            .any(|h| h.contains("preservation order 2026-114")),
+        "the report does not say on whose instruction the matter is still \
+         there: {:?}",
+        report.held
+    );
+
+    // Nothing was half-done, and the bytes are still there.
+    assert!(
+        held_blobs.get(kept).await.is_ok(),
+        "a held matter's bytes were expired anyway"
+    );
+    assert!(
+        matches!(
+            ordinary_blobs.get(doomed).await,
+            Err(agentplane::blob::BlobError::Expired { .. })
+        ),
+        "the unheld matter was not erased"
+    );
+
+    // A pause, not an exemption.
+    assert!(
+        cases.release_hold(held).await.expect("release"),
+        "the hold was not there to lift"
+    );
+    let after = agentplane::retention::retain(&stores, ts(1_000), ts(30), "retention")
+        .await
+        .expect("retain");
+    assert!(
+        after.held.is_empty(),
+        "a released matter is still reported as preserved: {:?}",
+        after.held
+    );
+    // Both, because erasure is idempotent: the matter erased by the first pass
+    // is still closed and still past the window, and re-erasing it writes the
+    // tombstones again over bytes that already carry them. That is the
+    // behaviour a resumable erasure needs — the count is passes, not victims.
+    assert_eq!(after.erased, 2, "a released matter was not erased");
+    assert!(
+        matches!(
+            held_blobs.get(kept).await,
+            Err(agentplane::blob::BlobError::Expired { .. })
+        ),
+        "lifting the hold did not let the sweep through"
+    );
+}
+
+/// **The refusal sits against the destruction, not only in the plan.**
+///
+/// `retention::plan` filters held matters out before the sweep reaches them, so
+/// the sweep alone never exercises the check inside `erase_case` — and that
+/// check is the one that matters. It covers the operator calling the verb
+/// directly, and it covers the hold placed *between* a plan and the pass that
+/// acts on it, which is the only window in which a held case arrives at the
+/// erasure at all. A guard that only the happy path exercises is a guard that
+/// looks present and is not.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn erasing_a_held_case_directly_is_refused_before_anything_is_destroyed() {
+    use agentplane::blob::{EraseError, erase_case};
+    use agentplane::core::LegalHold;
+
+    let (cases, blobs, tenant, held, _ordinary, held_blobs, kept, _ob, _d) =
+        two_closed_matters_one_of_them_held().await;
+
+    cases
+        .place_hold(
+            held,
+            &LegalHold {
+                placed_at: ts(12),
+                reason: "preservation order 2026-114".to_owned(),
+            },
+        )
+        .await
+        .expect("place hold");
+
+    match erase_case(
+        Some(blobs.as_ref()),
+        cases.as_ref(),
+        #[cfg(feature = "keyring")]
+        None,
+        &tenant,
+        held,
+        ts(20),
+        "retention",
+    )
+    .await
+    {
+        Err(EraseError::UnderLegalHold { case, reason, .. }) => {
+            assert_eq!(case, held.to_string());
+            assert!(
+                reason.contains("preservation order 2026-114"),
+                "the refusal does not carry the instruction it obeyed: {reason}"
+            );
+        }
+        other => panic!("a held matter was erased on a direct call: {other:?}"),
+    }
+
+    // Nothing was half-done: the check runs before the first tombstone.
+    assert!(
+        held_blobs.get(kept).await.is_ok(),
+        "a refused erasure still expired the matter's bytes"
+    );
+}

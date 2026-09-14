@@ -1264,3 +1264,44 @@ async fn two_identical_calls_in_one_step_are_two_effects() {
     assert_eq!(provider.calls(), 2, "replay must not ask the model again");
     assert_eq!(replayed.output.expect("an answer").peek(), answer.peek());
 }
+
+/// **A provider cannot report its way under a budget.**
+///
+/// `input_tokens` and `output_tokens` are whatever the response said, and a
+/// provider is untrusted data. Summed with a plain `+`, `u64::MAX` and `1` are
+/// `0` in a release build — so a run that reported astronomical usage counts as
+/// one that cost nothing, and the ceiling is defeated by the counterparty it
+/// exists to bound.
+///
+/// `Spend::plus` was already saturating for exactly this reason. This is the
+/// addition one step earlier, where the outside gets in.
+#[test]
+fn usage_a_provider_invented_cannot_wrap_a_ceiling() {
+    let hostile = Usage {
+        input_tokens: u64::MAX,
+        output_tokens: 1,
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
+        minor_units: 0,
+    };
+    assert_eq!(
+        hostile.spend().tokens,
+        u64::MAX,
+        "a wrapped sum reads as a free run: the ceiling is defeated by the \
+         provider whose usage it is bounding"
+    );
+    assert!(
+        !hostile.spend().is_free(),
+        "a run reporting the largest usage expressible must not be free"
+    );
+
+    // The ordinary case still adds.
+    let normal = Usage {
+        input_tokens: 55,
+        output_tokens: 15,
+        cache_write_tokens: 0,
+        cache_read_tokens: 0,
+        minor_units: 0,
+    };
+    assert_eq!(normal.spend().tokens, 70);
+}

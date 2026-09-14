@@ -19,6 +19,12 @@ Three rules, all of them stated in `concepts/README.md`:
    somewhere plausible.
 3. **Open work lives in ROADMAP.md only.** Every other document describes
    current state.
+4. **A code reference resolves to code.** `Type::member` in backticks names
+   something this crate actually exposes. The constitution cites the code
+   constantly and nothing else can check it: `tests/` cannot read an untracked
+   folder, and `cargo doc` never sees these files. A renamed method leaves the
+   design document quietly describing a surface that no longer exists, which is
+   worse here than a dangling link — the reader has no reason to doubt it.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent / "concepts"
 
 # Reference to somebody else's specification, which this folder's numbering
 # says nothing about. Anything else is a claim about a heading here.
-FOREIGN = re.compile(r"\b(ACS|RFC|MCP|A2A|OCSF)\s+§")
+FOREIGN = re.compile(r"\b(ACS|ACP|RFC|MCP|A2A|OCSF)\s+§")
 
 # Phrases that mean "not done" outside the one document allowed to say so.
 UNFINISHED = re.compile(
@@ -118,8 +124,47 @@ def main() -> int:
                 f"and every other document describes current state"
             )
 
+    # 4. Code references.
+    #
+    # The surface is every name a reader could reach: functions, consts, and
+    # public struct fields. Fields matter as much as methods — `Justification::
+    # summary` and `AuditReport::warrants` are both cited in this folder and
+    # both are fields, so a check that only knew about `fn` would report two
+    # faults on a clean tree and be turned off within the week.
+    surface: set[str] = set()
+    for rs in sorted((ROOT.parent / "src").rglob("*.rs")):
+        body = rs.read_text()
+        surface.update(re.findall(r"\bfn\s+([a-z_][A-Za-z0-9_]*)", body))
+        surface.update(re.findall(r"\b(?:const|static)\s+([A-Z][A-Z0-9_]*)", body))
+        surface.update(re.findall(r"^\s*pub\s+([a-z_][A-Za-z0-9_]*)\s*:", body, re.M))
+        surface.update(re.findall(r"\b(?:struct|enum|trait|type)\s+([A-Z][A-Za-z0-9]*)", body))
+        # Enum variants and associated types, picked up wherever the crate names
+        # one by path. Parsing `enum` bodies would mean matching braces; this
+        # gets the same names because a variant nothing in the crate ever names
+        # is not a surface a design document should be citing either.
+        surface.update(re.findall(r"::([A-Z][A-Za-z0-9]*)", body))
+
+    for name, text in docs.items():
+        for m in re.finditer(r"`([A-Z][A-Za-z0-9]*)::([A-Za-z_][A-Za-z0-9_]*)`", text):
+            ty, member = m.group(1), m.group(2)
+            # A type this crate does not define is somebody else's vocabulary —
+            # `AcsParams.required`, a protocol's own record names — and this
+            # folder cites those deliberately.
+            if ty not in surface:
+                continue
+            if member not in surface:
+                line = text[: m.start()].count("\n") + 1
+                faults.append(
+                    f"{name}:{line}: `{ty}::{member}` resolves to nothing in src/. "
+                    f"A design document describing a surface that no longer exists "
+                    f"is worse than a dangling link: the reader has no reason to doubt it"
+                )
+
     checked = sum(len(re.findall(r"\]\([A-Z][A-Za-z]*\.md", t)) for t in docs.values())
-    print(f"{len(docs)} documents, {len(defined)} sections, {checked} cross-file links")
+    print(
+        f"{len(docs)} documents, {len(defined)} sections, {checked} cross-file links, "
+        f"{len(surface)} names on the crate surface"
+    )
     for fault in faults:
         print(f"  {fault}")
     print(f"{len(faults)} fault(s)")

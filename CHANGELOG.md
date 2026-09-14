@@ -16,7 +16,172 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.36.0] — unreleased
+## [0.37.0] — unreleased
+
+### Added
+
+- **`spec.input`** — the reviewed shape an agent *takes*, mirroring
+  `spec.output`. Optional, digest-covered, refused when it constrains nothing.
+  It is what a catalogue offers a model as an `inputSchema`.
+- **`Manifest::input_schema`**, for a catalogue to offer.
+- **A served catalogue refuses a capability nothing on the plane provides**
+  (`ServeError::NoProvider`), at construction rather than at the first call.
+- **Serving MCP — `mcp-server`, `tools::serve::McpServer`.** Agents as MCP
+  tools and their reviewed instructions as prompts, admitted through the funnel
+  an A2A message takes. A suspended run answers as a **Task whose id is the run
+  id**, so `tasks/get` reads the journal rather than a table beside it.
+  One resource is served — the declaration, with its digest — and nothing that
+  carries a payload. Older revisions are refused; the
+  [status page](https://hupe1980.github.io/agentplane/docs/status/) says why.
+- **`testkit::conformance_policy`** — the contract `PolicyEngine` states in
+  prose and no signature expresses: total, pure, no state carried between
+  requests, a refusal that names a rule, a bundle identity that does not move,
+  and a `digest` that is the bundle's. Run it against the engine you wire, not
+  a stand-in.
+- **`blob::TOMBSTONE_FORMAT_VERSION` is reachable.** It was declared inside a
+  private module, so one of the five durable-format versions had no path a
+  reader could name — and the enumeration that calls itself closed could not be
+  checked by anybody.
+- **Legal holds on cases — `CaseStore::place_hold`, `release_hold`, `hold`,
+  `holds`, and the `agentplane hold` verb.** The one control that makes an
+  erasure *fail*: a retention pass runs on a window nobody re-reads, and the
+  matter somebody has been ordered to preserve looks exactly like every other
+  closed case old enough to sweep. The hold is checked before the first
+  tombstone, so a refusal leaves nothing half-erased; `retention::plan` reports
+  `due` and `held` separately so a dry run and a pass agree; and
+  `RetentionReport::held` is its own field, because a control doing its job must
+  not read as a failure. Holds were previously available on memory items only.
+- **Two examples for surfaces that had none** — `serve_mcp` drives this plane's
+  MCP server with the SDK's own client over an in-process pipe, and
+  `retention_hold` runs a retention pass against a matter under a preservation
+  order. Both are in `just examples`.
+- **Hold routes on the operator API** — `GET /holds`, `POST /holds`,
+  `POST /holds/release`, under three separate capabilities. `api:hold.place` and
+  `api:hold.release` are deliberately not one grant: placing a hold preserves
+  data and lifting one is what lets the next pass destroy it, so *who may
+  authorise destruction* is handed out separately from *who may prevent it*.
+- **`MemoryStore::legal_holds`** — the listing the item-level hold never had.
+  `legal_hold(id)` answers only for somebody who already knows which id to ask
+  about, which is detection without delivery.
+- **Every cacheable MCP result carries `ttlMs` and `cacheScope`**, `private` and
+  `0`. Required by the revision this server speaks, and not decoration: the
+  protocol's default scope is `public`, so an omitted field lets a shared
+  intermediary hold a governed declaration and serve it to somebody else — a
+  copy no erasure reaches.
+
+### Changed
+
+- **BREAKING — the erasure verbs return `blob::EraseError`, not `BlobError`.**
+  `erase_case` and `erase_run` are not blob operations: they walk a case, expire
+  each blob and destroy a key scope, and they can now refuse outright. Folding a
+  refusal into `BlobError` made two unrelated reads — the drill's `get`, and
+  `ScopedBlobs`'s error renaming — match a state neither can observe. Match on
+  `EraseError::{UnderLegalHold, Blob, Store}`.
+- **BREAKING — `CaseStore` and `MemoryStore` gained methods.** Any store
+  implemented outside this crate needs `place_hold`, `release_hold`, `hold`,
+  `holds` and `legal_holds`. The conformance batteries cover all of them.
+- **BREAKING — external media retention scopes are namespaced `media/<policy>`.**
+  An erasure scope is `tenant/<unit>`, and the two free-text vocabularies feeding
+  `<unit>` now carry a prefix each: a policy named `alice` and a memory subject
+  named `alice` otherwise shared a key, so one unit's erasure destroyed the
+  other's — the failure `TenantId`'s refusal of `/` prevents, one level down.
+  Bytes sealed under the old scope are unreachable through the new one;
+  pre-alpha, so recreate.
+- **BREAKING — `ErasureCoordinator::acquire` takes an `UnderLock` proof.** Only
+  `under_lock` can construct one, so taking a lifecycle lock without the
+  release-on-both-paths wrapper is a compile error rather than a rule in a doc
+  comment. A decorating coordinator forwards the proof it was handed.
+- **`Lease::new` and `Lease::token` are public.** `ErasureCoordinator` is a
+  seam, and without a constructor it was a public trait nobody outside this
+  crate could implement.
+- **`UnderLock::for_test` under `testkit`**, because a distributed lock is only
+  testable by being held across an assertion, which `under_lock`'s closure
+  cannot do. A guard refuses any call to it from the crate itself.
+- **BREAKING — `Lease::holding` carries the lock**, so dropping a lease releases
+  the scope. `release` remains the tidy path.
+
+### Security
+
+- **`rustls` 0.23.45** (RUSTSEC-2026-0285, medium): TLS 1.3 handshake messages
+  were accepted across encryption-level boundaries. Reached this tree through
+  every HTTPS path — `reqwest`, the A2A server, the MCP client, the AWS SDK.
+
+- **A cancelled erasure could strand a subject permanently.** Two paths, both
+  silent: a dropped `Lease` released nothing, and a cancelled `acquire` returned
+  a pooled connection whose abandoned lock request was granted the moment the
+  holder released. Every later erasure of that subject blocked forever. A lease
+  carries what holds the lock and the lock session is detached from the pool;
+  both paths are pinned against a real `PostgreSQL`.
+- **A provider could report its way under a budget.** `Usage::spend` summed the
+  `input_tokens` and `output_tokens` a provider returned with a plain `+`, and
+  a provider is untrusted data: a response claiming `u64::MAX` input tokens
+  wrapped to a spend of **zero** in a release build, so the run counted as free
+  against its ceiling. `Spend::plus` was already saturating for exactly this
+  reason; this is the addition one step earlier, where the outside gets in.
+
+### Fixed
+
+- **Every command in the documented recovery drill failed.** `operations.md`
+  spelled `export --out` (there is no such flag), and gave `verify` and
+  `restore` a `--file` where both take a positional, with `--anchor` for what is
+  spelled `--checkpoint`; `serve --manifest` was positional too. The block an
+  operator copies under pressure was the one that had drifted.
+- **`SealedCases::by_status` filtered on a branch that cannot be taken**, which
+  read as *erased cases are dropped from a listing* and was neither true nor
+  what the memory decorator beside it does.
+- **Six items had no description at all**, their summaries absorbed by the doc
+  comment above them or never written. `netguard::all_public` — the SSRF gate —
+  was the worst: its summary sat on the error enum below it, carrying the
+  instruction to connect to exactly the addresses it returned onto a type its
+  caller never reads.
+- **The architecture page counted two determinism escapes where there are
+  thirteen**, and presented lint gating as a layer that protects a skill author
+  — it is this crate's `clippy.toml` and does not reach your crate. The page
+  now carries the stanza to copy and says which layer holds regardless.
+- **The status page said nothing about the Agent Client Protocol**, which is
+  the question an adopter running coding agents arrives with. It is answered,
+  in both directions.
+- **The security page did not say who the sensitivity lattice governs.** It
+  governs what may leave *a run*, so the operator API returns journal payloads
+  to whoever holds the read verb — correct for the party whose journal it is,
+  and the boundary an adopter needs stated before putting anything else in
+  front of those records.
+
+### Assurance
+
+- **A documented command line is checked against the CLI.** Flags are read out
+  of the clap definitions, so the check runs wherever the tests do rather than
+  only where the binary is built. `upgrading.md` is exempt: showing the old
+  spelling beside the new one is that page's content.
+- **A documented function name is checked without a parenthesis.** The guard
+  holding the guides to the crate's real surface only flagged an invented name
+  written as a call, and these pages cite a member as `BlobStore::expire` far
+  more often than as `expire(..)`. It now checks both, and knows public fields,
+  consts and enum variants. Names the upgrading page mentions *because they were
+  removed* are asserted absent rather than exempted, so resurrecting one fails.
+
+- **Every sealing decorator is run through the contract it re-implements.** A
+  key ring makes the wrapper the store the runtime is given, and only the blob
+  decorator had ever been handed a battery. All six pass; a guard holds each to
+  a named battery run.
+- **The doc-comment guard could not see the defect it is named for.** It
+  required the line before an absorbed summary to end a sentence, so an
+  absorption separated by a blank line passed — and its own advice was to add
+  that blank line. It now also refuses any item whose documentation opens on a
+  `# Errors` or `# Panics` section, which is what an absorbed summary leaves
+  behind.
+- **Every durable format is held to version 1, and the list of them is held to
+  being complete.** Pre-freeze a shape change is a hard cut rather than a bump,
+  and the enumeration is documented as closed — but nothing compared the
+  constants against it, and a sixth format would have been discovered at the
+  freeze.
+- **The changelog cannot describe a released version again.** A guard reads the
+  tags: a version that is tagged may not still be headed *unreleased*, and the
+  newest entry must be the version in `Cargo.toml`.
+- **Seven public functions were exercised by nothing**, and are now tested. A
+  guard refuses a public function that nothing calls and no test names.
+
+## [0.36.0] — 2026-09-13
 
 ### Added
 

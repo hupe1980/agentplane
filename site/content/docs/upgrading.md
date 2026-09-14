@@ -25,6 +25,129 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## External media retention scopes are namespaced `media/<policy>`
+
+**Affected:** deployments using `MediaPolicy::external_retention(..)` with a key
+ring wired.
+
+An erasure scope is `tenant/<unit>`. `<unit>` is drawn from four vocabularies: a
+case id, a run id, a memory subject — already written `memory/<subject>` — and
+an external media retention policy name, which was free text under no prefix at
+all. A deployment that named a policy `memory/alice` therefore shared a key
+scope with that memory subject, so erasing either destroyed the other's key,
+invisibly and permanently. It is the same failure `TenantId`'s refusal of `/`
+exists to prevent, one level down.
+
+Media policies now seal under `tenant/media/<policy>`. Bytes sealed under the
+old scope are not reachable through the new one, and pre-alpha means recreate
+rather than migrate. Nothing else changes: policy names keep their own `/`,
+because versioned names like `invoices/v2` are what the field was built for.
+
+## `CaseStore` and `MemoryStore` gained legal-hold methods
+
+**Affected:** anyone who implements either trait outside this crate.
+
+`CaseStore` needs `place_hold`, `release_hold`, `hold` and `holds`;
+`MemoryStore` needs `legal_holds`. The conformance batteries cover all five, so
+`testkit::conformance_case::check_cases` and `testkit::conformance::memory` are
+the shortest way to find out whether yours is right.
+
+Why a store has to answer this at all: a retention pass is automatic, and the
+matter somebody has been ordered to preserve looks exactly like every other
+closed case old enough to sweep. `hold` is what `erase_case` consults before it
+writes the first tombstone. `holds` is the half that makes it a control rather
+than a flag — a register only answerable by case id delivers nothing to the
+person whose job is to find out what is still being kept.
+
+## The erasure verbs return `EraseError`
+
+**Affected:** anyone calling `blob::erase_case` or `blob::erase_run`.
+
+They returned `BlobError`. They now return `blob::EraseError`, which is
+`UnderLegalHold`, `Blob(BlobError)` or `Store(StoreError)`.
+
+The reason is not the new variant itself but what it did to unrelated code:
+folding a refusal into `BlobError` forced the recovery drill's `get` and
+`ScopedBlobs`'s error renaming to pattern-match a state neither can ever
+observe. An enum that describes states its own readers cannot reach has stopped
+describing its domain. The erasure verbs were never blob operations — they walk
+a case, expire each blob and destroy a key scope.
+
+Matching `Err(e)` and formatting it still works. Matching variants needs the new
+path.
+
+## Three new API actions: `api:hold.list`, `api:hold.place`, `api:hold.release`
+
+**Affected:** every deployment enumerating `api::action::ALL` against a
+deny-by-default policy engine.
+
+`GET /holds`, `POST /holds` and `POST /holds/release` each carry their own verb,
+and **all three must be granted** or the routes are refused to everybody — which
+is what a deny-by-default engine does with a verb nobody wrote a rule for.
+
+`place` and `release` are deliberately not one grant. Placing a hold preserves
+data; lifting one is what lets the next retention pass destroy it. A deployment
+that hands out "manage holds" as a single capability has given the power to
+authorise destruction to everybody who can prevent it, which is the one
+direction this pair must not be symmetric in.
+
+## `ErasureCoordinator::acquire` takes an `UnderLock`
+
+**Affected:** anyone implementing the erasure lifecycle lock.
+
+The lock has to be released on both the success and the failure path, and
+`Drop` cannot do it — releasing a distributed lock is `async` and fallible, and
+dropping *that* failure strands the subject for every other instance. So the
+rule was "call it through `under_lock`", written in a doc comment. It is the
+compiler's now: `UnderLock`'s only field is private to its module, so nothing
+outside can construct one.
+
+```rust
+// before
+async fn acquire(&self, scope: &str) -> Result<Lease, StoreError> { … }
+
+// after — a decorator forwards the proof it was handed
+async fn acquire(&self, scope: &str, proof: UnderLock) -> Result<Lease, StoreError> {
+    self.inner.acquire(scope, proof).await
+}
+```
+
+Two things landed with it. `Lease::new` and `Lease::token` are public, because
+without a constructor the trait was one nobody outside this crate could
+implement at all. And `UnderLock::for_test()` exists under `testkit`, because a
+distributed lock is only testable by being *held* across an assertion — one
+instance takes a scope, a second must block — which does not fit inside
+`under_lock`'s closure.
+
+## A lease releases the scope when it is dropped
+
+**Affected:** anyone implementing `ErasureCoordinator`; nobody calling it.
+
+A `Lease` now carries whatever holds the lock, built with `Lease::holding(scope,
+token, guard)` instead of `Lease::new`. Dropping it is a complete release, which
+is what makes a cancelled erasure safe: a `timeout` around an
+`EncryptedMemoryStore` write abandons the work without stranding the subject.
+
+The argument against an RAII guard was that releasing a distributed lock is
+async and fallible while `Drop` is neither. True of a lease *table*, and false
+of both primitives here — a process-local mutex releases by dropping its guard,
+and a `PostgreSQL` session advisory lock ends with the session, so dropping the
+connection releases it. Both are synchronous and cannot fail.
+
+Two leaks went with it, and both were permanent — a scope stranded with no
+error anywhere, blocking every later erasure of that subject:
+
+- a lease dropped instead of released left the lock in a side table keyed by a
+  lease that no longer existed;
+- a cancelled `acquire` returned a pooled connection with a `pg_advisory_lock`
+  still outstanding, and that abandoned request was **granted the lock** the
+  moment the holder released — to a session with no lease.
+
+`release` is still what `under_lock` calls and still worth reaching: it unlocks
+explicitly, so the scope frees immediately rather than when the connection
+finishes closing, and it can report a failure. An implementation whose release
+genuinely needs a round trip carries no guard and has neither property.
+
 ## `McpTaskSnapshot::ttl_ms` is `retention()`
 
 **Affected:** anyone polling an MCP task handle.

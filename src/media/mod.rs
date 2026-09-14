@@ -415,9 +415,19 @@ impl GovernedMedia {
     /// these bytes go. That controller is still an erasure unit, so it is what a
     /// data key is scoped to — sealing under a case that does not exist, or not
     /// sealing at all, would both be wrong.
-    pub(crate) fn external_scope(&self) -> Option<&str> {
+    ///
+    /// **Namespaced `media/`, for the reason the tenant prefixes every scope.**
+    /// An erasure scope is `tenant/<unit>`, and `<unit>` comes from four
+    /// vocabularies: a case id, a run id, a memory subject and this policy name.
+    /// The ids cannot collide; the two free-text ones therefore carry a prefix
+    /// each, or a policy called `alice` and a memory subject called `alice`
+    /// share a key and one unit's erasure destroys the other's — the failure
+    /// `TenantId`'s refusal of `/` prevents, one level down. A prefix rather
+    /// than refusing `/`, because versioned names like `invoices/v2` are the
+    /// idiom this field is for.
+    pub(crate) fn external_scope(&self) -> Option<String> {
         match &self.policy.retention {
-            MediaRetention::External { policy } => Some(policy),
+            MediaRetention::External { policy } => Some(format!("media/{policy}")),
             MediaRetention::CaseLinked => None,
         }
     }

@@ -353,3 +353,173 @@ async fn redb_satisfies_the_case_layer_contracts() {
 
     report.assert_conforms("RedbStore (case layer)");
 }
+
+/// **Every sealing decorator, against the contract it re-implements.**
+///
+/// A decorator is a store in its own right: the runtime is handed the wrapper,
+/// not the backend, the moment a key ring is wired. Each one re-implements the
+/// whole trait by forwarding, and forwarding is where a contract goes wrong — a
+/// row dropped instead of opened, a listing shortened, a scope that no erasure
+/// will ever name.
+///
+/// The blob battery already runs this way and found two defects doing it. The
+/// other batteries ran against bare backends only, which is the configuration
+/// that *cannot* break the guarantee testing the one that can.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn every_sealing_decorator_satisfies_the_contract_it_wraps() {
+    use agentplane::case::{CaseStore, EventStore, TaskStore};
+    use agentplane::core::TenantId;
+    use agentplane::keyring::{KeyRing, SealedCases, SealedEvents, SealedTasks};
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::{MemoryKeyRing, conformance_case};
+
+    let tenant = TenantId::new("sealed-battery").expect("tenant");
+    let keys = Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
+    let backend = || {
+        Arc::new(
+            RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(tenant.clone()),
+        )
+    };
+
+    let mut report = Report::default();
+    let cases = SealedCases::wrap(
+        backend() as Arc<dyn CaseStore>,
+        Arc::clone(&keys),
+        tenant.clone(),
+    ) as Arc<dyn CaseStore>;
+    conformance_case::check_cases(&cases, &mut report).await;
+    report.assert_conforms("SealedCases over RedbStore");
+
+    let mut report = Report::default();
+    let events = SealedEvents::wrap(
+        backend() as Arc<dyn EventStore>,
+        Arc::clone(&keys),
+        tenant.clone(),
+    ) as Arc<dyn EventStore>;
+    conformance_case::check_events(&events, &mut report).await;
+    report.assert_conforms("SealedEvents over RedbStore");
+
+    let mut report = Report::default();
+    let tasks = SealedTasks::wrap(
+        backend() as Arc<dyn TaskStore>,
+        Arc::clone(&keys),
+        tenant.clone(),
+    ) as Arc<dyn TaskStore>;
+    conformance_case::check_tasks(&tasks, &mut report).await;
+    report.assert_conforms("SealedTasks over RedbStore");
+
+    // The event buffer's erasure contract: an inbound payload is somebody's
+    // content held indefinitely, and the decorator is what a sealed deployment
+    // asks to delete it.
+    let buffered =
+        SealedEvents::wrap(backend() as Arc<dyn EventStore>, keys, tenant) as Arc<dyn EventStore>;
+    agentplane::testkit::conformance::event_erasure(buffered).await;
+}
+
+/// **The journal contract, against the sealed journal.**
+///
+/// Separate from the decorators above because this battery takes a factory: it
+/// builds a fresh store several times over, and each one has to be wrapped the
+/// same way. Worth the extra shape — the journal decorator is the one that
+/// touches the chain, and a payload it fails to open is left sealed rather than
+/// dropped precisely so an erased run stays auditable.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn the_sealed_journal_satisfies_the_journal_store_contract() {
+    use agentplane::core::TenantId;
+    use agentplane::keyring::{KeyRing, SealedJournal};
+    use agentplane::testkit::MemoryKeyRing;
+
+    let report = conformance::check(&|| {
+        Box::pin(async {
+            let tenant = TenantId::new("sealed-journal").expect("tenant");
+            let inner = Arc::new(
+                RedbStore::open_in_memory()
+                    .expect("store")
+                    .for_tenant(tenant.clone()),
+            ) as Arc<dyn JournalStore>;
+            SealedJournal::wrap(
+                inner,
+                Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>,
+                tenant,
+            ) as Arc<dyn JournalStore>
+        })
+    })
+    .await;
+    report.assert_conforms("SealedJournal over RedbStore");
+}
+
+/// **Every policy engine, against the contract the trait states in prose.**
+///
+/// `PolicyEngine` asks for three things no signature expresses — total, pure,
+/// no I/O — and the authorization story rests on all three. Totality is why the
+/// decision type has no error case; purity is why a third party can re-derive a
+/// verdict offline from the journal. Two implementations ship and they agree,
+/// which is the condition under which a third one's disagreement goes
+/// unnoticed.
+#[test]
+fn every_policy_engine_satisfies_the_contract() {
+    use agentplane::core::DenyAll;
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_policy;
+
+    let mut report = Report::default();
+    conformance_policy::check(&DenyAll, &mut report);
+    report.assert_conforms("DenyAll");
+
+    #[cfg(feature = "cedar")]
+    {
+        let engine = agentplane::policy::CedarEngine::new(
+            r#"permit(principal, action == Action::"effect:perform", resource);"#,
+        )
+        .expect("a policy set the battery can run against");
+        let mut report = Report::default();
+        conformance_policy::check(&engine, &mut report);
+        report.assert_conforms("CedarEngine");
+    }
+}
+
+/// The battery refuses an engine that answers differently the second time.
+///
+/// Without this the battery is a function that returns "no violations" for
+/// everything, which is the shape it exists to catch elsewhere.
+#[test]
+fn the_policy_battery_rejects_an_engine_that_is_not_pure() {
+    use agentplane::core::{PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest};
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_policy;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Permits every other call — a cache keyed on nothing, which is what a
+    /// hand-rolled engine with a counter or a clock read actually looks like.
+    #[derive(Debug, Default)]
+    struct Flapping(AtomicUsize);
+
+    impl PolicyEngine for Flapping {
+        fn authorize(&self, _request: &PolicyRequest<'_>) -> PolicyDecision {
+            if self.0.fetch_add(1, Ordering::Relaxed).is_multiple_of(2) {
+                PolicyDecision::Permit
+            } else {
+                PolicyDecision::deny("the rule that fired")
+            }
+        }
+
+        fn bundle(&self) -> PolicyBundleIdentity {
+            PolicyBundleIdentity::new(agentplane::core::Digest::of(b"flapping"), "flapping/v1")
+        }
+    }
+
+    let mut report = Report::default();
+    conformance_policy::check(&Flapping::default(), &mut report);
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|v| v.invariant == "evaluation is pure"),
+        "the battery accepted an engine that answers the same request two ways: {:?}",
+        report.violations
+    );
+}

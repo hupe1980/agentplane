@@ -201,6 +201,28 @@ It exports what the chain committed to, which with a key ring configured is
 ciphertext. That is deliberate: an export of plaintext would put a copy beyond
 the reach of key destruction, and undo the erasure below.
 
+**The retention floor is a control, not a hope.** Art. 26 makes a deployer keep
+logs for a minimum period, and an erasure request can arrive inside it — the one
+place a retention *ceiling* and a retention *floor* point in opposite directions.
+The automatic pass cannot tell them apart: a matter under a preservation order
+looks like every other closed case old enough to sweep. A **legal hold** is what
+refuses the erasure.
+
+```sh
+agentplane hold --store ./journal.redb --case case_01JD... \
+  --reason "Art. 26 retention floor; supervisory request 2026-114"
+agentplane hold --store ./journal.redb          # everything standing, with reasons
+```
+
+The standing holds are listable by somebody who does not already know which case
+to ask about, which is what makes the floor auditable: the question at review
+time is *what are we still keeping, and on whose instruction*. The mechanics are
+in [erasure](@/docs/erasure.md#a-legal-hold-stops-a-pass).
+
+What it does not do is decide the floor for you. There is no default period here
+for the reason `--older-than-days` has none: the window is a legal determination,
+and a crate that picked one would be choosing somebody else's.
+
 **Erasure is possible without breaking the record — for data you kept out of
 the chain.** `BlobStore::expire` drops a blob's bytes and leaves a tombstone;
 the hash chain still verifies afterwards because it only ever committed to the

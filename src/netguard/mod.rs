@@ -229,13 +229,6 @@ pub fn canonical_host(raw: &str) -> Option<String> {
     Some(url.host_str()?.trim_end_matches('.').to_ascii_lowercase())
 }
 
-/// Refuse unless **every** resolved address is public.
-///
-/// All of them, not the first: a hostname that answers with one public address
-/// and one private one is the standard rebinding setup, and a check that stops
-/// at the first answer passes it. The caller must then connect to exactly these
-/// addresses — resolving again would invite a different answer.
-///
 /// Why a resolution was rejected.
 ///
 /// Two variants rather than one string, because the caller's response differs by
@@ -254,6 +247,17 @@ pub enum NetGuardError {
     Forbidden { host: String, address: IpAddr },
 }
 
+/// Refuse unless **every** resolved address is public, and return the set to
+/// connect to.
+///
+/// All of them, not the first: a hostname that answers with one public address
+/// and one private one is the standard rebinding setup, and a check that stops
+/// at the first answer passes it.
+///
+/// The returned addresses are the ones to dial. Resolving the name again would
+/// invite a different answer, which is the rebinding this refuses — so the
+/// judgement and the connection must be about the same bytes.
+///
 /// # Errors
 ///
 /// [`NetGuardError::NoAddresses`] when there were no answers at all, and

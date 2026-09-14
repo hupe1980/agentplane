@@ -346,6 +346,26 @@ pub struct AcknowledgeRequest {
     pub note: String,
 }
 
+/// Placing a legal hold on one matter.
+#[derive(Debug, serde::Deserialize)]
+pub struct PlaceHoldRequest {
+    /// The matter to preserve.
+    pub case: String,
+    /// Why it may not be destroyed.
+    ///
+    /// **Not `#[serde(default)]`**, unlike an acknowledgement's note: a hold
+    /// with no reason is a matter preserved indefinitely that nobody can
+    /// account for, which reads exactly like a sweep that quietly stopped.
+    pub reason: String,
+}
+
+/// Lifting one.
+#[derive(Debug, serde::Deserialize)]
+pub struct ReleaseHoldRequest {
+    /// The matter to release.
+    pub case: String,
+}
+
 /// What a decision looks like on the wire.
 ///
 /// Note what is absent: **no actor, no roles**. Both come from the
@@ -845,6 +865,8 @@ impl Api {
             .route("/obligations", get(breached_obligations))
             .route("/obligations/acknowledge", post(acknowledge_obligation))
             .route("/cases/{case}", get(case_view))
+            .route("/holds", get(standing_holds).post(place_hold))
+            .route("/holds/release", post(release_hold))
             .route("/events", post(deliver))
             .route("/dead-letters", get(dead_letters));
         #[cfg(feature = "push")]
@@ -971,6 +993,25 @@ pub mod action {
     /// it, and the party allowed to see what a deployment missed is not
     /// automatically the party allowed to declare it answered.
     pub const OBLIGATION_ACKNOWLEDGE: &str = "api:obligation.acknowledge";
+    /// Reading which matters are preserved against erasure, and why.
+    ///
+    /// Its own verb because the audience is whoever answers for retention: the
+    /// listing says what a deployment is still keeping and on whose
+    /// instruction, not what any matter contains.
+    pub const HOLD_LIST: &str = "api:hold.list";
+    /// Placing one.
+    ///
+    /// Separate from reading the list for the reason acknowledging a breach is
+    /// separate from listing breaches: seeing what is preserved and deciding
+    /// what must be are different authorities.
+    pub const HOLD_PLACE: &str = "api:hold.place";
+    /// Lifting one.
+    ///
+    /// **Never folded into placing.** A hold preserves data; lifting one is
+    /// what lets the next retention pass destroy it, so "manage holds" as a
+    /// single grant would hand the power to authorise destruction to everybody
+    /// who can prevent it.
+    pub const HOLD_RELEASE: &str = "api:hold.release";
     pub const EVENT_DELIVER: &str = "api:event.deliver";
     /// Reading the messages that arrived and reached nobody.
     ///
@@ -1018,6 +1059,9 @@ pub mod action {
         CASE_LIST,
         OBLIGATION_LIST,
         OBLIGATION_ACKNOWLEDGE,
+        HOLD_LIST,
+        HOLD_PLACE,
+        HOLD_RELEASE,
         EVENT_DELIVER,
         DEADLETTER_LIST,
         #[cfg(feature = "push")]
@@ -1846,6 +1890,120 @@ async fn acknowledge_obligation(
             "recorded": recorded,
         })),
     ))
+}
+
+/// Every matter preserved against erasure, oldest hold first.
+///
+/// The half that makes a hold a control rather than a flag: `CaseStore::hold`
+/// answers for a matter somebody already named, and the question whoever signs
+/// off on retention has — *what are we still keeping, and on whose instruction*
+/// — cannot be asked by case id.
+///
+/// Ascending by the instant each hold was placed: releasing removes entries, so
+/// the head is not permanent, and the longest-standing unlifted hold is the one
+/// that most needs a question asked about it.
+async fn standing_holds(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::HOLD_LIST, "*").await?;
+    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+
+    // One more than the page, for the reason every sibling listing takes one
+    // more: a register of 140 shown as 100 reads as a register of 100.
+    let mut found = cases
+        .holds(None, api.limit.saturating_add(1))
+        .await
+        .map_err(|_| store_failed())?;
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "holds": found
+            .iter()
+            .map(|(case, hold)| json!({
+                "case": case.to_string(),
+                "placed_at": hold.placed_at.unix_timestamp(),
+                "reason": hold.reason,
+            }))
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
+/// Preserve one matter against every erasure verb.
+///
+/// Idempotent, and the response says which call placed what is in force: a
+/// second placement does not move the instant or rewrite the reason, so a
+/// caller who assumed theirs won would otherwise report an instruction that is
+/// not the one the store is acting on.
+async fn place_hold(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<PlaceHoldRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api.gate(&headers, action::HOLD_PLACE, &body.case).await?;
+    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+    let case = crate::core::CaseId::parse(&body.case).map_err(|_| bad("case"))?;
+    if body.reason.trim().is_empty() {
+        return Err(bad("reason"));
+    }
+
+    let placed = cases
+        .place_hold(
+            case,
+            &crate::core::LegalHold {
+                placed_at: now_for_account(),
+                reason: body.reason,
+            },
+        )
+        .await
+        .map_err(|e| hold_refused(&e))?;
+    let in_force = cases.hold(case).await.map_err(|_| store_failed())?;
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "case": body.case,
+            "placed": placed,
+            "in_force": in_force.map(|h| json!({
+                "placed_at": h.placed_at.unix_timestamp(),
+                "reason": h.reason,
+            })),
+        })),
+    ))
+}
+
+/// Lift one, and let the next retention pass reach the matter.
+async fn release_hold(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<ReleaseHoldRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api.gate(&headers, action::HOLD_RELEASE, &body.case).await?;
+    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+    let case = crate::core::CaseId::parse(&body.case).map_err(|_| bad("case"))?;
+
+    let lifted = cases
+        .release_hold(case)
+        .await
+        .map_err(|e| hold_refused(&e))?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "case": body.case, "lifted": lifted })),
+    ))
+}
+
+/// A matter that is not there, told apart from a store that could not be
+/// reached — the two call for different next steps, and a hold on a missing
+/// case would read as effective while preserving nothing.
+fn hold_refused(e: &crate::core::StoreError) -> ApiError {
+    match e {
+        crate::core::StoreError::NotFound(_) => {
+            ApiError(StatusCode::NOT_FOUND, "no such case".to_owned())
+        }
+        _ => store_failed(),
+    }
 }
 
 /// When an operator's account was recorded.

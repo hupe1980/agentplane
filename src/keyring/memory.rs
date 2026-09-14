@@ -326,6 +326,12 @@ impl MemoryStore for EncryptedMemoryStore {
     // authenticate, and an unreachable key ring all stay loud, because those
     // are faults to page about rather than erasures reporting themselves.
     async fn recall(&self, query: &Recall) -> Result<Vec<MemoryItem>, StoreError> {
+        // Every row a recall can return belongs to one subject, and a subject
+        // is one key scope — so this page is all-or-nothing: either the scope
+        // is live and every row opens, or it was destroyed and none do. That is
+        // what makes dropping rows here safe beside a `limit` the inner store
+        // has already applied. A per-row skip under a limit would otherwise
+        // hand back a short page shaped exactly like a complete one.
         let items = self.inner.recall(query).await?;
         let mut opened = Vec::with_capacity(items.len());
         for item in items {
@@ -397,6 +403,17 @@ impl MemoryStore for EncryptedMemoryStore {
             self.inner.set_legal_hold(id, held).await
         })
         .await
+    }
+
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        // Ids are not sealed — only content is — so the listing passes straight
+        // through. Sealing an id would make the hold register unreadable
+        // without the very key an erasure destroys.
+        self.inner.legal_holds(after, limit).await
     }
 
     async fn legal_hold(&self, id: &str) -> Result<bool, StoreError> {

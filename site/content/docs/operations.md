@@ -1363,7 +1363,7 @@ and nothing else.
 Then schedule the two loops, or let the binary do it:
 
 ```sh
-agentplane serve --manifest agent.yaml \
+agentplane serve agent.yaml \
   --sweep-every 30      `# gauges, deadlines, task expiry, dead letters` \
   --drill-every 86400   `# the recovery rehearsal` \
   --drain-secs 25       `# how long a SIGTERM may keep working`
@@ -2017,9 +2017,9 @@ grows with how much work was in flight:
 ### The drill {#recovery-drill}
 
 ```sh
-agentplane export  --store ./journal.redb --out plane.jsonl
-agentplane verify  --file plane.jsonl --anchor ./checkpoint.json
-agentplane restore --store ./restored.redb --file plane.jsonl
+agentplane export  --store ./journal.redb > plane.jsonl
+agentplane verify  plane.jsonl --checkpoint ./checkpoint.json
+agentplane restore plane.jsonl --store ./restored.redb
 agentplane drill   --store ./restored.redb      # every case's references, live
 ```
 

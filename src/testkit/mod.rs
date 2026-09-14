@@ -33,6 +33,10 @@ pub mod conformance_calendar;
 pub mod conformance_case;
 #[cfg(feature = "keyring")]
 pub mod conformance_keyring;
+// Ungated: `PolicyEngine` is a `core` seam with no feature of its own, and the
+// deployment most likely to replace it is the one that wrote its rules in Rust
+// rather than taking the shipped evaluator.
+pub mod conformance_policy;
 #[cfg(feature = "push")]
 pub mod conformance_push;
 pub mod conformance_quota;

@@ -497,3 +497,30 @@ async fn one_tenants_webhooks_are_not_another_tenants() {
     // And acme still reads its own, so this isolated rather than broke it.
     assert!(acme.get(task, "cfg-1").await.expect("get").is_some());
 }
+
+/// The same override semantics, through the decorator a sealed plane holds.
+///
+/// `SealedPush` forwards `due_in` rather than letting the trait default page
+/// over its own `due` — precisely so it keeps the backend's native filter — and
+/// that forwarding is what this pins. A decorator is the store the worker is
+/// actually given once a key ring is wired.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn the_sealed_push_store_due_in_matches_the_paging_default() {
+    use agentplane::core::TenantId;
+    use agentplane::keyring::{KeyRing, SealedPush};
+    use agentplane::testkit::MemoryKeyRing;
+
+    let tenant = TenantId::new("sealed-push").expect("tenant");
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone()),
+    ) as Arc<dyn PushStore>;
+    let sealed = SealedPush::wrap(
+        inner,
+        Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>,
+        tenant,
+    ) as Arc<dyn PushStore>;
+    agentplane::testkit::conformance_push::pin_due_in_against_the_default(sealed).await;
+}

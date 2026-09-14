@@ -64,6 +64,139 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     an_obligation_cannot_be_registered_on_a_closed_case(store, r).await;
     a_reopened_case_correlates_again(store, r).await;
     a_cases_blob_list_holds_only_its_own(store, r).await;
+    a_hold_is_placed_once_listed_and_lifted(store, r).await;
+    a_hold_on_a_missing_matter_is_not_found(store, r).await;
+}
+
+/// **The one control that can refuse an erasure, held to all four of its
+/// halves.**
+///
+/// A store that satisfies only the first two is a store where a legal hold
+/// cannot be found by anybody who does not already know which case they are
+/// asking about — which is detection without delivery, and is worth less than
+/// no control at all because it also manufactures the belief that somebody was
+/// told.
+///
+/// So: it must be readable back with the *reason and instant it was placed
+/// with*; it must appear in a listing keyed by nothing; a second placement must
+/// not rewrite the first (a retry that moved the instant would destroy the one
+/// fact a hold exists to record); and releasing must empty the listing, because
+/// a preservation register that only ever grows is one nobody reviews.
+async fn a_hold_is_placed_once_listed_and_lifted(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("HOLD-1"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    let hold = crate::core::LegalHold {
+        placed_at: ts(2_000),
+        reason: "preservation order 2026-114".to_owned(),
+    };
+
+    match store.place_hold(case, &hold).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return r.record("hold", "a first placement reported that it placed nothing");
+        }
+        Err(e) => return r.record("hold", format!("placing a hold failed: {e}")),
+    }
+
+    match store.hold(case).await {
+        Ok(Some(back)) if back == hold => {}
+        Ok(other) => r.record(
+            "hold",
+            format!("a hold must read back as it was placed, got {other:?}"),
+        ),
+        Err(e) => r.record("hold", format!("reading a hold failed: {e}")),
+    }
+
+    // Second placement: the first stands, instant and reason untouched.
+    let later = crate::core::LegalHold {
+        placed_at: ts(9_000),
+        reason: "a retry that must not win".to_owned(),
+    };
+    match store.place_hold(case, &later).await {
+        Ok(false) => match store.hold(case).await {
+            Ok(Some(back)) if back == hold => {}
+            Ok(other) => r.record(
+                "hold",
+                format!("a second placement rewrote the hold: {other:?}"),
+            ),
+            Err(e) => r.record("hold", format!("reading a hold failed: {e}")),
+        },
+        Ok(true) => r.record(
+            "hold",
+            "a second placement reported itself as the first — a retry must not              move when a hold began or why",
+        ),
+        Err(e) => r.record("hold", format!("a repeated placement failed: {e}")),
+    }
+
+    // Listable by somebody who does not know the case id.
+    match store.holds(None, 50).await {
+        Ok(listed) => {
+            if !listed.iter().any(|(c, h)| *c == case && *h == hold) {
+                r.record(
+                    "hold",
+                    "a held matter is not in the hold listing, so it can only be                      found by somebody who already knows the answer",
+                );
+            }
+        }
+        Err(e) => r.record("hold", format!("listing holds failed: {e}")),
+    }
+
+    match store.release_hold(case).await {
+        Ok(true) => {}
+        Ok(false) => r.record("hold", "releasing a placed hold reported nothing to lift"),
+        Err(e) => r.record("hold", format!("releasing a hold failed: {e}")),
+    }
+
+    match store.hold(case).await {
+        Ok(None) => {}
+        Ok(Some(_)) => r.record("hold", "a released hold is still in force"),
+        Err(e) => r.record("hold", format!("reading a hold failed: {e}")),
+    }
+    match store.holds(None, 50).await {
+        Ok(listed) if listed.iter().any(|(c, _)| *c == case) => r.record(
+            "hold",
+            "a released hold is still listed — the listing has no verb that              empties it, so it is a level that only rises",
+        ),
+        Ok(_) => {}
+        Err(e) => r.record("hold", format!("listing holds failed: {e}")),
+    }
+
+    match store.release_hold(case).await {
+        Ok(false) => {}
+        Ok(true) => r.record("hold", "releasing twice reported a second lift"),
+        Err(e) => r.record("hold", format!("a repeated release failed: {e}")),
+    }
+}
+
+/// A hold on a matter that is not there would read as effective in the listing
+/// while preserving nothing.
+async fn a_hold_on_a_missing_matter_is_not_found(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let absent = CaseId::generate();
+    let hold = crate::core::LegalHold {
+        placed_at: ts(2_000),
+        reason: "on nothing".to_owned(),
+    };
+    match store.place_hold(absent, &hold).await {
+        Err(StoreError::NotFound(_)) => {}
+        other => r.record(
+            "hold",
+            format!("a hold on a missing matter must be NotFound, got {other:?}"),
+        ),
+    }
+    match store.release_hold(absent).await {
+        Err(StoreError::NotFound(_)) => {}
+        other => r.record(
+            "hold",
+            format!("releasing on a missing matter must be NotFound, got {other:?}"),
+        ),
+    }
 }
 
 /// The obligation listing drains, and only by somebody answering it.

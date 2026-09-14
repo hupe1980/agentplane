@@ -8,9 +8,8 @@
 //! sealed under a scope that is about to stop existing, and the held item is
 //! destroyed anyway.
 //!
-//! [`EncryptedMemoryStore`](super::EncryptedMemoryStore) closed that window with
-//! a `tokio::sync::Mutex`, which is correct **and process-local** — so the
-//! adapter held its contract on a single-writer deployment and silently did not
+//! A `tokio::sync::Mutex` closes that window and is **process-local**, so on its
+//! own it holds the contract on a single-writer deployment and silently does not
 //! on an active-active one. That is worse than absent, because a configured key
 //! ring reads as *this plane can erase*.
 //!
@@ -36,21 +35,139 @@ use crate::core::StoreError;
 
 /// Permission to run one subject's lifecycle operation, held until released.
 ///
-/// Deliberately not an RAII guard. Releasing a distributed lock is `async` and
-/// fallible, and `Drop` is neither — a guard would have to either block a
-/// runtime thread or drop the failure, and dropping *that* failure strands the
-/// subject for every other instance. Callers use
-/// [`under_lock`], which releases on both paths.
-#[derive(Debug)]
+/// **Dropping it releases the lock**, and that is what makes every path through
+/// this seam safe rather than only the ones that remember to call
+/// [`release`](ErasureCoordinator::release). The argument against an RAII guard
+/// — that releasing a distributed lock is `async` and fallible while `Drop` is
+/// neither — is true of a lease *table* and false of the two primitives here: a
+/// process-local mutex releases by dropping its guard, and a `PostgreSQL`
+/// session advisory lock releases when the session ends, so dropping the
+/// connection is a complete release. Both are synchronous and cannot fail.
+///
+/// `release` still exists and is still what callers use through
+/// [`under_lock`], because it does the *tidy* thing: it unlocks explicitly, so
+/// the scope is free immediately rather than whenever a connection finishes
+/// closing, and it can report a failure. Correctness does not depend on it
+/// being reached.
+///
+/// An implementation whose release genuinely needs a round trip — a lease row,
+/// a lock service with no session semantics — builds a lease with
+/// [`new`](Self::new) and carries no guard. It is then back to needing
+/// `release`, and its cancellation story is its own.
 pub struct Lease {
     scope: String,
     token: u64,
+    /// Whatever holds the lock, if holding it is a value. Dropped on release
+    /// and on cancellation alike.
+    guard: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Lease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lease")
+            .field("scope", &self.scope)
+            .field("token", &self.token)
+            .field("guarded", &self.guard.is_some())
+            .finish()
+    }
 }
 
 impl Lease {
+    /// Mint a lease for a scope, keyed by whatever the implementation uses to
+    /// find the lock again in [`release`](ErasureCoordinator::release).
+    ///
+    /// Public because the trait is a seam: an implementation living in another
+    /// crate — etcd, Redis, a vendor's lock service — has to be able to return
+    /// one of these, and without a constructor the trait is `pub` and
+    /// implementable by nobody.
+    #[must_use]
+    pub fn new(scope: impl Into<String>, token: u64) -> Self {
+        Self {
+            scope: scope.into(),
+            token,
+            guard: None,
+        }
+    }
+
+    /// A lease whose lock is released by dropping `guard`.
+    ///
+    /// Prefer this wherever it is expressible: it is what makes a cancelled
+    /// future release the scope instead of stranding it. `release` can take the
+    /// guard back with [`take_guard`](Self::take_guard) to unlock explicitly
+    /// first.
+    #[must_use]
+    pub fn holding<G: Send + Sync + 'static>(
+        scope: impl Into<String>,
+        token: u64,
+        guard: G,
+    ) -> Self {
+        Self {
+            scope: scope.into(),
+            token,
+            guard: Some(Box::new(guard)),
+        }
+    }
+
+    /// Take the guard back, to release it deliberately rather than by dropping.
+    pub fn take_guard<G: 'static>(&mut self) -> Option<Box<G>> {
+        self.guard.take().and_then(|g| g.downcast::<G>().ok())
+    }
+
     #[must_use]
     pub fn scope(&self) -> &str {
         &self.scope
+    }
+
+    /// The implementation's own handle on the held lock.
+    #[must_use]
+    pub const fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+/// Proof that an acquire is happening inside [`under_lock`].
+///
+/// Its only field is private to this module, so a value of it cannot be
+/// constructed anywhere else — which makes calling
+/// [`acquire`](ErasureCoordinator::acquire) outside `under_lock` a compile
+/// error rather than a rule in a doc comment. What that buys is the explicit
+/// unlock and the reported failure: a dropped lease frees the scope on its own,
+/// and a lease nobody ever drops is a scope held for as long as the caller
+/// holds it.
+///
+/// The rule is the compiler's now, and this is what says so — widen the field
+/// back to public and this stops failing:
+///
+/// ```compile_fail
+/// use agentplane::keyring::{ErasureCoordinator, LocalCoordinator, UnderLock};
+/// # async fn f() {
+/// let coordinator = LocalCoordinator::default();
+/// // No way to make an `UnderLock` from out here, so no way to take a lock
+/// // this caller has not promised to release.
+/// let _ = coordinator.acquire("scope", UnderLock(())).await;
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct UnderLock(());
+
+#[cfg(feature = "testkit")]
+impl UnderLock {
+    /// Take a lifecycle lock without the wrapper, to test the lock itself.
+    ///
+    /// A distributed lock is only testable by holding it: one instance takes a
+    /// scope, a second must block, the release must grant it, and a different
+    /// scope must not contend. None of that fits inside
+    /// [`under_lock`]'s closure, which releases before it returns.
+    ///
+    /// Gated on `testkit` for the reason every escape in that feature is: it
+    /// exists so a seam can be *checked*, and it must not ship. Using it to
+    /// skip `under_lock` in ordinary code reinstates the bug the token exists
+    /// to prevent — an acquire whose release never runs strands the scope for
+    /// every other instance — and no test will tell you, because the strand
+    /// only appears on the next erasure.
+    #[must_use]
+    pub const fn for_test() -> Self {
+        Self(())
     }
 }
 
@@ -59,15 +176,16 @@ impl Lease {
 pub trait ErasureCoordinator: Send + Sync + std::fmt::Debug {
     /// Block until this scope's lifecycle lock is held.
     ///
-    /// **Not cancel-safe.** Dropping this future mid-flight can leave the lock
-    /// taken with no [`Lease`] to release it — the `PostgresCoordinator` has a
-    /// query outstanding on a pooled connection at that moment, and returning
-    /// that connection to the pool deadlocks its next user. Found by a test
-    /// that wrapped this in a `timeout` and hung the suite. Call it through
-    /// [`under_lock`], never inside a `select!` or a `timeout`; to ask *whether*
-    /// a scope is locked without taking it, use a probe
-    /// (`PostgresStore::erasure_probe`).
-    async fn acquire(&self, scope: &str) -> Result<Lease, StoreError>;
+    /// Reachable only from [`under_lock`], which is what the [`UnderLock`]
+    /// argument is for. The lease releases itself when dropped, so this is
+    /// about the *tidy* release rather than about correctness: `under_lock`
+    /// unlocks explicitly on both paths, so the scope frees immediately and a
+    /// release failure reaches somebody.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the underlying lock service answers.
+    async fn acquire(&self, scope: &str, _: UnderLock) -> Result<Lease, StoreError>;
 
     /// Release it. Called on the success *and* the failure path.
     async fn release(&self, lease: Lease) -> Result<(), StoreError>;
@@ -83,6 +201,22 @@ pub trait ErasureCoordinator: Send + Sync + std::fmt::Debug {
 }
 
 /// Run `work` with the scope's lifecycle lock held.
+///
+/// **Dropping this future releases the scope**, for both shipped coordinators,
+/// because the lock travels in the [`Lease`] and dropping a lease is a complete
+/// release: a process-local mutex gives up its guard, and a `PostgreSQL`
+/// session advisory lock ends with the session. So an ordinary `timeout` around
+/// something that reaches here — a `timeout` on an `EncryptedMemoryStore`
+/// write, say — abandons the work without stranding the subject.
+///
+/// What is lost on that path is only the tidy half: the explicit unlock, so the
+/// scope frees when the connection finishes closing rather than immediately,
+/// and the release failure, which nobody is left to report. A coordinator whose
+/// release genuinely needs a round trip carries no guard and has neither
+/// property — see [`Lease`].
+///
+/// To ask *whether* a scope is locked without taking it, use a probe
+/// (`PostgresStore::erasure_probe`).
 ///
 /// A free function rather than a default method, so the release-on-both-paths
 /// rule has exactly one implementation. Two copies of one rule agree everywhere
@@ -102,7 +236,7 @@ where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = Result<T, StoreError>> + Send,
 {
-    let lease = coordinator.acquire(scope).await?;
+    let lease = coordinator.acquire(scope, UnderLock(())).await?;
     let outcome = work().await;
     let released = coordinator.release(lease).await;
     match (outcome, released) {
@@ -134,7 +268,6 @@ where
 pub struct LocalCoordinator {
     scopes:
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    held: std::sync::Mutex<std::collections::HashMap<u64, tokio::sync::OwnedMutexGuard<()>>>,
     next: std::sync::atomic::AtomicU64,
 }
 
@@ -147,7 +280,7 @@ impl LocalCoordinator {
 
 #[async_trait]
 impl ErasureCoordinator for LocalCoordinator {
-    async fn acquire(&self, scope: &str) -> Result<Lease, StoreError> {
+    async fn acquire(&self, scope: &str, _: UnderLock) -> Result<Lease, StoreError> {
         let lock = {
             let mut scopes = self.scopes.lock().expect("lifecycle scopes");
             std::sync::Arc::clone(
@@ -158,21 +291,13 @@ impl ErasureCoordinator for LocalCoordinator {
         };
         let guard = lock.lock_owned().await;
         let token = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.held
-            .lock()
-            .expect("lifecycle leases")
-            .insert(token, guard);
-        Ok(Lease {
-            scope: scope.to_owned(),
-            token,
-        })
+        Ok(Lease::holding(scope, token, guard))
     }
 
     async fn release(&self, lease: Lease) -> Result<(), StoreError> {
-        self.held
-            .lock()
-            .expect("lifecycle leases")
-            .remove(&lease.token);
+        // The guard travels in the lease, so releasing is dropping it — which
+        // is also what a cancelled future does.
+        drop(lease);
         Ok(())
     }
 
@@ -199,7 +324,6 @@ impl ErasureCoordinator for LocalCoordinator {
 #[derive(Debug)]
 pub struct PostgresCoordinator {
     pool: deadpool_postgres::Pool,
-    held: tokio::sync::Mutex<std::collections::HashMap<u64, deadpool_postgres::Object>>,
     next: std::sync::atomic::AtomicU64,
 }
 
@@ -215,7 +339,6 @@ impl PostgresCoordinator {
     pub fn new(pool: deadpool_postgres::Pool) -> Self {
         Self {
             pool,
-            held: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             next: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -241,12 +364,27 @@ impl PostgresCoordinator {
 #[cfg(feature = "postgres")]
 #[async_trait]
 impl ErasureCoordinator for PostgresCoordinator {
-    async fn acquire(&self, scope: &str) -> Result<Lease, StoreError> {
-        let client = self
+    async fn acquire(&self, scope: &str, _: UnderLock) -> Result<Lease, StoreError> {
+        let pooled = self
             .pool
             .get()
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
+        // **Detached from the pool before the lock is taken**, and that is what
+        // makes this future safe to drop. A session advisory lock belongs to
+        // the connection, so a pooled connection handed back while it holds one
+        // — or while a `pg_advisory_lock` is still outstanding on it — keeps the
+        // lock and wedges whoever gets that connection next. Owned by the lease
+        // instead, a dropped future drops the client, the client closes the
+        // session, and `PostgreSQL` frees the session's locks. That is the same
+        // property this primitive was chosen for: an instance that dies
+        // mid-erasure releases by dying, and a cancelled future is a small
+        // death.
+        //
+        // The cost is one connection per erasure rather than one borrow, paid
+        // on an operation a deployment performs when somebody asks to be
+        // forgotten.
+        let client = deadpool_postgres::Object::take(pooled);
         // Blocking form, not `try_`: a caller that failed to get the lock would
         // have to decide between retrying and skipping, and skipping an erasure
         // is the wrong answer to contention.
@@ -255,21 +393,17 @@ impl ErasureCoordinator for PostgresCoordinator {
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         let token = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.held.lock().await.insert(token, client);
-        Ok(Lease {
-            scope: scope.to_owned(),
-            token,
-        })
+        Ok(Lease::holding(scope, token, client))
     }
 
-    async fn release(&self, lease: Lease) -> Result<(), StoreError> {
-        let Some(client) = self.held.lock().await.remove(&lease.token) else {
+    async fn release(&self, mut lease: Lease) -> Result<(), StoreError> {
+        let Some(client) = lease.take_guard::<deadpool_postgres::ClientWrapper>() else {
             return Ok(());
         };
-        // Unlock explicitly and only then return the connection to the pool. A
-        // pooled session that goes back still holding the lock keeps it until
-        // that session is recycled, which is a lock leak with no error anywhere
-        // — the failure this whole seam exists to prevent, arriving from inside.
+        // Unlock explicitly rather than relying on the session ending, so the
+        // scope is free the instant the work is done rather than whenever the
+        // connection finishes closing. Dropping the client is what actually
+        // guarantees it either way.
         let unlocked = client
             .execute(
                 "SELECT pg_advisory_unlock($1)",
@@ -282,19 +416,17 @@ impl ErasureCoordinator for PostgresCoordinator {
                 Ok(())
             }
             Err(error) => {
-                // The unlock failed but the session may still be healthy —
-                // a statement timeout, a cancelled query — and a healthy
-                // session recycled into the pool **still holds the lock**:
-                // its next user runs unrelated queries on a connection that
-                // silently serialises every erasure on this scope, until the
-                // pool happens to retire it. Taking the connection out of the
-                // pool and dropping it closes the session, and PostgreSQL
-                // frees a dead session's advisory locks — so the failure path
-                // costs one connection instead of an invisible lock leak.
+                // The unlock failed but the session may still be healthy — a
+                // statement timeout, a cancelled query — and a healthy session
+                // that stayed open **still holds the lock**. Dropping the
+                // client closes it, and `PostgreSQL` frees a dead session's
+                // advisory locks, so the failure path costs one connection
+                // instead of an invisible lock leak.
+                //
                 // What this does not cover: a network partition where the
                 // server never notices the client is gone keeps the lock until
                 // the server-side timeout reaps the session.
-                drop(deadpool_postgres::Object::take(client));
+                drop(client);
                 Err(StoreError::Backend(error.to_string()))
             }
         }

@@ -245,6 +245,8 @@ fn write_canonical(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
+/// Append one scalar's canonical bytes.
+///
 /// # Panics
 ///
 /// Only if `serde_json` cannot serialize a scalar `Value`, which is

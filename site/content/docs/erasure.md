@@ -180,11 +180,19 @@ releases by dying, where a lease with a TTL must choose between stranding the
 subject and handing it over while the first instance's KMS call may still be in
 flight.
 
-**The lease is not an RAII guard**, deliberately. Releasing a distributed lock is
-async and fallible and `Drop` is neither, so a guard would have to block a
-runtime thread or swallow the failure — and swallowing *that* failure strands the
-subject for every other instance. Use `under_lock`, which releases on the success
-and the failure path.
+**Dropping the lease releases the scope.** The usual argument against an RAII
+guard — releasing a distributed lock is async and fallible, `Drop` is neither —
+holds for a lease *table* and not for either primitive here: a process-local
+mutex releases by dropping its guard, and a `PostgreSQL` session advisory lock
+ends with the session, so dropping the connection releases it. Both are
+synchronous and cannot fail. That is what makes a cancelled erasure safe: put a
+`timeout` around a memory write and you abandon the work, not the subject.
+
+Use `under_lock` anyway. It releases on the success *and* the failure path, and
+what it adds is the tidy half — an explicit unlock, so the scope frees
+immediately rather than when the connection finishes closing, and a release
+failure that reaches somebody. A coordinator of your own whose release needs a
+round trip carries no guard and gets neither.
 
 The scope is per **tenant**, not per subject: `forget`, `forget_cascading` and
 `set_legal_hold` are addressed by item id and `sweep_expired` spans every
@@ -285,6 +293,64 @@ picked one would be choosing somebody else's. `--reason` is required and lands
 on every tombstone and key destruction, so a later read says *expired, on this
 date, for this reason* rather than *missing* — which is the distinction the
 recovery drill's verdict is built on.
+
+### A legal hold is the one thing that stops a pass {#a-legal-hold-stops-a-pass}
+
+A retention pass is automatic: it runs on a window nobody re-reads, and a matter
+under a preservation order looks exactly like every other closed case old enough
+to go. A hold is what makes that erasure **fail** instead.
+
+```sh
+# Preserve a matter. --reason is required: it is what somebody reads in 2028.
+agentplane hold --store ./journal.redb \
+  --case case_01JD... --reason "preservation order 2026-114"
+
+# Everything standing, for somebody who does not know which case to ask about.
+agentplane hold --store ./journal.redb
+
+# Release it. The next pass erases the matter normally.
+agentplane hold --store ./journal.redb --case case_01JD... --lift
+```
+
+```rust
+cases.place_hold(case, &LegalHold { placed_at: now, reason: order.into() }).await?;
+```
+
+Run it: `cargo run --example retention_hold --features redb,testkit`
+
+**Nothing is half-done.** The hold is read before the first tombstone and before
+any key is destroyed, so a refused erasure leaves no expired blobs and no missing
+key. Over HTTP it is `GET`/`POST /holds` and `POST /holds/release`, under three
+capabilities — `api:hold.place` and `api:hold.release` are separate, so whoever
+may authorise destruction is a grant you hand out separately from whoever may
+prevent it.
+
+**A held case reads as held, not as failed.** `RetentionReport::held` is its own
+field beside `failures`, and a hold does not make `is_complete()` false — a
+control doing its job must not page anybody. `retention::plan` splits `due` from
+`held` too, so a dry run and a pass never disagree. The hold is read again inside
+`erase_case`, which is what honours one placed between the two.
+
+**What else could destroy it.** Two things here destroy on a schedule, and a hold
+stops both: `retention::retain` (closed cases past a window) and
+`MemoryStore::sweep_expired` (memories past their effective expiry). Nothing else
+scheduled destroys anything — `forget_admissions` retires index rows and alters no
+history, `sweep_unclaimed` moves an event to the dead-letter listing with its
+payload, and journal records are append-only. The deliberate verbs —
+`erase_case`, `forget`, `forget_subject` — all consult a hold; `erase_run` does
+not, because its unit is a run bound to no matter.
+
+**It says what is preserved now, not what ever was.** Releasing leaves no history
+here. Kept rows would make their free-text reasons outlive the matter they
+preserved, and destroying them with the matter would destroy the record of the
+erasure's own authorisation; the chain of custody belongs to the system that
+issued the order.
+
+**What it does not cover.** A hold is placed on a *case*, the unit a preservation
+order names. Bind a run to a case if it must be preserved — that is also what
+gives it an obligation trail. Memory items carry their own finer hold
+(`MemoryStore::set_legal_hold`, listable with `legal_holds`), because the memory
+erasure unit is a subject rather than a matter.
 
 ### An expired address stays expired {#an-expired-address-stays-expired}
 

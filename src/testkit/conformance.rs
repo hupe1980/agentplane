@@ -515,10 +515,33 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         0,
         "expiry sweep bypassed legal hold"
     );
+    // Findable by somebody who does not already know the id. A hold only
+    // `legal_hold` can answer for is a flag, not a control: the person who has
+    // to certify that an erasure request was discharged is exactly the one who
+    // does not know which ids were held back.
+    assert!(
+        store
+            .legal_holds(None, 50)
+            .await
+            .expect("list holds")
+            .iter()
+            .any(|id| id == "memory-expiring"),
+        "a held id is not in the hold listing, so it can be found only by \
+         somebody who already knows the answer"
+    );
     store
         .set_legal_hold("memory-expiring", false)
         .await
         .expect("release legal hold");
+    assert!(
+        !store
+            .legal_holds(None, 50)
+            .await
+            .expect("list holds")
+            .iter()
+            .any(|id| id == "memory-expiring"),
+        "a released hold is still listed — the listing has no verb that empties it"
+    );
     assert_eq!(
         store
             .sweep_expired(at(1_760_000_101))

@@ -169,6 +169,9 @@ impl A2aClient {
         self
     }
 
+    /// A client for one peer endpoint, reaching nothing else until
+    /// [`egress`](Self::egress) narrows it further.
+    ///
     /// # Errors
     ///
     /// If the HTTP client cannot be built.

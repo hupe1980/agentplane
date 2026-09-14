@@ -1706,6 +1706,35 @@ struct InstrumentedCases {
 
 #[async_trait::async_trait]
 impl CaseStore for InstrumentedCases {
+    async fn place_hold(
+        &self,
+        case: agentplane::core::CaseId,
+        hold: &agentplane::core::LegalHold,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.place_hold(case, hold).await
+    }
+    async fn release_hold(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.release_hold(case).await
+    }
+    async fn hold(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<Option<agentplane::core::LegalHold>, agentplane::core::StoreError> {
+        self.inner.hold(case).await
+    }
+    async fn holds(
+        &self,
+        after: Option<agentplane::core::CaseId>,
+        limit: usize,
+    ) -> Result<
+        Vec<(agentplane::core::CaseId, agentplane::core::LegalHold)>,
+        agentplane::core::StoreError,
+    > {
+        self.inner.holds(after, limit).await
+    }
     async fn correlate(
         &self,
         keys: &[CorrelationKey],

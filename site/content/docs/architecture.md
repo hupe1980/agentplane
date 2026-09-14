@@ -47,17 +47,43 @@ Everything else depends on this holding.
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-Three layers enforce it, because convention is not enforcement:
+Two layers enforce it, because convention is not enforcement:
 
-1. **Capability absence.** Sandboxed skills (planned) get a WASI world with no
-   clock, RNG, socket, or filesystem. Non-determinism is unreachable rather than
-   discouraged.
-2. **Lint gating.** `clippy.toml` denies `SystemTime::now`, `Instant::now`,
-   `rand::random`, `Ulid::generate`. The two legitimate call sites in the crate carry
-   an explicit `#[allow]` and a comment naming the record that captures the
-   value.
-3. **Effect-key verification.** On replay the key is recomputed from the
+1. **Lint gating.** `clippy.toml` denies `SystemTime::now`, `Instant::now`,
+   `OffsetDateTime::now_utc`, `rand::random`, `rand::rng` and `Ulid::generate`.
+   Every legitimate call site in the crate carries an explicit `#[allow]` and a
+   comment naming the record that captures the value.
+
+   **This layer is the crate's own, and it does not reach your code.** A coded
+   skill lives in *your* crate, compiled against *your* lint configuration, so
+   the gate that would catch a bare `SystemTime::now` in it is one you have to
+   put there. Copy the stanza into your `clippy.toml`:
+
+   ```toml
+   disallowed-methods = [
+       { path = "std::time::SystemTime::now",    reason = "use StepCtx::now(), which journals the instant" },
+       { path = "std::time::Instant::now",       reason = "use StepCtx::now(), which journals the instant" },
+       { path = "time::OffsetDateTime::now_utc", reason = "use StepCtx::now(), which journals the instant" },
+       { path = "rand::random",                  reason = "use StepCtx::rng(), seeded from the run id" },
+       { path = "rand::rng",                     reason = "use StepCtx::rng(), seeded from the run id" },
+       { path = "ulid::Ulid::generate",          reason = "mint ids via StepCtx, which journals them" },
+   ]
+   ```
+2. **Effect-key verification.** On replay the key is recomputed from the
    deterministic zone. A mismatch quarantines the run.
+
+Layer 2 is the one that holds whatever you do, which is why the guarantee rests
+on it: a skill that reads the clock directly is not stopped, it is *caught* —
+the next replay asks for a different effect and the run quarantines rather than
+continuing on a history it no longer matches. Layer 1 exists so that failure
+arrives at compile time instead of at 3 a.m.
+
+Neither is a sandbox, and a native skill is not sandboxed by anything here: it
+is compiled into the process and can open a socket directly. Untrusted code
+belongs behind the effect boundary instead — an MCP tool, an A2A peer, another
+`Tool` transport — and behind whatever OS process, container or service boundary
+the deployment runs it in. Its nondeterminism is then journaled once, like any
+other effect's, and never re-executed on replay.
 
 Two things sit *inside* the deterministic zone that are easy to get wrong:
 **record upcasting** and **correlation matching**. Both are pure by

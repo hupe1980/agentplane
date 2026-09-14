@@ -1140,3 +1140,52 @@ async fn a_deleted_run_is_caught_by_the_anchor_a_witness_holds() {
         armed.findings
     );
 }
+
+/// **A split monitoring prefix is read from, and submissions still go to the
+/// submission prefix.**
+///
+/// `tlog-witness` allows a deployment to delegate reads to a different origin —
+/// a CDN in front of the checkpoints, while `add-checkpoint` still reaches the
+/// witness that signs. `monitoring_at` is the only way to express that, and it
+/// is one line that moves a URL: set it on the wrong field, or have `reader()`
+/// keep using the submission prefix, and the split silently does nothing while
+/// the deployment believes reads are served from the CDN.
+///
+/// Two servers, so the assertion is about *which one answered* rather than
+/// about a string.
+#[tokio::test]
+async fn a_split_monitoring_prefix_is_where_reads_go() {
+    let signing = Arc::new(SigningWitness::new("witness-1", 7));
+    let (submit_url, _) = monitoring_server(Arc::clone(&signing)).await;
+
+    // A second witness process, holding nothing until something is cosigned
+    // against it — so an answer from here proves the read went here.
+    let mirror = Arc::new(SigningWitness::new("witness-1", 7));
+    let (mirror_url, _) = monitoring_server(Arc::clone(&mirror)).await;
+
+    let w = HttpWitness::new(&submit_url, log_key(), vec![signing.trusted()])
+        .unwrap()
+        .monitoring_at(&mirror_url);
+
+    let cp = checkpoint(4);
+    w.cosign(&cp, 0, &[]).await.expect("cosigned");
+
+    // The submission went to the submission prefix: that witness holds it.
+    assert!(
+        signing.held.lock().unwrap().is_some(),
+        "the cosignature request did not reach the submission prefix"
+    );
+    // And the mirror was never submitted to, so a read routed there finds
+    // nothing — which is exactly what proves the read did not go to the
+    // submission prefix instead.
+    let reader = w.reader().expect("a reader for the monitoring prefix");
+    assert!(
+        reader
+            .latest(&cp.origin)
+            .await
+            .expect("the monitoring prefix answers")
+            .is_none(),
+        "the read was served by the submission prefix — `monitoring_at` moved \
+         nothing, and a deployment splitting the two would not find out"
+    );
+}

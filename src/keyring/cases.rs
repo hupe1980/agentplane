@@ -21,8 +21,8 @@ use serde_json::Value;
 
 use crate::case::{CaseStore, Correlation};
 use crate::core::{
-    Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState, Digest, RunId,
-    StoreError, TenantId, Timestamp,
+    Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState, Digest,
+    LegalHold, RunId, StoreError, TenantId, Timestamp,
 };
 use crate::journal::payload;
 
@@ -97,12 +97,24 @@ impl SealedCases {
         }
     }
 
-    async fn opened(&self, case: Option<Case>) -> Option<Case> {
-        let mut case = case?;
+    /// Open one case's sealed state in place.
+    ///
+    /// Returns a `Case` rather than an `Option<Case>` because opening never
+    /// removes a case from a listing: a state sealed to a destroyed key reads
+    /// as absent *state*, and the case itself is still a case. Writing this as
+    /// an `Option` invited a caller to treat it as a filter, and one did.
+    async fn open_case(&self, mut case: Case) -> Case {
         case.state = self
             .open_state(case.id, std::mem::take(&mut case.state))
             .await;
-        Some(case)
+        case
+    }
+
+    async fn opened(&self, case: Option<Case>) -> Option<Case> {
+        match case {
+            Some(case) => Some(self.open_case(case).await),
+            None => None,
+        }
     }
 }
 
@@ -205,9 +217,7 @@ impl CaseStore for SealedCases {
         let cases = self.inner.by_status(status, limit).await?;
         let mut out = Vec::with_capacity(cases.len());
         for case in cases {
-            if let Some(opened) = self.opened(Some(case)).await {
-                out.push(opened);
-            }
+            out.push(self.open_case(case).await);
         }
         Ok(out)
     }
@@ -274,6 +284,32 @@ impl CaseStore for SealedCases {
 
     async fn close(&self, case: CaseId) -> Result<(), StoreError> {
         self.inner.close(case).await
+    }
+
+    // Holds pass straight through, and deliberately unsealed. A hold's reason is
+    // an operator's own instruction, not a run's payload — and sealing it under
+    // the case's scope would be circular: the scope a hold exists to keep alive
+    // cannot also be the scope its own reason is readable through. The row is
+    // removed by `release_hold`, which is the only way an erasure can reach the
+    // case at all, so no hold reason outlives the matter it preserved.
+    async fn place_hold(&self, case: CaseId, hold: &LegalHold) -> Result<bool, StoreError> {
+        self.inner.place_hold(case, hold).await
+    }
+
+    async fn release_hold(&self, case: CaseId) -> Result<bool, StoreError> {
+        self.inner.release_hold(case).await
+    }
+
+    async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError> {
+        self.inner.hold(case).await
+    }
+
+    async fn holds(
+        &self,
+        after: Option<CaseId>,
+        limit: usize,
+    ) -> Result<Vec<(CaseId, LegalHold)>, StoreError> {
+        self.inner.holds(after, limit).await
     }
 
     async fn register_deadline(&self, deadline: &Deadline) -> Result<(), StoreError> {

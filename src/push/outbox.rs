@@ -255,6 +255,8 @@ pub struct Outbox {
 }
 
 impl Outbox {
+    /// The outbox over a set of operator destinations.
+    ///
     /// # Panics
     ///
     /// If two destinations share a name, or a name is blank. Both would make the

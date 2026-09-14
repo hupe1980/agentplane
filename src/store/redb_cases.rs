@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::case::{CaseCensus, CaseStore, Correlation};
 use crate::core::{
     BreachNote, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState,
-    Digest, RunId, StoreError, Timestamp,
+    Digest, LegalHold, RunId, StoreError, Timestamp,
 };
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
@@ -99,6 +99,17 @@ const CASES_OPEN: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new(
 /// under redb's ascending iteration, which is the order the worklist wants.
 const CASES_BY_STATUS: TableDefinition<(&str, &str, i64, &str), ()> =
     TableDefinition::new("cases_by_status");
+
+/// `(tenant, case_id) -> (placed_at, reason)`. The hold itself.
+const CASE_HOLDS: TableDefinition<(&str, &str), (i64, &str)> =
+    TableDefinition::new("case_legal_holds");
+
+/// `(tenant, placed_at, case_id) -> ()`. **Not** negated, unlike
+/// [`CASES_BY_STATUS`]: this listing is ascending on purpose, because
+/// `release_hold` empties it and the oldest unlifted hold is the one somebody
+/// needs to ask about.
+const CASE_HOLDS_BY_TIME: TableDefinition<(&str, i64, &str), ()> =
+    TableDefinition::new("case_legal_holds_by_time");
 
 fn ts(t: Timestamp) -> i64 {
     t.unix_timestamp()
@@ -281,6 +292,8 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(DEADLINES_DUE).map_err(|e| be(&e))?;
     w.open_table(CASES_OPEN).map_err(|e| be(&e))?;
     w.open_table(CASES_BY_STATUS).map_err(|e| be(&e))?;
+    w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
+    w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
     Ok(())
 }
 
@@ -1433,6 +1446,180 @@ impl CaseStore for RedbStore {
             Ok(recorded)
         })
         .await
+    }
+
+    async fn place_hold(&self, case: CaseId, hold: &LegalHold) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let key = case.to_string();
+        let (at, reason) = (ts(hold.placed_at), hold.reason.clone());
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let placed = {
+                let c = w.open_table(CASES).map_err(|e| be(&e))?;
+                if c.get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_none()
+                {
+                    return Err(StoreError::NotFound(key));
+                }
+                let mut h = w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
+                // First placement wins. A retry must not move the instant or the
+                // reason: those are the two facts the hold exists to record.
+                if h.get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_some()
+                {
+                    false
+                } else {
+                    h.insert((tenant.as_str(), key.as_str()), (at, reason.as_str()))
+                        .map_err(|e| be(&e))?;
+                    let mut idx = w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
+                    idx.insert((tenant.as_str(), at, key.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                    true
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(placed)
+        })
+        .await
+    }
+
+    async fn release_hold(&self, case: CaseId) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let key = case.to_string();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let released = {
+                let c = w.open_table(CASES).map_err(|e| be(&e))?;
+                if c.get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_none()
+                {
+                    return Err(StoreError::NotFound(key));
+                }
+                let mut h = w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
+                let at = h
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| v.value().0);
+                match at {
+                    Some(at) => {
+                        h.remove((tenant.as_str(), key.as_str()))
+                            .map_err(|e| be(&e))?;
+                        let mut idx = w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
+                        idx.remove((tenant.as_str(), at, key.as_str()))
+                            .map_err(|e| be(&e))?;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(released)
+        })
+        .await
+    }
+
+    async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError> {
+        let tenant = self.tenant_name();
+        let key = case.to_string();
+        let row = self
+            .with_db(move |db| {
+                let r = db.begin_read().map_err(|e| be(&e))?;
+                let t = r.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
+                Ok(t.get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (at, reason) = v.value();
+                        (at, reason.to_owned())
+                    }))
+            })
+            .await?;
+        row.map(|(at, reason)| {
+            Ok(LegalHold {
+                placed_at: from_ts(at)?,
+                reason,
+            })
+        })
+        .transpose()
+    }
+
+    async fn holds(
+        &self,
+        after: Option<CaseId>,
+        limit: usize,
+    ) -> Result<Vec<(CaseId, LegalHold)>, StoreError> {
+        let tenant = self.tenant_name();
+        // Resuming needs the cursor's own instant, because the index is ordered
+        // by time and a case id alone does not locate a position in it.
+        let from = match after {
+            Some(c) => match self.hold(c).await? {
+                Some(h) => Some((ts(h.placed_at), c.to_string())),
+                // A cursor whose hold was lifted mid-page: start again rather
+                // than silently returning the whole listing as if no cursor was
+                // given, which would repeat a page the caller already had.
+                None => return Ok(Vec::new()),
+            },
+            None => None,
+        };
+        let rows = self
+            .with_db(move |db| {
+                let r = db.begin_read().map_err(|e| be(&e))?;
+                let t = r.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
+                let lo = match &from {
+                    Some((at, id)) => (tenant.as_str(), *at, id.as_str()),
+                    None => (tenant.as_str(), i64::MIN, ""),
+                };
+                let mut out = Vec::new();
+                for e in t
+                    .range(lo..=(tenant.as_str(), i64::MAX, MAX_STR))
+                    .map_err(|e| be(&e))?
+                {
+                    if out.len() >= limit {
+                        break;
+                    }
+                    let (k, _) = e.map_err(|e| be(&e))?;
+                    let (_, at, id) = k.value();
+                    // The cursor row itself is the exclusive bound.
+                    if from
+                        .as_ref()
+                        .is_some_and(|(fat, fid)| *fat == at && fid == id)
+                    {
+                        continue;
+                    }
+                    out.push((at, id.to_owned()));
+                }
+                Ok(out)
+            })
+            .await?;
+
+        let mut held = Vec::with_capacity(rows.len());
+        for (at, id) in rows {
+            let reason = self
+                .with_db({
+                    let tenant = self.tenant_name();
+                    let id = id.clone();
+                    move |db| {
+                        let r = db.begin_read().map_err(|e| be(&e))?;
+                        let t = r.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
+                        Ok(t.get((tenant.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|v| v.value().1.to_owned()))
+                    }
+                })
+                .await?;
+            if let Some(reason) = reason {
+                held.push((
+                    parse_case_id(&id)?,
+                    LegalHold {
+                        placed_at: from_ts(at)?,
+                        reason,
+                    },
+                ));
+            }
+        }
+        Ok(held)
     }
 
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError> {

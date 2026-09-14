@@ -125,6 +125,8 @@ enum Verb {
     Halt(HaltArgs),
     /// List every emergency stop standing on a tenant.
     Halts(HaltsArgs),
+    /// Place, lift, or list the legal holds that stop a retention pass.
+    Hold(HoldArgs),
 }
 
 /// Retention, as a verb, for the tier that is a manifest and this binary.
@@ -160,6 +162,37 @@ struct RetainArgs {
     /// store and no key ring, so listing is the only half it can perform.
     #[arg(long)]
     dry_run: bool,
+}
+
+/// Preservation, as a verb.
+///
+/// The counterpart of `retain`: that verb says what a sweep would destroy, this
+/// one says what it may not. With no `--case`, it lists — because a hold that
+/// can only be read by somebody who already knows which matter to ask about
+/// delivers nothing to the person whose job is to find out what is still being
+/// preserved and why.
+#[derive(clap::Args, Debug)]
+struct HoldArgs {
+    /// The store holding the case layer.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// Which tenant's cases.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
+
+    /// The matter to place or lift a hold on. Omit to list every hold standing.
+    #[arg(long)]
+    case: Option<String>,
+
+    /// Why this matter may not be destroyed. Required to place one: the person
+    /// reviewing this listing in two years has only this sentence to act on.
+    #[arg(long)]
+    reason: Option<String>,
+
+    /// Lift the hold instead of placing it.
+    #[arg(long)]
+    lift: bool,
 }
 
 /// The emergency stop, as a verb: an incident is the worst time to discover
@@ -1226,6 +1259,114 @@ fn retain_verb(opts: &RetainArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// Place, lift, or list legal holds.
+///
+/// Prints what it did for the reason `halt` does: an operator who cannot see
+/// the control move has not been told whether they moved it.
+fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
+    if opts.case.is_none() && (opts.lift || opts.reason.is_some()) {
+        return Err(
+            "--lift and --reason act on one matter: name it with --case, or pass \
+             neither to list every hold standing"
+                .to_owned(),
+        );
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let redb = RedbStore::open(&opts.store).map_err(|e| e.to_string())?;
+        let redb = match opts.tenant.as_deref() {
+            Some(name) => redb.for_tenant(
+                agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}"))?,
+            ),
+            None => redb,
+        };
+        let cases: Arc<dyn agentplane::case::CaseStore> = Arc::new(redb);
+
+        let Some(case) = opts.case.as_deref() else {
+            let mut standing = Vec::new();
+            let mut after = None;
+            loop {
+                let page = cases.holds(after, 256).await.map_err(|e| e.to_string())?;
+                if page.is_empty() {
+                    break;
+                }
+                after = page.last().map(|(c, _)| *c);
+                for (id, hold) in page {
+                    standing.push(serde_json::json!({
+                        "case": id.to_string(),
+                        "placed_at": hold.placed_at.unix_timestamp(),
+                        "reason": hold.reason,
+                    }));
+                }
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "holds": standing }))
+                    .map_err(|e| e.to_string())?
+            );
+            return Ok(ExitCode::SUCCESS);
+        };
+
+        let case = agentplane::core::CaseId::parse(case).map_err(|e| format!("--case: {e}"))?;
+        if opts.lift {
+            let lifted = cases.release_hold(case).await.map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "case": case.to_string(),
+                    "lifted": lifted,
+                }))
+                .map_err(|e| e.to_string())?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+
+        let Some(reason) = opts.reason.as_deref() else {
+            return Err(concat!(
+                "--reason is required to place a hold: a preservation nobody can account for ",
+                "is indistinguishable from a sweep that quietly stopped working. ",
+                "Use --lift to release one"
+            )
+            .to_owned());
+        };
+        // Wall clock by design, like `retain`'s cutoff: when a hold was placed
+        // is a fact about the outside world, not a journaled observation.
+        #[allow(clippy::disallowed_methods)]
+        let now = time::OffsetDateTime::now_utc();
+        let placed = cases
+            .place_hold(
+                case,
+                &agentplane::core::LegalHold {
+                    placed_at: now,
+                    reason: reason.to_owned(),
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "case": case.to_string(),
+                "placed": placed,
+                // False means one was already standing, and the first placement
+                // is the one that counts — so say what is actually in force
+                // rather than leaving the operator to assume it is theirs.
+                "in_force": cases.hold(case).await.map_err(|e| e.to_string())?
+                    .map(|h| serde_json::json!({
+                        "placed_at": h.placed_at.unix_timestamp(),
+                        "reason": h.reason,
+                    })),
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
 /// Throw or lift one emergency stop.
 ///
 /// Prints what it did, because an operator who cannot see the switch move has
@@ -1362,6 +1503,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Verb::ForgetAdmissions(a) => forget_admissions_verb(&a),
         Verb::Retain(a) => retain_verb(&a),
         Verb::Halt(a) => halt_verb(&a),
+        Verb::Hold(a) => hold_verb(&a),
         Verb::Halts(a) => halts_verb(&a),
         Verb::Restore(a) => {
             let rt = tokio::runtime::Builder::new_current_thread()

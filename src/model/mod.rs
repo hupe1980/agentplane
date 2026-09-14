@@ -640,10 +640,18 @@ impl Usage {
     /// a token the provider processed. Cost weighting belongs in `minor_units`,
     /// which the driver prices; conflating the two would make the token ceiling
     /// mean something different for every provider.
+    ///
+    /// **Saturating, for the same reason [`Spend::plus`] is.** These two numbers
+    /// are whatever a provider's response said they were, and a provider is
+    /// untrusted data. A plain sum of `u64::MAX` and `1` is `0` in a release
+    /// build, which hands the budget a run that reported astronomical usage as
+    /// one that cost nothing — the ceiling defeated by the counterparty it
+    /// exists to bound. Saturating at the accumulator and not here would guard
+    /// every addition except the one where the outside gets in.
     #[must_use]
     pub const fn spend(&self) -> Spend {
         Spend {
-            tokens: self.input_tokens + self.output_tokens,
+            tokens: self.input_tokens.saturating_add(self.output_tokens),
             minor_units: self.minor_units,
         }
     }

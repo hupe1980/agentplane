@@ -282,10 +282,11 @@ impl TimerStore for RedbStore {
     }
 }
 
-/// Whether a run still has an armed timer.
-///
-/// Used by tests and by operator tooling; the sweep uses `claim_due`.
 impl RedbStore {
+    /// How many armed timers a run still has.
+    ///
+    /// For tests and operator tooling; the sweep uses `claim_due`.
+    ///
     /// # Errors
     ///
     /// If the count cannot be read.

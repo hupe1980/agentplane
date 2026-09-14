@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.36.0"
+version      = "0.37.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -96,6 +96,10 @@ mcp = ["dep:rmcp"]
 # `tokio/process`, which an embedder bringing their own transport should not
 # pay for.
 mcp-stdio = ["mcp", "rmcp/transport-child-process"]
+# Serve this plane's agents *as* MCP tools and their instructions as prompts.
+# Needs the manifest: what a catalogue offers is the declaration, never a
+# second list beside it.
+mcp-server = ["mcp", "manifest", "rmcp/server", "rmcp/transport-io"]
 # Reach an MCP server over streamable HTTP — the transport remote servers
 # speak. Separate for the same reason as `mcp-stdio`: it costs a reqwest
 # stack an embedder bringing their own transport should not pay for.
@@ -228,8 +232,8 @@ ed25519-dalek = { version = "3", default-features = false, features = ["alloc", 
 # `tests/guards/docs.rs` keeps it gone.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset", "stream"], optional = true }
 # Defaults declined on both AWS crates for one reason: the SDK's `rustls` feature
-# is `legacy-rustls-ring`, pinning `rustls` 0.21 and `rustls-webpki` 0.101 —
-# three live RUSTSEC advisories against certificate validation.
+# is `legacy-rustls-ring`, pinning `rustls` 0.21 and `rustls-webpki` 0.101,
+# which carry live RUSTSEC advisories against certificate validation.
 # `default-https-client` selects the maintained `rustls-aws-lc` stack. A TLS
 # client must not be whatever a transitive default picks; `just audit` keeps it
 # honest.
@@ -452,6 +456,17 @@ required-features = ["redb", "fake-model"]
 [[example]]
 name              = "streaming_run"
 required-features = ["redb", "fake-model"]
+
+# The plane as an MCP server. `mcp` as well as `mcp-server`, because the example
+# drives it with the SDK's own client over an in-process pipe — what a desktop
+# host runs, rather than a hand-written expectation of what the server sends.
+[[example]]
+name              = "serve_mcp"
+required-features = ["redb", "mcp", "mcp-server", "manifest"]
+
+[[example]]
+name              = "retention_hold"
+required-features = ["redb"]
 
 [lints.rust]
 unsafe_code = "forbid"

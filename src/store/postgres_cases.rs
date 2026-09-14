@@ -30,8 +30,8 @@ use crate::case::{BufferedEvent, ClaimError, TargetedDelivery};
 use crate::case::{CaseCensus, CaseStore, Correlation, EventStore, TaskStore, TimerStore};
 use crate::core::{
     BatchId, BreachNote, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, DeadLetter,
-    Deadline, DeadlineState, Digest, EffectKey, InboundEvent, OnExpiry, Priority, RunId, Spend,
-    StoreError, Subscription, Task, TaskId, TaskState, Timer, Timestamp,
+    Deadline, DeadlineState, Digest, EffectKey, InboundEvent, LegalHold, OnExpiry, Priority, RunId,
+    Spend, StoreError, Subscription, Task, TaskId, TaskState, Timer, Timestamp,
 };
 
 use super::postgres::{PostgresStore, amount_of, be, pool_err, sql_amount};
@@ -111,6 +111,21 @@ CREATE TABLE IF NOT EXISTS case_blobs (
 
 CREATE INDEX IF NOT EXISTS case_blobs_time
     ON case_blobs (tenant, case_id, written_at);
+
+CREATE TABLE IF NOT EXISTS case_legal_holds (
+    tenant    TEXT   NOT NULL,
+    case_id   TEXT   NOT NULL,
+    placed_at BIGINT NOT NULL,
+    reason    TEXT   NOT NULL,
+    PRIMARY KEY (tenant, case_id),
+    FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
+);
+
+-- The listing, oldest hold first. Ascending unlike every other backlog index
+-- here, because `release_hold` empties this one and the longest-standing
+-- unlifted hold is the entry somebody has to ask about.
+CREATE INDEX IF NOT EXISTS case_legal_holds_by_time
+    ON case_legal_holds (tenant, placed_at, case_id);
 
 CREATE TABLE IF NOT EXISTS case_deadlines (
     tenant          TEXT   NOT NULL,
@@ -217,6 +232,15 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 -- which knows only what it carries.
 CREATE INDEX IF NOT EXISTS subscriptions_by_key
     ON subscriptions (tenant, event_kind, namespace, value);
+
+-- The redelivery sweep's read: the oldest waits, bounded. Registration order is
+-- the index's own order, so a tick walks `limit` rows instead of sorting every
+-- subscription the tenant has — which is the shape the embedded backend already
+-- had in `SUBS_BY_TIME` and this one did not, so the two agreed on the answer
+-- and disagreed on the cost, on a path that runs every tick against a
+-- population a plane is *expected* to accumulate.
+CREATE INDEX IF NOT EXISTS subscriptions_waiting
+    ON subscriptions (tenant, created_at, run_id, effect_key);
 
 CREATE TABLE IF NOT EXISTS timers (
     tenant     TEXT   NOT NULL,
@@ -1256,6 +1280,144 @@ impl CaseStore for PostgresStore {
         .map_err(|e| be(&e))?;
         tx.commit().await.map_err(|e| be(&e))?;
         Ok(true)
+    }
+
+    async fn place_hold(&self, case: CaseId, hold: &LegalHold) -> Result<bool, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        // The case row's lock, for the reason `register_deadline` takes it: two
+        // snapshots each reading the other's pre-state is how a hold lands on a
+        // case that an erasure in the other transaction is already destroying.
+        let exists = tx
+            .query_opt(
+                "SELECT 1 FROM cases WHERE tenant = $1 AND case_id = $2 FOR UPDATE",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(case.to_string()));
+        }
+        // First placement wins: `DO NOTHING` rather than `DO UPDATE`, so a retry
+        // cannot move the instant or rewrite the reason.
+        let placed = tx
+            .execute(
+                "INSERT INTO case_legal_holds (tenant, case_id, placed_at, reason)
+                      VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (tenant, case_id) DO NOTHING",
+                &[
+                    &self.tenant_name(),
+                    &case.to_string(),
+                    &hold.placed_at.unix_timestamp(),
+                    &hold.reason,
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(placed == 1)
+    }
+
+    async fn release_hold(&self, case: CaseId) -> Result<bool, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM cases WHERE tenant = $1 AND case_id = $2",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(case.to_string()));
+        }
+        let removed = client
+            .execute(
+                "DELETE FROM case_legal_holds WHERE tenant = $1 AND case_id = $2",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(removed == 1)
+    }
+
+    async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                "SELECT placed_at, reason FROM case_legal_holds
+                  WHERE tenant = $1 AND case_id = $2",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        row.map(|r| {
+            Ok(LegalHold {
+                placed_at: Timestamp::from_unix_timestamp(r.get::<_, i64>(0))
+                    .map_err(|e| corrupt("unrepresentable placed_at", e))?,
+                reason: r.get(1),
+            })
+        })
+        .transpose()
+    }
+
+    async fn holds(
+        &self,
+        after: Option<CaseId>,
+        limit: usize,
+    ) -> Result<Vec<(CaseId, LegalHold)>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // `(placed_at, case_id)` as one tuple is what makes the cursor total:
+        // several holds can share an instant, and comparing the stamp alone
+        // would either repeat them or skip them depending on which side of the
+        // boundary the page fell.
+        let rows = match after {
+            Some(cursor) => {
+                client
+                    .query(
+                        "SELECT case_id, placed_at, reason FROM case_legal_holds
+                          WHERE tenant = $1
+                            AND (placed_at, case_id) > (
+                                SELECT placed_at, case_id FROM case_legal_holds
+                                 WHERE tenant = $1 AND case_id = $2)
+                          ORDER BY placed_at, case_id
+                          LIMIT $3",
+                        &[
+                            &self.tenant_name(),
+                            &cursor.to_string(),
+                            &i64::try_from(limit).unwrap_or(i64::MAX),
+                        ],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        "SELECT case_id, placed_at, reason FROM case_legal_holds
+                          WHERE tenant = $1
+                          ORDER BY placed_at, case_id
+                          LIMIT $2",
+                        &[
+                            &self.tenant_name(),
+                            &i64::try_from(limit).unwrap_or(i64::MAX),
+                        ],
+                    )
+                    .await
+            }
+        }
+        .map_err(|e| be(&e))?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    CaseId::parse(&r.get::<_, String>(0)).map_err(|e| corrupt("bad case id", e))?,
+                    LegalHold {
+                        placed_at: Timestamp::from_unix_timestamp(r.get::<_, i64>(1))
+                            .map_err(|e| corrupt("unrepresentable placed_at", e))?,
+                        reason: r.get(2),
+                    },
+                ))
+            })
+            .collect()
     }
 
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError> {

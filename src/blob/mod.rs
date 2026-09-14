@@ -36,7 +36,7 @@ use crate::core::{Digest, Timestamp};
 #[cfg(feature = "opendal")]
 mod opendal_store;
 #[cfg(feature = "opendal")]
-pub use opendal_store::OpenDalBlobs;
+pub use opendal_store::{OpenDalBlobs, TOMBSTONE_FORMAT_VERSION};
 
 mod memory;
 pub use memory::MemoryBlobs;
@@ -103,6 +103,39 @@ pub enum BlobError {
     /// reached, and what came back was unreadable.
     #[error("blob at {digest}: the bytes are gone and their tombstone does not read ({detail})")]
     UnreadableTombstone { digest: String, detail: String },
+}
+
+/// Why an erasure did not happen.
+///
+/// Separate from [`BlobError`], whose every variant describes something that
+/// already happened to some bytes. An erasure verb is not a blob operation — it
+/// walks a case, tombstones each blob and destroys a key scope — and it can
+/// refuse outright, which is not a state any reader of a blob can observe.
+#[derive(Debug, thiserror::Error)]
+pub enum EraseError {
+    /// The matter is under a legal hold, so **nothing was destroyed**.
+    ///
+    /// The only refusal in the erasure path, and the one state here that is not
+    /// a fault: no tombstone was written and no key destroyed, because somebody
+    /// outside the plane said this matter must be preserved. The reason travels
+    /// with it so whoever reads the report can say on whose instruction the data
+    /// is still there.
+    #[error(
+        "case {case} is under a legal hold placed at {placed_at}, so nothing was erased: {reason}"
+    )]
+    UnderLegalHold {
+        case: String,
+        placed_at: String,
+        reason: String,
+    },
+
+    /// A tombstone could not be written.
+    #[error(transparent)]
+    Blob(#[from] BlobError),
+
+    /// The case layer or the key ring could not be reached.
+    #[error(transparent)]
+    Store(#[from] crate::core::StoreError),
 }
 
 /// Bytes addressed by their own hash.
@@ -295,11 +328,20 @@ pub async fn erase_case(
     case: crate::core::CaseId,
     at: crate::core::Timestamp,
     reason: &str,
-) -> Result<usize, BlobError> {
-    let digests = cases
-        .blobs_of(case)
-        .await
-        .map_err(|e| BlobError::Backend(e.to_string()))?;
+) -> Result<usize, EraseError> {
+    // **Before anything is destroyed, and before any tombstone is written.**
+    // The order is the whole guarantee: a hold checked after the first
+    // `expire` would leave a half-erased matter that the hold says must be
+    // whole, and no verb here puts bytes back.
+    if let Some(hold) = cases.hold(case).await? {
+        return Err(EraseError::UnderLegalHold {
+            case: case.to_string(),
+            placed_at: hold.placed_at.to_string(),
+            reason: hold.reason,
+        });
+    }
+
+    let digests = cases.blobs_of(case).await?;
     let scope = crate::core::erasure_scope(tenant, &case.to_string());
     let mut n = 0;
     if let Some(blobs) = blobs {
@@ -326,7 +368,7 @@ pub async fn erase_case(
     if let Some(keys) = keyring {
         keys.destroy(&scope, at, reason)
             .await
-            .map_err(|e| BlobError::Backend(e.to_string()))?;
+            .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))?;
     }
     Ok(n)
 }
@@ -356,6 +398,13 @@ pub async fn erase_case(
 /// # Errors
 ///
 /// If the key ring cannot be reached.
+///
+/// **A case-less run cannot be held.** A legal hold is placed on a *matter*,
+/// and this verb exists precisely for the run that belongs to none — so there
+/// is no row to hold and nothing here consults one. A deployment that needs a
+/// run preserved binds it to a case, which is also what gives it an obligation
+/// trail; that is the documented limit rather than a second hold mechanism
+/// keyed by run.
 #[cfg(feature = "keyring")]
 pub async fn erase_run(
     keyring: &dyn crate::keyring::KeyRing,
@@ -363,11 +412,11 @@ pub async fn erase_run(
     run: crate::core::RunId,
     at: crate::core::Timestamp,
     reason: &str,
-) -> Result<(), BlobError> {
+) -> Result<(), EraseError> {
     keyring
         .destroy(&crate::keyring::scope(tenant, &run.to_string()), at, reason)
         .await
-        .map_err(|e| BlobError::Backend(e.to_string()))
+        .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))
 }
 
 /// Re-state a blob failure in the vocabulary a step is refused in.

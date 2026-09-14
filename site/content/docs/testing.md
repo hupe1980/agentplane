@@ -174,10 +174,16 @@ assert!(report.violations.is_empty(), "{report:#?}");
 ```
 
 There are matching batteries for the case layer, the quota store, the registry,
-the push store, the key ring, **blob storage** and **the calendar**. They exist
-as shipped code rather than as this crate's private tests for one reason:
-rebuilding a conformance suite per project is how each one ends up checking a
-slightly different, slightly weaker thing.
+the push store, the key ring, **blob storage**, **the calendar** and **the
+policy engine**. They exist as shipped code rather than as this crate's private
+tests for one reason: rebuilding a conformance suite per project is how each one
+ends up checking a slightly different, slightly weaker thing.
+
+**Run them against the handle you actually hold, not the one underneath it.** A
+decorator is a store in its own right — wire a key ring and the runtime is given
+`SealedCases`, not your case store — and it re-implements the whole trait by
+forwarding. Forwarding is where a contract goes wrong, and none of it is visible
+from above, because the wrapper answers the same signatures.
 
 The blob battery has two entry points, and the split is worth knowing before
 you write a store:
@@ -209,6 +215,27 @@ rather than approximated, that the digest identifies the ruleset, and that a
 count at the edge of its type is an error rather than an abort. The hostile
 counts are **derived** from the specs you declare supported, so you cannot hand
 the battery the inputs your code already handles.
+
+The **policy battery** checks the three things `PolicyEngine` asks for that no
+signature can express — total, pure, no I/O — plus the two that make a journaled
+verdict re-derivable:
+
+```rust
+use agentplane::testkit::conformance::Report;
+use agentplane::testkit::conformance_policy;
+
+let mut report = Report::default();
+conformance_policy::check(&my_engine, &mut report);
+report.assert_conforms("MyEngine");
+```
+
+It answers every request shape the runtime issues plus hostile ones — empty
+fields, a context that is not an object, rule-language metacharacters — and
+requires the same answer twice, the same answer regardless of what was evaluated
+before it, a refusal that names a rule rather than an empty string, a bundle
+identity that does not move between calls, and a `digest` that is the bundle's.
+What it cannot tell you is whether your rules are **right**: an engine that
+permits everything passes every check in it.
 
 The blob rule that is least obvious — an expired address stays expired — is
 argued where its reader is, on [erasure](@/docs/erasure.md#an-expired-address-stays-expired).

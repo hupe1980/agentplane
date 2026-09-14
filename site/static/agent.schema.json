@@ -37,7 +37,7 @@
           ]
         },
         "max_effects": {
-          "description": "Externally visible operations of **every** kind \u2014 a tool call, a clock read and a model completion each cost one, so this is not a model ceiling.",
+          "description": "Externally visible operations of **every** kind — a tool call, a clock read and a model completion each cost one, so this is not a model ceiling.",
           "format": "uint",
           "minimum": 0,
           "type": [
@@ -55,7 +55,7 @@
           ]
         },
         "max_minor_units": {
-          "description": "Money in minor units \u2014 cents, not euros. A float here would make a budget that fails to bind by a rounding error, and money is the one number nobody accepts \"approximately\" for.",
+          "description": "Money in minor units — cents, not euros. A float here would make a budget that fails to bind by a rounding error, and money is the one number nobody accepts \"approximately\" for.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -91,7 +91,7 @@
           ]
         },
         "max_tokens": {
-          "description": "Metered units consumed, compared against the run's total before **every** effect \u2014 including effects that consume no tokens at all.",
+          "description": "Metered units consumed, compared against the run's total before **every** effect — including effects that consume no tokens at all.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -178,7 +178,7 @@
           "type": "object"
         },
         {
-          "description": "The pointer selects something \u2014 anything, including `null`.",
+          "description": "The pointer selects something — anything, including `null`.",
           "properties": {
             "exists": {
               "type": "boolean"
@@ -390,6 +390,19 @@
       ],
       "type": "object"
     },
+    "Input": {
+      "additionalProperties": false,
+      "description": "The shape a caller must send.",
+      "properties": {
+        "schema": {
+          "description": "A JSON Schema, carried opaquely — never parsed as a schema by this crate, only checked to be a non-empty object."
+        }
+      },
+      "required": [
+        "schema"
+      ],
+      "type": "object"
+    },
     "Justification": {
       "description": "Why collaboration is worth its cost.",
       "oneOf": [
@@ -527,7 +540,7 @@
       "type": "object"
     },
     "MemorySubject": {
-      "description": "A memory scope: a literal name, or a run binding \u2014 `$correlation/<namespace>`, `$case`, or `$input/<RFC 6901 pointer>`. Write `$$` for a literal that really begins with a dollar sign; any other `$` spelling is refused rather than read as a constant.",
+      "description": "A memory scope: a literal name, or a run binding — `$correlation/<namespace>`, `$case`, or `$input/<RFC 6901 pointer>`. Write `$$` for a literal that really begins with a dollar sign; any other `$` spelling is refused rather than read as a constant.",
       "minLength": 1,
       "type": "string"
     },
@@ -656,7 +669,7 @@
         },
         "approvers": {
           "default": [],
-          "description": "Who may decide. Empty means anyone \u2014 a choice worth making on purpose rather than by omission.",
+          "description": "Who may decide. Empty means anyone — a choice worth making on purpose rather than by omission.",
           "items": {
             "type": "string"
           },
@@ -856,7 +869,7 @@
               "type": "null"
             }
           ],
-          "description": "Absent means *unbounded*, and that is a decision the manifest has to state out loud \u2014 see `Manifest::validate`."
+          "description": "Absent means *unbounded*, and that is a decision the manifest has to state out loud — see `Manifest::validate`."
         },
         "capabilities": {
           "allOf": [
@@ -885,7 +898,7 @@
               "type": "null"
             }
           ],
-          "description": "How this agent runs \u2014 and whether it needs any code at all."
+          "description": "How this agent runs — and whether it needs any code at all."
         },
         "identity": {
           "anyOf": [
@@ -897,6 +910,17 @@
             }
           ],
           "description": "Who the agent is told it is."
+        },
+        "input": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Input"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The shape of what this agent takes."
         },
         "memory": {
           "anyOf": [
@@ -1129,7 +1153,7 @@
           "type": "string"
         },
         "when": {
-          "description": "Every condition that must hold. Conjunctive, and an empty list is refused \u2014 a rule matching everything is a task per run written as a filter.",
+          "description": "Every condition that must hold. Conjunctive, and an empty list is refused — a rule matching everything is a task per run written as a filter.",
           "items": {
             "$ref": "#/definitions/Condition"
           },
@@ -1145,7 +1169,7 @@
       "type": "object"
     }
   },
-  "description": "The shape of an agentplane Agent manifest. The crate's parser stays authoritative: this schema refuses unknown fields, missing fields, and wrong types exactly as the parser does, but the parser's semantic refusals (an unstated budget, a declared control nothing performs) run only there \u2014 `agentplane validate` is the full check.",
+  "description": "The shape of an agentplane Agent manifest. The crate's parser stays authoritative: this schema refuses unknown fields, missing fields, and wrong types exactly as the parser does, but the parser's semantic refusals (an unstated budget, a declared control nothing performs) run only there — `agentplane validate` is the full check.",
   "properties": {
     "apiVersion": {
       "description": "Which schema this document claims to be.",

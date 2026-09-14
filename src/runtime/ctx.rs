@@ -4690,7 +4690,7 @@ impl StepCtx<'_> {
         // Propagated rather than replaced. Mapping every failure onto "no blob
         // store is configured" would report a missing *erasure unit* as a
         // missing store, and send whoever reads it to fix the wrong thing.
-        let blobs = self.blobs_scoped(fetcher.external_scope())?;
+        let blobs = self.blobs_scoped(fetcher.external_scope().as_deref())?;
         let raw = url.peek().clone();
         let arguments = Tainted::object([("url".to_owned(), url.map(Value::String))]);
         let case_link = if let Some(cx) = self.case.clone() {

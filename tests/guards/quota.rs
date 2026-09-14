@@ -1281,3 +1281,47 @@ impl Skill for SpendsThenFails {
         Ok(Outcome::fail("the work itself failed"))
     }
 }
+
+/// **A quota that constrains nothing says so, and one that constrains anything
+/// does not.**
+///
+/// `is_unlimited` and `bounds_spend` answer different questions and are one
+/// character apart in intent: a quota with only a concurrency ceiling bounds no
+/// *spend* and is emphatically not unlimited. Wiring a review or an admission
+/// check to the wrong one reads as a configured ceiling that is not there.
+#[test]
+fn a_quota_reports_whether_it_constrains_anything() {
+    assert!(
+        TenantQuota::default().is_unlimited(),
+        "the default constrains nothing, which is the honest answer for a tenant \
+         nobody has given a ceiling"
+    );
+    assert!(!TenantQuota::default().bounds_spend());
+
+    let concurrency_only = TenantQuota {
+        max_concurrent_runs: Some(4),
+        ..TenantQuota::default()
+    };
+    assert!(
+        !concurrency_only.is_unlimited(),
+        "a concurrency ceiling is a constraint"
+    );
+    assert!(
+        !concurrency_only.bounds_spend(),
+        "and it is not a spend ceiling — the two questions come apart exactly here"
+    );
+
+    for bounded in [
+        TenantQuota {
+            max_tokens_per_period: Some(1),
+            ..TenantQuota::default()
+        },
+        TenantQuota {
+            max_minor_units_per_period: Some(1),
+            ..TenantQuota::default()
+        },
+    ] {
+        assert!(!bounded.is_unlimited());
+        assert!(bounded.bounds_spend());
+    }
+}

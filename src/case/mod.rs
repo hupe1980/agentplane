@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::core::{
     BreachNote, Case, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineState,
-    Digest, RunId, StoreError, Timestamp,
+    Digest, LegalHold, RunId, StoreError, Timestamp,
 };
 
 /// What admission did with an inbound trigger.
@@ -311,6 +311,65 @@ pub trait CaseStore: Send + Sync + Debug {
         name: &str,
         note: &BreachNote,
     ) -> Result<bool, StoreError>;
+
+    /// Preserve this matter against every erasure verb until somebody lifts it.
+    ///
+    /// The only thing in this crate that makes an erasure **fail** rather than
+    /// succeed, and it exists because a retention pass is automatic: it runs on
+    /// a window nobody re-reads, and a matter under a preservation order looks
+    /// exactly like every other closed case old enough to sweep.
+    ///
+    /// **Idempotent, first placement wins**, returning whether this call placed
+    /// it — [`acknowledge_breach`](Self::acknowledge_breach)'s rule, for its
+    /// reason: a retry must not rewrite when the hold began or why.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the case does not exist — a hold on a matter
+    /// that is not there preserves nothing and reads as effective in the
+    /// listing.
+    async fn place_hold(&self, case: CaseId, hold: &LegalHold) -> Result<bool, StoreError>;
+
+    /// Lift a hold, returning whether one was there to lift.
+    ///
+    /// The verb that empties [`holds`](Self::holds); without it that listing is
+    /// a level that only rises, which [`breached`](Self::breached) refuses for
+    /// the same reason.
+    ///
+    /// **The register answers *what is preserved now*, not *what ever was*.**
+    /// Releasing leaves no history, deliberately: kept rows would make their
+    /// free-text reasons outlive the matter they preserved, and destroying them
+    /// with the matter would destroy the record of the erasure's own
+    /// authorisation. The chain of custody belongs to the system that issued the
+    /// order; what this crate supplies is the capability split
+    /// (`api:hold.place`, `api:hold.release`) that lets a deployment's own
+    /// access log answer it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the case does not exist.
+    async fn release_hold(&self, case: CaseId) -> Result<bool, StoreError>;
+
+    /// The hold on one matter, if it is held.
+    ///
+    /// The question every erasure verb asks before it destroys anything.
+    async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError>;
+
+    /// Every matter under hold, **oldest hold first**.
+    ///
+    /// The half that makes this a control: a store answering only
+    /// [`hold`](Self::hold) can be queried solely by somebody who already knows
+    /// which case to ask about, which delivers nothing to the person whose job
+    /// is to find out what is still preserved and why.
+    ///
+    /// Ascending legitimately — [`release_hold`](Self::release_hold) removes
+    /// entries, so the head is not permanent, and the longest-standing unlifted
+    /// hold is the one that needs a question asked about it.
+    async fn holds(
+        &self,
+        after: Option<CaseId>,
+        limit: usize,
+    ) -> Result<Vec<(CaseId, LegalHold)>, StoreError>;
 
     /// Cases matching a status, newest first.
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError>;

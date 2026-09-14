@@ -138,6 +138,17 @@ The sensitivity lattice governs *what* may leave a run. Egress allowlisting
 governs *where it may leave to*, and they close different holes: a value can sit
 perfectly within its ceiling and still be posted to a host nobody granted.
 
+**"A run" is the precise word.** The lattice is about effects the runtime
+dispatches, so the operator API is deliberately *not* filtered by it: `GET
+/runs/{id}/history` returns the journal records to whoever holds
+`api:run.history`, payloads included. That is right for the party whose journal
+it is — an auditor who cannot see what was written cannot audit — and the
+control there is the verb, which is why the read verbs are granted explicitly
+rather than folded into a broader one. It stops being right the moment the
+consumer is not that party: anything that would put those records in front of a
+*model* is an egress like any other and belongs behind the sink gate, not
+behind a read verb.
+
 `core::Egress` is a set of granted hosts. A model driver or peer client
 configured with one refuses any other destination **before the request is
 built** — nothing sent, nothing metered, and the disposition is `DidNotHappen`

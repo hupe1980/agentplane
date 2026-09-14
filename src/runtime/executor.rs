@@ -1643,6 +1643,11 @@ impl Runtime {
         self.inflight.is_draining()
     }
 
+    /// The cancellation recorded against a run, if one was.
+    ///
+    /// Reads the journal rather than a flag: a cancellation is a record, so
+    /// this answers the same thing after a restart and on another instance.
+    ///
     /// # Errors
     ///
     /// If the store is unreachable.
@@ -2250,6 +2255,21 @@ impl Runtime {
             digest: m.digest().ok()?,
             publisher: self.published_by.get(&m.metadata.name).cloned(),
         })
+    }
+
+    /// Whether anything on this plane answers `target`.
+    ///
+    /// For a catalogue built before the first call: a surface that advertises a
+    /// capability nothing provides offers a caller — often a model — a verb
+    /// that fails at admission every time, and the failure names the plane
+    /// rather than the catalogue that lied about it.
+    ///
+    /// Gated on the feature that builds a catalogue, so a build without one
+    /// answers *this question is not asked here* rather than carrying a method
+    /// nothing reaches.
+    #[cfg(feature = "mcp-server")]
+    pub(crate) fn provides(&self, target: &str) -> bool {
+        self.resolve(target).is_ok()
     }
 
     fn resolve(&self, target: &str) -> Result<Arc<dyn Skill>, RuntimeError> {

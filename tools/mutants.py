@@ -2186,6 +2186,48 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """                _ => EffectError::Refused(error.to_string()),""",
         """                _ => EffectError::Other(error.to_string()),""",
     ),
+    "ACatalogueOffersWhatNothingProvides": (
+        "src/tools/serve.rs",
+        "a_capability_the_plane_does_not_provide_is_not_offered",
+        "a manifest's declared capability is offered as a tool without asking "
+        "whether this plane has a skill for it, so a model is handed a verb "
+        "that is refused at admission every time it is called — and the error "
+        "names the plane rather than the catalogue that advertised it",
+        """                if !runtime.provides(capability) {""",
+        """                if false {""",
+    ),
+    "ASuspendedRunIsNotATask": (
+        "src/tools/serve.rs",
+        "a_suspended_run_is_a_task_that_reads_from_the_journal",
+        "a run that suspends answers the calling host as a failed tool call "
+        "rather than as a task handle, so a governed wait — an approval, a "
+        "timer, an event — reads to the caller as work that did not happen, "
+        "and the run it abandoned goes on holding its lease",
+        """            RunStatus::Suspended(ref why) => {""",
+        """            RunStatus::Suspended(ref why) if false => {""",
+    ),
+    "ADroppedLeaseReleasesNothing": (
+        "src/keyring/coordinator.rs",
+        "a_dropped_lease_frees_the_scope",
+        "the lock lives beside the lease rather than inside it, so a lease "
+        "dropped instead of released — a cancelled erasure, a `timeout` around "
+        "a memory write — leaves the scope held by a lease that no longer "
+        "exists, and every later erasure of that subject blocks forever with "
+        "no error anywhere",
+        """        Ok(Lease::holding(scope, token, client))""",
+        """        std::mem::forget(client);
+        Ok(Lease::new(scope, token))""",
+    ),
+    "AProviderCanReportItsWayUnderACeiling": (
+        "src/model/mod.rs",
+        "usage_a_provider_invented_cannot_wrap_a_ceiling",
+        "the usage a provider reported is summed with a plain `+`, so a "
+        "response claiming `u64::MAX` input tokens wraps to a spend of zero in "
+        "a release build — the token ceiling is defeated by the counterparty "
+        "whose consumption it exists to bound, and the run reads as free",
+        """            tokens: self.input_tokens.saturating_add(self.output_tokens),""",
+        """            tokens: self.input_tokens.wrapping_add(self.output_tokens),""",
+    ),
     "AForgetSeversItsIncomingLineage": (
         "src/store/redb_memory.rs",
         "redb_satisfies_the_memory_store_contract",
@@ -2419,10 +2461,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     "AnOutputContractMayPromiseNothing": (
         "src/manifest/mod.rs",
         "an_output_schema_that_permits_anything_is_refused",
-        "`output.schema: {}` is accepted, so a result contract that permits "
-        "anything reads in review as one that was declared",
-        "            serde_json::Value::Object(m) if !m.is_empty() => {}",
-        "            serde_json::Value::Object(_) => {}",
+        "a declared schema that permits everything is accepted, so a contract "
+        "that constrains nothing reads in review as one that was declared — for "
+        "the result shape and, since they are one rule, for the argument shape "
+        "a model is offered",
+        "            serde_json::Value::Object(m) if !m.is_empty() => Ok(()),",
+        "            serde_json::Value::Object(_) => Ok(()),",
     ),
     "AVersionCanBeRepublished": (
         "src/manifest/registry.rs",
@@ -3330,12 +3374,46 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        if let Some(keys) = self.keyring.clone() {",
         "        if let Some(keys) = None::<Arc<dyn crate::keyring::KeyRing>> {",
     ),
+    "LiftingAHoldNeedsOnlyThePowerToPlaceOne": (
+        "src/api/mod.rs",
+        "a_denying_policy_stops_every_route_before_it_touches_anything",
+        "lifting a legal hold is authorized by the capability that places one, so "
+        "every principal who can preserve a matter can also authorise its "
+        "destruction — the one direction this pair must not be symmetric in",
+        "    let s = api.gate(&headers, action::HOLD_RELEASE, &body.case).await?;",
+        "    let s = api.gate(&headers, action::HOLD_PLACE, &body.case).await?;",
+    ),
+    "AServedResultInvitesASharedCache": (
+        "src/tools/serve.rs",
+        "every_cacheable_result_refuses_a_shared_cache_and_a_freshness_window",
+        "served results carry the protocol's default cache scope, so a shared "
+        "intermediary may hold a governed declaration and serve it to another "
+        "principal — a copy no erasure reaches",
+        "const CACHE_SCOPE: CacheScope = CacheScope::Private;",
+        "const CACHE_SCOPE: CacheScope = CacheScope::Public;",
+    ),
+    "ARetentionSweepIgnoresALegalHold": (
+        "src/blob/mod.rs",
+        "erasing_a_held_case_directly_is_refused_before_anything_is_destroyed",
+        "erase_case destroys a matter that is under a legal hold, so an automatic "
+        "retention pass erases the one thing somebody was ordered to preserve",
+        "    if let Some(hold) = cases.hold(case).await? {",
+        "    if let Some(hold) = None::<crate::core::LegalHold> {",
+    ),
+    "AHeldMatterIsNotReported": (
+        "src/retention.rs",
+        "a_legal_hold_stops_the_retention_sweep_and_lifting_it_lets_the_sweep_through",
+        "a retention pass preserves a held matter and says nothing about it, so the "
+        "report reads as a clean sweep and nobody learns what is still being kept",
+        "    for case in &selected.held {",
+        "    for case in std::iter::empty::<&crate::core::CaseId>() {",
+    ),
     "MediaBytesBypassTheSeal": (
         "src/runtime/ctx.rs",
         "only_the_sealed_accessor_reads_the_raw_blob_store",
         "the media path reads the raw blob store directly, so a sealed "
         "deployment writes those payload bytes in the clear",
-        "        let blobs = self.blobs_scoped(fetcher.external_scope())?;",
+        "        let blobs = self.blobs_scoped(fetcher.external_scope().as_deref())?;",
         "        let blobs = self.blobs.clone().expect(\"a blob store\");",
     ),
     "AVaultOutageIsReadAsAnErasure": (

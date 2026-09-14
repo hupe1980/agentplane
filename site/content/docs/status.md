@@ -77,6 +77,7 @@ because rounding up is how a condition list stops being checkable.
 | 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down (readers before writers; rollback bounded by a *time window*), and the reader's half is pinned: a record from a shape this build does not know is refused as skew, not damage. What is left is the two-build exercise, which needs a version bump to have two builds to run |
 | 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility), and already implemented: hashes are agile by version, signatures by key, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
 | 8 | **The deferred format questions are settled**, because each one moves a record or a wire: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open — **eight** questions, each with an answer that changes a durable format or a protocol. Four more that had accumulated here turned out to change neither, whichever way they go, and no longer count against the freeze |
+| 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ⬜ open — both surfaces are built and published: a crate an embedder links, and a server an operator runs against a manifest with no Rust anywhere. What is unwritten is which one an adopter is expected to depend on, and therefore what the freeze is a promise *about*. It is a row rather than a footnote because a compatibility commitment with no stated subject is one an adopter completes in their own favour |
 
 **7 and 8 are independent, with one join.** They can be worked in parallel:
 agility is about how a digest says *which function produced it* and how a
@@ -146,11 +147,68 @@ record kind and the chain is *derived*, or this plane keeps two histories of one
 session and has to say which is the plan of record. Shipping the wire before
 that is answered would be shipping the second one by accident.
 
+**Serving MCP.** Built (`mcp-server`): tools, prompts, the Tasks mapping, and
+one resource.
+
+A host calls a tool and a governed run happens, under the same admission an A2A
+message gets. A capability nothing on the plane provides is refused when the
+catalogue is built, not when a model first calls it. Descriptors derive from your manifest — `inputSchema` is
+`spec.input`, and an agent that declares none cannot be offered, because the
+only honest argument shape to hand a model is one somebody reviewed. A prompt is
+your manifest's system prompt, served verbatim and taking no arguments.
+
+A run that suspends comes back as a **Task**, and its task id is the run id —
+so `tasks/get` answers by reading the journal rather than a table beside it, and
+the handle still means something after a restart or from another instance.
+`tasks/cancel` is the runtime's own cancellation, recorded and honoured at the
+next step boundary. Protocol revisions older than `2026-07-28` are refused at
+the handshake, because they carry no Tasks extension and a suspension would have
+no way to say so.
+
+**One resource is served: the declaration.** A resource read is an egress into
+a model's context, not an operator reading their own journal — the sensitivity
+lattice governs what may leave a *run*, so the read verb that answers for an
+operator answers a different question for a model, and the protocol's caching
+directives would put a payload copy somewhere no erasure reaches. A manifest has
+no payload to raise either question: it is the reviewed, content-addressed
+document `agentplane card` already publishes, served with its digest. Journals,
+cases and audit reports are **not** served.
+
+**An external agent operating the plane already works, over HTTP.** Every
+operator route carries its own `api:` capability, so MCP adds discovery and
+description rather than authority — and whatever carries it must keep the rule
+this surface is shaped by: who is acting comes from the request's identity,
+never from its body.
+
+**Speaking the [Agent Client Protocol](https://agentclientprotocol.com/).** Not
+built, and worth separating into the two things people mean by it.
+
+As a **control plane** it is refused. ACP's client answers a permission request
+by selecting an `optionId` from a list the *agent* supplied, so the vocabulary
+a reviewer may answer in is written by the party being reviewed; there is no
+amendment and no deferral; a pending request dies with the client process, so
+an approval cannot reach somebody who is not at the keyboard; and a tool call
+carries `rawInput` as arbitrary JSON, which gives a field-level gate nothing to
+bind to. The filesystem and terminal a client offers are a convenience for
+reading unsaved buffers, not a sandbox — the agent is a subprocess holding the
+client's own access.
+
+As a **record** — journaling what an agent this runtime does not execute was
+asked, and what a person allowed — it is deferred on the same durable-format
+question as the Guardian direction above, and for a sharper reason. A session
+update is the agent's own report. A journal record here means *this runtime
+announced the effect, dispatched it under authority and recorded the outcome*,
+and writing a report into that vocabulary would make every answer the journal
+gives about authorization false. So an observation chain would carry its own
+trust basis and share no record kind with the journal — which is a second
+history beside it, which is the question.
+
 **The rest of format freeze.** The mechanics are built, the
 [record format](@/docs/format.md) is specified, and a second implementation
-reads that specification and derives the same bytes. What is left is
-algorithm agility and the deferred questions that would each move a record —
-enumerated in [Format freeze](#format-freeze) above.
+reads that specification and derives the same bytes. What is left is the
+two-build migration exercise, the deferred questions that would each move a
+record, and the statement of which surface the promise attaches to — enumerated
+with their states in [Format freeze](#format-freeze) above.
 
 **A measured containment claim.** The runtime claims injection *containment*, not
 immunity, and no external measurement is attached to it. A static attack set

@@ -112,6 +112,32 @@ impl CaseStatus {
     }
 }
 
+/// An instruction from outside the plane that a matter must be preserved.
+///
+/// Orthogonal to [`CaseStatus`], which answers *where is this matter* and moves
+/// because runs did things. A hold answers *may this be destroyed*, decided by
+/// somebody outside and usually before anybody knows which matters it covers.
+/// A held matter still closes: one field for both would either end the hold when
+/// the work does, or make closure unreachable and strand [`Deadline`].
+///
+/// The reason is required for the reason every erasure verb takes one — a
+/// preservation nobody can account for is indistinguishable from a sweep that
+/// quietly stopped working. There is deliberately no `placed_by`: who is acting
+/// comes from the identity on the request, and a self-asserted name would be a
+/// second, unenforced answer to what the caller's credential already settles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegalHold {
+    /// When the hold was placed. Supplied by the caller, never read from a
+    /// clock here, for the reason every other lifecycle instant in this crate
+    /// is: a pass that read the clock itself could not be tested against a year
+    /// of ageing holds.
+    #[serde(with = "time::serde::rfc3339")]
+    pub placed_at: Timestamp,
+    /// Why this matter may not be destroyed. Free text, and load-bearing: it is
+    /// what the person reviewing the hold listing months later has to act on.
+    pub reason: String,
+}
+
 /// A long-lived, correlated business fact.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Case {

@@ -957,6 +957,23 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// Whether an id is currently protected by legal hold.
     async fn legal_hold(&self, id: &str) -> Result<bool, StoreError>;
 
+    /// Every held id, in id order, starting after `after`.
+    ///
+    /// The half that makes the hold a control rather than a flag:
+    /// [`legal_hold`](Self::legal_hold) is keyed by the id you are asking
+    /// about, so it answers only for somebody who already knows which memory to
+    /// name — not the person certifying what is still preserved and why.
+    ///
+    /// Paged by id, because an item hold is a bare flag: a case carries a
+    /// [`LegalHold`](crate::core::LegalHold) with its own instant and reason,
+    /// since a case is the unit a preservation order names and this is the
+    /// finer instrument reached for inside one.
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError>;
+
     /// Atomically erase current memories whose effective expiry has passed,
     /// unless held. Returns the number of memory ids erased.
     ///

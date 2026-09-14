@@ -1558,3 +1558,69 @@ spec:
         "a declared agent sent JSON nulls to policy at {offending:?}"
     );
 }
+
+/// **The action scoping a hand-written engine relies on.**
+///
+/// `PolicyRequest` carries the action as a string, and the trap the trait's own
+/// docs name is that a rule written about *effects* also matches at admission,
+/// where the same run input is in the context and no effect has been proposed
+/// yet. These two predicates are how an engine tells them apart, and they are
+/// the whole of what a hand-written engine gets instead of Cedar's
+/// `action == Action::"effect:perform"` binding.
+///
+/// The third case is the one worth pinning: an action that is *neither* must
+/// answer false to both, or an engine written as `if !is_effect() { admission }`
+/// treats every future gate as an admission.
+#[test]
+fn the_action_predicates_separate_the_gates_and_claim_nothing_else() {
+    use agentplane::core::{ACTION_ADMIT, ACTION_PERFORM, PolicyRequest};
+
+    let context = serde_json::json!({});
+    let at = |action: &str| {
+        let request = PolicyRequest {
+            principal: "agent:triage",
+            action,
+            resource: "tool.call",
+            context: &context,
+        };
+        (request.is_effect(), request.is_admission())
+    };
+
+    assert_eq!(at(ACTION_PERFORM), (true, false), "the effect gate");
+    assert_eq!(at(ACTION_ADMIT), (false, true), "admission");
+    assert_eq!(
+        at("api:task.decide"),
+        (false, false),
+        "an operator verb is neither gate — an engine that reads `not an effect` \
+         as `therefore admission` would scope its admission rules over the whole \
+         HTTP surface"
+    );
+}
+
+/// **A release scope says what it grants, and `trust()` grants no ceiling.**
+///
+/// The two accessors are what a gate asks a scope. Reading them wrongly is not
+/// a compile error — both are `Option`/`bool` — so the pairing is pinned here:
+/// a trust-only scope must not be readable as raising a sensitivity ceiling.
+#[test]
+fn a_release_scope_grants_only_what_it_names() {
+    use agentplane::core::{ReleaseScope, Sensitivity};
+
+    assert!(ReleaseScope::trust().improves_trust());
+    assert_eq!(
+        ReleaseScope::trust().sensitivity_target(),
+        None,
+        "a trust-only scope must not read as raising a ceiling"
+    );
+
+    let ceiling = ReleaseScope::sensitivity(Sensitivity::Internal);
+    assert!(
+        !ceiling.improves_trust(),
+        "a ceiling scope must not read as conferring trust"
+    );
+    assert_eq!(ceiling.sensitivity_target(), Some(Sensitivity::Internal));
+
+    let both = ReleaseScope::trust_and_sensitivity(Sensitivity::Internal);
+    assert!(both.improves_trust());
+    assert_eq!(both.sensitivity_target(), Some(Sensitivity::Internal));
+}

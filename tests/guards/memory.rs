@@ -597,6 +597,13 @@ impl MemoryStore for Counted {
     async fn legal_hold(&self, id: &str) -> Result<bool, agentplane::core::StoreError> {
         self.inner.legal_hold(id).await
     }
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.inner.legal_holds(after, limit).await
+    }
     async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
         self.sweeps
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -681,6 +688,13 @@ impl MemoryStore for RejectsComposedCascade {
     }
     async fn legal_hold(&self, id: &str) -> Result<bool, agentplane::core::StoreError> {
         self.inner.legal_hold(id).await
+    }
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.inner.legal_holds(after, limit).await
     }
     async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
         self.inner.sweep_expired(at).await
@@ -2424,9 +2438,16 @@ async fn the_encrypted_memory_store_takes_the_lifecycle_lock() {
 
     #[async_trait::async_trait]
     impl ErasureCoordinator for Counting {
-        async fn acquire(&self, scope: &str) -> Result<Lease, agentplane::core::StoreError> {
+        async fn acquire(
+            &self,
+            scope: &str,
+            proof: agentplane::keyring::UnderLock,
+        ) -> Result<Lease, agentplane::core::StoreError> {
             self.events.lock().unwrap().push(scope.to_owned());
-            self.inner.acquire(scope).await
+            // A decorating coordinator forwards the proof it was handed. That
+            // is the whole of what the token costs an implementor, and it is
+            // what keeps `acquire` reachable only from `under_lock`.
+            self.inner.acquire(scope, proof).await
         }
         async fn release(&self, lease: Lease) -> Result<(), agentplane::core::StoreError> {
             self.events.lock().unwrap().push("release".to_owned());
@@ -2512,8 +2533,12 @@ fn a_local_erasure_lock_beside_a_shared_store_is_refused() {
 
     #[async_trait::async_trait]
     impl ErasureCoordinator for Spanning {
-        async fn acquire(&self, scope: &str) -> Result<Lease, agentplane::core::StoreError> {
-            self.0.acquire(scope).await
+        async fn acquire(
+            &self,
+            scope: &str,
+            proof: agentplane::keyring::UnderLock,
+        ) -> Result<Lease, agentplane::core::StoreError> {
+            self.0.acquire(scope, proof).await
         }
         async fn release(&self, lease: Lease) -> Result<(), agentplane::core::StoreError> {
             self.0.release(lease).await
@@ -2670,6 +2695,13 @@ impl MemoryStore for Rewrites {
     async fn legal_hold(&self, id: &str) -> Result<bool, agentplane::core::StoreError> {
         self.inner.legal_hold(id).await
     }
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.inner.legal_holds(after, limit).await
+    }
     async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
         self.inner.sweep_expired(at).await
     }
@@ -2755,4 +2787,32 @@ async fn a_memory_rewritten_under_a_run_quarantines_it() {
              nobody audits"
         ),
     }
+}
+
+/// The memory contract, against the handle a **sealed** deployment holds.
+///
+/// The decorator re-implements every clause by forwarding, and forwarding is
+/// where a contract goes wrong: it is the store the runtime is actually given
+/// once a key ring is wired, and until now the battery only ever saw the
+/// backend underneath it. That is the configuration that cannot break the
+/// guarantee testing the one that can — the shape the blob battery was written
+/// to close, closed there and nowhere else.
+#[tokio::test]
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+async fn the_sealed_memory_store_satisfies_the_memory_store_contract() {
+    use agentplane::keyring::{EncryptedMemoryStore, KeyRing};
+    use agentplane::testkit::MemoryKeyRing;
+
+    let tenant = TenantId::new("sealed-contract").expect("tenant");
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone()),
+    ) as Arc<dyn MemoryStore>;
+    let sealed = Arc::new(EncryptedMemoryStore::new(
+        inner,
+        Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>,
+        tenant,
+    )) as Arc<dyn MemoryStore>;
+    agentplane::testkit::conformance::memory(sealed).await;
 }

@@ -20,6 +20,7 @@ mod a2a_server;
 mod api;
 mod drivers;
 mod mcp;
+mod mcp_server;
 mod media;
 mod model;
 mod outbox;

@@ -53,7 +53,7 @@ pub use provenance::{NS as PROVENANCE_NS, Provenance};
 
 pub use case::{
     BreachNote, Case, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineSpec,
-    DeadlineState, SweptAction,
+    DeadlineState, LegalHold, SweptAction,
 };
 pub use doubt::{Assertion, Doubt, QuarantineDecision, Undecided};
 pub use effect::{

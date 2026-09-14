@@ -2351,3 +2351,399 @@ fn every_journaled_record_field_names_core_vocabulary() {
          probably reading the wrong span rather than passing"
     );
 }
+
+/// **Every sealing decorator is run through the contract it re-implements.**
+///
+/// A decorator in `keyring` is a store: once a key ring is wired, it is the
+/// handle the runtime gets, and it re-implements the whole trait by forwarding.
+/// Forwarding is where a contract goes wrong — a row dropped instead of opened,
+/// a listing quietly shortened, a scope no erasure will name — and none of that
+/// is visible from above, because the wrapper answers the same signatures.
+///
+/// The cover is a **named map** rather than a search for the decorator's name
+/// in the test tree. The search version of this guard passes on an `use`
+/// statement, so removing a battery run left it green — which is the shape this
+/// file exists to catch, arriving in the guard written to catch it. A map fails
+/// on both moves that matter: a decorator added without cover is not a key, and
+/// a covering test renamed or deleted is a name that no longer resolves.
+#[test]
+fn every_sealing_store_decorator_is_put_through_a_battery() {
+    const COVERED: [(&str, &str); 7] = [
+        (
+            "SealedCases",
+            "every_sealing_decorator_satisfies_the_contract_it_wraps",
+        ),
+        (
+            "SealedEvents",
+            "every_sealing_decorator_satisfies_the_contract_it_wraps",
+        ),
+        (
+            "SealedTasks",
+            "every_sealing_decorator_satisfies_the_contract_it_wraps",
+        ),
+        (
+            "SealedJournal",
+            "the_sealed_journal_satisfies_the_journal_store_contract",
+        ),
+        (
+            "EncryptedMemoryStore",
+            "the_sealed_memory_store_satisfies_the_memory_store_contract",
+        ),
+        (
+            "SealedPush",
+            "the_sealed_push_store_due_in_matches_the_paging_default",
+        ),
+        ("EncryptedBlobs", "every_blob_store_satisfies_the_contract"),
+    ];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    let mut decorators: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(root.join("src/keyring"))
+        .expect("the keyring module is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        for line in std::fs::read_to_string(&path).expect("readable").lines() {
+            // `impl <Trait>Store for <Decorator> {` — the store traits are the
+            // ones with batteries, so they are the ones this rule is about.
+            if let Some(rest) = line.strip_prefix("impl ")
+                && let Some((traitname, name)) = rest.split_once(" for ")
+                && traitname.ends_with("Store")
+                && let Some(name) = name.strip_suffix(" {")
+            {
+                decorators.push(name.to_owned());
+            }
+        }
+    }
+    decorators.sort();
+    decorators.dedup();
+    assert!(
+        decorators.len() > 4,
+        "the `impl …Store for …` scan found only {decorators:?} — the keyring \
+         module moved and this guard is now inert"
+    );
+
+    let mut tests = String::new();
+    let mut stack = vec![root.join("tests")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                tests.push_str(&std::fs::read_to_string(&path).expect("readable"));
+            }
+        }
+    }
+
+    let uncovered: Vec<&String> = decorators
+        .iter()
+        .filter(|d| !COVERED.iter().any(|(name, _)| *name == d.as_str()))
+        .collect();
+    assert!(
+        uncovered.is_empty(),
+        "these sealing decorators implement a store trait and no battery run \
+         names them: {uncovered:?} — each re-implements a contract a battery \
+         already checks, and testing only the backend underneath is testing \
+         the configuration that cannot break the guarantee"
+    );
+
+    let gone: Vec<&str> = COVERED
+        .iter()
+        .filter(|(_, test)| !tests.contains(&format!("fn {test}(")))
+        .map(|(decorator, _)| *decorator)
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "the battery run named for {gone:?} no longer exists — a decorator's \
+         cover was renamed or deleted, and nothing else would have said so"
+    );
+}
+
+/// **The lifecycle-lock escape hatch is never used by the crate itself.**
+///
+/// `UnderLock::for_test` exists so a distributed lock can be tested by being
+/// held — one instance takes a scope, a second must block — which does not fit
+/// inside `under_lock`'s closure. In `src/` it would be the bug the token
+/// exists to prevent: an acquire whose release never runs strands the scope for
+/// every other instance, and nothing observes that until the next erasure.
+///
+/// Written because the rule was otherwise a sentence in a doc comment, which is
+/// the shape this round removed everywhere else.
+#[test]
+fn the_lifecycle_lock_escape_is_not_used_in_the_crate() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut callers: Vec<String> = Vec::new();
+    let mut files = 0usize;
+    let mut stack = vec![root.join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files += 1;
+                let text = std::fs::read_to_string(&path).expect("readable");
+                for (n, line) in text.lines().enumerate() {
+                    // The definition itself, and the doc comment naming it, are
+                    // not calls.
+                    if line.contains("for_test()")
+                        && !line.trim_start().starts_with("//")
+                        && !line.contains("pub const fn for_test")
+                    {
+                        callers.push(format!(
+                            "{}:{}",
+                            path.strip_prefix(root).unwrap_or(&path).display(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        files > 50,
+        "only {files} source files were scanned — the tree moved and this guard is now inert"
+    );
+    assert!(
+        callers.is_empty(),
+        "the lifecycle-lock escape is called from the crate itself at {callers:?} — \
+         it exists to test the lock by holding it, and in `src/` it is an acquire \
+         that `under_lock` is not releasing"
+    );
+}
+
+/// **Every durable format is at version 1, and the list of them is complete.**
+///
+/// Pre-freeze the rule is not "bump carefully", it is that a shape change is a
+/// *hard cut*: the old journal is not migrated, it is recreated. So a version
+/// above 1 before the freeze means somebody bumped a number instead of taking
+/// the cut — and a bumped number advertises that artifacts at the lower version
+/// are readable, which is exactly what a hard cut makes false. The shapes still
+/// parse with moved and added fields taking their defaults, so reading one
+/// answers an audit question wrongly rather than failing to answer it.
+///
+/// The second half is the one nothing could check before: the enumeration is
+/// documented as **closed**, and one of its five members was declared inside a
+/// private module, so no reader could name it and no test could compare against
+/// it. A scan for the constants keeps the list honest — a sixth durable format
+/// fails here rather than being discovered at the freeze.
+#[test]
+fn every_durable_format_is_at_version_one_and_the_list_is_closed() {
+    // The closed enumeration, and the reachable path for each.
+    assert_eq!(agentplane::core::canon::VERSION, 1, "canon::VERSION");
+    assert_eq!(
+        agentplane::export::FORMAT_VERSION,
+        1,
+        "export::FORMAT_VERSION"
+    );
+    #[cfg(feature = "keyring")]
+    assert_eq!(
+        agentplane::keyring::ENVELOPE_FORMAT_VERSION,
+        1,
+        "keyring::ENVELOPE_FORMAT_VERSION"
+    );
+    #[cfg(feature = "opendal")]
+    assert_eq!(
+        agentplane::blob::TOMBSTONE_FORMAT_VERSION,
+        1,
+        "blob::TOMBSTONE_FORMAT_VERSION"
+    );
+
+    // `RecordKind::version()` is a method rather than a constant, so it is read
+    // from a record rather than from a path.
+    let known: &[&str] = &[
+        "core/canon",
+        "export",
+        "keyring/envelope",
+        "keyring/mod",
+        "blob/opendal_store",
+        "journal/record",
+    ];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found: Vec<String> = Vec::new();
+    let mut files = 0usize;
+    let mut stack = vec![root.join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files += 1;
+                let text = std::fs::read_to_string(&path).expect("readable");
+                let rel = path
+                    .strip_prefix(root.join("src"))
+                    .unwrap_or(&path)
+                    .with_extension("")
+                    .display()
+                    .to_string();
+                // A durable format announces itself: a constant whose name ends
+                // in FORMAT_VERSION, or the canonicalization rule's own.
+                for line in text.lines() {
+                    let l = line.trim();
+                    if (l.starts_with("pub const") || l.starts_with("pub(super) const"))
+                        && (l.contains("FORMAT_VERSION") || l.contains("VERSION: u16"))
+                        && !known.iter().any(|k| rel.starts_with(k) || rel == *k)
+                    {
+                        found.push(format!("{rel}: {l}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        files > 50,
+        "only {files} source files were scanned — the tree moved and this guard is now inert"
+    );
+    assert!(
+        found.is_empty(),
+        "these look like durable formats outside the closed enumeration: {found:?} — \
+         a durable format belongs in the list the moment it exists, because the list \
+         is what says an artifact at any other version is refused rather than lifted"
+    );
+}
+
+/// Source with every comment line removed.
+///
+/// Stripping comments before counting a mention is the whole reason the sweep
+/// below finds anything: a method referenced only from a sibling's
+/// `[peer_task](Self::peer_task)` link reads as *mentioned* to a naive scan and
+/// is exercised by nobody.
+fn code_without_comments(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("readable").flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+fn joined_code(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| code_without_comments(&std::fs::read_to_string(p).expect("readable")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whole-word occurrences, so `peer_task` does not match `peer_tasks`.
+fn whole_word_mentions(name: &str, haystack: &str) -> usize {
+    haystack
+        .match_indices(name)
+        .filter(|(i, _)| {
+            let before = haystack[..*i].chars().next_back();
+            let after = haystack[i + name.len()..].chars().next();
+            !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                && !after.is_some_and(|c| c.is_alphanumeric() || c == '_')
+        })
+        .count()
+}
+
+/// Every `pub fn` in `src`, mapped to where it is declared and how many times.
+///
+/// A name declared more than once is a trait method with implementations; what
+/// exercises it is the trait's callers, so it is not this sweep's business.
+fn public_functions(
+    src: &[std::path::PathBuf],
+) -> std::collections::BTreeMap<String, (String, usize)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut declared = std::collections::BTreeMap::new();
+    for path in src {
+        // `testkit` is the seam that exists *for* consumers, so its surface is
+        // legitimately called only from outside this repository.
+        if path.to_string_lossy().contains("testkit") {
+            continue;
+        }
+        let text = std::fs::read_to_string(path).expect("readable");
+        let body = text.split("#[cfg(test)]").next().unwrap_or(&text);
+        for (n, line) in body.lines().enumerate() {
+            let Some(rest) = line.trim_start().strip_prefix("pub ") else {
+                continue;
+            };
+            let rest = rest.strip_prefix("async ").unwrap_or(rest);
+            let rest = rest.strip_prefix("const ").unwrap_or(rest);
+            let Some(rest) = rest.strip_prefix("fn ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            declared
+                .entry(name)
+                .and_modify(|e: &mut (String, usize)| e.1 = usize::MAX)
+                .or_insert_with(|| (format!("{rel}:{}", n + 1), 1));
+        }
+    }
+    declared
+}
+
+/// **Every public function is exercised somewhere.**
+///
+/// This project's own bar is that an item is built when a check fails on its
+/// removal. A `pub fn` that nothing in `src` calls and no test or example names
+/// does not meet it: it compiles, it is documented, and deleting it breaks
+/// nothing — which is the same evidence a reader has that it works.
+///
+/// The allowlist is empty on purpose. An entry is a claim that a function is
+/// worth shipping and not worth checking, which is a claim worth having to
+/// write down.
+#[test]
+fn every_public_function_is_called_or_tested_somewhere() {
+    const ALLOWED: &[&str] = &[];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let (mut src, mut elsewhere) = (Vec::new(), Vec::new());
+    rust_files(&root.join("src"), &mut src);
+    rust_files(&root.join("tests"), &mut elsewhere);
+    rust_files(&root.join("examples"), &mut elsewhere);
+
+    let src_code = joined_code(&src);
+    let outside = joined_code(&elsewhere);
+    let declared = public_functions(&src);
+    assert!(
+        declared.len() > 200,
+        "only {} public functions were found — the scan stopped matching and this \
+         guard is now inert",
+        declared.len()
+    );
+
+    let unexercised: Vec<String> = declared
+        .iter()
+        .filter(|(name, (_, count))| *count == 1 && !ALLOWED.contains(&name.as_str()))
+        .filter(|(name, _)| {
+            whole_word_mentions(name, &src_code) <= 1 && whole_word_mentions(name, &outside) == 0
+        })
+        .map(|(name, (site, _))| format!("{name} ({site})"))
+        .collect();
+    assert!(
+        unexercised.is_empty(),
+        "these public functions are called by nothing and named by no test or \
+         example: {unexercised:#?} — each one's removal breaks nothing, which is \
+         all the evidence a reader has that it works. Test it, delete it, or add \
+         it to ALLOWED with the reason"
+    );
+}

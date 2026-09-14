@@ -1351,7 +1351,7 @@ async fn an_unconvertible_column_is_refused_rather_than_nulled() {
 #[cfg(feature = "keyring")]
 #[tokio::test]
 async fn the_erasure_lock_excludes_a_second_instance() {
-    use agentplane::keyring::ErasureCoordinator;
+    use agentplane::keyring::{ErasureCoordinator, UnderLock};
 
     let Ok(container) = Postgres::default().with_tag(PG).start().await else {
         eprintln!("skipping: no Docker daemon available");
@@ -1372,17 +1372,13 @@ async fn the_erasure_lock_excludes_a_second_instance() {
 
     let scope = "acme/memory-lifecycle";
     let held = a
-        .acquire(scope)
+        .acquire(scope, UnderLock::for_test())
         .await
         .expect("first instance takes the lock");
 
-    // Probed with `pg_try_advisory_lock` on a third session rather than by
-    // cancelling a real `acquire`. Dropping an in-flight `pg_advisory_lock`
-    // returns a connection to the pool with a query still outstanding and the
-    // lock's fate unknown — so the obvious `timeout(b.acquire(..))` deadlocks
-    // the *next* user of that connection, which is how this test first hung.
-    // The hazard is real beyond the test and is recorded on `acquire`: it is
-    // not cancel-safe, and callers must use `under_lock`.
+    // Probed with `pg_try_advisory_lock` on a third session, so this test asks
+    // *is the scope held* without taking it. Cancelling a real `acquire` is the
+    // subject of its own test below.
     let probe = PostgresStore::connect(&url).await.expect("connect");
     let held_by_someone: bool = probe
         .erasure_probe(scope)
@@ -1406,18 +1402,24 @@ async fn the_erasure_lock_excludes_a_second_instance() {
 
     // And it is granted once the holder releases, or the lock is a deadlock.
     a.release(held).await.expect("release");
-    let after = tokio::time::timeout(std::time::Duration::from_secs(30), b.acquire(scope))
-        .await
-        .expect("the second instance never got the lock after it was released")
-        .expect("acquire");
+    let after = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        b.acquire(scope, UnderLock::for_test()),
+    )
+    .await
+    .expect("the second instance never got the lock after it was released")
+    .expect("acquire");
     b.release(after).await.expect("release");
 
     // A different scope is never contended, or one tenant's erasure would stop
     // every other tenant's writes.
-    let x = a.acquire("acme/memory-lifecycle").await.expect("a");
+    let x = a
+        .acquire("acme/memory-lifecycle", UnderLock::for_test())
+        .await
+        .expect("a");
     let y = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        b.acquire("other/memory-lifecycle"),
+        b.acquire("other/memory-lifecycle", UnderLock::for_test()),
     )
     .await
     .expect("a different scope must not be blocked by this one")
@@ -2334,4 +2336,212 @@ async fn the_log_grew_from_the_one_restored(
         "a restored store exported something that does not verify: {:#?}",
         verified.findings
     );
+}
+
+/// **A cancelled acquire leaves neither the lock nor the connection wedged.**
+///
+/// The hazard this rules out is specific and was real: a session advisory lock
+/// belongs to its connection, so a *pooled* connection handed back with a
+/// `pg_advisory_lock` still outstanding takes the lock's fate with it — and the
+/// next borrower of that connection blocks on a query it never issued. An
+/// ordinary `timeout` around anything that reaches this seam was enough to
+/// cause it, which is the way an embedder is most likely to meet it.
+///
+/// The fix is that a lease owns its connection outright: the future's drop
+/// drops the client, the client closes the session, and `PostgreSQL` frees a
+/// dead session's locks. So the assertion is not "acquire is fast" — it is that
+/// after a cancellation, the *same coordinator* can still acquire, which it
+/// cannot do through a poisoned pool.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn a_cancelled_acquire_leaves_neither_the_lock_nor_the_pool_wedged() {
+    use agentplane::keyring::{ErasureCoordinator, UnderLock};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let one = PostgresStore::connect(&url).await.expect("connect");
+    // **A pool of one, deliberately.** With a larger pool the second acquire
+    // gets a *different* connection and the test passes whether or not the lock
+    // session was detached — which it did, on the first version of this test.
+    // One connection is what forces the next borrower to be handed the exact
+    // connection the cancelled attempt let go of.
+    let two = PostgresStore::connect_sized(&url, Some(1))
+        .await
+        .expect("connect");
+    let a = one.erasure_coordinator();
+    let b = two.erasure_coordinator();
+    let scope = "acme/cancelled-acquire";
+
+    let held = a
+        .acquire(scope, UnderLock::for_test())
+        .await
+        .expect("first instance takes the lock");
+
+    // The second instance blocks, and its future is dropped mid-flight.
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(750),
+        b.acquire(scope, UnderLock::for_test()),
+    )
+    .await;
+    assert!(
+        cancelled.is_err(),
+        "the second instance was granted a lock the first was holding"
+    );
+
+    a.release(held).await.expect("the first instance releases");
+
+    // Nothing holds the scope now. If the abandoned request were still queued
+    // server-side it would have been granted the lock the moment `a` released —
+    // to a session with no lease, which nothing can release.
+    let probe = PostgresStore::connect(&url).await.expect("connect");
+    assert!(
+        !probe.erasure_probe(scope).await.expect("probe"),
+        "the scope is held after the only lease was released — the cancelled \
+         attempt was granted the lock it had abandoned"
+    );
+
+    // The whole point: `b` acquires again. Under a pooled lock session the
+    // cancelled attempt would have returned a connection with an outstanding
+    // `pg_advisory_lock`, and this call would hang on it — or the abandoned
+    // request would be granted the lock the moment `a` released, handing it to
+    // a session nobody can release.
+    let after = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        b.acquire(scope, UnderLock::for_test()),
+    )
+    .await
+    .expect(
+        "the coordinator whose acquire was cancelled can no longer take the lock — \
+         the cancelled attempt either poisoned its pool or is still queued for a \
+         lock it will never release",
+    )
+    .expect("acquire");
+    b.release(after).await.expect("release");
+}
+
+/// **A lease that is dropped instead of released frees the scope.**
+///
+/// The other half of cancellation, and the one an embedder meets by putting a
+/// `timeout` around an `EncryptedMemoryStore` write: the acquire *succeeded*,
+/// and then the future carrying the lease went away before `release` could run.
+/// If the lock lives in a side table keyed by the lease, nothing removes it and
+/// the scope is held by a lease that no longer exists — every later erasure of
+/// that subject blocks forever, with no error anywhere.
+///
+/// The lease carries its own guard, so dropping it closes the session and
+/// `PostgreSQL` frees the session's locks. Releasing is the tidy path, not the
+/// correct one.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn a_dropped_lease_frees_the_scope() {
+    use agentplane::keyring::{ErasureCoordinator, UnderLock};
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let one = PostgresStore::connect(&url).await.expect("connect");
+    let probe = PostgresStore::connect(&url).await.expect("connect");
+    let a = one.erasure_coordinator();
+    let scope = "acme/dropped-lease";
+
+    {
+        let held = a
+            .acquire(scope, UnderLock::for_test())
+            .await
+            .expect("the lock is taken");
+        assert!(
+            probe.erasure_probe(scope).await.expect("probe"),
+            "the scope should be held while the lease is alive, or the probe \
+             proves nothing below"
+        );
+        drop(held);
+    }
+
+    // The session closes asynchronously, so the scope frees within a moment
+    // rather than instantly. Polled rather than slept on, so a fast machine and
+    // a slow one agree.
+    let mut freed = false;
+    for _ in 0..100 {
+        if !probe.erasure_probe(scope).await.expect("probe") {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        freed,
+        "the scope is still held five seconds after its only lease was dropped — \
+         a cancelled erasure has stranded the subject, and nothing holds a lease \
+         that could release it"
+    );
+
+    // And it can be taken again, which is what "stranded" would prevent.
+    let again = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        a.acquire(scope, UnderLock::for_test()),
+    )
+    .await
+    .expect("the scope is takeable again")
+    .expect("acquire");
+    a.release(again).await.expect("release");
+}
+
+/// **The sweep and backlog reads are served by an index, not by a sort.**
+///
+/// Two of them were not, and both fail the same way: correct answers at a cost
+/// proportional to the whole tenant, on paths whose population a plane is
+/// *expected* to accumulate. The redelivery pass reads the oldest waits every
+/// tick, and the embedded backend walks an ordered index for it while this one
+/// sorted every subscription the tenant had — the two backends agreeing on the
+/// answer and disagreeing on the cost, which no conformance battery can see.
+///
+/// `EXPLAIN` rather than a stopwatch: a timing assertion on an empty test
+/// database passes whatever the plan is, which is exactly the check that cannot
+/// fail.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn the_sweep_reads_are_planned_as_index_scans() {
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = PostgresStore::connect(&url).await.expect("connect");
+
+    for (what, sql, index) in [
+        (
+            "the redelivery sweep's oldest waits",
+            "EXPLAIN SELECT run_id, effect_key, case_id, step, phase, event_kind, \
+             namespace, value FROM subscriptions WHERE tenant = 'acme' \
+             ORDER BY created_at ASC LIMIT 50",
+            "subscriptions_waiting",
+        ),
+        (
+            "the parked-registration backlog",
+            "EXPLAIN SELECT task_id, config_id FROM push_delivery \
+             WHERE tenant = 'acme' AND parked ORDER BY task_id, config_id LIMIT 50",
+            "push_delivery_parked",
+        ),
+    ] {
+        let plan = store.explain(sql).await.expect("explain");
+        assert!(
+            plan.contains(index),
+            "{what} is not planned through {index}:\n{plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan"),
+            "{what} is planned as a sequential scan, so its cost is the whole \
+             tenant rather than the page asked for:\n{plan}"
+        );
+    }
 }

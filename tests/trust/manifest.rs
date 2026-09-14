@@ -7022,3 +7022,62 @@ async fn a_capability_served_must_also_be_advertised() {
         .try_build()
         .expect("an ungoverned skill advertises nothing and contradicts nothing");
 }
+
+/// **The shape an agent takes is a reviewed artifact, exactly as the shape it
+/// returns is.**
+///
+/// The output contract never had to consider the caller this exists for: a
+/// *model* composing the arguments. An embedder calling `run_under` holds the
+/// shape in its own Rust on both sides, and an A2A peer's message is the
+/// sender's problem — neither is true once an agent is offered as a tool to
+/// somebody else's model. Under the digest, the schema a model was offered on a
+/// given run is the schema somebody approved.
+#[test]
+fn narrowing_the_input_schema_changes_the_manifest_identity() {
+    let with_input = GOOD.replace(
+        "  tools:",
+        "  input:\n    schema:\n      type: object\n      required: [ticket]\n  tools:",
+    );
+    let a = Manifest::parse(&with_input).expect("parse");
+    assert!(
+        a.input_schema().is_some(),
+        "the schema did not survive parsing"
+    );
+
+    let narrowed =
+        Manifest::parse(&with_input.replace("required: [ticket]", "required: [ticket, priority]"))
+            .expect("parse");
+
+    assert_ne!(
+        a.digest().unwrap(),
+        narrowed.digest().unwrap(),
+        "narrowing the argument contract did not change the manifest's identity, so \
+         a model could be offered a shape under a digest that was approved for \
+         another one"
+    );
+}
+
+/// An input contract that constrains nothing is refused, for the same reason
+/// an output one is.
+///
+/// `{}` is a valid JSON Schema meaning *anything*. Offered to a model it reads
+/// as a reviewed argument shape and admits every document — which is worse than
+/// declaring nothing, because declaring nothing is honest about it.
+#[test]
+fn an_input_schema_that_permits_anything_is_refused() {
+    let empty = GOOD.replace("  tools:", "  input:\n    schema: {}\n  tools:");
+    match Manifest::parse(&empty) {
+        Err(ManifestError::Empty(field)) => assert_eq!(field, "spec.input.schema"),
+        Err(e) => panic!("wrong refusal: {e}"),
+        Ok(_) => panic!("an argument contract that constrains nothing was accepted"),
+    }
+
+    let wrong = GOOD.replace("  tools:", "  input:\n    schema: [1, 2]\n  tools:");
+    assert!(
+        matches!(
+            Manifest::parse(&wrong),
+            Err(ManifestError::NotASchema { .. })
+        ),
+        "an input schema that is not a schema object at all was accepted"
+    );
+}

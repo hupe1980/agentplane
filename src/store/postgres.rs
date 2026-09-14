@@ -268,6 +268,14 @@ CREATE TABLE IF NOT EXISTS push_delivery (
 CREATE INDEX IF NOT EXISTS push_delivery_due
     ON push_delivery (tenant, next_attempt_at, task_id, config_id)
     WHERE NOT parked;
+
+-- And the complement, because the parked listing is the *other* half of the
+-- same column and a partial index over one value of a predicate serves only
+-- that value. An operator paging the backlog of receivers a worker gave up on
+-- would otherwise scan every registration to find the few that are parked.
+CREATE INDEX IF NOT EXISTS push_delivery_parked
+    ON push_delivery (tenant, task_id, config_id)
+    WHERE parked;
 ";
 
 /// A journal on `PostgreSQL`.
@@ -494,6 +502,36 @@ fn lease_expiry(now: u64, ttl: Duration) -> Result<u64, StoreError> {
 impl PostgresStore {
     pub(super) fn pool_ref(&self) -> &Pool {
         &self.pool
+    }
+
+    /// The planner's answer for a statement, as `EXPLAIN` lines.
+    ///
+    /// Gated on `testkit` because it runs whatever SQL it is handed, which is a
+    /// capability a production build has no reason to carry. It exists so a
+    /// test can assert a *plan* rather than a duration: a stopwatch over an
+    /// empty database passes whichever plan the query gets, which is the shape
+    /// of check that cannot fail — and the defect it was written for was a
+    /// sweep read whose answers were right and whose cost was the whole tenant.
+    ///
+    /// # Errors
+    ///
+    /// If the database cannot be reached or the statement does not plan.
+    #[cfg(feature = "testkit")]
+    pub async fn explain(&self, sql: &str) -> Result<String, crate::core::StoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| crate::core::StoreError::Backend(e.to_string()))?;
+        let rows = client
+            .query(sql, &[])
+            .await
+            .map_err(|e| crate::core::StoreError::Backend(e.to_string()))?;
+        Ok(rows
+            .iter()
+            .map(|r| r.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     /// A lifecycle lock for cryptographic memory erasure, in *this* database.

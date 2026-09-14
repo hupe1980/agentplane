@@ -347,6 +347,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `mcp` | MCP host: governed prompts, resources, tools, and asynchronous Tasks |
 | `mcp-stdio` | reach an MCP server by **running** it — the stdio child process most published servers are. What lets `agentplane run`/`serve` execute a declarative `tool-calling` agent with no Rust |
 | `mcp-http` | reach an MCP server over **streamable HTTP** — the transport remote servers speak |
+| `mcp-server` | the other direction: serve **this plane's agents as MCP tools** and their reviewed instructions as MCP prompts, so a host you do not run can call a governed agent |
 | `a2a` | A2A peer transport — calling other agents |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |
@@ -607,9 +608,11 @@ Pick the example for the question you have; none needs credentials or network:
 | How do governed media capabilities materialize without entering the journal? | `media_run` |
 | Can prompt, model, schema and ceilings be one digest-covered file? | `manifest_run` |
 | How does an MCP server sit beside a typed Rust tool? | `mcp_tools` |
+| What does a host see when it calls *this* plane over MCP? | `serve_mcp` |
 | How does an agent remember across runs without a storage backdoor? | `memory_run` |
 | Can one customer's approved budget span several runs, then be revoked? | `standing_authority` |
 | What does erasing a case actually erase — and what still verifies? | `sealed_run` |
+| What stops a retention pass from erasing a matter under a preservation order? | `retention_hold` |
 | How are separate agents and handoffs bounded? | `blog_room` |
 | What does another organisation's agent see when it calls this one? | `a2a_peer` |
 | How does an agent call another *plane's* agent, and whose chain does the peer see? | `peer_call` |

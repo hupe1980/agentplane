@@ -220,8 +220,12 @@ agentplane serve examples/served.yaml \
 Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too, on
 its **own** listener, off unless asked for, and separated from the peer surface
 by *policy* (`peer` reaches `a2a:*`, `operator` reaches `api:*`) rather than by
-the port. It serves the worklist and task decisions, plus the backlogs an on-call
-person asks for by question rather than by id: what is quarantined, what is
+the port. It is an HTTP API rather than a console: **anything holding a
+delegation that carries the verbs can drive it**, and who is acting comes from
+the authenticated identity, never from the request body — the decision type has
+no actor field to spoof. It serves the worklist and task
+decisions, plus the backlogs an on-call person asks for by question rather than
+by id: what is quarantined, what is
 escalated, which obligations were missed, which messages reached nobody, which
 webhook receivers stopped accepting
 ([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for)).
@@ -266,18 +270,19 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 💸 | **Budgets and tenant quotas that bind** — a failed model call is billed for what it burned, because the provider bills for it too, and a replayed run reaches the same tally at the same point → [budgets](https://hupe1980.github.io/agentplane/docs/plans-cases/#budgets) |
 | 🧬 | **Effects that take together, or not at all** — each reversible member records the concrete call that undoes it, built from what that call *actually returned*; an irreversible send is **deferred** to commit, so an aborted group never sends it → [effects](https://hupe1980.github.io/agentplane/docs/effects/) |
 | 👤 | **Human oversight on the *call*, not a summary of it** — a task carries the exact tool and arguments about to be dispatched, and a read-only `preview` puts *four thousand records* on the reviewer's screen instead of `older_than: "2024-01-01"` → [worklists](https://hupe1980.github.io/agentplane/docs/plans-cases/#human-tasks) |
-| 🔑 | **Erasure that reaches the backups** — payload bytes are sealed under a per-case key the crate never holds, so erasing a case destroys the key and the backup taken an hour ago becomes unreadable too. The chain commits to the **ciphertext**, so an auditor holding no keys still verifies the run → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
+| 🔑 | **Erasure that reaches the backups** — payload bytes are sealed under a per-case key the crate never holds, so erasing a case destroys the key and last hour's backup with it. The chain commits to the **ciphertext**, so an auditor with no keys still verifies the run — and a legal hold refuses the sweep for a matter you must preserve → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
 | 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety*, and the run is journaled and deterministically replayable |
 
 Ten rows, not the inventory. The full surface — the export/audit/restore
 toolchain, a durable manifest registry with an enumerable inventory, typed
 release, standing authorities, effect groups that commit with the journal,
 batch runs over 10⁵ items with per-item journals and an item-granular resume,
-the scoped emergency stop, the audited sweeper, a scheduled recovery drill and a
-retention pass that says what it could not reach, model drivers and streaming,
-MCP and A2A on both sides, signed Agent Cards, governed media and memory,
-multi-tenancy, quotas, witnessing, break-glass, and why there is no `AllowAll`
-anywhere — is documented mechanism by mechanism on the site:
+the scoped emergency stop, the audited sweeper, a scheduled recovery drill, a
+retention pass that says what it could not reach and the legal holds that stop
+one, model drivers and streaming, MCP and A2A on both sides, signed Agent Cards,
+governed media and memory, multi-tenancy, quotas, witnessing, break-glass, and
+why there is no `AllowAll` anywhere — is documented mechanism by mechanism on
+the site:
 **[what you get, in full](https://hupe1980.github.io/agentplane/docs/)**.
 
 What is deliberately **not** built, and what will move →

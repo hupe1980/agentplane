@@ -243,7 +243,7 @@ test-a2a-server:
 
 # The union of every example's `required-features`, so the crate is compiled
 # once instead of once per example.
-EXAMPLE_FEATURES := "redb,testkit,manifest,keyring,media,mcp,a2a,a2a-server"
+EXAMPLE_FEATURES := "redb,testkit,manifest,keyring,media,mcp,mcp-server,a2a,a2a-server"
 
 # run every example end to end
 #
@@ -270,8 +270,9 @@ examples:
         hello_skill durable_pipeline clearing_case plan_graph governed_transfer \
         saga_checkout effect_group tool_loop approved_call planned_run sealed_run \
         model_run media_run memory_run batch_run budget_pause answered_doubt \
-        operator_stop recovered_run manifest_run mcp_tools blog_room a2a_peer \
-        peer_call standing_authority streaming_run observability
+        operator_stop recovered_run manifest_run mcp_tools serve_mcp blog_room \
+        a2a_peer peer_call standing_authority streaming_run observability \
+        retention_hold
     do
         printf '\n\033[1m── %s ─────────────────────────────────\033[0m\n' "$ex"
         ./target/debug/examples/"$ex"

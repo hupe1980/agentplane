@@ -845,6 +845,30 @@ impl MemoryStore for PostgresStore {
         tx.commit().await.map_err(|error| be(&error))
     }
 
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|error| {
+            StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
+        })?;
+        let tenant = self.tenant_name();
+        let after = after.unwrap_or("").to_owned();
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = client
+            .query(
+                "SELECT id FROM memory_legal_holds
+                  WHERE tenant = $1 AND id > $2
+                  ORDER BY id
+                  LIMIT $3",
+                &[&tenant, &after, &limit],
+            )
+            .await
+            .map_err(|error| StoreError::Backend(error.to_string()))?;
+        Ok(rows.into_iter().map(|r| r.get::<_, String>(0)).collect())
+    }
+
     async fn legal_hold(&self, id: &str) -> Result<bool, StoreError> {
         let client = self.pool_ref().get().await.map_err(|error| {
             StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))

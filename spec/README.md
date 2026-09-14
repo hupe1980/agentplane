@@ -13,11 +13,13 @@ correct, and that are hardest to convince yourself of by reading code:
 | [`Authorization.tla`](Authorization.tla) | Can a replay re-open a decision policy already made, and is a refusal always on the record? |
 | [`Delegation.tla`](Delegation.tla) | Can authority grow as it is passed on, and is a chain read from storage trusted or re-checked? |
 
-These check the **design**. The `madsim` simulation (planned) checks the
-**implementation** against deliberately the same invariant list, and the
-integration tests check observable behaviour. Each layer catches what the others
-structurally cannot: a model checker explores interleavings no test will think
-of, and a test catches the gap between the model and the code.
+These check the **design**. The implementation is checked against deliberately
+the same invariant list by deterministic fault injection at the store seam
+(`testkit::faults`, which explains why that seam rather than a simulated
+runtime), and the integration tests check observable behaviour. Each layer
+catches what the others structurally cannot: a model checker explores
+interleavings no test will think of, and a test catches the gap between the
+model and the code.
 
 ## Status
 
