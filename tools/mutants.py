@@ -5564,7 +5564,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the second reading",
         "        // Strict verification never writes, so it holds no lease to renew.\n"
         "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
-        "        let _ = self.check_quota(run, None, now_for_admission()).await?;\n"
+        "        let _ = self.check_quota(run, None, None, now_for_admission()).await?;\n"
         "        // Strict verification never writes, so it holds no lease to renew.\n"
         "        let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));",
     ),
@@ -8373,6 +8373,14 @@ def check() -> int:
     identical to being verified. Refactoring the code a mutation points at is
     routine — rewriting the model drivers for streaming broke seven at once — so
     this is a text-only check something cheap can run.
+
+    **What it therefore does not cover: the replacement.** An anchor can match
+    while the text that replaces it no longer compiles — change a function's
+    signature and every replacement that *calls* it is stale, though every anchor
+    still reads correctly. The sweep reports that as `ERROR — did not compile`
+    rather than as a caught guarantee, which is the right answer and an expensive
+    one to wait for. So a signature change means running the mutations that name
+    the callers, not trusting a green `--check`.
     """
     # A sweep mutates source in place and restores it afterwards, leaving a
     # `.orig` beside whatever it currently holds. Anchor results are meaningless
