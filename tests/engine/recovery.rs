@@ -1497,6 +1497,10 @@ fn every_conclusion_but_success_carries_a_reason() {
             actor: "ops:hupe".into(),
             reason: "INC-42: stuck settlement".into(),
         },
+        RunStatus::Withheld {
+            subject: "alice".into(),
+            reason: "credential withdrawn: laptop lost".into(),
+        },
     ];
 
     for status in statuses {
@@ -1519,7 +1523,11 @@ fn every_conclusion_but_success_carries_a_reason() {
             | RunStatus::Exhausted(_)
             // A crossing cannot be recorded without one, so this is the variant
             // where an empty reason would be a refusal that did not happen.
-            | RunStatus::BrokeGlass { .. } => {
+            | RunStatus::BrokeGlass { .. }
+            // A withholding carries the operator's own words from the halt, and
+            // a halt cannot be thrown without them — so an empty reason here
+            // would mean the refusal that requires one did not happen.
+            | RunStatus::Withheld { .. } => {
                 let text = reason.unwrap_or_else(|| {
                     panic!("{} ended without saying why", status.as_str());
                 });

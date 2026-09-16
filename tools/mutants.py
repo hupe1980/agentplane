@@ -4674,13 +4674,32 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "            unfinished: self.snapshot(),",
         "            unfinished: Vec::new(),",
     ),
+    "AStrandedSlotReadsAsLiveWork": (
+        "src/runtime/executor.rs",
+        "the_live_listing_attributes_each_run_and_marks_a_stranded_slot",
+        "the live listing stops distinguishing a slot whose lease has lapsed "
+        "from a run something is actually executing, so an operator cancels "
+        "what the recovery sweep was about to resume — which unwinds work that "
+        "was going to finish",
+        "                stranded: stranded.contains(&run),",
+        "                stranded: false,",
+    ),
+    "LiftingAHaltIsTheAuthorityToThrowOne": (
+        "src/api/mod.rs",
+        "throwing_a_halt_and_lifting_one_are_separate_authorities",
+        "lifting the emergency stop is gated on the capability to throw it, so "
+        "a deployment that granted somebody the power to stop the plane has "
+        "silently granted them the power to start it again",
+        "    let s = api.gate(&headers, action::HALT_LIFT, &body.scope).await?;",
+        "    let s = api.gate(&headers, action::HALT_PLACE, &body.scope).await?;",
+    ),
     "ADrainDoesNotWait": (
         "src/runtime/drain.rs",
         "a_drain_waits_for_a_background_run_to_reach_its_conclusion",
         "a drain closes admission and returns without waiting, so every run in "
         "flight is cut at the same point a crash would cut it — the whole "
         "difference between a scheduled stop and an accident",
-        "            if self.running.lock().expect(\"in-flight runs\").is_empty() {\n                break;\n            }",
+        "            if crate::core::poison::recover(&self.running).is_empty() {\n                break;\n            }",
         "            if true {\n                break;\n            }",
     ),
     "ADrainWearsTheBackPressureCode": (
@@ -5472,12 +5491,61 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                            .map_err(|e| be(&e))?\n"
         "                            .take(limit as usize)",
     ),
+    "AWithdrawnAuthorityDoesNotStopWorkInFlight": (
+        "src/runtime/executor.rs",
+        "a_withdrawn_authority_pauses_a_running_run_without_unwinding_it",
+        "a withdrawal never reaches a running run, so work carries on under a "
+        "credential somebody withdrew — which is the harm the subject scope "
+        "exists to stop, not a side effect of it",
+        "                let standing = self.withdrawn_authority(identity.as_ref()).await?;",
+        "                let standing: Option<(String, String)> = None;",
+    ),
+    "AWithdrawalUnwindsTheWorkItPaused": (
+        "src/runtime/executor.rs",
+        "a_withdrawn_authority_pauses_a_running_run_without_unwinding_it",
+        "a withheld run is unwound like a cancelled one, so a withdrawn "
+        "credential reverses correct, completed work for a reason unrelated to "
+        "it — a week of a six-week matter undone because somebody lost a laptop",
+        "            RunStatus::Failed(_) | RunStatus::Cancelled { .. } => {}",
+        "            RunStatus::Failed(_) | RunStatus::Cancelled { .. } | RunStatus::Withheld { .. } => {}",
+    ),
+    "AWithdrawalIsCheckedAgainstThePlanesOwnChain": (
+        "src/runtime/executor.rs",
+        "a_halt_can_name_the_authority_a_run_acts_for",
+        "a halt scoped to an authority is matched against the *plane's* chain "
+        "rather than the caller's, so a withdrawn credential is compared with "
+        "the operator's own subject and never matches — a refusal that does not "
+        "happen, writing no record and raising no error",
+        """                terms
+                    .acting_as
+                    .as_ref()
+                    .or(self.identity.as_ref())
+                    .map(|c| c.subject().id.as_str()),""",
+        """                self.identity.as_ref().map(|c| c.subject().id.as_str()),""",
+    ),
     "AnAdmittedRunSkipsItsQuota": (
         "src/runtime/executor.rs",
         "a_refused_run_writes_nothing",
         "admission never consults the tenant's ceiling, so a caller that can "
         "start runs can start a thousand of them, each within its own budget",
-        "        let quota = match self\n            .check_quota(run, governed_by.as_ref(), now_for_admission())\n            .await\n        {",
+        """        let quota = match self
+            .check_quota(
+                run,
+                governed_by.as_ref(),
+                // **The chain this run acts under, not the plane's.** A served
+                // surface admits each run under its caller's chain, so reading
+                // the plane's here would check a withdrawal against the
+                // operator's own subject and never match the caller's — a
+                // refusal that does not happen, which leaves no trace anywhere.
+                terms
+                    .acting_as
+                    .as_ref()
+                    .or(self.identity.as_ref())
+                    .map(|c| c.subject().id.as_str()),
+                now_for_admission(),
+            )
+            .await
+        {""",
         "        let quota = match Ok::<_, RuntimeError>(QuotaPass::disabled()) {",
     ),
     "AFinishedRunKeepsItsSlot": (
@@ -6417,9 +6485,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """        RUN_READ,
         RUN_HISTORY,
         RUN_LIST,
+        RUN_LIVE,
         RUN_CANCEL,""",
         """        RUN_READ,
         RUN_HISTORY,
+        RUN_LIVE,
         RUN_CANCEL,""",
     ),
     "EscalatedCasesAreNotListable": (

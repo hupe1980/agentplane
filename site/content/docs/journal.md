@@ -81,12 +81,12 @@ rather than something a formatter does.
 A conclusion is not always a closure. Only conclusions nothing may resume —
 `succeeded`, `cancelled`, `abandoned` — **seal**: the journal freezes (the
 store refuses further appends as a constraint, not a convention) and the run
-enters the Merkle log below. `failed`, `exhausted` and `quarantined` leave the
-run open, because each has a party who can honestly answer it — a resume reads
-completed effects back rather than performing them again, a raised ceiling
-continues an exhaustion, and a person answers a doubt — and a leaf published for
-a run its own resume may grow would be a checkpoint attesting a prefix of a
-moving history.
+enters the Merkle log below. `failed`, `exhausted`, `withheld` and `quarantined`
+leave the run open, because each has a party who can honestly answer it — a
+resume reads completed effects back rather than performing them again, a raised
+ceiling continues an exhaustion, a lifted withdrawal continues a withholding, and
+a person answers a doubt — and a leaf published for a run its own resume may grow
+would be a checkpoint attesting a prefix of a moving history.
 
 A **quarantine** is the case worth stating, because sealing one looks right and
 is not. It is the runtime saying it does not know: the story is not over, and a

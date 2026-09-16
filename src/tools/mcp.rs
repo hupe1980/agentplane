@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CancelTaskParams, ClientInfo, ErrorCode,
+    CallToolRequestParams, CallToolResponse, CancelTaskParams, ClientConfig, ErrorCode,
     ExtensionCapabilities, GetPromptRequestParams, GetPromptResponse, GetTaskParams,
     InputResponses, JsonObject, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
     TASKS_EXTENSION_ID, UpdateTaskParams,
@@ -177,7 +177,7 @@ pub struct McpClient {
     /// Local, not something the server chose: the catalogue keys on it, and a
     /// server able to rename itself could step into another's entry.
     server: String,
-    service: Arc<RunningService<RoleClient, ClientInfo>>,
+    service: Arc<RunningService<RoleClient, ClientConfig>>,
     access: McpAccess,
     /// The whole-request deadline for every call through this client.
     ///
@@ -209,10 +209,10 @@ impl McpClient {
     /// are deliberately absent: advertising them would invite a server to open
     /// an interaction that has no governed runtime path.
     #[must_use]
-    pub fn host_info() -> ClientInfo {
-        let mut info = ClientInfo::default();
+    pub fn host_info() -> ClientConfig {
+        let mut info = ClientConfig::default();
         // The protocol baseline is pinned here rather than inherited from
-        // rmcp's `ClientInfo::default()`, whose `LATEST` constant lags the
+        // rmcp's `ClientConfig::default()`, whose `LATEST` constant lags the
         // 2026-07-28 spec this host is written against — the tasks extension
         // and structured tool responses this module relies on are defined
         // there. Pinning also means a future rmcp bump cannot silently move
@@ -339,7 +339,7 @@ impl McpClient {
     /// request is ever issued in an unknown dialect.
     pub fn new(
         server: impl Into<String>,
-        service: Arc<RunningService<RoleClient, ClientInfo>>,
+        service: Arc<RunningService<RoleClient, ClientConfig>>,
         destination: crate::tools::Destination,
     ) -> Result<Self, ToolError> {
         let server = server.into();
@@ -842,7 +842,7 @@ pub struct McpPrompt {
     name: String,
     arguments: Value,
     safety: McpDataSafety,
-    service: Arc<RunningService<RoleClient, ClientInfo>>,
+    service: Arc<RunningService<RoleClient, ClientConfig>>,
     timeout: Duration,
 }
 
@@ -920,7 +920,7 @@ pub struct McpResource {
     server: String,
     uri: String,
     safety: McpDataSafety,
-    service: Arc<RunningService<RoleClient, ClientInfo>>,
+    service: Arc<RunningService<RoleClient, ClientConfig>>,
     timeout: Duration,
 }
 
@@ -984,7 +984,7 @@ impl Effect for McpResource {
 #[derive(Debug)]
 pub struct McpTaskPoll {
     task: McpTask,
-    service: Arc<RunningService<RoleClient, ClientInfo>>,
+    service: Arc<RunningService<RoleClient, ClientConfig>>,
     timeout: Duration,
     /// The ceiling for the snapshot this poll returns.
     ///
@@ -1003,7 +1003,7 @@ pub struct McpTaskUpdate {
     input_responses: InputResponses,
     arguments: Value,
     safety: McpDataSafety,
-    service: Arc<RunningService<RoleClient, ClientInfo>>,
+    service: Arc<RunningService<RoleClient, ClientConfig>>,
     timeout: Duration,
 }
 
@@ -1068,7 +1068,7 @@ impl Effect for McpTaskUpdate {
 #[derive(Debug)]
 pub struct McpTaskCancel {
     task: McpTask,
-    service: Arc<RunningService<RoleClient, ClientInfo>>,
+    service: Arc<RunningService<RoleClient, ClientConfig>>,
     timeout: Duration,
 }
 
@@ -1213,7 +1213,7 @@ impl ToolClient for McpClient {
                     tool: tool.clone(),
                     detail: format!(
                         "MCP tool arguments must be a JSON object, got {}",
-                        kind_of(other)
+                        crate::core::canon::json_kind(other)
                     ),
                 });
             }
@@ -1296,17 +1296,6 @@ impl ToolClient for McpClient {
     /// What the wiring declared, unchanged.
     fn destination(&self, _tool: &ToolId) -> crate::tools::Destination {
         self.destination.clone()
-    }
-}
-
-fn kind_of(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "a boolean",
-        Value::Number(_) => "a number",
-        Value::String(_) => "a string",
-        Value::Array(_) => "an array",
-        Value::Object(_) => "an object",
     }
 }
 

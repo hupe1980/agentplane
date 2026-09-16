@@ -76,7 +76,7 @@ because rounding up is how a condition list stops being checkable.
 | 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — consulted on *every* record read, with a test lifting a record whose shape this build cannot parse and asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump |
 | 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down (readers before writers; rollback bounded by a *time window*), and the reader's half is pinned: a record from a shape this build does not know is refused as skew, not damage. What is left is the two-build exercise, which needs a version bump to have two builds to run |
 | 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility), and already implemented: hashes are agile by version, signatures by key, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
-| 8 | **The deferred format questions are settled**, because each one moves a record or a wire: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open — **eight** questions, each with an answer that changes a durable format or a protocol. Four more that had accumulated here turned out to change neither, whichever way they go, and no longer count against the freeze |
+| 8 | **The deferred format questions are settled**, because each one moves a record or a wire: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open — **eight** questions, each with an answer that changes a durable format or a protocol |
 | 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ⬜ open — both surfaces are built and published: a crate an embedder links, and a server an operator runs against a manifest with no Rust anywhere. What is unwritten is which one an adopter is expected to depend on, and therefore what the freeze is a promise *about*. It is a row rather than a footnote because a compatibility commitment with no stated subject is one an adopter completes in their own favour |
 
 **7 and 8 are independent, with one join.** They can be worked in parallel:
@@ -179,6 +179,13 @@ operator route carries its own `api:` capability, so MCP adds discovery and
 description rather than authority — and whatever carries it must keep the rule
 this surface is shaped by: who is acting comes from the request's identity,
 never from its body.
+
+**An embedded store admits one writer process.** While `agentplane serve` holds
+a redb file, the verbs that open it directly — `halt`, `halts`, `audit`,
+`export`, `verify`, `retain`, `drill` — cannot run, and say so in those words.
+`--store postgres://…` has no such rule: an operator verb and a serving plane
+coexist. Which surface each verb lives on, and why two live on both, is in
+[operations](@/docs/operations.md#what-the-endpoints-are-for).
 
 **Speaking the [Agent Client Protocol](https://agentclientprotocol.com/).** Not
 built, and worth separating into the two things people mean by it.

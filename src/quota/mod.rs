@@ -158,6 +158,15 @@ impl Period {
 /// when a deploy is the incident. [`Agent`](Self::Agent) covers every revision
 /// of a declared name. [`Tenant`](Self::Tenant) is the power switch.
 ///
+/// **[`Subject`](Self::Subject) is keyed on the other axis**, and it is the one
+/// to reach for when the incident is not the workload but the *authority*: a
+/// credential somebody has withdrawn, a service account that turned out to be
+/// shared, a person who has left. The three scopes above ask *what is running*;
+/// this one asks *who it is running for*, which is the delegation subject bound
+/// at admission and carried on every run's `IdentityBound` record. A run with no
+/// chain of its own is covered by none of them — there is nothing to key on, and
+/// inventing a match would stop work for a reason nobody could look up.
+///
 /// A name is a string the manifest's author typed, and a halt is still keyed
 /// on one because it is a **refusal**: a name-keyed refusal at worst stops
 /// work somebody did not mean to stop, which an operator sees at once and
@@ -174,6 +183,14 @@ pub enum HaltScope {
     /// The form that is precise about *which* revision is stopped, so a fix
     /// published as a new version is not stopped with it.
     Revision { digest: crate::core::Digest },
+    /// Everything acting for one delegation subject.
+    ///
+    /// The authority axis rather than the workload axis. Ordered last so that
+    /// it wins the *message* when several scopes cover one run: an operator who
+    /// withdrew a credential and whoever is refused are looking for different
+    /// sentences, and "the tenant is halted" sends the second one to the wrong
+    /// incident.
+    Subject { id: String },
 }
 
 impl HaltScope {
@@ -188,6 +205,11 @@ impl HaltScope {
         Self::Revision { digest }
     }
 
+    /// Everything acting for one delegation subject.
+    pub fn subject(id: impl Into<String>) -> Self {
+        Self::Subject { id: id.into() }
+    }
+
     /// The durable key, and the form an operator types on the command line.
     ///
     /// Round-trips through [`parse`](Self::parse). One column rather than a
@@ -199,6 +221,7 @@ impl HaltScope {
             Self::Tenant => "tenant".to_owned(),
             Self::Agent { name } => format!("agent:{name}"),
             Self::Revision { digest } => format!("revision:{digest}"),
+            Self::Subject { id } => format!("subject:{id}"),
         }
     }
 
@@ -221,21 +244,58 @@ impl HaltScope {
         if let Some(hex) = key.strip_prefix("revision:") {
             return crate::core::Digest::from_hex(hex).ok().map(Self::revision);
         }
+        if let Some(id) = key.strip_prefix("subject:")
+            && !id.is_empty()
+        {
+            return Some(Self::subject(id));
+        }
         None
     }
 
-    /// Whether this halt stops a run governed by `agent`.
+    /// The authority this halt withdraws, when it withdraws one.
     ///
-    /// An ungoverned run — a skill registered directly on the plane, with no
-    /// manifest — is stopped only by [`Tenant`](Self::Tenant). There is nothing
-    /// narrower to key it on, and inventing a match would stop work for a
-    /// reason nobody could look up.
+    /// **The one scope that reaches work already running.** The others stop
+    /// admission, because cutting a saga mid-flight leaves reversals unrun; here
+    /// the incident *is* the authority, and a run carrying on under a withdrawn
+    /// credential is the harm. It **pauses**: the run stops at its next step
+    /// boundary, its mutations stand, and lifting the halt continues it.
+    ///
+    /// Returns the subject rather than a `bool` so the in-flight check has
+    /// nothing to pass and so nothing to get wrong — a caller asking `covers`
+    /// with the agent but not the subject would match nothing, which is a
+    /// refusal that does not happen.
     #[must_use]
-    pub fn covers(&self, agent: Option<&crate::journal::AgentIdentity>) -> bool {
+    pub fn withdrawn_subject(&self) -> Option<&str> {
+        match self {
+            Self::Subject { id } => Some(id.as_str()),
+            Self::Tenant | Self::Agent { .. } | Self::Revision { .. } => None,
+        }
+    }
+
+    /// Whether this halt stops a run governed by `agent` and acting for
+    /// `subject`.
+    ///
+    /// **Both, because the scopes ask different questions.** Three of them ask
+    /// what is running and one asks who it runs for, so a caller that passed
+    /// only the agent would silently never match a withdrawn authority — the
+    /// worst failure available here, since it is a refusal that does not happen
+    /// and therefore leaves no trace at all.
+    ///
+    /// A run with neither — a skill registered directly on the plane, with no
+    /// manifest and no chain — is stopped only by [`Tenant`](Self::Tenant).
+    /// There is nothing narrower to key it on, and inventing a match would stop
+    /// work for a reason nobody could look up.
+    #[must_use]
+    pub fn covers(
+        &self,
+        agent: Option<&crate::journal::AgentIdentity>,
+        subject: Option<&str>,
+    ) -> bool {
         match self {
             Self::Tenant => true,
             Self::Agent { name } => agent.is_some_and(|a| &a.name == name),
             Self::Revision { digest } => agent.is_some_and(|a| &a.digest == digest),
+            Self::Subject { id } => subject.is_some_and(|s| s == id),
         }
     }
 }
@@ -246,6 +306,7 @@ impl std::fmt::Display for HaltScope {
             Self::Tenant => f.write_str("the whole tenant"),
             Self::Agent { name } => write!(f, "agent '{name}'"),
             Self::Revision { digest } => write!(f, "manifest revision {digest}"),
+            Self::Subject { id } => write!(f, "everything acting for '{id}'"),
         }
     }
 }

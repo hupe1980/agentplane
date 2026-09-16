@@ -16,7 +16,66 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.37.0] — unreleased
+## [0.38.0] — unreleased
+
+### Added
+
+- **The emergency stop is on the operator API** — `GET`/`POST /halts`,
+  `POST /halts/lift`. Throwing and lifting are separate capabilities
+  (`api:halt.place`, `api:halt.lift`): granting the power to stop the plane says
+  nothing about who may start it again.
+- **`GET /runs/live` — what is executing now**, and `Runtime::running_runs`
+  behind it. Each entry carries the agent, its revision and the delegation
+  subject; `?subject=` narrows. A slot whose lease has lapsed is marked
+  `stranded` — the recovery sweep's to resume, not yours to cancel.
+- **`HaltScope::Subject` — stop work by the authority it acts for.** The only
+  scope that reaches runs already executing, and it **pauses** them: a run under
+  a withdrawn credential stops at its next step boundary as `RunStatus::Withheld`
+  with its completed work intact, and lifting the halt resumes it.
+- **Two record kinds, `AuthorityWithheld` and `AuthorityRestored`.** The second
+  supersedes the first, as `BudgetReadmitted` supersedes `BudgetRefused`; a
+  reader takes the last word. The published
+  [format specification](https://hupe1980.github.io/agentplane/docs/format/) now
+  names twenty-nine kinds.
+- **`runtime::Stores` and `Runtime::builder_with`** — the six store handles as a
+  value, for a deployment that picks its backend at run time.
+
+### Changed
+
+- **BREAKING — `--store` takes a `postgres://` connection string**, and every
+  verb that opens a store takes `--tenant` beside it. On the shared store the
+  operator verbs run beside a serving plane, which on `redb` they cannot.
+  [Upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+- **BREAKING — `RunStatus` gained `Withheld`, `HaltScope` gained `Subject`**, and
+  `HaltScope::covers` takes the delegation subject beside the agent identity.
+  Exhaustive matches stop compiling, which is the intended way to find out.
+- **BREAKING — `agentplane run --store` wires the whole plane**, as `serve` did.
+  A manifest declaring memory or a wait built under one verb and was refused
+  under the other.
+- **The locked-store refusal says what to do about it.** *Database already open*
+  did not say that something else holds the file, or that the shared store has no
+  such rule.
+
+### Fixed
+
+- **Two reachable panics removed.** `RunFailure`'s `Display` had an
+  `unreachable!()` on a status its own public field can hold, so formatting an
+  error panicked. Two copies of a JSON type-name match carried another; all three
+  are now `core::canon::json_kind`.
+- **A poisoned mutex no longer becomes a permanent fault.** The drain deregisters
+  a run from a `Drop`, so a poisoned lock aborted the process. `core::poison::recover`
+  states the rule per lock; the ledger keeps its propagating unwrap.
+- **The A2A request future is boxed.** It carried the executor's locals — sixteen
+  kilobytes on the stack per concurrent request.
+
+### Assurance
+
+- **The CLI smoke check says why a verb failed**, holds an export to its tenant,
+  and holds a build without `postgres` to naming the feature.
+- **The documented-flag guard follows `#[command(flatten)]`.** It modelled a
+  flattened field as a flag of its own.
+
+## [0.37.0] — 2026-09-14
 
 ### Added
 

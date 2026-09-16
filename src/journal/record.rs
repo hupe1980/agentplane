@@ -388,6 +388,40 @@ pub enum RecordKind {
         limit: String,
     },
 
+    /// The authority this run acts under was withdrawn while it was running.
+    ///
+    /// Run-level — no step, no effect key — and written at a step boundary only:
+    /// between boundaries an effect may be announced and not yet recorded, and
+    /// stopping there manufactures the in-doubt case the protocol exists to
+    /// avoid.
+    ///
+    /// **A pause, so it has a counterpart.** A lift is journaled as
+    /// [`AuthorityRestored`](Self::AuthorityRestored) *beside* this record
+    /// rather than instead of it, or a strict replay would stop here and report
+    /// `withheld` about a run whose own later records show it finishing. Same
+    /// construction as [`BudgetRefused`](Self::BudgetRefused) and
+    /// [`BudgetReadmitted`](Self::BudgetReadmitted).
+    AuthorityWithheld {
+        /// The delegation subject that was withdrawn — what an operator matches
+        /// against the halt they threw.
+        subject: String,
+        /// Why, in the operator's own words, carried from the halt.
+        reason: String,
+    },
+
+    /// A run that was withheld was admitted to continue, the withdrawal having
+    /// been lifted.
+    ///
+    /// The counterpart of [`AuthorityWithheld`](Self::AuthorityWithheld), and
+    /// the record that makes a resumed run's history readable: from here the
+    /// withholding is history that was *superseded*, not a verdict to re-serve.
+    AuthorityRestored {
+        /// The subject whose withdrawal was lifted. Recorded rather than
+        /// inferred from the record above, so a reader holding a page of the
+        /// chain can pair them without holding the whole of it.
+        subject: String,
+    },
+
     /// The delegation chain this run acts under, owner first.
     ///
     /// Recorded once, at admission, because "on whose behalf" is the question a
@@ -668,6 +702,8 @@ impl RecordKind {
             Self::GroupSettled { .. } => "GroupSettled",
             Self::BudgetRefused { .. } => "BudgetRefused",
             Self::BudgetReadmitted { .. } => "BudgetReadmitted",
+            Self::AuthorityWithheld { .. } => "AuthorityWithheld",
+            Self::AuthorityRestored { .. } => "AuthorityRestored",
             Self::IdentityBound { .. } => "IdentityBound",
             Self::PolicyDenied { .. } => "PolicyDenied",
             Self::Released { .. } => "Released",

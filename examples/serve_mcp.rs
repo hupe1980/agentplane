@@ -85,8 +85,8 @@ impl Skill for Checker {
 struct Host;
 
 impl rmcp::ClientHandler for Host {
-    fn get_info(&self) -> rmcp::model::ClientInfo {
-        let mut info = rmcp::model::ClientInfo::default();
+    fn get_info(&self) -> rmcp::model::ClientConfig {
+        let mut info = rmcp::model::ClientConfig::default();
         info.protocol_version = ProtocolVersion::V_2026_07_28;
         info.capabilities = rmcp::model::ClientCapabilities::builder()
             .enable_tasks()

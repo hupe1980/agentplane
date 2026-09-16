@@ -34,7 +34,7 @@ use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData,
     Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerInfo, Tool as McpTool, ToolAnnotations,
+    ServerConfig, Tool as McpTool, ToolAnnotations,
 };
 use rmcp::serve_server;
 use rmcp::service::{RequestContext, RoleServer};
@@ -115,11 +115,11 @@ struct TicketServer;
 // trait's contract is a future either way.
 #[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for TicketServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut me = Implementation::default();
         me.name = "tickets".into();
         me.version = "0.0.0".into();
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         // The version the spec text names, never the SDK's `default()`: that
         // is whatever rmcp's `LATEST` happens to be in the linked release, and a fixture
         // that inherits it makes the negotiation test check the dependency's

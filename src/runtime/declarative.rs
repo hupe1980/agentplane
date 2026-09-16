@@ -1841,16 +1841,17 @@ fn resolve_subject(
             match selected.peek() {
                 Value::String(value) if !value.trim().is_empty() => Ok(value.clone()),
                 Value::Number(value) => Ok(value.to_string()),
+                // The only kind this arm names differently from the shared
+                // helper: a string reaching here is a string the arm above
+                // rejected for being blank, and "a string" would read as though
+                // the type were wrong.
                 other => Err(refuse(format!(
                     "`{field}.subject: $input{pointer}` selects {}, and a subject \
                      is a scope name — it must be a non-empty string or a number",
-                    match other {
-                        Value::String(_) => "an empty string",
-                        Value::Null => "null",
-                        Value::Bool(_) => "a boolean",
-                        Value::Array(_) => "an array",
-                        Value::Object(_) => "an object",
-                        Value::Number(_) => unreachable!("numbers are accepted above"),
+                    if other.is_string() {
+                        "an empty string"
+                    } else {
+                        crate::core::canon::json_kind(other)
                     }
                 ))),
             }

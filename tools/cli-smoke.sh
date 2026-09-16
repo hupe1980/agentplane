@@ -173,8 +173,44 @@ while IFS= read -r line; do
 done <<<"$out"
 echo "ok: the export is framed, and every line parses on its own"
 
-"${BIN[@]}" audit --store "$jdir/j.redb" >"$jdir/report.json" 2>/dev/null || {
-    echo "FAIL: the audit exited non-zero on healthy history"; exit 1; }
+# ── the tenant is part of naming a store, not decoration ──
+#
+# Every key in both backends leads with the tenant, so naming the wrong one is a
+# *miss* rather than an error: the verb answers about a plane nobody runs and
+# exits zero. An export of the wrong tenant is empty, well-formed and looks
+# exactly like an export of a quiet one — which is the artifact an auditor is
+# handed. Asserted here because no unit test holds a whole binary to it.
+runs_in() {
+    "${BIN[@]}" export --store "$jdir/j.redb" ${2:+--tenant "$2"} 2>/dev/null \
+        | python3 -c 'import json,sys
+for line in sys.stdin:
+    d = json.loads(line)
+    if d.get("kind") == "agentplane.export.end":
+        print(d["runs_exported"])'
+}
+[ "$(runs_in _ )" != "0" ] || {
+    echo "FAIL: the default tenant exported nothing, so this check proves nothing"; exit 1; }
+[ "$(runs_in _ somebody-else)" = "0" ] || {
+    echo "FAIL: an export named another tenant and still found this one's runs"; exit 1; }
+echo "ok: an export is scoped to the tenant it was asked for"
+
+echo "── a connection string in a build without the backend names the feature ──"
+# `cli` does not pull in `postgres`, so this smoke test runs the exact build a
+# reader meets the flag in. "No such file or directory" would send them to look
+# at their path for a mistake that is in their feature list.
+if out="$("${BIN[@]}" halts --store 'postgres://localhost/nope' 2>&1 >/dev/null)"; then
+    echo "FAIL: a build without postgres opened a connection string"; exit 1
+fi
+grep -q 'postgres' <<<"$out" || {
+    echo "FAIL: the refusal does not name the missing feature: $out"; exit 1; }
+echo "ok: refused, naming the feature to rebuild with"
+
+# Stderr is captured rather than discarded: these three are the verbs an
+# operator reaches for during an incident, and a smoke failure that says only
+# `exited non-zero` sends whoever reads it back to reproduce by hand.
+"${BIN[@]}" audit --store "$jdir/j.redb" >"$jdir/report.json" 2>"$jdir/audit.err" || {
+    echo "FAIL: the audit exited non-zero on healthy history:"
+    sed 's/^/    /' "$jdir/audit.err"; exit 1; }
 python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$jdir/report.json" || {
     echo "FAIL: the audit report is not machine-readable"; exit 1; }
 grep -q 'not_checked' "$jdir/report.json" || {
@@ -187,8 +223,9 @@ echo "── the restore drill runs on the export alone ──"
 # `verify` takes a file and nothing else: no store, no manifest, no toolchain.
 # That is the point — it is the verb somebody handed a copy can run.
 "${BIN[@]}" export --store "$jdir/j.redb" >"$jdir/history.jsonl" 2>/dev/null
-"${BIN[@]}" verify "$jdir/history.jsonl" >"$jdir/verify.json" 2>/dev/null || {
-    echo "FAIL: a faithful export did not verify"; exit 1; }
+"${BIN[@]}" verify "$jdir/history.jsonl" >"$jdir/verify.json" 2>"$jdir/verify.err" || {
+    echo "FAIL: a faithful export did not verify:"
+    sed 's/^/    /' "$jdir/verify.err"; exit 1; }
 grep -q '"findings": \[\]' "$jdir/verify.json" || {
     echo "FAIL: a faithful export produced findings"; exit 1; }
 grep -q 'no public key was supplied' "$jdir/verify.json" || {
@@ -217,8 +254,9 @@ fi
 echo "ok: a truncated export is refused on its missing frame"
 
 echo "── a store rebuilds from an export, and proves it ──"
-"${BIN[@]}" restore "$jdir/history.jsonl" --store "$jdir/restored.redb" >"$jdir/restore.json" 2>/dev/null || {
-    echo "FAIL: restoring an export exited non-zero"; exit 1; }
+"${BIN[@]}" restore "$jdir/history.jsonl" --store "$jdir/restored.redb" >"$jdir/restore.json" 2>"$jdir/restore.err" || {
+    echo "FAIL: restoring an export exited non-zero:"
+    sed 's/^/    /' "$jdir/restore.err"; exit 1; }
 # The result is the comparison, not the loading: equal roots at equal size.
 python3 - "$jdir/restore.json" <<'PY' || { echo "FAIL: the rebuilt store commits to a different history"; exit 1; }
 import json,sys

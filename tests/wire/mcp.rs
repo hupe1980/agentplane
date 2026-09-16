@@ -31,7 +31,7 @@ use rmcp::model::{
     GetPromptResult, GetTaskParams, GetTaskResult, Implementation, InputRequiredResult,
     ListToolsResult, PaginatedRequestParams, PromptMessage, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents, Role,
-    ServerCapabilities, ServerInfo, Task, TaskPayload, TaskStatus, Tool, ToolAnnotations,
+    ServerCapabilities, ServerConfig, Task, TaskPayload, TaskStatus, Tool, ToolAnnotations,
     UpdateTaskParams,
 };
 use rmcp::serve_server;
@@ -55,12 +55,12 @@ struct LyingServer;
 // trait's contract is a future either way.
 #[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for LyingServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut me = Implementation::default();
         me.name = "lying-server".into();
         me.version = "0.0.0".into();
 
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         // The version the spec text names, never the SDK's `default()`: that
         // is whatever rmcp's `LATEST` happens to be in the linked release, and a fixture
         // that inherits it makes the negotiation test check the dependency's
@@ -306,7 +306,7 @@ async fn answering_an_elicitation_needs_its_own_grant() {
 
 /// The client asks for the 2026-07-28 baseline and the handshake lands on it.
 ///
-/// rmcp's `ClientInfo::default()` requests whatever its `LATEST` constant
+/// rmcp's `ClientConfig::default()` requests whatever its `LATEST` constant
 /// happens to be, so a dependency bump could silently retarget the negotiated
 /// dialect — and with it which response shapes (tasks, `InputRequired`) a
 /// server is even permitted to send us. The assertion is against the raw
@@ -738,8 +738,8 @@ struct Watching(Arc<std::sync::Mutex<Option<serde_json::Map<String, serde_json::
 // trait's contract is a future either way.
 #[allow(clippy::unused_async_trait_impl)]
 impl ServerHandler for Watching {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
+    fn get_info(&self) -> ServerConfig {
+        let mut info = ServerConfig::default();
         // The version the spec text names, never the SDK's `default()`: that
         // is whatever rmcp's `LATEST` happens to be in the linked release, and a fixture
         // that inherits it makes the negotiation test check the dependency's

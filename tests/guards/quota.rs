@@ -1325,3 +1325,351 @@ fn a_quota_reports_whether_it_constrains_anything() {
         assert!(bounded.bounds_spend());
     }
 }
+
+/// **The other axis: stopping work by who it acts for.**
+///
+/// The claim that would fail silently, and so the one under test, is the
+/// **source of the subject**. A served surface admits each run under its
+/// *caller's* chain and the plane has one of its own; reading the plane's would
+/// compare a withdrawal against the operator's own subject and never match — a
+/// refusal that does not happen, writing no record and raising no error.
+#[tokio::test]
+async fn a_halt_can_name_the_authority_a_run_acts_for() {
+    use agentplane::core::{Delegation, Principal, RuntimeError, Scope};
+    use agentplane::quota::{HaltScope, QuotaError};
+    use agentplane::runtime::RunTerms;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    // The plane's own chain is deliberately a *different* subject from the
+    // caller's: if the check reads this one, the test passes for the wrong
+    // reason and the assertion below is the only thing that notices.
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .quota(store.clone() as Arc<dyn QuotaStore>, TenantQuota::default())
+        .acting_as(Delegation::root(Principal::new("the-plane", Scope::root())))
+        .skill(Work)
+        .build();
+
+    let caller = || Delegation::root(Principal::new("alice", Scope::root()));
+
+    rt.set_halt(
+        &HaltScope::subject("alice"),
+        Some("credential withdrawn: laptop lost"),
+    )
+    .await
+    .expect("withdraw an authority");
+
+    match rt
+        .run_under(
+            "work",
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(caller()),
+        )
+        .await
+    {
+        Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, reason, .. })) => {
+            assert_eq!(scope, HaltScope::subject("alice"));
+            assert!(
+                reason.contains("laptop lost"),
+                "the refusal must carry the operator's reason: {reason}"
+            );
+        }
+        other => panic!("a run acting for a withdrawn authority was admitted: {other:?}"),
+    }
+
+    // Another caller is untouched: a withdrawal is not a halt on the agent.
+    let bob = Delegation::root(Principal::new("bob", Scope::root()));
+    rt.run_under(
+        "work",
+        Tainted::trusted(json!({})),
+        RunTerms::default().acting_as(bob),
+    )
+    .await
+    .expect("a different subject is not withdrawn");
+
+    // And the plane's own runs are untouched too, which is the half that tells
+    // `subject:` apart from `tenant:`.
+    rt.run("work", Tainted::trusted(json!({})))
+        .await
+        .expect("the plane's own chain is not the withdrawn one");
+
+    // Lifting restores it.
+    rt.set_halt(&HaltScope::subject("alice"), None)
+        .await
+        .expect("lift");
+    rt.run_under(
+        "work",
+        Tainted::trusted(json!({})),
+        RunTerms::default().acting_as(caller()),
+    )
+    .await
+    .expect("a lifted withdrawal admits again");
+}
+
+use agentplane::core::{
+    ArgSource, Compensation, Effect, EffectDescriptor, EffectError, PlanIR, PlanNode, Recovery,
+    RetryPolicy, StepId,
+};
+use agentplane::quota::HaltScope;
+
+/// A mutating effect, so a completed step has something to reverse.
+#[derive(Debug)]
+struct Charge;
+
+#[async_trait::async_trait]
+impl Effect for Charge {
+    type Output = Value;
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new("test.charge", json!({}))
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+    fn retry(&self) -> RetryPolicy {
+        RetryPolicy::never()
+    }
+    async fn perform(&self) -> Result<Value, EffectError> {
+        Ok(json!({ "charged": true }))
+    }
+}
+
+/// A step that mutates, declares itself reversible, and **then** has the
+/// credential withdrawn under it.
+///
+/// Withdrawing from inside the run is what puts the completed step in the
+/// executor's `completed` list when the boundary check fires. Throwing the
+/// halt from outside and resuming would fire the check at the *first*
+/// boundary of the resume, where nothing has completed in that pass — and
+/// the claim that nothing was unwound would hold however the code behaved.
+#[derive(Debug)]
+struct Charges(Arc<dyn QuotaStore>, AtomicBool);
+
+#[async_trait::async_trait]
+impl Skill for Charges {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("charges").provides("charges")
+    }
+    fn compensation(&self) -> Compensation {
+        Compensation::Compensatable
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let out = cx.effect(Charge).await?;
+        // Once, and only once. This is a store write from inside a skill —
+        // exactly the ungoverned side effect the effect protocol exists to
+        // prevent — so it is guarded to fire on the live pass alone. Without
+        // the guard the replay that follows a *lift* re-throws the halt, and
+        // the run can never continue.
+        if !self.1.swap(true, Ordering::SeqCst) {
+            self.0
+                .set_halt(
+                    &HaltScope::subject("alice"),
+                    Some("credential withdrawn: laptop lost"),
+                )
+                .await
+                .expect("withdraw mid-run");
+        }
+        Ok(Outcome::done(out))
+    }
+    async fn compensate(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _output: &Tainted<Value>,
+    ) -> Result<(), SkillError> {
+        cx.effect(Charge).await?;
+        Ok(())
+    }
+}
+
+/// A plane acting for `alice`, and a run it has just withheld.
+///
+/// Two steps on purpose: a completed, compensatable step and then a wait. With
+/// one step there is nothing finished to reverse, so *the run was not unwound*
+/// would hold however the code behaved.
+async fn a_withheld_run() -> (Arc<RedbStore>, Arc<Runtime>, agentplane::core::RunId) {
+    use agentplane::core::{Delegation, Principal, Scope};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    // The plane's own chain is alice's here: these tests are about what a
+    // withdrawal *does*, and which chain it is read from has its own test.
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn agentplane::case::CaseStore>)
+        .events(store.clone() as Arc<dyn agentplane::case::EventStore>)
+        .timers(store.clone() as Arc<dyn agentplane::case::TimerStore>)
+        .quota(store.clone() as Arc<dyn QuotaStore>, TenantQuota::default())
+        .acting_as(Delegation::root(Principal::new("alice", Scope::root())))
+        .skill(Charges(
+            store.clone() as Arc<dyn QuotaStore>,
+            AtomicBool::new(false),
+        ))
+        .skill(Waits)
+        .build();
+
+    // Step 0 charges and completes; step 1 waits. So there is finished,
+    // reversible work standing when the withdrawal arrives.
+    let plan = PlanIR::new(vec![
+        PlanNode::new(0, "charges").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "waits")
+            .arg("x", ArgSource::node(StepId(0)))
+            .terminal(),
+    ]);
+    let out = rt
+        .run_plan_correlated(
+            plan,
+            Tainted::trusted(json!({})),
+            "claim",
+            &[agentplane::core::CorrelationKey::new("claim", "CLM-1")],
+        )
+        .await
+        .expect("admitted before any withdrawal");
+    let run = out.run_id;
+    match &out.status {
+        RunStatus::Withheld { subject, reason } => {
+            assert_eq!(subject, "alice");
+            assert!(reason.contains("laptop lost"), "{reason}");
+        }
+        other => panic!("a run under a withdrawn authority carried on: {other:?}"),
+    }
+    (store, rt, run)
+}
+
+/// How many records of one shape the run holds.
+async fn count(
+    store: &Arc<RedbStore>,
+    run: agentplane::core::RunId,
+    f: fn(&RecordKind) -> bool,
+) -> usize {
+    store
+        .read(run, 1)
+        .await
+        .expect("records")
+        .iter()
+        .filter(|r| f(r.kind()))
+        .count()
+}
+
+/// **A withdrawal reaches work already running, and pauses rather than
+/// destroys.**
+///
+/// The workload scopes stop admission only, because cutting a saga mid-flight
+/// leaves reversals unrun. This one reaches in, because the incident *is* the
+/// authority. What it must not do is unwind: that reverses correct work for a
+/// reason unrelated to it.
+#[tokio::test]
+async fn a_withdrawn_authority_pauses_a_running_run_without_unwinding_it() {
+    let (store, _rt, run) = a_withheld_run().await;
+
+    assert!(
+        count(&store, run, |k| matches!(k, RecordKind::EffectDone { .. })).await > 0,
+        "the first step did not perform its mutation, so there is nothing an \
+         unwind could reverse and the claim below would hold vacuously"
+    );
+    assert_eq!(
+        count(&store, run, |k| matches!(
+            k,
+            RecordKind::AuthorityWithheld { .. }
+        ))
+        .await,
+        1,
+        "the pause is not on the record, so nothing says why the run stopped"
+    );
+    assert_eq!(
+        count(&store, run, |k| matches!(
+            k,
+            RecordKind::StepCompensated { .. }
+        ))
+        .await,
+        0,
+        "the run was unwound — a withdrawal reversed correct, completed work for \
+         a reason unrelated to it, which is the second incident this pause exists \
+         to avoid"
+    );
+}
+
+/// **A withheld run resumes once the withdrawal is lifted, and the record says
+/// the pause was superseded.**
+///
+/// The half that makes it a pause rather than an ending. Re-resuming while the
+/// withdrawal still stands must add **no** second record, or a queue of retries
+/// becomes a queue of records; and the lift must be journaled, or a strict
+/// replay stops at the pause and reports a run as withheld whose own later
+/// records show it continuing.
+#[tokio::test]
+async fn a_lifted_withdrawal_lets_a_withheld_run_continue() {
+    use agentplane::runtime::Mode;
+
+    let (store, rt, run) = a_withheld_run().await;
+
+    // Resuming again while it still stands adds no second record.
+    let again = rt.replay(run, Mode::Resume).await.expect("resume again");
+    assert!(matches!(again.status, RunStatus::Withheld { .. }));
+    assert_eq!(
+        count(&store, run, |k| matches!(
+            k,
+            RecordKind::AuthorityWithheld { .. }
+        ))
+        .await,
+        1,
+        "a second resume wrote a second withholding, so a queue of retries \
+         becomes a queue of records"
+    );
+
+    // Lifted, and the run continues from where it stopped.
+    rt.set_halt(&HaltScope::subject("alice"), None)
+        .await
+        .expect("lift");
+    let restored = rt
+        .replay(run, Mode::Resume)
+        .await
+        .expect("resume after lift");
+    assert!(
+        matches!(restored.status, RunStatus::Suspended(_)),
+        "a lifted withdrawal did not let the run continue: {:?}",
+        restored.status
+    );
+    assert_eq!(
+        count(&store, run, |k| matches!(
+            k,
+            RecordKind::AuthorityRestored { .. }
+        ))
+        .await,
+        1,
+        "the lift is not on the record, so a strict replay would stop at the \
+         withholding and report a run as withheld that its own later records \
+         show continuing"
+    );
+}
+
+/// A skill that waits for an event, so a run has a boundary left to reach.
+#[derive(Debug)]
+struct Waits;
+
+#[async_trait::async_trait]
+impl Skill for Waits {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("waits").provides("waits")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.deadline(
+            "reply-window",
+            &agentplane::core::DeadlineSpec::days(1),
+            None,
+        )
+        .await?;
+        cx.await_event(
+            &agentplane::core::AwaitSpec::new("reply", "reply-window")
+                .correlate(agentplane::core::CorrelationKey::new("claim", "CLM-1")),
+        )
+        .await?;
+        Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}

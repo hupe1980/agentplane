@@ -333,6 +333,30 @@ fn es_number(value: f64, out: &mut Vec<u8>) {
     }
 }
 
+/// What kind of JSON value this is, as the noun a refusal puts in a sentence.
+///
+/// Three copies of this match had grown — in manifest validation, in the
+/// declarative tiers and in the MCP tool adapter — and **two of them carried an
+/// `unreachable!()`**, because each was written as the tail of a larger match
+/// whose earlier arms had already taken a variant. That is a panic guarding an
+/// invariant the compiler cannot see: it holds only while the arms above stay
+/// where they are, and the reader of the refactor that moves one has no warning.
+///
+/// Total by construction here, so there is nothing to keep true. A caller that
+/// has already handled a variant specially says so at the call site, where the
+/// special case is visible, rather than by deleting an arm from a copy of this.
+#[must_use]
+pub fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

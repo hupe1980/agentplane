@@ -306,6 +306,13 @@ fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
         // and nobody could establish what — so it takes the state a peer
         // investigates rather than the one they dismiss.
         | RunStatus::Abandoned { .. }
+        // A withdrawal is a *pause* here and still `FAILED` on this wire, which
+        // is the honest mapping rather than a lazy one. A2A has no state for
+        // "stopped, intact, and resumable by somebody else's action": the peer
+        // cannot lift the halt, cannot wait for it, and has nothing to supply —
+        // so `INPUT_REQUIRED` would ask them for input that would never help.
+        // The run's own status keeps the distinction for the party who can act.
+        | RunStatus::Withheld { .. }
         | RunStatus::Replanning(_) => TaskState::Failed,
         // Neither is a task, and `REJECTED` is the state that says so: no peer
         // submitted a sweep or a break-glass crossing, and a run id that
@@ -1348,12 +1355,7 @@ impl A2aServer {
         if state != TaskState::Completed {
             return Ok(ArtifactRead::Artifacts(None));
         }
-        if let Some(cached) = self
-            .artifact_cache
-            .lock()
-            .expect("the artifact cache mutex is never poisoned")
-            .get(run)
-        {
+        if let Some(cached) = crate::core::poison::recover(&self.artifact_cache).get(run) {
             return Ok(cached);
         }
         if let Some(budget) = &budget
@@ -1365,10 +1367,7 @@ impl A2aServer {
         if let Some(budget) = budget {
             *budget -= 1;
         }
-        self.artifact_cache
-            .lock()
-            .expect("the artifact cache mutex is never poisoned")
-            .insert(run, artifacts.clone());
+        crate::core::poison::recover(&self.artifact_cache).insert(run, artifacts.clone());
         Ok(ArtifactRead::Artifacts(artifacts))
     }
 
@@ -1707,7 +1706,15 @@ async fn rpc(
         };
     }
 
-    match dispatch(&server, &headers, &req).await {
+    // **Boxed, because this future is the whole runtime.** `dispatch` fans out
+    // to every A2A method and one of them admits and executes a run, so the
+    // state machine inlined here carries the executor's own locals — sixteen
+    // kilobytes of them. Held on the stack it is sixteen kilobytes *per
+    // concurrent request*, paid by every caller including the ones asking for a
+    // task's status. One heap allocation per request buys that back, and a
+    // request that reaches this line is already doing far more work than an
+    // allocation.
+    match Box::pin(dispatch(&server, &headers, &req)).await {
         Ok(result) => Json(json!({ "jsonrpc": "2.0", "id": id, "result": result })).into_response(),
         Err(e) => e.with_id(id).into_response(),
     }
@@ -3309,7 +3316,7 @@ mod state_agreement_tests {
         let statuses = crate::runtime::every_status();
         assert_eq!(
             statuses.len(),
-            10,
+            11,
             "a RunStatus variant was added or removed — decide which A2A state it \
              surfaces as, in `state_of` and in `sealed_state` both"
         );

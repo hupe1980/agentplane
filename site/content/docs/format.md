@@ -534,16 +534,25 @@ re-addressing, because a record names the digest it always named and that run's
 
 ## Vocabulary {#vocabulary}
 
-Twenty-seven record kinds. A verifier does not interpret them; a reader that
+Twenty-nine record kinds. A verifier does not interpret them; a reader that
 does must refuse one it has never heard of, for the reason
 [the record body](#record-body) gives.
 
 `RunAdmitted`, `QuotaPassStarted`, `PlanFrozen`, `StepStarted`, `StepFinished`,
 `Note`, `EffectStarted`, `EffectDone`, `EffectFailed`, `EffectReconciled`,
 `StepCompensated`, `QuarantineDecided`, `GroupOpened`, `GroupSettled`,
-`BudgetRefused`, `BudgetReadmitted`, `IdentityBound`, `PolicyDenied`,
-`RunSuspended`, `CaseBound`, `DeadlineRegistered`, `DeadlineTransition`,
-`Released`, `RunCancelled`, `RunConcluded`, `BreakGlass`, `Swept`.
+`BudgetRefused`, `BudgetReadmitted`, `AuthorityWithheld`, `AuthorityRestored`,
+`IdentityBound`, `PolicyDenied`, `RunSuspended`, `CaseBound`,
+`DeadlineRegistered`, `DeadlineTransition`, `Released`, `RunCancelled`,
+`RunConcluded`, `BreakGlass`, `Swept`.
+
+**Two pairs supersede rather than replace.** `BudgetReadmitted` follows a
+`BudgetRefused` and `AuthorityRestored` follows an `AuthorityWithheld`; in both
+cases the earlier record stays in the chain and the later one says it was
+overturned. A reader reconstructing a run's state takes the **last word** — a
+refusal followed by a continuation is a decision somebody made, not a
+contradiction, and treating the earlier record as final reports a run as stopped
+whose own later records show it finishing.
 
 Each kind's member set is pinned by `tests/golden/records.jsonl`, one line per
 kind. That file is the normative statement of the payloads: prose listing them

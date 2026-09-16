@@ -202,6 +202,13 @@ fn effects() -> Vec<RecordKind> {
         RecordKind::BudgetReadmitted {
             limit: "effects raised to 5".into(),
         },
+        RecordKind::AuthorityWithheld {
+            subject: "acme/ops".into(),
+            reason: "credential withdrawn: laptop lost".into(),
+        },
+        RecordKind::AuthorityRestored {
+            subject: "acme/ops".into(),
+        },
         RecordKind::IdentityBound {
             chain: vec![Principal::new(
                 "acme/ops",

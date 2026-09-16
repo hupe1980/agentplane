@@ -141,14 +141,11 @@ enum Verb {
 /// three-way verdict is built on.
 #[derive(clap::Args, Debug)]
 struct RetainArgs {
-    /// The store holding the case layer.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
-
-    /// Which tenant's cases. Blob addresses and key scopes derive from it, so a
-    /// pass under the wrong one erases nothing and says it erased nothing.
-    #[arg(long, env = "AGENTPLANE_TENANT")]
-    tenant: Option<String>,
+    /// The store holding the case layer, and whose. Blob addresses and key
+    /// scopes derive from the tenant, so a pass under the wrong one erases
+    /// nothing and says it erased nothing.
+    #[command(flatten)]
+    at: StoreRef,
 
     /// Erase closed cases opened longer ago than this, in days. Required.
     #[arg(long)]
@@ -173,13 +170,9 @@ struct RetainArgs {
 /// preserved and why.
 #[derive(clap::Args, Debug)]
 struct HoldArgs {
-    /// The store holding the case layer.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
-
-    /// Which tenant's cases.
-    #[arg(long, env = "AGENTPLANE_TENANT")]
-    tenant: Option<String>,
+    /// The store holding the case layer, and whose.
+    #[command(flatten)]
+    at: StoreRef,
 
     /// The matter to place or lift a hold on. Omit to list every hold standing.
     #[arg(long)]
@@ -204,13 +197,9 @@ struct HoldArgs {
 /// default.
 #[derive(clap::Args, Debug)]
 struct HaltArgs {
-    /// The store holding the halt.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
-
-    /// Which tenant to stop. Defaults to the single-tenant plane's tenant.
-    #[arg(long, env = "AGENTPLANE_TENANT")]
-    tenant: Option<String>,
+    /// The store holding the halt, and which tenant to stop.
+    #[command(flatten)]
+    at: StoreRef,
 
     /// What to stop: `tenant`, `agent:<metadata.name>`, or
     /// `revision:<manifest digest>`.
@@ -233,13 +222,9 @@ struct HaltArgs {
 /// What is stopped right now — the question a per-scope lookup cannot answer.
 #[derive(clap::Args, Debug)]
 struct HaltsArgs {
-    /// The store holding the halts.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
-
-    /// Which tenant to read. Defaults to the single-tenant plane's tenant.
-    #[arg(long, env = "AGENTPLANE_TENANT")]
-    tenant: Option<String>,
+    /// The store holding the halts, and whose to read.
+    #[command(flatten)]
+    at: StoreRef,
 }
 
 /// Retention for the admission index, as a verb.
@@ -255,9 +240,9 @@ struct HaltsArgs {
 /// horizon for them.
 #[derive(clap::Args, Debug)]
 struct ForgetArgs {
-    /// The store holding the admission index.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
+    /// The store holding the admission index, and whose.
+    #[command(flatten)]
+    at: StoreRef,
 
     /// Retire keys claimed longer ago than this, as days. Required.
     ///
@@ -284,8 +269,8 @@ struct ForgetArgs {
 struct DrillArgs {
     /// The store holding the case layer to drill. Required — the drill walks
     /// cases, and a memory store this process did not write holds none.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
+    #[command(flatten)]
+    at: StoreRef,
 }
 
 /// Rebuild a journal from an export.
@@ -294,10 +279,13 @@ struct RestoreArgs {
     /// The export to read.
     file: String,
 
-    /// Where to write the rebuilt journal. Must not already hold these runs —
-    /// this rebuilds a history rather than merging one.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
+    /// Where to write the rebuilt journal, and under which tenant. Must not
+    /// already hold these runs — this rebuilds a history rather than merging
+    /// one. The tenant matters as much as the path: a restore into the unnamed
+    /// default of a store whose plane serves `acme` rebuilds a history nobody
+    /// serves.
+    #[command(flatten)]
+    at: StoreRef,
 }
 
 /// The restore drill: an export, and nothing else.
@@ -437,10 +425,10 @@ struct AuditArgs {
 /// deployment's source tree.
 #[derive(clap::Args, Debug)]
 struct StoreArgs {
-    /// The journal to read. Required — there is nothing to audit or export in
-    /// a memory store that this process did not itself write.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
+    /// The journal to read, and whose. Required — there is nothing to audit or
+    /// export in a memory store that this process did not itself write.
+    #[command(flatten)]
+    at: StoreRef,
 
     /// Which runs, by outcome. Repeatable. Defaults to every sealed outcome.
     #[arg(long)]
@@ -449,6 +437,63 @@ struct StoreArgs {
     /// How many runs to consider per outcome.
     #[arg(long, default_value_t = 1000)]
     limit: usize,
+}
+
+/// Where a plane's state is, and whose.
+///
+/// One type rather than a `--store`/`--tenant` pair written out per verb. Four
+/// verbs had both, five had only the store, and the binary could serve only the
+/// unnamed tenant — so an operator who learnt `--tenant` from `halt` and reached
+/// for `export` got an artifact about a different plane, empty, well-formed and
+/// exit zero. A verb cannot now name a store without saying whose it is,
+/// because there is no other way to name one.
+#[derive(clap::Args, Debug, Clone)]
+struct StoreRef {
+    /// The plane's store: a redb file, or a `postgres://` connection string.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: String,
+
+    /// Which tenant's plane. Defaults to the unnamed single-tenant plane.
+    ///
+    /// Every key in both backends leads with the tenant, so naming the wrong
+    /// one is a *miss* rather than an error: the verb answers about a plane
+    /// nobody runs and reports success.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
+}
+
+impl StoreRef {
+    async fn open(&self) -> Result<Backend, String> {
+        Backend::open(&self.store, self.tenant.as_deref()).await
+    }
+}
+
+/// [`StoreRef`] for the two verbs a store is genuinely optional for.
+///
+/// `run` may journal to memory because it exits with its answer; `serve` refuses
+/// without one and says why in its own words rather than clap's.
+#[derive(clap::Args, Debug, Clone)]
+struct MaybeStoreRef {
+    /// The plane's store: a redb file, or a `postgres://` connection string.
+    #[arg(long, env = "AGENTPLANE_STORE")]
+    store: Option<String>,
+
+    /// Which tenant's plane. Defaults to the unnamed single-tenant plane.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
+}
+
+impl MaybeStoreRef {
+    /// Open the named store, or say nothing was named.
+    ///
+    /// `Ok(None)` rather than a default, so each caller decides what an absent
+    /// store means: `run` journals to memory and says so, `serve` refuses.
+    async fn open(&self) -> Result<Option<Backend>, String> {
+        match &self.store {
+            Some(spec) => Backend::open(spec, self.tenant.as_deref()).await.map(Some),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Build a verifier from repeated `--key <key-id>=<hex>` flags.
@@ -520,9 +565,9 @@ struct RunArgs {
     #[arg(long)]
     capability: Option<String>,
 
-    /// Journal on disk. Defaults to memory, which keeps nothing.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: Option<String>,
+    /// Journal on disk, and whose. Defaults to memory, which keeps nothing.
+    #[command(flatten)]
+    at: MaybeStoreRef,
 
     /// Run an MCP server as a child process and reach it as `tool://NAME/...`.
     ///
@@ -555,10 +600,10 @@ struct ReplayArgs {
     /// The run to re-execute.
     run_id: String,
 
-    /// The journal holding it. Required: there is nothing to replay in a
-    /// memory store this process did not itself write.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: String,
+    /// The journal holding it, and whose. Required: there is nothing to replay
+    /// in a memory store this process did not itself write.
+    #[command(flatten)]
+    at: StoreRef,
 
     /// The manifest (or `---`-separated room) the run executed under.
     ///
@@ -620,10 +665,10 @@ struct ServeArgs {
     #[arg(long, env = "AGENTPLANE_TOKENS")]
     tokens: Option<String>,
 
-    /// Journal on disk. Required: a served task's id is a promise it can be
-    /// fetched again.
-    #[arg(long, env = "AGENTPLANE_STORE")]
-    store: Option<String>,
+    /// Journal on disk, and which tenant this plane serves. Required: a served
+    /// task's id is a promise it can be fetched again.
+    #[command(flatten)]
+    at: MaybeStoreRef,
 
     /// Also serve the operator surface — the worklist, task decisions and
     /// `GET /runs?outcome=quarantined` — on its own listener.
@@ -999,12 +1044,12 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let redb = Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
-        let store: Arc<dyn JournalStore> = redb.clone();
-        // The same file holds the case layer, so the export always carries it.
+        let backend = opts.at.open().await?;
+        let store = backend.journal();
+        // The same store holds the case layer, so the export always carries it.
         // An optional flag here would be a way to quietly produce the file the
         // verifier flags — the matters the journal names, missing.
-        let cases: Arc<dyn agentplane::case::CaseStore> = redb;
+        let cases = backend.cases();
 
         // The library's own list, not literals restated here: the store indexes
         // runs *by* outcome and has no "all runs" query, so an offline verb has
@@ -1115,15 +1160,22 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let redb = Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
-        // The same file the other journal verbs open holds the case layer —
+        let backend = opts.at.open().await?;
+        // The same store the other journal verbs open holds the case layer —
         // that is the wiring, whole. Blobs and keys are not in it, and the
         // report says so instead of this verb pretending otherwise.
-        let cases: Arc<dyn agentplane::case::CaseStore> = redb;
-        // The tenant scopes blob addresses and key scopes, and this verb has
-        // neither store to reach — the default is inert here, and a future
-        // flag that wires blobs must add `--tenant` beside it.
-        let tenant = agentplane::core::TenantId::default();
+        let cases = backend.cases();
+        // The tenant scopes blob addresses and key scopes. This verb wires
+        // neither store, so it reaches neither — but the value is the one the
+        // operator named, so a future flag that wires blobs inherits the right
+        // scope rather than a default that was never a decision.
+        let tenant = opts
+            .at
+            .tenant
+            .as_deref()
+            .map(|name| agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}")))
+            .transpose()?
+            .unwrap_or_default();
         let stores = agentplane::drill::Stores {
             cases: &cases,
             blobs: None,
@@ -1178,8 +1230,7 @@ fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let store: Arc<dyn JournalStore> =
-            Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
+        let store = opts.at.open().await?.journal();
         // Wall clock by design, like the sweeper's: a retention window is a
         // question about how long ago something was claimed, not a journaled
         // observation of a run.
@@ -1226,14 +1277,7 @@ fn retain_verb(opts: &RetainArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let redb = RedbStore::open(&opts.store).map_err(|e| e.to_string())?;
-        let redb = match opts.tenant.as_deref() {
-            Some(name) => redb.for_tenant(
-                agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}"))?,
-            ),
-            None => redb,
-        };
-        let cases: Arc<dyn agentplane::case::CaseStore> = Arc::new(redb);
+        let cases = opts.at.open().await?.cases();
 
         // Wall clock by design, like the sweeper's: a retention window is a
         // question about how long ago a matter opened, not a journaled
@@ -1277,14 +1321,7 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let redb = RedbStore::open(&opts.store).map_err(|e| e.to_string())?;
-        let redb = match opts.tenant.as_deref() {
-            Some(name) => redb.for_tenant(
-                agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}"))?,
-            ),
-            None => redb,
-        };
-        let cases: Arc<dyn agentplane::case::CaseStore> = Arc::new(redb);
+        let cases = opts.at.open().await?.cases();
 
         let Some(case) = opts.case.as_deref() else {
             let mut standing = Vec::new();
@@ -1393,7 +1430,7 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let quotas = quota_store_at(&opts.store, opts.tenant.as_deref())?;
+        let quotas = opts.at.open().await?.quotas();
         quotas
             .set_halt(&scope, opts.reason.as_deref())
             .await
@@ -1418,7 +1455,7 @@ fn halts_verb(opts: &HaltsArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let quotas = quota_store_at(&opts.store, opts.tenant.as_deref())?;
+        let quotas = opts.at.open().await?.quotas();
         let halts = quotas.halts().await.map_err(|e| e.to_string())?;
         let rows: Vec<serde_json::Value> = halts
             .iter()
@@ -1433,23 +1470,173 @@ fn halts_verb(opts: &HaltsArgs) -> Result<ExitCode, String> {
     })
 }
 
-/// The quota store behind a file, scoped to the tenant an operator named.
+/// Whichever backend `--store` names.
 ///
-/// Scoping is not optional decoration: a halt written against the default
-/// tenant while the plane runs as `acme` is a switch that reads back correctly
-/// and stops nothing.
-fn quota_store_at(
-    path: &str,
-    tenant: Option<&str>,
-) -> Result<Arc<dyn agentplane::quota::QuotaStore>, String> {
-    let store = RedbStore::open(path).map_err(|e| e.to_string())?;
-    let store = match tenant {
-        Some(name) => store.for_tenant(
-            agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}"))?,
-        ),
-        None => store,
-    };
-    Ok(Arc::new(store))
+/// One flag rather than `--store` plus `--database-url`: two flags are mutually
+/// exclusive in prose and simultaneously settable in fact, which is a refusal
+/// somebody has to remember to write.
+///
+/// The choice is not cosmetic. redb admits a single writer **process**, so every
+/// verb here is one a serving plane locks out; the shared store has no such
+/// rule, which is what makes `halt` reachable during the incident it exists for.
+enum Backend {
+    /// A redb file. One writer process, so these verbs run between serving
+    /// sessions rather than beside one.
+    Embedded(Arc<RedbStore>, agentplane::core::TenantId),
+    /// A shared `PostgreSQL` database. Several processes, so an operator verb
+    /// and a serving plane coexist.
+    #[cfg(feature = "postgres")]
+    Shared(
+        Arc<agentplane::store::PostgresStore>,
+        agentplane::core::TenantId,
+    ),
+}
+
+impl Backend {
+    /// Open whichever backend `--store` names, scoped to `--tenant`.
+    ///
+    /// **Both arguments, always.** Every key in both backends leads with the
+    /// tenant, so a cross-tenant read is a *miss* rather than a filtered row: a
+    /// verb that opened a store without deciding whose would answer about the
+    /// unnamed default and exit zero.
+    // `async` in every configuration and awaiting nothing in one: connecting is
+    // a network call, opening a file is not. One signature so no caller has to
+    // know which feature set it was built with.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn open(spec: &str, tenant: Option<&str>) -> Result<Self, String> {
+        let tenant = tenant
+            .map(|name| agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}")))
+            .transpose()?;
+        if is_connection_string(spec) {
+            // The refusal names the flag rather than saying "not a file": the
+            // feature exists, it is one rebuild away, and "no such file or
+            // directory" would send somebody to look at their path.
+            #[cfg(not(feature = "postgres"))]
+            return Err(
+                "--store names a PostgreSQL database and this build cannot open one. \
+                 Reinstall with `--features cli,postgres`, or use the `:full` container \
+                 image, which is built with it"
+                    .to_owned(),
+            );
+            #[cfg(feature = "postgres")]
+            return Self::shared(spec, tenant).await;
+        }
+        let store = RedbStore::open(spec).map_err(|e| held_by_a_plane(&e.to_string()))?;
+        let tenant = tenant.unwrap_or_default();
+        Ok(Self::Embedded(
+            Arc::new(store.for_tenant(tenant.clone())),
+            tenant,
+        ))
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn shared(url: &str, tenant: Option<agentplane::core::TenantId>) -> Result<Self, String> {
+        let store = agentplane::store::PostgresStore::connect(url)
+            .await
+            .map_err(|e| e.to_string())?;
+        let tenant = tenant.unwrap_or_default();
+        Ok(Self::Shared(
+            Arc::new(store.for_tenant(tenant.clone())),
+            tenant,
+        ))
+    }
+
+    /// The six stores a plane runs on.
+    fn stores(&self) -> agentplane::runtime::Stores {
+        match self {
+            Self::Embedded(s, _) => agentplane::runtime::Stores::on(Arc::clone(s)),
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => agentplane::runtime::Stores::on(Arc::clone(s)),
+        }
+    }
+
+    fn journal(&self) -> Arc<dyn JournalStore> {
+        match self {
+            Self::Embedded(s, _) => Arc::clone(s) as _,
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => Arc::clone(s) as _,
+        }
+    }
+
+    fn cases(&self) -> Arc<dyn agentplane::case::CaseStore> {
+        match self {
+            Self::Embedded(s, _) => Arc::clone(s) as _,
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => Arc::clone(s) as _,
+        }
+    }
+
+    fn quotas(&self) -> Arc<dyn agentplane::quota::QuotaStore> {
+        match self {
+            Self::Embedded(s, _) => Arc::clone(s) as _,
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => Arc::clone(s) as _,
+        }
+    }
+
+    #[cfg(feature = "push")]
+    fn push(&self) -> Arc<dyn agentplane::push::PushStore> {
+        match self {
+            Self::Embedded(s, _) => Arc::clone(s) as _,
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => Arc::clone(s) as _,
+        }
+    }
+
+    /// Whose plane this store was opened as.
+    ///
+    /// The store is scoped by `for_tenant` and the runtime carries a tenant of
+    /// its own, and **they are two halves of one decision**: a plane running as
+    /// the default against a store scoped to `acme` writes runs into one
+    /// keyspace while naming the other in every policy request and every
+    /// erasure. `try_build` refuses that, which is how this was found — so the
+    /// tenant travels with the backend rather than being passed twice.
+    fn tenant(&self) -> agentplane::core::TenantId {
+        match self {
+            Self::Embedded(_, t) => t.clone(),
+            #[cfg(feature = "postgres")]
+            Self::Shared(_, t) => t.clone(),
+        }
+    }
+
+    /// What this is, for a message an operator reads.
+    #[cfg(all(feature = "a2a-server", feature = "cedar"))]
+    const fn describe(&self) -> &'static str {
+        match self {
+            Self::Embedded(..) => "embedded redb file",
+            #[cfg(feature = "postgres")]
+            Self::Shared(..) => "shared PostgreSQL store",
+        }
+    }
+}
+
+/// Say what a locked embedded store means, in the words of the situation.
+///
+/// redb admits one writer **process**, so the ordinary way to meet this is to
+/// run an operator verb against the file a `serve` is holding — which is to say,
+/// during an incident, which is when the message matters most. *Database already
+/// open* is true and tells nobody what to do about it.
+fn held_by_a_plane(detail: &str) -> String {
+    if !detail.contains("already open") {
+        return detail.to_owned();
+    }
+    format!(
+        "{detail}\n\nAn embedded redb store admits one writer process, and something \
+         else is holding this one — most likely `agentplane serve`. Either stop that \
+         process and run this again, or put the plane on a shared store \
+         (`--store postgres://…`), where an operator verb and a serving plane \
+         coexist. To act on a *running* embedded plane meanwhile, the operator API \
+         is the surface that reaches it."
+    )
+}
+
+/// Whether `--store` names a database rather than a file.
+///
+/// The two schemes `libpq` accepts, and nothing else. A prefix test rather than
+/// a URL parse because the alternative treats every path containing `://` as a
+/// connection string and every malformed URL as a filename.
+fn is_connection_string(spec: &str) -> bool {
+    spec.starts_with("postgres://") || spec.starts_with("postgresql://")
 }
 
 /// Read and validate the manifests, for every verb.
@@ -1511,9 +1698,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 .build()
                 .map_err(|e| format!("could not start the async runtime: {e}"))?;
             rt.block_on(async {
-                let redb = Arc::new(RedbStore::open(&a.store).map_err(|e| e.to_string())?);
-                let store: Arc<dyn JournalStore> = redb.clone();
-                let cases: Arc<dyn agentplane::case::CaseStore> = redb;
+                let backend = a.at.open().await?;
+                let store = backend.journal();
+                let cases = backend.cases();
                 let file =
                     std::fs::File::open(&a.file).map_err(|e| format!("reading {}: {e}", a.file))?;
                 let report = agentplane::export::from_jsonl(
@@ -1828,21 +2015,19 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         // A journal in memory would make every served task disappear on
         // restart, which is the opposite of what a peer promises when it hands
         // back a task id. Refused rather than defaulted.
-        let path = opts.store.as_deref().ok_or(
+        let backend = opts.at.open().await?.ok_or(
             "`serve` needs --store: a served task's id is a promise that it can be \
              fetched again, and an in-memory journal breaks that promise at the next \
              restart. `run` may journal to memory because it exits with its answer",
         )?;
-        let store = Arc::new(RedbStore::open(path).map_err(|e| e.to_string())?);
 
-        // **The whole plane, not a corner of it.** One redb file backs every
-        // store this runtime has, and a server that wired only the journal and
-        // the case layer would accept an agent that waits, sleeps or opens a
-        // human task and then never make progress on any of them — a suspended
-        // run is a row, and something has to come back for it. `builder_on`
-        // wires all six stores to the file in one call.
+        // **The whole plane, not a corner of it.** One store backs every store
+        // this runtime has, and a server that wired only the journal and the
+        // case layer would accept an agent that waits, sleeps or opens a human
+        // task and then never make progress on any of them — a suspended run is
+        // a row, and something has to come back for it.
         let mut builder = with_providers(
-            Runtime::builder_on(Arc::clone(&store)),
+            Runtime::builder_with(backend.stores()).tenant(backend.tenant()),
             std::slice::from_ref(manifest),
         )
         .await?;
@@ -1862,7 +2047,7 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         // backlog, and the operator surface is where a backlog is answered —
         // the delivery worker that parked one has nothing more to say about it.
         if !opts.push_host.is_empty() {
-            builder = builder.push(Arc::clone(&store) as Arc<dyn agentplane::push::PushStore>);
+            builder = builder.push(backend.push());
         }
         let runtime = builder.try_build().map_err(|e| e.to_string())?;
 
@@ -1870,8 +2055,17 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         let mut server = A2aServer::new(Arc::clone(&runtime), auth, &security, manifest, url)
             .map_err(|e| e.to_string())?;
 
-        server = wire_push(server, &opts.push_host, &store)?;
-        serve_until_stopped(&runtime, server, operator_auth, opts, manifest, url).await?;
+        server = wire_push(server, &opts.push_host, &backend)?;
+        serve_until_stopped(
+            &runtime,
+            server,
+            operator_auth,
+            opts,
+            manifest,
+            url,
+            &backend,
+        )
+        .await?;
         Ok(ExitCode::SUCCESS)
     })
 }
@@ -1889,6 +2083,7 @@ async fn serve_until_stopped(
     opts: &ServeArgs,
     manifest: &Manifest,
     url: &str,
+    backend: &Backend,
 ) -> Result<(), String> {
     let addr = opts.addr.as_str();
     // One signal, every listener. Raised by the signal watcher below, and
@@ -1931,6 +2126,11 @@ async fn serve_until_stopped(
         manifest.metadata.name, manifest.metadata.version
     );
     eprintln!("  card: {url}/.well-known/agent-card.json");
+    // Which backend, never the connection string: a `postgres://` URL carries a
+    // password, and a startup banner is the most-copied text a deployment has.
+    // It matters to an operator because it decides whether the CLI verbs work
+    // beside this process or only after it stops.
+    eprintln!("  store: {}", backend.describe());
     eprintln!("  stop: SIGTERM drains for up to {}s", opts.drain_secs);
 
     let mut peer = tokio::spawn(async move {
@@ -2551,7 +2751,7 @@ async fn connect_mcp_servers(
 fn wire_push(
     server: agentplane::api::a2a::A2aServer,
     hosts: &[String],
-    store: &Arc<RedbStore>,
+    backend: &Backend,
 ) -> Result<agentplane::api::a2a::A2aServer, String> {
     if hosts.is_empty() {
         return Ok(server);
@@ -2563,7 +2763,7 @@ fn wire_push(
         });
     let server = server
         .with_push(
-            Arc::clone(store) as Arc<dyn agentplane::push::PushStore>,
+            backend.push(),
             Arc::new(agentplane::push::PushSender::new(policy))
                 as Arc<dyn agentplane::push::PushTransport>,
         )
@@ -2686,16 +2886,24 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let store: Arc<dyn JournalStore> = if let Some(path) = &opts.store {
-            Arc::new(RedbStore::open(path).map_err(|e| e.to_string())?)
+        // **The whole plane, not the journal alone**, as `serve` wires it: a
+        // declaration naming memory or a wait is not a different declaration
+        // because of which verb reached it.
+        let (stores, tenant) = if let Some(backend) = opts.at.open().await? {
+            (backend.stores(), backend.tenant())
         } else {
             // Said out loud rather than assumed: a run whose journal disappears
             // is the opposite of what this crate is for.
             eprintln!("note: journaling to memory; this run will not survive the process");
-            Arc::new(RedbStore::open_in_memory().map_err(|e| e.to_string())?)
+            (
+                agentplane::runtime::Stores::on(Arc::new(
+                    RedbStore::open_in_memory().map_err(|e| e.to_string())?,
+                )),
+                agentplane::core::TenantId::default(),
+            )
         };
-
-        let mut builder = with_providers(Runtime::builder(Arc::clone(&store)), manifests).await?;
+        let mut builder =
+            with_providers(Runtime::builder_with(stores).tenant(tenant), manifests).await?;
         for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
@@ -2744,9 +2952,12 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, String>
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let store = Arc::new(RedbStore::open(&opts.store).map_err(|e| e.to_string())?);
-        let mut builder =
-            with_providers(Runtime::builder_on(Arc::clone(&store)), manifests).await?;
+        let backend = opts.at.open().await?;
+        let mut builder = with_providers(
+            Runtime::builder_with(backend.stores()).tenant(backend.tenant()),
+            manifests,
+        )
+        .await?;
         for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }

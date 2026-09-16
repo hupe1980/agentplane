@@ -86,7 +86,7 @@ impl InFlight {
     /// that stayed registered after its task died would make every later drain
     /// wait out its whole grace period for a task nobody is running.
     pub(crate) fn enter(self: &std::sync::Arc<Self>, run: RunId) -> Ticket {
-        self.running.lock().expect("in-flight runs").insert(run);
+        crate::core::poison::recover(&self.running).insert(run);
         Ticket {
             inflight: std::sync::Arc::clone(self),
             run,
@@ -95,7 +95,7 @@ impl InFlight {
 
     fn leave(&self, run: RunId) {
         let empty = {
-            let mut running = self.running.lock().expect("in-flight runs");
+            let mut running = crate::core::poison::recover(&self.running);
             running.remove(&run);
             running.is_empty()
         };
@@ -105,9 +105,7 @@ impl InFlight {
     }
 
     fn snapshot(&self) -> Vec<RunId> {
-        self.running
-            .lock()
-            .expect("in-flight runs")
+        crate::core::poison::recover(&self.running)
             .iter()
             .copied()
             .collect()
@@ -125,7 +123,7 @@ impl InFlight {
             let waiter = self.idle.notified();
             tokio::pin!(waiter);
             waiter.as_mut().enable();
-            if self.running.lock().expect("in-flight runs").is_empty() {
+            if crate::core::poison::recover(&self.running).is_empty() {
                 break;
             }
             tokio::select! {

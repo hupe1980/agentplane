@@ -76,8 +76,10 @@ cargo run --example answered_doubt     # a call nobody can account for: a person
                                         # supplies the fact, the runtime keeps the
                                         # verdict, and giving up leaves a finding
 cargo run --example operator_stop      # cancel a run and it unwinds; halt a
-                                        # tenant, an agent or one revision, and
-                                        # nothing new starts
+                                        # tenant, an agent or one revision and
+                                        # nothing new starts; withdraw a
+                                        # credential and the runs acting for it
+                                        # pause, work intact, until you lift it
 cargo run --example observability      # the last mile: latency without replays,
                                         # gauges from the census, one alert
                                         # predicate — and the OTLP wiring
@@ -217,6 +219,10 @@ agentplane serve examples/served.yaml \
   --store ./served.redb
 ```
 
+`--store` takes a redb file or a `postgres://` connection string, and `--tenant`
+says whose plane — one flag apart, because on the shared store several instances
+coexist and so do an operator's verbs and a serving process.
+
 Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too, on
 its **own** listener, off unless asked for, and separated from the peer surface
 by *policy* (`peer` reaches `a2a:*`, `operator` reaches `api:*`) rather than by
@@ -227,8 +233,13 @@ no actor field to spoof. It serves the worklist and task
 decisions, plus the backlogs an on-call person asks for by question rather than
 by id: what is quarantined, what is
 escalated, which obligations were missed, which messages reached nobody, which
-webhook receivers stopped accepting
+webhook receivers stopped accepting, **what is executing right now** and **what
+is stopped**
 ([the full table](https://hupe1980.github.io/agentplane/docs/operations/#what-the-endpoints-are-for)).
+
+`GET /runs/live` carries the agent, the revision and the delegation subject
+beside each id, because an incident is rarely *cancel this run* but a bad deploy
+or a credential somebody has just withdrawn.
 
 Every backlog that is *work* has a verb that empties it, including
 [the hard one](https://hupe1980.github.io/agentplane/docs/operations/#answering-a-quarantine)

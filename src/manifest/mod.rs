@@ -2769,14 +2769,7 @@ impl Manifest {
             // reads as a declared contract while promising nothing.
             serde_json::Value::Object(_) => Err(ManifestError::Empty(field)),
             other => Err(ManifestError::NotASchema {
-                found: match other {
-                    serde_json::Value::Null => "null",
-                    serde_json::Value::Bool(_) => "a boolean",
-                    serde_json::Value::Number(_) => "a number",
-                    serde_json::Value::String(_) => "a string",
-                    serde_json::Value::Array(_) => "an array",
-                    serde_json::Value::Object(_) => unreachable!(),
-                },
+                found: crate::core::canon::json_kind(other),
             }),
         }
     }

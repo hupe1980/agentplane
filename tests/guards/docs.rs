@@ -2951,6 +2951,70 @@ fn the_changelog_top_entry_is_this_version_and_released_ones_are_dated() {
 ///
 /// `upgrading.md` is exempt. Showing the old spelling beside the new one is
 /// that page's whole content.
+/// One `clap::Args` struct's long flags, including the renamed ones and **the
+/// ones it flattens**.
+///
+/// A `#[command(flatten)]` field contributes the flags of the struct it names
+/// and no flag of its own, which is what clap does. Modelling it as a flag named
+/// after the field would report every page documenting `--store` as wrong the
+/// day a shared `StoreRef` replaced nine hand-written copies of it — and the
+/// cheapest way to silence that is to delete the flatten, which fixes nothing.
+///
+/// Lives beside the test rather than inside it because the recursion needs a
+/// name, and because the test was over its line budget with it nested.
+fn flags_of(cli: &str, ty: &str, depth: usize) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    // Args structs do not nest deeply; the bound means a cycle in the source
+    // cannot hang the suite.
+    if depth > 4 {
+        return out;
+    }
+    let Some(at) = cli.find(&format!("struct {ty} {{")) else {
+        return out;
+    };
+    let body = &cli[at..];
+    let end = body.find("\n}").map_or(body.len(), |e| e + 2);
+    let body = &body[..end];
+    let mut renamed = None;
+    let mut flattening = false;
+    for line in body.lines().map(str::trim) {
+        if line.starts_with("#[command(flatten)]") {
+            flattening = true;
+            continue;
+        }
+        if line.starts_with("#[arg(") {
+            renamed = line
+                .split("long = \"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .map(str::to_owned);
+            if line.contains("long") {
+                continue;
+            }
+        }
+        if let Some((field, rest)) = line.split_once(':')
+            && !field.starts_with("//")
+            && !field.starts_with('#')
+            && field.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !field.is_empty()
+        {
+            if flattening {
+                flattening = false;
+                out.extend(flags_of(
+                    cli,
+                    rest.trim().trim_end_matches(',').trim(),
+                    depth + 1,
+                ));
+                continue;
+            }
+            let name = renamed.take().unwrap_or_else(|| kebab_field(field));
+            out.insert(format!("--{name}"));
+        }
+    }
+    out.insert("--help".to_owned());
+    out
+}
+
 #[test]
 fn every_documented_command_line_uses_flags_the_cli_has() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2982,41 +3046,6 @@ fn every_documented_command_line_uses_flags_the_cli_has() {
         verb_args.len()
     );
 
-    // Each struct's long flags, including the renamed ones.
-    let flags_of = |ty: &str| -> std::collections::BTreeSet<String> {
-        let mut out = std::collections::BTreeSet::new();
-        let Some(at) = cli.find(&format!("struct {ty} {{")) else {
-            return out;
-        };
-        let body = &cli[at..];
-        let end = body.find("\n}").map_or(body.len(), |e| e + 2);
-        let body = &body[..end];
-        let mut renamed = None;
-        for line in body.lines().map(str::trim) {
-            if line.starts_with("#[arg(") {
-                renamed = line
-                    .split("long = \"")
-                    .nth(1)
-                    .and_then(|r| r.split('"').next())
-                    .map(str::to_owned);
-                if line.contains("long") {
-                    continue;
-                }
-            }
-            if let Some((field, _)) = line.split_once(':')
-                && !field.starts_with("//")
-                && !field.starts_with('#')
-                && field.chars().all(|c| c.is_alphanumeric() || c == '_')
-                && !field.is_empty()
-            {
-                let name = renamed.take().unwrap_or_else(|| kebab_field(field));
-                out.insert(format!("--{name}"));
-            }
-        }
-        out.insert("--help".to_owned());
-        out
-    };
-
     let mut pages: Vec<std::path::PathBuf> = walk(&root.join("site/content/docs"))
         .into_iter()
         .filter(|p| p.extension().is_some_and(|e| e == "md") && !p.ends_with("upgrading.md"))
@@ -3040,7 +3069,7 @@ fn every_documented_command_line_uses_flags_the_cli_has() {
             let Some(ty) = verb_args.get(verb) else {
                 continue; // prose, or a verb that takes no flags
             };
-            let have = flags_of(ty);
+            let have = flags_of(&cli, ty, 0);
             // Inline `# …` annotations are documentation, not arguments.
             let args: String = rest.split('`').step_by(2).collect::<Vec<_>>().join(" ");
             for word in args.split_whitespace() {

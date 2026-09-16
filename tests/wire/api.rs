@@ -777,6 +777,19 @@ fn hold_routes(actor: Option<&str>) -> Vec<Request<Body>> {
     ]
 }
 
+/// The emergency-stop routes.
+fn halt_routes(actor: Option<&str>) -> Vec<Request<Body>> {
+    vec![
+        get("/halts", actor),
+        post(
+            "/halts",
+            actor,
+            &json!({ "scope": "tenant", "reason": "incident 42" }),
+        ),
+        post("/halts/lift", actor, &json!({ "scope": "tenant" })),
+    ]
+}
+
 /// No credentials, no answer — on every route.
 #[tokio::test]
 async fn an_unauthenticated_request_is_refused_everywhere() {
@@ -786,6 +799,7 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
 
     let mut requests = vec![
         get("/runs?outcome=quarantined", None),
+        get("/runs/live", None),
         get("/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV", None),
         post(
             "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/cancel",
@@ -834,6 +848,7 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
         ),
     ];
     requests.extend(hold_routes(None));
+    requests.extend(halt_routes(None));
     requests.extend(push_routes(None));
     for req in requests {
         let uri = req.uri().to_string();
@@ -920,6 +935,7 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         // hold by cancelling omissions, and a deployment enumerating `ALL` then
         // never writes a rule for it.
         get("/runs", Some("bob")),
+        get("/runs/live", Some("bob")),
         get("/cases", Some("bob")),
         get("/obligations", Some("bob")),
         post(
@@ -930,6 +946,7 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         get("/dead-letters", Some("bob")),
     ];
     requests.extend(hold_routes(Some("bob")));
+    requests.extend(halt_routes(Some("bob")));
     requests.extend(push_routes(Some("bob")));
     for req in requests {
         let uri = req.uri().to_string();
@@ -2428,5 +2445,287 @@ async fn a_hold_is_placed_listed_with_its_reason_and_released() {
     assert!(
         body["holds"].as_array().is_some_and(Vec::is_empty),
         "a released hold is still in the register: {body}"
+    );
+}
+
+/// A router whose policy permits exactly one `api:` action.
+///
+/// So a refusal names the capability that was missing rather than the fixture's
+/// mood — which is what makes the two halt authorities testable at all.
+fn halt_router(store: &Arc<RedbStore>, policy: Arc<dyn PolicyEngine>) -> axum::Router {
+    use agentplane::quota::QuotaStore;
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .quota(
+            store.clone() as Arc<dyn QuotaStore>,
+            agentplane::quota::TenantQuota::default(),
+        )
+        .policy(policy)
+        .build();
+    Api::new(rt, Arc::new(HeaderAuth))
+        .expect("the fixture wires a policy engine")
+        .router()
+}
+
+/// Permits exactly one `api:` action and denies the rest.
+#[derive(Debug)]
+struct OnlyAllows(&'static str);
+
+impl PolicyEngine for OnlyAllows {
+    fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+        if request.action == self.0 || !request.action.starts_with("api:") {
+            PolicyDecision::Permit
+        } else {
+            PolicyDecision::deny(format!("this caller does not hold {}", request.action))
+        }
+    }
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(Digest::of(b"only-allows"), "agentplane-test/one-verb")
+    }
+}
+
+/// **The emergency stop, over the wire.**
+///
+/// The switch existed only against a *store*, and the embedded backend admits
+/// one writer process — so on a single-node plane it was unreachable from any
+/// process while the plane it stops was running, which is the one state it
+/// exists for.
+///
+/// The register has to round-trip *with its reason*: the person who finds a
+/// plane stopped is usually not the person who stopped it, and that sentence is
+/// the whole of what they have to act on.
+#[tokio::test]
+async fn a_halt_is_thrown_listed_with_its_reason_and_lifted() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let router = halt_router(
+        &store,
+        Arc::new(Recording::default()) as Arc<dyn PolicyEngine>,
+    );
+
+    // Throw it, and the response says what it does *not* stop — the sentence an
+    // operator would otherwise learn the shape of during the outage.
+    let (status, body) = send(
+        &router,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "agent:payments-clerk", "reason": "incident 42: looping" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["halted"], true);
+    assert!(
+        body["does_not_stop"]
+            .as_str()
+            .is_some_and(|s| s.contains("already executing")),
+        "the response does not say what a halt leaves running: {body}"
+    );
+
+    // A blank reason is refused rather than stored.
+    let (status, _) = send(
+        &router,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "tenant", "reason": "  " }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a blank reason was stored");
+
+    // A scope this build cannot read is refused, not silently written: a halt
+    // keyed on something nobody can look up stops work for no stated reason.
+    let (status, _) = send(
+        &router,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "everything", "reason": "typo" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unreadable scope was accepted"
+    );
+
+    let (status, body) = send(&router, get("/halts", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["halts"][0]["scope"], "agent:payments-clerk");
+    assert_eq!(
+        body["halts"][0]["reason"], "incident 42: looping",
+        "the listing does not say why the plane is stopped: {body}"
+    );
+
+    let (status, body) = send(
+        &router,
+        post(
+            "/halts/lift",
+            Some("bob"),
+            &json!({ "scope": "agent:payments-clerk" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["halted"], false);
+
+    let (_, body) = send(&router, get("/halts", Some("bob"))).await;
+    assert!(
+        body["halts"].as_array().is_some_and(Vec::is_empty),
+        "a lifted halt is still standing: {body}"
+    );
+}
+
+/// **Throwing the emergency stop and lifting it are different authorities.**
+///
+/// A deployment that hands out *stop the plane* has said nothing about who may
+/// start it again, and a single `api:halt` grant would have made that
+/// distinction unwritable. Both directions are asserted, because one of them is
+/// the dangerous one and a test of only the other passes on a merged grant.
+#[tokio::test]
+async fn throwing_a_halt_and_lifting_one_are_separate_authorities() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+
+    let lifter = halt_router(
+        &store,
+        Arc::new(OnlyAllows(agentplane::api::action::HALT_LIFT)),
+    );
+    let (status, _) = send(
+        &lifter,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "tenant", "reason": "not mine to throw" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a caller holding only the lift capability threw the switch"
+    );
+
+    let thrower = halt_router(
+        &store,
+        Arc::new(OnlyAllows(agentplane::api::action::HALT_PLACE)),
+    );
+    let (status, _) = send(
+        &thrower,
+        post("/halts/lift", Some("bob"), &json!({ "scope": "tenant" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a caller holding only the place capability lifted the switch"
+    );
+}
+
+/// **What is executing right now, over the wire.**
+///
+/// `GET /runs` answers from the journal's outcome index, which only *concluded*
+/// runs are in — so the operator surface could enumerate everything finished and
+/// nothing in flight, while `POST /runs/{run}/cancel` took an id that no listing
+/// produced. The store answered this question on both backends and was reached
+/// by nothing outside its own conformance battery.
+///
+/// The claim that would rot quietly is the second one: a slot whose lease has
+/// lapsed is **marked, not omitted**. Those belong to the recovery sweep, which
+/// resumes them — so an operator who cannot tell them from live work will cancel
+/// a run that was about to continue, which unwinds it. A listing that returned
+/// bare ids reads identically whether or not that distinction is made.
+#[tokio::test]
+async fn the_live_listing_attributes_each_run_and_marks_a_stranded_slot() {
+    use agentplane::quota::QuotaStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let quotas = store.clone() as Arc<dyn QuotaStore>;
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .quota(quotas.clone(), agentplane::quota::TenantQuota::default())
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .build();
+    let router = Api::new(rt, Arc::new(HeaderAuth))
+        .expect("the fixture wires a policy engine")
+        .router();
+
+    let at = agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap();
+    let held = agentplane::core::RunId::generate();
+    quotas.reserve(held, None, at).await.unwrap();
+
+    let (status, body) = send(&router, get("/runs/live", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let runs = body["runs"].as_array().expect("a listing");
+    assert_eq!(runs.len(), 1, "the held slot is not listed: {body}");
+    assert_eq!(runs[0]["run"], held.to_string());
+    assert_eq!(
+        runs[0]["stranded"], false,
+        "a slot with no lapsed lease was reported as stranded: {body}"
+    );
+    // Nothing journaled this run, so there is nothing to attribute it with —
+    // and the listing says so with `null` rather than inventing a name.
+    assert!(
+        runs[0]["agent"].is_null(),
+        "an unattributed run claimed an agent: {body}"
+    );
+
+    // ── A stranded slot is marked ────────────────────────────────────────
+    //
+    // A real lapsed lease rather than a stub: the flag is a join against
+    // `abandoned_runs`, and asserting only the `false` case above would pass on
+    // a field hard-coded to `false`. One second is the store's own granularity
+    // floor, so this is the shortest honest version of the wait.
+    let stranded = agentplane::core::RunId::generate();
+    quotas.reserve(stranded, None, at).await.unwrap();
+    (store.clone() as Arc<dyn JournalStore>)
+        .acquire(
+            stranded,
+            "an-instance-that-died",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+
+    let (_, body) = send(&router, get("/runs/live", Some("bob"))).await;
+    let rows = body["runs"].as_array().expect("a listing");
+    let stranded_row = rows
+        .iter()
+        .find(|r| r["run"] == stranded.to_string())
+        .unwrap_or_else(|| panic!("the stranded slot is not listed at all: {body}"));
+    assert_eq!(
+        stranded_row["stranded"], true,
+        "a slot held by a run whose lease lapsed reads as live work, so an \
+         operator cancels what the recovery sweep was about to resume: {body}"
+    );
+    let live_row = rows
+        .iter()
+        .find(|r| r["run"] == held.to_string())
+        .unwrap_or_else(|| panic!("the live slot vanished: {body}"));
+    assert_eq!(
+        live_row["stranded"], false,
+        "every slot was marked stranded, so the flag distinguishes nothing: {body}"
+    );
+
+    // ── Narrowing by authority ───────────────────────────────────────────
+    //
+    // The query that turns *withdraw a credential* into *and here is what is
+    // still acting under it*. Neither slot here was journaled, so neither has a
+    // subject — which is the case that must return nothing rather than
+    // everything, since a filter that falls back to the unfiltered listing is
+    // how an operator concludes a withdrawal reached work it did not.
+    let (_, body) = send(&router, get("/runs/live?subject=alice", Some("bob"))).await;
+    assert!(
+        body["runs"].as_array().is_some_and(Vec::is_empty),
+        "an unattributed run matched a subject filter: {body}"
+    );
+
+    // The slot is given back at settlement, and the listing empties with it.
+    quotas.release(held).await.unwrap();
+    quotas.release(stranded).await.unwrap();
+    let (_, body) = send(&router, get("/runs/live", Some("bob"))).await;
+    assert!(
+        body["runs"].as_array().is_some_and(Vec::is_empty),
+        "a released slot is still listed as running: {body}"
     );
 }

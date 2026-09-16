@@ -99,8 +99,8 @@ fn plane() -> Arc<Runtime> {
 struct Caller;
 
 impl rmcp::ClientHandler for Caller {
-    fn get_info(&self) -> rmcp::model::ClientInfo {
-        let mut info = rmcp::model::ClientInfo::default();
+    fn get_info(&self) -> rmcp::model::ClientConfig {
+        let mut info = rmcp::model::ClientConfig::default();
         info.protocol_version = ProtocolVersion::V_2026_07_28;
         // A client that does not declare tasks is one the server may not hand a
         // task handle to, so a caller of a plane whose agents suspend declares

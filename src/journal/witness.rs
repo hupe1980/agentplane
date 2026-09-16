@@ -504,15 +504,9 @@ impl MemoryWitness {
     }
 
     /// The last checkpoint this witness accepted for a log.
-    ///
-    /// # Panics
-    ///
-    /// If a previous caller panicked while holding the lock.
     #[must_use]
     pub fn last_seen(&self, origin: &str) -> Option<(u64, Digest)> {
-        self.seen
-            .lock()
-            .expect("witness mutex")
+        crate::core::poison::recover(&self.seen)
             .get(origin)
             .copied()
     }

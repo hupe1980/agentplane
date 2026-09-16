@@ -35,8 +35,9 @@ pub(crate) use executor::every_status;
 /// copy that disagrees the day a record kind arrives.
 pub(crate) use executor::observed_status;
 pub use executor::{
-    Admission, FullBackend, LEASE_TTL, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, OUTCOMES_OF_RECORD,
-    RunFailure, RunOutcome, RunStatus, RunTerms, Runtime, RuntimeBuilder, SEALED_OUTCOMES, Spawned,
+    Admission, FullBackend, LEASE_TTL, LiveRun, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL,
+    OUTCOMES_OF_RECORD, RunFailure, RunOutcome, RunStatus, RunTerms, Runtime, RuntimeBuilder,
+    SEALED_OUTCOMES, Spawned, Stores,
 };
 pub use group::{EffectGroup, Invariant};
 

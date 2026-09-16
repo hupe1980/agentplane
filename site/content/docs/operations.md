@@ -356,7 +356,8 @@ races — and it means ~115 effects/sec is the *whole plane's* durable write
 budget on this hardware, not one run's. A single-node plane running agents that
 call models will never notice. A plane running many concurrent runs of cheap
 effects will, and that is the signal to move to `PostgreSQL`, which is also the
-answer for more than one instance.
+answer for more than one instance. It is a flag, not a rewrite: every verb takes
+`--store postgres://…` beside `--tenant`, including `serve`.
 
 **Replay is not the same cost, by a wide margin.** It performs nothing and reads
 history back — 1000× faster on disk. That matters more than it looks: a
@@ -561,10 +562,10 @@ listing is not where it is handed back. `POST /push/rearm` answers
 never there — rather than reporting success to somebody who would then wait for
 a sweep with nothing to do.
 
-**Grant the read verbs explicitly.** `api:run.list`, `api:case.list`,
-`api:obligation.list`, `api:deadletter.list` and `api:push.list` are what an
-on-call person needs, plus `api:obligation.acknowledge` for whoever answers a
-breach — separate from reading the list, because the party allowed to see what a
+**Grant the read verbs explicitly.** `api:run.list`, `api:run.live`,
+`api:case.list`, `api:obligation.list`, `api:deadletter.list`, `api:push.list`
+and `api:halt.list` are what an on-call person needs, plus
+`api:obligation.acknowledge` for whoever answers a breach — separate from reading the list, because the party allowed to see what a
 deployment missed is not automatically the party allowed to declare it
 answered. An allowlist built
 from route names alone will miss them; under a default-deny engine an ungranted
@@ -573,7 +574,9 @@ writing rules rather than reading the route table. `api:obligation.list` is
 separate from `api:case.list` so a compliance function can be given *what did we
 miss* without the contents of every matter, and `api:task.takeover` is separate
 from `api:task.claim` so displacing an absent colleague can go to a queue lead
-without going to every reviewer.
+without going to every reviewer. `api:run.live` is separate from `api:run.list`
+on the same principle: one enumerates what has finished, the other is a live map
+of what a tenant is doing right now.
 
 ### Answering a quarantine {#answering-a-quarantine}
 
@@ -1633,11 +1636,67 @@ all 28 or ship a policy change; neither is an emergency stop.
 | `HaltScope::Tenant` | everything this tenant would start | the plane is the incident |
 | `HaltScope::agent("payments-clerk")` | every revision of one declared name | *this agent is misbehaving and I do not yet know since when* |
 | `HaltScope::revision(digest)` | one exact reviewed revision | a bad deploy — a fix published as a new version runs while the broken one stays stopped |
+| `HaltScope::subject("alice")` | everything acting **for** one delegation subject, **including runs already in flight** | the incident is a *credential*, not a workload: a laptop lost, a service account that turned out to be shared, somebody who has left |
+
+The first three ask *what is running*; the last asks *who it runs for*. That
+subject is the chain the **run** was admitted under — on a served plane, the
+caller's, not the operator's — so withdrawing `alice` stops the work `alice`
+asked for and leaves everyone else's alone.
+
+**It is the only scope that reaches work already running, and it pauses.** A run
+under a withdrawn credential stops at its next step boundary as `withheld`; its
+completed work stands, and lifting the halt lets it continue. It is not unwound —
+reversing correct work because a credential lapsed is a second incident. To
+reverse it, cancel it.
+
+Both halves are journaled: `AuthorityWithheld` at the pause and
+`AuthorityRestored` at the lift, the second beside the first. A reader takes the
+last word.
 
 ```sh
 agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --reason "incident 42: looping"
 agentplane halts --store ./journal.redb          # what is stopped right now
 agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --lift
+```
+
+Those commands open the store, and `redb` admits one writer **process** — so
+against the file an `agentplane serve` is holding they fail, saying so in those
+words. Two ways round it, and both are ordinary rather than workarounds:
+
+```sh
+# 1. The operator API reaches a running plane, whichever backend is under it.
+curl -sX POST "$PLANE/halts" -H "authorization: Bearer $TOKEN" \
+     -d '{"scope":"agent:payments-clerk","reason":"incident 42: looping"}'
+curl -s "$PLANE/halts"  -H "authorization: Bearer $TOKEN"
+curl -sX POST "$PLANE/halts/lift" -H "authorization: Bearer $TOKEN" \
+     -d '{"scope":"agent:payments-clerk"}'
+
+# 2. On the shared store, the CLI and a serving plane coexist.
+agentplane halt --store "$DATABASE_URL" --tenant acme                 --scope 'agent:payments-clerk' --reason "incident 42"
+```
+
+Throwing the stop and lifting it are **separate capabilities** —
+`api:halt.place` and `api:halt.lift`. Granting somebody the power to stop the
+plane says nothing about who may start it again, and one grant covering both
+would make that distinction unwritable.
+
+**A halt closes the door; it does not empty the room.** Runs already executing
+carry on, deliberately: cutting them mid-saga leaves reversals unrun and turns
+one incident into two. To reach work in flight, cancel it — and
+`GET /runs/live` is the listing that tells you which, with the agent, the
+revision and the delegation subject beside each id. A slot marked `stranded`
+belongs to the recovery sweep, which resumes it; cancelling one unwinds work
+that was about to finish.
+
+Withdrawing a credential:
+
+```sh
+# Nothing new starts for alice, and what is running for her pauses.
+curl -sX POST "$PLANE/halts" -H "authorization: Bearer $TOKEN" \
+     -d '{"scope":"subject:alice","reason":"credential withdrawn: laptop lost"}'
+
+# What is paused or still finishing under it — cancel what you want unwound.
+curl -s "$PLANE/runs/live?subject=alice" -H "authorization: Bearer $TOKEN"
 ```
 
 **Scopes are independent rows, not one flag the last writer wins.** Halting the
@@ -1694,6 +1753,7 @@ whether a run id exists by comparing a `400` against a `404`.
 | Route | The question it answers |
 |---|---|
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
+| `GET /runs/live` | What is executing **right now**, and under whose authority? Each entry carries the agent, the revision and the delegation subject — because an incident is usually a bad deploy or a withdrawn credential, not a run id. `stranded` marks a slot whose lease lapsed: the recovery sweep's to resume, not yours to cancel |
 | `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end, and on whose decision? |
 | `GET /runs/{run}/history` | What did it actually *do*? The journal, record by record, from `?from=<seq>` |
 | `GET /tasks` | What is waiting for me? |
@@ -1712,6 +1772,9 @@ whether a run id exists by comparing a `400` against a `404`.
 | `POST /runs/{run}/abandon` | Nobody will ever establish what happened; close it where it stands |
 | `POST /events` | This message arrived; wake whoever wanted it |
 | `GET /dead-letters` | Which messages arrived and reached nobody — the keys they were filed under, so the mismatch is visible |
+| `GET /halts` | What is stopped right now, and why |
+| `POST /halts` | Stop work at this scope starting — the emergency stop, reachable while the plane it stops is running |
+| `POST /halts/lift` | Let it start again. A **separate** capability from throwing it |
 | `GET /push` | Which webhook receivers a delivery worker gave up on, and what they said last |
 | `POST /push/rearm` | That one is fixed — resume at the record it never acknowledged |
 
@@ -1996,12 +2059,19 @@ which makes RPO a property of whichever of these you rely on:
 |---|---|
 | `PostgreSQL` streaming replication with a synchronous standby | ~0 |
 | `PostgreSQL` WAL archiving / point-in-time recovery | the archive interval |
-| `agentplane export` on a schedule | the export interval |
+| `agentplane export` on a schedule, against a shared store | the export interval |
 | Embedded `redb` file snapshots | the snapshot interval |
 
 An export is **not** a substitute for the first two. It carries the journal and
 the case layer and nothing else, by design — see *what an operator
 re-establishes*, below.
+
+The export row names its backend because the condition is real: `redb` admits
+one writer process, so `agentplane export` cannot open a file `agentplane serve`
+is holding. On the embedded store the scheduled copy is a file snapshot and the
+export is what you take when the plane is stopped. On `postgres` the export runs
+beside the serving plane, so the interval is one you can actually schedule —
+`agentplane export --store "$DATABASE_URL" --tenant acme`.
 
 **RTO — how long until the plane serves again.** Four terms, and only the last
 grows with how much work was in flight:

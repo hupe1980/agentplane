@@ -293,6 +293,14 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
         // work stands, and raising the ceiling resumes it. Filing it under
         // `Failed` taught operators to re-run items whose work was intact.
         RunStatus::Exhausted(limit) => ItemOutcome::Exhausted(limit.to_string()),
+        // The same shape, from the other cause: the item's work stands and the
+        // remedy is an operator's, not a re-run. Reported as exhausted because
+        // that is what this coarse enum means by *paused, do not retry blindly*
+        // — and the reason names the withdrawn subject, so the two are told
+        // apart by whoever reads it.
+        RunStatus::Withheld { subject, reason } => {
+            ItemOutcome::Exhausted(format!("authority '{subject}' withdrawn: {reason}"))
+        }
         // An item somebody stopped did not settle, and the batch must not
         // report otherwise — but the reason names the person, so a partial
         // batch can be told apart from one that hit a wall.

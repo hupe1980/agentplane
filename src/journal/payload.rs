@@ -260,6 +260,16 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         | K::RunSuspended { reason: _ }
         | K::BudgetRefused { limit: _, used: _ }
         | K::BudgetReadmitted { limit: _ }
+        // A subject is an identifier an operator typed into a halt and a reason
+        // they wrote for the next person; neither is the run's data. Sealing
+        // them would put the *reason a run stopped* behind a key an erasure
+        // destroys, which is the one sentence somebody reading a withheld run
+        // two years later has to be able to read.
+        | K::AuthorityWithheld {
+            subject: _,
+            reason: _,
+        }
+        | K::AuthorityRestored { subject: _ }
         | K::IdentityBound { chain: _ }
         // The rule's own words, written by the operator who wrote the rule —
         // never the request. Naming a reason to a caller is what this crate

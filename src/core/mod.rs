@@ -24,6 +24,7 @@ mod identity;
 mod label;
 pub mod merkle;
 mod plan;
+pub(crate) mod poison;
 mod policy;
 mod retry;
 pub(crate) mod secret;

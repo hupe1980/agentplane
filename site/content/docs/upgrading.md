@@ -25,6 +25,95 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## Every CLI verb that opens a store takes `--tenant`, and `--store` takes a connection string
+
+**Affected:** anyone scripting `agentplane audit`, `export`, `drill`,
+`forget-admissions`, `restore`, `replay`, `run` or `serve`.
+
+Nothing breaks that was correct before: `--tenant` is optional and defaults to
+the unnamed single-tenant plane, which is what those verbs already assumed. What
+changes is that they can now be *wrong* on purpose rather than by omission.
+
+```sh
+# Before — the unnamed tenant, always, with no way to say otherwise
+agentplane export --store ./plane.redb
+
+# After — whose plane, said out loud; and a shared store is a flag
+agentplane export --store ./plane.redb --tenant acme
+agentplane export --store "$DATABASE_URL" --tenant acme
+```
+
+**Why.** Every key in both backends leads with the tenant, so a cross-tenant read
+is a *miss* rather than an error. Four verbs took `--tenant` and five did not,
+and `serve` could only ever be the unnamed tenant — so an operator who learnt the
+flag from `halt` and reached for `export` got a well-formed, empty artifact and
+exit zero, indistinguishable from a quiet plane's.
+
+**The shared store is the other half.** `--store postgres://…` works on every
+verb now, including `serve`. On `redb` a store admits one writer *process*, so
+`halt`, `audit`, `export`, `verify`, `retain` and `drill` cannot run beside a
+serving plane; on `postgres` they can. A build without the feature refuses a
+connection string by naming the feature rather than the path.
+
+**One thing to check if you run multi-tenant:** `--tenant` scopes the store *and*
+the runtime, and a mismatch is refused at build. If you were wiring a
+`PostgresStore::for_tenant(..)` by hand and setting no `RuntimeBuilder::tenant`,
+that configuration was already wrong and now says so.
+
+---
+
+## `agentplane run --store` wires the whole plane
+
+**Affected:** anyone whose manifest declares `spec.memory`, a wait or a human
+task and who ran it with `agentplane run`.
+
+It used to wire only the journal, so the same document built under `serve` and
+was refused under `run`. Now both wire all six stores. Nothing to change; a
+manifest that was refused should now run.
+
+---
+
+## A halt can name a delegation subject
+
+**Affected:** anyone matching on `HaltScope` exhaustively, or storing scope keys.
+
+`HaltScope` gained a fourth variant, `Subject { id }`, keyed `subject:<id>`. A
+`match` over the enum without a `_` arm stops compiling — which is the intended
+way to find out, because the new variant is the one that reaches a different
+population than the other three.
+
+```rust
+// The three existing scopes ask what is running.
+rt.set_halt(&HaltScope::agent("payments-clerk"), Some("incident 42")).await?;
+
+// This one asks who it runs for.
+rt.set_halt(&HaltScope::subject("alice"), Some("credential withdrawn")).await?;
+```
+
+`HaltScope::covers` also takes the delegation subject now, beside the agent
+identity. A caller passing only the agent would silently never match a
+withdrawn authority, which is a refusal that does not happen — so the signature
+changed rather than gaining a default.
+
+**`RunStatus` gained `Withheld { subject, reason }`**, which is the other
+exhaustive match that stops compiling. It is a **pause**: resumable like `failed`
+and `exhausted`, and it does not seal. A run under a withdrawn credential stops
+at its next step boundary, its completed work stands, and lifting the halt lets
+it continue. If you map `RunStatus` onto your own wire type, this is the variant
+to think about — reporting it as a failure tells an operator to re-run work that
+is intact.
+
+**Two record kinds arrived with it**, `AuthorityWithheld` and
+`AuthorityRestored`. If you read the journal yourself: the second supersedes the
+first, exactly as `BudgetReadmitted` supersedes `BudgetRefused`. Take the last
+word. A reader that treats the withholding as final reports a run as stopped
+whose own later records show it finishing.
+
+`GET /runs/live?subject=alice` is still worth calling after a withdrawal —
+pausing is not always what you want, and some of those runs you will cancel.
+
+---
+
 ## External media retention scopes are namespaced `media/<policy>`
 
 **Affected:** deployments using `MediaPolicy::external_retention(..)` with a key
@@ -1074,9 +1163,10 @@ rt.set_halt(&HaltScope::agent("payments-clerk"), Some("incident 42")).await?;
 let standing: Vec<Halt> = rt.halts().await?;
 ```
 
-`halted()` is replaced by `halts()`, which returns every standing stop —
-`HaltScope::Tenant`, `Agent` by `metadata.name`, or `Revision` by manifest
-digest. Scopes are **independent rows**: `quota_halted` is keyed
+`halted()` is replaced by `halts()`, which returns every standing stop. The
+scopes at that version were `HaltScope::Tenant`, `Agent` by `metadata.name` and
+`Revision` by manifest digest; `Subject` arrived later and has its own entry
+above. Scopes are **independent rows**: `quota_halted` is keyed
 `(tenant, scope)` on both backends, so lifting a narrow stop leaves a broader
 one standing. Recreate the table; no migration is provided. A store that reads
 back a scope it cannot parse must report `StoreError::Corrupt` rather than skip

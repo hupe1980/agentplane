@@ -366,6 +366,38 @@ pub struct ReleaseHoldRequest {
     pub case: String,
 }
 
+/// Throwing the emergency stop.
+///
+/// The scope is the *durable key* — `tenant`, `agent:<name>`,
+/// `revision:<digest>` — rather than a tagged union, because that spelling is
+/// the one an operator already types on the command line and the one the store
+/// keeps. Two spellings of one scope is two ways for a lift to miss the halt it
+/// meant to clear.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceHaltRequest {
+    /// What to stop.
+    pub scope: String,
+    /// Why, for whoever looks next.
+    ///
+    /// Required, and required here for the reason it is required on the command
+    /// line: the person who finds a plane stopped is usually not the person who
+    /// stopped it.
+    pub reason: String,
+}
+
+/// Lifting it.
+///
+/// No reason field, deliberately. A halt is the state somebody has to justify;
+/// lifting one restores the default, and demanding a sentence for *returning to
+/// normal* is how a control acquires the reputation that gets it routed around.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiftHaltRequest {
+    /// Which halt to clear.
+    pub scope: String,
+}
+
 /// What a decision looks like on the wire.
 ///
 /// Note what is absent: **no actor, no roles**. Both come from the
@@ -849,6 +881,7 @@ impl Api {
     pub fn router(self) -> Router {
         let router = Router::new()
             .route("/runs", get(runs_by_outcome))
+            .route("/runs/live", get(live_runs))
             .route("/runs/{run}", get(run_view))
             .route("/runs/{run}/history", get(run_history))
             .route("/runs/{run}/cancel", post(cancel_run))
@@ -867,6 +900,8 @@ impl Api {
             .route("/cases/{case}", get(case_view))
             .route("/holds", get(standing_holds).post(place_hold))
             .route("/holds/release", post(release_hold))
+            .route("/halts", get(standing_halts).post(place_halt))
+            .route("/halts/lift", post(lift_halt))
             .route("/events", post(deliver))
             .route("/dead-letters", get(dead_letters));
         #[cfg(feature = "push")]
@@ -951,6 +986,17 @@ pub mod action {
     /// said nothing about the second.
     pub const RUN_HISTORY: &str = "api:run.history";
     pub const RUN_LIST: &str = "api:run.list";
+    /// Reading which runs are executing **right now**.
+    ///
+    /// Its own verb rather than a widened [`RUN_LIST`], and the reason is that
+    /// the two answer from different places about different things.
+    /// [`RUN_LIST`] reads the journal's outcome index, so it answers only for
+    /// runs that have *concluded*; this reads the tenant's admission slots, so
+    /// it answers only for runs that have not. A deployment that granted an
+    /// on-call rota the ability to see finished work has said nothing about
+    /// whether they may enumerate what is in flight, which on a busy plane is a
+    /// far better map of what a tenant is doing.
+    pub const RUN_LIVE: &str = "api:run.live";
     pub const RUN_CANCEL: &str = "api:run.cancel";
     /// Handing a quarantined run back to be judged again.
     ///
@@ -1012,6 +1058,25 @@ pub mod action {
     /// single grant would hand the power to authorise destruction to everybody
     /// who can prevent it.
     pub const HOLD_RELEASE: &str = "api:hold.release";
+    /// Reading what is stopped right now.
+    ///
+    /// The emergency stop reached this surface late and for a reason worth
+    /// keeping: its verbs existed only against a *store*, and the embedded
+    /// backend admits one writer process — so the switch was unreachable from
+    /// any process while the plane it stops was running, which is the only
+    /// state it exists for. Legal holds had taken routes on the argument that a
+    /// control exercised the moment somebody asks belongs where the asking
+    /// happens. The emergency stop makes that argument more strongly.
+    pub const HALT_LIST: &str = "api:halt.list";
+    /// Throwing it.
+    pub const HALT_PLACE: &str = "api:halt.place";
+    /// Lifting it.
+    ///
+    /// **Never folded into throwing**, for the reason
+    /// [`HOLD_RELEASE`] is not folded into [`HOLD_PLACE`]: one of the pair
+    /// stops work and the other lets it start again, and a deployment handing
+    /// out *stop the plane* has said nothing about who may start it.
+    pub const HALT_LIFT: &str = "api:halt.lift";
     pub const EVENT_DELIVER: &str = "api:event.deliver";
     /// Reading the messages that arrived and reached nobody.
     ///
@@ -1045,6 +1110,7 @@ pub mod action {
         RUN_READ,
         RUN_HISTORY,
         RUN_LIST,
+        RUN_LIVE,
         RUN_CANCEL,
         RUN_REOPEN,
         RUN_ABANDON,
@@ -1062,6 +1128,9 @@ pub mod action {
         HOLD_LIST,
         HOLD_PLACE,
         HOLD_RELEASE,
+        HALT_LIST,
+        HALT_PLACE,
+        HALT_LIFT,
         EVENT_DELIVER,
         DEADLETTER_LIST,
         #[cfg(feature = "push")]
@@ -1519,6 +1588,66 @@ async fn runs_by_outcome(
         "runs": found.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "truncated": truncated,
     })))
+}
+
+/// What is executing right now, and under whose authority.
+///
+/// The listing that makes `POST /runs/{run}/cancel` usable: `GET /runs` answers
+/// from the journal's outcome index, which only *concluded* runs are in.
+///
+/// Each entry carries what a responder keys on — the declared agent and
+/// revision, and the delegation subject the run was admitted under — because an
+/// incident is rarely *cancel this run* but a revoked credential or a bad
+/// deploy. `stranded` marks a lapsed lease: the recovery sweep's to resume, not
+/// an operator's to cancel.
+async fn live_runs(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Query(q): Query<LiveQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::RUN_LIVE, "*").await?;
+    let mut found = s
+        .plane
+        .running_runs(api.limit.saturating_add(1))
+        .await
+        .map_err(|_| store_failed())?;
+    // **Filtered after the page, and the page is the bound.** `?subject=` is
+    // what turns *withdraw an authority* into *and here is what is still acting
+    // under it*, which is the whole reason the listing carries a subject. It
+    // narrows what the caller reads and never widens it — the gate above
+    // answered for the listing, not for a subject.
+    if let Some(subject) = q.subject.as_deref() {
+        found.retain(|live| live.subject.as_deref() == Some(subject));
+    }
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "runs": found
+            .iter()
+            .map(|live| json!({
+                "run": live.run.to_string(),
+                "agent": live.governed_by.as_ref().map(|id| json!({
+                    "name": id.name,
+                    "version": id.version,
+                    "digest": id.digest.to_hex(),
+                })),
+                "subject": live.subject,
+                "stranded": live.stranded,
+            }))
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
+/// Narrowing the live listing.
+///
+/// Absent means every run this tenant holds a slot for. `subject` is the
+/// delegation subject a run was admitted under, so *what is still running for
+/// the credential I just withdrew* is one query rather than a read-and-grep.
+#[derive(serde::Deserialize)]
+struct LiveQuery {
+    subject: Option<String>,
 }
 
 /// Which ending to list. Defaults to the one somebody is looking for.
@@ -1991,6 +2120,83 @@ async fn release_hold(
     Ok((
         StatusCode::OK,
         Json(json!({ "case": body.case, "lifted": lifted })),
+    ))
+}
+
+/// What is stopped right now, and why.
+///
+/// The question a per-scope lookup cannot answer without already knowing the
+/// answer — which is [`I13`]'s distinction between indexed and delivered,
+/// applied to the control an incident reaches for first.
+///
+/// [`I13`]: crate::journal
+async fn standing_halts(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::HALT_LIST, "*").await?;
+    let halts = s.plane.halts().await.map_err(|_| store_failed())?;
+    Ok(Json(json!({
+        "halts": halts
+            .iter()
+            .map(|halt| json!({
+                "scope": halt.scope.key(),
+                "covers": halt.scope.to_string(),
+                "reason": halt.reason,
+            }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+/// Throw it.
+///
+/// **Says what it does not stop.** A halt closes admission; it does not reach
+/// the runs already executing, because cutting those mid-saga leaves reversals
+/// unrun and turns one incident into two. The response carries that sentence
+/// rather than leaving an operator to discover the shape of the control during
+/// the outage — and names `POST /runs/{run}/cancel` as the verb that does reach
+/// work in flight.
+async fn place_halt(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<PlaceHaltRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api.gate(&headers, action::HALT_PLACE, &body.scope).await?;
+    let scope = crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| bad("scope"))?;
+    if body.reason.trim().is_empty() {
+        return Err(bad("reason"));
+    }
+    s.plane
+        .set_halt(&scope, Some(&body.reason))
+        .await
+        .map_err(|_| store_failed())?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "scope": scope.key(),
+            "halted": true,
+            "reason": body.reason,
+            "does_not_stop": "runs already executing, and suspended runs \
+                 resuming — cancel a run to reach work in flight",
+        })),
+    ))
+}
+
+/// Lift it.
+async fn lift_halt(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Json(body): Json<LiftHaltRequest>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let s = api.gate(&headers, action::HALT_LIFT, &body.scope).await?;
+    let scope = crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| bad("scope"))?;
+    s.plane
+        .set_halt(&scope, None)
+        .await
+        .map_err(|_| store_failed())?;
+    Ok((
+        StatusCode::OK,
+        Json(json!({ "scope": scope.key(), "halted": false })),
     ))
 }
 

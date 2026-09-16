@@ -294,6 +294,81 @@ pub struct Spawned {
     pub fresh: bool,
 }
 
+/// The six stores a full plane runs on, as handles rather than as one type.
+///
+/// [`Runtime::builder_on`] is the shorthand for one backend implementing all
+/// six, and is the wrong shape for a caller that picks its backend at **run
+/// time** — an operator naming either a file or a connection string holds
+/// `Arc<dyn JournalStore>`, and unsizing a generic parameter needs it `Sized`,
+/// so the wiring is a value that `builder_on` builds.
+///
+/// Here rather than in [`store`](crate::store) because that module is the
+/// backends, gated on `redb` or `postgres`, while this exists whether or not
+/// either is compiled in.
+#[derive(Clone)]
+pub struct Stores {
+    pub journal: std::sync::Arc<dyn crate::journal::JournalStore>,
+    pub cases: std::sync::Arc<dyn crate::case::CaseStore>,
+    pub tasks: std::sync::Arc<dyn crate::case::TaskStore>,
+    pub events: std::sync::Arc<dyn crate::case::EventStore>,
+    pub timers: std::sync::Arc<dyn crate::case::TimerStore>,
+    pub memory: std::sync::Arc<dyn crate::memory::MemoryStore>,
+}
+
+impl std::fmt::Debug for Stores {
+    /// The handles are trait objects with no identity to print, so what a reader
+    /// wants here is *that the set is complete*, which it is by construction.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Stores { journal, cases, tasks, events, timers, memory }")
+    }
+}
+
+impl Stores {
+    /// Every store from one backend that implements all six.
+    #[must_use]
+    pub fn on<B: FullBackend + 'static>(store: std::sync::Arc<B>) -> Self {
+        Self {
+            journal: std::sync::Arc::clone(&store) as _,
+            cases: std::sync::Arc::clone(&store) as _,
+            tasks: std::sync::Arc::clone(&store) as _,
+            events: std::sync::Arc::clone(&store) as _,
+            timers: std::sync::Arc::clone(&store) as _,
+            memory: store as _,
+        }
+    }
+}
+
+/// How far into a run's history [`Runtime::running_runs`] reads to attribute it.
+///
+/// `RunAdmitted` is seq 1 and `IdentityBound` follows it when the caller
+/// presented a chain, with the quota pass and the frozen plan between them — so
+/// a handful of records carries both and a long-running agent's history is not
+/// scanned to answer *who is this*.
+const ATTRIBUTION_RECORDS: usize = 8;
+
+/// One run this tenant currently holds an admission slot for.
+///
+/// What [`Runtime::running_runs`] answers with. The ids alone would be a listing
+/// an operator reads out; the attribution is what makes it one they can act on.
+#[derive(Debug, Clone)]
+pub struct LiveRun {
+    pub run: RunId,
+    /// The declared agent governing it, when a declared one does.
+    ///
+    /// `None` for a skill registered directly on the plane — a legitimate shape,
+    /// and one an incident about *a bad revision* can therefore rule out.
+    pub governed_by: Option<crate::journal::AgentIdentity>,
+    /// Who this run acts for: the root of the delegation chain bound at
+    /// admission, when the caller presented one.
+    pub subject: Option<String>,
+    /// The slot is held by a run whose lease has lapsed, so no process is
+    /// executing it.
+    ///
+    /// Not a cancellation candidate: the recovery sweep resumes these, and
+    /// cancelling one unwinds work that was about to continue.
+    pub stranded: bool,
+}
+
 /// A run that stopped short of an answer, as an error a caller can `?`.
 ///
 /// Carries the [`RunStatus`] whole rather than a flattened string, so a caller
@@ -306,11 +381,26 @@ pub struct RunFailure {
     pub status: RunStatus,
 }
 
+/// **Total, including over the status this type is not supposed to hold.**
+///
+/// `status` is public and `RunStatus` carries `Succeeded`, so a
+/// `RunFailure { status: Succeeded }` is a value any caller can build. Asserting
+/// that away would make *formatting an error* the operation that panics, and a
+/// `Display` impl runs wherever an error is logged — disproportionately during
+/// an incident. So it prints the contradiction instead.
 impl std::fmt::Display for RunFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if matches!(self.status, RunStatus::Succeeded) {
+            return write!(
+                f,
+                "run {} is recorded as a failure carrying a success — \
+                 whatever built this value did so wrongly",
+                self.run_id
+            );
+        }
         write!(f, "run {} did not succeed: ", self.run_id)?;
         match &self.status {
-            RunStatus::Succeeded => unreachable!("a success is not a failure"),
+            RunStatus::Succeeded => write!(f, "it succeeded"),
             RunStatus::Failed(reason) => write!(f, "it failed — {reason}"),
             RunStatus::Suspended(reason) => write!(f, "it is suspended — {reason:?}"),
             RunStatus::Exhausted(limit) => write!(f, "a budget stopped it — {limit}"),
@@ -327,6 +417,12 @@ impl std::fmt::Display for RunFailure {
                 write!(
                     f,
                     "{actor} abandoned it, unresolved and not unwound — {reason}"
+                )
+            }
+            RunStatus::Withheld { subject, reason } => {
+                write!(
+                    f,
+                    "the authority it acts for — '{subject}' — was withdrawn: {reason}"
                 )
             }
         }
@@ -411,6 +507,19 @@ pub enum RunStatus {
         actor: String,
         reason: String,
     },
+    /// The authority this run acts under was withdrawn while it was running.
+    ///
+    /// **A pause, not a fault**, for the reason exhaustion is one: the run did
+    /// nothing wrong. Its mutations stand and it stays resumable — lift the halt
+    /// and it continues. Unwinding would reverse correct work for a reason
+    /// unrelated to it; cancelling is the verb for that.
+    ///
+    /// Carries the subject, because *whose* authority is what an operator
+    /// matches against the withdrawal they made.
+    Withheld {
+        subject: String,
+        reason: String,
+    },
 }
 
 impl RunStatus {
@@ -439,7 +548,8 @@ impl RunStatus {
             | Self::Replanning(reason)
             | Self::Cancelled { reason, .. }
             | Self::Abandoned { reason, .. }
-            | Self::BrokeGlass { reason, .. } => Some(Cow::Borrowed(reason.as_str())),
+            | Self::BrokeGlass { reason, .. }
+            | Self::Withheld { reason, .. } => Some(Cow::Borrowed(reason.as_str())),
             Self::Suspended(reason) => Some(Cow::Owned(reason.to_string())),
             Self::Exhausted(exceeded) => Some(Cow::Owned(exceeded.to_string())),
         }
@@ -471,6 +581,7 @@ impl RunStatus {
             Self::Abandoned { .. } => "abandoned",
             Self::Swept => super::sweeper::SWEEP_OUTCOME,
             Self::BrokeGlass { .. } => BREAK_GLASS_OUTCOME,
+            Self::Withheld { .. } => WITHHELD_OUTCOME,
         }
     }
 
@@ -486,12 +597,17 @@ impl RunStatus {
             Self::Cancelled { actor, .. }
             | Self::Abandoned { actor, .. }
             | Self::BrokeGlass { actor, .. } => Some(actor.as_str()),
+            // A withdrawal names a *subject*, not an actor: the operator who
+            // threw the halt and the credential it covers are different
+            // parties, and answering "who" with the subject would report the
+            // person whose authority was taken as the one who took it.
             Self::Succeeded
             | Self::Failed(_)
             | Self::Suspended(_)
             | Self::Exhausted(_)
             | Self::Quarantined(_)
             | Self::Replanning(_)
+            | Self::Withheld { .. }
             | Self::Swept => None,
         }
     }
@@ -915,12 +1031,24 @@ impl Runtime {
     /// an explicit decision.
     #[must_use]
     pub fn builder_on<B: FullBackend + 'static>(store: Arc<B>) -> RuntimeBuilder {
-        Self::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-            .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
-            .tasks(Arc::clone(&store) as Arc<dyn TaskStore>)
-            .events(Arc::clone(&store) as Arc<dyn EventStore>)
-            .timers(Arc::clone(&store) as Arc<dyn TimerStore>)
-            .memory(store as Arc<dyn crate::memory::MemoryStore>)
+        Self::builder_with(Stores::on(store))
+    }
+
+    /// A builder with the whole case layer wired from handles.
+    ///
+    /// What [`builder_on`](Self::builder_on) is in terms of: the six casts live
+    /// in one place, so a deployment that chose its backend at run time — an
+    /// operator naming either a file or a connection string — wires exactly what
+    /// a deployment on one concrete type wires, rather than a hand-written
+    /// approximation of it that drifts the day a seventh store is added.
+    #[must_use]
+    pub fn builder_with(stores: Stores) -> RuntimeBuilder {
+        Self::builder(stores.journal)
+            .cases(stores.cases)
+            .tasks(stores.tasks)
+            .events(stores.events)
+            .timers(stores.timers)
+            .memory(stores.memory)
     }
 
     #[must_use]
@@ -1592,6 +1720,83 @@ impl Runtime {
         quotas.halts().await.map_err(RuntimeError::Store)
     }
 
+    /// Which runs are executing **right now**, and under whose authority.
+    ///
+    /// [`runs_by_outcome`](crate::journal::JournalStore::runs_by_outcome)
+    /// answers from the journal's index, which only *concluded* runs are in; the
+    /// live set is the tenant's admission slots.
+    ///
+    /// **The join is the point, not the ids.** An incident is rarely *cancel
+    /// this run* but a revoked credential or a bad revision, so each entry
+    /// carries the declared agent and the delegation subject it was admitted
+    /// under.
+    ///
+    /// A slot whose lease has lapsed is marked `stranded` rather than omitted:
+    /// the recovery sweep resumes those, and cancelling one undoes work that was
+    /// about to continue.
+    ///
+    /// Bounded by `limit`, and reads a page of each run's header records to
+    /// attribute it — an operator question rather than a hot path.
+    ///
+    /// # Errors
+    ///
+    /// If no quota store is wired, or either store is unreachable.
+    pub async fn running_runs(&self, limit: usize) -> Result<Vec<LiveRun>, RuntimeError> {
+        let quotas = self.quotas.as_ref().ok_or_else(|| {
+            RuntimeError::Store(crate::core::StoreError::Backend(
+                "no quota store is wired, so nothing tracks which runs hold this \
+                 tenant's admission slots"
+                    .to_owned(),
+            ))
+        })?;
+        let live = quotas
+            .running_runs(limit)
+            .await
+            .map_err(RuntimeError::Store)?;
+        // One read, not one per run: the stranded set is small and the whole of
+        // it is needed to answer any entry.
+        let stranded: std::collections::BTreeSet<RunId> = self
+            .store
+            .abandoned_runs(limit)
+            .await
+            .map_err(RuntimeError::Store)?
+            .into_iter()
+            .collect();
+
+        let mut out = Vec::with_capacity(live.len());
+        for run in live {
+            // The header records only. `RunAdmitted` is the first and
+            // `IdentityBound` follows it when the caller presented a chain, so a
+            // short page carries both without reading a run's whole history —
+            // which on a long-running agent is the difference between an
+            // operator listing and a scan.
+            let head = self
+                .store
+                .read_page(run, 1, ATTRIBUTION_RECORDS)
+                .await
+                .map_err(RuntimeError::Store)?;
+            let governed_by = head.iter().find_map(|r| match r.kind() {
+                crate::journal::RecordKind::RunAdmitted { governed_by, .. } => {
+                    governed_by.as_ref().map(|id| (**id).clone())
+                }
+                _ => None,
+            });
+            let subject = head.iter().find_map(|r| match r.kind() {
+                crate::journal::RecordKind::IdentityBound { chain } => {
+                    chain.first().map(|p| p.id.clone())
+                }
+                _ => None,
+            });
+            out.push(LiveRun {
+                stranded: stranded.contains(&run),
+                run,
+                governed_by,
+                subject,
+            });
+        }
+        Ok(out)
+    }
+
     /// Stop this instance taking on work, then wait for what it is already
     /// doing.
     ///
@@ -1890,6 +2095,83 @@ impl Runtime {
         }))
     }
 
+    /// The withdrawal standing against this run's authority, if one is.
+    ///
+    /// Read at a step boundary on a live pass only: a halt thrown *today* must
+    /// not decide what a run did last year, which is the rule the cancellation
+    /// check beside it follows. Only a subject-scoped halt reaches here — see
+    /// [`HaltScope::withdrawn_subject`](crate::quota::HaltScope::withdrawn_subject).
+    ///
+    /// An unreachable store propagates. Carrying on would leave a withdrawal
+    /// unenforced exactly while the accounting is down.
+    ///
+    /// # Errors
+    ///
+    /// If the quota store is unreachable.
+    async fn withdrawn_authority(
+        &self,
+        identity: Option<&crate::core::Delegation>,
+    ) -> Result<Option<(String, String)>, RuntimeError> {
+        let (Some(quotas), Some(chain)) = (self.quotas.as_ref(), identity) else {
+            return Ok(None);
+        };
+        let subject = chain.subject().id.as_str();
+        let halts = quotas.halts().await.map_err(RuntimeError::Store)?;
+        Ok(halts.into_iter().find_map(|halt| {
+            (halt.scope.withdrawn_subject() == Some(subject))
+                .then(|| (subject.to_owned(), halt.reason))
+        }))
+    }
+
+    /// Stop a run because the authority it acts under was withdrawn.
+    ///
+    /// A **pause**: `stop` is reached with a status `maybe_unwind` passes
+    /// straight through, so the run's mutations stand and it stays resumable.
+    /// That is the treatment exhaustion gets and for the same reason — the run
+    /// did nothing wrong, and reversing correct work because a credential lapsed
+    /// would be a second incident.
+    ///
+    /// `record` is false on a resume that finds the withdrawal still standing:
+    /// the withholding already on the chain says so, and a second one per resume
+    /// attempt would turn a queue of retries into a queue of records.
+    #[allow(clippy::too_many_arguments)]
+    async fn withhold(
+        &self,
+        cx: Unwind<'_>,
+        withdrawal: (String, String),
+        record: bool,
+        completed: &[(StepId, Capability)],
+        outputs: &BTreeMap<StepId, Tainted<Value>>,
+        cursor: &mut ReplayCursor,
+        case_id: Option<crate::core::CaseId>,
+        quota: &QuotaPass,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let (subject, reason) = withdrawal;
+        if record {
+            let stamped = (cx.stamp)(Append::new(
+                cx.run,
+                RecordKind::AuthorityWithheld {
+                    subject: subject.clone(),
+                    reason: reason.clone(),
+                },
+            ));
+            self.store
+                .append(cx.epoch, vec![stamped])
+                .await
+                .map_err(RuntimeError::from_store)?;
+        }
+        self.stop(
+            cx,
+            RunStatus::Withheld { subject, reason },
+            completed,
+            outputs,
+            cursor,
+            case_id,
+            quota,
+        )
+        .await
+    }
+
     /// Refuse a run whose tenant is at a ceiling.
     ///
     /// Fails **closed**: an unreachable quota store refuses rather than admits,
@@ -1904,6 +2186,7 @@ impl Runtime {
         &self,
         run: RunId,
         governed_by: Option<&crate::journal::AgentIdentity>,
+        subject: Option<&str>,
         at: crate::core::Timestamp,
     ) -> Result<QuotaPass, RuntimeError> {
         let Some(quotas) = self.quotas.as_ref() else {
@@ -1922,14 +2205,16 @@ impl Runtime {
         // message**: an operator who stopped one agent and whoever is refused
         // are looking for different sentences, and "the tenant is halted" told
         // to the caller of agent 12 sends them to the wrong incident. Ordering
-        // the scopes puts `Revision` before `Agent` before `Tenant`, so the
-        // reason reported is the most specific one that actually covers this
-        // run.
+        // the scopes puts `Subject` before `Revision` before `Agent` before
+        // `Tenant`, so the reason reported is the most specific one that
+        // actually covers this run — and a withdrawn authority outranks every
+        // workload scope, because it is the answer that tells the caller their
+        // credential is the problem rather than the agent.
         match quotas.halts().await {
             Ok(halts) => {
                 if let Some(halt) = halts
                     .into_iter()
-                    .filter(|halt| halt.scope.covers(governed_by))
+                    .filter(|halt| halt.scope.covers(governed_by, subject))
                     .max_by(|a, b| a.scope.cmp(&b.scope))
                 {
                     return Err(RuntimeError::QuotaExceeded(
@@ -3099,7 +3384,21 @@ impl Runtime {
             .map_err(RuntimeError::from_store)?;
 
         let quota = match self
-            .check_quota(run, governed_by.as_ref(), now_for_admission())
+            .check_quota(
+                run,
+                governed_by.as_ref(),
+                // **The chain this run acts under, not the plane's.** A served
+                // surface admits each run under its caller's chain, so reading
+                // the plane's here would check a withdrawal against the
+                // operator's own subject and never match the caller's — a
+                // refusal that does not happen, which leaves no trace anywhere.
+                terms
+                    .acting_as
+                    .as_ref()
+                    .or(self.identity.as_ref())
+                    .map(|c| c.subject().id.as_str()),
+                now_for_admission(),
+            )
             .await
         {
             Ok(pass) => pass,
@@ -3381,6 +3680,7 @@ impl Runtime {
                 agent: a.agent,
                 identity: a.identity,
                 refusal: None,
+                withheld_subject: None,
                 successors: Vec::new(),
                 started: BTreeSet::new(),
                 finished: BTreeSet::new(),
@@ -3663,6 +3963,7 @@ impl Runtime {
                 // replay cursor like an effect's does. It is lifted here from
                 // the records `replay` has already read.
                 refusal: recorded_step_refusal(&records),
+                withheld_subject: standing_withholding(&records),
                 // Every `PlanFrozen` after the first is a successor this run
                 // produced. Replay walks them in the order they were made.
                 successors: records
@@ -3748,6 +4049,7 @@ impl Runtime {
             agent,
             identity,
             refusal: recorded_refusal,
+            withheld_subject,
             successors,
             started,
             finished,
@@ -3767,6 +4069,12 @@ impl Runtime {
         // re-synthesised.
         let mut current: PlanIR = ir.clone();
         let mut replans: u32 = 0;
+        // A withholding the recorded history left standing, if it did. Seeded
+        // from the records for the same reason the step refusal is: it is a fact
+        // about *this* run that a resume has to answer, and asking the journal
+        // again at every boundary would be a read per ready set for a question
+        // whose answer only this loop can change.
+        let mut withheld: Option<String> = withheld_subject;
         let recorded_successors = successors;
 
         // One ledger for the run. A step never gets its own allowance to blow.
@@ -3855,6 +4163,91 @@ impl Runtime {
                     .await;
             }
 
+            // ── The withdrawal check, at the same boundary ─────────────────
+            //
+            // Beside the stop check and for its reasons. Unlike a cancellation
+            // this is a **pause**: `stop` is reached with a status
+            // `maybe_unwind` passes straight through, as exhaustion is.
+            if writing {
+                let standing = self.withdrawn_authority(identity.as_ref()).await?;
+                match (standing, withheld.take()) {
+                    // Lifted since the run was withheld: that decision is a
+                    // fact about the run and goes on the record, beside the
+                    // withholding it supersedes rather than instead of it.
+                    // Without it a strict replay would stop at the old pause and
+                    // report `withheld` about a run whose own later records show
+                    // it finishing.
+                    (None, Some(prior)) => {
+                        self.store
+                            .append(
+                                epoch,
+                                vec![stamp(Append::new(
+                                    run,
+                                    RecordKind::AuthorityRestored { subject: prior },
+                                ))],
+                            )
+                            .await
+                            .map_err(RuntimeError::from_store)?;
+                    }
+                    // Still withdrawn. The standing record already says so — no
+                    // second one, for the reason a re-exhausted run writes no
+                    // second refusal.
+                    // The prior is dropped rather than restored: this pass
+                    // returns, and the *records* are what a later resume reads
+                    // its standing state from.
+                    (Some((subject, reason)), Some(_prior)) => {
+                        return self
+                            .withhold(
+                                Unwind {
+                                    agent: &agent,
+                                    identity: identity.as_ref(),
+                                    run,
+                                    epoch,
+                                    ir: &current,
+                                    mode,
+                                    case: case.clone(),
+                                    ledger: &ledger,
+                                    writing,
+                                    stamp: &stamp,
+                                },
+                                (subject, reason),
+                                false,
+                                &completed,
+                                &outputs,
+                                cursor,
+                                case_id,
+                                &quota,
+                            )
+                            .await;
+                    }
+                    (Some((subject, reason)), None) => {
+                        return self
+                            .withhold(
+                                Unwind {
+                                    agent: &agent,
+                                    identity: identity.as_ref(),
+                                    run,
+                                    epoch,
+                                    ir: &current,
+                                    mode,
+                                    case: case.clone(),
+                                    ledger: &ledger,
+                                    writing,
+                                    stamp: &stamp,
+                                },
+                                (subject, reason),
+                                true,
+                                &completed,
+                                &outputs,
+                                cursor,
+                                case_id,
+                                &quota,
+                            )
+                            .await;
+                    }
+                    (None, None) => {}
+                }
+            }
             let ready = current.ready(&done);
             if ready.is_empty() {
                 break;
@@ -5522,7 +5915,10 @@ fn severity(status: &RunStatus) -> u8 {
         // Abandonment is not produced by a step and never competes here; it is
         // named so a new stop reason cannot be given a rank by omission.
         RunStatus::Cancelled { .. } | RunStatus::Abandoned { .. } | RunStatus::Failed(_) => 2,
-        RunStatus::Exhausted(_) => 1,
+        // A withdrawal ranks with exhaustion for the same reason: both pause a
+        // healthy run, neither unwinds, and a sibling that actually failed has
+        // decided more about the run than either.
+        RunStatus::Exhausted(_) | RunStatus::Withheld { .. } => 1,
         // A replan request is the weakest signal in a batch: a sibling that
         // failed outright has already decided the run, and re-planning around a
         // failure is not what the requesting step was asking for.
@@ -5558,6 +5954,12 @@ fn collect(
         cursor.restore(step, Phase::Forward, slice);
         outcomes.push((step, status, out));
     }
+    // The key is an `Option`, and `None` would sort *first* — so the invariant
+    // that makes this total is worth naming rather than trusting: every
+    // dispatched step came from `admit_ready(&ready, ..)`, which returns a
+    // subset of `ready`. A future that dispatched a step outside the ready set
+    // would silently re-order this batch rather than fail, and the order is what
+    // an unwind reverses.
     outcomes.sort_by_key(|(step, _, _)| ready.iter().position(|r| r == step));
     Ok(outcomes)
 }
@@ -5718,6 +6120,26 @@ fn recorded_step_refusal(records: &[Record]) -> Option<(StepId, String, String)>
             {
                 standing = None;
             }
+            _ => {}
+        }
+    }
+    standing
+}
+
+/// The subject of a withholding the records left standing, if one stands.
+///
+/// **The last word wins**, exactly as it does for a step refusal: a withheld run
+/// resumes once somebody lifts the halt, and the resume journals an
+/// `AuthorityRestored` beside the withholding. From then on the withholding is
+/// history that was *superseded* rather than a verdict to re-serve — without
+/// this, a resumed run would be treated as still withheld and would conclude
+/// that way forever, with each resume adding nothing.
+fn standing_withholding(records: &[Record]) -> Option<String> {
+    let mut standing: Option<String> = None;
+    for r in records {
+        match r.kind() {
+            RecordKind::AuthorityWithheld { subject, .. } => standing = Some(subject.clone()),
+            RecordKind::AuthorityRestored { .. } => standing = None,
             _ => {}
         }
     }
@@ -6332,6 +6754,10 @@ struct Execution<'a> {
     /// Where the recorded run was refused by a step limit, if it was. `None`
     /// for a live run, which has no history to consult.
     refusal: Option<(StepId, String, String)>,
+    /// The subject of a withholding the recorded history left standing. `None`
+    /// for a live run, and for a resumed one whose withdrawal was already
+    /// lifted and recorded.
+    withheld_subject: Option<String>,
     /// Successor plans the recorded run produced, oldest first. Empty on a live
     /// run. Read back rather than re-synthesised, because a planner asked twice
     /// can answer differently.
@@ -6450,7 +6876,13 @@ fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
         // reach here at all, because neither is ever a recorded conclusion.
         // Stating that as "the two that do not seal" was wrong; there are four,
         // and only two of them can be a `RunSealed` outcome.
-        "failed" | "exhausted" => None,
+        // A withdrawal joins them, and is the clearest case of the three: the
+        // run did nothing wrong, its mutations stand, and lifting the halt is
+        // what continues it. Closing it would turn *stop acting under this
+        // credential* into *destroy this work*, which is not what an operator
+        // withdrawing a credential asked for — the operator who wants that
+        // cancels, and cancelling unwinds.
+        "failed" | "exhausted" | WITHHELD_OUTCOME => None,
         // Fail closed. An outcome this build does not recognise — a sweep's
         // `swept`, a future variant, a corrupted string — is not permission to
         // resume; it is a run whose recorded ending this code cannot interpret,
@@ -6729,6 +7161,13 @@ const BREAK_GLASS_EPOCH: crate::core::Epoch = 1;
 /// failed at a goal, which is why a sweep seals as `swept` rather than
 /// borrowing one.
 const BREAK_GLASS_OUTCOME: &str = "broke-glass";
+
+/// How a run ends when the authority it acts under is withdrawn under it.
+///
+/// Resumable, so it is deliberately absent from both
+/// [`SEALED_OUTCOMES`] and [`OUTCOMES_OF_RECORD`]: the run has not ended, it is
+/// waiting for somebody to lift a halt or to cancel it properly.
+pub const WITHHELD_OUTCOME: &str = "withheld";
 
 /// One governed identity: a declaration and the skills that serve it.
 ///
@@ -8881,6 +9320,10 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
             actor: "ops".into(),
             reason: "INC-42".into(),
         },
+        RunStatus::Withheld {
+            subject: "alice".into(),
+            reason: "credential withdrawn".into(),
+        },
     ]
 }
 
@@ -8913,7 +9356,7 @@ mod resume_agreement_tests {
         let statuses = every_status();
         assert_eq!(
             statuses.len(),
-            10,
+            11,
             "a RunStatus variant was added or removed — decide whether it seals \
              and whether a resume may continue from it, then update this list"
         );
@@ -8933,14 +9376,19 @@ mod resume_agreement_tests {
         }
     }
 
-    /// The availability half: the two conclusions that stay open really do.
+    /// The availability half: the conclusions that stay open really do.
     ///
     /// Asserted separately and by name rather than as the converse of the rule
     /// above, because the converse is false — `Suspended` and `Replanning` do
     /// not seal either, and neither is ever a recorded conclusion.
+    ///
+    /// `withheld` is here because it is a **pause**: the authority a run acts
+    /// under was withdrawn, its mutations stand, and lifting the halt is what
+    /// lets it continue. A withheld run that could not be resumed would make the
+    /// withdrawal a destruction rather than a stop.
     #[test]
     fn a_failed_or_exhausted_run_may_still_be_resumed() {
-        for outcome in ["failed", "exhausted"] {
+        for outcome in ["failed", "exhausted", super::WITHHELD_OUTCOME] {
             assert!(
                 resume_is_closed(&sealed_as(outcome)).is_none(),
                 "'{outcome}' is a conclusion a resume must be able to continue \
