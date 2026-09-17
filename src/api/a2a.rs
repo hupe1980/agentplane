@@ -223,18 +223,25 @@ fn quota_refusal(e: &crate::quota::QuotaError) -> RpcError {
 /// `ProtoJSON` spelling — `TASK_STATE_WORKING`, not `working`. A client matching
 /// on the enum gets nothing from a friendlier spelling.
 ///
-/// # Why this is a subset
+/// # Why this is the whole vocabulary, not the part this plane produces
 ///
-/// A2A also defines `SUBMITTED`, `REJECTED` and `AUTH_REQUIRED`, and this plane
-/// never enters any of them. `SUBMITTED` means accepted but not yet started, and
-/// there is no such moment here: a run starts inside the call that admits it.
-/// The other two are refusals, and a refusal never becomes a task — a declined
-/// request is answered with a `Message`, and an unauthenticated one never
-/// reaches dispatch.
+/// It is **both** an output and an input: `ListTasks` takes a `status` filter,
+/// so a caller may name any state A2A defines and must get a valid, empty
+/// answer rather than `INVALID_PARAMS`. A subset would turn a legitimate query
+/// into a protocol error.
 ///
-/// Declared and never produced would be worse than absent: a client writing a
-/// branch for `SUBMITTED` would be writing dead code against a promise this
-/// agent does not keep.
+/// Three of these this plane never *produces*, and the reasons are worth
+/// keeping because they are what a client would otherwise have to guess.
+/// `TASK_STATE_SUBMITTED` means accepted but not yet started, and there is no
+/// such moment here: a run starts inside the call that admits it.
+/// `TASK_STATE_AUTH_REQUIRED` cannot arise either — an unauthenticated request
+/// never reaches dispatch, so there is no task to report it against.
+///
+/// `TASK_STATE_REJECTED` **is** produced, and not as a refusal: a sweep and a
+/// break-glass crossing take it, because
+/// neither is a task any peer submitted. A caller polling one of those is
+/// asking about this plane's record of itself, and gets the same answer as for
+/// a run id that does not exist at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     #[serde(rename = "TASK_STATE_UNSPECIFIED")]
@@ -2974,7 +2981,12 @@ async fn cancel_task(
 
     server
         .runtime
-        .request_cancel(id, &caller.actor, "cancelled over A2A")
+        .request_cancel(
+            id,
+            &crate::core::Operator::authenticated(caller.actor.clone())
+                .map_err(|e| RpcError::new(code::INVALID_PARAMS, e.to_string()))?,
+            "cancelled over A2A",
+        )
         .await
         .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
 

@@ -239,6 +239,10 @@ CREATE TABLE IF NOT EXISTS run_cancel (
     tenant       TEXT   NOT NULL,
     run_id       TEXT   NOT NULL,
     actor        TEXT   NOT NULL,
+    -- What established the actor's name. An intervention arrives from an
+    -- authenticated API caller and from somebody holding this connection
+    -- string, and a reader of the row cannot tell those apart from a name.
+    actor_basis  TEXT   NOT NULL,
     reason       TEXT   NOT NULL,
     requested_at BIGINT NOT NULL CHECK (requested_at >= 0),
     PRIMARY KEY (tenant, run_id)
@@ -1577,7 +1581,7 @@ impl JournalStore for PostgresStore {
     async fn request_cancel(
         &self,
         run: RunId,
-        actor: &str,
+        actor: &crate::core::Operator,
         reason: &str,
     ) -> Result<bool, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
@@ -1586,13 +1590,14 @@ impl JournalStore for PostgresStore {
         // record, so a retried request cannot rewrite who intervened.
         let n = client
             .execute(
-                "INSERT INTO run_cancel (tenant, run_id, actor, reason, requested_at)
-                 VALUES ($1, $2, $3, $4, $5)
+                "INSERT INTO run_cancel (tenant, run_id, actor, actor_basis, reason, requested_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (tenant, run_id) DO NOTHING",
                 &[
                     &self.tenant_name(),
                     &run.to_string(),
-                    &actor.to_owned(),
+                    &actor.actor(),
+                    &actor.basis().as_str(),
                     &reason.to_owned(),
                     &now_secs().cast_signed(),
                 ],
@@ -1606,15 +1611,19 @@ impl JournalStore for PostgresStore {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let row = client
             .query_opt(
-                "SELECT actor, reason FROM run_cancel WHERE tenant = $1 AND run_id = $2",
+                "SELECT actor, actor_basis, reason FROM run_cancel \
+                 WHERE tenant = $1 AND run_id = $2",
                 &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
-        Ok(row.map(|r| Cancellation {
-            actor: r.get(0),
-            reason: r.get(1),
-        }))
+        row.map(|r| {
+            Ok(Cancellation {
+                actor: super::decode_operator(r.get(0), r.get(1), "run_cancel")?,
+                reason: r.get(2),
+            })
+        })
+        .transpose()
     }
 }
 

@@ -13,6 +13,14 @@ use std::sync::Arc;
 use agentplane::blob::{BlobError, BlobStore, MemoryBlobs};
 use agentplane::core::{Digest, Timestamp};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 fn ts(secs: i64) -> Timestamp {
     Timestamp::from_unix_timestamp(secs).expect("representable")
 }
@@ -1428,6 +1436,7 @@ async fn a_legal_hold_stops_the_retention_sweep_and_lifting_it_lets_the_sweep_th
             &LegalHold {
                 placed_at: ts(12),
                 reason: "preservation order 2026-114".to_owned(),
+                by: operator("compliance"),
             },
         )
         .await
@@ -1543,6 +1552,7 @@ async fn erasing_a_held_case_directly_is_refused_before_anything_is_destroyed() 
             &LegalHold {
                 placed_at: ts(12),
                 reason: "preservation order 2026-114".to_owned(),
+                by: operator("compliance"),
             },
         )
         .await

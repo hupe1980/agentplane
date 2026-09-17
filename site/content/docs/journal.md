@@ -285,6 +285,7 @@ Rust struct.
   from one misreading round-trip cleanly. A quorum is otherwise a count of
   HTTP status codes, and every guarantee resting on *an independent party
   observed this log* would be a guarantee about string formatting.
+
 Both backends maintain the log, and both keep their gaps. redb advances a
 counter row inside the sealing transaction; Postgres uses a **sequence**, because
 several instances seal concurrently there — that is the topology it exists for —

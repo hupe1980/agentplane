@@ -42,7 +42,23 @@ use agentplane::core::{
 use agentplane::journal::RecordKind;
 use agentplane::prelude::*;
 use agentplane::quota::{HaltScope, TenantQuota};
+
 use serde_json::{Value, json};
+
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
+/// A fixed instant, because every lifecycle instant in this crate is the
+/// caller's and a fixture that read the clock could not be tested against an
+/// ageing plane.
+fn test_instant() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("a fixed instant")
+}
 
 /// What the outside world has seen, in order.
 type World = Arc<Mutex<Vec<String>>>;
@@ -165,12 +181,18 @@ async fn stop_one_run() -> Result<(), Box<dyn std::error::Error>> {
     // The counterparty withdraws the dispute. Waiting out the review deadline
     // would be days; the operator stops the run now, with a reason on record.
     let first = rt
-        .request_cancel(run.run_id, "ops-carol", "counterparty withdrew the dispute")
+        .request_cancel(
+            run.run_id,
+            &operator("ops-carol"),
+            "counterparty withdrew the dispute",
+        )
         .await?;
     assert!(first, "the first request is the intervention of record");
 
     // A second asker does not take the first one's place.
-    let second = rt.request_cancel(run.run_id, "ops-bob", "me too").await?;
+    let second = rt
+        .request_cancel(run.run_id, &operator("ops-bob"), "me too")
+        .await?;
     assert!(!second);
 
     println!("\n   ops-carol stopped it — and the stop *undid* the hold:");
@@ -199,7 +221,7 @@ async fn stop_one_run() -> Result<(), Box<dyn std::error::Error>> {
         })
         .expect("the intervention is journaled");
     println!("   on record → cancelled by {actor}: \"{reason}\"");
-    assert_eq!(actor, "ops-carol");
+    assert_eq!(actor.actor(), "ops-carol");
     journal.verify(run.run_id).await?;
     println!("   and the chain verifies with the intervention in it\n");
     Ok(())
@@ -249,7 +271,12 @@ async fn halt_the_front_door() -> Result<(), Box<dyn std::error::Error>> {
 
     one.set_halt(
         &HaltScope::Tenant,
-        Some("incident 42: ledger reconciliation is wrong"),
+        // Who threw it, and on what basis. An emergency stop the runtime cannot
+        // check is worth the name beside it; from a terminal that name is
+        // *asserted*, and the row says so.
+        &operator("ops-carol"),
+        test_instant(),
+        "incident 42: ledger reconciliation is wrong",
     )
     .await?;
     println!("2. instance one throws the emergency stop (whole tenant)");
@@ -263,7 +290,7 @@ async fn halt_the_front_door() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    one.set_halt(&HaltScope::Tenant, None).await?;
+    one.lift_halt(&HaltScope::Tenant).await?;
     let lifted = two.run("desk.ack", Tainted::trusted(json!({}))).await?;
     println!(
         "   lifted     → instance two admits again ({})",

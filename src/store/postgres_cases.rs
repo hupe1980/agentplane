@@ -36,6 +36,18 @@ use crate::core::{
 
 use super::postgres::{PostgresStore, amount_of, be, pool_err, sql_amount};
 
+/// A hold's stored attribution, or corruption.
+///
+/// Fails closed for the reason every decoder in this crate does: a hold this
+/// build cannot read is a preservation order a retention pass would walk past,
+/// and from the outside that is indistinguishable from one that was released.
+fn hold_row(reason: String, actor: &str, basis: &str) -> Result<super::HoldRow, StoreError> {
+    Ok(super::HoldRow {
+        reason,
+        by: super::decode_operator(actor, basis, "case_legal_holds")?,
+    })
+}
+
 pub(super) const CASE_SCHEMA: &str = "
 -- Every table here leads with the tenant, for the reason the journal schema
 -- gives: a key component turns a forgotten predicate into an empty result
@@ -112,11 +124,17 @@ CREATE TABLE IF NOT EXISTS case_blobs (
 CREATE INDEX IF NOT EXISTS case_blobs_time
     ON case_blobs (tenant, case_id, written_at);
 
+-- `by_actor` and `by_basis` are on the same footing as the reason: a
+-- preservation order the runtime cannot check is worth exactly the name beside
+-- it, and the basis says whether an authenticator produced that name or
+-- somebody holding the connection string typed it.
 CREATE TABLE IF NOT EXISTS case_legal_holds (
     tenant    TEXT   NOT NULL,
     case_id   TEXT   NOT NULL,
     placed_at BIGINT NOT NULL,
     reason    TEXT   NOT NULL,
+    by_actor  TEXT   NOT NULL,
+    by_basis  TEXT   NOT NULL,
     PRIMARY KEY (tenant, case_id),
     FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
@@ -340,12 +358,23 @@ CREATE TABLE IF NOT EXISTS quota_running (
 -- halt on the whole tenant are two rows rather than one flag the last writer
 -- wins. An incident that widens and then partly resolves is the ordinary shape,
 -- and a single overwritable flag gets it wrong in the direction that lets work
--- through. Values are 'tenant', 'agent:<metadata.name>' or
--- 'revision:<manifest digest>'.
+-- through. The scope spellings are the ones `HaltScope::parse` accepts, and
+-- they are not restated here: a grammar written twice is a grammar that loses a
+-- form the day one is added.
+--
+-- `by_actor` and `by_basis` are the whole evidentiary weight of the row. The
+-- runtime cannot check an emergency stop — there is no verdict to re-derive —
+-- so who asked, and what established that name, is the record. The basis is
+-- kept beside the name rather than inferred from the surface, because the same
+-- act arrives from an authenticated API caller and from somebody holding the
+-- database URL, and a reader years later cannot tell those apart from a name.
 CREATE TABLE IF NOT EXISTS quota_halted (
-    tenant      TEXT   NOT NULL,
-    scope       TEXT   NOT NULL,
-    reason      TEXT   NOT NULL,
+    tenant      TEXT        NOT NULL,
+    scope       TEXT        NOT NULL,
+    reason      TEXT        NOT NULL,
+    by_actor    TEXT        NOT NULL,
+    by_basis    TEXT        NOT NULL,
+    thrown_at   BIGINT      NOT NULL,
     PRIMARY KEY (tenant, scope)
 );
 
@@ -1302,14 +1331,17 @@ impl CaseStore for PostgresStore {
         // cannot move the instant or rewrite the reason.
         let placed = tx
             .execute(
-                "INSERT INTO case_legal_holds (tenant, case_id, placed_at, reason)
-                      VALUES ($1, $2, $3, $4)
+                "INSERT INTO case_legal_holds
+                      (tenant, case_id, placed_at, reason, by_actor, by_basis)
+                      VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT (tenant, case_id) DO NOTHING",
                 &[
                     &self.tenant_name(),
                     &case.to_string(),
                     &hold.placed_at.unix_timestamp(),
                     &hold.reason,
+                    &hold.by.actor(),
+                    &hold.by.basis().as_str(),
                 ],
             )
             .await
@@ -1344,18 +1376,18 @@ impl CaseStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let row = client
             .query_opt(
-                "SELECT placed_at, reason FROM case_legal_holds
+                "SELECT placed_at, reason, by_actor, by_basis FROM case_legal_holds
                   WHERE tenant = $1 AND case_id = $2",
                 &[&self.tenant_name(), &case.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
         row.map(|r| {
-            Ok(LegalHold {
-                placed_at: Timestamp::from_unix_timestamp(r.get::<_, i64>(0))
+            Ok(super::hold_from_row(
+                Timestamp::from_unix_timestamp(r.get::<_, i64>(0))
                     .map_err(|e| corrupt("unrepresentable placed_at", e))?,
-                reason: r.get(1),
-            })
+                hold_row(r.get(1), &r.get::<_, String>(2), &r.get::<_, String>(3))?,
+            ))
         })
         .transpose()
     }
@@ -1371,38 +1403,34 @@ impl CaseStore for PostgresStore {
         // would either repeat them or skip them depending on which side of the
         // boundary the page fell.
         let rows = match after {
-            Some(cursor) => {
-                client
-                    .query(
-                        "SELECT case_id, placed_at, reason FROM case_legal_holds
+            Some(cursor) => client
+                .query(
+                    "SELECT case_id, placed_at, reason, by_actor, by_basis FROM case_legal_holds
                           WHERE tenant = $1
                             AND (placed_at, case_id) > (
                                 SELECT placed_at, case_id FROM case_legal_holds
                                  WHERE tenant = $1 AND case_id = $2)
                           ORDER BY placed_at, case_id
                           LIMIT $3",
-                        &[
-                            &self.tenant_name(),
-                            &cursor.to_string(),
-                            &i64::try_from(limit).unwrap_or(i64::MAX),
-                        ],
-                    )
-                    .await
-            }
-            None => {
-                client
-                    .query(
-                        "SELECT case_id, placed_at, reason FROM case_legal_holds
+                    &[
+                        &self.tenant_name(),
+                        &cursor.to_string(),
+                        &i64::try_from(limit).unwrap_or(i64::MAX),
+                    ],
+                )
+                .await,
+            None => client
+                .query(
+                    "SELECT case_id, placed_at, reason, by_actor, by_basis FROM case_legal_holds
                           WHERE tenant = $1
                           ORDER BY placed_at, case_id
                           LIMIT $2",
-                        &[
-                            &self.tenant_name(),
-                            &i64::try_from(limit).unwrap_or(i64::MAX),
-                        ],
-                    )
-                    .await
-            }
+                    &[
+                        &self.tenant_name(),
+                        &i64::try_from(limit).unwrap_or(i64::MAX),
+                    ],
+                )
+                .await,
         }
         .map_err(|e| be(&e))?;
 
@@ -1410,11 +1438,11 @@ impl CaseStore for PostgresStore {
             .map(|r| {
                 Ok((
                     CaseId::parse(&r.get::<_, String>(0)).map_err(|e| corrupt("bad case id", e))?,
-                    LegalHold {
-                        placed_at: Timestamp::from_unix_timestamp(r.get::<_, i64>(1))
+                    super::hold_from_row(
+                        Timestamp::from_unix_timestamp(r.get::<_, i64>(1))
                             .map_err(|e| corrupt("unrepresentable placed_at", e))?,
-                        reason: r.get(2),
-                    },
+                        hold_row(r.get(2), &r.get::<_, String>(3), &r.get::<_, String>(4))?,
+                    ),
                 ))
             })
             .collect()

@@ -25,6 +25,53 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## Every operator act records who asked, and on what basis
+
+**Affected:** anyone calling `Runtime::set_halt`, `request_cancel`,
+`decide_quarantine` or `reconcile_effect`; anyone building a `LegalHold`;
+anyone scripting `agentplane halt` or `agentplane hold`; anyone parsing
+`cancellation_requested_by` or `decided_by` from the operator API.
+
+**Why.** The runtime cannot check an operator act — there is no verdict to
+re-derive and no policy that authorized the judgement — so the name beside it is
+the whole of its evidence. Two of those acts recorded no name at all: the
+emergency stop and the legal hold, both with the authenticated caller in scope
+at the call site and unused. The argument against recording it was that *who is
+acting comes from the identity on the request*, which is true and rules out
+reading a name from the request **body**; it does not follow that the name goes
+unrecorded, and the request is gone within the second while the row outlives the
+matter by years.
+
+**What to change.**
+
+- `Runtime::set_halt(&scope, &by, at, reason)` — the operator and the instant
+  are now arguments, and `reason` is no longer an `Option`. Lifting is
+  `Runtime::lift_halt(&scope)`, which answers whether one was standing.
+- `LegalHold { placed_at, reason, by }`.
+- `request_cancel`, `decide_quarantine` and `reconcile_effect` take
+  `&core::Operator` where they took `&str`. Build one with
+  `Operator::authenticated(..)` when an authenticator named the actor,
+  `Operator::asserted(..)` when somebody with the store typed it, or
+  `Operator::connected(..)` when the actor is a channel rather than a person.
+- `agentplane halt` and `agentplane hold` require `--actor` to place one. It is
+  recorded as *asserted*: nothing at a terminal verified it, and what it proves
+  is that whoever ran the command could open the store.
+- `cancellation_requested_by` and `decided_by` are `{actor, basis}` objects.
+  Two fields rather than a rendered sentence, because a client must not have to
+  parse the basis back out of prose.
+
+**What you get for it.** A reader of an old row can tell an act an identity
+provider vouched for from one somebody with the database URL asserted — the
+distinction a bare name silently collapses, and the one an incident review
+needs. A conclusion whose attribution record is missing now quarantines instead
+of being served under the name `"unknown"`.
+
+**Not retained, and stated so you do not look for it:** who *lifted* a halt.
+The row goes when the stop is lifted. Where the stop reached a running run, the
+run's own journal holds both halves.
+
+---
+
 ## Every CLI verb that opens a store takes `--tenant`, and `--store` takes a connection string
 
 **Affected:** anyone scripting `agentplane audit`, `export`, `drill`,

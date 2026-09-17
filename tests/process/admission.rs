@@ -825,7 +825,7 @@ impl JournalStore for BlindToKeys {
     async fn request_cancel(
         &self,
         run: agentplane::RunId,
-        actor: &str,
+        actor: &agentplane::core::Operator,
         reason: &str,
     ) -> Result<bool, agentplane::core::StoreError> {
         self.0.request_cancel(run, actor, reason).await

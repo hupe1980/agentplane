@@ -19,6 +19,14 @@ use agentplane::case::CaseStore;
 use agentplane::core::{CorrelationKey, LegalHold, Timestamp, erasure_scope};
 use agentplane::prelude::*;
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// Wall-clock instants for a fixture, outside any run. Real dates, because a
 /// retention window is the one thing here a reader checks against a calendar.
 fn at(secs: i64) -> Timestamp {
@@ -80,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &LegalHold {
                 placed_at: at(ORDERED),
                 reason: "preservation order 2026-114".to_owned(),
+                by: operator("compliance"),
             },
         )
         .await?;

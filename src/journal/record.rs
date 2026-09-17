@@ -407,6 +407,15 @@ pub enum RecordKind {
         subject: String,
         /// Why, in the operator's own words, carried from the halt.
         reason: String,
+        /// Who withdrew it, carried from the halt that did.
+        ///
+        /// A withdrawal is the one halt scope that reaches a run already
+        /// executing, so this record is the only durable trace of that act on
+        /// the run it stopped — and a pause nobody is named on cannot be asked
+        /// about afterwards. The basis travels with the name because the same
+        /// halt is thrown through an authenticated API and from a terminal
+        /// holding the store.
+        by: crate::core::Operator,
     },
 
     /// A run that was withheld was admitted to continue, the withdrawal having
@@ -499,7 +508,7 @@ pub enum RecordKind {
         /// Who decided. Required, and never derived from a session or a
         /// default — the whole weight of this record is that a named person
         /// took responsibility for a fact the runtime could not establish.
-        decider: String,
+        decider: crate::core::Operator,
         /// Why, in the words the next reader needs. What was checked, in which
         /// system, and what it said.
         reason: String,
@@ -559,7 +568,7 @@ pub enum RecordKind {
         /// the same record and the question *who decided this run could carry
         /// on* has no answer in the chain.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        asserted_by: Option<String>,
+        asserted_by: Option<crate::core::Operator>,
     },
 
     /// Policy approved a typed label improvement. The record binds the decision
@@ -587,7 +596,7 @@ pub enum RecordKind {
     /// "announced" and "recorded" manufactures the in-doubt case the effect
     /// protocol exists to avoid.
     RunCancelled {
-        actor: String,
+        actor: crate::core::Operator,
         reason: String,
     },
 
@@ -645,7 +654,7 @@ pub enum RecordKind {
     /// exists.
     BreakGlass {
         /// The authenticated operator, from the credential — never a body.
-        actor: String,
+        actor: crate::core::Operator,
         /// The roles that credential carried, so an auditor can see which
         /// grant was used rather than only which person.
         roles: Vec<String>,

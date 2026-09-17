@@ -1612,10 +1612,10 @@ let stranded = journal.abandoned_runs(100).await?;
 The listing empties as runs settle, which is what makes it a queue rather than a
 record of everything that ever ran.
 
-### The emergency stop
+### The emergency stop {#the-emergency-stop}
 
 Beside the ceilings sits a switch that is deliberately not one:
-`Runtime::set_halt(&scope, Some(reason))` stops **new work** from starting,
+`Runtime::set_halt(&scope, &by, at, reason)` stops **new work** from starting,
 across every instance, because the flag lives in the quota store rather than
 in the process — a stop that only stops the instance it was thrown on is the
 in-process-counter failure arriving during an incident. The refusal is its own
@@ -1654,10 +1654,30 @@ Both halves are journaled: `AuthorityWithheld` at the pause and
 last word.
 
 ```sh
-agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --reason "incident 42: looping"
+agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' \
+                 --reason "incident 42: looping" --actor ops-carol
 agentplane halts --store ./journal.redb          # what is stopped right now
 agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --lift
 ```
+
+`--scope` takes `tenant`, `agent:<metadata.name>`, `revision:<manifest digest>`
+or `subject:<delegation subject>` — the four forms `HaltScope::parse` accepts,
+and the refusal you get for a typo lists them.
+
+**`--actor` is required to throw one, and the row says it was *asserted*.** The
+runtime cannot check an emergency stop: there is no verdict to re-derive and no
+policy that authorized the judgement, so the whole of its evidentiary weight is
+the name beside it. Through the operator API that name comes from the credential
+the authenticator verified and is recorded as `authenticated`; at a terminal
+nothing verified it, and what it proves is that whoever ran the command could
+open the store. Both are legitimate — the second is how an incident is handled
+when the plane itself is the problem — and the row keeps them apart so a reader
+two years on is not left guessing which they are looking at.
+
+Lifting names nobody, because the row goes. What that costs is stated rather
+than papered over: **who lifted a stop is not retained.** Where the stop reached
+a run — the `subject:` scope, the one that does — the run's own journal holds
+both halves, with the operator from the halt on `AuthorityWithheld`.
 
 Those commands open the store, and `redb` admits one writer **process** — so
 against the file an `agentplane serve` is holding they fail, saying so in those
@@ -1672,7 +1692,8 @@ curl -sX POST "$PLANE/halts/lift" -H "authorization: Bearer $TOKEN" \
      -d '{"scope":"agent:payments-clerk"}'
 
 # 2. On the shared store, the CLI and a serving plane coexist.
-agentplane halt --store "$DATABASE_URL" --tenant acme                 --scope 'agent:payments-clerk' --reason "incident 42"
+agentplane halt --store "$DATABASE_URL" --tenant acme \
+                --scope 'agent:payments-clerk' --reason "incident 42" --actor ops-carol
 ```
 
 Throwing the stop and lifting it are **separate capabilities** —
@@ -1753,7 +1774,7 @@ whether a run id exists by comparing a `400` against a `404`.
 | Route | The question it answers |
 |---|---|
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
-| `GET /runs/live` | What is executing **right now**, and under whose authority? Each entry carries the agent, the revision and the delegation subject — because an incident is usually a bad deploy or a withdrawn credential, not a run id. `stranded` marks a slot whose lease lapsed: the recovery sweep's to resume, not yours to cancel |
+| `GET /runs/live` | What is executing **right now**, and under whose authority? Each entry carries the agent, the revision and the delegation subject, and `stranded` marks a lapsed lease → [the emergency stop](#the-emergency-stop) |
 | `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end, and on whose decision? |
 | `GET /runs/{run}/history` | What did it actually *do*? The journal, record by record, from `?from=<seq>` |
 | `GET /tasks` | What is waiting for me? |

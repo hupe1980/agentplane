@@ -144,6 +144,25 @@ def main() -> int:
         # is not a surface a design document should be citing either.
         surface.update(re.findall(r"::([A-Z][A-Za-z0-9]*)", body))
 
+    # Module paths are the half the type rule cannot see. `netguard::intake`,
+    # `journal::payload` and `core::canon` are cited here as often as types are,
+    # and a lowercase first segment does not match the pattern below — so a
+    # module renamed or a helper moved leaves the citation reading as current.
+    # Scoped to first segments this crate actually has a module for, which makes
+    # somebody else's lowercase vocabulary skip without an exemption list.
+    modules = {p.stem for p in (ROOT.parent / "src").rglob("*.rs")}
+    modules |= {d.name for d in (ROOT.parent / "src").iterdir() if d.is_dir()}
+    for name, text in docs.items():
+        for m in re.finditer(r"`([a-z_][a-z0-9_]*)::([a-z_][A-Za-z0-9_]*)`", text):
+            module, item = m.group(1), m.group(2)
+            if module not in modules or item in surface or item in modules:
+                continue
+            line = text[: m.start()].count("\n") + 1
+            faults.append(
+                f"{name}:{line}: `{module}::{item}` names a module this crate has "
+                f"and an item it does not"
+            )
+
     for name, text in docs.items():
         for m in re.finditer(r"`([A-Z][A-Za-z0-9]*)::([A-Za-z_][A-Za-z0-9_]*)`", text):
             ty, member = m.group(1), m.group(2)

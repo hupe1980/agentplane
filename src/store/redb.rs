@@ -134,7 +134,8 @@ const SEAL_LOG: TableDefinition<(&str, u64), &str> = TableDefinition::new("seal_
 /// Keyed by run, so the request is idempotent and a retry cannot overwrite who
 /// intervened. Deliberately not fenced: whoever wants a run stopped is not its
 /// owner, holds no epoch, and is usually asking because the owner is busy.
-const RUN_CANCEL: TableDefinition<&str, (&str, &str, u64)> = TableDefinition::new("run_cancel");
+const RUN_CANCEL: TableDefinition<&str, (&str, &str, &str, u64)> =
+    TableDefinition::new("run_cancel");
 
 /// The next log position to hand out. `MAX + 1` over a table that keeps its gaps
 /// would reuse a removed run's slot.
@@ -1542,11 +1543,15 @@ impl JournalStore for RedbStore {
     async fn request_cancel(
         &self,
         run: RunId,
-        actor: &str,
+        actor: &crate::core::Operator,
         reason: &str,
     ) -> Result<bool, StoreError> {
         let key = self.run_key(run);
-        let (actor, reason) = (actor.to_owned(), reason.to_owned());
+        let (who, basis, reason) = (
+            actor.actor().to_owned(),
+            actor.basis().as_str(),
+            reason.to_owned(),
+        );
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let first = {
@@ -1556,8 +1561,11 @@ impl JournalStore for RedbStore {
                 if t.get(key.as_str()).map_err(|e| be(&e))?.is_some() {
                     false
                 } else {
-                    t.insert(key.as_str(), (actor.as_str(), reason.as_str(), now_secs()))
-                        .map_err(|e| be(&e))?;
+                    t.insert(
+                        key.as_str(),
+                        (who.as_str(), basis, reason.as_str(), now_secs()),
+                    )
+                    .map_err(|e| be(&e))?;
                     true
                 }
             };
@@ -1572,13 +1580,16 @@ impl JournalStore for RedbStore {
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(RUN_CANCEL).map_err(|e| be(&e))?;
-            Ok(t.get(key.as_str()).map_err(|e| be(&e))?.map(|v| {
-                let (actor, reason, _) = v.value();
-                Cancellation {
-                    actor: actor.to_owned(),
-                    reason: reason.to_owned(),
-                }
-            }))
+            t.get(key.as_str())
+                .map_err(|e| be(&e))?
+                .map(|v| {
+                    let (who, basis, reason, _) = v.value();
+                    Ok(Cancellation {
+                        actor: super::decode_operator(who, basis, "run_cancel")?,
+                        reason: reason.to_owned(),
+                    })
+                })
+                .transpose()
         })
         .await
     }

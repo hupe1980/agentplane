@@ -25,7 +25,23 @@ use agentplane::core::{
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{BatchSpec, Runtime, StepCtx};
 use agentplane::store::RedbStore;
+
 use serde_json::{Value, json};
+
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
+/// A fixed instant, because every lifecycle instant in this crate is the
+/// caller's and a fixture that read the clock could not be tested against an
+/// ageing plane.
+fn test_instant() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("a fixed instant")
+}
 
 /// Every settlement that actually reached the world, in order.
 type World = Arc<Mutex<Vec<String>>>;
@@ -225,9 +241,14 @@ async fn a_halt_mid_batch_stops_the_pass_without_failing_the_items() {
     let id = BatchId::generate();
     let spec = BatchSpec::new(plan(), Arc::new(Keys::upto(3)));
 
-    rt.set_halt(&HaltScope::Tenant, Some("incident 42"))
-        .await
-        .expect("halt");
+    rt.set_halt(
+        &HaltScope::Tenant,
+        &operator("ops"),
+        test_instant(),
+        "incident 42",
+    )
+    .await
+    .expect("halt");
     let stopped = rt.run_batch(id, &spec).await;
     assert!(
         matches!(
@@ -247,7 +268,7 @@ async fn a_halt_mid_batch_stops_the_pass_without_failing_the_items() {
         "a halted plane performed work"
     );
 
-    rt.set_halt(&HaltScope::Tenant, None).await.expect("lift");
+    rt.lift_halt(&HaltScope::Tenant).await.expect("lift");
     let report = rt
         .run_batch(id, &spec)
         .await

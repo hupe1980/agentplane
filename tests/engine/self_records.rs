@@ -15,6 +15,14 @@ use agentplane::journal::JournalStore;
 use agentplane::runtime::{RunStatus, Runtime};
 use agentplane::store::RedbStore;
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 fn plane() -> (Arc<Runtime>, Arc<RedbStore>) {
     let store = Arc::new(RedbStore::open_in_memory().expect("a store"));
     let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>).build();
@@ -32,7 +40,7 @@ async fn a_break_glass_crossing_names_who_crossed() {
     let (runtime, _store) = plane();
     let run = runtime
         .record_break_glass(
-            "ops:hupe",
+            &operator("ops:hupe"),
             &["admin".to_owned()],
             "INC-42: stuck settlement",
         )
@@ -53,7 +61,7 @@ async fn a_break_glass_crossing_names_who_crossed() {
     );
     assert_eq!(
         outcome.status.actor(),
-        Some("ops:hupe"),
+        Some(&operator("ops:hupe")),
         "a crossing must name the operator who made it: {:?}",
         outcome.status
     );

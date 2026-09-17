@@ -133,28 +133,50 @@ impl QuotaStore for RedbStore {
         })
     }
 
-    async fn set_halt(&self, scope: &HaltScope, reason: Option<&str>) -> Result<(), StoreError> {
+    async fn set_halt(
+        &self,
+        scope: &HaltScope,
+        by: &crate::core::Operator,
+        at: crate::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let scope = scope.key();
-        let reason = reason.map(ToOwned::to_owned);
+        // Encoded through the one row type both backends share, so a field
+        // added to a halt cannot reach one store and miss the other.
+        let row = serde_json::to_string(&super::HaltRow {
+            reason: reason.to_owned(),
+            by: by.clone(),
+            at,
+        })
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
         self.with_db(move |db| {
             let w = begin_write(db)?;
             {
                 let mut halted = w.open_table(HALTED).map_err(|e| be(&e))?;
-                match &reason {
-                    Some(reason) => {
-                        halted
-                            .insert((tenant.as_str(), scope.as_str()), reason.as_str())
-                            .map_err(|e| be(&e))?;
-                    }
-                    None => {
-                        halted
-                            .remove((tenant.as_str(), scope.as_str()))
-                            .map_err(|e| be(&e))?;
-                    }
-                }
+                halted
+                    .insert((tenant.as_str(), scope.as_str()), row.as_str())
+                    .map_err(|e| be(&e))?;
             }
             w.commit().map_err(|e| be(&e))
+        })
+        .await
+    }
+
+    async fn lift_halt(&self, scope: &HaltScope) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let scope = scope.key();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let standing = {
+                let mut halted = w.open_table(HALTED).map_err(|e| be(&e))?;
+                halted
+                    .remove((tenant.as_str(), scope.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_some()
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(standing)
         })
         .await
     }
@@ -173,7 +195,7 @@ impl QuotaStore for RedbStore {
                 .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
                 .map_err(|e| be(&e))?
             {
-                let (key, reason) = entry.map_err(|e| be(&e))?;
+                let (key, row) = entry.map_err(|e| be(&e))?;
                 let stored = key.value().1.to_owned();
                 // Corruption, not a row to skip. A halt this build cannot read
                 // is one it would otherwise run straight through, and from the
@@ -185,10 +207,18 @@ impl QuotaStore for RedbStore {
                          read — refusing rather than admitting work an operator stopped"
                     ),
                 })?;
-                out.push(Halt {
-                    scope,
-                    reason: reason.value().to_owned(),
-                });
+                // The row is held to the same standard as the scope: a halt
+                // whose operator this build cannot read is still a halt, and
+                // guessing at who threw it is worse than refusing.
+                let row: super::HaltRow =
+                    serde_json::from_str(row.value()).map_err(|e| StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!(
+                            "quota_halted holds a row for '{stored}' this build cannot read \
+                             ({e}) — refusing rather than admitting work an operator stopped"
+                        ),
+                    })?;
+                out.push(super::halt_from_row(scope, row));
             }
             Ok(out)
         })

@@ -588,9 +588,14 @@ async fn a_pending_stop_is_visible_on_the_run() {
     .await;
 
     let (_, after) = send(&router, get(&format!("/runs/{run}"), Some("bob"))).await;
+    // Two fields, not a rendered sentence: an operator reading a name needs to
+    // know whether an authenticator produced it or whether somebody holding the
+    // store typed it, and a client must not have to parse that back out of
+    // prose.
     assert_eq!(
-        after["cancellation_requested_by"], "bob",
-        "an operator cannot see that a stop is standing against this run: {after}"
+        after["cancellation_requested_by"],
+        json!({ "actor": "bob", "basis": "authenticated" }),
+        "an operator cannot see who asked for the stop, or on what basis: {after}"
     );
 }
 

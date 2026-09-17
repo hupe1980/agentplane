@@ -30,6 +30,14 @@ use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 type World = Arc<Mutex<Vec<String>>>;
 
 /// Records what it did, so a test can ask whether it was undone.
@@ -169,9 +177,13 @@ async fn stopping_a_suspended_run_undoes_what_it_did() {
     assert_eq!(*f.world.lock().unwrap(), vec!["posted".to_string()]);
 
     let fresh =
-        f.rt.request_cancel(run, "ops-carol", "counterparty withdrew the dispute")
-            .await
-            .unwrap();
+        f.rt.request_cancel(
+            run,
+            &operator("ops-carol"),
+            "counterparty withdrew the dispute",
+        )
+        .await
+        .unwrap();
     assert!(fresh, "the first stop request must be the one recorded");
 
     // The run is over, and the posting was reversed. A stop that leaves the
@@ -195,7 +207,7 @@ async fn stopping_a_suspended_run_undoes_what_it_did() {
 async fn the_intervention_is_on_the_record() {
     let f = fixture(PostsThenWaits);
     let run = suspended_run(&f, "demo.post").await;
-    f.rt.request_cancel(run, "ops-carol", "counterparty withdrew")
+    f.rt.request_cancel(run, &operator("ops-carol"), "counterparty withdrew")
         .await
         .unwrap();
 
@@ -210,7 +222,7 @@ async fn the_intervention_is_on_the_record() {
             _ => None,
         })
         .expect("the stop must be journaled, not only requested");
-    assert_eq!(cancelled.0, "ops-carol");
+    assert_eq!(cancelled.0, operator("ops-carol"));
     assert_eq!(cancelled.1, "counterparty withdrew");
 
     // And the chain still verifies with it in.
@@ -226,14 +238,25 @@ async fn the_first_asker_owns_the_intervention() {
     let f = fixture(PostsThenWaits);
     let run = suspended_run(&f, "demo.post").await;
 
-    assert!(f.rt.request_cancel(run, "alice", "first").await.unwrap());
     assert!(
-        !f.rt.request_cancel(run, "bob", "second").await.unwrap(),
+        f.rt.request_cancel(run, &operator("alice"), "first")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !f.rt
+            .request_cancel(run, &operator("bob"), "second")
+            .await
+            .unwrap(),
         "a second request reported itself as the intervention of record"
     );
 
     let c = f.rt.cancellation(run).await.unwrap().unwrap();
-    assert_eq!(c.actor, "alice", "the record names the wrong person");
+    assert_eq!(
+        c.actor,
+        operator("alice"),
+        "the record names the wrong person"
+    );
 }
 
 /// A stopped run stays stopped.
@@ -245,7 +268,7 @@ async fn the_first_asker_owns_the_intervention() {
 async fn a_stopped_run_is_not_resumed_by_a_later_event() {
     let f = fixture(PostsThenWaits);
     let run = suspended_run(&f, "demo.post").await;
-    f.rt.request_cancel(run, "ops-carol", "withdrawn")
+    f.rt.request_cancel(run, &operator("ops-carol"), "withdrawn")
         .await
         .unwrap();
     let after_stop = f.world.lock().unwrap().clone();
@@ -354,7 +377,7 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
         .tasks(db.clone() as Arc<dyn TaskStore>)
         .skill(PostsThenWaits)
         .build();
-    rt.request_cancel(run, "ops-carol", "just stop it")
+    rt.request_cancel(run, &operator("ops-carol"), "just stop it")
         .await
         .unwrap();
 
@@ -375,7 +398,7 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
 async fn stopping_an_unknown_run_is_refused_rather_than_silently_accepted() {
     let f = fixture(PostsThenWaits);
     let err =
-        f.rt.request_cancel(RunId::generate(), "ops", "typo in the id")
+        f.rt.request_cancel(RunId::generate(), &operator("ops"), "typo in the id")
             .await;
     assert!(
         err.is_err(),
@@ -427,7 +450,7 @@ async fn stopping_a_finished_run_does_not_reopen_it() {
         .unwrap();
     assert!(matches!(out.status, RunStatus::Succeeded));
 
-    rt.request_cancel(out.run_id, "ops", "too late")
+    rt.request_cancel(out.run_id, &operator("ops"), "too late")
         .await
         .unwrap();
     let after = rt.replay(out.run_id, Mode::Resume).await.unwrap();
@@ -500,14 +523,17 @@ async fn cancelling_a_running_run_acknowledges_and_lands_at_the_boundary() {
 
     // The stop request returns promptly with an acknowledgement, while the
     // step is still mid-flight and the owner holds the lease.
-    let fresh = rt.request_cancel(run, "ops", "stop it").await.unwrap();
+    let fresh = rt
+        .request_cancel(run, &operator("ops"), "stop it")
+        .await
+        .unwrap();
     assert!(fresh, "the first stop request records");
 
     // The owner reaches its next boundary and observes the stop.
     proceed.store(true, Ordering::SeqCst);
     let out = running.await.unwrap().unwrap();
     assert!(
-        matches!(out.status, RunStatus::Cancelled { ref actor, .. } if actor == "ops"),
+        matches!(out.status, RunStatus::Cancelled { ref actor, .. } if actor.actor() == "ops"),
         "the running owner did not observe the durable stop at its boundary: {:?}",
         out.status
     );

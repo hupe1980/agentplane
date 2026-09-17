@@ -27,6 +27,21 @@ use crate::core::{
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
 
+/// A hold row, or corruption.
+///
+/// A hold this build cannot read is a preservation order it would otherwise
+/// walk straight past, which from the outside is indistinguishable from one
+/// that was released — so an unreadable row refuses rather than defaults.
+fn decode_hold(row: &str) -> Result<super::HoldRow, StoreError> {
+    serde_json::from_str(row).map_err(|e| StoreError::Corrupt {
+        seq: 0,
+        detail: format!(
+            "case_legal_holds holds a row this build cannot read ({e}) — refusing rather \
+             than letting a retention pass reach a matter somebody preserved"
+        ),
+    })
+}
+
 /// What a case row holds: `kind`, `status`, `state`, `version`, `opened_at`.
 type CaseRow<'a> = (&'a str, &'a str, &'a str, u64, i64);
 
@@ -1451,7 +1466,11 @@ impl CaseStore for RedbStore {
     async fn place_hold(&self, case: CaseId, hold: &LegalHold) -> Result<bool, StoreError> {
         let tenant = self.tenant_name();
         let key = case.to_string();
-        let (at, reason) = (ts(hold.placed_at), hold.reason.clone());
+        let at = ts(hold.placed_at);
+        // Encoded through the one row type both backends share, so a field
+        // added to a hold cannot reach one store and miss the other.
+        let row = serde_json::to_string(&super::hold_row(hold))
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let placed = {
@@ -1471,7 +1490,7 @@ impl CaseStore for RedbStore {
                 {
                     false
                 } else {
-                    h.insert((tenant.as_str(), key.as_str()), (at, reason.as_str()))
+                    h.insert((tenant.as_str(), key.as_str()), (at, row.as_str()))
                         .map_err(|e| be(&e))?;
                     let mut idx = w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
                     idx.insert((tenant.as_str(), at, key.as_str()), ())
@@ -1531,18 +1550,13 @@ impl CaseStore for RedbStore {
                 Ok(t.get((tenant.as_str(), key.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|v| {
-                        let (at, reason) = v.value();
-                        (at, reason.to_owned())
+                        let (at, row) = v.value();
+                        (at, row.to_owned())
                     }))
             })
             .await?;
-        row.map(|(at, reason)| {
-            Ok(LegalHold {
-                placed_at: from_ts(at)?,
-                reason,
-            })
-        })
-        .transpose()
+        row.map(|(at, row)| Ok(super::hold_from_row(from_ts(at)?, decode_hold(&row)?)))
+            .transpose()
     }
 
     async fn holds(
@@ -1609,13 +1623,10 @@ impl CaseStore for RedbStore {
                     }
                 })
                 .await?;
-            if let Some(reason) = reason {
+            if let Some(row) = reason {
                 held.push((
                     parse_case_id(&id)?,
-                    LegalHold {
-                        placed_at: from_ts(at)?,
-                        reason,
-                    },
+                    super::hold_from_row(from_ts(at)?, decode_hold(&row)?),
                 ));
             }
         }

@@ -98,9 +98,18 @@ impl QuotaStore for FailsFirstSettlement {
     async fn set_halt(
         &self,
         scope: &agentplane::quota::HaltScope,
-        reason: Option<&str>,
+        by: &agentplane::core::Operator,
+        at: agentplane::core::Timestamp,
+        reason: &str,
     ) -> Result<(), agentplane::core::StoreError> {
-        self.inner.set_halt(scope, reason).await
+        self.inner.set_halt(scope, by, at, reason).await
+    }
+
+    async fn lift_halt(
+        &self,
+        scope: &agentplane::quota::HaltScope,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.lift_halt(scope).await
     }
 
     async fn halts(&self) -> Result<Vec<agentplane::quota::Halt>, agentplane::core::StoreError> {
@@ -602,7 +611,9 @@ spec:
 
     rt.set_halt(
         &HaltScope::agent("payments-clerk"),
-        Some("incident 42: agent 12 is looping"),
+        &operator("ops"),
+        test_instant(),
+        "incident 42: agent 12 is looping",
     )
     .await
     .expect("halt one agent");
@@ -644,10 +655,15 @@ spec:
     // lifting the agent's, must leave the tenant's standing — an incident that
     // widens and then partly resolves is the ordinary shape, and one
     // overwritable flag gets it wrong in the direction that lets work through.
-    rt.set_halt(&HaltScope::Tenant, Some("incident 42 widened"))
-        .await
-        .expect("widen");
-    rt.set_halt(&HaltScope::agent("payments-clerk"), None)
+    rt.set_halt(
+        &HaltScope::Tenant,
+        &operator("ops"),
+        test_instant(),
+        "incident 42 widened",
+    )
+    .await
+    .expect("widen");
+    rt.lift_halt(&HaltScope::agent("payments-clerk"))
         .await
         .expect("narrow the stop");
     match rt.run("support.do", Tainted::trusted(json!({}))).await {
@@ -657,7 +673,7 @@ spec:
         other => panic!("lifting a narrow halt lifted the broad one under it: {other:?}"),
     }
 
-    rt.set_halt(&HaltScope::Tenant, None).await.expect("lift");
+    rt.lift_halt(&HaltScope::Tenant).await.expect("lift");
     assert_eq!(
         rt.run("pay.do", Tainted::trusted(json!({})))
             .await
@@ -713,7 +729,9 @@ spec:
     running_broken
         .set_halt(
             &HaltScope::revision(broken.digest().expect("digest")),
-            Some("incident 42: this revision double-posts"),
+            &operator("ops"),
+            test_instant(),
+            "incident 42: this revision double-posts",
         )
         .await
         .expect("halt one revision");
@@ -769,7 +787,9 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
 
     one.set_halt(
         &agentplane::quota::HaltScope::Tenant,
-        Some("incident 42: ledger reconciliation is wrong"),
+        &operator("ops"),
+        test_instant(),
+        "incident 42: ledger reconciliation is wrong",
     )
     .await
     .expect("halt");
@@ -807,7 +827,7 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
         "halting one tenant stopped another"
     );
 
-    one.set_halt(&agentplane::quota::HaltScope::Tenant, None)
+    one.lift_halt(&agentplane::quota::HaltScope::Tenant)
         .await
         .expect("lift");
     assert_eq!(
@@ -1353,7 +1373,9 @@ async fn a_halt_can_name_the_authority_a_run_acts_for() {
 
     rt.set_halt(
         &HaltScope::subject("alice"),
-        Some("credential withdrawn: laptop lost"),
+        &operator("ops"),
+        test_instant(),
+        "credential withdrawn: laptop lost",
     )
     .await
     .expect("withdraw an authority");
@@ -1393,7 +1415,7 @@ async fn a_halt_can_name_the_authority_a_run_acts_for() {
         .expect("the plane's own chain is not the withdrawn one");
 
     // Lifting restores it.
-    rt.set_halt(&HaltScope::subject("alice"), None)
+    rt.lift_halt(&HaltScope::subject("alice"))
         .await
         .expect("lift");
     rt.run_under(
@@ -1410,6 +1432,21 @@ use agentplane::core::{
     RetryPolicy, StepId,
 };
 use agentplane::quota::HaltScope;
+
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
+/// A fixed instant, because every lifecycle instant in this crate is the
+/// caller's and a fixture that read the clock could not be tested against an
+/// ageing plane.
+fn test_instant() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("a fixed instant")
+}
 
 /// A mutating effect, so a completed step has something to reverse.
 #[derive(Debug)]
@@ -1469,7 +1506,9 @@ impl Skill for Charges {
             self.0
                 .set_halt(
                     &HaltScope::subject("alice"),
-                    Some("credential withdrawn: laptop lost"),
+                    &operator("ops"),
+                    test_instant(),
+                    "credential withdrawn: laptop lost",
                 )
                 .await
                 .expect("withdraw mid-run");
@@ -1620,7 +1659,7 @@ async fn a_lifted_withdrawal_lets_a_withheld_run_continue() {
     );
 
     // Lifted, and the run continues from where it stopped.
-    rt.set_halt(&HaltScope::subject("alice"), None)
+    rt.lift_halt(&HaltScope::subject("alice"))
         .await
         .expect("lift");
     let restored = rt

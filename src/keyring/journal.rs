@@ -296,7 +296,7 @@ impl JournalStore for SealedJournal {
     async fn request_cancel(
         &self,
         run: RunId,
-        actor: &str,
+        actor: &crate::core::Operator,
         reason: &str,
     ) -> Result<bool, StoreError> {
         self.inner.request_cancel(run, actor, reason).await

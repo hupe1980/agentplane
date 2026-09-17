@@ -54,6 +54,14 @@ use agentplane::core::{
 use agentplane::prelude::*;
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// A capture that times out, and a provider that cannot say what happened.
 #[derive(Debug, Clone)]
 struct Capture {
@@ -260,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let same =
         p.rt.decide_quarantine(
             run,
-            "ada",
+            &operator("ada"),
             "had a look, seems fine",
             QuarantineDecision::Reopen,
         )
@@ -275,14 +283,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run,
         doubts[0].effect,
         Assertion::Landed(json!({ "charge": "ch_9RtQ", "captured": true })),
-        "ada",
+        &operator("ada"),
         "charge ch_9RtQ exists in the provider console, created 12:41Z",
     )
     .await?;
     let done =
         p.rt.decide_quarantine(
             run,
-            "ada",
+            &operator("ada"),
             "the charge is in the provider's ledger",
             QuarantineDecision::Reopen,
         )
@@ -303,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let closed =
         q.rt.decide_quarantine(
             lost,
-            "ada",
+            &operator("ada"),
             "two weeks of provider tickets; nobody can say",
             QuarantineDecision::Abandon,
         )

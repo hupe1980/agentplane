@@ -27,6 +27,14 @@ use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 fn store() -> Arc<RedbStore> {
     Arc::new(RedbStore::open_in_memory().unwrap())
 }
@@ -680,7 +688,9 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
     // The operator stops the run. The stop must quarantine rather than unwind:
     // step 1's mutation may or may not stand, and compensating step 0 around
     // it undoes everything except the one thing nobody can account for.
-    rt.request_cancel(run, "ops", "stop it").await.unwrap();
+    rt.request_cancel(run, &operator("ops"), "stop it")
+        .await
+        .unwrap();
 
     assert_eq!(
         undone.load(Ordering::SeqCst),

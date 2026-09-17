@@ -351,7 +351,7 @@ mutant must be caught by the *specific* invariant written for it.
 normative prose, and `tools/verify_export.py` is written from it and reads none
 of this crate's Rust — enforced by a guard, because a verifier that consulted
 `src/` would agree with the implementation by construction. `just verify-golden`
-runs it: it **re-derives** all 27 record vectors from their parsed values with
+runs it: it **re-derives** all 29 record vectors from their parsed values with
 its own canonicalizer and chain digest, verifies the sealed export end to end,
 and then damages that export six ways and asserts each is reported. Vectors a
 project generates and then checks are that project agreeing with itself; this
@@ -393,15 +393,12 @@ APIs. They are gated twice — an explicit `AGENTPLANE_LIVE=1`
 *and* a key — because a credential being available is not a decision to spend
 money with it, and they are never part of `ci`. They exist because a stubbed
 provider is structurally unable to have the defects a real one finds: it never
-rejects a malformed request and never returns a shape the driver mis-reads.
-What they catch had passed every offline test — including a plan format no
-provider with constrained decoding accepts, which left the dual-model execution
-kind unable to run for real at all. The Gemini
-battery is the sharpest case: a **thought signature** is minted and validated by
-Google, so a canned server accepts whatever a fixture tells it to and says
-nothing about whether Gemini takes the signature back — the one check that
-distinguishes a driver carrying the model's turn verbatim from one rebuilding
-it, which is where the rest of the ecosystem has been losing this.
+rejects a malformed request and never returns a shape the driver mis-reads. The
+Gemini battery is the sharpest case — a **thought signature** is minted and
+validated by Google, so a canned server accepts whatever a fixture tells it to
+and says nothing about whether Gemini takes the signature back, which is the one
+check distinguishing a driver that carries the model's turn verbatim from one
+rebuilding it.
 
 **🧬 Mutation testing over the code.** Every load-bearing guarantee is broken on
 purpose, and the test *named for each one* must fail. A mutation caught by some other test is

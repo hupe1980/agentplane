@@ -2550,8 +2550,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/executor.rs",
         "a_stopped_run_is_not_resumed_by_a_later_event",
         "a stopped run is resumed by the next event and carries on",
-        '        "cancelled" => Some(RunStatus::Cancelled {',
-        '        "cancelled" if false => Some(RunStatus::Cancelled {',
+        '        "cancelled" => Some(recorded_canceller(records).map_or_else(',
+        '        "cancelled" if false => Some(recorded_canceller(records).map_or_else(',
     ),
     "AStopRequestOverwritesTheAsker": (
         "src/store/redb.rs",
@@ -5994,12 +5994,17 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "every later checkpoint attests — the failure the 'a conclusion is not "
         "a closure' work removed for `failed`, reachable again the moment the "
         "sealing set and the resumable set disagree",
-        '        "abandoned" => Some(RunStatus::Abandoned {\n'
-        '            actor: recorded_decider(records).unwrap_or_else(|| "unknown".into()),\n'
-        '            reason: "recorded as abandoned; its outcome was never established and nothing was \\\n'
-        '                     unwound"\n'
-        "                .into(),\n"
-        "        }),",
+        '        "abandoned" => Some(recorded_decider(records).map_or_else(\n'
+        "            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),\n"
+        "            |actor| {\n"
+        "                RunStatus::Abandoned {\n"
+        "                    actor,\n"
+        '                    reason: "recorded as abandoned; its outcome was never established and nothing \\\n'
+        '                         was unwound"\n'
+        "                        .into(),\n"
+        "                }\n"
+        "            },\n"
+        "        )),",
         '        "abandoned" => None,',
     ),
     "TheLiveAnswerHasItsOwnStateMapping": (
@@ -6138,8 +6143,33 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "break_glass_without_a_reason_is_refused",
         "a break-glass with no stated reason is accepted, recording an "
         "exception that explains nothing",
-        "        if reason.trim().is_empty() {",
-        "        if false {",
+        "    ) -> Result<RunId, RuntimeError> {\n        if reason.trim().is_empty() {",
+        "    ) -> Result<RunId, RuntimeError> {\n        if false {",
+    ),
+    "AnEndingIsGivenAName": (
+        "src/runtime/executor.rs",
+        "an_ending_with_no_attribution_record_is_not_given_a_name",
+        "a conclusion whose attribution record is missing is served under a "
+        "fabricated operator name instead of being quarantined — and a "
+        "fabricated actor is indistinguishable from a real operator with that "
+        "name on the surface an incident review reads",
+        '        "cancelled" => recorded_canceller(records).map_or_else(\n'
+        "            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),",
+        '        "cancelled" => recorded_canceller(records).map_or_else(\n'
+        '            || RunStatus::Cancelled {\n'
+        '                actor: crate::core::Operator::asserted("unknown").expect("a name"),\n'
+        "                reason: said(),\n"
+        "            },",
+    ),
+    "AHaltForgetsHowItsOperatorWasNamed": (
+        "src/store/redb_quota.rs",
+        "redb_satisfies_the_quota_store_contract",
+        "every emergency stop is stored as though the name on it had been "
+        "typed at a terminal, so a halt an authenticator attributed and one "
+        "somebody with the database URL asserted read back identically — the "
+        "distinction the row exists to keep",
+        "            by: by.clone(),",
+        '            by: crate::core::Operator::asserted(by.actor()).expect("a name"),',
     ),
     "ACheckpointNoteIsReadLineByLine": (
         "src/journal/store.rs",
@@ -6729,9 +6759,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "being a failure to access — which is the whole of the control",
         """        // The record first, and the plane only if it landed.
         plane
-            .record_break_glass(&caller.actor, &caller.roles, reason)
-            .await?;
-        Ok(plane)""",
+            .record_break_glass(""",
         """        let _ = plane
             .record_break_glass(&caller.actor, &caller.roles, reason)
             .await;
@@ -6869,8 +6897,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "itself reads back as quarantined with 'this build does not recognise "
         "it' in place of the operator's reason — on the one surface the docs "
         "send an incident review to",
-        """        BREAK_GLASS_OUTCOME => RunStatus::BrokeGlass {""",
-        """        "never-written-by-this-build" => RunStatus::BrokeGlass {""",
+        """        BREAK_GLASS_OUTCOME => recorded_crosser(records).map_or_else(""",
+        """        "never-written-by-this-build" => recorded_crosser(records).map_or_else(""",
     ),
     "ACrossingIsAnonymous": (
         "src/runtime/executor.rs",
@@ -8102,7 +8130,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a person's assertion is journaled as if the effect's own probe had "
         "answered, so 'the provider told us' and 'somebody asserted it' are "
         "the same record and nobody can tell which decided a run could carry on",
-        """                asserted_by: Some(asserted_by.to_owned()),""",
+        """                asserted_by: Some(asserted_by.clone()),""",
         """                asserted_by: None,""",
     ),
     "AnAbandonedDoubtIsNotAFinding": (

@@ -120,11 +120,15 @@ impl CaseStatus {
 /// A held matter still closes: one field for both would either end the hold when
 /// the work does, or make closure unreachable and strand [`Deadline`].
 ///
-/// The reason is required for the reason every erasure verb takes one — a
-/// preservation nobody can account for is indistinguishable from a sweep that
-/// quietly stopped working. There is deliberately no `placed_by`: who is acting
-/// comes from the identity on the request, and a self-asserted name would be a
-/// second, unenforced answer to what the caller's credential already settles.
+/// The reason and the [`Operator`] are both required, for the same reason every
+/// erasure verb takes a reason: the runtime cannot check a preservation order,
+/// so the row is worth exactly what it says. A hold nobody can account for is
+/// indistinguishable from a sweep that quietly stopped working, and one nobody
+/// is named on cannot be asked about. The name comes from the credential an
+/// authenticator verified or from whoever opened the store — never from the
+/// request body, which is the requester's own word.
+///
+/// [`Operator`]: crate::core::Operator
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegalHold {
     /// When the hold was placed. Supplied by the caller, never read from a
@@ -136,6 +140,8 @@ pub struct LegalHold {
     /// Why this matter may not be destroyed. Free text, and load-bearing: it is
     /// what the person reviewing the hold listing months later has to act on.
     pub reason: String,
+    /// Who placed it, and what established the name.
+    pub by: crate::core::Operator,
 }
 
 /// A long-lived, correlated business fact.

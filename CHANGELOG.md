@@ -16,7 +16,67 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.38.0] — unreleased
+## [0.39.0] — unreleased
+
+### Added
+
+- **`core::Operator` — who asked for an operator act, and what established the
+  name.** `Basis` is `authenticated` (a credential named them), `asserted`
+  (somebody with the store typed it) or `connected` (the party on a connection
+  this runtime accepted, named by the channel). It is stored, never inferred
+  from the surface an act arrived on.
+- **`QuotaStore::lift_halt`**, so throwing a stop and lifting one are separate
+  verbs rather than one call taking an `Option`. It answers whether a halt was
+  standing — during an incident, *I cleared it* and *I cleared the wrong scope*
+  are different facts.
+- **`HaltScope::FORMS`** — the scope grammar, once. It was spelled in five
+  places and the fourth form, `subject:`, had reached three of them.
+
+### Changed
+
+- **BREAKING — every operator act records who asked.** `Halt` and `LegalHold`
+  gain `by`; `RunCancelled`, `BreakGlass`, `QuarantineDecided`,
+  `EffectReconciled` and `Cancellation` carry an `Operator` where they carried a
+  name; `AuthorityWithheld` gains the operator from the halt that withdrew the
+  authority. The runtime cannot check any of these acts, so the name beside one
+  is the whole of its evidence — and the two surfaces they arrive on establish
+  that name differently.
+- **BREAKING — `agentplane halt` and `agentplane hold` require `--actor`**, and
+  record it as *asserted*. `Runtime::set_halt` takes the operator and the
+  instant; `decide_quarantine` and `reconcile_effect` take an `Operator`.
+- **BREAKING — the operator API returns `{actor, basis}`** for
+  `cancellation_requested_by` and `decided_by`, rather than a bare name.
+- **Both store schemas gained attribution columns** — `quota_halted`,
+  `case_legal_holds` and `run_cancel`. Direct DDL edits; pre-alpha.
+
+### Fixed
+
+- **A conclusion whose attribution record was missing was served under the name
+  `"unknown"`.** Four arms of one match fabricated an operator where a fifth —
+  an exhausted run with no typed ceiling verdict — already quarantined. A
+  fabricated actor is worse than a missing one: it is indistinguishable from a
+  real operator with that name, and it reached the operator API as fact. All of
+  them quarantine now.
+- **Three pages said the second reader re-derives 27 record vectors.** It
+  re-derives 29. The corpus grew with `AuthorityWithheld` and
+  `AuthorityRestored`; the sentence counting it did not.
+- **The emergency stop's fourth scope was invisible.** `subject:` — the only
+  scope that reaches work already running — was missing from the CLI's `--scope`
+  help, from the refusal a typo produces, and from the operator API's
+  documentation. The grammar has one home now.
+
+### Assurance
+
+- **`decide_quarantine` and `reconcile_effect` lost a runtime check each**,
+  because `Operator` has no empty value: what was a check on one path is now a
+  property of the type on every path that builds one.
+- Two mutations, both `--verify` KILLED: a conclusion given a fabricated name,
+  and a store that records every halt as though the name had been typed.
+- **A guard holds every published count of the record vocabulary to the tree.**
+  The existing check asked whether the format specification *names* every record
+  kind, which stayed green while the pages saying *how many* were wrong by two.
+
+## [0.38.0] — 2026-09-16
 
 ### Added
 

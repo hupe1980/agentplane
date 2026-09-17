@@ -32,10 +32,26 @@ use agentplane::peers::CardSecurity;
 use agentplane::push::{Delivered, PushConfig, PushError, PushStore, PushTransport};
 use agentplane::runtime::{Runtime, StepCtx};
 use agentplane::store::RedbStore;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
+
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
+/// A fixed instant, because every lifecycle instant in this crate is the
+/// caller's and a fixture that read the clock could not be tested against an
+/// ageing plane.
+fn test_instant() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("a fixed instant")
+}
 
 /// One capability, so the single-skill dispatch path is the default here.
 const ONE_SKILL: &str = r#"
@@ -2466,7 +2482,9 @@ async fn a_halted_agent_is_not_back_pressure() {
         .build();
     rt.set_halt(
         &HaltScope::Tenant,
-        Some("incident 42: ledger reconciliation is wrong"),
+        &operator("ops"),
+        test_instant(),
+        "incident 42: ledger reconciliation is wrong",
     )
     .await
     .expect("halt");

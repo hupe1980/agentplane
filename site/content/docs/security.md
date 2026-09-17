@@ -7,6 +7,13 @@ weight = 15
 group = "Trust"
 +++
 
+> **Evaluating this against a control catalogue?** The questions evaluators
+> actually ask — and keep re-asking, because the answers are spread across
+> pages — are collected in one table:
+> [answers evaluators have had to ask for](@/docs/regulation.md#evaluator-questions).
+> It is on the regulation page for historical reasons and is not a statutory
+> table; start there and follow the links.
+
 What this runtime defends, how, and — the part most security documents omit —
 **what it does not cover**. The residual column in every table below is not
 decoration: a threat model without one is marketing.

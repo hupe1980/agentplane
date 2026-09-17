@@ -301,11 +301,13 @@ under a preservation order looks exactly like every other closed case old enough
 to go. A hold is what makes that erasure **fail** instead.
 
 ```sh
-# Preserve a matter. --reason is required: it is what somebody reads in 2028.
+# Preserve a matter. --reason and --actor are both required: one is what
+# somebody reads in 2028, the other is who they can ask about it.
 agentplane hold --store ./journal.redb \
-  --case case_01JD... --reason "preservation order 2026-114"
+  --case case_01JD... --reason "preservation order 2026-114" --actor compliance-dana
 
 # Everything standing, for somebody who does not know which case to ask about.
+# Each row carries who placed it and whether a credential or a terminal said so.
 agentplane hold --store ./journal.redb
 
 # Release it. The next pass erases the matter normally.
@@ -313,7 +315,10 @@ agentplane hold --store ./journal.redb --case case_01JD... --lift
 ```
 
 ```rust
-cases.place_hold(case, &LegalHold { placed_at: now, reason: order.into() }).await?;
+let by = Operator::authenticated(caller.actor)?;   // or `asserted` at a terminal
+cases
+    .place_hold(case, &LegalHold { placed_at: now, reason: order.into(), by })
+    .await?;
 ```
 
 Run it: `cargo run --example retention_hold --features redb,testkit`

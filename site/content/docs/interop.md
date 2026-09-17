@@ -225,28 +225,31 @@ cannot widen authority — but it can name an address, and these are the two
 places an address becomes a connection. Each resolves the host, checks every
 answer against `netguard`, refuses redirects, bounds the whole request, and
 bounds the answer — a timeout says how long the far side may take and nothing
-about how much it may send. The
-address check is the client's own DNS resolver, so it holds for **every**
+about how much it may send.
+
+The address check is the client's own DNS resolver, so it holds for **every**
 connection the client opens rather than for the one request a pin was computed
-for — which is what makes it real against DNS rebinding and what lets one
-client be reused. Refusing redirects is what stops an allowed host handing the
-decision to a third one. The
-host allowlist stays optional on both, because a deployment that discovers
-agents from the open internet cannot enumerate them in advance — with none set,
-the address rule is the only lock, which is why it is unconditional. Loopback is
-permitted only through a `testkit`-gated opt-in, and only for a host that *is* a
-loopback literal or `localhost`, never one that merely resolved there. The server provides
-`GetTask`, `ListTasks`, streaming/subscription, cancellation, durable push, and
-extended cards. A returned Task becomes a typed `PeerTask`; `PeerTaskCall` polls
-it as an untrusted journaled effect under the same peer grant and
-audience-bound credential, and `PeerTaskCancel` asks the peer to stop it — a
-run that commissioned remote work and is itself cancelled propagates the stop
-instead of leaving the peer spending on an answer nobody will read. The cancel
-is cooperative and safely retryable: a repeat of one that landed meets the
-protocol's `TaskNotCancelable` refusal, never a second act. Strict replay
-reads the recorded snapshot and never polls again. Subscription remains a server-side journal view rather than a
-second client event channel; outbound callers use explicit polling or an
-application webhook mapped into the existing inbound-event boundary.
+for: that is what makes it real against DNS rebinding, and what lets one client
+be reused. Refusing redirects stops an allowed host handing the decision to a
+third one. The host allowlist stays optional on both, because a deployment that
+discovers agents from the open internet cannot enumerate them in advance — with
+none set the address rule is the only lock, which is why it is unconditional.
+Loopback is permitted only through a `testkit`-gated opt-in, and only for a host
+that *is* a loopback literal or `localhost`, never one that merely resolved
+there.
+
+The server provides `GetTask`, `ListTasks`, streaming/subscription,
+cancellation, durable push, and extended cards. A returned Task becomes a typed
+`PeerTask`; `PeerTaskCall` polls it as an untrusted journaled effect under the
+same peer grant and audience-bound credential, and `PeerTaskCancel` asks the
+peer to stop it, so a run that commissioned remote work and is itself cancelled
+propagates the stop rather than leaving the peer spending on an answer nobody
+will read. The cancel is cooperative and safely retryable: a repeat of one that
+landed meets the protocol's `TaskNotCancelable` refusal, never a second act.
+Strict replay reads the recorded snapshot and never polls again. Subscription
+remains a server-side journal view rather than a second client event channel;
+outbound callers use explicit polling or an application webhook mapped into the
+existing inbound-event boundary.
 
 A2A tasks are long-running and stateful, so "did the peer act?" is not a detail.
 

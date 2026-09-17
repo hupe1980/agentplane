@@ -536,7 +536,16 @@ impl ServerHandler for McpServer {
         let run = RunId::parse(&request.task_id)
             .map_err(|_| McpError::invalid_params("no such task", None))?;
         self.runtime
-            .request_cancel(run, "mcp://client", "cancelled by the calling host")
+            // The actor is the *channel*, not a person: an MCP host cancelling
+            // the task it started is identified by the connection this runtime
+            // accepted and by nothing else. Recorded as `Connected` so a reader
+            // is not told a credential named anybody.
+            .request_cancel(
+                run,
+                &crate::core::Operator::connected("mcp://client")
+                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
+                "cancelled by the calling host",
+            )
             .await
             .map(|_| ())
             .map_err(|e| McpError::invalid_params(e.to_string(), None))

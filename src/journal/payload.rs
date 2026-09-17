@@ -268,6 +268,10 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         | K::AuthorityWithheld {
             subject: _,
             reason: _,
+            // The operator who threw the halt, on the same footing as the
+            // reason: a withheld run two years on has to say who withdrew the
+            // authority, and a name behind a destroyed key says nobody did.
+            by: _,
         }
         | K::AuthorityRestored { subject: _ }
         | K::IdentityBound { chain: _ }

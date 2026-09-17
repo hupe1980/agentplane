@@ -32,6 +32,14 @@ use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// Everything the run did, in order, so a test can assert on the sequence
 /// rather than on counters.
 type Log = Arc<Mutex<Vec<String>>>;
@@ -570,7 +578,7 @@ async fn an_exhausted_run_pauses_with_its_work_standing() {
     // Cancelling is the option that unwinds — the operator deciding the work
     // is not worth finishing, through the same protocol every stop uses.
     let fresh = rt
-        .request_cancel(out.run_id, "ops", "not worth finishing")
+        .request_cancel(out.run_id, &operator("ops"), "not worth finishing")
         .await
         .unwrap();
     assert!(fresh, "the first stop request records");

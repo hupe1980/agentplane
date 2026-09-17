@@ -322,7 +322,15 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     }
 
     report.checked += 1;
-    if let Err(e) = store.set_halt(&tenant, Some("incident 42")).await {
+    // Every throw in this battery names somebody: a halt with no operator on
+    // it is the state this contract exists to make unreachable.
+    let thrower =
+        |actor: &str| crate::core::Operator::asserted(actor).expect("a battery names its operator");
+    let at = crate::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("a fixed instant");
+    if let Err(e) = store
+        .set_halt(&tenant, &thrower("ops-alice"), at, "incident 42")
+        .await
+    {
         report.record("setting the halt", format!("{e}"));
     }
     match store.halts().await {
@@ -340,7 +348,10 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     // The reason is replaced rather than appended to, so the current one is
     // always the current one.
     report.checked += 1;
-    if let Err(e) = store.set_halt(&tenant, Some("incident 43")).await {
+    if let Err(e) = store
+        .set_halt(&tenant, &thrower("ops-alice"), at, "incident 43")
+        .await
+    {
         report.record("re-halting", format!("{e}"));
     }
     match store.halts().await {
@@ -357,10 +368,16 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     // that widens and then partly resolves is the ordinary shape, and a single
     // overwritable flag gets it wrong in the direction that lets work through.
     report.checked += 1;
-    if let Err(e) = store.set_halt(&agent, Some("agent 12 is looping")).await {
+    if let Err(e) = store
+        .set_halt(&agent, &thrower("ops-bob"), at, "agent 12 is looping")
+        .await
+    {
         report.record("halting one agent", format!("{e}"));
     }
-    if let Err(e) = store.set_halt(&revision, Some("bad deploy")).await {
+    if let Err(e) = store
+        .set_halt(&revision, &thrower("ops-bob"), at, "bad deploy")
+        .await
+    {
         report.record("halting one revision", format!("{e}"));
     }
     match store.halts().await {
@@ -379,7 +396,7 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     }
 
     report.checked += 1;
-    if let Err(e) = store.set_halt(&agent, None).await {
+    if let Err(e) = store.lift_halt(&agent).await {
         report.record("lifting one scope", format!("{e}"));
     }
     match store.halts().await {
@@ -398,7 +415,7 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
 
     report.checked += 1;
     for scope in [&tenant, &revision] {
-        if let Err(e) = store.set_halt(scope, None).await {
+        if let Err(e) = store.lift_halt(scope).await {
             report.record("lifting the halt", format!("{e}"));
         }
     }
@@ -415,9 +432,48 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     }
 
     // Lifting a halt nobody set is a no-op, not an error: an operator clearing
-    // a switch they are not sure about must not be punished for it.
+    // a switch they are not sure about must not be punished for it — and the
+    // answer still has to say that nothing was standing, because during an
+    // incident *I cleared it* and *I cleared the wrong scope* are different
+    // facts and only one of them is good news.
     report.checked += 1;
-    if let Err(e) = store.set_halt(&tenant, None).await {
-        report.record("lifting an unset halt", format!("{e}"));
+    match store.lift_halt(&tenant).await {
+        Ok(false) => {}
+        Ok(true) => report.record(
+            "lifting an unset halt",
+            "the store reported that a halt was standing when none was".to_owned(),
+        ),
+        Err(e) => report.record("lifting an unset halt", format!("{e}")),
+    }
+
+    // **Who threw it survives the round trip, and so does what established the
+    // name.** The runtime cannot check an emergency stop, so the operator on
+    // the row is the whole of its evidence — a store that keeps the reason and
+    // drops the name leaves a switch nobody can be asked about.
+    report.checked += 1;
+    let by = crate::core::Operator::authenticated("ops-carol").expect("a name");
+    if let Err(e) = store.set_halt(&tenant, &by, at, "incident 44").await {
+        report.record("halting with an authenticated operator", format!("{e}"));
+    }
+    match store.halts().await {
+        Ok(halts) => match halts.iter().find(|h| h.scope == tenant) {
+            Some(h) if h.by == by && h.at == at => {}
+            Some(h) => report.record(
+                "a halt keeps who threw it",
+                format!(
+                    "the store read back {:?} at {:?} rather than {by:?} at {at:?} — an \
+                     emergency stop nobody is named on cannot be asked about afterwards",
+                    h.by, h.at
+                ),
+            ),
+            None => report.record(
+                "a halt keeps who threw it",
+                "the halt did not read back at all".to_owned(),
+            ),
+        },
+        Err(e) => report.record("reading an attributed halt", format!("{e}")),
+    }
+    if let Err(e) = store.lift_halt(&tenant).await {
+        report.record("clearing the attributed halt", format!("{e}"));
     }
 }

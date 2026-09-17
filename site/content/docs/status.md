@@ -7,6 +7,13 @@ weight = 19
 group = "Operate"
 +++
 
+> **Evaluating this against a control catalogue?** The questions evaluators
+> actually ask — and keep re-asking, because the answers are spread across
+> pages — are collected in one table:
+> [answers evaluators have had to ask for](@/docs/regulation.md#evaluator-questions).
+> It is on the regulation page for historical reasons and is not a statutory
+> table; start there and follow the links.
+
 `agentplane` is published on crates.io and pre-alpha. This page answers three questions an
 adopter has to answer before writing any code: **what will move**, **what is
 deliberately absent**, and **how to check that either answer is still true**.
@@ -71,12 +78,12 @@ because rounding up is how a condition list stops being checkable.
 |---|---|---|
 | 1 | **Canonicalization is versioned and vector-checked.** A rule change must read as *unverifiable* rather than as a divergence | ✅ done — versioned at the run, a complete RFC 8785 implementation held to the standard's own number vectors |
 | 2 | **Golden corpora for the journal record format.** A fixed set of records, byte-for-byte, that every future build must still read and still hash identically | ✅ done — one canonical record per kind and its chain digest in `tests/golden/records.jsonl`, sealed through the same function every backend appends through, with a guard holding the corpus to the record vocabulary so a new kind cannot ship unpinned |
-| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | ✅ done — a sealed export with its case layer is checked in, and `tools/verify_export.py` verifies it from the [published specification](@/docs/format.md) alone, re-deriving all 27 record vectors rather than only accepting them |
+| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | ✅ done — a sealed export with its case layer is checked in, and `tools/verify_export.py` verifies it from the [published specification](@/docs/format.md) alone, re-deriving all 29 record vectors rather than only accepting them |
 | 4 | **A stated unknown-field policy per durable format.** | ✅ done, and strict in both directions — a record is *evidence*, so a reader that drops a field reaches a verdict over evidence it did not see. Refusals are classified as build skew rather than damage, with the deployment order they imply written down beside them |
 | 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — consulted on *every* record read, with a test lifting a record whose shape this build cannot parse and asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump |
 | 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down (readers before writers; rollback bounded by a *time window*), and the reader's half is pinned: a record from a shape this build does not know is refused as skew, not damage. What is left is the two-build exercise, which needs a version bump to have two builds to run |
 | 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility), and already implemented: hashes are agile by version, signatures by key, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
-| 8 | **The deferred format questions are settled**, because each one moves a record or a wire: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open — **eight** questions, each with an answer that changes a durable format or a protocol |
+| 8 | **The deferred format questions are settled**, because each one moves a record or a wire: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open — each answer changes a durable format or a protocol, so each is cheap now and a migration later |
 | 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ⬜ open — both surfaces are built and published: a crate an embedder links, and a server an operator runs against a manifest with no Rust anywhere. What is unwritten is which one an adopter is expected to depend on, and therefore what the freeze is a promise *about*. It is a row rather than a footnote because a compatibility commitment with no stated subject is one an adopter completes in their own favour |
 
 **7 and 8 are independent, with one join.** They can be worked in parallel:

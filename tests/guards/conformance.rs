@@ -300,7 +300,7 @@ impl JournalStore for NoExactlyOnce {
     async fn request_cancel(
         &self,
         run: agentplane::core::RunId,
-        actor: &str,
+        actor: &agentplane::core::Operator,
         reason: &str,
     ) -> Result<bool, agentplane::core::StoreError> {
         self.inner.request_cancel(run, actor, reason).await

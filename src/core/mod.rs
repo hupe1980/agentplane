@@ -23,6 +23,7 @@ mod id;
 mod identity;
 mod label;
 pub mod merkle;
+mod operator;
 mod plan;
 pub(crate) mod poison;
 mod policy;
@@ -76,6 +77,7 @@ pub use label::{
     Label, ProtectedField, Release, ReleaseMark, ReleaseScope, Sensitivity, SourceId, Tainted,
     Trust,
 };
+pub use operator::{Basis, Operator, OperatorError};
 pub use plan::{ArgSource, Collaboration, PlanError, PlanIR, PlanNode, Topology};
 pub use policy::{
     ACTION_ADMIT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE, ACTIONS, DenyAll,

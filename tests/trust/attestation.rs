@@ -695,7 +695,7 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         async fn request_cancel(
             &self,
             run: RunId,
-            actor: &str,
+            actor: &agentplane::core::Operator,
             reason: &str,
         ) -> Result<bool, StoreError> {
             self.0.request_cancel(run, actor, reason).await
@@ -1641,7 +1641,7 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         async fn request_cancel(
             &self,
             run: RunId,
-            actor: &str,
+            actor: &agentplane::core::Operator,
             reason: &str,
         ) -> Result<bool, StoreError> {
             self.inner.request_cancel(run, actor, reason).await

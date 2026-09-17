@@ -368,8 +368,9 @@ pub struct ReleaseHoldRequest {
 
 /// Throwing the emergency stop.
 ///
-/// The scope is the *durable key* — `tenant`, `agent:<name>`,
-/// `revision:<digest>` — rather than a tagged union, because that spelling is
+/// The scope is the *durable key* — the forms
+/// [`HaltScope::FORMS`](crate::quota::HaltScope::FORMS) lists — rather than a
+/// tagged union, because that spelling is
 /// the one an operator already types on the command line and the one the store
 /// keeps. Two spellings of one scope is two ways for a lift to miss the halt it
 /// meant to clear.
@@ -418,6 +419,28 @@ pub struct DecisionRequest {
     pub amendment: Value,
 }
 
+/// A person (or a channel) on a run's record, with what established the name.
+///
+/// Two fields rather than one string, because they are two facts and
+/// [`I14`](crate::journal) forbids flattening control state into prose: an
+/// operator reading `alice` needs to know whether an authenticator said so or
+/// whether somebody holding the store typed it, and a rendered
+/// `alice (asserted)` is a sentence a client would have to parse back.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActorView {
+    pub actor: String,
+    pub basis: String,
+}
+
+impl From<&crate::core::Operator> for ActorView {
+    fn from(op: &crate::core::Operator) -> Self {
+        Self {
+            actor: op.actor().to_owned(),
+            basis: op.basis().as_str().to_owned(),
+        }
+    }
+}
+
 /// A run, to somebody working out why it has stopped.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunView {
@@ -451,7 +474,7 @@ pub struct RunView {
     /// it is a *different* situation from one nobody has touched — it is about
     /// to unwind, and an operator who cannot see that will ask again.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cancellation_requested_by: Option<String>,
+    pub cancellation_requested_by: Option<ActorView>,
     /// Whose decision this ending was, where a person made it.
     ///
     /// Distinct from `cancellation_requested_by`, which answers *somebody has
@@ -465,7 +488,7 @@ pub struct RunView {
     /// first left a break-glass crossing reporting its reason with nobody's
     /// name against it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub decided_by: Option<String>,
+    pub decided_by: Option<ActorView>,
     /// Journal length — the operator's handle on "is it doing anything".
     pub records: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -742,7 +765,15 @@ impl Planes {
             .ok_or_else(|| crate::core::RuntimeError::UnknownTenant(target.to_string()))?;
         // The record first, and the plane only if it landed.
         plane
-            .record_break_glass(&caller.actor, &caller.roles, reason)
+            .record_break_glass(
+                &crate::core::Operator::authenticated(caller.actor.clone()).map_err(|e| {
+                    crate::core::RuntimeError::Store(crate::core::StoreError::Backend(
+                        e.to_string(),
+                    ))
+                })?,
+                &caller.roles,
+                reason,
+            )
             .await?;
         Ok(plane)
     }
@@ -1361,12 +1392,12 @@ async fn run_view(
         .cancellation(id)
         .await
         .map_err(|_| store_failed())?
-        .map(|c| c.actor);
+        .map(|c| ActorView::from(&c.actor));
 
     let decided_by = observed
         .as_ref()
         .and_then(RunStatus::actor)
-        .map(ToOwned::to_owned);
+        .map(ActorView::from);
 
     Ok(Json(RunView {
         run: id.to_string(),
@@ -1409,7 +1440,12 @@ async fn cancel_run(
     // means: the run's state refuses the request.
     let fresh = s
         .plane
-        .request_cancel(id, &s.caller.actor, &body.reason)
+        .request_cancel(
+            id,
+            &crate::core::Operator::authenticated(s.caller.actor.clone())
+                .map_err(|_| bad("actor"))?,
+            &body.reason,
+        )
         .await
         .map_err(|e| match e {
             crate::core::RuntimeError::Store(crate::core::StoreError::NotFound(_)) => {
@@ -1474,7 +1510,13 @@ async fn decide_quarantine(
     // for one. Same rule as deciding a task or stopping a run.
     let outcome = s
         .plane
-        .decide_quarantine(id, &s.caller.actor, reason, decision)
+        .decide_quarantine(
+            id,
+            &crate::core::Operator::authenticated(s.caller.actor.clone())
+                .map_err(|_| bad("actor"))?,
+            reason,
+            decision,
+        )
         .await
         .map_err(quarantine_error)?;
     Ok((
@@ -1526,7 +1568,14 @@ async fn reconcile_effect(
     };
 
     s.plane
-        .reconcile_effect(id, effect, assertion, &s.caller.actor, &body.note)
+        .reconcile_effect(
+            id,
+            effect,
+            assertion,
+            &crate::core::Operator::authenticated(s.caller.actor.clone())
+                .map_err(|_| bad("actor"))?,
+            &body.note,
+        )
         .await
         .map_err(quarantine_error)?;
 
@@ -2078,12 +2127,17 @@ async fn place_hold(
         return Err(bad("reason"));
     }
 
+    // The actor is the authenticated caller; `PlaceHoldRequest` has no field
+    // for it, for the reason a cancellation's has none.
+    let by =
+        crate::core::Operator::authenticated(s.caller.actor.clone()).map_err(|_| bad("actor"))?;
     let placed = cases
         .place_hold(
             case,
             &crate::core::LegalHold {
                 placed_at: now_for_account(),
                 reason: body.reason,
+                by,
             },
         )
         .await
@@ -2098,6 +2152,8 @@ async fn place_hold(
             "in_force": in_force.map(|h| json!({
                 "placed_at": h.placed_at.unix_timestamp(),
                 "reason": h.reason,
+                "by": h.by.actor(),
+                "basis": h.by.basis().as_str(),
             })),
         })),
     ))
@@ -2166,8 +2222,13 @@ async fn place_halt(
     if body.reason.trim().is_empty() {
         return Err(bad("reason"));
     }
+    // The actor is the authenticated caller; `PlaceHaltRequest` has no field
+    // for it. The whole weight of a stop is the name beside it, and a name the
+    // requester supplies is a name the requester chose.
+    let by =
+        crate::core::Operator::authenticated(s.caller.actor.clone()).map_err(|_| bad("actor"))?;
     s.plane
-        .set_halt(&scope, Some(&body.reason))
+        .set_halt(&scope, &by, now_for_account(), &body.reason)
         .await
         .map_err(|_| store_failed())?;
     Ok((
@@ -2176,6 +2237,8 @@ async fn place_halt(
             "scope": scope.key(),
             "halted": true,
             "reason": body.reason,
+            "by": by.actor(),
+            "basis": by.basis().as_str(),
             "does_not_stop": "runs already executing, and suspended runs \
                  resuming — cancel a run to reach work in flight",
         })),
@@ -2190,13 +2253,21 @@ async fn lift_halt(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let s = api.gate(&headers, action::HALT_LIFT, &body.scope).await?;
     let scope = crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| bad("scope"))?;
-    s.plane
-        .set_halt(&scope, None)
+    let was_standing = s
+        .plane
+        .lift_halt(&scope)
         .await
         .map_err(|_| store_failed())?;
     Ok((
         StatusCode::OK,
-        Json(json!({ "scope": scope.key(), "halted": false })),
+        // `was_standing: false` is the answer to *did I clear the right one*,
+        // which during an incident is the question. A lift that found nothing
+        // is not an error and must not read as success either.
+        Json(json!({
+            "scope": scope.key(),
+            "halted": false,
+            "was_standing": was_standing,
+        })),
     ))
 }
 

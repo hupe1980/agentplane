@@ -210,8 +210,9 @@ refuses the erasure.
 
 ```sh
 agentplane hold --store ./journal.redb --case case_01JD... \
-  --reason "Art. 26 retention floor; supervisory request 2026-114"
-agentplane hold --store ./journal.redb          # everything standing, with reasons
+  --reason "Art. 26 retention floor; supervisory request 2026-114" \
+  --actor compliance-dana
+agentplane hold --store ./journal.redb   # everything standing, with reasons and who placed them
 ```
 
 The standing holds are listable by somebody who does not already know which case
@@ -237,7 +238,7 @@ are a few hundred bytes. Three mechanisms decide it, and they compose:
 
 | | What it does |
 |---|---|
-| **`.keyring(..)`** | Seals journal payloads under a per-case wrapping key. The chain commits to **ciphertext**, so destroying the key erases every copy — live store, replica, every backup — while the history still verifies with no key at all. `erase_case` then discharges an Art. 17 request against records |
+| **`.keyring(..)`** | Seals journal payloads under a per-case key. The chain commits to **ciphertext**, so destroying the key erases every copy — live store, replica, backup — and the history still verifies without it → [erasure](@/docs/erasure.md) |
 | **`cx.store_blob`** | Puts bytes in a blob at **any** size and journals only the digest |
 | **`security.max_sensitivity_journaled`** | Refuses at dispatch, before the announcement, when a value above the ceiling would be journaled |
 
@@ -296,11 +297,18 @@ Three questions worth asking of any tool in this space, including this one:
    findings, and [status](@/docs/status.md) lists what is not built. Anything that
    reports only findings is telling you about its coverage by omission.
 
-Three answers evaluators have had to ask for, collected here because each lives
-on a page you may not have opened:
+### Answers evaluators have had to ask for {#evaluator-questions}
+
+Each lives on a page you may not have opened, so they are collected here. **If
+you arrived with a security control catalogue rather than a statutory one, this
+table is still the right one** — three of the four below were asked again after
+they were answered, which is a finding about where they were filed rather than
+about whether they were written.
 
 | Question | Answer |
 |---|---|
+| Are format-freeze conditions 7 and 8 coupled? | No — [independent, with one join](@/docs/status.md#format-freeze). Agility is about how a digest says which function produced it; the deferred questions add fields to kinds that are already hashed. The join is the policy-bundle format, which is itself a hashed artifact, so 8 gates only the last line of 7's inventory |
+| Who threw an emergency stop, or placed a legal hold? | On the row, with what established the name — `authenticated` when a credential named it, `asserted` when somebody with the store typed it → [the stop](@/docs/operations.md#the-emergency-stop). Who *lifted* one is deliberately not retained |
 | How much data did a run send? | `EffectStarted.outbound_bytes`, per effect → [volume](@/docs/security.md#volume-is-not-sensitivity-and-the-journal-records-it). `Budget::max_egress_bytes` bounds it, exactly — the size is known before dispatch, so the call that would cross the ceiling is the call refused |
 | How often did policy stop a run from *starting*? | The `agentplane.policy.denials` metric, by action. Not the journal, and [deliberately](@/docs/operations.md#what-no-audit-can-answer-the-runs-that-never-started) |
 | What does `max_denials` actually bound? | The refusals a model can probe — sink refusals, which come back as `REFUSED` and let the loop continue. An engine denial ends the run in that same loop → [what it counts](@/docs/security.md#what-max-denials-counts) |

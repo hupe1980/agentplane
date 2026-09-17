@@ -16,6 +16,14 @@ use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
 use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety};
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// Records every call it receives and answers by tool name.
 #[derive(Debug, Default)]
 struct Recorder {
@@ -841,7 +849,7 @@ async fn break_glass_is_recorded_in_the_crossed_tenants_journal() {
 
     let run = rt
         .record_break_glass(
-            "carol@ops",
+            &operator("carol@ops"),
             &["incident-commander".to_owned()],
             "INC-42: customer reports a stuck settlement",
         )
@@ -860,7 +868,7 @@ async fn break_glass_is_recorded_in_the_crossed_tenants_journal() {
             _ => None,
         })
         .expect("the journal holds the crossing");
-    assert_eq!(entry.0, "carol@ops");
+    assert_eq!(entry.0, operator("carol@ops"));
     assert_eq!(entry.1, vec!["incident-commander".to_owned()]);
     assert!(
         entry.2.contains("INC-42"),
@@ -946,7 +954,7 @@ async fn crossing_to_another_tenant_records_before_it_serves() {
     assert!(
         records.iter().any(|r| matches!(
             r.kind(),
-            RecordKind::BreakGlass { actor, .. } if actor == "carol@ops"
+            RecordKind::BreakGlass { actor, .. } if actor.actor() == "carol@ops"
         )),
         "the crossing was served without naming who crossed"
     );
@@ -1005,7 +1013,9 @@ async fn break_glass_without_a_reason_is_refused() {
         Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
     let rt = Runtime::builder(Arc::clone(&store)).build();
 
-    let refused = rt.record_break_glass("carol@ops", &[], "   ").await;
+    let refused = rt
+        .record_break_glass(&operator("carol@ops"), &[], "   ")
+        .await;
     assert!(
         refused.is_err(),
         "a blank reason was accepted — the record exists to make the exception \

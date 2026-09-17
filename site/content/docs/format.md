@@ -534,7 +534,7 @@ re-addressing, because a record names the digest it always named and that run's
 
 ## Vocabulary {#vocabulary}
 
-Twenty-nine record kinds. A verifier does not interpret them; a reader that
+There are 29 record kinds. A verifier does not interpret them; a reader that
 does must refuse one it has never heard of, for the reason
 [the record body](#record-body) gives.
 

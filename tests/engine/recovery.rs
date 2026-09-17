@@ -19,6 +19,14 @@ use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// A fixed three-stage pipeline that can be made to die partway through.
 ///
 /// `crash_at` stops the **same program** mid-flight, the way a `kill -9` would,
@@ -1481,7 +1489,7 @@ fn every_conclusion_but_success_carries_a_reason() {
         RunStatus::Quarantined("an effect's outcome is unknown".into()),
         RunStatus::Replanning("the plan no longer fits".into()),
         RunStatus::Cancelled {
-            actor: "ops:hupe".into(),
+            actor: operator("ops:hupe"),
             reason: "stopped for the maintenance window".into(),
         },
         RunStatus::Suspended(SuspendReason::AwaitingTime {
@@ -1489,12 +1497,12 @@ fn every_conclusion_but_success_carries_a_reason() {
         }),
         RunStatus::Exhausted(BudgetExceeded::Steps { allowed: 3 }),
         RunStatus::Abandoned {
-            actor: "ops".into(),
+            actor: operator("ops"),
             reason: "the provider has no record either way".into(),
         },
         RunStatus::Swept,
         RunStatus::BrokeGlass {
-            actor: "ops:hupe".into(),
+            actor: operator("ops:hupe"),
             reason: "INC-42: stuck settlement".into(),
         },
         RunStatus::Withheld {

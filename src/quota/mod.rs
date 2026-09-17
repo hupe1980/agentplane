@@ -225,6 +225,31 @@ impl HaltScope {
         }
     }
 
+    /// Every form [`parse`](Self::parse) accepts, written the way an operator
+    /// types it.
+    ///
+    /// One list, because a scope an operator cannot learn the spelling of is a
+    /// control they cannot reach — and the CLI's help, its refusal and the
+    /// operator API all have to say the same thing this parser accepts. Held to
+    /// the list rather than to the variant count: a count agrees with itself
+    /// while a form is missing.
+    pub const FORMS: [&'static str; 4] = [
+        "tenant",
+        "agent:<metadata.name>",
+        "revision:<manifest digest>",
+        "subject:<delegation subject>",
+    ];
+
+    /// The forms, joined for a refusal a person reads.
+    #[must_use]
+    pub fn forms() -> String {
+        Self::FORMS
+            .iter()
+            .map(|f| format!("'{f}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// Read back a stored key.
     ///
     /// `None` for anything this build does not understand — a scope written by
@@ -312,6 +337,17 @@ impl std::fmt::Display for HaltScope {
 }
 
 /// One standing emergency stop.
+///
+/// The runtime cannot check this instruction — there is no verdict to re-derive
+/// and no policy that authorized the judgement — so its whole evidentiary weight
+/// is the name beside it, and [`Operator`] carries what established that name.
+///
+/// **Who lifted one is not kept.** Lifting removes the row; retaining lifted
+/// rows would be a listing that grows with nothing to empty it. Where the stop
+/// reached a running run, [`AuthorityWithheld`] holds the operator from this row.
+///
+/// [`Operator`]: crate::core::Operator
+/// [`AuthorityWithheld`]: crate::journal::RecordKind::AuthorityWithheld
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Halt {
     pub scope: HaltScope,
@@ -319,6 +355,12 @@ pub struct Halt {
     /// somebody else, possibly at three in the morning, and *why* is the whole
     /// question.
     pub reason: String,
+    /// Who threw it, and what established the name.
+    pub by: crate::core::Operator,
+    /// When it was thrown. Supplied by the caller, never read from a clock
+    /// here, for the reason every other lifecycle instant in this crate is: a
+    /// pass that reads its own clock cannot be tested against an ageing plane.
+    pub at: crate::core::Timestamp,
 }
 
 /// Why a run was not admitted.
@@ -427,11 +469,12 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// If the store cannot be reached.
     async fn release(&self, run: RunId) -> Result<(), StoreError>;
 
-    /// Stop work at `scope` from starting, or let it start again.
+    /// Stop work at `scope` from starting.
     ///
-    /// `Some(reason)` halts; `None` lifts. The reason is required when halting
-    /// because the next person to look will be someone else, possibly at 3am,
-    /// and *why* is the whole question.
+    /// Throwing and lifting are **separate verbs** rather than one call taking
+    /// an `Option`, for the reason acquiring and renewing a lease are: they are
+    /// different acts with different arguments. Throwing one names who threw it
+    /// and when; lifting names neither, because the row goes.
     ///
     /// **In the store, not in the process.** An in-memory flag is a switch that
     /// only stops the instance it was thrown on — which is the same failure an
@@ -447,7 +490,23 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// # Errors
     ///
     /// If the store cannot be reached.
-    async fn set_halt(&self, scope: &HaltScope, reason: Option<&str>) -> Result<(), StoreError>;
+    async fn set_halt(
+        &self,
+        scope: &HaltScope,
+        by: &crate::core::Operator,
+        at: crate::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), StoreError>;
+
+    /// Let work at `scope` start again.
+    ///
+    /// Answers whether one was standing, so an operator who lifts a scope
+    /// nobody halted is told that rather than told *done*.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn lift_halt(&self, scope: &HaltScope) -> Result<bool, StoreError>;
 
     /// Every standing halt for this tenant.
     ///

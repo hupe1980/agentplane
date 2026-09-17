@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.38.0"
+version      = "0.39.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -10,7 +10,7 @@ homepage     = "https://hupe1980.github.io/agentplane/"
 documentation = "https://docs.rs/agentplane"
 readme       = "README.md"
 keywords     = ["agent", "durable-execution", "replay", "runtime", "llm"]
-categories   = ["asynchronous", "data-structures"]
+categories   = ["asynchronous", "development-tools"]
 
 # An allowlist, because a crates.io publish is immutable: a denylist has to
 # predict every generated file, and a file that should not have shipped can

@@ -467,7 +467,7 @@ impl JournalStore for Faulty {
     async fn request_cancel(
         &self,
         run: RunId,
-        actor: &str,
+        actor: &crate::core::Operator,
         reason: &str,
     ) -> Result<bool, StoreError> {
         self.inner.request_cancel(run, actor, reason).await
@@ -593,7 +593,12 @@ mod tests {
         ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
             unreachable!("the test reads capabilities only")
         }
-        async fn request_cancel(&self, _: RunId, _: &str, _: &str) -> Result<bool, StoreError> {
+        async fn request_cancel(
+            &self,
+            _: RunId,
+            _: &crate::core::Operator,
+            _: &str,
+        ) -> Result<bool, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn cancellation(

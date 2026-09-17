@@ -550,7 +550,7 @@ impl JournalStore for CountsAcquires {
     async fn request_cancel(
         &self,
         run: RunId,
-        actor: &str,
+        actor: &agentplane::core::Operator,
         reason: &str,
     ) -> Result<bool, StoreError> {
         self.inner.request_cancel(run, actor, reason).await

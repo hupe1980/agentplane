@@ -2722,21 +2722,12 @@ fn the_changelog_ships_only_what_the_reader_receives() {
     );
 }
 
-/// The published format specification names every record kind that exists.
+/// The record vocabulary, read out of the enum that defines it.
 ///
-/// The one document an outside implementation reads. A kind missing from it is
-/// a record a second implementation will meet and have no rule for — and the
-/// failure is silent on this side, because every test here is written against
-/// the vocabulary this build already has.
-///
-/// The constants are checked in the same pass: a specification that states the
-/// wrong domain string, prefix byte or ceiling is worse than one that omits
-/// them, because a reader implements what it says and gets signatures that
-/// verify against nothing.
-#[test]
-fn the_format_specification_is_in_step_with_the_code() {
-    let spec = read("site/content/docs/format.md");
-
+/// Two guards need this list and they must not each parse it: a second parser
+/// that reads a slightly different span agrees with the first until the day the
+/// enum moves, and then one of them reports on a vocabulary nobody has.
+fn record_kinds() -> Vec<String> {
     let source = read("src/journal/record.rs");
     let start = source
         .find("pub enum RecordKind {")
@@ -2757,6 +2748,25 @@ fn the_format_specification_is_in_step_with_the_code() {
         kinds.len() > 20,
         "found {kinds:?} — the guard is reading the wrong span rather than passing"
     );
+    kinds
+}
+
+/// The published format specification names every record kind that exists.
+///
+/// The one document an outside implementation reads. A kind missing from it is
+/// a record a second implementation will meet and have no rule for — and the
+/// failure is silent on this side, because every test here is written against
+/// the vocabulary this build already has.
+///
+/// The constants are checked in the same pass: a specification that states the
+/// wrong domain string, prefix byte or ceiling is worse than one that omits
+/// them, because a reader implements what it says and gets signatures that
+/// verify against nothing.
+#[test]
+fn the_format_specification_is_in_step_with_the_code() {
+    let spec = read("site/content/docs/format.md");
+
+    let kinds = record_kinds();
     for kind in &kinds {
         assert!(
             spec.contains(&format!("`{kind}`")),
@@ -2794,6 +2804,87 @@ fn the_format_specification_is_in_step_with_the_code() {
             "the format specification does not state {what} as the code has it ({needle:?})"
         );
     }
+}
+
+/// Every published count of the record vocabulary is the count the tree holds.
+///
+/// The guard above checks *which* kinds a page names. This one checks *how
+/// many*, and the two rot separately: adding a kind is a deliberate edit to the
+/// enum, the corpus and the specification's list, while the sentence on three
+/// other pages saying how many vectors a second implementation re-derives is
+/// nobody's edit. It was wrong by two for a release — a guard that checks
+/// membership passing while the sentence the list is published under is false.
+///
+/// Two phrasings are held, and they are the two that state a *derived total*:
+/// `N record vectors` is the golden corpus, and `There are N record kinds` is
+/// the vocabulary. A page counting a handful of new kinds (`Two record kinds
+/// arrived with it`) is a different claim and is deliberately not matched. What
+/// this does not cover is a fourth phrasing invented later; the answer to that
+/// is to add it here, not to widen the match until ordinary prose trips it.
+#[test]
+fn every_published_record_count_is_the_one_the_tree_holds() {
+    let kinds = record_kinds();
+    let corpus = read("tests/golden/records.jsonl");
+    let vectors = corpus.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(
+        vectors,
+        kinds.len(),
+        "the golden corpus holds {vectors} vectors for {} record kinds — the          published counts are checked against the corpus, so the two must agree          before either can be published",
+        kinds.len()
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut pages: Vec<std::path::PathBuf> = walk(&root.join("site/content/docs"))
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    pages.push(root.join("README.md"));
+    assert!(
+        pages.len() > 5,
+        "only {} pages were scanned — the site layout moved",
+        pages.len()
+    );
+
+    let mut found = 0usize;
+    for page in &pages {
+        let text = read(page.strip_prefix(root).unwrap_or(page).to_str().unwrap());
+        for (claim, suffix, expected) in [
+            ("", " record vectors", vectors),
+            ("There are ", " record kinds", kinds.len()),
+        ] {
+            for (idx, _) in text.match_indices(suffix) {
+                let head = &text[..idx];
+                let digits: String = head
+                    .chars()
+                    .rev()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if digits.is_empty() {
+                    continue;
+                }
+                let before = &head[..head.len() - digits.len()];
+                if !claim.is_empty() && !before.ends_with(claim) {
+                    continue;
+                }
+                let stated: usize = digits.parse().expect("a run of ASCII digits");
+                assert_eq!(
+                    stated,
+                    expected,
+                    "{}: the page says {stated}{suffix} and the tree holds {expected}",
+                    page.display()
+                );
+                found += 1;
+            }
+        }
+    }
+    assert!(
+        found >= 3,
+        "found {found} published counts — this guard read nothing and passed, \
+         which is the shape it exists to catch"
+    );
 }
 
 /// The second implementation is in the gate, and independent of the first.

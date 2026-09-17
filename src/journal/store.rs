@@ -183,10 +183,14 @@ pub struct Inclusion {
 /// A durable request that a run stop.
 ///
 /// Carries the asker's name because an intervention with nobody attached to it
-/// is an outage, not oversight — the same rule a human decision follows.
+/// is an outage, not oversight — the same rule a human decision follows. The
+/// name travels as an [`Operator`](crate::core::Operator) so that *what
+/// established it* travels with it: the same request arrives from an
+/// authenticated API caller and from somebody holding the store, and a reader
+/// of the record cannot tell those apart from a string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cancellation {
-    pub actor: String,
+    pub actor: crate::core::Operator,
     pub reason: String,
 }
 
@@ -698,7 +702,7 @@ pub trait JournalStore: Send + Sync + Debug {
     async fn request_cancel(
         &self,
         run: RunId,
-        actor: &str,
+        actor: &crate::core::Operator,
         reason: &str,
     ) -> Result<bool, StoreError>;
 

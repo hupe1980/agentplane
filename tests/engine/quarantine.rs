@@ -36,6 +36,14 @@ use agentplane::runtime::{Mode, RunStatus, Runtime};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// A mutating call that times out and whose provider cannot say what happened.
 ///
 /// The canonical in-doubt effect: `Recovery::Reconcile` means the runtime asks
@@ -265,7 +273,7 @@ async fn a_quarantined_run_is_open_and_seals_only_when_it_truly_ends() {
 
     f.rt.decide_quarantine(
         run,
-        "ada",
+        &operator("ada"),
         "the provider has no record either way",
         QuarantineDecision::Abandon,
     )
@@ -289,7 +297,7 @@ async fn answering_a_quarantine_takes_it_off_the_quarantine_backlog() {
 
     f.rt.decide_quarantine(
         run,
-        "ada",
+        &operator("ada"),
         "written off after two weeks",
         QuarantineDecision::Abandon,
     )
@@ -362,7 +370,7 @@ async fn an_operators_landed_verdict_finishes_the_run_without_repeating_the_call
         run,
         key,
         Assertion::Landed(json!({ "captured": true, "via": "operator" })),
-        "ada",
+        &operator("ada"),
         "charge ch_9RtQ exists in the provider console, created 12:41Z",
     )
     .await
@@ -371,7 +379,7 @@ async fn an_operators_landed_verdict_finishes_the_run_without_repeating_the_call
     let out =
         f.rt.decide_quarantine(
             run,
-            "ada",
+            &operator("ada"),
             "the charge is in the provider's ledger",
             QuarantineDecision::Reopen,
         )
@@ -415,7 +423,7 @@ async fn an_asserted_result_names_its_author_and_is_not_trusted() {
         run,
         key,
         Assertion::Landed(json!({ "captured": true })),
-        "ada",
+        &operator("ada"),
         "checked the console",
     )
     .await
@@ -435,7 +443,7 @@ async fn an_asserted_result_names_its_author_and_is_not_trusted() {
         })
         .expect("an operator's reconciliation is on the record");
 
-    assert_eq!(asserted.0, "ada");
+    assert_eq!(asserted.0, operator("ada"));
     assert_eq!(asserted.2, Disposition::Landed);
     assert_eq!(
         asserted.1,
@@ -462,7 +470,7 @@ async fn an_assertion_alone_does_not_reopen_the_run() {
         run,
         key,
         Assertion::Landed(json!({ "captured": true })),
-        "ada",
+        &operator("ada"),
         "charge ch_9RtQ exists",
     )
     .await
@@ -488,9 +496,14 @@ async fn reopening_without_answering_the_doubt_quarantines_again() {
     let run = quarantined(&f).await;
 
     let out =
-        f.rt.decide_quarantine(run, "ada", "looks fine to me", QuarantineDecision::Reopen)
-            .await
-            .expect("reopen");
+        f.rt.decide_quarantine(
+            run,
+            &operator("ada"),
+            "looks fine to me",
+            QuarantineDecision::Reopen,
+        )
+        .await
+        .expect("reopen");
     assert!(
         matches!(out.status, RunStatus::Quarantined(_)),
         "got {:?}",
@@ -548,7 +561,7 @@ async fn an_assertion_cannot_overwrite_an_outcome_the_journal_holds() {
             run,
             booked,
             Assertion::DidNotHappen,
-            "mallory",
+            &operator("mallory"),
             "i would rather this had not happened",
         )
         .await;
@@ -570,8 +583,13 @@ async fn a_run_that_is_not_quarantined_refuses_both_decisions() {
     assert_eq!(out.status, RunStatus::Succeeded);
 
     let refused =
-        f.rt.decide_quarantine(out.run_id, "ada", "tidying up", QuarantineDecision::Abandon)
-            .await;
+        f.rt.decide_quarantine(
+            out.run_id,
+            &operator("ada"),
+            "tidying up",
+            QuarantineDecision::Abandon,
+        )
+        .await;
     match refused {
         Err(RuntimeError::NotQuarantined { status, .. }) => assert_eq!(status, "succeeded"),
         other => panic!("expected a refusal naming the state, got {other:?}"),
@@ -588,15 +606,21 @@ async fn a_decision_needs_a_decider_and_a_reason() {
     let f = fixture();
     let run = quarantined(&f).await;
 
-    for (decider, reason) in [("", "checked"), ("ada", "   ")] {
-        let refused =
-            f.rt.decide_quarantine(run, decider, reason, QuarantineDecision::Reopen)
-                .await;
-        assert!(
-            refused.is_err(),
-            "accepted decider={decider:?} reason={reason:?}"
-        );
-    }
+    // **The decider is refused by the type now, and the reason at the verb.**
+    // `Operator` has no empty value, so a nameless decision cannot be built —
+    // the check that used to live in `decide_quarantine` moved from rung 3 of
+    // the evidence ladder to rung 1, and holds on every path that constructs
+    // one rather than only on the path through this call.
+    assert!(
+        agentplane::core::Operator::asserted("").is_err(),
+        "a nameless decider is constructible, so the runtime check this replaced \
+         is the only thing standing between a blank name and the chain"
+    );
+
+    let refused =
+        f.rt.decide_quarantine(run, &operator("ada"), "   ", QuarantineDecision::Reopen)
+            .await;
+    assert!(refused.is_err(), "accepted a blank reason");
 }
 
 // ── Giving up ───────────────────────────────────────────────────────────────
@@ -615,7 +639,7 @@ async fn abandoning_leaves_the_world_exactly_as_the_run_left_it() {
     let out =
         f.rt.decide_quarantine(
             run,
-            "ada",
+            &operator("ada"),
             "two weeks of provider tickets; nobody can say",
             QuarantineDecision::Abandon,
         )
@@ -624,7 +648,7 @@ async fn abandoning_leaves_the_world_exactly_as_the_run_left_it() {
 
     match &out.status {
         RunStatus::Abandoned { actor, reason } => {
-            assert_eq!(actor, "ada");
+            assert_eq!(actor.actor(), "ada");
             assert!(reason.contains("nobody can say"), "{reason}");
         }
         other => panic!("expected abandoned, got {other:?}"),
@@ -663,7 +687,7 @@ async fn an_abandonment_recorded_before_a_crash_is_finished_by_the_next_resume()
             vec![Append::new(
                 run,
                 RecordKind::QuarantineDecided {
-                    decider: "ada".into(),
+                    decider: operator("ada"),
                     reason: "written off".into(),
                     decision: QuarantineDecision::Abandon,
                 },
@@ -695,9 +719,14 @@ async fn an_abandonment_recorded_before_a_crash_is_finished_by_the_next_resume()
 async fn the_decision_is_on_the_chain_before_the_ending_it_asks_for() {
     let f = fixture();
     let run = quarantined(&f).await;
-    f.rt.decide_quarantine(run, "ada", "written off", QuarantineDecision::Abandon)
-        .await
-        .expect("abandon");
+    f.rt.decide_quarantine(
+        run,
+        &operator("ada"),
+        "written off",
+        QuarantineDecision::Abandon,
+    )
+    .await
+    .expect("abandon");
 
     let recs = f.records(run).await;
     let decided = recs
@@ -729,7 +758,7 @@ async fn cancelling_a_quarantined_run_is_refused_and_names_the_two_verbs() {
     let f = fixture();
     let run = quarantined(&f).await;
 
-    let refused = f.rt.request_cancel(run, "ada", "stop it").await;
+    let refused = f.rt.request_cancel(run, &operator("ada"), "stop it").await;
     let message = match refused {
         Err(e) => e.to_string(),
         Ok(_) => panic!("a cancellation that unwinds must not be accepted here"),
@@ -764,9 +793,14 @@ async fn an_abandoned_doubt_is_reportable_from_the_journal_forever() {
         .expect("audit");
     assert!(before.is_sound(), "{:?}", before.findings);
 
-    f.rt.decide_quarantine(run, "ada", "written off", QuarantineDecision::Abandon)
-        .await
-        .expect("abandon");
+    f.rt.decide_quarantine(
+        run,
+        &operator("ada"),
+        "written off",
+        QuarantineDecision::Abandon,
+    )
+    .await
+    .expect("abandon");
 
     let after = agentplane::audit::audit(&store, &[run], &agentplane::audit::Evidence::default())
         .await
@@ -799,9 +833,14 @@ async fn a_run_with_a_finding_still_reports_what_authorized_it() {
     let f = fixture();
     let run = quarantined(&f).await;
 
-    f.rt.decide_quarantine(run, "ada", "written off", QuarantineDecision::Abandon)
-        .await
-        .expect("abandon");
+    f.rt.decide_quarantine(
+        run,
+        &operator("ada"),
+        "written off",
+        QuarantineDecision::Abandon,
+    )
+    .await
+    .expect("abandon");
 
     let store = f.store.clone() as Arc<dyn JournalStore>;
     let report = agentplane::audit::audit(&store, &[run], &agentplane::audit::Evidence::default())
@@ -847,14 +886,19 @@ async fn an_answered_doubt_leaves_no_finding() {
         run,
         key,
         Assertion::Landed(json!({ "captured": true })),
-        "ada",
+        &operator("ada"),
         "charge ch_9RtQ exists",
     )
     .await
     .expect("assert");
-    f.rt.decide_quarantine(run, "ada", "confirmed", QuarantineDecision::Reopen)
-        .await
-        .expect("reopen");
+    f.rt.decide_quarantine(
+        run,
+        &operator("ada"),
+        "confirmed",
+        QuarantineDecision::Reopen,
+    )
+    .await
+    .expect("reopen");
 
     let store = f.store.clone() as Arc<dyn JournalStore>;
     let report = agentplane::audit::audit(&store, &[run], &agentplane::audit::Evidence::default())
@@ -875,14 +919,19 @@ async fn an_answered_run_replays_strictly() {
         run,
         key,
         Assertion::Landed(json!({ "captured": true })),
-        "ada",
+        &operator("ada"),
         "charge ch_9RtQ exists",
     )
     .await
     .expect("assert");
-    f.rt.decide_quarantine(run, "ada", "confirmed", QuarantineDecision::Reopen)
-        .await
-        .expect("reopen");
+    f.rt.decide_quarantine(
+        run,
+        &operator("ada"),
+        "confirmed",
+        QuarantineDecision::Reopen,
+    )
+    .await
+    .expect("reopen");
 
     let before = f.calls.load(Ordering::SeqCst);
     let strict = f.rt.replay(run, Mode::Strict).await.expect("strict replay");

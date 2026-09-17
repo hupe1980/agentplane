@@ -39,6 +39,14 @@ use agentplane::core::{
 use agentplane::journal::{AgentIdentity, Record, RecordBody, RecordKind};
 use serde_json::{Value, json};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// A run id that does not move between runs of the suite.
 ///
 /// The corpus is bytes, so every value in it has to be fixed. A generated id
@@ -175,14 +183,14 @@ fn effects() -> Vec<RecordKind> {
             spend: Spend::tokens(30),
             detail: Some("the provider's console lists it".into()),
             declared: Some(DeclaredOutput::untrusted()),
-            asserted_by: Some("ada".into()),
+            asserted_by: Some(operator("ada")),
         },
         RecordKind::StepCompensated {
             compensation: Compensation::Compensatable,
             outcome: "compensated".into(),
         },
         RecordKind::QuarantineDecided {
-            decider: "ada".into(),
+            decider: operator("ada"),
             reason: "two weeks of provider tickets; nobody can say".into(),
             decision: QuarantineDecision::Abandon,
         },
@@ -205,6 +213,7 @@ fn effects() -> Vec<RecordKind> {
         RecordKind::AuthorityWithheld {
             subject: "acme/ops".into(),
             reason: "credential withdrawn: laptop lost".into(),
+            by: operator("ops"),
         },
         RecordKind::AuthorityRestored {
             subject: "acme/ops".into(),
@@ -243,7 +252,7 @@ fn endings() -> Vec<RecordKind> {
             value: digest(),
         },
         RecordKind::RunCancelled {
-            actor: "ada".into(),
+            actor: operator("ada"),
             reason: "the counterparty withdrew".into(),
         },
         RecordKind::RunConcluded {
@@ -257,7 +266,7 @@ fn endings() -> Vec<RecordKind> {
             chain_head: digest(),
         },
         RecordKind::BreakGlass {
-            actor: "ada".into(),
+            actor: operator("ada"),
             roles: vec!["incident-commander".into()],
             reason: "SEV-1: reading tenant acme under incident 4711".into(),
         },

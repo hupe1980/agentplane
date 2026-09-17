@@ -467,7 +467,7 @@ pub enum RunStatus {
     /// run that has moved money and leaving the movement in place is not
     /// stopping it.
     Cancelled {
-        actor: String,
+        actor: crate::core::Operator,
         reason: String,
     },
     /// An operator closed a run whose outcome could never be established.
@@ -484,7 +484,7 @@ pub enum RunStatus {
     /// becomes an `agentplane audit` finding, which is derived from the journal
     /// and outlives every status the run will ever have.
     Abandoned {
-        actor: String,
+        actor: crate::core::Operator,
         reason: String,
     },
     /// A pass this plane made over its own state, journaled as a run of its own.
@@ -504,7 +504,7 @@ pub enum RunStatus {
     /// back from the crossing record, `reason` from the conclusion, and a
     /// crossing cannot be recorded without one.
     BrokeGlass {
-        actor: String,
+        actor: crate::core::Operator,
         reason: String,
     },
     /// The authority this run acts under was withdrawn while it was running.
@@ -592,11 +592,11 @@ impl RunStatus {
     /// *who* is the question an operator asks immediately after *what* — and a
     /// surface that reads the reason and drops the actor answers half of it.
     #[must_use]
-    pub fn actor(&self) -> Option<&str> {
+    pub fn actor(&self) -> Option<&crate::core::Operator> {
         match self {
             Self::Cancelled { actor, .. }
             | Self::Abandoned { actor, .. }
-            | Self::BrokeGlass { actor, .. } => Some(actor.as_str()),
+            | Self::BrokeGlass { actor, .. } => Some(actor),
             // A withdrawal names a *subject*, not an actor: the operator who
             // threw the halt and the credential it covers are different
             // parties, and answering "who" with the subject would report the
@@ -1308,7 +1308,7 @@ impl Runtime {
     pub async fn request_cancel(
         &self,
         run: RunId,
-        actor: &str,
+        actor: &crate::core::Operator,
         reason: &str,
     ) -> Result<bool, RuntimeError> {
         // Checked before recording. Writing first and failing afterwards leaves a
@@ -1416,16 +1416,17 @@ impl Runtime {
     pub async fn decide_quarantine(
         &self,
         run: RunId,
-        decider: &str,
+        decider: &crate::core::Operator,
         reason: &str,
         decision: crate::core::QuarantineDecision,
     ) -> Result<RunOutcome, RuntimeError> {
-        // Both are required and neither is defaulted. The whole weight of this
-        // record is that a named person took responsibility for a fact the
-        // runtime could not establish, and "unknown decided this for no stated
-        // reason" is a record that documents nothing while looking like
-        // process.
-        if decider.trim().is_empty() || reason.trim().is_empty() {
+        // The whole weight of this record is that a named person took
+        // responsibility for a fact the runtime could not establish, and
+        // "unknown decided this for no stated reason" documents nothing while
+        // looking like process. Only the reason is checked here: `Operator` has
+        // no empty value, so the decider is guaranteed by the type on every
+        // path that builds one rather than by a check on this one.
+        if reason.trim().is_empty() {
             return Err(RuntimeError::PlanContract(
                 "answering a quarantine needs a decider and a reason — who looked, and what they \
                  found"
@@ -1460,7 +1461,7 @@ impl Runtime {
         &self,
         run: RunId,
         lease: &crate::journal::Lease,
-        decider: &str,
+        decider: &crate::core::Operator,
         reason: &str,
         decision: crate::core::QuarantineDecision,
     ) -> Result<(), RuntimeError> {
@@ -1484,7 +1485,7 @@ impl Runtime {
         let mut append = Append::new(
             run,
             RecordKind::QuarantineDecided {
-                decider: decider.to_owned(),
+                decider: decider.clone(),
                 reason: reason.to_owned(),
                 decision,
             },
@@ -1532,10 +1533,11 @@ impl Runtime {
         run: RunId,
         effect: crate::core::EffectKey,
         assertion: crate::core::Assertion,
-        asserted_by: &str,
+        asserted_by: &crate::core::Operator,
         note: &str,
     ) -> Result<(), RuntimeError> {
-        if asserted_by.trim().is_empty() || note.trim().is_empty() {
+        // `asserted_by` needs no emptiness check: `Operator` has none to fail.
+        if note.trim().is_empty() {
             return Err(RuntimeError::PlanContract(
                 "an assertion about an effect needs a name and a note — who established this, and \
                  how"
@@ -1562,7 +1564,7 @@ impl Runtime {
         lease: &crate::journal::Lease,
         effect: crate::core::EffectKey,
         assertion: crate::core::Assertion,
-        asserted_by: &str,
+        asserted_by: &crate::core::Operator,
         note: &str,
     ) -> Result<(), RuntimeError> {
         let records = self
@@ -1606,7 +1608,7 @@ impl Runtime {
                 // of the attempt this answers.
                 spend: Spend::ZERO,
                 detail: Some(note.to_owned()),
-                asserted_by: Some(asserted_by.to_owned()),
+                asserted_by: Some(asserted_by.clone()),
             },
         )
         .step(undecided.step)
@@ -1677,8 +1679,15 @@ impl Runtime {
     /// broad one standing. An ungoverned run, with no manifest, is stopped
     /// only by a tenant halt; there is nothing narrower to key it on.
     ///
+    /// `at` is the caller's, never a clock read here: every lifecycle instant in
+    /// this crate is supplied for the reason a hold's is — a pass that reads its
+    /// own clock cannot be tested against an ageing plane, and [`I1`] forbids the
+    /// runtime an ambient clock outside the effect protocol.
+    ///
     /// Requires a quota store; without one there is nowhere durable to keep the
     /// flag, and an emergency stop that a restart forgets is not one.
+    ///
+    /// [`I1`]: crate::journal
     ///
     /// # Errors
     ///
@@ -1686,20 +1695,48 @@ impl Runtime {
     pub async fn set_halt(
         &self,
         scope: &crate::quota::HaltScope,
-        reason: Option<&str>,
+        by: &crate::core::Operator,
+        at: crate::core::Timestamp,
+        reason: &str,
     ) -> Result<(), RuntimeError> {
-        let quotas = self.quotas.as_ref().ok_or_else(|| {
+        let quotas = self.quota_store()?;
+        quotas
+            .set_halt(scope, by, at, reason)
+            .await
+            .map_err(RuntimeError::Store)
+    }
+
+    /// Lift one, and let work at that scope start again.
+    ///
+    /// Answers whether one was standing. An operator who lifts a scope nobody
+    /// halted is told so rather than told *done* — during an incident the
+    /// difference between *I cleared it* and *I cleared the wrong one* is the
+    /// whole of what they need.
+    ///
+    /// **Lifting names nobody on the record**, because the row goes. The
+    /// asymmetry with throwing one is stated rather than papered over: what
+    /// this store keeps is *what is stopped now*, and a history of episodes
+    /// would be a listing that grows with nothing to empty it. Where the stop
+    /// reached a run, the run's own journal holds both halves.
+    ///
+    /// # Errors
+    ///
+    /// If no quota store is wired, or the store is unreachable.
+    pub async fn lift_halt(&self, scope: &crate::quota::HaltScope) -> Result<bool, RuntimeError> {
+        let quotas = self.quota_store()?;
+        quotas.lift_halt(scope).await.map_err(RuntimeError::Store)
+    }
+
+    /// The quota store, or the refusal that says why an emergency stop needs one.
+    fn quota_store(&self) -> Result<&std::sync::Arc<dyn crate::quota::QuotaStore>, RuntimeError> {
+        self.quotas.as_ref().ok_or_else(|| {
             RuntimeError::Store(crate::core::StoreError::Backend(
                 "an emergency stop needs a quota store to keep the flag in — an \
                  in-process one is forgotten by a restart and never seen by a \
                  second instance"
                     .to_owned(),
             ))
-        })?;
-        quotas
-            .set_halt(scope, reason)
-            .await
-            .map_err(RuntimeError::Store)
+        })
     }
 
     /// Every standing emergency stop on this tenant, and why.
@@ -1914,7 +1951,7 @@ impl Runtime {
     /// is refused rather than stored empty.
     pub async fn record_break_glass(
         &self,
-        actor: &str,
+        actor: &crate::core::Operator,
         roles: &[String],
         reason: &str,
     ) -> Result<RunId, RuntimeError> {
@@ -1933,7 +1970,7 @@ impl Runtime {
                 vec![Append::new(
                     run,
                     RecordKind::BreakGlass {
-                        actor: actor.to_owned(),
+                        actor: actor.clone(),
                         roles: roles.to_vec(),
                         reason: reason.to_owned(),
                     },
@@ -2111,15 +2148,18 @@ impl Runtime {
     async fn withdrawn_authority(
         &self,
         identity: Option<&crate::core::Delegation>,
-    ) -> Result<Option<(String, String)>, RuntimeError> {
+    ) -> Result<Option<Withdrawal>, RuntimeError> {
         let (Some(quotas), Some(chain)) = (self.quotas.as_ref(), identity) else {
             return Ok(None);
         };
         let subject = chain.subject().id.as_str();
         let halts = quotas.halts().await.map_err(RuntimeError::Store)?;
         Ok(halts.into_iter().find_map(|halt| {
-            (halt.scope.withdrawn_subject() == Some(subject))
-                .then(|| (subject.to_owned(), halt.reason))
+            (halt.scope.withdrawn_subject() == Some(subject)).then(|| Withdrawal {
+                subject: subject.to_owned(),
+                reason: halt.reason,
+                by: halt.by,
+            })
         }))
     }
 
@@ -2138,7 +2178,7 @@ impl Runtime {
     async fn withhold(
         &self,
         cx: Unwind<'_>,
-        withdrawal: (String, String),
+        withdrawal: Withdrawal,
         record: bool,
         completed: &[(StepId, Capability)],
         outputs: &BTreeMap<StepId, Tainted<Value>>,
@@ -2146,13 +2186,18 @@ impl Runtime {
         case_id: Option<crate::core::CaseId>,
         quota: &QuotaPass,
     ) -> Result<RunOutcome, RuntimeError> {
-        let (subject, reason) = withdrawal;
+        let Withdrawal {
+            subject,
+            reason,
+            by,
+        } = withdrawal;
         if record {
             let stamped = (cx.stamp)(Append::new(
                 cx.run,
                 RecordKind::AuthorityWithheld {
                     subject: subject.clone(),
                     reason: reason.clone(),
+                    by: by.clone(),
                 },
             ));
             self.store
@@ -4195,7 +4240,7 @@ impl Runtime {
                     // The prior is dropped rather than restored: this pass
                     // returns, and the *records* are what a later resume reads
                     // its standing state from.
-                    (Some((subject, reason)), Some(_prior)) => {
+                    (Some(withdrawal), Some(_prior)) => {
                         return self
                             .withhold(
                                 Unwind {
@@ -4210,7 +4255,7 @@ impl Runtime {
                                     writing,
                                     stamp: &stamp,
                                 },
-                                (subject, reason),
+                                withdrawal,
                                 false,
                                 &completed,
                                 &outputs,
@@ -4220,7 +4265,7 @@ impl Runtime {
                             )
                             .await;
                     }
-                    (Some((subject, reason)), None) => {
+                    (Some(withdrawal), None) => {
                         return self
                             .withhold(
                                 Unwind {
@@ -4235,7 +4280,7 @@ impl Runtime {
                                     writing,
                                     stamp: &stamp,
                                 },
-                                (subject, reason),
+                                withdrawal,
                                 true,
                                 &completed,
                                 &outputs,
@@ -5991,6 +6036,17 @@ struct Batch<'a> {
     parallelism: usize,
 }
 
+/// A standing withdrawal, as the step boundary meets it.
+///
+/// Carries the operator from the halt rather than only its reason: the
+/// withholding record is the one durable trace of this act on the run it
+/// stopped, and a pause nobody is named on cannot be asked about afterwards.
+struct Withdrawal {
+    subject: String,
+    reason: String,
+    by: crate::core::Operator,
+}
+
 /// What the journal proves about a run an unwind is deciding over.
 struct UnwindEvidence {
     /// Steps that announced a mutating forward effect.
@@ -6795,6 +6851,16 @@ struct Execution<'a> {
     identity: Option<crate::core::Delegation>,
 }
 
+/// What a conclusion says when nothing on the chain says who ended the run.
+///
+/// Quarantine rather than a placeholder name, for the reason the exhausted arm
+/// beside it quarantines when the typed ceiling verdict is missing: the record
+/// is not trustworthy, and *not trustworthy* is a different bucket from *try
+/// again*. A name invented here would be served through the operator API as the
+/// person who did it.
+const UNATTRIBUTED: &str = "the chain records this ending and not who asked for it — an \
+                            operator act with nobody on it cannot be answered by reading further";
+
 /// The recorded status of a run that must not be resumed.
 ///
 /// The outcomes that close a run to recovery:
@@ -6849,19 +6915,33 @@ fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
                     .into(),
             )
         }),
-        "abandoned" => Some(RunStatus::Abandoned {
-            actor: recorded_decider(records).unwrap_or_else(|| "unknown".into()),
-            reason: "recorded as abandoned; its outcome was never established and nothing was \
-                     unwound"
-                .into(),
-        }),
+        // A conclusion whose attribution record is missing is **quarantined**,
+        // not attributed to a person called "unknown". The arm for an exhausted
+        // run with no typed ceiling verdict already reads this way; these three
+        // fabricated a name instead, and a fabricated one is worse than a
+        // missing one because it is indistinguishable from a real operator with
+        // that name and it is served through the operator API as fact.
+        "abandoned" => Some(recorded_decider(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| {
+                RunStatus::Abandoned {
+                    actor,
+                    reason: "recorded as abandoned; its outcome was never established and nothing \
+                         was unwound"
+                        .into(),
+                }
+            },
+        )),
         // A stopped run stays stopped. Otherwise the next inbound event resumes
         // it and it carries on doing the thing somebody intervened to prevent —
         // and the intervention would look, from the journal, like it worked.
-        "cancelled" => Some(RunStatus::Cancelled {
-            actor: recorded_canceller(records).unwrap_or_else(|| "unknown".into()),
-            reason: "recorded as cancelled; an operator stopped this run".into(),
-        }),
+        "cancelled" => Some(recorded_canceller(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| RunStatus::Cancelled {
+                actor,
+                reason: "recorded as cancelled; an operator stopped this run".into(),
+            },
+        )),
         // The two conclusions that deliberately do not close a run: a failed
         // run resumes with its completed effects read back from history, and an
         // exhausted one continues once somebody raises the ceiling.
@@ -7076,19 +7156,28 @@ fn recorded_status(
             RunStatus::Exhausted,
         ),
         "quarantined" => RunStatus::Quarantined(said()),
-        "cancelled" => RunStatus::Cancelled {
-            actor: recorded_canceller(records).unwrap_or_else(|| "unknown".into()),
-            reason: said(),
-        },
-        "abandoned" => RunStatus::Abandoned {
-            actor: recorded_decider(records).unwrap_or_else(|| "unknown".into()),
-            reason: said(),
-        },
+        "cancelled" => recorded_canceller(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| RunStatus::Cancelled {
+                actor,
+                reason: said(),
+            },
+        ),
+        "abandoned" => recorded_decider(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| RunStatus::Abandoned {
+                actor,
+                reason: said(),
+            },
+        ),
         super::sweeper::SWEEP_OUTCOME => RunStatus::Swept,
-        BREAK_GLASS_OUTCOME => RunStatus::BrokeGlass {
-            actor: recorded_crosser(records).unwrap_or_else(|| "unknown".into()),
-            reason: said(),
-        },
+        BREAK_GLASS_OUTCOME => recorded_crosser(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| RunStatus::BrokeGlass {
+                actor,
+                reason: said(),
+            },
+        ),
         // Fail closed, as the resume path does: a conclusion this build cannot
         // interpret is not permission to treat the run as ordinary. Every
         // outcome this build *writes* has an arm above, and a guard holds the
@@ -7106,7 +7195,7 @@ fn recorded_status(
 /// Read rather than remembered, for the same reason every other fact about a run
 /// is: the journal gives the same answer on every subsequent read, and an
 /// operator asking "who stopped this?" six weeks later is asking history.
-fn recorded_canceller(records: &[Record]) -> Option<String> {
+fn recorded_canceller(records: &[Record]) -> Option<crate::core::Operator> {
     records.iter().rev().find_map(|r| match r.kind() {
         RecordKind::RunCancelled { actor, .. } => Some(actor.clone()),
         _ => None,
@@ -7118,7 +7207,7 @@ fn recorded_canceller(records: &[Record]) -> Option<String> {
 /// The twin of `recorded_canceller`, and read for the same reason: an
 /// abandonment's `RunConcluded` carries the *reason* a person gave, and the
 /// person is on the decision record that asked for it.
-fn recorded_decider(records: &[Record]) -> Option<String> {
+fn recorded_decider(records: &[Record]) -> Option<crate::core::Operator> {
     records.iter().rev().find_map(|r| match r.kind() {
         RecordKind::QuarantineDecided { decider, .. } => Some(decider.clone()),
         _ => None,
@@ -7132,7 +7221,7 @@ fn recorded_decider(records: &[Record]) -> Option<String> {
 /// the crossing record itself, and an incident review that can see the reason
 /// and not the person has been told half of what the control was written to
 /// capture.
-fn recorded_crosser(records: &[Record]) -> Option<String> {
+fn recorded_crosser(records: &[Record]) -> Option<crate::core::Operator> {
     records.iter().rev().find_map(|r| match r.kind() {
         RecordKind::BreakGlass { actor, .. } => Some(actor.clone()),
         _ => None,
@@ -9308,16 +9397,16 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
         RunStatus::Quarantined("unknown outcome".into()),
         RunStatus::Replanning("try again".into()),
         RunStatus::Cancelled {
-            actor: "ops".into(),
+            actor: crate::core::Operator::asserted("ops").expect("a name"),
             reason: "stop".into(),
         },
         RunStatus::Abandoned {
-            actor: "ops".into(),
+            actor: crate::core::Operator::asserted("ops").expect("a name"),
             reason: "nobody could establish what happened".into(),
         },
         RunStatus::Swept,
         RunStatus::BrokeGlass {
-            actor: "ops".into(),
+            actor: crate::core::Operator::asserted("ops").expect("a name"),
             reason: "INC-42".into(),
         },
         RunStatus::Withheld {
@@ -9437,7 +9526,7 @@ mod resume_agreement_tests {
     #[test]
     fn every_outcome_this_build_writes_is_one_it_can_read_back() {
         for outcome in super::OUTCOMES_OF_RECORD {
-            let status = super::recorded_status(outcome, Some("why"), None, &[]);
+            let status = super::recorded_status(outcome, Some("why"), None, &sealed_as(outcome));
             assert_eq!(
                 &status.as_str(),
                 outcome,
@@ -9445,6 +9534,30 @@ mod resume_agreement_tests {
                  '{}' — a catch-all answering `Quarantined` about a record this \
                  plane wrote itself",
                 status.as_str()
+            );
+        }
+    }
+
+    /// **An ending nobody is named on is quarantined, not given a name.**
+    ///
+    /// The chain this build writes always carries the attribution record before
+    /// the conclusion; a chain that carries only the conclusion is a crash
+    /// between the two appends, or a chain somebody edited. Either way the
+    /// record is not trustworthy, and *not trustworthy* is a different bucket
+    /// from *an operator called unknown did this*.
+    ///
+    /// A fabricated actor would be worse than a missing one: indistinguishable
+    /// from a real operator with that name, and served through the operator API
+    /// as fact.
+    #[test]
+    fn an_ending_with_no_attribution_record_is_not_given_a_name() {
+        for outcome in ["cancelled", "abandoned", super::BREAK_GLASS_OUTCOME] {
+            let status =
+                super::recorded_status(outcome, Some("why"), None, &concluded_only(outcome));
+            assert!(
+                matches!(status, RunStatus::Quarantined(_)),
+                "'{outcome}' with no record of who asked read back as {status:?} — \
+                 an operator act with nobody on it was given a name"
             );
         }
     }
@@ -9460,7 +9573,7 @@ mod resume_agreement_tests {
             super::BREAK_GLASS_OUTCOME,
             Some("INC-42: stuck settlement"),
             None,
-            &[],
+            &sealed_as(super::BREAK_GLASS_OUTCOME),
         );
         assert_eq!(
             status.reason().as_deref(),
@@ -9508,29 +9621,77 @@ mod resume_agreement_tests {
         );
     }
 
-    /// A chain whose only record is a seal with this outcome.
+    /// A chain carrying the conclusion and **not** the attribution record.
+    ///
+    /// The damaged shape, which no healthy write produces: a crash between the
+    /// two appends, or an edit. Built by taking the real chain and dropping
+    /// everything before the conclusion, so it cannot drift from what
+    /// [`sealed_as`] produces.
+    fn concluded_only(outcome: &str) -> Vec<crate::journal::Record> {
+        let full = sealed_as(outcome);
+        full.into_iter()
+            .filter(|r| matches!(r.kind(), RecordKind::RunConcluded { .. }))
+            .collect()
+    }
+
+    /// The chain this build actually writes for an ending.
+    ///
+    /// **Including the attribution record**, where the ending has one. A
+    /// conclusion is never the only record of a cancellation, an abandonment or
+    /// a crossing — the runtime appends who asked first — so a fixture holding
+    /// the conclusion alone asserts a round trip over a chain this plane does
+    /// not produce, and would keep passing if the reader began inventing a
+    /// name for the missing half.
     fn sealed_as(outcome: &str) -> Vec<crate::journal::Record> {
         use crate::core::{Digest, Epoch};
         use crate::journal::{Record, RecordBody};
 
-        let body = RecordBody {
-            seq: 1,
-            run: crate::core::RunId::generate(),
-            case: None,
-            step: None,
-            phase: super::Phase::Forward,
-            epoch: Epoch::default(),
-            v: 1,
-            effect_key: None,
-            kind: RecordKind::RunConcluded {
-                outcome: outcome.to_owned(),
-                chain_head: Digest::of(b""),
-                reason: None,
-                exhaustion: None,
-                live_spend: crate::core::Spend::default(),
-            },
+        let run = crate::core::RunId::generate();
+        let who = || crate::core::Operator::asserted("ops").expect("a name");
+        let mut kinds: Vec<RecordKind> = match outcome {
+            "cancelled" => vec![RecordKind::RunCancelled {
+                actor: who(),
+                reason: "stop".into(),
+            }],
+            "abandoned" => vec![RecordKind::QuarantineDecided {
+                decider: who(),
+                reason: "nobody could establish what happened".into(),
+                decision: crate::core::QuarantineDecision::Abandon,
+            }],
+            super::BREAK_GLASS_OUTCOME => vec![RecordKind::BreakGlass {
+                actor: who(),
+                roles: vec!["oncall".into()],
+                reason: "INC-42".into(),
+            }],
+            _ => Vec::new(),
         };
-        vec![Record::seal(body, Digest::of(b"")).expect("a sealed record")]
+        kinds.push(RecordKind::RunConcluded {
+            outcome: outcome.to_owned(),
+            chain_head: Digest::of(b""),
+            reason: None,
+            exhaustion: None,
+            live_spend: crate::core::Spend::default(),
+        });
+
+        let mut prev = Digest::of(b"");
+        let mut out = Vec::new();
+        for (i, kind) in kinds.into_iter().enumerate() {
+            let body = RecordBody {
+                seq: u64::try_from(i + 1).expect("a small fixture"),
+                run,
+                case: None,
+                step: None,
+                phase: super::Phase::Forward,
+                epoch: Epoch::default(),
+                v: 1,
+                effect_key: None,
+                kind,
+            };
+            let record = Record::seal(body, prev).expect("a sealed record");
+            prev = record.hash;
+            out.push(record);
+        }
+        out
     }
 
     /// One execution pass is authorized and accrued against one period even

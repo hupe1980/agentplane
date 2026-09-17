@@ -135,38 +135,56 @@ impl QuotaStore for PostgresStore {
         })
     }
 
-    async fn set_halt(&self, scope: &HaltScope, reason: Option<&str>) -> Result<(), StoreError> {
+    async fn set_halt(
+        &self,
+        scope: &HaltScope,
+        by: &crate::core::Operator,
+        at: crate::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), StoreError> {
         let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
         let scope = scope.key();
-        match reason {
-            Some(reason) => {
-                client
-                    .execute(
-                        "INSERT INTO quota_halted (tenant, scope, reason) VALUES ($1, $2, $3)
-                         ON CONFLICT (tenant, scope) DO UPDATE SET reason = EXCLUDED.reason",
-                        &[&self.tenant_name(), &scope, &reason],
-                    )
-                    .await
-                    .map_err(|e| be(&e))?;
-            }
-            None => {
-                client
-                    .execute(
-                        "DELETE FROM quota_halted WHERE tenant = $1 AND scope = $2",
-                        &[&self.tenant_name(), &scope],
-                    )
-                    .await
-                    .map_err(|e| be(&e))?;
-            }
-        }
+        client
+            .execute(
+                "INSERT INTO quota_halted (tenant, scope, reason, by_actor, by_basis, thrown_at)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (tenant, scope) DO UPDATE SET
+                     reason = EXCLUDED.reason,
+                     by_actor = EXCLUDED.by_actor,
+                     by_basis = EXCLUDED.by_basis,
+                     thrown_at = EXCLUDED.thrown_at",
+                &[
+                    &self.tenant_name(),
+                    &scope,
+                    &reason,
+                    &by.actor(),
+                    &by.basis().as_str(),
+                    &at.unix_timestamp(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
         Ok(())
+    }
+
+    async fn lift_halt(&self, scope: &HaltScope) -> Result<bool, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let removed = client
+            .execute(
+                "DELETE FROM quota_halted WHERE tenant = $1 AND scope = $2",
+                &[&self.tenant_name(), &scope.key()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(removed > 0)
     }
 
     async fn halts(&self) -> Result<Vec<Halt>, StoreError> {
         let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT scope, reason FROM quota_halted WHERE tenant = $1 ORDER BY scope",
+                "SELECT scope, reason, by_actor, by_basis, thrown_at FROM quota_halted \
+                 WHERE tenant = $1 ORDER BY scope",
                 &[&self.tenant_name()],
             )
             .await
@@ -184,10 +202,27 @@ impl QuotaStore for PostgresStore {
                          read — refusing rather than admitting work an operator stopped"
                     ),
                 })?;
-                Ok(Halt {
+                let corrupt = |what: &str| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!(
+                        "quota_halted holds a halt on '{stored}' whose {what} this build \
+                         cannot read — refusing rather than admitting work an operator stopped"
+                    ),
+                };
+                let by = super::decode_operator(
+                    &row.get::<_, String>(2),
+                    &row.get::<_, String>(3),
+                    "quota_halted",
+                )?;
+                Ok(super::halt_from_row(
                     scope,
-                    reason: row.get(1),
-                })
+                    super::HaltRow {
+                        reason: row.get(1),
+                        by,
+                        at: crate::core::Timestamp::from_unix_timestamp(row.get::<_, i64>(4))
+                            .map_err(|_| corrupt("instant"))?,
+                    },
+                ))
             })
             .collect()
     }

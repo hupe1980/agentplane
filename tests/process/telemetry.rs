@@ -27,6 +27,14 @@ use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 use tracing::{Event, Metadata, Subscriber, span};
 
+/// An operator for a fixture, on the weakest basis a real caller could present.
+///
+/// `Asserted`: a suite that only built the authenticated form would leave the
+/// basis a store persists untested on the path an incident actually takes.
+fn operator(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
+}
+
 /// A span and the span it was created inside.
 type Parented = (String, Option<String>);
 
@@ -346,7 +354,7 @@ async fn abandoning_a_quarantined_run_emits_its_event() {
     let closed = rt
         .decide_quarantine(
             out.run_id,
-            "ada",
+            &operator("ada"),
             "two weeks of provider tickets; nobody can say",
             agentplane::core::QuarantineDecision::Abandon,
         )

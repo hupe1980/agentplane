@@ -94,6 +94,7 @@ async fn a_hold_is_placed_once_listed_and_lifted(store: &Arc<dyn CaseStore>, r: 
     let hold = crate::core::LegalHold {
         placed_at: ts(2_000),
         reason: "preservation order 2026-114".to_owned(),
+        by: crate::core::Operator::authenticated("compliance-dana").expect("a name"),
     };
 
     match store.place_hold(case, &hold).await {
@@ -114,9 +115,14 @@ async fn a_hold_is_placed_once_listed_and_lifted(store: &Arc<dyn CaseStore>, r: 
     }
 
     // Second placement: the first stands, instant and reason untouched.
+    // A different operator on a different basis, so first-placement-wins is
+    // checked over *who* as well as over the instant and the reason. A store
+    // that let the second write through would attribute a preservation order to
+    // whoever retried it last.
     let later = crate::core::LegalHold {
         placed_at: ts(9_000),
         reason: "a retry that must not win".to_owned(),
+        by: crate::core::Operator::asserted("a-retry").expect("a name"),
     };
     match store.place_hold(case, &later).await {
         Ok(false) => match store.hold(case).await {
@@ -182,6 +188,7 @@ async fn a_hold_on_a_missing_matter_is_not_found(store: &Arc<dyn CaseStore>, r: 
     let hold = crate::core::LegalHold {
         placed_at: ts(2_000),
         reason: "on nothing".to_owned(),
+        by: crate::core::Operator::authenticated("compliance-dana").expect("a name"),
     };
     match store.place_hold(absent, &hold).await {
         Err(StoreError::NotFound(_)) => {}

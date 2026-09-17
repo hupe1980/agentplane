@@ -183,26 +183,35 @@ struct HoldArgs {
     #[arg(long)]
     reason: Option<String>,
 
-    /// Lift the hold instead of placing it.
+    /// Who is placing it. Required to place one.
+    ///
+    /// Recorded as **asserted**: nothing here verified it, and what it proves
+    /// is that whoever ran this command could open the store. The operator API
+    /// records the same field from the credential its authenticator checked,
+    /// and the row says which of the two it was.
     #[arg(long)]
+    actor: Option<String>,
+
+    /// Lift the hold instead of placing it.
+    #[arg(long, conflicts_with_all = ["reason", "actor"])]
     lift: bool,
 }
 
 /// The emergency stop, as a verb: an incident is the worst time to discover
 /// that the brake needs a compiler.
 ///
-/// `--reason` is required to halt and refused to lift. The next person to look
-/// will be somebody else, possibly at three in the morning, and *why* is the
-/// whole question — while a lift needs no justification because it restores the
-/// default.
+/// `--reason` and `--actor` are required to halt and refused to lift: the next
+/// person to look will be somebody else, possibly at three in the morning, and
+/// *why* and *who* are the whole question. A lift needs neither, because it
+/// restores the default and the row it clears is gone.
 #[derive(clap::Args, Debug)]
 struct HaltArgs {
     /// The store holding the halt, and which tenant to stop.
     #[command(flatten)]
     at: StoreRef,
 
-    /// What to stop: `tenant`, `agent:<metadata.name>`, or
-    /// `revision:<manifest digest>`.
+    /// What to stop: `tenant`, `agent:<metadata.name>`,
+    /// `revision:<manifest digest>`, or `subject:<delegation subject>`.
     ///
     /// `revision:` is the one to reach for when a bad deploy is the incident:
     /// it names the exact reviewed bytes, so a fix published as a new version
@@ -214,8 +223,22 @@ struct HaltArgs {
     #[arg(long)]
     reason: Option<String>,
 
+    /// Who is throwing it. Required unless `--lift`.
+    ///
+    /// It goes on the row, and it is recorded as **asserted** rather than
+    /// authenticated: nothing here verified it, and what it proves is that
+    /// whoever ran this command could open the store. The operator API records
+    /// the same field from the credential its authenticator checked, and the
+    /// two are told apart on the row rather than guessed at from the surface.
+    ///
+    /// Required rather than defaulted from the shell, because a name taken from
+    /// `$USER` reads on the record exactly like one somebody chose to put
+    /// there, and only one of those is true.
+    #[arg(long)]
+    actor: Option<String>,
+
     /// Lift this halt instead of setting it.
-    #[arg(long, conflicts_with = "reason")]
+    #[arg(long, conflicts_with_all = ["reason", "actor"])]
     lift: bool,
 }
 
@@ -1337,6 +1360,8 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
                         "case": id.to_string(),
                         "placed_at": hold.placed_at.unix_timestamp(),
                         "reason": hold.reason,
+                        "by": hold.by.actor(),
+                        "basis": hold.by.basis().as_str(),
                     }));
                 }
             }
@@ -1370,6 +1395,15 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
             )
             .to_owned());
         };
+        let Some(actor) = opts.actor.as_deref() else {
+            return Err(concat!(
+                "--actor is required to place a hold: a preservation order the runtime ",
+                "cannot check is worth the name beside it, and the row records that this ",
+                "one was asserted rather than authenticated"
+            )
+            .to_owned());
+        };
+        let by = agentplane::core::Operator::asserted(actor).map_err(|e| e.to_string())?;
         // Wall clock by design, like `retain`'s cutoff: when a hold was placed
         // is a fact about the outside world, not a journaled observation.
         #[allow(clippy::disallowed_methods)]
@@ -1380,6 +1414,7 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
                 &agentplane::core::LegalHold {
                     placed_at: now,
                     reason: reason.to_owned(),
+                    by,
                 },
             )
             .await
@@ -1396,6 +1431,8 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
                     .map(|h| serde_json::json!({
                         "placed_at": h.placed_at.unix_timestamp(),
                         "reason": h.reason,
+                        "by": h.by.actor(),
+                        "basis": h.by.basis().as_str(),
                     })),
             }))
             .map_err(|e| e.to_string())?
@@ -1411,18 +1448,27 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
 fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
     let scope = agentplane::quota::HaltScope::parse(&opts.scope).ok_or_else(|| {
         format!(
-            "'{}' is not a scope: use 'tenant', 'agent:<metadata.name>', {}",
-            opts.scope, "or 'revision:<manifest digest>'"
+            "'{}' is not a scope: use {}",
+            opts.scope,
+            agentplane::quota::HaltScope::forms()
         )
     })?;
-    if !opts.lift && opts.reason.is_none() {
-        return Err(concat!(
+    let thrown = if opts.lift {
+        None
+    } else {
+        let reason = opts.reason.as_deref().ok_or(concat!(
             "--reason is required to halt: the next person to look will be somebody else, ",
             "possibly at three in the morning, and why is the whole question. ",
             "Use --lift to clear a halt"
-        )
-        .to_owned());
-    }
+        ))?;
+        let actor = opts.actor.as_deref().ok_or(concat!(
+            "--actor is required to halt: the runtime cannot check an emergency stop, ",
+            "so the name beside it is the whole of its evidence. It is recorded as ",
+            "asserted — nothing here verified it"
+        ))?;
+        let by = agentplane::core::Operator::asserted(actor).map_err(|e| e.to_string())?;
+        Some((by, reason))
+    };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1431,18 +1477,39 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
 
     rt.block_on(async {
         let quotas = opts.at.open().await?.quotas();
-        quotas
-            .set_halt(&scope, opts.reason.as_deref())
-            .await
-            .map_err(|e| e.to_string())?;
-        println!(
-            "{}",
-            serde_json::json!({
-                "scope": scope.key(),
-                "halted": !opts.lift,
-                "reason": opts.reason,
-            })
-        );
+        let printed = if let Some((by, reason)) = &thrown {
+            {
+                // Wall clock by design, like `retain`'s cutoff and a hold's
+                // instant: when a person threw a stop is a fact about the
+                // outside world, not a journaled observation.
+                #[allow(clippy::disallowed_methods)]
+                let now = time::OffsetDateTime::now_utc();
+                quotas
+                    .set_halt(&scope, by, now, reason)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                serde_json::json!({
+                    "scope": scope.key(),
+                    "halted": true,
+                    "reason": reason,
+                    "by": by.actor(),
+                    "basis": by.basis().as_str(),
+                })
+            }
+        } else {
+            {
+                let was_standing = quotas.lift_halt(&scope).await.map_err(|e| e.to_string())?;
+                // Whether one was standing is the answer to *did I clear the
+                // right scope*, which is the question during an incident. A lift
+                // that found nothing must not read as success.
+                serde_json::json!({
+                    "scope": scope.key(),
+                    "halted": false,
+                    "was_standing": was_standing,
+                })
+            }
+        };
+        println!("{printed}");
         Ok(ExitCode::SUCCESS)
     })
 }
@@ -1459,7 +1526,15 @@ fn halts_verb(opts: &HaltsArgs) -> Result<ExitCode, String> {
         let halts = quotas.halts().await.map_err(|e| e.to_string())?;
         let rows: Vec<serde_json::Value> = halts
             .iter()
-            .map(|h| serde_json::json!({ "scope": h.scope.key(), "reason": h.reason }))
+            .map(|h| {
+                serde_json::json!({
+                    "scope": h.scope.key(),
+                    "reason": h.reason,
+                    "by": h.by.actor(),
+                    "basis": h.by.basis().as_str(),
+                    "thrown_at": h.at.unix_timestamp(),
+                })
+            })
             .collect();
         println!(
             "{}",

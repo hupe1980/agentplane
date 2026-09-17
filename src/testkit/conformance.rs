@@ -31,6 +31,15 @@ use std::time::Duration;
 use crate::core::{CaseId, Digest, EffectKey, RunId, StepId};
 use crate::journal::{Append, JournalStore, Record, RecordKind};
 
+/// An operator for a battery, on the weakest basis a real caller could use.
+///
+/// `Asserted` on purpose: a contract test that only ever exercised the
+/// authenticated form would leave the basis a store persists untested on the
+/// path an incident actually takes.
+fn named(actor: &str) -> crate::core::Operator {
+    crate::core::Operator::asserted(actor).expect("a battery names its operator")
+}
+
 /// What a store got wrong.
 #[derive(Debug, Clone)]
 pub struct Violation {
@@ -2001,7 +2010,10 @@ async fn a_stop_request_needs_no_lease(fresh: Factory<'_>, r: &mut Report) {
         return;
     }
 
-    match store.request_cancel(run, "operator", "stop it").await {
+    match store
+        .request_cancel(run, &named("operator"), "stop it")
+        .await
+    {
         Ok(true) => {}
         Ok(false) => r.record(
             "cancellation",
@@ -2017,7 +2029,7 @@ async fn a_stop_request_needs_no_lease(fresh: Factory<'_>, r: &mut Report) {
     }
 
     match store.cancellation(run).await {
-        Ok(Some(c)) if c.actor == "operator" && c.reason == "stop it" => {}
+        Ok(Some(c)) if c.actor == named("operator") && c.reason == "stop it" => {}
         Ok(Some(c)) => r.record(
             "cancellation",
             format!("the stop request read back as {c:?}, which is not what was written"),
@@ -2051,11 +2063,14 @@ async fn the_first_asker_stays_on_the_record(fresh: Factory<'_>, r: &mut Report)
     let store = fresh().await;
     let run = RunId::generate();
 
-    if !matches!(store.request_cancel(run, "alice", "first").await, Ok(true)) {
+    if !matches!(
+        store.request_cancel(run, &named("alice"), "first").await,
+        Ok(true)
+    ) {
         r.record("cancellation", "the first stop request was not recorded");
         return;
     }
-    match store.request_cancel(run, "bob", "second").await {
+    match store.request_cancel(run, &named("bob"), "second").await {
         Ok(false) => {}
         Ok(true) => r.record(
             "cancellation",
@@ -2068,7 +2083,7 @@ async fn the_first_asker_stays_on_the_record(fresh: Factory<'_>, r: &mut Report)
         ),
     }
     match store.cancellation(run).await {
-        Ok(Some(c)) if c.actor == "alice" && c.reason == "first" => {}
+        Ok(Some(c)) if c.actor == named("alice") && c.reason == "first" => {}
         Ok(other) => r.record(
             "cancellation",
             format!(
