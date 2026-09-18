@@ -347,9 +347,12 @@ async fn the_negotiated_protocol_version_is_pinned_to_2026_07_28() {
 /// readable from the client, and `agentplane serve` prints it — the declarative
 /// tier has no Rust in which to ask.
 ///
-/// Asserted against the raw string a *server* chose rather than a constant, so
-/// this fails if the accessor ever reports what was offered instead of what was
-/// agreed — which is the one way it could look correct and be useless.
+/// Asserted against the raw string the *handshake* settled on rather than a
+/// constant, so this fails if the accessor ever reports the pinned baseline
+/// instead — which is the one way it could look correct and be useless. The
+/// downgrade it can report is the fallback and no further: a revision outside
+/// `McpClient::SPOKEN_REVISIONS` is refused rather than proceeded on, so
+/// *answered but never offered* is no longer a state this host can reach.
 #[tokio::test]
 async fn the_client_reports_the_version_the_handshake_settled_on() {
     // Hand-rolled rather than an rmcp `ServerHandler`, because rmcp's server
@@ -386,7 +389,7 @@ async fn the_client_reports_the_version_the_handshake_settled_on() {
                 "jsonrpc": "2.0",
                 "id": request["id"],
                 "result": {
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": "2025-11-25",
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "old-server", "version": "0.0.0" },
                 }
@@ -403,9 +406,9 @@ async fn the_client_reports_the_version_the_handshake_settled_on() {
 
     assert_eq!(
         client.negotiated_version().as_deref(),
-        Some("2025-06-18"),
-        "the client reported the version it *offered* rather than the one the \
-         server answered with, so a downgrade — and the absent tasks extension \
+        Some("2025-11-25"),
+        "the client reported its pinned baseline rather than the revision the \
+         handshake settled on, so a downgrade — and the absent tasks extension \
          that comes with it — stays invisible to every deployment that does not \
          speak rmcp directly"
     );
@@ -1041,6 +1044,66 @@ async fn an_unknown_negotiated_version_is_refused_at_construction() {
     assert!(
         error.to_string().contains("2099-01-01"),
         "the refusal names the version: {error}"
+    );
+}
+
+/// **A revision this host is not held to is refused, even though the SDK knows
+/// it.**
+///
+/// The SDK parses five revisions and this host is exercised against two: the
+/// one it serves and the handshake-era fallback. Accepting the other three
+/// because the SDK can deserialize them would be claiming a dialect on somebody
+/// else's inventory — and the claim is not abstract, because those revisions
+/// carry no Tasks extension and differ in the shapes this host reads back, so a
+/// governed suspension would simply never be reported.
+#[tokio::test]
+async fn a_revision_the_sdk_knows_but_this_host_is_not_held_to_is_refused() {
+    let (client_side, server_side) = tokio::io::duplex(8 * 1024);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (r, mut w) = tokio::io::split(server_side);
+        let mut lines = BufReader::new(r).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(request): Result<serde_json::Value, _> = serde_json::from_str(&line) else {
+                continue;
+            };
+            if request["method"] == "server/discover" {
+                let refusal = json!({
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "error": { "code": -32601, "message": "Method not found" }
+                });
+                let _ = w.write_all(format!("{refusal}\n").as_bytes()).await;
+                let _ = w.flush().await;
+                continue;
+            }
+            if request["method"] != "initialize" {
+                continue;
+            }
+            // A revision in `ProtocolVersion::KNOWN_VERSIONS` and outside
+            // `McpClient::SPOKEN_REVISIONS`: the SDK understands it, this host
+            // has never been run against it.
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": { "name": "older-server", "version": "0.0.0" },
+                }
+            });
+            let _ = w.write_all(format!("{reply}\n").as_bytes()).await;
+            let _ = w.flush().await;
+        }
+    });
+
+    let (cr, cw) = tokio::io::split(client_side);
+    let error = McpClient::connect("older", (cr, cw), agentplane::tools::Destination::Local)
+        .await
+        .expect_err("a revision this host is not held to must be refused");
+    assert!(
+        error.to_string().contains("2025-06-18"),
+        "the refusal names the revision: {error}"
     );
 }
 

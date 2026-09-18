@@ -13,13 +13,13 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# Downloaded by spec/verify.sh
+# Downloaded by tla/verify.sh
 .tla-cache/
 # Cloned by tools/a2a_tck.sh — the official A2A conformance kit and its venv
 .tck-cache/
 # TLC leaves these beside the specs it checks
-spec/states/
-spec/*.out
+tla/states/
+tla/*.out
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
@@ -37,9 +37,10 @@ concepts/
 # not be mistaken for source.
 *.rs.orig
 
-# Local agent tooling. The audit skill encodes this project's own review
-# standards and is useful, but it is workflow rather than product — and it
-# references `concepts/`, which is itself internal.
+# Local agent tooling. The round skill encodes this project's own working
+# procedure — how an item gets from open to discharged, how the gate is
+# believed, how a mutation is written — and is useful, but it is workflow rather
+# than product, and it reads `concepts/`, which is itself internal.
 .claude/
 
 # Python bytecode from tools/mutants.py.

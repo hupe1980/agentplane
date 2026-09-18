@@ -57,6 +57,21 @@ pub use mcp::{
 pub use rmcp;
 pub use typed::{Tool, ToolBox, ToolFailure};
 
+/// The MCP revision this plane serves and offers.
+///
+/// One definition because it is one fact. It is the set `server/discover`
+/// advertises, the ceiling `initialize` may negotiate to, the revision each
+/// request is validated against, the revision the client offers first, and the
+/// one the interop page publishes — and a revision that disagrees with the
+/// advertised set is drift a caller finds before we do.
+///
+/// **The extension decides it, not the date.** A governed suspension has no
+/// expression on this wire without the Tasks extension, so the dependency is on
+/// the extension and this revision is the one that carries it — which is why
+/// the published support policy is stated per extension.
+#[cfg(feature = "mcp")]
+pub const MCP_REVISION: rmcp::model::ProtocolVersion = rmcp::model::ProtocolVersion::V_2026_07_28;
+
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;

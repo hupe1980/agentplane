@@ -60,6 +60,26 @@ macro_rules! debug_is_display {
 }
 pub(crate) use debug_is_display;
 
+/// The rendered rate-limit failure, including the window the peer named.
+///
+/// The window belongs on the *message* because the message is what
+/// `EffectFailed` stores: an operator reading the journal has to be able to tell
+/// a thirty-second throttle from a two-hour one, and the two decide different
+/// things about a run that failed for it.
+///
+/// Deliberately only on the message. A replayed failure is reconstructed from
+/// the recorded string, so a skill branching on a *typed* window would take one
+/// path live and another on replay — which is why the advice informs the
+/// runtime's own schedule and never a caller's control flow.
+fn rate_limited_message(detail: &str, retry_after: Option<std::time::Duration>) -> String {
+    match retry_after {
+        Some(window) => {
+            format!("effect rate limited: {detail} (the peer asked for {window:?})")
+        }
+        None => format!("effect rate limited: {detail}"),
+    }
+}
+
 /// How many capabilities a refusal lists before it summarises the rest.
 ///
 /// A bounded list shaped exactly like a complete one is the silent-truncation
@@ -402,7 +422,7 @@ pub enum EffectError {
     ///
     /// Nothing was applied and nothing metered, so a mutating effect is as safe
     /// to repeat here as a read.
-    #[error("effect rate limited: {detail}")]
+    #[error("{}", rate_limited_message(detail, *retry_after))]
     RateLimited {
         detail: String,
         retry_after: Option<std::time::Duration>,

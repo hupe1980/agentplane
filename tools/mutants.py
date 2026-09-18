@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Break a guarantee on purpose, and check that a test notices.
 
-`spec/mutations.py` does this for the specs: each spec is re-run against
+`tla/mutations.py` does this for the specs: each spec is re-run against
 deliberately broken copies of itself, and every mutant must trip the invariant
 written to catch it. The reasoning was that a spec which passes with its own bug
 present proves nothing.
@@ -800,6 +800,97 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             })?;""",
         "        let acting_as = caller.clone();",
     ),
+    # Publishing the caller's chain in the message metadata. A receiver cannot
+    # verify a chain it reads from a body, so the only correct use of the field
+    # is to discard it — and a field published under this crate's own extension
+    # whose correct use is to be discarded is one a third-party implementer
+    # authorizes on instead. The chain crosses in the credential.
+    "TheChainIsPublishedOnTheWire": (
+        "src/peers/a2a.rs",
+        "the_chain_does_not_travel_in_the_message",
+        "the caller's delegation chain is published in the message metadata, where no receiver can verify it and a careless one will authorize on the sender's own claim about its authority",
+        '        governance.insert("capability".into(), json!(capability));',
+        '        governance.insert("capability".into(), json!(capability));\n        governance.insert("chain".into(), json!(acting_as));',
+    ),
+    # One sentence for every halt scope. Three scopes name a workload and close
+    # admission; `subject:` names an authority and pauses runs already
+    # executing. Collapsing them tells somebody who withdrew a credential to
+    # cancel, which unwinds the completed work the withdrawal preserved — the
+    # predicate exists on the type precisely so this is derived, not restated.
+    "AWithdrawalRepeatsTheWorkloadSentence": (
+        "src/api/mod.rs",
+        "a_withdrawal_says_it_reaches_the_work_a_workload_halt_leaves_running",
+        "every halt scope reads back the same sentence about its reach, so an operator who withdrew a credential is told the stop does not reach running work and to cancel instead — unwinding a week of correct work the withdrawal deliberately left standing",
+        "    let reach = if scope.withdrawn_subject().is_some() {",
+        "    let reach = if scope.withdrawn_subject().is_none() {",
+    ),
+    # The audit reports warrants and drops the runs that have none. A run with
+    # no `RunAdmitted` then appears in neither list, so *what authorized this*
+    # is a question the report silently leaves some runs out of — and the runs
+    # it leaves out are exactly the ones nothing authorized.
+    "UnadmittedRunsAreNotReported": (
+        "src/audit.rs",
+        "every_verified_run_is_warranted_or_reported_as_unadmitted",
+        "an audit lists the runs it found a warrant for and says nothing about the rest, so a verified run that nothing admitted is indistinguishable from one the report simply did not reach",
+        "        unadmitted,\n",
+        "        unadmitted: Vec::new(),\n",
+    ),
+    # A protected field's path stops resolving — a renamed field, a catalogue
+    # written against a shape the tool moved on from. The rule still parses and
+    # matches nothing, so the gate either refuses or waves the call through with
+    # the authority-bearing argument ungoverned. Removing the resolution check
+    # makes an unresolvable path inherit the nearest ancestor's label instead.
+    "AnUnresolvableProtectedPathGuardsNothing": (
+        "src/core/label.rs",
+        "a_protected_path_that_matches_no_field_refuses_the_call",
+        "a protected field whose path matches nothing in the value is treated as present and inherits a label from an ancestor, so a rule that named a renamed field silently guards nothing and the call goes out ungoverned",
+        "        self.value.pointer(path)?;",
+        "        // self.value.pointer(path)?;",
+    ),
+    # The same path question on the release side. Without field lineage the
+    # runtime cannot improve one field, so falling back would let a narrow
+    # reviewed release launder the whole model-produced body.
+    "AReleaseWithoutFieldLineageIsAccepted": (
+        "src/core/label.rs",
+        "a_release_naming_a_field_the_value_lacks_is_refused",
+        "a field-scoped release whose path matches nothing is accepted, so a release granted over one reviewed field claims precision the runtime does not have and improves a value it never tracked",
+        "            .any(|path| !self.fields.contains_key(path) || self.value.pointer(path).is_none())",
+        "            .any(|_path| false)",
+    ),
+    # The runtime reads the peer's window, schedules from it, and writes none of
+    # it down. `EffectFailed` then says a call was throttled without saying
+    # whether the peer wanted forty milliseconds or two hours — the difference
+    # between a run worth resuming shortly and one that should be parked.
+    "TheNamedRetryWindowIsNotRecorded": (
+        "src/core/error.rs",
+        "the_window_a_peer_named_is_on_the_record",
+        "a throttled effect records that it was rate limited and not the window the peer named, so the one fact that decides whether the run is worth resuming soon is consumed by the schedule and never written down",
+        '''            format!("effect rate limited: {detail} (the peer asked for {window:?})")''',
+        '''            format!("effect rate limited: {detail}")''',
+    ),
+    # The acting declaration never reaches a step, so no effect gate can name
+    # the revision. Admission refuses the agent's name as a principal and tells
+    # rules to bind to `context.agent.digest`; at an effect that name *is* the
+    # principal, so without this a deployment can say which revision may start
+    # and not which may reach a sink.
+    "AnEffectGateCannotNameTheRevision": (
+        "src/runtime/executor.rs",
+        "an_effect_rule_can_bind_to_the_acting_revision",
+        "the declaration never reaches a step, so every effect gate authorizes under an agent name any manifest can claim and no rule can bind to the revision that is actually acting",
+        "            declaration: manifest.as_deref().and_then(|m| self.identity_of(m)),",
+        "            declaration: None,",
+    ),
+    # The export stops saying what it never carries. A restored plane's runs and
+    # cases come back and the operational rows beside them do not, so an operator
+    # reading a clean report with no statement concludes the restore was total —
+    # and goes looking for a webhook subscriber's missing deliveries as a fault.
+    "TheExportHidesWhatItCannotCarry": (
+        "src/export.rs",
+        "an_export_names_the_operational_state_it_cannot_carry",
+        "a verified export says nothing about the operational state it structurally cannot carry, so a clean report reads as a total restore and the rows that did not survive are discovered as faults later",
+        "        .extend(UNCARRIED.iter().map(|limit| (*limit).to_owned()));",
+        "        .extend(UNCARRIED.iter().take(0).map(|limit| (*limit).to_owned()));",
+    ),
     "A2aInvalidResponseLooksLikeRefusal": (
         "src/peers/a2a.rs",
         "an_invalid_agent_response_is_in_doubt",
@@ -916,15 +1007,20 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "        let stripped = r.context.clone();",
     ),
     "AnAbsentPublisherIsNull": (
-        "src/runtime/executor.rs",
+        "src/runtime/ctx.rs",
         "a_declared_agent_sends_no_null_either",
         "an unpublished manifest's absent publisher is sent as a JSON null "
         "rather than omitted, which is the shape the adapter's own "
         "documentation calls 'absent' and the shape Cedar cannot parse",
-        '            if let Some(publisher) = id.publisher.as_ref() {\n'
-        '                agent["publisher"] = serde_json::to_value(publisher)?;\n'
-        "            }",
-        '            agent["publisher"] = serde_json::to_value(&id.publisher)?;',
+        '    if let Some(value) = id\n'
+        '        .publisher\n'
+        '        .as_ref()\n'
+        '        .and_then(|p| serde_json::to_value(p).ok())\n'
+        '    {\n'
+        '        agent["publisher"] = value;\n'
+        "    }",
+        '    agent["publisher"] =\n'
+        '        serde_json::to_value(&id.publisher).unwrap_or(serde_json::Value::Null);',
     ),
     "CedarErrorsReadAsRefusals": (
         "src/policy/cedar.rs",
@@ -937,8 +1033,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/policy/cedar.rs",
         "the_digest_follows_the_policy_text",
         "the policy bundle identity does not depend on the rules",
-        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), EVALUATOR_SEMANTICS)",
-        "PolicyBundleIdentity::new(Digest::ZERO, EVALUATOR_SEMANTICS)",
+        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), evaluator_semantics())",
+        "PolicyBundleIdentity::new(Digest::ZERO, evaluator_semantics())",
     ),
     "CedarBundleIgnoresSchema": (
         "src/policy/cedar.rs",
@@ -961,12 +1057,26 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "                .with_configuration(Digest::of(ADAPTER_CONFIGURATION));",
         ";",
     ),
-    "CedarBundleEvaluatorVersionDrifts": (
+    "CedarBundleEvaluatorIsCopiedNotRead": (
         "src/policy/cedar.rs",
-        "the_evaluator_identity_tracks_the_pinned_cedar_version",
-        "the bundle claims evaluator semantics unrelated to the pinned Cedar version",
-        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), EVALUATOR_SEMANTICS)",
-        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), \"cedar-policy/unversioned\")",
+        "the_evaluator_identity_is_the_linked_cedar_language_version",
+        "a journaled bundle names an evaluator the build is not running",
+        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), evaluator_semantics())",
+        "PolicyBundleIdentity::new(Digest::of(source.as_bytes()), \"cedar-lang/4.4.0;agentplane-adapter/4;extensions=all-available\")",
+    ),
+    "AnUnreachableRuleCompiles": (
+        "src/policy/cedar.rs",
+        "a_rule_that_can_never_fire_is_refused_at_construction",
+        "a forbid no request can satisfy compiles into a bundle an operator reads as a limit",
+        "                if let Some(rule) = first_unreachable(&policies, &validation) {",
+        "                if let Some(rule) = Option::<String>::None {",
+    ),
+    "ADurableDigestDomainLeavesTheEnumeration": (
+        "src/core/calendar.rs",
+        "every_versioned_crypto_domain_is_enumerated_and_at_version_one",
+        "a versioned digest domain on a record moves with nothing naming the list it left",
+        "Digest::of(b\"agentplane.calendar.wallclock.v1\")",
+        "Digest::of(b\"agentplane.calendar.wallclock.v2\")",
     ),
     "ResumeIgnoresPolicyBundleDrift": (
         "src/runtime/executor.rs",
@@ -1239,8 +1349,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "warranted it, so a run that executed with no policy engine configured "
         "at all verifies exactly as soundly as a governed one and an auditor "
         "reading `sound` concludes it was governed",
-        "        warrants.extend(warrant_in(run, &records));",
-        "        let _ = warrant_in;",
+        "            Some(warrant) => warrants.push(warrant),",
+        "            Some(_warrant) => {}",
     ),
     "AnAuditHidesWhatItSkipped": (
         "src/audit.rs",
@@ -1256,8 +1366,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "treated as sealed, so every healthy resumable run audits as an "
         "integrity finding: a false alarm on every pass, which is how the true "
         "alarm stops being believed",
-        """        .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))""",
-        """        .is_some()""",
+        """    concluded_outcome(records).is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))""",
+        """    concluded_outcome(records).is_some()""",
     ),
     "AMissingLeafAuditsAsSound": (
         "src/audit.rs",
@@ -1265,8 +1375,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a run whose own records carry a sealing conclusion but which the log "
         "holds no leaf for is reported sound — history the log no longer "
         "commits to, waved through by the audit that exists to name it",
-        """        .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))""",
-        """        .is_some_and(|_| false)""",
+        """    concluded_outcome(records).is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))""",
+        """    concluded_outcome(records).is_some_and(|_| false)""",
     ),
     "AGroupUnsettledUnderASealIsNotAFinding": (
         "src/audit.rs",
@@ -4625,8 +4735,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "2026-07-28 replaced with server/discover, so every connection negotiates "
         "down to a legacy dialect and the tasks extension silently never appears",
         """                ClientLifecycleMode::Auto {
-                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
+                    preferred_versions: vec![crate::tools::MCP_REVISION],
+                    legacy_version: Some(Self::LEGACY_REVISION),
                 },""",
         """                ClientLifecycleMode::Initialize,""",
     ),
@@ -4786,12 +4896,12 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a Cedar denial reports the generated policy id instead of the rule's "
         "@id, so forty rules produce forty reasons that each name a number and "
         "the required reason answers nothing",
-        """        self.policies
-            .annotation(id, RULE_NAME_ANNOTATION)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map_or_else(|| id.to_string(), ToOwned::to_owned)""",
-        """        id.to_string()""",
+        """    policies
+        .annotation(id, RULE_NAME_ANNOTATION)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map_or_else(|| id.to_string(), ToOwned::to_owned)""",
+        """    id.to_string()""",
     ),
     "AToolTransportReachesAnUngrantedHost": (
         "src/tools/mod.rs",
@@ -5737,6 +5847,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "run away while it is still working",
         "        if self.lease_ttl < MIN_LEASE_TTL {",
         "        if self.lease_ttl < Duration::ZERO {",
+    ),
+    "TheClientSpeaksEveryRevisionTheSdkKnows": (
+        "src/tools/mcp.rs",
+        "a_revision_the_sdk_knows_but_this_host_is_not_held_to_is_refused",
+        "the host proceeds on a revision nobody ran it against, because the SDK can parse it",
+        """    pub const SPOKEN_REVISIONS: [ProtocolVersion; 2] =
+        [crate::tools::MCP_REVISION, Self::LEGACY_REVISION];""",
+        """    pub const SPOKEN_REVISIONS: [ProtocolVersion; 3] =
+        [crate::tools::MCP_REVISION, Self::LEGACY_REVISION, ProtocolVersion::V_2025_06_18];""",
     ),
     "TheServerSpeaksTheOldProtocolVersion": (
         "src/api/a2a.rs",
@@ -6936,6 +7055,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
             "recorded as '{other}', which this build does not recognise as resumable"
         ))),""",
         """        _ => None,""",
+    ),
+    "AFormedMemoryLaundersItsSource": (
+        "src/runtime/ctx.rs",
+        "a_formed_memory_names_the_sources_of_what_it_was_formed_from",
+        "a memory formed from untrusted material names only the model that "
+        "phrased it, so the sources it was formed from are absent from the "
+        "record a protected field's allowed_sources would have refused",
+        "        let label = completion.label().join(&source_label);",
+        "        let label = completion.label().clone();",
     ),
     "FormationIgnoresQuarantined": (
         "src/runtime/declarative.rs",

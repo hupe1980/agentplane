@@ -1337,6 +1337,146 @@ async fn an_audit_reports_what_authorized_each_run() {
     );
 }
 
+/// **Every verified run is in exactly one of `warrants` and `unadmitted`, so
+/// *what authorized this* has an answer for all of them.**
+///
+/// A run with no `RunAdmitted` produces no warrant. Collected with a push that
+/// silently adds nothing, its absence is indistinguishable from a row nobody
+/// looked for — and the entry that vanishes is the one `warrants`' own
+/// documentation calls load-bearing, leaving a reader with two lists of
+/// different lengths and nothing saying why.
+///
+/// This plane already writes such runs: a sweep opens a run of its own for the
+/// decisions it takes without a request, with no admission, and seals it under
+/// its own outcome. That is also the shape a record *about* an agent this plane
+/// does not execute would take, which is why the rule is worth pinning before
+/// anything is wired to produce one.
+///
+/// The partition is asserted rather than the two memberships, because the
+/// failure worth catching is a run that falls in **neither** — and checking only
+/// that the sweep run is reported would pass for a build that put every run
+/// there.
+#[tokio::test]
+async fn every_verified_run_is_warranted_or_reported_as_unadmitted() {
+    use agentplane::core::Label;
+    use agentplane::journal::{Append, RecordKind};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    // An ordinary admitted run.
+    let admitted = agentplane::core::RunId::generate();
+    let lease = s
+        .acquire(admitted, "test", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    s.append(
+        lease.epoch,
+        vec![Append::new(
+            admitted,
+            RecordKind::RunAdmitted {
+                capability: "demo".into(),
+                governed_by: None,
+                input_label: Label::trusted(),
+                input: json!({}),
+                policy_bundle: None,
+                canon: agentplane::core::canon::VERSION,
+                idempotency_key: None,
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    conclude(&s, admitted, lease.epoch, "succeeded").await;
+
+    // A run shaped exactly as the sweeper writes one: no admission, its own
+    // record kind, sealed under its own outcome.
+    let swept = agentplane::core::RunId::generate();
+    let lease = s
+        .acquire(swept, "test", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    s.append(
+        lease.epoch,
+        vec![Append::new(
+            swept,
+            RecordKind::Swept {
+                subject: "case_x".into(),
+                action: agentplane::core::SweptAction::CaseEscalated,
+                detail: None,
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    conclude(&s, swept, lease.epoch, "swept").await;
+
+    let report = agentplane::audit::audit(
+        &s,
+        &[admitted, swept],
+        &agentplane::audit::Evidence::default(),
+    )
+    .await
+    .unwrap();
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+
+    for run in &report.sound {
+        let warranted = report.warrants.iter().filter(|w| w.run == *run).count();
+        let unadmitted = report.unadmitted.iter().filter(|u| u.run == *run).count();
+        assert_eq!(
+            warranted + unadmitted,
+            1,
+            "run {run} appears in {warranted} warrants and {unadmitted} unadmitted \
+             entries — a verified run must be in exactly one, or *what authorized \
+             this* is a question the report leaves some runs out of"
+        );
+    }
+
+    let entry = report
+        .unadmitted
+        .iter()
+        .find(|u| u.run == swept)
+        .expect("a run with no admission is not reported as unadmitted");
+    assert_eq!(
+        entry.outcome.as_deref(),
+        Some("swept"),
+        "the outcome is what tells an unadmitted-by-construction run from one \
+         that should have been admitted and was not"
+    );
+}
+
+/// Append a sealing conclusion over the head it actually sits on, then seal.
+///
+/// The `chain_head` has to be the record's own `prev_hash` or the seal claim
+/// does not hold — the same order `conclude` uses for an ordinary run, and the
+/// sweeper for its own.
+async fn conclude(
+    s: &Arc<dyn JournalStore>,
+    run: agentplane::core::RunId,
+    epoch: u64,
+    outcome: &str,
+) {
+    use agentplane::journal::{Append, RecordKind};
+
+    let head = s.head(run).await.unwrap();
+    s.append(
+        epoch,
+        vec![Append::new(
+            run,
+            RecordKind::RunConcluded {
+                outcome: outcome.to_owned(),
+                chain_head: head.hash,
+                reason: None,
+                exhaustion: None,
+                live_spend: agentplane::core::Spend::default(),
+            },
+        )],
+    )
+    .await
+    .unwrap();
+    s.seal(run, epoch, outcome).await.unwrap();
+}
+
 /// **A missing leaf is a finding exactly when the run's own records say it
 /// sealed — an open run is a state, not a defect.**
 ///

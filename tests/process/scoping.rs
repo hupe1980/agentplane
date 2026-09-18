@@ -216,6 +216,74 @@ spec:
     );
 }
 
+/// **The formation branch does not launder the source it read.**
+///
+/// Formation is the one place this crate runs the dual-model branch itself: a
+/// quarantined model reads material derived from untrusted input and answers in
+/// a bounded schema, and what it returns is written as durable memory. The
+/// branch's whole safety argument is that the exit carries the source's label
+/// out with it — so a memory formed from the agent's answer must name the
+/// answer's sources, not only the quarantined model that phrased it.
+///
+/// Provenance is the dimension that proves it. Trust is unconditional on a
+/// model's output and sensitivity already rides the prompt into the completion,
+/// so both survive the join being deleted; **nothing else unions the source's
+/// provenance into what formation writes**. A formed memory that named only
+/// `q-1` would be one a protected field's `allowed_sources` could not refuse,
+/// because the source it would have refused is not on the record.
+#[tokio::test]
+async fn a_formed_memory_names_the_sources_of_what_it_was_formed_from() {
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: watcher, version: "1.0.0" }
+spec:
+  capabilities: { provides: [watch.deadline] }
+  models:
+    privileged: { provider: fake, model: m-1 }
+    quarantined: { provider: fake, model: q-1 }
+  execution: { kind: completion }
+  security: { max_sensitivity_egress: internal }
+  memory:
+    formation:
+      subject: "clearing-desk"
+      purpose: clearing
+      instruction: Extract stable facts only.
+      max_items: 2
+      max_sensitivity: internal
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+    let p = plane(
+        &manifest,
+        json!({ "deadline_status": "OK", "days_left": 9 }),
+    );
+
+    let out =
+        p.rt.run("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .await
+            .expect("the run completes");
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let filed = p
+        .store
+        .recall(&Recall::about("clearing-desk"))
+        .await
+        .expect("recall");
+    let named: Vec<String> = filed[0]
+        .provenance
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        named.iter().any(|source| source == "model:fake/m-1"),
+        "the formed memory does not name the model whose answer it was formed \
+         from, so the branch's exit dropped the source's label: {named:?}"
+    );
+}
+
 /// A binding the run cannot resolve fails the run rather than guessing.
 ///
 /// The two wrong answers are both worse than a failure: filing under the literal

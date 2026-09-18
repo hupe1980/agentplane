@@ -220,9 +220,10 @@ impl McpClient {
         // the negotiated string byte-for-byte. What this does NOT do is
         // reject a server that negotiates the connection down to an older
         // version — rmcp's handshake accepts the server's answer, and
-        // [`new`](Self::new) refuses only a version this host has never heard
-        // of, because an unknown dialect cannot even be downgraded to.
-        info.protocol_version = ProtocolVersion::V_2026_07_28;
+        // [`new`](Self::new) is what refuses anything outside
+        // [`SPOKEN_REVISIONS`](Self::SPOKEN_REVISIONS), because a dialect this
+        // host is not exercised against cannot be downgraded to.
+        info.protocol_version = crate::tools::MCP_REVISION;
         // The identity a server's logs and allowlists see. rmcp's default
         // names the SDK it was compiled from, which is the wrong party: the
         // server is talking to this plane, not to its HTTP library.
@@ -234,21 +235,26 @@ impl McpClient {
         info
     }
 
-    /// Every protocol revision this host knows how to speak.
+    /// The handshake-era revision this host falls back to.
     ///
-    /// Negotiating *down* within this set is the protocol working and stays
-    /// legible through [`negotiated_version`](Self::negotiated_version).
-    /// Negotiating *outside* it is refused at construction: rmcp deserializes
-    /// any string into a version, so without this check a server answering
-    /// `2099-01-01` would proceed on a dialect nobody implements — and the
-    /// spec's own instruction for an unsupported answer is to disconnect.
-    pub const KNOWN_VERSIONS: [ProtocolVersion; 5] = [
-        ProtocolVersion::V_2024_11_05,
-        ProtocolVersion::V_2025_03_26,
-        ProtocolVersion::V_2025_06_18,
-        ProtocolVersion::V_2025_11_25,
-        ProtocolVersion::V_2026_07_28,
-    ];
+    /// One, and the newest: the revisions before it differ in ways this host
+    /// neither implements nor exercises, and a fallback nobody tests is a
+    /// dialect this plane would be claiming on the strength of the SDK
+    /// understanding it.
+    pub const LEGACY_REVISION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
+
+    /// Every protocol revision this host is **held to**.
+    ///
+    /// Not the set the SDK can parse — `ProtocolVersion::KNOWN_VERSIONS` is
+    /// that, and copying it here would claim four revisions on the strength of
+    /// somebody else's inventory. Negotiating *down* inside this set is the
+    /// protocol working and stays legible through
+    /// [`negotiated_version`](Self::negotiated_version). Settling outside it is
+    /// refused at construction, because a dialect this host does not implement
+    /// cannot be downgraded to and the specification's own instruction for an
+    /// unsupported version is to disconnect.
+    pub const SPOKEN_REVISIONS: [ProtocolVersion; 2] =
+        [crate::tools::MCP_REVISION, Self::LEGACY_REVISION];
 
     /// Open a transport and run the MCP lifecycle this host is written for.
     ///
@@ -269,7 +275,7 @@ impl McpClient {
     /// `2025-11-25` when the server answers discover with a legacy refusal
     /// or not at all. A downgrade is still the protocol working and stays
     /// readable through [`negotiated_version`](Self::negotiated_version); a
-    /// version outside [`KNOWN_VERSIONS`](Self::KNOWN_VERSIONS) is refused
+    /// version outside [`SPOKEN_REVISIONS`](Self::SPOKEN_REVISIONS) is refused
     /// exactly as [`new`](Self::new) refuses it.
     ///
     /// Takes the transport rather than a URL for the reason `new` takes a
@@ -296,8 +302,8 @@ impl McpClient {
             .serve_with_lifecycle(
                 transport,
                 ClientLifecycleMode::Auto {
-                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
-                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
+                    preferred_versions: vec![crate::tools::MCP_REVISION],
+                    legacy_version: Some(Self::LEGACY_REVISION),
                 },
             )
             .await
@@ -345,7 +351,7 @@ impl McpClient {
         let server = server.into();
         if let Some(info) = service.peer_info() {
             let negotiated = &info.protocol_version;
-            if !Self::KNOWN_VERSIONS.contains(negotiated) {
+            if !Self::SPOKEN_REVISIONS.contains(negotiated) {
                 return Err(ToolError::Unreachable {
                     tool: ToolId::new(&server, "initialize"),
                     detail: format!(

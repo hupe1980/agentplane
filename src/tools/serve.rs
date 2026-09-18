@@ -227,7 +227,7 @@ impl ServerHandler for McpServer {
     /// same downgrade this crate guards against as a client, arriving from the
     /// other side.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Owned(vec![ProtocolVersion::V_2026_07_28])
+        Cow::Owned(vec![crate::tools::MCP_REVISION])
     }
 
     /// **Refuse an unsupported revision here, rather than on the next call.**
@@ -277,7 +277,7 @@ impl ServerHandler for McpServer {
              dispatched under the agent's declared authority and budget. A refusal is \
              an answer, not an outage.",
         );
-        info.protocol_version = ProtocolVersion::V_2026_07_28;
+        info.protocol_version = crate::tools::MCP_REVISION;
         info
     }
 

@@ -457,6 +457,25 @@ the two schedules.
 let policy = RetryPolicy::attempts(4).wait_at_most(Duration::from_secs(45));
 ```
 
+`max_advice` is a bound on **worker occupancy**, so it is deliberately not
+raised to hours: a throttle that long is a wait for the world, and waits for the
+world suspend. A skill that expects one catches the terminal failure and sleeps
+durably instead, which costs a row rather than a worker:
+
+```rust
+if let Err(StepError::Effect(e)) = cx.effect(call).await {
+    cx.sleep(Duration::from_secs(900)).await?;   // declared, not advised
+    // …then issue the call again.
+}
+```
+
+The window is **declared** rather than taken from the peer's advice, and that is
+what makes it replay-safe: a replayed failure is rebuilt from the recorded
+message, so a branch on the advised window would go one way live and another on
+the way back. The advice is still on the record — the failure message names it —
+so a person can see what the peer asked for even though the run did not act on
+it automatically.
+
 Two ceilings, not one, because obeying a stranger and guessing for oneself are
 different risks:
 

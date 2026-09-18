@@ -110,14 +110,44 @@ use crate::core::{
 };
 use crate::runtime::telemetry;
 
-/// Decision semantics pinned into every Cedar bundle identity.
+/// The Cedar language revision this adapter has been held to.
 ///
-/// Cargo cannot expose a dependency's version through `env!`, so this stays
-/// deliberately explicit and is guarded against `Cargo.toml` by a test. The
-/// adapter revision covers entity mapping, schema-aware context parsing, and
-/// the set of Cedar extensions made available by 4.12.
-pub const EVALUATOR_SEMANTICS: &str =
-    "cedar-policy/4.12.0;agentplane-adapter/3;extensions=all-available";
+/// Not a range and not the crate version: Cedar publishes a language version
+/// separately from its SDK version, and the language version is the upstream
+/// statement of what can change an authorization answer. A release that moves
+/// it fails the guard that compares this against the linked crate, so widening
+/// the claim is a deliberate act with a changelog entry behind it.
+pub const CEDAR_LANGUAGE: &str = "4.5.0";
+
+/// This adapter's own revision, which covers everything Cedar's language
+/// version does not: entity mapping, schema-aware context parsing, which
+/// validation findings are fatal, and the set of extensions made available.
+const ADAPTER_REVISION: u32 = 4;
+
+/// Decision semantics recorded in every Cedar bundle identity.
+///
+/// # Why the crate version is not in it
+///
+/// The identity is compared whole when a run resumes, so a digest that moves
+/// refuses the resume ([`PolicyBundleIdentity`]). Carrying the crate version
+/// would therefore make every patch release of the evaluator a breaking change
+/// for anybody mid-run, in exchange for a distinction Cedar itself says is not
+/// one: it publishes a **language** version for what decides an answer and an
+/// SDK version for what is linked, and they move on different schedules.
+///
+/// So the record names what can change a decision and a guard watches what is
+/// linked, against [`CEDAR_LANGUAGE`]. An upgrade that moves the language, or
+/// an adapter change, moves every bundle digest and is an upgrade note; one
+/// that moves neither leaves open runs resumable. A version *copied* into a
+/// string could do neither, being a claim about the build rather than a reading
+/// of it.
+#[must_use]
+pub fn evaluator_semantics() -> String {
+    format!(
+        "cedar-lang/{};agentplane-adapter/{ADAPTER_REVISION};extensions=all-available",
+        cedar_policy::get_lang_version()
+    )
+}
 
 const ADAPTER_CONFIGURATION: &[u8] =
     b"principal=Agent;action=Action;resource=Resource;context=action-schema;rule-name=@id";
@@ -177,6 +207,17 @@ pub enum CedarError {
     Validation(String),
     #[error("static Cedar entities do not parse against the bundle schema: {0}")]
     Entities(String),
+    /// A rule cannot apply to any request, so it governs nothing.
+    ///
+    /// Distinct from [`Validation`](Self::Validation) because it is not a
+    /// malformed policy: it type-checks, it reads as a control, and it can
+    /// never fire. A `forbid` in that state is the dangerous direction — an
+    /// operator reads the bundle and believes a limit is in force.
+    #[error(
+        "rule '{0}' can never apply to any request, so it governs nothing — \
+         fix its scope or delete it"
+    )]
+    UnreachableRule(String),
     /// Two rules answer to one name, so a denial could not say which fired.
     ///
     /// The whole point of the `@id` annotation is that a reason names one
@@ -240,6 +281,9 @@ impl CedarEngine {
                         .join("; ");
                     return Err(CedarError::Validation(errors));
                 }
+                if let Some(rule) = first_unreachable(&policies, &validation) {
+                    return Err(CedarError::UnreachableRule(rule));
+                }
                 (Some(schema), Some(Digest::of(&canon::value_bytes(&value))))
             }
             None => (None, None),
@@ -257,7 +301,7 @@ impl CedarEngine {
         };
 
         let mut bundle =
-            PolicyBundleIdentity::new(Digest::of(source.as_bytes()), EVALUATOR_SEMANTICS)
+            PolicyBundleIdentity::new(Digest::of(source.as_bytes()), evaluator_semantics())
                 .with_configuration(Digest::of(ADAPTER_CONFIGURATION));
         if let Some(digest) = schema_digest {
             bundle = bundle.with_schema(digest);
@@ -307,24 +351,61 @@ impl CedarEngine {
             .map_err(|e| format!("request is not well formed: {e}"))
     }
 
-    /// What to call a rule in a denial: its `@id`, or Cedar's generated id.
+    /// What to call a rule in a denial — see [`effective_rule_name`], which a
+    /// startup refusal answers from too.
     ///
-    /// Cedar's own ids are positional — `policy0`, `policy1` — so a forty-rule
-    /// set produces forty reasons that each name a number, and the operator
-    /// still has to find which of forty rules that is. The annotation is the
-    /// half a wrapper cannot supply, and it is why the reason is required at
-    /// all.
-    ///
-    /// An `@id` with no value parses as `Some("")`, which would name nothing;
-    /// that falls back to the generated id rather than producing an empty
-    /// reason.
+    /// [`effective_rule_name`]: fn@effective_rule_name
     fn rule_name(&self, id: &cedar_policy::PolicyId) -> String {
-        self.policies
-            .annotation(id, RULE_NAME_ANNOTATION)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map_or_else(|| id.to_string(), ToOwned::to_owned)
+        effective_rule_name(&self.policies, id)
     }
+}
+
+/// The first rule the validator says can never apply, if there is one.
+///
+/// Cedar reports two findings of that shape as **warnings**: a scope no action
+/// can satisfy, and a condition the typechecker proves always false. A warning
+/// is the right call upstream — neither is a malformed policy — and the wrong
+/// one here, because this adapter's whole contract is that a bundle an operator
+/// reads is a bundle that governs. A rule that cannot fire is the same defect a
+/// grant that cannot fire is, and it is refused in the same place: where it is
+/// written.
+///
+/// Scoped to those two. The remaining warnings are about how an identifier is
+/// spelled — confusable scripts, bidirectional characters — which is a review
+/// concern and not a claim about reach.
+fn first_unreachable(
+    policies: &PolicySet,
+    validation: &cedar_policy::ValidationResult,
+) -> Option<String> {
+    validation.validation_warnings().find_map(|warning| {
+        matches!(
+            warning,
+            cedar_policy::ValidationWarning::InvalidActionApplication(_)
+                | cedar_policy::ValidationWarning::ImpossiblePolicy(_)
+        )
+        .then(|| effective_rule_name(policies, warning.policy_id()))
+    })
+}
+
+/// What to call a rule when something has to name it: its `@id`, or Cedar's
+/// generated id.
+///
+/// Cedar's own ids are positional — `policy0`, `policy1` — so a forty-rule set
+/// produces forty reasons that each name a number, and the operator still has
+/// to find which of forty rules that is. The annotation is the half a wrapper
+/// cannot supply, and it is why the reason is required at all. An `@id` with no
+/// value parses as `Some("")`, which would name nothing; that falls back to the
+/// generated id rather than producing an empty reason.
+///
+/// One spelling for both callers — a denial's reason and a startup refusal —
+/// because a rule named `policy0` in one and `betragsgrenze` in the other is
+/// two answers to the operator's only question.
+fn effective_rule_name(policies: &PolicySet, id: &cedar_policy::PolicyId) -> String {
+    policies
+        .annotation(id, RULE_NAME_ANNOTATION)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map_or_else(|| id.to_string(), ToOwned::to_owned)
 }
 
 /// Refuse a policy set in which two rules answer to one name.

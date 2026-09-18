@@ -44,14 +44,14 @@ remaining design pressure is.
 | **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
 | **Journal record format** | **will change** | not frozen. Upcasters exist, but a format-freeze milestone has not happened and hard cuts are preferred until it does — see the freeze conditions below for what has to land first, and for the export-as-the-durable-artifact position in the meantime |
 | **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. A reference names a server and a tool, never a transport, so the key does not move when the transport does |
-| **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` means an added field is safe and a *removed* one is a hard failure. A field the runtime cannot enforce is removed rather than kept as a declaration nothing honours. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
+| **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` makes an added field safe and a *removed* one a hard failure. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
 | **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
 | **Error enums** | additive; `#[non_exhaustive]` | they gain variants as the runtime learns to say more — a rate limit is its own variant rather than a generic rejection, and the next distinction will be too. Match with a `_` arm |
 | **`RetryPolicy` fields** | additive | it is a plain struct, so a literal breaks when a field lands. Build with `RetryPolicy::attempts(n)` and the builder methods, or spread `..RetryPolicy::default()` |
-| **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled. `context` gains attributes as the runtime learns to say more; a `forbid` reading one that does not exist is an evaluation error, and the Cedar adapter **denies an `Allow` that arrives with evaluation errors** rather than letting a broken rule disappear — see [security](@/docs/security.md#the-authorization-context) |
+| **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled; `context` gains attributes as the runtime learns to say more. Guard optional ones with `has` → [security](@/docs/security.md#the-authorization-context) |
 | **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
-| **Store schemas — SQL, redb, and what a blob store writes** | **will change without migration** | pre-alpha, and there is no migration tooling. Recreate rather than migrate. All three deliberately: a redb `TableDefinition` pins its value types, so widening one fails at open rather than at read, and an object store's tombstones carry a version a later build refuses rather than guesses at |
-| **A2A / MCP wire behaviour** | tracks the specs | exact released versions, not a compatibility range: a version this crate has not been held to is one it does not claim |
+| **Store schemas — SQL, redb, and what a blob store writes** | **will change without migration** | there is no migration tooling: recreate rather than migrate. Widening a redb table fails at open rather than at read, and a tombstone carries a version a later build refuses rather than guesses at |
+| **A2A / MCP wire behaviour** | tracks the specs | exact released revisions, not a compatibility range: a revision this crate has not been held to is one it does not claim, and the serving and calling roles differ → [which revisions this plane speaks](@/docs/interop.md#protocol-revisions) |
 | **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
 
 ## 🧊 Format freeze: the conditions, and where they stand {#format-freeze}
@@ -82,18 +82,20 @@ because rounding up is how a condition list stops being checkable.
 | 4 | **A stated unknown-field policy per durable format.** | ✅ done, and strict in both directions — a record is *evidence*, so a reader that drops a field reaches a verdict over evidence it did not see. Refusals are classified as build skew rather than damage, with the deployment order they imply written down beside them |
 | 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — consulted on *every* record read, with a test lifting a record whose shape this build cannot parse and asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump |
 | 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down (readers before writers; rollback bounded by a *time window*), and the reader's half is pinned: a record from a shape this build does not know is refused as skew, not damage. What is left is the two-build exercise, which needs a version bump to have two builds to run |
-| 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility), and already implemented: hashes are agile by version, signatures by key, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
-| 8 | **The deferred format questions are settled**, because each one moves a record or a wire: a rate-limit wait that suspends needs a field on `EffectFailed` and a rule for reading it in order | ⬜ open — each answer changes a durable format or a protocol, so each is cheap now and a migration later |
-| 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ⬜ open — both surfaces are built and published: a crate an embedder links, and a server an operator runs against a manifest with no Rust anywhere. What is unwritten is which one an adopter is expected to depend on, and therefore what the freeze is a promise *about*. It is a row rather than a footnote because a compatibility commitment with no stated subject is one an adopter completes in their own favour |
+| 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility) and already implemented: hashes are agile by version, signatures by key, [digest domains](@/docs/format.md#digest-domains) carry their own, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
+| 8 | **The deferred format questions are settled**, each of which moved a record or a wire | ✅ done — the set is empty. The one that could still have added a record was whether a context branch belongs in the runtime at the loop tier, and the answer is a refusal: a branch lowers no label, so it adds no record and relieves none of the pressure it was aimed at |
+| 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ⬜ open — see below |
 
-**7 and 8 are independent, with one join.** They can be worked in parallel:
-agility is about how a digest says *which function produced it* and how a
-verifier meets an older one, while the deferred questions add **fields** to
-record kinds that are already hashed — a field on `EffectFailed` changes the
-bytes, not the scheme that covers them. The join is the policy-bundle canonical
-format, which is itself a hashed artifact: agility enumerates every durable or
-signed format, and that enumeration is not complete until the bundle's format
-exists. So 8 does not gate 7's *design*, only the last line of its inventory.
+**Condition 9 is a sentence, not a build.** Both surfaces exist and are
+published: a crate an embedder links, and a server an operator runs against a
+manifest with no Rust anywhere. What is unwritten is which one an adopter is
+expected to depend on, and therefore what the freeze is a promise *about*. It is
+a row rather than a footnote because a compatibility commitment with no stated
+subject is one an adopter completes in their own favour.
+
+**What is left is an exercise and a sentence**, which is a different kind of
+waiting from the rest of this table: neither is a design question, and neither
+can still change a record shape.
 
 Two things follow that are worth stating plainly.
 
@@ -113,141 +115,106 @@ by a party who has never run this crate.
 
 ## ⬜ Deliberately not built {#deliberately-not-built}
 
-Each entry says *why*, because the distinction a status page exists to make is
-"deliberately deferred" from "never thought about".
+Two kinds, and conflating them is what makes a gap list useless. **Refused** will
+not arrive: something in the design forecloses it, and the entry says what.
+**Deferred** names what it is waiting on, so a reader can tell whether their own
+need would move it.
 
-**Symbolic policy analysis.** Cedar can prove a policy set cannot widen access
-rather than test it — the check that catches Cedar's totality, where a `when`
-clause reading an absent attribute makes the rule vanish instead of erroring.
-The prover (`cedar-policy-symcc`) and its solver are released and work. The
-blocker is that proving needs a **schema**, and a universal one is not
-expressible: `context.args` is caller data of arbitrary shape and Cedar records
-are closed. A per-deployment schema is expressible but needs a vocabulary
-decision first — `effect:perform` spans every effect kind, so one action's
-context type would have to cover them all.
+Nothing here is an oversight. What is genuinely unexamined does not appear on
+this page, because a page cannot list what nobody has thought of.
+
+### Refused
 
 **Cross-run mutual exclusion over a declared resource.** An effect group enforces
 its footprint *within* a run. Two runs grouping over the same resource are
 ordered by the resources themselves, not by the plane.
 
-**Speaking the [Agent Control Standard](https://github.com/GenAI-Security-Project/agent-control-standard).**
-Two directions, two different answers.
+**Speaking ACS as an observed agent** — asking an external Guardian to permit
+each step. ACS-Core's failure posture defaults to *proceed*, for a hook that
+times out and for a handshake that never completes, and the specification states
+the consequence itself: an adversary who can disrupt the channel converts control
+into audit. The gate here is inside effect dispatch, so no partition opens a path
+to a sink — and a verdict fetched over the network could not be replayed anyway,
+since a recorded decision is re-read on a resume rather than re-asked.
 
-As an **observed agent** — asking an external Guardian to permit each step —
-this is not deferred, it is refused. ACS-Core's failure posture defaults to
-*proceed*, for a hook that times out and for a handshake that never completes,
-and the specification states the consequence itself: an adversary who can
-disrupt the channel converts control into audit. The gate here is inside effect
-dispatch, so no partition opens a path to a sink, and a verdict fetched over the
-network could not be replayed in the first place — a recorded decision is
-re-read on a resume, never re-asked.
+**[ACP](https://agentclientprotocol.com/) as a control plane.** Its client
+answers a permission request by selecting an `optionId` from a list the *agent*
+supplied, so the vocabulary a reviewer may answer in is written by the party
+being reviewed. There is no amendment and no deferral; a pending request dies
+with the client process, so an approval cannot reach somebody who is not at the
+keyboard; and a tool call carries `rawInput` as arbitrary JSON, which gives a
+field-level gate nothing to bind to. The filesystem and terminal a client offers
+are a convenience for reading unsaved buffers, not a sandbox — the agent is a
+subprocess holding the client's own access.
 
-As a **Guardian** — serving the wire so agents this runtime does not execute can
-be governed by a plane that journals the decision — it is deferred, and the
-mapping is close to complete: Cedar is the deterministic layer, the sink gate is
-allow/deny, an amendment is `MODIFY`, an approval task is `ASK`, a suspension is
-`DEFER`, and the audit chain is already `SHA-256` over RFC 8785 canonical JSON,
-which is ACS's own construction with the fields in the other order. What defers
-it is a durable-format question rather than effort: ACS's SessionContext is a
-second append-only chain over the same session, so either every hook maps onto a
-record kind and the chain is *derived*, or this plane keeps two histories of one
-session and has to say which is the plan of record. Shipping the wire before
-that is answered would be shipping the second one by accident.
+**The operator verbs on the MCP tool list.** Every operator route already
+carries its own `api:` capability over HTTP, so an external agent can drive the
+plane today; projecting those verbs onto a tool list would add discovery, not
+permission. What rules it out is narrower: the operator surface's rule is that
+who is acting comes from the request's identity, never from its body — and a
+tool call is arguments. A naive projection puts an actor there and retires
+four-eyes in one translation.
 
-**Serving MCP.** Built (`mcp-server`): tools, prompts, the Tasks mapping, and
-one resource.
-
-A host calls a tool and a governed run happens, under the same admission an A2A
-message gets. A capability nothing on the plane provides is refused when the
-catalogue is built, not when a model first calls it. Descriptors derive from your manifest — `inputSchema` is
-`spec.input`, and an agent that declares none cannot be offered, because the
-only honest argument shape to hand a model is one somebody reviewed. A prompt is
-your manifest's system prompt, served verbatim and taking no arguments.
-
-A run that suspends comes back as a **Task**, and its task id is the run id —
-so `tasks/get` answers by reading the journal rather than a table beside it, and
-the handle still means something after a restart or from another instance.
-`tasks/cancel` is the runtime's own cancellation, recorded and honoured at the
-next step boundary. Protocol revisions older than `2026-07-28` are refused at
-the handshake, because they carry no Tasks extension and a suspension would have
-no way to say so.
-
-**One resource is served: the declaration.** A resource read is an egress into
-a model's context, not an operator reading their own journal — the sensitivity
-lattice governs what may leave a *run*, so the read verb that answers for an
-operator answers a different question for a model, and the protocol's caching
-directives would put a payload copy somewhere no erasure reaches. A manifest has
-no payload to raise either question: it is the reviewed, content-addressed
-document `agentplane card` already publishes, served with its digest. Journals,
-cases and audit reports are **not** served.
-
-**An external agent operating the plane already works, over HTTP.** Every
-operator route carries its own `api:` capability, so MCP adds discovery and
-description rather than authority — and whatever carries it must keep the rule
-this surface is shaped by: who is acting comes from the request's identity,
-never from its body.
-
-**An embedded store admits one writer process.** While `agentplane serve` holds
-a redb file, the verbs that open it directly — `halt`, `halts`, `audit`,
-`export`, `verify`, `retain`, `drill` — cannot run, and say so in those words.
-`--store postgres://…` has no such rule: an operator verb and a serving plane
-coexist. Which surface each verb lives on, and why two live on both, is in
-[operations](@/docs/operations.md#what-the-endpoints-are-for).
-
-**Speaking the [Agent Client Protocol](https://agentclientprotocol.com/).** Not
-built, and worth separating into the two things people mean by it.
-
-As a **control plane** it is refused. ACP's client answers a permission request
-by selecting an `optionId` from a list the *agent* supplied, so the vocabulary
-a reviewer may answer in is written by the party being reviewed; there is no
-amendment and no deferral; a pending request dies with the client process, so
-an approval cannot reach somebody who is not at the keyboard; and a tool call
-carries `rawInput` as arbitrary JSON, which gives a field-level gate nothing to
-bind to. The filesystem and terminal a client offers are a convenience for
-reading unsaved buffers, not a sandbox — the agent is a subprocess holding the
-client's own access.
-
-As a **record** — journaling what an agent this runtime does not execute was
-asked, and what a person allowed — it is deferred on the same durable-format
-question as the Guardian direction above, and for a sharper reason. A session
-update is the agent's own report. A journal record here means *this runtime
-announced the effect, dispatched it under authority and recorded the outcome*,
-and writing a report into that vocabulary would make every answer the journal
-gives about authorization false. So an observation chain would carry its own
-trust basis and share no record kind with the journal — which is a second
-history beside it, which is the question.
-
-**The rest of format freeze.** The mechanics are built, the
-[record format](@/docs/format.md) is specified, and a second implementation
-reads that specification and derives the same bytes. What is left is the
-two-build migration exercise, the deferred questions that would each move a
-record, and the statement of which surface the promise attaches to — enumerated
-with their states in [Format freeze](#format-freeze) above.
-
-**A measured containment claim.** The runtime claims injection *containment*, not
-immunity, and no external measurement is attached to it. A static attack set
-would manufacture exactly the confidence this project refuses; an adaptive,
-defence-aware evaluation is what would count, and none has been run here. The
-methodology exists in published form
-([2606.26479](https://arxiv.org/abs/2606.26479)); what remains is running one,
-over A2A, graded from the journal.
-
-**A rate-limit wait that outlives a worker.** A peer's `Retry-After` is honoured
-and bounded by `RetryPolicy::max_advice` (60 s), which is also the bound on how
-long one effect holds a worker; a longer throttle costs attempts rather than a
-row. Suspending instead is a **durable-format** question — the replay cursor is
-strictly ordered, so such a wait needs a field on `EffectFailed` and a rule for
-reading it — so it waits for freeze rather than being half-built. The workaround
-is a skill that catches the failure and calls `cx.sleep()`.
+**A rate-limit wait the runtime takes by suspending.** A peer's `Retry-After` is
+honoured and bounded by `RetryPolicy::max_advice` (60 s), which is also the bound
+on how long one effect holds a worker. Suspending *inside* the retry loop is
+refused on replay grounds: a replayed failure is rebuilt from the recorded
+message, so a window handed to a skill as a typed value would be a branch input
+live and absent on the way back. A long wait is a skill's to take — catch the
+terminal failure and call `cx.sleep()` with a **declared** window, an ordinary
+journaled effect the cursor consumes in position. The advice still reaches the
+record: the failure message names the window the peer asked for.
 
 **A curated event type between the journal and the wire.** The durable,
-resumable output stream this would provide already exists: `Runtime::journal()`
+resumable output stream it would provide already exists: `Runtime::journal()`
 plus `JournalStore::read(run, from)` is a seq-cursored, reconnect-safe read any
 instance can serve, and the A2A server is an embedder of it. A third vocabulary
 between the records and the wire would drift from both. Live in-process deltas
 stay advisory (`ModelCall::streaming_to`): none is journaled and strict replay
 emits none, because a durable delta stream is a second truth beside the one
 terminal `Completion`.
+
+### Deferred
+
+**Symbolic policy analysis.** Cedar can *prove* a policy set cannot widen access
+rather than test it — the check that catches Cedar's totality, where a `when`
+clause reading an absent attribute makes a rule vanish instead of erroring. The
+prover and its solver are released and work. *Waiting on:* a schema. A universal
+one is not expressible — `context.args` is caller data of arbitrary shape and
+Cedar records are closed — and a per-deployment one needs a vocabulary decision
+first, since `effect:perform` spans every effect kind.
+
+**Serving [ACS](https://github.com/GenAI-Security-Project/agent-control-standard)
+as a Guardian** — so agents this runtime does not execute can be governed by a
+plane that journals the decision. The mapping is close to complete: Cedar is the
+deterministic layer, the sink gate is allow/deny, an amendment is `MODIFY`, an
+approval task is `ASK`, a suspension is `DEFER`, and the audit chain is already
+`SHA-256` over RFC 8785 canonical JSON — ACS's own construction with the fields
+in the other order. *Waiting on:* the wire. Where such a session goes is settled
+(below).
+
+**ACP as a record** — journaling what an agent this runtime does not execute was
+asked, and what a person allowed. A session update is the agent's own report,
+while a journal record means *this runtime announced the effect, dispatched it
+under authority and recorded the outcome*; writing a report into that vocabulary
+would make every answer the journal gives about authorization false. So an
+observed session is a **run of its own** in the one journal — sharing the
+canonical form, the Merkle log and the witness, sharing no record kind with a
+dispatched effect, and reported as unadmitted by an `audit`. That is the shape
+the sweeper's own runs already take: one history, one root, one audit.
+*Waiting on:* the wire, for either protocol.
+
+**A measured containment claim.** The runtime claims injection *containment*, not
+immunity, and no external measurement is attached to it. A static attack set
+would manufacture exactly the confidence this project refuses. *Waiting on:* one
+adaptive, defence-aware evaluation, over A2A, graded from the journal — the
+methodology exists in published form
+([2606.26479](https://arxiv.org/abs/2606.26479)).
+
+**The rest of format freeze.** The mechanics are built and the
+[record format](@/docs/format.md) is specified, with a second implementation
+deriving the same bytes from that specification alone. *Waiting on:* the open
+rows in [Format freeze](#format-freeze) above.
 
 ## 🔍 How to check any of this {#how-to-check-any-of-this}
 

@@ -2506,7 +2506,7 @@ async fn a_halt_is_thrown_listed_with_its_reason_and_lifted() {
         Arc::new(Recording::default()) as Arc<dyn PolicyEngine>,
     );
 
-    // Throw it, and the response says what it does *not* stop — the sentence an
+    // Throw it, and the response says how far it reaches — the sentence an
     // operator would otherwise learn the shape of during the outage.
     let (status, body) = send(
         &router,
@@ -2520,10 +2520,10 @@ async fn a_halt_is_thrown_listed_with_its_reason_and_lifted() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["halted"], true);
     assert!(
-        body["does_not_stop"]
+        body["reach"]
             .as_str()
-            .is_some_and(|s| s.contains("already executing")),
-        "the response does not say what a halt leaves running: {body}"
+            .is_some_and(|s| s.contains("cancel a run to reach work in flight")),
+        "the response does not say what a workload-scoped halt leaves running: {body}"
     );
 
     // A blank reason is refused rather than stored.
@@ -2579,6 +2579,58 @@ async fn a_halt_is_thrown_listed_with_its_reason_and_lifted() {
     assert!(
         body["halts"].as_array().is_some_and(Vec::is_empty),
         "a lifted halt is still standing: {body}"
+    );
+}
+
+/// **A withdrawal says it reaches work in flight, because it does.**
+///
+/// Three halt scopes name a workload and close admission; `subject:` names an
+/// authority and pauses the runs already executing under it. One sentence for
+/// all four is false for this one, and false in the expensive direction: an
+/// operator who has just withdrawn a credential, told that the stop does not
+/// reach running work and to cancel instead, unwinds completed work that the
+/// withdrawal deliberately left standing.
+///
+/// This is also the scope a deployment's own revocation relay uses, since the
+/// intake for a revocation signal belongs to the deployment rather than to this
+/// crate — so the sentence it reads back is part of the supported integration
+/// rather than a nicety.
+///
+/// Both arms are asserted here and in the test above: an assertion that the
+/// subject sentence appears passes just as well if *every* scope started
+/// returning it, which is the same defect pointing the other way.
+#[tokio::test]
+async fn a_withdrawal_says_it_reaches_the_work_a_workload_halt_leaves_running() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let router = halt_router(
+        &store,
+        Arc::new(Recording::default()) as Arc<dyn PolicyEngine>,
+    );
+
+    let (status, body) = send(
+        &router,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({
+                "scope": "subject:alice",
+                "reason": "credential withdrawn: laptop lost",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["scope"], "subject:alice", "{body}");
+
+    let reach = body["reach"].as_str().unwrap_or_default();
+    assert!(
+        reach.contains("pause at their next step boundary"),
+        "a withdrawal does not say it reaches running work: {body}"
+    );
+    assert!(
+        !reach.contains("cancel a run to reach work in flight"),
+        "a withdrawal repeats the workload scopes' sentence, which sends an \
+         operator to unwind work this halt left standing on purpose: {body}"
     );
 }
 

@@ -1415,3 +1415,78 @@ async fn a_sink_records_how_many_bytes_crossed_it() {
         "a fixture measuring nothing would pass whatever the runtime recorded"
     );
 }
+
+/// Releases one named field path over a value that carries `/recipient`.
+///
+/// The path is a parameter so one fixture gives both halves: a release that
+/// names a field the value has, and one that names a field it does not.
+#[derive(Debug)]
+struct ReleasesField(&'static str);
+
+#[async_trait::async_trait]
+impl Skill for ReleasesField {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("releases-field").provides("releases-field")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let arguments = Tainted::object([(
+            "recipient",
+            Tainted::from_source(json!("treasury"), SourceId::new("model.complete")),
+        )]);
+        let released = cx
+            .release(
+                arguments,
+                Release::fields(
+                    ReleaseScope::trust(),
+                    [self.0],
+                    "operator matched the account to settlement SET-42",
+                    "tool://ledger/transfer",
+                    ["approval:SET-42"],
+                ),
+            )
+            .await?;
+        Ok(Outcome::done(released))
+    }
+}
+
+/// **A release naming a field the value does not carry is refused, not widened
+/// to the whole value.**
+///
+/// The other side of the same identity question the sink gate answers: a stored
+/// path is matched against the value in hand, and when it matches nothing the
+/// runtime has no field lineage to improve. Falling back to the whole-value
+/// label would let one narrow, reviewed release launder an entire
+/// model-produced body — precision the runtime does not possess, claimed from a
+/// path that stopped resolving.
+///
+/// Both halves, because a check that refused every field release would satisfy
+/// the negative one perfectly and make field-scoped release useless.
+#[tokio::test]
+async fn a_release_naming_a_field_the_value_lacks_is_refused() {
+    async fn run(path: &'static str) -> RunStatus {
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .skill(ReleasesField(path))
+            .build()
+            .run("releases-field", Tainted::trusted(json!({})))
+            .await
+            .unwrap()
+            .status
+    }
+
+    assert!(
+        matches!(run("/recipient").await, RunStatus::Succeeded),
+        "a release over a field the value does have must still work"
+    );
+    match run("/beneficiary").await {
+        RunStatus::Failed(reason) => assert!(
+            reason.to_lowercase().contains("release"),
+            "the refusal does not say a release failed: {reason}"
+        ),
+        other => panic!("a release over a field the value lacks was accepted: {other:?}"),
+    }
+}

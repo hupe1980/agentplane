@@ -2102,8 +2102,8 @@ fn the_landing_pages_proof_figures_are_the_real_ones() {
             .unwrap_or_else(|e| panic!("the figure before '{needle}' is not a number: {e}"))
     };
 
-    let tla = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("spec"))
-        .expect("read spec/")
+    let tla = std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("tla"))
+        .expect("read tla/")
         .filter_map(Result::ok)
         .filter(|e| e.path().extension().is_some_and(|x| x == "tla"))
         .count() as u64;
@@ -2138,7 +2138,7 @@ fn the_landing_pages_proof_figures_are_the_real_ones() {
         (
             "deliberately broken specs",
             stated("deliberately broken specs"),
-            rows("spec/mutations.py"),
+            rows("tla/mutations.py"),
         ),
         (
             "code mutations",
@@ -2162,10 +2162,116 @@ fn the_landing_pages_proof_figures_are_the_real_ones() {
     );
 }
 
+/// **The published revision set is the one the code speaks.**
+///
+/// `server/discover` advertises a set, a handshake is bounded by it, and the
+/// interop page tells a caller what to build against — one fact with four
+/// readers, which is exactly the shape that drifts. The page is the copy
+/// nothing else checks: a wire behaves the same whether or not the sentence
+/// describing it is true, so the caller reading the page is the one who finds
+/// out.
+///
+/// Scoped to *protocol revisions* rather than to any date on the page, so a
+/// statutory deadline or an example timestamp is not mistaken for a claim about
+/// MCP. A revision the SDK knows and this host does not speak must not appear as
+/// something this plane offers.
+#[test]
+#[cfg(feature = "mcp")]
+fn the_interop_page_publishes_the_revisions_this_host_speaks() {
+    let page = read("site/content/docs/interop.md");
+
+    for revision in agentplane::tools::McpClient::SPOKEN_REVISIONS {
+        assert!(
+            page.contains(revision.as_str()),
+            "the interop page does not name `{revision}`, which this host speaks — \
+             a caller cannot build against a set they cannot read"
+        );
+    }
+
+    let spoken: Vec<&str> = agentplane::tools::McpClient::SPOKEN_REVISIONS
+        .iter()
+        .map(rmcp::model::ProtocolVersion::as_str)
+        .collect();
+    for known in rmcp::model::ProtocolVersion::KNOWN_VERSIONS {
+        let revision = known.as_str();
+        if spoken.contains(&revision) {
+            continue;
+        }
+        assert!(
+            !page.contains(revision),
+            "the interop page names `{revision}`, a revision this host refuses — \
+             a reader takes a revision on this page for one they may connect with"
+        );
+    }
+
+    assert_eq!(
+        agentplane::tools::MCP_REVISION.as_str(),
+        "2026-07-28",
+        "this guard is anchored on the served revision; if it moved, move the \
+         page's sentences with it rather than only this assertion"
+    );
+}
+
+/// **Every axis the benchmark reports appears in the page that quotes it.**
+///
+/// The operations page publishes a block of figures and the claim that one axis
+/// dominates. Both are only as good as their currency: the harness grew from
+/// one number to four while the page still quoted the old shape, so a reader
+/// was being shown a measurement that no longer existed. Nothing but a guard
+/// notices that, because a benchmark is not run by CI — deliberately, since the
+/// figure is hardware-specific — and prose about numbers compiles whatever it
+/// says.
+///
+/// The axis names are read out of the harness's own output format rather than
+/// listed here, so adding one to the report and forgetting the page fails,
+/// which is the direction that actually happens.
+#[test]
+fn the_operations_page_names_every_axis_the_benchmark_reports() {
+    let bench = read("examples/gate_bench.rs");
+    let format = bench
+        .split("println!(")
+        .nth(1)
+        .expect("the harness prints its result")
+        .split(");")
+        .next()
+        .expect("the print is terminated");
+
+    // Each reported line opens with its axis name and a formatted number.
+    let axes: Vec<&str> = format
+        .lines()
+        .filter_map(|line| {
+            let (name, rest) = line.trim().split_once(char::is_whitespace)?;
+            (rest.trim_start().starts_with('{') && name.chars().all(char::is_alphabetic))
+                .then_some(name)
+        })
+        .collect();
+    assert!(
+        axes.len() >= 4,
+        "no axis names were read out of the harness's format string, so this \
+         guard is comparing the page against nothing: {axes:?}"
+    );
+
+    let page = read("site/content/docs/operations.md");
+    let quoted = page
+        .split("## What the gate costs")
+        .nth(1)
+        .expect("the operations page carries the benchmark section")
+        .split("## ")
+        .next()
+        .expect("the section is terminated");
+    for axis in axes {
+        assert!(
+            quoted.contains(axis),
+            "the benchmark reports a `{axis}` axis the operations page does not \
+             mention — a figure a reader cannot find is one they cannot check"
+        );
+    }
+}
+
 /// **Every specification the tree holds is named where the README lists them.**
 ///
 /// The list read "effect protocol, retry safety, sagas, fencing, authorization,
-/// delegation" while `spec/` held a seventh, `EffectGroup` — the one covering
+/// delegation" while `tla/` held a seventh, `EffectGroup` — the one covering
 /// the transactional tier, which is the hardest thing here to believe without
 /// a proof and therefore the one worth naming. A hand-maintained list of files
 /// drifts in exactly this direction: adding the spec is deliberate, remembering
@@ -2173,8 +2279,8 @@ fn the_landing_pages_proof_figures_are_the_real_ones() {
 #[test]
 fn the_readme_names_every_specification_the_tree_holds() {
     let readme = read("README.md").to_lowercase();
-    for entry in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("spec"))
-        .expect("read spec/")
+    for entry in std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("tla"))
+        .expect("read tla/")
         .filter_map(Result::ok)
     {
         let path = entry.path();
@@ -2201,7 +2307,7 @@ fn the_readme_names_every_specification_the_tree_holds() {
         for word in &words {
             assert!(
                 readme.contains(word.as_str()),
-                "spec/{stem}.tla is model-checked on every push and the README's \
+                "tla/{stem}.tla is model-checked on every push and the README's \
                  list of specifications never says '{word}' — a reader deciding \
                  whether to trust this project is shown a shorter list than the \
                  one CI runs"

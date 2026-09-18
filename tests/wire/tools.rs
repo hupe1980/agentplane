@@ -805,6 +805,102 @@ async fn untrusted_data_cannot_select_a_protected_tool_argument() {
     assert!(client.calls.lock().unwrap().is_empty());
 }
 
+/// Sends a tool call whose every field is trusted.
+///
+/// Deliberately has no untrusted member: it exists for the missing-path test,
+/// where any taint anywhere would give the gate a *second* reason to refuse and
+/// the test could no longer tell which control fired.
+#[derive(Debug)]
+struct SendsTrusted {
+    catalog: ToolCatalog,
+    client: Arc<Fake>,
+}
+
+#[async_trait::async_trait]
+impl Skill for SendsTrusted {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("trusted-structured").provides("trusted-structured")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let arguments = Tainted::object([("recipient", Tainted::trusted(json!("treasury")))]);
+        let call = ToolCall::prepare(
+            &self.catalog,
+            Arc::clone(&self.client) as Arc<dyn ToolClient>,
+            transfer(),
+            arguments.peek().clone(),
+            None,
+        )
+        .map_err(|error| SkillError::Other(error.to_string()))?;
+        let out = cx.sink(call, &arguments).await?;
+        Ok(Outcome::done(out))
+    }
+}
+
+/// **A protected path that does not resolve refuses the call; it does not
+/// silently guard nothing.**
+///
+/// This is what a schema change looks like from the gate's side. A rule names
+/// `/beneficiary`; the value carries `/recipient`, because the field was
+/// renamed, or the catalogue was written against a shape the tool has since
+/// moved on from. The rule still parses, still looks like a control in review,
+/// and matches no field — so the *only* two answers are to refuse the call or to
+/// wave it through with the authority-bearing argument ungoverned.
+///
+/// It fails closed, and that had no test: nothing in the suite named
+/// `ProtectedFieldMissing`, so deleting the check would have passed a full gate.
+/// A control whose removal nothing notices is the one that quietly stops being
+/// there.
+///
+/// **Every field here is trusted, and that is the load-bearing part of the
+/// fixture.** With any taint in the value, an unresolvable path inherits the
+/// whole-value label, the taint gate refuses — naming the same path — and the
+/// test passes for the wrong reason, unable to tell which control fired. With
+/// nothing to taint, removing the resolution check lets the call *succeed*,
+/// which is a result the assertions below can see.
+///
+/// The positive half is the two tests above, which drive the same tool through a
+/// catalogue whose path does resolve — without them this would pass for a build
+/// that refused every structured call.
+#[tokio::test]
+async fn a_protected_path_that_matches_no_field_refuses_the_call() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            // The value has `/recipient`. This names a field that is not there.
+            .protect(ProtectedField::trusted("/beneficiary")),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsTrusted {
+            catalog,
+            client: Arc::clone(&client),
+        })
+        .build()
+        .run("trusted-structured", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    match &out.status {
+        RunStatus::Failed(reason) => assert!(
+            reason.contains("/beneficiary"),
+            "the refusal does not name the path that failed to resolve, so an \
+             operator cannot tell a renamed field from a taint refusal: {reason}"
+        ),
+        other => panic!("a rule naming a field the value does not have was not refused: {other:?}"),
+    }
+    assert!(
+        client.calls.lock().unwrap().is_empty(),
+        "the tool was called with an authority-bearing field that no rule checked"
+    );
+}
+
 /// Read-only describes world mutation, not authority. An attacker-selected
 /// URL, tenant, path, or account can still expose data or trigger SSRF, so an
 /// explicit protected selector must be checked on reads too.

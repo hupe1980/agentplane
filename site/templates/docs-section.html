@@ -8,12 +8,15 @@
   <article class="doc">
     <header>
       <h1>{{ section.title }}</h1>
-      <p class="lede">{{ section.description }}</p>
+      <p class="lede">{{ section.extra.lede | default(value=section.description) | safe }}</p>
     </header>
 
     {% for group in config.extra.doc_groups %}
     <section class="group">
       <h2>{{ group }}</h2>
+      {%- if config.extra.doc_group_lede[group] %}
+      <p class="fine">{{ config.extra.doc_group_lede[group] }}</p>
+      {%- endif %}
       <div class="cards">
       {%- for p in section.pages %}
       {%- if p.extra.group == group %}

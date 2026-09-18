@@ -390,10 +390,10 @@ fn every_spec_invariant_is_claimed_by_a_test() {
     let tests: String = walk("tests").iter().map(|f| read(f)).collect();
 
     for (spec, invariant, test) in CLAIMS {
-        let source = read(&format!("spec/{spec}.tla"));
+        let source = read(&format!("tla/{spec}.tla"));
         assert!(
             source.contains(&format!("\n{invariant} ==")),
-            "spec/{spec}.tla no longer defines `{invariant}` — the spec was \
+            "tla/{spec}.tla no longer defines `{invariant}` — the spec was \
              renamed out from under this mapping, so the model and the code are \
              no longer known to be checking the same thing"
         );
@@ -407,7 +407,7 @@ fn every_spec_invariant_is_claimed_by_a_test() {
     // Discovered, not listed: a spec added without an entry here would verify
     // invariants that nothing checks against the code, which is exactly the
     // direction this guard exists to catch.
-    let specs: Vec<String> = walk_ext("spec", "tla")
+    let specs: Vec<String> = walk_ext("tla", "tla")
         .into_iter()
         .map(|f| {
             f.rsplit('/')
@@ -423,7 +423,7 @@ fn every_spec_invariant_is_claimed_by_a_test() {
         specs.len()
     );
     for spec in &specs {
-        let source = read(&format!("spec/{spec}.tla"));
+        let source = read(&format!("tla/{spec}.tla"));
         let safety = source
             .split_once("\nSafety ==")
             .expect("every spec states a top-level Safety conjunction")
@@ -438,7 +438,7 @@ fn every_spec_invariant_is_claimed_by_a_test() {
             }
             assert!(
                 CLAIMS.iter().any(|(s, i, _)| *s == spec && *i == conjunct),
-                "spec/{spec}.tla verifies `{conjunct}`, but no test checks it \
+                "tla/{spec}.tla verifies `{conjunct}`, but no test checks it \
                  against the implementation. Either map it to a test above, or \
                  the model is proving something the runtime does not do."
             );
@@ -1108,7 +1108,7 @@ fn every_interacting_feature_pair_is_exercised() {
     for path in walk("tests") {
         // This file is excluded, and that is not housekeeping. It contains every
         // detection key below as a string literal, so scanning it makes the
-        // guard believe one test exercises all eight axes and every pair is
+        // guard believe one test exercises every axis and every pair is
         // covered. The dead-variant check learned the same lesson from its own
         // doc comment: a guard that reads itself is reading its description as
         // evidence.
@@ -2607,6 +2607,118 @@ fn every_durable_format_is_at_version_one_and_the_list_is_closed() {
          a durable format belongs in the list the moment it exists, because the list \
          is what says an artifact at any other version is refused rather than lifted"
     );
+}
+
+/// **A versioned cryptographic domain is enumerated too, and is also at 1.**
+///
+/// The guard above scans for a constant whose name ends in `FORMAT_VERSION`,
+/// which is the spelling a format uses when a reader dispatches on its version.
+/// A digest domain carries its version a second way — inside the domain string
+/// itself — and that spelling is invisible to a name scan, so a version on a
+/// durable artifact could sit outside a list documented as closed.
+///
+/// Both kinds bind a digest to what it is a digest *of*. The difference is who
+/// reads the version: a format's is read back and dispatched on, a domain's is
+/// read by nobody, which is precisely why nothing else would catch it moving.
+/// `calendar_digest` on `DeadlineRegistered` and the policy bundle on
+/// `RunAdmitted` are both on records, so a change to either domain silently
+/// re-values a field an audit compares across builds.
+#[test]
+fn every_versioned_crypto_domain_is_enumerated_and_at_version_one() {
+    // The closed enumeration, with what each one separates.
+    let known: &[&str] = &[
+        "agentplane.policy.bundle.v1",      // PolicyBundleIdentity::digest
+        "agentplane.calendar.wallclock.v1", // WallClock::digest
+        "io.github.hupe1980.agentplane/manifest/v1", // attest::DOMAIN_MANIFEST
+        "io.github.hupe1980.agentplane/record/v1", // attest::DOMAIN_RECORD
+        "io.github.hupe1980.agentplane/provenance/v1", // attest::DOMAIN_PROVENANCE
+    ];
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut found: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut files = 0usize;
+    let mut stack = vec![root.join("src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("readable").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files += 1;
+                let text = std::fs::read_to_string(&path).expect("readable");
+                for domain in versioned_domains(&text) {
+                    if !seen.contains(&domain) {
+                        seen.push(domain.clone());
+                    }
+                    if !known.contains(&domain.as_str()) {
+                        found.push(domain);
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        files > 50,
+        "only {files} source files were scanned — the tree moved and this guard is now inert"
+    );
+    assert!(
+        found.is_empty(),
+        "these are versioned cryptographic domains outside the closed enumeration: \
+         {found:?} — a domain's version is read by nobody, so a list is the only \
+         thing that can notice it move"
+    );
+    for domain in known {
+        assert!(
+            domain.ends_with("v1"),
+            "{domain} is past version 1 — pre-freeze a shape change is a hard cut, \
+             and a bumped domain advertises that digests under the old one are \
+             still derivable"
+        );
+        assert!(
+            seen.contains(&(*domain).to_owned()),
+            "{domain} is enumerated here and defined nowhere in src/ — an entry \
+             naming a domain that no longer exists makes the list read as checked \
+             while it is stale"
+        );
+    }
+}
+
+/// Every `agentplane`-owned domain string in one file that ends in a version.
+///
+/// A domain this crate defines is prefixed with a name it owns, and a versioned
+/// one ends in `.vN` or `/vN`. Scanned rather than matched with a regex: this
+/// tree carries no regex dependency, and adding one to read five string
+/// literals would pay a supply-chain cost to avoid a loop.
+fn versioned_domains(text: &str) -> Vec<String> {
+    const PREFIXES: &[&str] = &["agentplane.", "io.github.hupe1980.agentplane/"];
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // Comments name domains in prose; only a literal defines one.
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for prefix in PREFIXES {
+            let mut rest = line;
+            while let Some(at) = rest.find(prefix) {
+                let tail = &rest[at..];
+                let end = tail
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || "._/-".contains(c)))
+                    .unwrap_or(tail.len());
+                let candidate = &tail[..end];
+                if let Some(version) = candidate.rsplit(['.', '/']).next()
+                    && version.starts_with('v')
+                    && version.len() > 1
+                    && version[1..].chars().all(|c| c.is_ascii_digit())
+                {
+                    out.push(candidate.to_owned());
+                }
+                rest = &tail[end.max(1)..];
+            }
+        }
+    }
+    out
 }
 
 /// Source with every comment line removed.

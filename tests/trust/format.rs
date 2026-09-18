@@ -757,3 +757,39 @@ fn frozen_export() -> Vec<u8> {
         out
     })
 }
+
+/// **The artifact says what it never carries, on every pass.**
+///
+/// A restored plane's runs and cases come back; the operational rows beside them
+/// do not. A webhook delivery cursor and a worklist decision no run has consumed
+/// are store rows rather than records, so nothing in this file can reconstruct
+/// them — and an operator who reads a clean report and is told nothing concludes
+/// the restore was total. Both losses degrade safely (a cursor costs repetition,
+/// a decision is taken again under the same four-eyes), which is the argument for
+/// leaving them out; saying so is what stops that argument from being silent.
+///
+/// Asserted against an export with **no case layer**, which is the half that
+/// matters: these are properties of the format, not of a file that happens to
+/// reference something, so a statement made only where cases are carried would
+/// be absent from exactly the minimal artifact a reader is most likely to meet.
+#[tokio::test]
+async fn an_export_names_the_operational_state_it_cannot_carry() {
+    let store = std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let s = store.clone() as std::sync::Arc<dyn agentplane::journal::JournalStore>;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&s, None, &[], &mut out)
+        .await
+        .expect("an empty export still writes a header and a trailer");
+
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("the file reads");
+    let said = report.not_checked.join("\n");
+    assert!(
+        said.contains("webhook delivery cursors"),
+        "the artifact does not say it carries no delivery cursors: {said}"
+    );
+    assert!(
+        said.contains("worklist decisions no run has consumed"),
+        "the artifact does not say it carries no unconsumed worklist decisions: {said}"
+    );
+}

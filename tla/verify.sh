@@ -15,8 +15,8 @@
 #
 # The mutations live in mutations.py, one per plausible real-world bug.
 #
-# Usage:  spec/verify.sh            (uses Docker; no local Java needed)
-#         TLA_JAR=/path/to.jar spec/verify.sh --local
+# Usage:  tla/verify.sh            (uses Docker; no local Java needed)
+#         TLA_JAR=/path/to.jar tla/verify.sh --local
 set -euo pipefail
 
 SPEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

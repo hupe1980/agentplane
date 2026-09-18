@@ -25,6 +25,62 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## An MCP client speaks the revisions it is tested on, not the ones the SDK parses
+
+**Affected:** anyone reading `McpClient::KNOWN_VERSIONS`; anyone whose
+`McpClient` connects to a server serving `2024-11-05`, `2025-03-26` or
+`2025-06-18`.
+
+**Why.** The constant listed every revision the SDK can deserialize, which is a
+statement about the SDK rather than about this host. Three of those five are
+exercised by nothing here and carry no Tasks extension, so a governed suspension
+on one of them would never be reported: the tool call works, the wait never
+surfaces, and no error names the cause. Claiming them was claiming reach on
+somebody else's inventory.
+
+**What to do.** Read `McpClient::SPOKEN_REVISIONS` — the served revision and the
+handshake-era fallback, `2026-07-28` and `2025-11-25`. A handshake settling
+anywhere else is now refused at construction, naming the revision. If you need
+an older server, put a proxy in front of it that speaks one of the two, or pin
+the previous release. What this plane promises about revisions is
+[published](@/docs/interop.md#protocol-revisions), and the unit is a revision
+plus the extensions it is chosen for.
+
+---
+
+## The evaluator identity names Cedar's language version, not its crate version
+
+**Affected:** anyone with an open run at the upgrade; anyone reading
+`agentplane::policy::EVALUATOR_SEMANTICS`; anyone whose Cedar policy set
+contains a rule that can never apply.
+
+**Why.** The identity carried the crate version, and the crate version was
+copied into a string while the requirement in `Cargo.toml` was a range — so the
+build linked `4.13.0`, every journaled bundle said `4.12.0`, and the guard
+written to catch exactly that compared the string against the other copy and
+passed. Cedar reports both of its versions at runtime, which makes the copy
+unnecessary and the range decidable: the *language* version is its published
+statement of what changes an answer, and the SDK version moves on releases that
+change none. Recording the SDK version made every patch release a breaking
+change for anybody mid-run, since the identity is compared whole on resume.
+
+**What to do.** `EVALUATOR_SEMANTICS` is gone; call
+`agentplane::policy::evaluator_semantics()`, and read
+`agentplane::policy::CEDAR_LANGUAGE` for the revision this adapter is held to.
+Every bundle digest moves once with this release, so an open run resumed across
+it presents a different bundle and is refused — that is the drift check working.
+Re-admit rather than migrate. Afterwards a Cedar upgrade moves no digest unless
+it moves the language version, and one that does fails the build rather than the
+resume.
+
+Separately, a policy set containing a rule **no request can satisfy** is now
+refused at construction, naming the rule by its `@id`. Cedar 4.13 reclassified
+that finding from a validation error to a validation warning, so such a set had
+begun compiling silently; a `forbid` in that state is a limit an operator reads
+in the bundle and nothing ever evaluates. Fix the rule's scope or delete it.
+
+---
+
 ## Every operator act records who asked, and on what basis
 
 **Affected:** anyone calling `Runtime::set_halt`, `request_cancel`,

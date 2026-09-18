@@ -128,8 +128,9 @@ cargo run --example blog_room --features redb,fake-model,manifest
 cargo run --example a2a_peer --features redb,a2a-server,manifest
 
 # Two planes in one process: a served reviewer and a desk that consults it
-# through `cx.call_peer` — the peer sees the run's chain plus one link, and a
-# strict replay of the desk's run never reaches the reviewer.
+# through `cx.call_peer` — the hop is checked against the run's chain plus one
+# link, the reviewer binds to what its own authenticator established, and a
+# strict replay never reaches it.
 cargo run --example peer_call --features redb,testkit,manifest,a2a,a2a-server
 
 # Live tokens for a human, one journaled completion for the machine — and a

@@ -9,7 +9,9 @@
 mod cedar;
 
 #[cfg(feature = "cedar")]
-pub use cedar::{CONTEXT_NULLS_STRIPPED, CedarEngine, CedarError};
+pub use cedar::{
+    CEDAR_LANGUAGE, CONTEXT_NULLS_STRIPPED, CedarEngine, CedarError, evaluator_semantics,
+};
 
 #[cfg(feature = "signing")]
 mod signing;

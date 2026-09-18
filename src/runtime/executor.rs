@@ -1665,19 +1665,29 @@ impl Runtime {
     /// ceiling: a ceiling means *not right now* and invites a retry, which is
     /// exactly what somebody pulling this switch is trying to stop.
     ///
-    /// **What it does not stop, deliberately.** Runs already executing, and
-    /// suspended runs resuming. Those are existing work, and refusing to let
-    /// them continue would strand them mid-saga with reversals unrun — turning
-    /// an incident into a second one. To stop work in flight, cancel it: that
-    /// unwinds what it did and records who asked. This is the front door, not a
-    /// power cut, and saying so is the difference between a control an operator
-    /// can reason about and one they discover the shape of during an outage.
+    /// **What a workload-scoped halt does not stop, deliberately.** Runs
+    /// already executing, and suspended runs resuming. Those are existing work,
+    /// and refusing to let them continue would strand them mid-saga with
+    /// reversals unrun — turning an incident into a second one. To stop work in
+    /// flight, cancel it: that unwinds what it did and records who asked. This
+    /// is the front door, not a power cut, and saying so is the difference
+    /// between a control an operator can reason about and one they discover the
+    /// shape of during an outage.
     ///
-    /// **How wide it reaches** is the [`HaltScope`](crate::quota::HaltScope):
-    /// the tenant, every revision of one declared agent, or one exact reviewed
-    /// digest. Scopes are independent rows — lifting a narrow halt leaves a
-    /// broad one standing. An ungoverned run, with no manifest, is stopped
-    /// only by a tenant halt; there is nothing narrower to key it on.
+    /// **How wide it reaches** is the [`HaltScope`](crate::quota::HaltScope),
+    /// and the scopes divide on *which axis they name* rather than on how
+    /// broad they are. Three name a workload — the tenant, every revision of
+    /// one declared agent, or one exact reviewed digest — and stop admission.
+    /// The fourth names an **authority**, the delegation subject a run was
+    /// admitted under, and is the one that reaches work already running:
+    /// there the incident *is* the credential, so a run carrying on under it is
+    /// the harm rather than a side effect, and it pauses at its next step
+    /// boundary with its completed work standing
+    /// ([`withdrawn_subject`](crate::quota::HaltScope::withdrawn_subject) is the
+    /// predicate, so the distinction is checked rather than remembered).
+    /// Scopes are independent rows — lifting a narrow halt leaves a broad one
+    /// standing. An ungoverned run, with no manifest, is stopped only by a
+    /// tenant halt; there is nothing narrower to key it on.
     ///
     /// `at` is the caller's, never a clock read here: every lifecycle instant in
     /// this crate is supplied for the reason a hold's is — a pass that reads its
@@ -2570,15 +2580,22 @@ impl Runtime {
     /// sub-run opens its own run and records its own governor, so every run in a
     /// room has exactly one — there is no case where this has to pick.
     ///
-    /// The digest is computed here rather than stored on the agent because it is
-    /// only needed at admission, and a manifest that cannot produce one is a
-    /// manifest that could not have been published; recording `None` in that
-    /// case would claim the run was ungoverned, so the failure is surfaced as an
-    /// absent identity rather than a false one.
+    /// A manifest that cannot produce a digest is one that could not have been
+    /// published; recording `None` would claim the run was ungoverned, so the
+    /// failure is surfaced as an absent identity rather than a false one.
     #[cfg(feature = "manifest")]
     fn identity_for(&self, target: &str) -> Option<crate::journal::AgentIdentity> {
         let skill = self.resolve(target).ok()?;
-        let m = self.governing(skill.as_ref())?;
+        self.identity_of(self.governing(skill.as_ref())?.as_ref())
+    }
+
+    /// The declaration's identity, as every gate reports it.
+    ///
+    /// One construction, because admission and each effect gate must name the
+    /// same revision the same way: two spellings of *which agent is acting*
+    /// would let a rule permitted at the door mean something else at the sink.
+    #[cfg(feature = "manifest")]
+    fn identity_of(&self, m: &crate::manifest::Manifest) -> Option<crate::journal::AgentIdentity> {
         Some(crate::journal::AgentIdentity {
             name: m.metadata.name.clone(),
             version: m.metadata.version.clone(),
@@ -3230,33 +3247,7 @@ impl Runtime {
         // edited one may not" is otherwise inexpressible, and a name-only rule
         // keeps permitting an agent whose prompt and grants have since changed.
         if let Some(id) = governed_by {
-            let mut agent = serde_json::json!({
-                "name": id.name,
-                "version": id.version,
-                "digest": id.digest.to_hex(),
-            });
-            // The grouping a real rule binds to. `name` is beside it for
-            // readability and must not be authorized on: a file claims a name,
-            // but only the holder of a key can claim a publisher.
-            //
-            // **Absent, never `null`.** An `Option` serialized straight into the
-            // context put a JSON `null` there for every unpublished manifest —
-            // which is most of them, since publisher attestation is opt-in — and
-            // Cedar refuses a context containing one: not the field, the whole
-            // record. So the request never reached a rule, came back
-            // `malformed`, and **every run on a Cedar plane with an unsigned
-            // manifest was denied**, with the caller told only that it was
-            // declined, because naming the reason to an external caller is
-            // precisely what this crate refuses to do. The adapter's own module
-            // documentation already said *"or absent"*; only the code disagreed.
-            //
-            // A policy asks `context.agent has publisher` and then reads it,
-            // which is Cedar's idiom for an optional attribute and is what the
-            // absent form supports.
-            if let Some(publisher) = id.publisher.as_ref() {
-                agent["publisher"] = serde_json::to_value(publisher)?;
-            }
-            context["agent"] = agent;
+            context["agent"] = super::ctx::agent_context(id);
         }
         super::ctx::merge_identity(&mut context, chain);
         // Who is acting, and what is being asked for. Passing one string as both
@@ -5275,6 +5266,8 @@ impl Runtime {
             identity,
             agent,
             plane: self.self_ref.clone(),
+            #[cfg(feature = "manifest")]
+            declaration: manifest.as_deref().and_then(|m| self.identity_of(m)),
             #[cfg(feature = "manifest")]
             manifest,
             signer: self.signer.clone(),

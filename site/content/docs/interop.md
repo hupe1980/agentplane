@@ -78,7 +78,7 @@ so no code path can reach a credential without passing it.
 span attributes and error messages, and a secret with a `Debug` impl ends up in
 all three. The audience stays visible, because that is the part worth debugging.
 
-### The chain a peer receives is the run's
+### The chain a hop is checked against is the run's
 
 `cx.call_peer` extends the run's chain — `cx.acting_as()`, which on a served
 plane is the *caller's* — by one link naming the peer, and dispatches through
@@ -87,6 +87,16 @@ carries a registry or a client of its own: a chain a skill held in its own state
 would be an ambient credential, the same owner on every peer call whoever asked
 for the run. A run admitted without a chain has none to extend and is refused at
 the call.
+
+**That extended chain governs the hop here, and it is not what the peer
+receives.** Depth, audience and expiry are checked before dispatch, and a chain
+with no room for another link refuses at the hand-off — so the bound is real and
+it is enforced on this side. What the peer gets is the credential, from which its
+own authenticator derives whatever chain it will act under. The message
+deliberately carries none: a chain a receiver reads from a body is the sender's
+claim about its own authority, and the only safe use of one is to ignore it, so
+publishing it would offer an implementer a field that is either useless or a
+confused-deputy bug.
 
 The peer is a server name in a grant. `tool://reviewer/audit.check` is offered
 to a tool-calling model like any tool and dispatches to the registered peer
@@ -133,10 +143,10 @@ it testable at arbitrary instants and adds no escape to the determinism gate.
 
 ### Authority narrows at the boundary
 
-A peer acts on our behalf, so it receives the caller's chain plus one link.
-`Delegation::delegate` already refuses to widen and caps depth, so a hop cannot
-lend a peer more than the caller holds, and a request cannot wander arbitrarily
-far from the human who authorised it.
+A peer acts on our behalf, so the hop is governed by the caller's chain plus one
+link naming the peer. `Delegation::delegate` already refuses to widen and caps
+depth, so a hop cannot lend a peer more than the caller holds, and a request
+cannot wander arbitrarily far from the human who authorised it.
 
 A grant wider than the caller's own authority is **refused, not clipped**.
 Clipping would silently absorb a misconfiguration; an operator who granted a peer
@@ -159,6 +169,39 @@ Two drivers ship, both off by default and both thin. What each carries is a
 **failure mapping**, and that is the entire design content — the JSON is
 commodity, the mapping decides whether a request may be sent again and whether
 the budget is telling the truth.
+
+### Which revisions this plane speaks {#protocol-revisions}
+
+**The unit is a revision plus the extensions named with it, and the extension is
+the part that decides.** A governed suspension has no expression on MCP without
+the Tasks extension, so that is what this plane depends on; `2026-07-28` is the
+revision carrying it.
+
+Stated the other way round the promise would have to be
+re-made every time the specification moved, because a Current revision keeps
+receiving backwards-compatible changes under the same date, and the
+specification's own lifecycle states — Active, Deprecated, Removed, with a
+twelve-month floor before removal — are defined per **feature**, not per
+revision. The specification says the rest of it directly: removal from the
+specification does not oblige an implementation to drop a feature, and that
+timeline is the implementation's own.
+
+**Served, this plane accepts one revision.** It is `2026-07-28`, it is what
+`server/discover` advertises, and it bounds what a handshake may negotiate to.
+An older revision is refused there rather than downgraded into.
+
+**Calling out, it speaks two:** `2026-07-28`, and `2025-11-25` as the
+handshake-era fallback — the pair it is exercised against. A handshake settling
+anywhere else is refused at construction, including a revision the SDK
+understands perfectly well: a dialect this host does not implement cannot be
+downgraded to, and the specification's instruction for an unsupported version is
+to disconnect.
+
+**A revision leaves in a release that says so**, in the changelog and on the
+[upgrading](@/docs/upgrading.md) page, and never while it is the specification's
+Current revision. There is no second deprecation clock here: a *feature* this
+plane depends on carries the specification's window, and a *revision* this plane
+serves is a promise about this crate's own releases.
 
 ### MCP, context and tools (`mcp`)
 
@@ -268,12 +311,14 @@ happened is how a half-finished transfer gets sent twice. Symmetrically, a task
 in a terminal unsuccessful state is not in doubt: the peer created a task and
 reported its outcome, so `Recovery` has nothing left to discover.
 
-The delegation chain and provenance travel under a declared extension URI rather
+The capability and the provenance travel under a declared extension URI rather
 than being smuggled into a free-form field, so a peer that does not understand it
-still receives a well-formed message. The delegation chain remains a claim. The
-provenance block is separately attested and bound to the call, so a peer with the
-workload verifier can check who made that exact request; neither substitutes for
-the peer's own authorization decision.
+still receives a well-formed message. The delegation chain is not among them:
+[the hop is checked against it here](#the-chain-a-hop-is-checked-against-is-the-run-s)
+and the peer derives its own from the credential. The provenance block is
+separately attested and bound to the call, so a peer with the workload verifier
+can check who made that exact request; it does not substitute for the peer's own
+authorization decision.
 
 #### A plane with many agents serves a card for each
 
@@ -687,6 +732,36 @@ body did not end when the stream did, so the connection outlived the task — th
 exact failure the design is shaped to avoid. An idle stream may be reaped by
 an intermediary, which is the better failure, because a client can recover from a
 closed connection and cannot recover from one that never ends.
+
+### MCP, being served (`mcp-server`)
+
+Served: tools, prompts, the Tasks mapping, and one resource. A host calls a tool
+and a governed run happens, under the same admission an A2A message gets.
+
+**Descriptors derive from the manifest.** A tool's `inputSchema` is `spec.input`,
+and an agent that declares none cannot be offered at all: the only honest
+argument shape to hand a model is one somebody reviewed. A prompt is the
+manifest's system prompt, served verbatim and taking no arguments. A capability
+nothing on the plane provides is refused when the catalogue is built rather than
+when a model first calls it.
+
+**A suspension comes back as a Task, and its task id is the run id.** So
+`tasks/get` answers by reading the journal rather than a table beside it, and the
+handle still means something after a restart or from another instance.
+`tasks/cancel` is the runtime's own cancellation, recorded and honoured at the
+next step boundary. Revisions older than `2026-07-28` are refused at the
+handshake: they carry no Tasks extension, so a suspension would have no way to
+say so — the reason [the promise is stated per extension](#protocol-revisions).
+
+#### One resource is served, and it is the declaration
+
+A resource read is an **egress into a model's context**, not an operator reading
+their own journal. The sensitivity lattice governs what may leave a *run*, so the
+read verb that answers for an operator answers a different question for a model —
+and the protocol's caching directives would put a payload copy somewhere no
+erasure reaches. A manifest raises neither question: it is the reviewed,
+content-addressed document `agentplane card` already publishes, served with its
+digest. Journals, cases and audit reports are **not** served.
 
 ### Model providers (`providers`, `bedrock`)
 

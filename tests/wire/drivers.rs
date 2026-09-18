@@ -866,9 +866,18 @@ async fn an_unreachable_peer_did_not_happen() {
     assert!(matches!(err, PeerError::Unreachable { .. }), "{err}");
 }
 
-/// The delegation chain travels under a declared extension URI.
+/// The governed metadata travels under a declared extension URI, and the
+/// delegation chain is **not** in it.
+///
+/// A chain in a message is the sender's claim about its own authority, so a
+/// receiver can only ignore it — and a field published under this crate's own
+/// extension whose correct use is to be discarded is one a third-party
+/// implementer will authorize on instead. The chain crosses in the credential,
+/// where the receiver's authenticator can verify it. The positive half is here
+/// deliberately: an assertion that something is absent passes just as well when
+/// the whole extension stopped being sent.
 #[tokio::test]
-async fn the_delegation_chain_rides_a_declared_extension() {
+async fn the_chain_does_not_travel_in_the_message() {
     let (c, seen, seen_headers) = canned_observed(
         200,
         json!({
@@ -905,9 +914,16 @@ async fn the_delegation_chain_rides_a_declared_extension() {
         msg["extensions"][0], EXTENSION_URI,
         "the extension is not declared, so a peer cannot say it understood it"
     );
+    assert_eq!(
+        msg["metadata"][EXTENSION_URI]["capability"], "audit.check",
+        "the extension stopped carrying the request's own metadata, so the \
+         absence check below would pass for the wrong reason: {body}"
+    );
     assert!(
-        msg["metadata"][EXTENSION_URI]["chain"].is_object(),
-        "the delegation chain did not travel: {body}"
+        msg["metadata"][EXTENSION_URI]["chain"].is_null(),
+        "the delegation chain is in the message — a receiver cannot verify it, \
+         so publishing it invites a peer to authorize on the sender's own claim \
+         about its authority: {body}"
     );
     assert_eq!(msg["parts"][0]["data"]["doc"], "INV-1");
     let headers = seen_headers.lock().unwrap();

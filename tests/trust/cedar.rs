@@ -694,19 +694,61 @@ fn malformed_bundle_components_are_refused_at_startup() {
     ));
 }
 
-/// The evaluator tag is deliberately hard-coded because Cargo exposes this
-/// crate's version, not a dependency's. This guard makes a dependency bump that
-/// forgot the semantic identity fail in the same change.
+/// **The evaluator identity is read from the linked evaluator, not copied.**
+///
+/// The earlier form of this guard compared the identity against the version
+/// string in `Cargo.toml`, on the belief that a dependency cannot report its
+/// own version. Cedar does, and the requirement in `Cargo.toml` is a *range*:
+/// it read `4.12.0` while the build linked `4.13.0`, so every bundle identity
+/// this crate journaled named an evaluator that was not running, and the guard
+/// written to catch exactly that passed. A guard that compares a claim against
+/// another copy of the claim cannot fail.
+///
+/// So the identity is derived and this asks the linked crate instead. The
+/// language version is the one that governs a decision, and an upstream release
+/// that moves it lands here rather than in a record nobody re-reads.
 #[test]
-fn the_evaluator_identity_tracks_the_pinned_cedar_version() {
-    let cargo = include_str!("../../Cargo.toml");
-    assert!(cargo.contains("cedar-policy = { version = \"4.12.0\""));
+fn the_evaluator_identity_is_the_linked_cedar_language_version() {
+    assert_eq!(
+        cedar_policy::get_lang_version().to_string(),
+        agentplane::policy::CEDAR_LANGUAGE,
+        "Cedar moved its language version, so what decides an authorization \
+         answer has changed: read the changelog, bump CEDAR_LANGUAGE, and note \
+         that every open run's bundle identity moves with it"
+    );
+    assert_eq!(
+        CedarEngine::new("").unwrap().bundle().evaluator(),
+        agentplane::policy::evaluator_semantics(),
+        "a compiled bundle records semantics other than this build's"
+    );
     assert!(
-        CedarEngine::new("")
-            .unwrap()
-            .bundle()
-            .evaluator()
-            .contains("cedar-policy/4.12.0")
+        agentplane::policy::evaluator_semantics()
+            .contains(&format!("cedar-lang/{}", cedar_policy::get_lang_version())),
+        "the recorded semantics do not name the linked language version"
+    );
+}
+
+/// **A rule that can never apply is refused where it is written.**
+///
+/// Cedar 4.13 reclassified an invalid action application from a validation
+/// *error* to a validation *warning*, so a policy set this adapter used to
+/// refuse at startup began compiling silently. The direction that matters is a
+/// `forbid`: an operator reads the bundle, believes the limit is in force, and
+/// nothing ever evaluates it.
+#[test]
+fn a_rule_that_can_never_fire_is_refused_at_construction() {
+    // `effect:perform` is declared over Agent principals, so scoping the rule
+    // to a `Resource` principal leaves an action no request can satisfy. It
+    // type-checks; it simply never applies.
+    let src = r#"
+        @id("dead-limit")
+        forbid (principal == Resource::"x", action == Action::"effect:perform", resource);
+    "#;
+    let err = CedarEngine::from_bundle(src, Some(REQUEST_SCHEMA), None)
+        .expect_err("a rule that cannot apply must not compile into a bundle");
+    assert!(
+        matches!(&err, CedarError::UnreachableRule(rule) if rule == "dead-limit"),
+        "unexpected refusal: {err}"
     );
 }
 

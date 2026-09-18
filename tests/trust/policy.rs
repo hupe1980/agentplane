@@ -1624,3 +1624,136 @@ fn a_release_scope_grants_only_what_it_names() {
     assert!(both.improves_trust());
     assert_eq!(both.sensitivity_target(), Some(Sensitivity::Internal));
 }
+
+/// Records every request, so a test can ask what the runtime actually sent.
+///
+/// Gated on the feature its users need: every test that constructs one needs
+/// `testkit`, and an ungated helper is dead code in the no-feature lint config.
+#[cfg(feature = "testkit")]
+#[derive(Debug, Default)]
+struct Captures {
+    seen: Mutex<Vec<(String, Value)>>,
+}
+
+#[cfg(feature = "testkit")]
+impl PolicyEngine for Captures {
+    fn authorize(&self, r: &agentplane::core::PolicyRequest<'_>) -> PolicyDecision {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((r.action.to_owned(), r.context.clone()));
+        PolicyDecision::Permit
+    }
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(Digest::of(b"test.captures"), "test/captures-v1")
+    }
+}
+
+/// **A rule at an effect can name the revision that is acting.**
+///
+/// Admission refuses to make the agent's `metadata.name` its principal — a name
+/// is whatever a manifest's author typed, so a rule granting authority to one
+/// grants it to any file claiming it — and tells rules to bind to
+/// `context.agent.digest` instead. At an effect that name *is* the principal, so
+/// without the declaration in the context the advice admission gives cannot be
+/// followed at the gate where the call actually goes out: a deployment could say
+/// which revision may *start* and not which may reach a particular sink, and an
+/// escalation rule could not name the revision it trusts.
+///
+/// Both halves. An ungoverned run must carry no `agent` key at all rather than
+/// an invented one, because `context has agent` is the guard a rule writes and a
+/// fabricated block would make it true for a run no declaration governs.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn an_effect_rule_can_bind_to_the_acting_revision() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summariser, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise", constraints: "One sentence." }
+  capabilities: { provides: [support.summarise] }
+  models: { privileged: { provider: fake, model: sum-1 } }
+  budgets: { max_tokens: 1000 }
+"#,
+    )
+    .expect("manifest");
+    let digest = manifest.digest().expect("a manifest has a digest").to_hex();
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("a summary");
+    let engine = Arc::new(Captures::default());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::clone(&engine) as Arc<dyn PolicyEngine>)
+        .provider(
+            "fake",
+            provider as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+    let outcome = rt
+        .run("support.summarise", Tainted::trusted(json!({"t": "x"})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome.status, RunStatus::Succeeded),
+        "{outcome:?}"
+    );
+
+    let seen = engine.seen.lock().unwrap().clone();
+    let performs: Vec<&Value> = seen
+        .iter()
+        .filter(|(action, _)| action == agentplane::core::ACTION_PERFORM)
+        .map(|(_, context)| context)
+        .collect();
+    assert!(
+        !performs.is_empty(),
+        "no effect was authorized, so this proves nothing about the effect gate"
+    );
+    for context in &performs {
+        assert_eq!(
+            context["agent"]["digest"].as_str(),
+            Some(digest.as_str()),
+            "an effect gate cannot name the revision that is acting: {context}"
+        );
+    }
+}
+
+/// The other half: a run no declaration governs carries no `agent` block.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn an_ungoverned_effect_names_no_revision() {
+    let engine = Arc::new(Captures::default());
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::clone(&engine) as Arc<dyn PolicyEngine>)
+        .skill(Pays {
+            world: Arc::new(Mutex::new(Vec::new())),
+        })
+        .build();
+    let outcome = rt.run("pay", Tainted::trusted(json!({}))).await.unwrap();
+    assert!(
+        matches!(outcome.status, RunStatus::Succeeded),
+        "{outcome:?}"
+    );
+
+    let seen = engine.seen.lock().unwrap().clone();
+    let performs = seen
+        .iter()
+        .filter(|(action, _)| action == agentplane::core::ACTION_PERFORM)
+        .count();
+    assert!(performs > 0, "no effect was authorized");
+    for (action, context) in &seen {
+        assert!(
+            context.get("agent").is_none(),
+            "a run no declaration governs was given an `agent` block at {action}, \
+             so `context has agent` is true for a run nothing declared: {context}"
+        );
+    }
+}

@@ -187,10 +187,22 @@ impl A2aClient {
 
     /// Build the A2A 1.0 JSON-RPC body for `SendMessage`.
     ///
-    /// The delegation chain rides in the message metadata under
-    /// [`EXTENSION_URI`]. It is a *claim* today, not an attestation: a peer that
-    /// authorizes on it is trusting whatever the last hop wrote. Signing it is
-    /// designed and not built.
+    /// **The delegation chain is deliberately not in the body.** A chain a
+    /// receiver reads from a message is a claim by the sender about its own
+    /// authority, and the only safe thing a receiver can do with one is ignore
+    /// it — so publishing it under this crate's own extension would hand a
+    /// third-party implementer a field whose sole correct use is to be
+    /// discarded, and hand a careless one the confused-deputy bug.
+    ///
+    /// Where a chain does cross a hop is the **credential**: the receiver's
+    /// `Authenticator` derives `Caller::acting_as` from what it verified, and
+    /// that is what its runtime journals. This plane's extended chain governs
+    /// the hop *here* — depth, audience and expiry are checked before dispatch,
+    /// and a chain with no room for another link refuses at the hand-off.
+    ///
+    /// What the metadata carries instead are statements about the *request* —
+    /// the capability asked for and the provenance of the values in it — which
+    /// a receiver may read without any of them widening what it will do.
     fn body(
         capability: &str,
         payload: &Value,
@@ -198,9 +210,9 @@ impl A2aClient {
         provenance: Option<&crate::core::Provenance>,
         tenant: Option<&str>,
     ) -> Value {
-        // Under the same declared extension the delegation chain travels in, so
-        // a peer that does not implement the extension ignores both together
-        // rather than half-understanding the message.
+        // Under the declared extension with the capability, so a peer that does
+        // not implement the extension ignores both together rather than
+        // half-understanding the message.
         let attested = provenance.map(|p| Value::Object(p.to_meta()));
         // A2A uses `messageId` as its duplicate-detection key, so it must be
         // stable across retries of one logical call. A runtime call carries a
@@ -226,7 +238,6 @@ impl A2aClient {
         );
         let mut governance = serde_json::Map::new();
         governance.insert("capability".into(), json!(capability));
-        governance.insert("chain".into(), json!(acting_as));
         // Inserted only when there is one. `json!` renders `None` as `null`,
         // and an absent ProtoJSON field is **omitted**, not null-valued.
         if let Some(attested) = attested {

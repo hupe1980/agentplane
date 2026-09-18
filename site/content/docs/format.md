@@ -501,6 +501,7 @@ than to anybody's key:
 | Construction | Governed by |
 |---|---|
 | Record digests, the chain, effect keys | `canon`, on `RunAdmitted` |
+| The domain-separated digests below | `canon`, on `RunAdmitted` |
 | Sealed envelopes | envelope byte 0 |
 | Export framing | the export header's `version` |
 | Merkle leaf, node and root | the checkpoint's `origin` |
@@ -526,6 +527,33 @@ deliberate rather than accidental:
 - **Not at all**, for the Agent Card's JWS. `alg` is compared against a
   constant, never read from the card, so a card declaring another algorithm is
   refused rather than honoured. Changing it is a release of this crate.
+
+### Domain-separated digests {#digest-domains}
+
+Two digests on records identify something other than bytes a reader holds: the
+policy that decided, and the calendar that resolved an instant. Each is
+domain-separated, and each domain carries its own version — so the enumeration
+below is what says a domain moved, since nothing dispatches on one.
+
+| On | Derivation |
+|---|---|
+| `RunAdmitted.policy_bundle` | `SHA-256( "agentplane.policy.bundle.v1" ‖ 0x00 ‖ canon(identity) )` |
+| `DeadlineRegistered.calendar_digest` | `SHA-256( "agentplane.calendar.wallclock.v1" )`, for the wall-clock ruleset |
+
+`identity` is a JSON object with `rules` and `evaluator` always present and
+`schema`, `entities` and `configuration` present only when the bundle has them:
+the first four are hex digests over the bundle's own components, and `evaluator`
+is a string naming the decision semantics —
+`cedar-lang/<language version>;agentplane-adapter/<n>;extensions=…` for the
+Cedar adapter. It names what can change an answer rather than what is linked:
+an evaluator's crate version moves on releases that change no decision, and a
+digest that moved with it would refuse every open run's resume for nothing.
+
+A deployment's own calendar names its own domain. There is no registry: a
+verifier compares these digests across records, it does not re-derive a decision
+from one, and a digest whose domain it has never seen leaves that run
+**unverifiable by that reader** — the same finding an unknown `canon` produces,
+and never a divergence.
 
 **Content addresses do not migrate.** A blob's address *is* its digest, so a new
 algorithm yields new addresses and existing blobs keep theirs — nothing needs

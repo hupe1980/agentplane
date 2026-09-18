@@ -176,8 +176,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     // Recall truncates, so ordering by recency alone is an eviction an attacker
     // steers: anything able to write an untrusted memory — model output and tool
     // output both can, by design — writes `limit` of them and the trusted ones
-    // silently lose their place. Every label stays correct in that scenario,
-    // which is what made it hard to see; the defect is the ordering.
+    // silently lose their place. Every label stays correct in that scenario:
+    // the defect is the ordering, not the labelling.
     let mut trusted = make("rank-trusted", "team-rank", "support", json!({"rule": 1}));
     trusted.trust = Trust::Trusted;
     trusted.created_at = at(1_760_000_100);
@@ -1706,13 +1706,13 @@ async fn a_released_lease_is_free_at_once(fresh: Factory<'_>, r: &mut Report) {
 
     match store.acquire(run, "instance-b", LEASE).await {
         Ok(b) => {
-            // The epoch *must* advance. An earlier version of this battery
-            // asserted the opposite — "a handover is not a crash, so there is
-            // nothing to fence" — which is wrong: releasing says the owner
-            // intends to stop, not that it already has. An un-awaited task or a
-            // crash between release and exit leaves an append in flight, and
-            // the only thing that stops it is a bump. The property worth having
-            // is that takeover is *immediate*, not that the epoch stands still.
+            // The epoch *must* advance, and the tempting reading is the wrong
+            // one: *a handover is not a crash, so there is nothing to fence*.
+            // Releasing says the owner intends to stop, not that it already
+            // has. An un-awaited task or a crash between release and exit
+            // leaves an append in flight, and the only thing that stops it is
+            // a bump. The property worth having is that takeover is
+            // *immediate*, not that the epoch stands still.
             if b.epoch <= a.epoch {
                 r.record(
                     "fencing",

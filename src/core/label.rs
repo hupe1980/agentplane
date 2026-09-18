@@ -102,8 +102,32 @@ impl std::fmt::Display for Sensitivity {
 /// transformation — are the only ways to move one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Label {
+    /// Every source that influenced this value, unioned through each join.
+    ///
+    /// **It answers *influenced by these*, never *this sentence came from that
+    /// one*.** The set is a property of the whole value: a completion written
+    /// from three recalled memories carries all three, and nothing here says
+    /// which clause owes which. That granularity is deliberate — the only form
+    /// of claim-level attribution this runtime could *derive* is a verbatim span
+    /// match, which would attribute exactly what a model copied and silently
+    /// omit everything it paraphrased, so an absent citation would read as *not
+    /// derived from* while meaning *not copied from*. A set that over-covers is
+    /// honest; a citation that under-covers is not.
+    ///
+    /// Over-coverage is the safe direction and is what the gates are built on:
+    /// a protected field's `allowed_sources` refuses a value whose set contains
+    /// anything unlisted, so a source that merely *might* have contributed still
+    /// stops the call.
+    ///
+    /// Not to be confused with [`Provenance`](crate::core::Provenance), which
+    /// names the *call* a value came out of — run, case, effect — rather than
+    /// the sources that shaped it.
     pub provenance: BTreeSet<SourceId>,
+    /// How far this value may be believed. Degrades on join, improves only
+    /// through a typed, policy-authorized release.
     pub trust: Trust,
+    /// How far this value may travel. Escalates on join to the most sensitive
+    /// contributor, and gates every sink that declares a ceiling.
     pub sensitivity: Sensitivity,
 }
 

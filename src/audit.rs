@@ -138,7 +138,13 @@ pub struct AuditReport {
     /// The digest is what makes the declaration half meaningful: a name and
     /// version identify a file that may since have been edited, and only the
     /// digest pins what it actually said — the system prompt included.
+    ///
+    /// Read it with [`unadmitted`](Self::unadmitted): every run whose chain
+    /// verified appears in exactly one of the two.
     pub warrants: Vec<Warrant>,
+    /// The runs that carry no admission record — the complement of
+    /// [`warrants`](Self::warrants). See [`Unadmitted`].
+    pub unadmitted: Vec<Unadmitted>,
 }
 
 /// What authorized one run.
@@ -156,6 +162,33 @@ pub struct Warrant {
     /// `None` means **no engine was configured**. That is the entry an auditor
     /// most needs and the one an integrity-only report cannot show.
     pub policy: Option<crate::core::PolicyBundleIdentity>,
+}
+
+/// A run whose history carries no admission record.
+///
+/// Its existence is the other half of [`Warrant`], and the pair is what makes
+/// *what authorized this* answerable for **every** run rather than for the ones
+/// that happen to have an answer. A run with no `RunAdmitted` produces no
+/// warrant, so listing warrants alone leaves a reader with two lists of
+/// different lengths and nothing saying why — and the entry that goes missing is
+/// the one [`Warrant`]'s own documentation calls load-bearing.
+///
+/// Not a finding on its own. Some runs are unadmitted by construction: this
+/// plane writes a run of its own for the decisions a sweep takes without a
+/// request, and the same shape is what a record *about* an agent this plane does
+/// not execute would take. The outcome is carried so a reader can tell those
+/// from a run that was supposed to be admitted and was not — the audit reports
+/// the fact and leaves the judgement to somebody who knows which outcomes this
+/// deployment writes.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Unadmitted {
+    /// The run this describes.
+    pub run: RunId,
+    /// The outcome it concluded under, when it has concluded.
+    ///
+    /// `None` for a run still open, which is a different statement from a run
+    /// that ended without ever being admitted.
+    pub outcome: Option<String>,
 }
 
 /// One journaled decision to improve a label.
@@ -449,14 +482,19 @@ async fn placement(
 /// duplicate-rule shape, and the copy in an offline checker is the one that
 /// drifts.
 fn has_sealing_conclusion(records: &[Record]) -> bool {
-    records
-        .iter()
-        .rev()
-        .find_map(|r| match r.kind() {
-            crate::journal::RecordKind::RunConcluded { outcome, .. } => Some(outcome.as_str()),
-            _ => None,
-        })
-        .is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))
+    concluded_outcome(records).is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))
+}
+
+/// The outcome a run concluded under, if it has concluded.
+///
+/// One traversal shared by the seal question and the unadmitted report, because
+/// two copies of *which record carries the outcome* is the duplicate-rule shape
+/// and the copy nobody edits is the one that drifts.
+fn concluded_outcome(records: &[Record]) -> Option<&str> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        crate::journal::RecordKind::RunConcluded { outcome, .. } => Some(outcome.as_str()),
+        _ => None,
+    })
 }
 
 /// What this run left permanently undecided, if it may never resume.
@@ -717,6 +755,7 @@ pub async fn audit(
     let mut sound = Vec::new();
     let mut releases = Vec::new();
     let mut warrants = Vec::new();
+    let mut unadmitted = Vec::new();
     let mut open_runs = 0usize;
 
     // ── Per run ────────────────────────────────────────────────────────────
@@ -771,7 +810,15 @@ pub async fn audit(
         // the finding answers *this run left the world in an unknown state*
         // and declines to say what it was authorized to do.
         releases.extend(releases_in(run, &records));
-        warrants.extend(warrant_in(run, &records));
+        // Total over the runs that verified: an absent row is indistinguishable
+        // from a row nobody looked for. See `Unadmitted`.
+        match warrant_in(run, &records) {
+            Some(warrant) => warrants.push(warrant),
+            None => unadmitted.push(Unadmitted {
+                run,
+                outcome: concluded_outcome(&records).map(str::to_owned),
+            }),
+        }
 
         // Every fault this run has, not the first one. A sealed run may both
         // claim a foreign chain head and be missing from the log, and the two
@@ -849,5 +896,6 @@ pub async fn audit(
         not_checked,
         releases,
         warrants,
+        unadmitted,
     })
 }

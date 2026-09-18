@@ -86,6 +86,13 @@
 //! * *Stop it.* — the other half of oversight, and the one most surfaces omit.
 //! * *What has happened on this matter?* — the case, its deadlines, its tasks.
 //!
+//! **Every cursored list reads one more row than the page.** That extra row is
+//! the only thing that distinguishes a full page from an overflowing one:
+//! inferring truncation from `len() == limit` calls a queue of exactly the
+//! limit truncated, and a backlog of 140 shown as 100 reads as a backlog of
+//! 100. It also bounds the read — a cursored endpoint that loaded the whole
+//! remainder per page would do work proportional to the total for every page.
+//!
 //! There is no `/health` and no `/metrics`. The embedder owns the port and the
 //! process; a liveness probe answered by this router would be one more route
 //! that must not authenticate, and the one route that skips the gate is the one
@@ -1281,10 +1288,7 @@ async fn run_history(
     // page, which is the truthful answer to "what have I not seen".
     let from = page.from.unwrap_or(1).max(1);
 
-    // One more than the page, exactly as the case history does: the extra record
-    // is how this learns the page was cut, and bounding the read is the point —
-    // a cursored endpoint that loads a run's whole remaining history per page
-    // does work proportional to the run's length for every page of it.
+    // One more than the page — see the module doc on cursored lists.
     let mut records = s
         .plane
         .journal()
@@ -1621,8 +1625,7 @@ async fn runs_by_outcome(
     let outcome = q.outcome.unwrap_or_else(|| "quarantined".to_owned());
     let s = api.gate(&headers, action::RUN_LIST, &outcome).await?;
 
-    // One more than the page, so a full page and an overflowing one are
-    // distinguishable — the same reason the worklist asks for one extra.
+    // One more than the page — see the module doc on cursored lists.
     let mut found = s
         .plane
         .journal()
@@ -1713,9 +1716,7 @@ async fn worklist(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Wor
     // queue by asking for one they do not hold, because there is nowhere in the
     // request to ask.
     //
-    // One more than the page, so a full page and an overflowing one are
-    // distinguishable. Inferring it from `len() == limit` would call a queue of
-    // exactly 100 truncated.
+    // One more than the page — see the module doc on cursored lists.
     let mut queued = tasks
         .queue(&s.caller.roles, api.limit.saturating_add(1))
         .await
@@ -1940,9 +1941,7 @@ async fn cases_by_status(
     let status = CaseStatus::parse(&asked).ok_or_else(|| bad("status"))?;
     let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
 
-    // One more than the page, so a full page and an overflowing one are
-    // distinguishable — a backlog of 140 shown as 100 reads as a backlog of 100,
-    // and the cases that fell off the end are the ones nobody clears.
+    // One more than the page — see the module doc on cursored lists.
     let mut found = cases
         .by_status(status, api.limit.saturating_add(1))
         .await
@@ -2206,12 +2205,18 @@ async fn standing_halts(
 
 /// Throw it.
 ///
-/// **Says what it does not stop.** A halt closes admission; it does not reach
-/// the runs already executing, because cutting those mid-saga leaves reversals
-/// unrun and turns one incident into two. The response carries that sentence
-/// rather than leaving an operator to discover the shape of the control during
-/// the outage — and names `POST /runs/{run}/cancel` as the verb that does reach
-/// work in flight.
+/// **Says how far it reaches, and that answer depends on the scope.** Three
+/// scopes name a workload and close admission only: cutting the runs already
+/// executing mid-saga leaves reversals unrun and turns one incident into two,
+/// so `POST /runs/{run}/cancel` is the verb that reaches those. The subject
+/// scope names an *authority* and does reach work in flight, pausing each run
+/// at its next step boundary with its completed work intact.
+///
+/// The response carries the sentence for the scope it was given rather than
+/// leaving an operator to discover the shape of the control during the outage —
+/// and a single sentence for all four would be false for the one that matters
+/// most, telling somebody who withdrew a credential to cancel, which unwinds
+/// exactly the work the withdrawal was careful to preserve.
 async fn place_halt(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -2231,6 +2236,16 @@ async fn place_halt(
         .set_halt(&scope, &by, now_for_account(), &body.reason)
         .await
         .map_err(|_| store_failed())?;
+    // Derived from the scope; the doc comment above says why one sentence for
+    // all four is false in the direction that costs the most.
+    let reach = if scope.withdrawn_subject().is_some() {
+        "runs already executing for this subject pause at their next step \
+             boundary; their completed work stands, and lifting this halt \
+             continues them — cancel only if the work itself must be reversed"
+    } else {
+        "runs already executing, and suspended runs resuming — cancel a run to \
+             reach work in flight"
+    };
     Ok((
         StatusCode::OK,
         Json(json!({
@@ -2239,8 +2254,7 @@ async fn place_halt(
             "reason": body.reason,
             "by": by.actor(),
             "basis": by.basis().as_str(),
-            "does_not_stop": "runs already executing, and suspended runs \
-                 resuming — cancel a run to reach work in flight",
+            "reach": reach,
         })),
     ))
 }

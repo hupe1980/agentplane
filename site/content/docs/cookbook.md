@@ -155,8 +155,9 @@ The rule of thumb: **if you can draw the graph before you start, draw it.** A
 plan is checkable in advance and a commission is not; the commission's advantage
 is that it does not need to be.
 
-Most agents need neither. `rt.run(capability, Tainted::trusted(input))` is one capability and no
-graph, which is what nine of the twelve examples use.
+Most agents need neither, and most of the examples in this repository are the
+evidence: `rt.run(capability, Tainted::trusted(input))` is one capability and no
+graph.
 
 ### Fan out to several specialists at once
 
@@ -1763,14 +1764,14 @@ let rt = Runtime::builder(store)
 let verdict = cx.call_peer(&PeerId::new("reviewer"), "audit.check", &input).await?;
 ```
 
-What the hop carries is the point. The peer receives **the run's chain plus
-one link** naming it — the caller's chain on a served plane, `cx.acting_as()`
-— so the reviewer's journal answers *on whose behalf* with the same owner
-the desk's does, and a chain with no room for another hop refuses at the
-desk. The grant governs the hop as it governs a tool: its `protected_fields`
-and `max_sensitivity` are checked at the sink, `mutates: true` puts the
-whole-value taint gate in front of it, `requires_approval` puts a person in
-front of it. The answer comes back untrusted, labelled
+What governs the hop is the point. It is checked against **the run's chain plus
+one link** naming the peer — the caller's chain on a served plane,
+`cx.acting_as()` — so a chain with no room for another hop refuses at the desk.
+The peer receives the credential, not the chain, and its own authenticator
+decides what it acts under. The grant governs the hop as it governs a tool: its
+`protected_fields` and `max_sensitivity` are checked at the sink,
+`mutates: true` puts the whole-value taint gate in front of it,
+`requires_approval` puts a person in front of it. The answer comes back untrusted, labelled
 `tool://reviewer/audit.check`, so a source rule downstream can name this
 peer's word and nobody else's. And it is an effect — journaled, metered,
 counted against `max_delegation_depth`, read back on strict replay without

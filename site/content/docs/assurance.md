@@ -47,7 +47,7 @@ it must fail.
 | `tests/guards/postgres.rs` | The shared-store backend against a real PostgreSQL server: tenant isolation with a *valid* identifier from the other tenant, concurrency under a lock, the case layer's contracts |
 | `tests/wire/a2a_interop.rs` | This crate's A2A **client** against the reference SDK's server — the one interoperability gap the conformance kit cannot close, since the kit validates servers |
 | `tests/guards/vault.rs` | The key-ring contract against a real Vault — where the status codes an in-process ring cannot get wrong actually live |
-| `spec/` | TLA+ models of the effect protocol, retry safety, sagas, and fencing, plus the mutants that prove those models constrain anything |
+| `tla/` | TLA+ models of the effect protocol, retry safety, sagas, and fencing, plus the mutants that prove those models constrain anything |
 
 Those three need a Docker daemon or a foreign implementation, and are skipped
 rather than failed without one — so they stay compiled and exercised by
@@ -156,18 +156,18 @@ Model checking proves a spec's invariants hold *of the spec*. It says nothing
 about whether those invariants constrain anything, and the difference is not
 visible by reading.
 
-Writing `spec/RetrySafety.tla` also paid for itself immediately: TLC deadlocked
+Writing `tla/RetrySafety.tla` also paid for itself immediately: TLC deadlocked
 on an effect that was *safe* to repeat, failing in doubt on its final attempt,
 with no rule to apply. The implementation handled it; the rules as first written
 did not.
 
-`spec/EffectProtocol.tla` models "act" and "record" as **separate** steps. As one
+`tla/EffectProtocol.tla` models "act" and "record" as **separate** steps. As one
 atomic step TLC explores it exhaustively and finds no errors — but the one state
 the protocol exists to survive, *the action landed and the process died before
 recording it*, is unreachable, so `ExactlyOnce` holds by construction. Green, and
 worthless.
 
-So `spec/verify.sh` runs two passes. The first checks the specs. The second
+So `tla/verify.sh` runs two passes. The first checks the specs. The second
 checks the check: each spec is re-run against deliberately broken copies of
 itself, and each mutant must be caught by the specific invariant written for it.
 
@@ -285,8 +285,8 @@ tested and broke the saga: a successor reusing a completed step's id made the
 unwind compensate work that never ran. The model↔code guard maps each invariant
 to one test, and no test combined a replan with an unwind. Adding a feature
 widens where an invariant applies, so the widening is what gets checked — every
-pair of the eight feature axes must be exercised together, or declared
-independent with the reason.
+pair of the feature axes must be exercised together, or declared independent
+with the reason.
 
 **A guard that reads source must exclude the source that is the guard.** Both
 source-reading guards have been blinded by themselves: the dead-variant check by

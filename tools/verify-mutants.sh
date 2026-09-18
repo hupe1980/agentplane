@@ -2,7 +2,7 @@
 #
 # Break each guarantee on purpose; check that its named test notices.
 #
-# The specs are already checked this way (`spec/verify.sh`). This does the same
+# The specs are already checked this way (`tla/verify.sh`). This does the same
 # for the implementation, because a guarantee that no test can falsify is
 # indistinguishable from one that was never built — and this project has shipped
 # exactly that: the refusal to replan on untrusted data was real, tested, and

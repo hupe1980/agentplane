@@ -1014,3 +1014,63 @@ async fn exhausting_the_attempts_keeps_the_driver_s_verdict() {
          decides whether it is safe to unwind now has the wrong answer"
     );
 }
+
+/// **The window a peer named survives into the record, and the silence when it
+/// named none.**
+///
+/// The runtime receives the window, acts on it — `RetryPolicy::wait_before`
+/// schedules from it — and the record is the only place a person can learn it
+/// afterwards. Without it, `EffectFailed` says a call was throttled and not
+/// whether the peer wanted thirty seconds or two hours, which is precisely the
+/// difference between a run worth resuming shortly and one that should be
+/// parked. The runtime consumed a fact and wrote none of it down.
+///
+/// It is on the **message** rather than in a typed field, and that is the
+/// decision rather than an economy: a replayed failure is rebuilt from the
+/// recorded string, so a skill that branched on a typed window would take one
+/// path live and another on replay.
+///
+/// Both halves, because a message that always appended a window would be
+/// satisfied by the first assertion and would be inventing one for every peer
+/// that named nothing.
+#[tokio::test]
+async fn the_window_a_peer_named_is_on_the_record() {
+    async fn failure_text(script: &[Attempt]) -> String {
+        let (e, calls) = scripted(script);
+        let f = fixture(e, calls);
+        let out =
+            f.rt.run("demo.once", Tainted::trusted(json!({})))
+                .await
+                .unwrap();
+        assert!(
+            matches!(out.status, RunStatus::Failed(_)),
+            "the script never succeeds: {:?}",
+            out.status
+        );
+        f.store
+            .read(out.run_id, 1)
+            .await
+            .unwrap()
+            .iter()
+            .find_map(|r| match r.kind() {
+                RecordKind::EffectFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            })
+            .expect("a failed effect is on the record")
+    }
+
+    // Every attempt throttled: the script falls through to `Succeed` once it
+    // runs out, so it has to cover the whole policy.
+    let named = failure_text(&[Attempt::RateLimited(40); 4]).await;
+    assert!(
+        named.contains("40ms"),
+        "the record does not say what window the peer asked for, so a reader \
+         cannot tell a short throttle from a long one: {named}"
+    );
+
+    let silent = failure_text(&[Attempt::ThrottledSilently; 4]).await;
+    assert!(
+        !silent.contains("asked for"),
+        "a peer that named no window is reported as having named one: {silent}"
+    );
+}

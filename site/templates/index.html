@@ -5,10 +5,11 @@
   <p class="eyebrow">Durable execution · Deterministic replay · Policy-governed</p>
   <h1>The journal <em>is</em> the plan of record.</h1>
   <p class="lede">
-    An agent runtime in Rust where every outward call is written down before it
-    happens. Crash mid-run and resume from the last completed effect. Replay a
-    run and perform <em>nothing</em>. Prove afterwards what occurred — and that
-    the record was not edited.
+    An agent runtime in Rust where one gate decides all four questions about an
+    outward call — <em>may this principal act</em>, <em>may this value go
+    there</em>, <em>can it be repeated</em>, and <em>what does it leave
+    behind</em>. They are usually answered in four different places, by four
+    systems that cannot see each other's answers.
   </p>
   <p class="cta">
     <a class="btn primary" href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
@@ -27,63 +28,108 @@
   </ul>
 </section>
 
-<section class="pillars">
-  <h2>What it gives you</h2>
+<section class="whitespace">
+  <h2>Why the usual answers stop short</h2>
+  <p class="lede">
+    Each of these is a real control, and none of them is careless. The
+    difference is structural, and it is a list you can go and check rather than
+    a claim about who is more serious.
+  </p>
   <div class="grid">
     <article>
-      <h3>A journal you can audit</h3>
-      <p>Append-only and hash-chained, with per-record signatures naming the
-        workload that wrote them, and a per-plane Merkle log so deleting a whole
-        run is detectable.</p>
+      <h3>A gateway or perimeter</h3>
+      <p>Authorizes the calls that <em>cross it</em>. A memory write, a model
+        call, a commission and a case mutation never do. It holds no label on
+        the value, and its audit trail is a second log beside execution rather
+        than the one execution recovers from.</p>
     </article>
     <article>
-      <h3>Durable execution</h3>
-      <p>Resume from the last completed effect. A suspended run costs a row on
-        disk, not a thread — so a plane can hold 10⁵ of them waiting for a human.</p>
+      <h3>A framework hook</h3>
+      <p>Runs inside the process it is governing, so it is advisory against
+        that process. And it fires at a boundary where the argument has already
+        lost its history — no interceptor can reconstruct where a value came
+        from once it is just a string in a call.</p>
     </article>
     <article>
-      <h3>Exactly-once, honestly</h3>
-      <p>Enforced by the store, not by a code path someone might forget. A call
-        whose outcome is unknown is never blindly retried and never quietly
-        unwound.</p>
+      <h3>A durable execution engine</h3>
+      <p>Journals whatever activity boundary the SDK happens to expose, which
+        makes the workflow survivable. It has no declaration to check an
+        argument against, no label on a value, and nothing it can refuse.</p>
+    </article>
+  </div>
+  <p class="fine">
+    Recovery is the commodity now — durable agents are a few lines of
+    integration. What a bound layer cannot add afterwards is the part below it:
+    a reviewable declaration, a field-level flow decision, an erasure that
+    reaches every copy, and an audit somebody runs without the runtime.
+    <a href="{{ get_url(path='@/docs/concepts.md') }}">How the pieces fit</a>.
+  </p>
+</section>
+
+<section class="pillars">
+  <h2>What one gate buys</h2>
+  <div class="grid">
+    <article>
+      <h3>Authorization that sees the arguments</h3>
+      <p>Not <em>may this agent call that tool</em> but <em>may these values
+        populate these fields</em>. A recipient must derive from the tool that
+        looked it up; a value a model chose cannot fill an authority-bearing
+        argument, and the refusal names the field.</p>
     </article>
     <article>
-      <h3>Information-flow labels</h3>
-      <p><em>May this principal act</em> and <em>may this value go there</em> are
-        different questions. Untrusted data cannot reach a mutating sink without
-        a typed, policy-authorized, journaled release.</p>
+      <h3>Labels that travel with the value</h3>
+      <p>Trust, sensitivity and the sources that shaped it, carried per field
+        and joined on every combination. Untrusted data cannot reach a mutating
+        sink without a typed, policy-authorized, journaled release — scoped to
+        one destination, so it launders nothing else.</p>
     </article>
     <article>
-      <h3>Human oversight that binds</h3>
-      <p>Durable worklists with four-eyes, declared expiry behaviour, and an
-        operator who can <em>stop</em> a run and have it unwind.</p>
+      <h3>Authority that only narrows</h3>
+      <p>Delegation is audience-, time- and depth-bounded, bound at admission
+        and read back on replay. A peer's run executes under <em>its own</em>
+        chain, never the plane's, and no downstream card or tool annotation can
+        widen what it holds.</p>
+    </article>
+    <article>
+      <h3>Evidence that is also the recovery mechanism</h3>
+      <p>One log, not two. The record a crash resumes from is the record an
+        auditor reads — append-only, hash-chained, optionally signed, entered in
+        a Merkle log. A separate compliance trail would eventually disagree with
+        execution, and the disagreement would be invisible.</p>
+    </article>
+    <article>
+      <h3>Anchored outside the operator</h3>
+      <p>A checkpoint is cosigned only if it provably extends the last one seen;
+        a shrunken log is rejected, and so is a second history of the same size.
+        The auditor reads the anchor back from the witness rather than from the
+        party being audited — which is the only claim here that survives a
+        dishonest operator.</p>
     </article>
     <article>
       <h3>Erasure that keeps the proof</h3>
-      <p>Drop a payload's bytes and the chain still verifies — it only ever
+      <p>Drop a payload's bytes and the chain still verifies: it only ever
         committed to a digest. A later read says <em>expired, on this date, for
-        this reason</em>, never <em>missing</em>.</p>
-    </article>
-    <article>
-      <h3>A witness that refuses</h3>
-      <p>A checkpoint is cosigned only if it provably extends the last one seen.
-        A shrunken log is rejected, and so is a second history of the same size
-        — the split view. An auditor reads the anchor back from the witness, not
-        from the operator.</p>
-    </article>
-    <article>
-      <h3>Cases, not long-lived workflows</h3>
-      <p>Runs stay minutes; business processes span months. A deploy never has to
-        migrate an in-flight workflow.</p>
+        this reason</em> — never <em>missing</em>. This is the case that decides
+        whether an evidence tier is real, because it is where most of them
+        break.</p>
     </article>
   </div>
+  <p class="fine">
+    The recovery you would expect is here too and is deliberately not the
+    headline: resume from the last completed effect, exactly-once enforced by
+    the store rather than by a code path someone might forget, and month-long
+    business processes modelled as cases so a deploy never migrates an in-flight
+    workflow.
+  </p>
 </section>
 
 <section class="proof">
   <h2>Why you should believe any of it</h2>
   <p class="lede">
-    Guarantees are only worth what their tests can falsify — so each one is
-    broken on purpose, and the test written for it must fail.
+    Every claim above is the kind that is easy to write and hard to keep, so
+    none of them is offered on trust. Each is broken on purpose and the test
+    written for it must fail — a guarantee whose removal nothing notices is
+    treated here as a defect, not as a feature that happens to be untested.
   </p>
   {#- Every figure here is checked against the tree by
       `tests/guards/docs.rs::the_landing_pages_proof_figures_are_the_real_ones`,
@@ -93,7 +139,7 @@
   <dl class="stats">
     <div><dt>7</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
     <div><dt>28</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
-    <div><dt>753</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>765</dt><dd>code mutations, each naming the one test that must fail</dd></div>
     <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
   </dl>
   <p class="fine">

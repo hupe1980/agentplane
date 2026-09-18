@@ -120,7 +120,7 @@ Three gates decide, in order:
 A policy can narrow what the first two allow and can never widen it. Raising
 `max_attempts` does not make a mutating in-doubt call retryable, which is
 pinned down by `raising_max_attempts_does_not_make_an_in_doubt_call_retryable`
-in `tests/engine/retries.rs` and by the `RetryInDoubtBlindly` mutant in `spec/`.
+in `tests/engine/retries.rs` and by the `RetryInDoubtBlindly` mutant in `tla/`.
 
 #### Asking beats guessing
 
@@ -898,16 +898,14 @@ leaves an orphan is not stuck: the announcement is journaled, the effect declare
 a `Recovery`, and resuming resolves it. Quarantining there would turn every
 recoverable orphan into a permanent operator obligation.
 
-### What building it found
+### The replay cursor is keyed by phase, not only by step
 
-The replay cursor was keyed by *step*, and a step's forward pass and its
-compensation share a step id — so they shared a cursor. That was harmless for as
-long as compensation could only run after the forward pass had consumed its own
-history, which was true of every path that existed. Cancelling a suspended run
-reaches compensation *without* re-running the forward pass, and the compensating
-effect then read the forward record and reported non-determinism against history
-that was perfectly sound.
+A step's forward pass and its compensation share a step id, so a cursor keyed by
+step alone would be shared between them. That holds only while compensation
+cannot start before the forward pass has consumed its own history — and
+cancelling a *suspended* run reaches compensation without re-running the forward
+pass, at which point the compensating effect reads the forward record and
+reports non-determinism against history that is sound.
 
-The cursor is keyed by `(step, phase)` — which is what the effect key has
-always said the identity is. A latent bug that only a new entry point could
-reach.
+So the cursor is keyed by `(step, phase)`, which is what the effect key already
+says the identity is.

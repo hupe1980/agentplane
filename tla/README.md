@@ -41,7 +41,7 @@ derives them — if a number here disagrees with what it prints, the number
 here is the one that is wrong:
 
 ```sh
-spec/verify.sh          # Docker; no local Java needed
+tla/verify.sh          # Docker; no local Java needed
 ```
 
 ## Why the mutants matter more than the specs
@@ -322,17 +322,17 @@ is no gap to slip into.
 
 ## Running them
 
-`spec/verify.sh` uses Docker and needs nothing else installed. With a local
+`tla/verify.sh` uses Docker and needs nothing else installed. With a local
 Java 11+ and [`tla2tools.jar`](https://github.com/tlaplus/tlaplus/releases):
 
 ```sh
-TLA_JAR=/path/to/tla2tools.jar spec/verify.sh --local
+TLA_JAR=/path/to/tla2tools.jar tla/verify.sh --local
 ```
 
 To check a single spec by hand:
 
 ```sh
-java -cp tla2tools.jar tlc2.TLC -config spec/EffectProtocol.cfg spec/EffectProtocol.tla
+java -cp tla2tools.jar tlc2.TLC -config tla/EffectProtocol.cfg tla/EffectProtocol.tla
 ```
 
 ## Bounds

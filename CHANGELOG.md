@@ -16,7 +16,142 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.39.0] — unreleased
+## [0.40.0] — unreleased
+
+### Added
+
+- **`tools::MCP_REVISION` — the revision this plane serves and offers.** One
+  value behind `server/discover`'s advertised set, the handshake ceiling and the
+  client's first offer. The published [support policy](https://hupe1980.github.io/agentplane/docs/interop/#protocol-revisions)
+  states the unit: a revision plus the extensions it is chosen for.
+
+- **`AuditReport::unadmitted` — the runs an audit found no warrant for, and the
+  outcome each concluded under.** Every run whose chain verified is now in
+  exactly one of `warrants` and `unadmitted`. Some have no admission by design:
+  the sweeper opens a run of its own.
+
+### Removed
+
+- **BREAKING: `McpClient::KNOWN_VERSIONS` is replaced by
+  `SPOKEN_REVISIONS`, which holds two revisions rather than five.** It named
+  every revision the SDK can parse; it now names the two this host is exercised
+  against. A handshake settling on `2024-11-05`, `2025-03-26` or `2025-06-18` is
+  refused at construction instead of proceeding.
+
+- **BREAKING: `policy::EVALUATOR_SEMANTICS` is replaced by
+  `policy::evaluator_semantics()`, and it names Cedar's *language* version.**
+  Every policy bundle digest moves once, so an open run resumed across this
+  release is refused and must be re-admitted. After it, a Cedar upgrade moves no
+  digest unless it moves the language version. `policy::CEDAR_LANGUAGE` is the
+  revision this adapter is held to.
+
+- **BREAKING (wire): the delegation chain no longer travels in A2A message
+  metadata.** The extension still declares itself and still carries the
+  capability and the provenance; the `chain` member is gone. Nothing in this
+  crate read it. Take a peer's chain from the credential your authenticator
+  issues.
+
+### Fixed
+
+- **A journaled policy bundle named an evaluator the build was not running.**
+  The identity carried a hard-coded `cedar-policy/4.12.0` while the dependency
+  requirement was a range and the build linked 4.13.0. It is read from the
+  linked evaluator now.
+
+- **A Cedar rule no request can satisfy is refused at construction**, named by
+  its `@id`. Cedar 4.13 reclassified that finding from a validation error to a
+  warning, so such a policy set had begun compiling silently.
+
+- **BREAKING (API): `POST /halts` answers `reach` instead of `does_not_stop`,
+  and the sentence now depends on the scope.** A `subject:` halt *does* reach
+  runs already executing, which the old sentence denied for every scope. The
+  operator guide is corrected to match.
+
+### Known
+
+- **The durable commit dominates what the gate costs.** Authorization runs about
+  26 µs per effect at three rules and the label gate does not rise above the
+  spread between identical runs; against ~8.5 ms of fsync neither is resolvable.
+  Tune the store, not the policy set. What a *refusal* costs the work it stops
+  is not measured here.
+
+- **Reading hostile tool output in a side context is a pattern, not a runtime
+  feature.** `planned` is the declarative answer when the task's shape is known
+  up front; otherwise compose it from a `quarantined`-role call under
+  `expecting(schema)`. The [security guide](https://hupe1980.github.io/agentplane/docs/security/#quarantining-a-parse)
+  names the four things such a branch must not do.
+
+- **Provenance is per value, not per claim.** A label's source set answers
+  *influenced by these*, never *this sentence came from that one*, and that is
+  settled rather than pending: the only derivable finer form is a verbatim span
+  match, which would omit everything a model paraphrased. `Label::provenance`
+  now says so.
+
+### Changed
+
+- **BREAKING (example): `journal_bench` is `gate_bench`, and it measures each
+  control separately.** `just perf` reports the journal append, one policy
+  evaluation and the label gate as deltas on the same store, beside the spread
+  across repeated baseline runs. It needs `--features redb,cedar`.
+
+- **The delegation chain's absence from a peer message is stated where it was
+  contradicted.** Three passages in the guides still said a peer receives the
+  caller's chain; the hop is checked against it here and the peer derives its
+  own from the credential.
+
+- **A verified export says what it structurally cannot carry.** Webhook delivery
+  cursors and worklist decisions no run has consumed are store rows, not
+  records, so they do not survive a restore — stated on every pass rather than
+  discovered later as a fault. A lost cursor costs repetition; a lost decision
+  re-opens the task.
+
+- **A policy rule at an effect can name the revision that is acting.** The
+  governing declaration now reaches `context.agent` at `effect:perform` and
+  `information_flow.release`, not only at `run:admit` — same block, same
+  construction. An effect's principal is the agent's name, which any manifest can
+  claim, so a rule that trusts one revision binds to `context.agent.digest`. A
+  run no declaration governs carries no `agent` block; guard with
+  `context has agent`.
+
+- **A throttled effect records the window the peer asked for.** `Retry-After`
+  informed the schedule and reached no reader; `EffectFailed`'s message now
+  names it, so a short throttle and a long one are distinguishable after the
+  fact. It stays on the message rather than becoming a typed field a skill could
+  branch on — a replayed failure is rebuilt from that string.
+
+### Assurance
+
+- **The benchmark refuses to time a run that did not do the work**, and the
+  operations page is held to the axes it reports. A refused effect is faster
+  than a performed one, so an axis that stops working reads as an improvement
+  until something checks.
+
+- **A memory formed from untrusted material names the sources it was formed
+  from.** Provenance is the dimension nothing else supplies, and it had no
+  test.
+
+- **The interop page's revision set is held to the code's.** A revision this
+  host refuses may not appear on the page as one it offers, and one it speaks
+  must appear.
+
+- **The versioned cryptographic domains are enumerated and held closed**, and
+  in the published inventory: `RunAdmitted.policy_bundle` and
+  `DeadlineRegistered.calendar_digest` are each derived through one.
+
+- **An unresolvable field path is pinned at both gates.** A protected field
+  whose pointer matches no member refuses the call; a field-scoped release
+  naming an untracked path refuses the release. Both were already correct and
+  neither had a test.
+
+- **The `subject:` halt scope is exercised over HTTP**, both arms: a workload
+  halt must not claim to reach running work, and a withdrawal must not repeat
+  the workload sentence.
+
+- **The chain's absence from A2A metadata is pinned**, together with the
+  extension still carrying its own metadata, so the check cannot pass by the
+  whole extension disappearing.
+
+## [0.39.0] — 2026-09-18
 
 ### Added
 

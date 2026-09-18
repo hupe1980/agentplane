@@ -532,13 +532,7 @@ pub fn verify<R: std::io::BufRead>(
         cases: 0,
         complete: false,
     };
-    if verifier.is_none() {
-        report.not_checked.push(
-            "signatures — no public key was supplied, so this pass cannot say who wrote \
-             anything"
-                .to_owned(),
-        );
-    }
+    unanswerable(&mut report, verifier.is_some());
 
     let mut header_seen = false;
     // (index, leaf) for every sealed run, so the tree can be rebuilt in log
@@ -632,6 +626,10 @@ pub fn verify<R: std::io::BufRead>(
         &empty_blocks,
     );
     settle_cases(&mut report, &stamped, &carried, blob_digests);
+    report.not_checked.push(
+        "worklist decisions no run has consumed — a decision recorded against a task and not          yet read back by the run it answers is a store row, not a record, so it does not          survive here. The task re-opens and is decided again under the same four-eyes and          expiry"
+            .to_owned(),
+    );
     Ok(report)
 }
 
@@ -836,6 +834,47 @@ fn read_case_block(
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
 }
+
+/// What this pass cannot answer, whatever the file turns out to contain.
+///
+/// The twin of the audit's own missing-evidence list, and it exists for the same
+/// reason: a pass that quietly skips a question and then reports clean is the
+/// reassuring-but-empty artifact this module is built to avoid. Two kinds sit
+/// here — a check this invocation lacked an input for, and state the format
+/// never carries at all.
+fn unanswerable(report: &mut VerifyReport, verifier_supplied: bool) {
+    if !verifier_supplied {
+        report.not_checked.push(
+            "signatures — no public key was supplied, so this pass cannot say who wrote \
+             anything"
+                .to_owned(),
+        );
+    }
+    report
+        .not_checked
+        .extend(UNCARRIED.iter().map(|limit| (*limit).to_owned()));
+}
+
+/// Operational state this format never carries, named on every pass.
+///
+/// A restored plane's runs and cases come back; the rows beside them do not.
+/// Said unconditionally rather than where something references them, because
+/// these are properties of the *format* — a reader meeting a minimal artifact is
+/// the one most likely to assume a clean report means a total restore.
+///
+/// Both losses degrade safely, which is the argument for leaving them out: a
+/// cursor costs repetition against receivers that already deduplicate, and a
+/// decision is taken again under the same four-eyes and expiry. Stating the
+/// argument is what stops it from being a silence.
+const UNCARRIED: [&str; 2] = [
+    "webhook delivery cursors — this file carries no push registrations, so a restored plane \
+     re-delivers from the start of each subscriber's history rather than from where it got \
+     to. Receivers deduplicate on the event's own identity, so the cost is repetition rather \
+     than loss",
+    "worklist decisions no run has consumed — a decision recorded against a task and not yet \
+     read back by the run it answers is a store row, not a record, so it does not survive \
+     here. The task re-opens and is decided again under the same four-eyes and expiry",
+];
 
 /// The case layer's own settlement: coverage, and what a file cannot check.
 ///

@@ -46,6 +46,17 @@ Labels **join** on combination — trust degrades to the worse, sensitivity
 escalates to the higher, provenance accumulates. A bounded join-semilattice, and
 the reason derived values inherit untrust automatically.
 
+**Provenance answers *influenced by these sources*, never *this sentence came
+from that one*.** The set belongs to the whole value: a completion written from
+three recalled memories carries all three, and nothing says which clause owes
+which. That is deliberate rather than pending. The only finer form this runtime
+could *derive* is a verbatim span match, which would attribute what a model
+copied and omit what it paraphrased — an absent citation reading as *not derived
+from* while meaning *not copied from*. Over-coverage is the safe direction and is
+what the gates rest on: `allowed_sources` refuses a value whose set contains
+anything unlisted, so a source that merely *might* have contributed still stops
+the call.
+
 `Tainted<T>` exposes `peek()` (reading is fine — the enforcement point is at
 *sinks*, not at reads) but no public unwrap. Structured JSON can additionally
 carry labels at RFC 6901 paths. `Tainted::object` and `Tainted::array` preserve
@@ -416,11 +427,37 @@ trust:
   derivative comes back **labelled untrusted**, journaled, spend billed to
   the asker — containment, not isolation, because the granting agent still
   reads the derivative.
+* **A skill composing one**: `cx.complete_with(&source, |v| ModelCall::new(…)
+  .expecting(schema))` on the `quarantined` role is the same construct by hand,
+  and it is how memory formation is built. This one is **yours**, deliberately
+  — see below.
 
 No path makes untrusted data trusted. Schema-shaped is not trusted; the only
 promotion is a typed, journaled `release` a policy authorized. The gates hold
 because the *label* survives the parse, not because the parse cleaned
 anything.
+
+**Why the fourth one is not a runtime feature.** Reading hostile output in a
+side context so the privileged model never sees it is a good pattern, and it is
+not a guarantee this runtime can make: its entire strength is the schema you
+write, and `{"summary": "string"}` bounds nothing. There is no rule the runtime
+could apply to decide whether a shape bounds anything, so offering it as a
+declared control would be offering something that reads as enforced and is not.
+`planned` is the declarative answer where the shape of the task is known up
+front; otherwise it is a pattern you compose. Four things it must not do:
+
+* **Hand the parent something trusted.** The derivative carries the source's
+  label joined in. Improving it is a `release` — with the policy check and the
+  record a release has, not a side effect of having parsed.
+* **Give the child tools.** The quarantined role holds no authority; a branch
+  with tools is the ordinary loop with extra steps.
+* **Check the shape in your own code.** `expecting(schema)` is enforced at the
+  effect boundary, so the journal carries what was required. A skill that
+  parses the string itself leaves no evidence the bound existed.
+* **Read the schema as a bound on content.** It bounds shape. The attacker
+  writes the field values, and a model reading any derivative of hostile input
+  can still be steered inside the tools it was granted — which is why the
+  consequence is bounded by the grant, the sink gate and `requires_approval`.
 
 ### Sensitivity composes upward only
 
@@ -585,7 +622,7 @@ and is timeless, unlike a signature or an expiry. It runs the same predicate the
 constructor does, deliberately: two definitions of "valid chain" is how the
 storage path drifts from the construction path.
 
-`spec/Delegation.tla` models building, storing, *tampering*, and loading, and its
+`tla/Delegation.tla` models building, storing, *tampering*, and loading, and its
 mutants are the two failures above.
 
 ## Authorization
@@ -858,7 +895,9 @@ behaviour you want.
 For `tool.call`, `context.args` carries `{ server, tool, arguments }` — which is
 what lets a rule speak about one server without speaking about every tool on it.
 
-At **`run:admit`**, the governing declaration arrives under `context.agent`:
+The governing declaration arrives under `context.agent`, at **every** gate a
+declared agent reaches — `run:admit`, `effect:perform` and
+`information_flow.release`:
 
 ```text
 context.agent.name       the declared name — for reading, never for granting
@@ -866,6 +905,17 @@ context.agent.version
 context.agent.digest     hex over the manifest's canonical bytes
 context.agent.publisher  the KeyId that vouched for it, or absent
 ```
+
+It is the same block in each, because a deployment writes one rule about a
+revision and expects it to mean the same thing wherever it is evaluated. It
+matters most *away* from admission: an effect's principal is the agent's own
+`metadata.name`, which any file can claim, so a rule that wants to trust one
+revision — an escalation that auto-approves, a sink only a reviewed build may
+reach — has to bind to the digest rather than to the name beside it.
+
+Guard it: a run no declaration governs carries no `agent` block at all, so a rule
+reads `context has agent` before reading into it. Absent rather than fabricated
+is what keeps that guard meaningful.
 
 ### Worked policies
 
@@ -992,6 +1042,29 @@ manufacture drift.
 Live identity, delegation state, labels, amounts, and other per-call facts do
 **not** belong in the static bundle. They remain request context and are recorded
 through the normal effect/journal protocol where applicable.
+
+**The evaluator identifier is a semantics version, not a build version.** For
+the Cedar adapter it is `cedar-lang/<language version>` — Cedar's own published
+statement of what decides — beside `agentplane-adapter/<n>` for everything the
+language version does not cover: entity mapping, context parsing, which
+validation findings are fatal, and the extension set.
+
+What is *linked* is held to that language version by a test rather than copied
+into the string. So an upstream release that changes no decision leaves every
+bundle digest where it is, and one that moves the language fails the build
+rather than quietly re-valuing a field an audit compares across builds.
+
+That matters because the identity is compared **whole** when an open run
+resumes: a digest that moved refuses the resume rather than continuing under
+semantics the run was not admitted under. Re-admit rather than migrate. The
+derivation is [published](@/docs/format.md#digest-domains), so a third party can
+recompute a bundle identity from an export without this crate — though not
+re-decide with it, since the identity names an evaluator rather than carrying
+one.
+
+A policy set that **cannot fire** is refused where it is written, at startup,
+beside the parse and validation failures: a rule whose scope no request can
+satisfy is a `forbid` an operator reads as a limit and nothing ever evaluates.
 
 ### An agent binds by digest, never by its name
 
@@ -1393,7 +1466,7 @@ budget by asking.
 
 ### How it is checked
 
-`spec/Authorization.tla` models a run, a rule change, and a replay, with
+`tla/Authorization.tla` models a run, a rule change, and a replay, with
 invariants `NothingForbiddenIsPerformed`, `ReplayNeverConsultsPolicy`,
 `DenialIsDurable`, `ReplayPerformsNothing`, `NoRedundantPermitRecords`. Runtime
 mutants additionally remove each Cedar bundle component or the resume equality
@@ -1512,33 +1585,6 @@ Fitting MCP to this exposed a gap in `EffectError`: there was no way to say *the
 peer performed the operation and it failed*. `Rejected` means nothing was
 applied, and the only other `Landed` variant was a decode error. Hence
 `EffectError::Performed`.
-
-## Refusals leak
-
-Every mechanism above decides whether an action is permitted. What the agent is
-*told* when the answer is no is a separate question, and getting it wrong hands
-back the thing the gate was protecting.
-
-Refusal messages are written for an operator reading a journal, so they are
-precise: which principal, which sink, what sensitivity, which ceiling. Fed into
-an agent's next prompt — which is what an agent loop naturally does with an error
-— that precision turns the policy into a queryable service. Injected content
-steering the loop can probe it: vary the request, watch which variants come back
-refused, and read the boundary off the answers.
-
-The egress ceiling was the sharpest case: its message reported *the sensitivity
-of the data*. A handful of probes classify data the run was never permitted to
-reveal, and none of it ever crosses the boundary — the classification leaks
-through the refusals alone.
-
-So the audiences are separated. `Display` keeps everything, for the journal and
-the operator. `PolicyError::for_model()` returns one uniform sentence for
-anything that reaches a prompt. An auditor can still answer *why*; the thing that
-might be attacking the policy learns nothing it can tell apart.
-
-That leaves the refused/allowed bit itself, which no wording removes short of
-fabricating success. `Budget::max_denials` bounds it — see [what that ceiling
-counts](#what-max-denials-counts), which is not the same on both refusal paths.
 
 ## Content guardrails
 

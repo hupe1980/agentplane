@@ -315,44 +315,71 @@ named the right invariant — including one mutation that moved the writes outsi
 the transaction, which the atomicity check caught with "a rejected batch left 1
 record(s) behind".
 
-## What an effect costs
+## What the gate costs
 
 The first question a runtime built on *"the journal is the plan of record"*
 invites, and one this project could not answer until it had a way to produce a
 number. `just perf` produces it; these figures are from an Apple-silicon laptop
-and are quoted with the command precisely because they are hardware-specific:
+and are quoted with the command precisely because they are hardware-specific.
+
+Each control is measured on its own store and reported by its best of three
+runs, as the delta it adds to a bare effect. `spread` is what the method
+resolves — the gap between identical baseline runs — and a delta smaller than it
+is the machine rather than the control:
 
 ```
-2000 effects, redb in memory
-  live      161.8ms      12363 effects/sec   0.08 ms/effect
-  replay     11.7ms     171282 effects/sec   14x faster than live
+2000 effects × 3 runs, redb in memory, 3 policy rules
+  journal     0.094 ms/effect      10586 effects/sec   canonicalize, chain, commit
+  policy      0.120 ms/effect     +0.026 ms vs journal  one authorize per effect
+  sink        0.098 ms/effect       under the spread  label gate, one protected field
+  replay      0.003 ms/effect     291838 effects/sec   the read path, nothing performed
+  spread      0.011 ms/effect                     across 3 baseline runs, what this resolves
 
-2000 effects, redb on disk
-  live       17.5s         115 effects/sec   8.73 ms/effect
-  replay     16.3ms     122809 effects/sec   1072x faster than live
+400 effects × 3 runs, redb on disk, 3 policy rules
+  journal     8.471 ms/effect        118 effects/sec   canonicalize, chain, commit
+  policy      8.152 ms/effect       under the spread  one authorize per effect
+  sink        8.137 ms/effect       under the spread  label gate, one protected field
+  replay      0.004 ms/effect     250646 effects/sec   the read path, nothing performed
+  spread      0.758 ms/effect                     across 3 baseline runs, what this resolves
 ```
+
+### One axis dominates, and it is not the one people ask about
+
+**The durability point is the whole figure.** Authorization costs about 26 µs
+per effect at three rules, and the label gate over a protected field does not
+rise above what three identical runs disagree by. Against 8.5 ms of fsync
+neither is resolvable at all — the gate's own checks are two orders of magnitude
+below the commit that records them. An adopter tuning this tunes the store, not
+the policy set.
+
+Two consequences worth stating. Policy evaluation scales with the rule set, so a
+plane running forty rules pays proportionally more than the three measured here
+— still nowhere near the commit, but it is the axis that grows. And a control
+that reads as free here is not free everywhere: these are the costs of *checking*,
+and what a refusal costs the work it stops is a different measurement, taken
+against a deployment's own bundle rather than against this loop.
 
 ### Read the gap, not the numbers
 
 **Two fsyncs per effect.** An effect crosses the protocol twice — `EffectStarted`
 before dispatch, its terminal record after — and both are durable commits at
 `Durability::Immediate`, because intent precedes action: the announcement must survive the
-process *before* anything reaches the world. The ~9 ms is that guarantee's
+process *before* anything reaches the world. The ~8.5 ms is that guarantee's
 price, not an inefficiency waiting to be tuned away. Batching the two would
 break the only thing standing between a crash and an unrecorded payment.
 
 **Against what an effect normally is, this is noise.** A model call is seconds; a
-tool call is tens of milliseconds. At 9 ms, journaling is well under 1 % of a
+tool call is tens of milliseconds. At 8.5 ms, journaling is well under 1 % of a
 real agent's wall clock, and the whole design is priced for effects that reach
 the world.
 
 **It stops being noise when effects are cheap and many.** `cx.now()`, a case
-read, a memory recall — a plan doing hundreds of those pays 9 ms each. If a
+read, a memory recall — a plan doing hundreds of those pays 8.5 ms each. If a
 step is looping over cheap effects, that loop is the cost.
 
 **On redb it is a plane-wide ceiling, not a per-run one.** redb has a single
 writer, which is exactly what makes its exactly-once key and its fencing free of
-races — and it means ~115 effects/sec is the *whole plane's* durable write
+races — and it means ~118 effects/sec is the *whole plane's* durable write
 budget on this hardware, not one run's. A single-node plane running agents that
 call models will never notice. A plane running many concurrent runs of cheap
 effects will, and that is the signal to move to `PostgreSQL`, which is also the
@@ -360,7 +387,7 @@ answer for more than one instance. It is a flag, not a rewrite: every verb takes
 `--store postgres://…` beside `--tenant`, including `serve`.
 
 **Replay is not the same cost, by a wide margin.** It performs nothing and reads
-history back — 1000× faster on disk. That matters more than it looks: a
+history back — 2000× faster on disk. That matters more than it looks: a
 divergence check, a crash recovery and an offline audit all pay the read price,
 so the expensive half is the half that only happens once.
 
@@ -770,6 +797,15 @@ innocence**: a run whose chain did not verify shows neither, because nothing
 drawn from those records can be trusted, and a run that verified and then failed
 a check shows both, because that is the run an investigator opened the report
 for.
+
+Read `warrants` with `unadmitted`, its complement: **every run that verified is
+in exactly one of the two**. A run with no admission record produces no warrant,
+and reported alone the warrant list is shorter than the run list with nothing
+saying why — so the runs that have no answer are listed with the outcome they
+concluded under. Some are unadmitted by design: the sweeper opens a run of its
+own for decisions it takes without a request. What the pair buys is that *what
+authorized this run* is a question the report answers for all of them, including
+with "nothing did".
 
 `audit` prints the report as JSON and exits non-zero on findings — but **not** on
 `not_checked`, which is a separate list and the one worth reading. An audit given
@@ -1744,7 +1780,7 @@ happened is not an outcome of the item, and the next pass admits them again.
 be somebody else, possibly at three in the morning, and *why* is the whole
 question, while a lift needs no justification because it restores the default.
 
-#### What it does not stop
+#### What a workload-scoped halt does not stop
 
 Runs already executing, and suspended runs resuming — deliberately. Those are
 existing work, and refusing to let them continue would strand them mid-saga with
@@ -1752,6 +1788,15 @@ reversals unrun, turning one incident into two. Work in flight is stopped by
 *cancelling* it (`request_cancel`), which unwinds what it did and records who
 asked. `cargo run --example operator_stop` runs both brakes side by side, which
 is the clearest statement of the difference.
+
+**The `subject:` scope is the exception, and it is the one an incident most
+often needs.** It names an authority rather than a workload, so it *does* reach
+runs already executing — each pauses at its next step boundary as `withheld`,
+completed work standing, and lifting the halt continues it. The response to
+`POST /halts` says which of the two you got, derived from the scope, because an
+operator who withdrew a credential and reads *cancel to reach work in flight*
+will unwind a week of correct work that the withdrawal had deliberately
+preserved.
 
 ### One surface, many tenants
 
@@ -1931,47 +1976,18 @@ point the `deny` and `proceed` policies of every task behind them would
 silently stop firing. Reviewer attention is a finite resource; a queue that
 can be flooded is an oversight control that can be switched off.
 
-### The second thing building it found
+### A task id mixes in the run it belongs to
 
-Two runs of one plan shared one human task.
+An `EffectKey` is unique *within* a run — the journal enforces `(run, effect_key)`
+and needs nothing more — while the worklist is a table every run shares. Two runs
+of one plan reach the same step, at the same ordinal, with the same descriptor,
+so a task id derived from the key alone would collide, and `TaskStore::open` is
+idempotent by id: the second run's task would silently not be created, and it
+would wait for an answer nobody is ever shown.
 
-`TaskId` was derived from the awaiting effect's key. An `EffectKey` is unique
-*within a run* — the journal enforces `(run, effect_key)` and needs nothing more
-— but the worklist is a table shared by every run, and two runs of one plan reach
-the same step, at the same ordinal, with the same descriptor, and derive the same
-key. `TaskStore::open` is idempotent by id, so the second run's task was silently
-**not created**. One proposal appeared, carrying the first run's amount; an
-operator decided it; the second run went on waiting for an answer nobody would
-ever be shown. Two €900 refunds became one €100 approval, and nothing anywhere
-reported a problem.
-
-It surfaced while writing a test that needed three tasks in one queue and could
-only produce one.
-
-The rule it encodes: **an effect key is unique within its run; anything that
-escapes into a shared namespace has to mix the run back in.** `TaskId::derive`
-now hashes both, and the field is private, so the collision is unrepresentable
-rather than merely fixed. The `("task", …)` correlation key inherits the fix,
-since it is derived from the id.
-
-Worth noting *why* no test caught it: every task test ran one run. A one-run
-fixture cannot express a two-run collision, and the shape was shared by all of
-them — the same failure named in the retrospective as "one test shape hiding a
-class of bug".
-
-### What building it found
-
-Writing the first handler failed to compile, and the reason was not in the
-handler: `Runtime`'s futures were not `Send`. One field did it — a bare
-`&dyn Fn(Append) -> Append` in the executor, which is neither `Send` nor `Sync`
-unless it says so, and which infected every future that touched it.
-
-Nothing in the crate had noticed, because nothing needed to: a single-threaded
-`#[tokio::test]` awaits futures in place. An embedder calling `tokio::spawn`
-would have hit it immediately, as a page of trait error naming a private type
-they cannot see. `tests/guards/layering.rs` holds it at both ends — a compile-time
-assertion that every public runtime future is `Send`, and a scan that fails any
-bare `dyn Fn` field in `src/runtime/`.
+So `TaskId::derive` hashes the run in as well, and the field is private — the
+collision is unrepresentable rather than avoided by care. The `("task", …)`
+correlation key inherits that, being derived from the id.
 
 ## 🗄️ Retention and erasure {#retention-and-erasure}
 
@@ -2103,7 +2119,12 @@ grows with how much work was in flight:
    the same root at the same size, and exits non-zero when it does not.
 3. Start the plane. Nothing is replayed at startup; a run is replayed when it is
    resumed.
-4. **Re-arm the suspended runs.** Resuming each one is what repairs its waits.
+4. **Re-arm the suspended runs.** Resuming each one is what repairs its waits:
+   replay reaches the announced wait, finds no terminal record, and re-arms the
+   timer, re-subscribes and re-opens the task row. A run waiting on a person is
+   in the worklist; a run waiting on a **timer or an event** is in no listing
+   today, so keep the run ids from before the incident — the export names every
+   run it carried.
 
 ### The drill {#recovery-drill}
 

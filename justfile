@@ -288,8 +288,8 @@ FULL_FEATURES := "cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,
 #
 # what an effect costs, so a performance claim can carry a number
 perf:
-    cargo run --release --quiet --example journal_bench --features redb
-    DISK=1 cargo run --release --quiet --example journal_bench --features redb
+    cargo run --release --quiet --example gate_bench --features redb,cedar
+    DISK=1 cargo run --release --quiet --example gate_bench --features redb,cedar
 
 # the binary is never exercised by `cargo test` — it only compiles
 cli-smoke:
@@ -398,7 +398,7 @@ site-serve:
 
 # TLA+ model check, plus the spec mutants
 specs:
-    ./spec/verify.sh
+    ./tla/verify.sh
 
 # ── Release ─────────────────────────────────────────────────────────────────
 

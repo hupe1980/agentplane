@@ -215,6 +215,14 @@ pub(crate) struct Frame {
     /// agent about what the agent is.
     #[cfg(feature = "manifest")]
     pub manifest: Option<Arc<crate::manifest::Manifest>>,
+    /// The declaration's identity, as every gate reports it.
+    ///
+    /// Carried rather than derived at the gate so that the *same* revision is
+    /// named at admission and at every effect. Computed once where the manifest
+    /// is wired, because the publisher arrives beside the document from a
+    /// verified registry resolution and a manifest alone cannot state it.
+    #[cfg(feature = "manifest")]
+    pub declaration: Option<crate::journal::AgentIdentity>,
     /// The plane's workload identity, for signing what it tells a callee.
     ///
     /// Separate from the store's signer even though a deployment should give
@@ -280,6 +288,8 @@ pub struct StepCtx<'a> {
     plane: std::sync::Weak<super::Runtime>,
     #[cfg(feature = "manifest")]
     manifest: Option<Arc<crate::manifest::Manifest>>,
+    #[cfg(feature = "manifest")]
+    declaration: Option<crate::journal::AgentIdentity>,
     signer: Option<Arc<dyn crate::core::Signer>>,
     /// Whether this context is currently taking a group back.
     ///
@@ -349,6 +359,8 @@ impl<'a> StepCtx<'a> {
             plane,
             #[cfg(feature = "manifest")]
             manifest,
+            #[cfg(feature = "manifest")]
+            declaration,
             signer,
             recorded_groups,
         } = frame;
@@ -385,6 +397,8 @@ impl<'a> StepCtx<'a> {
             plane,
             #[cfg(feature = "manifest")]
             manifest,
+            #[cfg(feature = "manifest")]
+            declaration,
             signer,
             recorded_groups,
             reversing: false,
@@ -2065,6 +2079,24 @@ impl<'a> StepCtx<'a> {
         if let Some(label) = outbound {
             context["label"] = serde_json::to_value(label).unwrap_or(Value::Null);
         }
+        // **Which revision is acting**, on the same terms admission offers it.
+        //
+        // Admission refuses to make the agent's `metadata.name` its principal,
+        // because a name is whatever a manifest's author typed and a rule
+        // granting authority to one grants it to any file claiming it — and then
+        // tells rules to bind to `context.agent.digest` instead. At an effect
+        // that name *is* the principal, so without this the advice admission
+        // gives cannot be followed at the gate where the call actually goes out:
+        // a deployment could say which revision may start and not which may
+        // reach a particular sink.
+        //
+        // Nothing new is on the record: the same identity is journaled at
+        // admission as `RunAdmitted.governed_by`, so a third party re-deriving
+        // this verdict offline still has every input to it.
+        #[cfg(feature = "manifest")]
+        if let Some(id) = self.declaration.as_ref() {
+            context["agent"] = agent_context(id);
+        }
         merge_identity(&mut context, self.identity.as_ref());
         let request = crate::core::PolicyRequest {
             principal: &self.agent,
@@ -3278,6 +3310,12 @@ impl<'a> StepCtx<'a> {
             "release": release,
             "label": label,
         });
+        // The acting revision, on the same terms every other gate offers it —
+        // see the effect gate for why a rule must be able to name it.
+        #[cfg(feature = "manifest")]
+        if let Some(id) = self.declaration.as_ref() {
+            context["agent"] = agent_context(id);
+        }
         merge_identity(&mut context, self.identity.as_ref());
         let request = crate::core::PolicyRequest {
             principal: &self.agent,
@@ -5361,6 +5399,38 @@ impl<T: Effect, Er: Into<StepError>> BuildsEffect<T> for Result<T, Er> {
     fn into_effect(self) -> Result<T, StepError> {
         self.map_err(Into::into)
     }
+}
+
+/// The declaration, as every gate reports it.
+///
+/// One construction shared by admission and by each effect gate, because a
+/// deployment writes *one* rule about a revision and expects it to mean the
+/// same thing wherever it is evaluated. Two spellings would let a rule permitted
+/// at the door read differently at the sink.
+///
+/// `name` is beside the digest for readability and must not be authorized on: a
+/// file claims a name, but only the holder of a key can claim a publisher.
+///
+/// **Publisher absent, never `null`.** An `Option` serialized straight into the
+/// context puts a JSON `null` there for every unpublished manifest — which is
+/// most of them, since attestation is opt-in — and Cedar refuses a context
+/// containing one: not the field, the whole record. A policy asks
+/// `context.agent has publisher` and then reads it, which is the idiom for an
+/// optional attribute and what the absent form supports.
+pub(crate) fn agent_context(id: &crate::journal::AgentIdentity) -> serde_json::Value {
+    let mut agent = serde_json::json!({
+        "name": id.name,
+        "version": id.version,
+        "digest": id.digest.to_hex(),
+    });
+    if let Some(value) = id
+        .publisher
+        .as_ref()
+        .and_then(|p| serde_json::to_value(p).ok())
+    {
+        agent["publisher"] = value;
+    }
+    agent
 }
 
 /// Fold a delegation chain into a policy context object.

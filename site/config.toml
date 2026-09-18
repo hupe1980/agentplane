@@ -51,3 +51,12 @@ tagline = "The journal is the plan of record."
 # holds this list and the pages' `extra.group` to each other, so a page with a
 # group nobody declared is a page that has vanished from the navigation.
 doc_groups = ["Start here", "Build", "How it works", "Trust", "Operate"]
+
+# One line per group, shown on the documentation index. Keyed by name so
+# `doc_groups` stays the plain list the sidebar iterates.
+[extra.doc_group_lede]
+"Start here" = "Enough to run something and understand what you just ran."
+"Build" = "Writing an agent: what you declare, what the runtime enforces, and how to test it without a provider."
+"How it works" = "The mechanisms, and why each is shaped the way it is. Read these when you need to predict behaviour rather than look it up."
+"Trust" = "What can be proven, by whom, and what each proof deliberately does not cover."
+"Operate" = "Running it: what will change under you, what to pin, and what to do when something is stuck."

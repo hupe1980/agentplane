@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.39.0"
+version      = "0.40.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -301,8 +301,8 @@ name              = "bedrock_live"
 required-features = ["bedrock"]
 
 [[example]]
-name              = "journal_bench"
-required-features = ["redb"]
+name              = "gate_bench"
+required-features = ["redb", "cedar"]
 
 [[example]]
 name              = "hello_skill"
