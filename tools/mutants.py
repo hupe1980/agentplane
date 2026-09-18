@@ -5498,7 +5498,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "credential somebody withdrew — which is the harm the subject scope "
         "exists to stop, not a side effect of it",
         "                let standing = self.withdrawn_authority(identity.as_ref()).await?;",
-        "                let standing: Option<(String, String)> = None;",
+        "                let standing: Option<Withdrawal> = None;",
     ),
     "AWithdrawalUnwindsTheWorkItPaused": (
         "src/runtime/executor.rs",
@@ -6759,9 +6759,27 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "being a failure to access — which is the whole of the control",
         """        // The record first, and the plane only if it landed.
         plane
-            .record_break_glass(""",
+            .record_break_glass(
+                &crate::core::Operator::authenticated(caller.actor.clone()).map_err(|e| {
+                    crate::core::RuntimeError::Store(crate::core::StoreError::Backend(
+                        e.to_string(),
+                    ))
+                })?,
+                &caller.roles,
+                reason,
+            )
+            .await?;
+        Ok(plane)""",
         """        let _ = plane
-            .record_break_glass(&caller.actor, &caller.roles, reason)
+            .record_break_glass(
+                &crate::core::Operator::authenticated(caller.actor.clone()).map_err(|e| {
+                    crate::core::RuntimeError::Store(crate::core::StoreError::Backend(
+                        e.to_string(),
+                    ))
+                })?,
+                &caller.roles,
+                reason,
+            )
             .await;
         Ok(plane)""",
     ),
