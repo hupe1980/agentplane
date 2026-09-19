@@ -210,7 +210,7 @@ macro_rules! manifests {
 }
 
 pub use crate::core::{
-    AgentRef, Capability, CaseId, Digest, EffectKey, Label, Outcome, Recovery, RunId, RuntimeError,
+    Capability, CaseId, Digest, EffectKey, Label, Outcome, Recovery, RunId, RuntimeError,
     Sensitivity, Seq, Skill, SkillDescriptor, SourceId, StepId, Tainted, Trust,
 };
 pub use crate::journal::{JournalStore, Record, RecordKind};

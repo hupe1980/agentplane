@@ -1844,6 +1844,31 @@ impl Runtime {
         Ok(out)
     }
 
+    /// The runs that are waiting, and what each one waits for.
+    ///
+    /// The third listing, beside concluded runs and running ones: a suspended
+    /// run has no outcome and holds no admission slot, so neither of the others
+    /// names it. Re-arming these is the recovery runbook's last step, and until
+    /// this existed that step named a verb with no argument an operator could
+    /// obtain.
+    ///
+    /// Soonest due first, bounded by `limit`. Straight through to the store's
+    /// maintained index — no page of records is read, because what a run waits
+    /// for is on the suspension itself.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    pub async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::journal::WaitingRun>, RuntimeError> {
+        self.store
+            .waiting_runs(limit)
+            .await
+            .map_err(RuntimeError::from_store)
+    }
+
     /// Stop this instance taking on work, then wait for what it is already
     /// doing.
     ///
@@ -3769,6 +3794,51 @@ impl Runtime {
         Ok(())
     }
 
+    /// Ensure an open run cannot cross its history frontier under a different
+    /// **declaration** than the one it was admitted under.
+    ///
+    /// The bundle check above covers who may authorize an effect; this covers
+    /// what the agent *is*. For a declarative agent the manifest is the whole
+    /// behaviour, and a resume under an edited one runs a different program over
+    /// the first one's journal — which replay would eventually catch as a key
+    /// mismatch, several effects in and without being able to say what changed.
+    /// The digest is already on the record at admission, so refusing here costs
+    /// a comparison and turns a late diagnosis into a named remedy.
+    ///
+    /// **Silent in two cases, and deliberately.** A run admitted with no
+    /// declaration is a coded skill, whose behaviour is the embedder's binary:
+    /// this crate cannot identify that and will not pretend to. And a plane that
+    /// holds no manifest under the recorded name cannot run the agent
+    /// declaratively at all, so the refusal it needs is the one plan resolution
+    /// already gives.
+    #[cfg(feature = "manifest")]
+    fn ensure_resume_declaration(&self, records: &[Record]) -> Result<(), RuntimeError> {
+        let Some(recorded) = records.iter().find_map(|record| match record.kind() {
+            RecordKind::RunAdmitted { governed_by, .. } => governed_by.as_deref().cloned(),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let Some(current) = self
+            .governed_by
+            .values()
+            .find(|m| m.metadata.name == recorded.name)
+        else {
+            return Ok(());
+        };
+        let configured = current
+            .digest()
+            .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
+        if configured != recorded.digest {
+            return Err(RuntimeError::DeclarationChanged {
+                agent: recorded.name,
+                recorded: recorded.digest,
+                configured,
+            });
+        }
+        Ok(())
+    }
+
     /// Re-execute a recorded run from its journal.
     ///
     /// * [`Mode::Strict`] verifies determinism: every effect must match, and the
@@ -3962,6 +4032,8 @@ impl Runtime {
         // usable as an offline verifier without loading the historical engine.
         if mode == Mode::Resume {
             self.ensure_resume_policy_bundle(&records)?;
+            #[cfg(feature = "manifest")]
+            self.ensure_resume_declaration(&records)?;
         }
 
         let quota = self.start_replay_quota_pass(run, mode, lease).await?;
@@ -4354,11 +4426,11 @@ impl Runtime {
                     if !matches!(status, RunStatus::Succeeded) {
                         continue;
                     }
-                    if let Some(key) = cursor.unconsumed_in(step, Phase::Forward) {
+                    if let Some(missing) = cursor.unconsumed_in(step, Phase::Forward) {
                         self.meter.count(metrics::DIVERGENCES, "");
                         tracing::error!(
                             target: telemetry::NONDETERMINISM,
-                            %step, %key, unconsumed = true,
+                            %step, key = %missing.key, unconsumed = true,
                         );
                         return self
                             .conclude(
@@ -4366,8 +4438,8 @@ impl Runtime {
                                 epoch,
                                 RunStatus::Quarantined(format!(
                                     "strict replay verified less than the run recorded: \
-                                     step {step} finished with journaled effect {key} never \
-                                     requested — this build performs fewer effects than the \
+                                     step {step} finished with journaled effect {missing} \
+                                     never requested — this build performs fewer effects than the \
                                      recorded one"
                                 )),
                                 None,
@@ -4450,12 +4522,12 @@ impl Runtime {
         // record holds work this build cannot account for, and "verified" must
         // not be the answer.
         if mode == Mode::Strict
-            && let Some((step, phase, key)) = cursor.first_unconsumed()
+            && let Some((step, phase, missing)) = cursor.first_unconsumed()
         {
             self.meter.count(metrics::DIVERGENCES, "");
             tracing::error!(
                 target: telemetry::NONDETERMINISM,
-                %step, %key, unconsumed = true,
+                %step, key = %missing.key, unconsumed = true,
             );
             return self
                 .conclude(
@@ -4463,8 +4535,8 @@ impl Runtime {
                     epoch,
                     RunStatus::Quarantined(format!(
                         "strict replay verified less than the run recorded: journaled \
-                         effect {key} (step {step}, {phase:?} phase) was never requested \
-                         — this build performs fewer effects than the recorded one"
+                         effect {missing} at step {step}, {phase:?} phase, was never \
+                         requested — this build performs fewer effects than the recorded one"
                     )),
                     None,
                     writing,
@@ -4923,12 +4995,12 @@ impl Runtime {
         // was perform a different one.
         if !writing
             && !matches!(unwound, RunStatus::Quarantined(_))
-            && let Some((step, phase, key)) = cursor.first_unconsumed()
+            && let Some((step, phase, missing)) = cursor.first_unconsumed()
         {
             self.meter.count(metrics::DIVERGENCES, "");
             tracing::error!(
                 target: telemetry::NONDETERMINISM,
-                %step, %key, unconsumed = true,
+                %step, key = %missing.key, unconsumed = true,
             );
             return self
                 .conclude(
@@ -4936,8 +5008,8 @@ impl Runtime {
                     epoch,
                     RunStatus::Quarantined(format!(
                         "strict replay verified less than the run recorded: journaled \
-                         effect {key} (step {step}, {phase:?} phase) was never requested \
-                         — this build performs fewer effects than the recorded one"
+                         effect {missing} at step {step}, {phase:?} phase, was never \
+                         requested — this build performs fewer effects than the recorded one"
                     )),
                     None,
                     writing,
@@ -6755,15 +6827,19 @@ fn classify(
                     seq,
                     expected,
                     actual,
+                    detail,
                 }) => {
                     tracing::error!(
                         target: telemetry::NONDETERMINISM,
-                        %seq, %expected, %actual,
+                        %seq, %expected, %actual, %detail,
                     );
                     meter.count(metrics::DIVERGENCES, "");
                 }
-                SkillError::Step(StepError::ReplayOverrun { actual }) => {
-                    tracing::error!(target: telemetry::NONDETERMINISM, %actual, overrun = true);
+                SkillError::Step(StepError::ReplayOverrun { actual, kind }) => {
+                    tracing::error!(
+                        target: telemetry::NONDETERMINISM,
+                        %actual, %kind, overrun = true,
+                    );
                     meter.count(metrics::DIVERGENCES, "");
                 }
                 SkillError::Step(StepError::Undecidable { key, detail, .. }) => {

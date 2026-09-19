@@ -125,15 +125,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/journal/replay.rs",
         "resume_refuses_a_journal_written_by_different_code",
         "a recomputed effect key that differs from history is accepted",
-        """        if *expected != recomputed {
+        """        if entry.key != recomputed {
             return Err(StepError::NonDeterminism {
-                seq: *seq,
-                expected: *expected,
+                seq: entry.seq,
+                expected: entry.key,
                 actual: recomputed,
+                detail: entry.diverged_from(asked, attempt),
             });
         }
         self.pos += 1;""",
-        """        let _ = expected;
+        """        let _ = (asked, attempt);
         self.pos += 1;""",
     ),
     # ── Retry safety ────────────────────────────────────────────────────────
@@ -346,10 +347,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "changing_release_evidence_is_replay_divergence",
         "strict replay accepts a release with different scope or evidence from history",
         """        if self.mode.is_replaying() {
-            match self.cursor.next(key)? {
+            match self.cursor.next(key, &descriptor, 1)? {
                 Some(EffectReplay::Done { .. }) => return Ok(released),""",
         """        if false {
-            match self.cursor.next(key)? {
+            match self.cursor.next(key, &descriptor, 1)? {
                 Some(EffectReplay::Done { .. }) => return Ok(released),""",
     ),
     "SinkViaEffect": (
@@ -1142,7 +1143,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                 if let Some(pos) = self
                     .effects
                     .iter()
-                    .rposition(|(k, _, r)| *k == key && matches!(r, EffectReplay::Refused { .. }))
+                    .rposition(|e| e.key == key && matches!(e.replay, EffectReplay::Refused { .. }))
                 {
                     self.effects.remove(pos);
                 }
@@ -2066,9 +2067,11 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "history, which the one surface that pages then truncates — so the "
         "answers are byte-identical and the only difference is that every page "
         "of a long run costs the length of the run",
-        """                .map_err(|e| be(&e))?
+        """                .range((key.as_str(), from)..=(key.as_str(), u64::MAX))
+                .map_err(|e| be(&e))?
                 .take(limit)""",
-        """                .map_err(|e| be(&e))?
+        """                .range((key.as_str(), from)..=(key.as_str(), u64::MAX))
+                .map_err(|e| be(&e))?
                 .take(usize::MAX)""",
     ),
     "ARecordArrivesWithoutItsEnvelope": (
@@ -6635,10 +6638,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         RUN_HISTORY,
         RUN_LIST,
         RUN_LIVE,
+        RUN_WAITING,
+        ATTENTION,
         RUN_CANCEL,""",
         """        RUN_READ,
         RUN_HISTORY,
         RUN_LIVE,
+        RUN_WAITING,
+        ATTENTION,
         RUN_CANCEL,""",
     ),
     "EscalatedCasesAreNotListable": (
@@ -7904,10 +7911,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "fallback keeps every other test green",
         """                "metadata": {
                     "skill": capability,
-                    EXTENSION_URI: Value::Object(governance),
+                    EXT_CALLER_CONTEXT: Value::Object(governance),
                 }""",
         """                "metadata": {
-                    EXTENSION_URI: Value::Object(governance),
+                    EXT_CALLER_CONTEXT: Value::Object(governance),
                 }""",
     ),
     "ALegacyResourceNotFoundIsInDoubt": (
@@ -8095,10 +8102,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "a terminal record overwrites the slot rather than adding to it, so a "
         "reconciled attempt replays at the probe's figure alone and the run "
         "stops somewhere its own history never did",
-        """            let carried = slot.2.spend();
-            slot.2 = state;
-            slot.2.add_spend(carried);""",
-        """            slot.2 = state;""",
+        """            let carried = slot.replay.spend();
+            slot.replay = state;
+            slot.replay.add_spend(carried);""",
+        """            slot.replay = state;""",
     ),
     "AWideReadySetIsDispatchedWhole": (
         "src/runtime/executor.rs",
@@ -8328,6 +8335,180 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                 seq: 0,
                 detail: format!("record {kind} is v{version}"),
             }),""",
+    ),
+    "AnExportVerdictHidesItsOwnWidth": (
+        "src/export.rs",
+        "a_framing_member_this_build_does_not_know_bounds_the_verdict",
+        "a framing line written by a later build carries members this reader "
+        "passes over in silence, so the report says the file is sound without "
+        "saying it read part of it — on the artifact handed to somebody with no "
+        "other copy",
+        """        if let Some(kind) = value.get("kind").and_then(Value::as_str) {
+            note_unknown_members(kind, &value, &mut report);
+        }""",
+        """        if false {
+            note_unknown_members("", &value, &mut report);
+        }""",
+    ),
+    "ADrillAssertsACauseItCannotEstablish": (
+        "src/drill.rs",
+        "a_header_this_build_cannot_parse_names_both_causes",
+        "a sealed header another build wrote is reported as loss or tampering, "
+        "so a drill pages somebody to hunt a fault while the remedy is which "
+        "binary is running — on the report an auditor reads to decide whether "
+        "erasure worked",
+        """        Some(Err(e @ KeyError::UnreadableHeader { .. })) => report.findings.push(format!(""",
+        """        Some(Err(e @ KeyError::Destroyed { .. })) if false => report.findings.push(format!(""",
+    ),
+    "ASealedHeaderTakesUnknownMembers": (
+        "src/keyring/mod.rs",
+        "a_header_member_this_build_does_not_know_is_refused",
+        "an envelope's header is read with members this build never saw taken "
+        "silently off the floor, so a data key is unwrapped under parameters "
+        "another build wrote down — on the one format whose misreading decides "
+        "whether data is still readable",
+        """#[serde(deny_unknown_fields)]
+pub struct WrappedKey {""",
+        """pub struct WrappedKey {""",
+    ),
+    "AMissingEffectIsOnlyADigest": (
+        "src/journal/replay.rs",
+        "strict_replay_rejects_a_build_that_does_something_different",
+        "a strict pass that finds the record holds an effect this build never "
+        "asked for names it by key alone, so an operator hunting a missing call "
+        "is handed a digest and sent to read the journal by hand",
+        """            Some(kind) => write!(f, "`{kind}` ({})", self.key),""",
+        """            Some(_) => write!(f, "{}", self.key),""",
+    ),
+    "AnOverrunIsOnlyADigest": (
+        "src/core/error.rs",
+        "strict_replay_rejects_a_build_that_does_more_than_the_record",
+        "a build that runs past the end of its own history reports the key of "
+        "the call it made and not the call, so the finding names nothing the "
+        "developer who added it would recognise",
+        """        "replay overrun: journal is exhausted but the run requested `{kind}` ({actual}) — \\""",
+        """        "replay overrun: journal is exhausted but the run requested {actual}{kind:.0} — \\""",
+    ),
+    "AnEditedDeclarationResumesAnyway": (
+        "src/runtime/executor.rs",
+        "an_edited_declaration_is_refused_before_the_resume_replays",
+        "a run admitted under one declaration resumes under an edited one, so "
+        "the ceilings, tool grants and prompt its journal was written against "
+        "are not the ones its live tail dispatches under — and the change "
+        "surfaces later as two differing digests, if at all",
+        """        if configured != recorded.digest {""",
+        """        if false && configured != recorded.digest {""",
+    ),
+    "AnAttentionRollUpCallsSilenceHealth": (
+        "src/runtime/attention.rs",
+        "attention_names_each_condition_and_what_it_could_not_check",
+        "a backlog this plane has no store for is left out of the answer "
+        "instead of being named as unchecked, so a plane that could not look "
+        "and a plane that found nothing return the same empty list — which is "
+        "the one reading an operator must never be given",
+        """            None => out.not_checked.push(
+                "obligations — this plane holds no case store, so whether any went \\
+                 unaccounted for was not established",
+            ),""",
+        """            None => {}""",
+    ),
+    "AnUnexpiredWaitIsAFinding": (
+        "src/runtime/attention.rs",
+        "a_wait_needs_a_person_only_once_its_instant_has_passed",
+        "every waiting run is reported as needing a person, expired or not — so "
+        "scheduling something for next Tuesday pages somebody every day until "
+        "Tuesday, and a roll-up that cries wolf is one people stop reading",
+        """            .filter(|w| w.reason.until() <= at)""",
+        """            .filter(|w| w.reason.until() >= crate::core::Timestamp::UNIX_EPOCH)""",
+    ),
+    "AnAuthOracleIsAccepted": (
+        "src/testkit/conformance_auth.rs",
+        "the_auth_battery_rejects_an_oracle",
+        "the authenticator battery stops separating a refused credential from "
+        "an absent one, so a deployment whose implementation answers `Missing` "
+        "for a token it looked at passes it — and that bit tells a prober the "
+        "token was the right shape",
+        """            Err(AuthError::Rejected) => {}
+            Err(AuthError::Missing) => r.record(""",
+        """            Err(AuthError::Missing | AuthError::Rejected) => {}
+            #[allow(unreachable_patterns)]
+            Err(AuthError::Missing) => r.record(""",
+    ),
+    "AWaitingRunIsNeverListed": (
+        "src/store/redb.rs",
+        "a_restored_event_wait_is_subscribed_by_nothing_until_the_run_is_resumed",
+        "a run whose last record is a suspension is not indexed as waiting, so "
+        "the recovery runbook's last step — re-arm the suspended runs — names a "
+        "verb with no argument an operator can obtain, and after a restore "
+        "those runs lie inert with nothing pointing at them",
+        """                        crate::journal::RecordKind::RunSuspended { reason } => Some(reason.clone()),""",
+        """                        crate::journal::RecordKind::RunSuspended { .. } => None,""",
+    ),
+    "AResumedRunStaysOnTheWaitingList": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the waiting index only ever gains rows, so a run that suspended once "
+        "is listed as waiting forever — an oldest-first page whose head is "
+        "permanent, which is the shape that makes a backlog unworkable rather "
+        "than merely wrong",
+        """                    if let Some(prior) = at
+                        .remove((tenant.as_str(), key.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map(|v| v.value())
+                    {""",
+        """                    if let Some(prior) = at
+                        .get((tenant.as_str(), key.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map(|v| v.value())
+                        .filter(|_| waiting.is_some())
+                    {""",
+    ),
+    "ADivergenceIsTwoDigests": (
+        "src/journal/replay.rs",
+        "a_divergence_names_the_call_that_moved",
+        "a run quarantined for non-determinism reports two effect keys and "
+        "nothing else, so the developer who changed the code is handed a pair "
+        "of hashes — and the reason is journaled, which makes the unhelpful "
+        "version the permanent one",
+        """                detail: entry.diverged_from(asked, attempt),""",
+        """                detail: String::new(),""",
+    ),
+    "ADivergenceQuotesASealedArgument": (
+        "src/journal/replay.rs",
+        "a_divergence_says_which_of_the_three_things_moved",
+        "the sentence a divergence journals into a run's conclusion is "
+        "composed from the effect's arguments, which are a sealed field — so a "
+        "plaintext copy of caller data lands where an erasure cannot reach it",
+        """        format!(
+            "both perform `{}` at attempt {}, so the arguments differ — they are sealed with \\
+             the record, so comparing them needs a reader holding the key",
+            what.kind, what.attempt
+        )""",
+        """        format!(
+            "both perform `{}` at attempt {}, with arguments {} rather than {}",
+            what.kind, what.attempt, asked.args, asked.args
+        )""",
+    ),
+    "AShapeSkewIsAnEncodingFault": (
+        "src/journal/record.rs",
+        "a_shape_this_build_cannot_read_at_its_own_version_is_a_build_skew",
+        "the only skew a pre-freeze deployment can meet — a shape that moved "
+        "without the version moving — reaches an operator as a serde message "
+        "about a column number, with nothing saying the bytes are intact or "
+        "which binary to run",
+        """        Some((kind, version)) => StoreError::UnreadableRecordShape {""",
+        """        Some(_) => StoreError::Encoding(parse),
+        #[allow(unreachable_patterns)]
+        Some((kind, version)) => StoreError::UnreadableRecordShape {""",
+    ),
+    "AnOldReaderCallsAnExportTampered": (
+        "src/export.rs",
+        "a_record_from_a_newer_build_is_not_reported_as_tampering",
+        "an export written one hard cut ahead reads as a damaged file to the "
+        "one audience that has no other copy — the build skew is reported in "
+        "the vocabulary of an edit, record by record",
+        """        crate::core::StoreError::UnreadableRecordShape { .. } => {""",
+        """        crate::core::StoreError::Corrupt { .. } => {""",
     ),
     "AnUndeclaredFieldIsDroppedOnTheFloor": (
         "src/journal/record.rs",

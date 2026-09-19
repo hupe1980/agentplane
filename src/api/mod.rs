@@ -237,6 +237,11 @@ pub trait Authenticator: Send + Sync + std::fmt::Debug {
 /// Why a request has no usable identity.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    /// Nothing usable was presented: no header at all, or a scheme this
+    /// server does not speak. A credential this server *did* look at and
+    /// refuse is [`Rejected`](Self::Rejected) whatever was wrong with it —
+    /// answering `Missing` for one tells whoever is probing that their token
+    /// was at least the right shape.
     #[error("no credentials were presented")]
     Missing,
     /// Deliberately does not say *why* the credential was rejected: expired,
@@ -920,6 +925,8 @@ impl Api {
         let router = Router::new()
             .route("/runs", get(runs_by_outcome))
             .route("/runs/live", get(live_runs))
+            .route("/runs/waiting", get(waiting_runs))
+            .route("/attention", get(attention))
             .route("/runs/{run}", get(run_view))
             .route("/runs/{run}/history", get(run_history))
             .route("/runs/{run}/cancel", post(cancel_run))
@@ -1035,6 +1042,25 @@ pub mod action {
     /// whether they may enumerate what is in flight, which on a busy plane is a
     /// far better map of what a tenant is doing.
     pub const RUN_LIVE: &str = "api:run.live";
+    /// Enumerating the runs that are waiting.
+    ///
+    /// A third set, and its own verb for the reason [`RUN_LIVE`] is separate
+    /// from [`RUN_LIST`]: a suspended run has concluded nothing, so no outcome
+    /// listing holds it, and it gave its admission slot back, so the live
+    /// listing does not either. Answering *what is this tenant waiting on* is
+    /// also the most revealing of the three — every pending approval, every
+    /// timer, every correlation key somebody is expecting — so a deployment
+    /// that granted the on-call rota a view of finished work has said nothing
+    /// about whether they may read it.
+    pub const RUN_WAITING: &str = "api:run.waiting";
+    /// Asking whether anything on this plane needs a person.
+    ///
+    /// The roll-up over the backlogs, so its own verb: it answers across every
+    /// one of them at once, which is strictly more than any single listing's
+    /// grant. A deployment that let an on-call rota see quarantines has not
+    /// thereby said they may enumerate every overdue approval and every
+    /// unaccounted obligation in one request.
+    pub const ATTENTION: &str = "api:attention";
     pub const RUN_CANCEL: &str = "api:run.cancel";
     /// Handing a quarantined run back to be judged again.
     ///
@@ -1149,6 +1175,8 @@ pub mod action {
         RUN_HISTORY,
         RUN_LIST,
         RUN_LIVE,
+        RUN_WAITING,
+        ATTENTION,
         RUN_CANCEL,
         RUN_REOPEN,
         RUN_ABANDON,
@@ -1689,6 +1717,74 @@ async fn live_runs(
             }))
             .collect::<Vec<_>>(),
         "truncated": truncated,
+    })))
+}
+
+/// What is waiting, and for what.
+///
+/// The listing the recovery runbook's last step needs: after a restore the
+/// timers and subscriptions are gone — an export carries neither — so the runs
+/// that were waiting are inert, and re-arming each one is what repairs its
+/// waits. Answered from the journal rather than from the registrations,
+/// precisely because the registrations are what is missing.
+///
+/// **Soonest due first**, so the runs whose instant has already passed sort to
+/// the front. An ascending page is legitimate here because resuming a run
+/// removes it from the listing.
+async fn waiting_runs(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::RUN_WAITING, "*").await?;
+    let mut found = s
+        .plane
+        .waiting_runs(api.limit.saturating_add(1))
+        .await
+        .map_err(|_| store_failed())?;
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
+
+    Ok(Json(json!({
+        "runs": found
+            .iter()
+            .map(|w| json!({
+                "run": w.run.to_string(),
+                // The reason serialises as its own tagged shape, so a caller
+                // reads `reason` to tell a timer from a correlation — the two
+                // fail differently, and an instant that has not arrived is the
+                // system working.
+                "waiting_for": w.reason,
+                "until": w.reason.until().to_string(),
+            }))
+            .collect::<Vec<_>>(),
+        "truncated": truncated,
+    })))
+}
+
+/// Does anything on this plane need a person right now, and which thing.
+///
+/// The one request a dashboard makes. Each condition is **named** rather than
+/// summed, because an operator acts on which one — three quarantines and one
+/// dead letter is not "four" of anything — and `not_checked` says which
+/// backlogs this plane has no store for, so an empty answer from a plane that
+/// looked and one that could not are different sentences.
+async fn attention(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::ATTENTION, "*").await?;
+    let found = s
+        .plane
+        .attention(now_for_account(), api.limit)
+        .await
+        .map_err(|_| store_failed())?;
+    Ok(Json(json!({
+        "needs_attention": found.any(),
+        "conditions": found
+            .conditions
+            .iter()
+            .map(|c| json!({
+                "condition": c.kind,
+                "found": c.found,
+                "at_least": c.at_least,
+                "remedy": c.remedy,
+            }))
+            .collect::<Vec<_>>(),
+        "not_checked": found.not_checked,
     })))
 }
 

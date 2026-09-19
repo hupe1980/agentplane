@@ -107,15 +107,27 @@ impl Endpoint {
     }
 }
 
-/// The A2A extension URI under which this runtime carries its own metadata.
+/// The A2A extension URI under which a caller states its own account of a
+/// request: the capability it asked for, and the provenance of the values in
+/// it.
 ///
-/// Declared rather than smuggled into free-form fields: A2A's extension
-/// mechanism exists so a peer can say what it understood, and a peer that does
-/// not understand this one still gets a well-formed message.
+/// Declared rather than smuggled into a free-form field, so a peer that does
+/// not understand it still gets a well-formed message — and under a domain the
+/// project controls, because a peer may fetch it.
 ///
-/// Under a domain the project controls: a peer may fetch this URI, so an
-/// unregistered domain is both a collision risk and a broken link.
-pub const EXTENSION_URI: &str = "https://hupe1980.github.io/agentplane/a2a/delegation/v1";
+/// **"caller" is load-bearing.** This is the sender's account of its own
+/// request and a receiver may not read it as authority; a delegation chain in
+/// particular is not here, because a chain read from a body is a claim about
+/// itself. The hop is checked against the credential instead
+/// ([`peers`](crate::peers)).
+///
+/// **"context" is a category, deliberately.** Naming a published identifier
+/// after a *member* makes it a promise about the block's contents, and the
+/// name is then wrong in the place nobody re-reads. Shaped like the card's
+/// extensions — `…/a2a/ext/<name>/v1` — and held there by
+/// `every_a2a_extension_uri_is_one_of_the_family`.
+pub const EXT_CALLER_CONTEXT: &str =
+    "https://hupe1980.github.io/agentplane/a2a/ext/caller-context/v1";
 
 /// The protocol version this client speaks.
 ///
@@ -252,7 +264,7 @@ impl A2aClient {
                 "role": "ROLE_USER",
                 "messageId": message_id,
                 "parts": [{ "data": payload, "mediaType": "application/json" }],
-                "extensions": [EXTENSION_URI],
+                "extensions": [EXT_CALLER_CONTEXT],
                 // `skill` is where dispatch is *named*. A2A has no
                 // skill-selection field of its own, so a receiver that refuses
                 // to infer the capability from untrusted text — this crate's
@@ -265,7 +277,7 @@ impl A2aClient {
                 // ignores the key — metadata is opaque to the protocol.
                 "metadata": {
                     "skill": capability,
-                    EXTENSION_URI: Value::Object(governance),
+                    EXT_CALLER_CONTEXT: Value::Object(governance),
                 }
             }),
         );
@@ -451,7 +463,7 @@ impl A2aClient {
         let mut request = client
             .post(&self.endpoint.url)
             .header("A2A-Version", PROTOCOL_VERSION)
-            .header("A2A-Extensions", EXTENSION_URI)
+            .header("A2A-Extensions", EXT_CALLER_CONTEXT)
             .json(body);
         if let Some(credential) = credential {
             request = request.bearer_auth(credential.expose());

@@ -47,6 +47,25 @@ echo "$out" | grep -q '"summary"' || {
     echo "FAIL: the declared output shape did not come back: $out"; exit 1; }
 echo "ok: $out"
 
+# **What a first run prints is part of the product.** Metrics carry their own
+# `tracing` target so a subscriber can filter them out, and a one-shot verb has
+# nobody collecting them — two metric events per run bury the two lines the run
+# is about, on the first command the guide tells a reader to type. `RUST_LOG`
+# still reaches them, which is the half that keeps this a default rather than a
+# removal.
+echo "── a one-shot run prints its answer, not a metric stream ──"
+noise="$("${BIN[@]}" run "$YAML" --input '{"ticket":"printer on fire"}' 2>&1 >/dev/null \
+    | grep -c 'agentplane.metric' || true)"
+[ "$noise" = "0" ] || {
+    echo "FAIL: $noise metric events on a one-shot run — the guide shows three lines"
+    exit 1; }
+asked="$(RUST_LOG=agentplane=info "${BIN[@]}" run "$YAML" --input '{"ticket":"x"}' 2>&1 >/dev/null \
+    | grep -c 'agentplane.metric' || true)"
+[ "$asked" != "0" ] || {
+    echo "FAIL: RUST_LOG cannot reach the metric stream, so this is a removal"
+    exit 1; }
+echo "ok: quiet by default, reachable on request"
+
 echo "── a manifest with no execution block is refused ──"
 tmp="$(mktemp -t agentplane-XXXX).yaml"
 trap 'rm -f "$tmp"' EXIT

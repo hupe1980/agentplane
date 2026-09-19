@@ -16,7 +16,105 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.40.0] — unreleased
+## [0.41.0] — unreleased
+
+### Added
+
+- **`testkit::conformance_auth` — a contract for the `Authenticator` a
+  deployment writes.** An empty request must be `Missing`, not an anonymous
+  caller; a credential presented and refused must be `Rejected`, since
+  `Missing` for it tells a prober the token was the right shape; an accepted
+  request must name the actor you say it does. The outbound credential seams
+  get none — audience is enforced at the boundary, not per implementation.
+
+- **`Runtime::attention` — does anything on this plane need a person right
+  now, and which thing.** One call over every backlog with a listing, plus the
+  open conclusions whose answer is a person's. Conditions are named rather than
+  summed, each with its remedy, and a backlog this plane has no store for is
+  reported as `not_checked`. `agentplane attention` exits non-zero when
+  something does; `GET /attention` under `api:attention`.
+
+- **`JournalStore::waiting_runs` — the runs that are waiting, and for what.**
+  The listing the recovery runbook's last step needs, soonest due first. Derived
+  from the journal rather than from the timer and subscription tables, so it
+  still answers on a plane restored from an export, which carries neither.
+  `agentplane waiting` and `GET /runs/waiting` (`api:run.waiting`) →
+  [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+- **`StoreError::UnreadableRecordShape` — a record at the version this build
+  writes whose shape it cannot parse.** Before the freeze that is the only build
+  skew there is, and it arrived as a bare serde message. The refusal now says
+  the bytes hash as written and another build produced them.
+
+- **`KeyError::UnreadableHeader` — a sealed envelope at a readable version whose
+  header will not parse.** Damage or another build's shape, and nothing has
+  authenticated the bytes yet. `drill` reports both causes and the step that
+  separates them.
+
+- **A resume under an edited declaration is refused, by name.** The manifest
+  digest is recorded at admission, so `Mode::Resume` compares it and raises
+  `RuntimeError::DeclarationChanged` before replaying — instead of letting the
+  change surface later as two differing effect keys. Coded skills are unaffected:
+  this crate cannot identify an embedder's binary and does not claim to.
+
+### Removed
+
+- **BREAKING: `core::AgentRef`.** A prelude type nothing constructed, nothing
+  read, and whose doc described what `journal::AgentIdentity` actually does. A
+  new guard, `no_public_struct_is_dead`, covers what `dead_code` cannot: a
+  `pub use` makes a dead type reachable API, and the lint goes quiet.
+
+### Changed
+
+- **BREAKING: the A2A message extension is `…/a2a/ext/caller-context/v1`, and
+  the constant is `EXT_CALLER_CONTEXT`.** The old URI named a delegation chain
+  the block deliberately does not carry, and skipped the `ext/` segment its
+  four siblings use →
+  [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+- **BREAKING: every replay finding names the call, not its digest.** A
+  divergence reads *history performed `x` here and this build asks for `y`*; a
+  strict pass that verified less names the effect that went missing. Arguments
+  stay unquoted — they are sealed and a conclusion is not →
+  [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+- **BREAKING: `WrappedKey` refuses unknown members.** A durable format that
+  travels with the payload it sealed; a skipped member would unwrap under
+  parameters this build never saw.
+
+- **`agentplane verify` names framing members it does not know**, in
+  `not_checked` rather than as a finding — *sound* over a file the reader
+  understood part of is a wider verdict than it earned.
+  `tools/verify_export.py` implements the same rule.
+
+### Fixed
+
+- **A one-shot `agentplane` verb prints its answer, not a metric stream.**
+  Metrics carry their own `tracing` target so a subscriber can filter them, and
+  this binary is a subscriber: a first `run` emitted two metric events that
+  buried the two lines the guide shows. `serve` still streams them, and
+  `RUST_LOG` reaches them anywhere.
+
+- **`agentplane verify` no longer calls an export from a newer build tampered.**
+  Every unreadable record produced *it was edited after it was sealed*, and one
+  of them stopped the block's head advancing, so the records after it were
+  reported unlinked and missing too.
+
+### Assurance
+
+- **Two questions an adopter had to infer are answered in writing.** Where a
+  content classifier hangs — behind an effect, producing a label, never on the
+  policy seam, which is total and pure and journals no permit — is stated on
+  `PolicyEngine` itself and on the security page. And the statutory mapping is
+  the guide site's alone, downstream of the mechanisms: a change to a mechanism
+  a row cites obliges re-reading that row.
+
+- **The migration and rollback procedure is rehearsed, across two released
+  builds.** Everything above came out of it. It also settles what the procedure
+  means today: a hard cut is unreadable in both directions, so the rollback
+  window before the freeze is zero and a shape change is a fresh journal.
+
+## [0.40.0] — 2026-09-18
 
 ### Added
 

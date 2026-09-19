@@ -1,5 +1,6 @@
 //! Execution: the step context, the effect protocol, and the executor.
 
+mod attention;
 pub mod batch;
 mod build_error;
 mod ctx;
@@ -15,6 +16,7 @@ pub mod metrics;
 mod sweeper;
 pub mod telemetry;
 
+pub use attention::{Attention, Condition};
 pub use batch::BatchSpec;
 pub use build_error::BuildError;
 pub use ctx::{BuildsEffect, Mode, StepCtx};

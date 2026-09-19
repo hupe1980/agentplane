@@ -25,6 +25,80 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## Every replay finding names the call, not its digest
+
+**Affected:** anyone matching on `StepError::NonDeterminism` or
+`ReplayOverrun`; anyone calling `StepCursor::next` or `StepCursor::
+first_unconsumed`; anyone reading `EffectReplay::Orphan`'s descriptor.
+
+**Why.** A quarantined run reported *expected `ek:9f2c…`, recomputed
+`ek:41ab…`*. The party who has to act is whoever changed the code, and a digest
+is not a name to them — and the reason is journaled into the run's conclusion,
+so the unhelpful version was also the permanent one.
+
+**What to do.** `NonDeterminism` gains `detail` and `ReplayOverrun` gains
+`kind`; add the fields or match with `..`. `StepCursor::next` takes the
+descriptor being asked for and the attempt. `first_unconsumed` returns
+`Unconsumed`, which carries the call beside the key. `EffectReplay::Orphan`
+drops the descriptor nothing read — the kind is on the entry instead. Arguments
+are still not quoted anywhere: they are sealed and a conclusion is not.
+
+---
+
+## A resume is refused when the declaration changed, and `JournalStore` answers what is waiting
+
+**Affected:** anyone implementing `JournalStore`; anyone resuming a run whose
+manifest was edited.
+
+**Why.** The bundle identity gated a resume and the *declaration* did not, so an
+edited manifest ran a different program over the first one's journal and
+surfaced later, if at all, as two differing effect keys. Separately, the
+recovery runbook's last step — re-arm the suspended runs — named no listing that
+could produce them.
+
+**What to do.** Implement `JournalStore::waiting_runs`, returning the runs whose
+**last** record is a suspension, soonest `until` first, and removing a run when
+it makes any progress; the store conformance battery checks both halves. A
+resume under a different manifest digest now raises
+`RuntimeError::DeclarationChanged` before replaying — resume under the revision
+that wrote the journal, or abandon the run. Coded skills are unaffected: this
+crate cannot identify an embedder's binary and does not claim to.
+
+---
+
+## The A2A message extension is `…/a2a/ext/caller-context/v1`
+
+**Affected:** any peer negotiating on the old URI; anyone reading
+`peers::a2a::EXTENSION_URI`.
+
+**Why.** The URI ended in `/delegation/v1` and the block under it carries no
+delegation chain — deliberately, since a chain read from a body is the sender's
+claim about itself. So the one string an implementer reads before the prose
+named the thing it does not hold. It also skipped the `ext/` segment its four
+siblings on the card use.
+
+**What to do.** Read `peers::a2a::EXT_CALLER_CONTEXT`. The new name is a
+*category* rather than a member, so a member arriving or leaving cannot make it
+wrong again, and a guard holds every extension URI to the family shape.
+
+---
+
+## `WrappedKey` refuses unknown members, and `core::AgentRef` is gone
+
+**Affected:** anyone whose key ring writes extra header members; anyone naming
+`core::AgentRef`.
+
+**Why.** The sealed envelope is a durable format that travels with the payload
+it sealed, so a reader that skipped a member would unwrap under parameters it
+never saw — the rule the record vocabulary already followed. `AgentRef` was a
+prelude type nothing constructed, documenting what `journal::AgentIdentity`
+actually does.
+
+**What to do.** Keep the envelope header to `scope`, `wrapped_by` and `sealed`.
+Use `journal::AgentIdentity` for a pinned agent reference.
+
+---
+
 ## An MCP client speaks the revisions it is tested on, not the ones the SDK parses
 
 **Affected:** anyone reading `McpClient::KNOWN_VERSIONS`; anyone whose
@@ -1584,8 +1658,6 @@ contention, 500 for an outage. `POST /runs/{id}/cancel` likewise answers 404
 for an unknown run and 500 for a store outage (both were 409). `ClaimError`
 lives in `core` beside `Task`; the `agentplane::case::ClaimError` path
 re-exports it, so imports hold.
-
-
 
 **Affected:** custom `MemoryStore` implementations; anything constructing a
 `SemanticQuery` by hand.

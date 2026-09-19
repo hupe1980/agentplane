@@ -122,7 +122,15 @@ impl Debug for DataKey {
 /// travels *with* the payload it sealed. A backup therefore contains everything
 /// needed to restore and nothing needed to read: the wrapping key stayed in the
 /// service, and destroying it is what makes the backup unreadable.
+///
+/// **Unknown members are refused**, the rule every durable format here is held
+/// to. This one travels with the payload it sealed, so a reader that skipped a
+/// member it did not know would unwrap under parameters somebody else wrote
+/// down and this build never saw — and the wrapping key is the one thing an
+/// erasure destroys, so guessing at its header is guessing about whether data
+/// is still readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WrappedKey {
     /// What this key protects: a case, a tenant, whatever the deployment erases
     /// as a unit. Erasure destroys a scope, so the scope *is* the erasure unit.
@@ -212,6 +220,25 @@ pub enum KeyError {
          {version}"
     )]
     UnknownFormat { version: u8, supported: u8 },
+
+    /// The envelope's version is one this build reads, and its header is not.
+    ///
+    /// **Two causes, and this build cannot separate them.** The header is
+    /// parsed before anything authenticates — the tag that would establish the
+    /// bytes is inside the payload, and reaching it needs the key this header
+    /// names. So these bytes are either damaged in place or written by a build
+    /// whose header shape differs, which before the format freeze is what a
+    /// hard cut produces.
+    ///
+    /// Distinct from [`Refused`](Self::Refused) so that a report can say both
+    /// rather than pick one. Naming it tampering sends somebody to hunt a fault
+    /// that may not exist; naming it a skew tells them to change binaries when
+    /// the data may be gone. The honest answer is the one that fits in neither
+    /// arm, so it has its own.
+    #[error(
+        "this sealed envelope is a format version this build reads and its header is not one          it parses ({detail}) — either the bytes were damaged or another build wrote them,          and nothing here can tell which"
+    )]
+    UnreadableHeader { detail: String },
 
     /// The key ring could not be reached. May succeed later.
     #[error("the key ring is unavailable: {0}")]

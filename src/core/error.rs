@@ -168,6 +168,31 @@ pub enum RuntimeError {
         configured: Option<crate::core::Digest>,
     },
 
+    /// An open run would continue under a different **declaration** than the
+    /// one it was admitted under.
+    ///
+    /// The bundle above covers who may authorize; this covers what the agent
+    /// *is*. A declarative agent's behaviour is its manifest — the prompt, the
+    /// tool grants, the model, the ceilings — so editing it and resuming runs
+    /// one program over another's journal. Refused before anything replays,
+    /// which is the difference between a named remedy and discovering the same
+    /// fact as a key mismatch several effects in.
+    ///
+    /// Reported only where both sides name a declaration. A coded skill's
+    /// behaviour is the embedder's binary, which this crate cannot identify and
+    /// does not claim to; there, divergence is the answer, later and less
+    /// precisely.
+    #[error(
+        "the declaration for `{agent}` changed while resuming an open run: admitted under \
+         {recorded}, and this plane holds {configured} — resume under the revision that \
+         wrote the journal, or abandon the run"
+    )]
+    DeclarationChanged {
+        agent: String,
+        recorded: crate::core::Digest,
+        configured: crate::core::Digest,
+    },
+
     /// The history was written under a different canonicalization rule.
     ///
     /// Not a divergence, and reporting it as one is the defect this exists to
@@ -746,11 +771,19 @@ pub enum StepError {
     Unreproducible { what: String, detail: String },
 
     /// Surfaced when replay finds the recorded run took a different path.
-    #[error("non-determinism at seq {seq}: expected {expected}, recomputed {actual}")]
+    ///
+    /// **`detail` is the field that makes this actionable**, and the two keys
+    /// are not. A digest pair says two calls differ and nothing about how; the
+    /// party who has to act is whoever changed the code, and what they need is
+    /// which call moved. It is composed from the fields that are *clear* on the
+    /// record — an effect's kind and its attempt — because this message is
+    /// journaled into the run's conclusion, which is not a sealed field.
+    #[error("non-determinism at seq {seq}: {detail} (history {expected}, this build {actual})")]
     NonDeterminism {
         seq: Seq,
         expected: EffectKey,
         actual: EffectKey,
+        detail: String,
     },
 
     /// A limit stopped the run before it spent more.
@@ -815,10 +848,10 @@ pub enum StepError {
     /// ordered key comparison alone cannot see, because there is nothing left to
     /// compare against.
     #[error(
-        "replay overrun: journal is exhausted but the run requested {actual} — \
+        "replay overrun: journal is exhausted but the run requested `{kind}` ({actual}) — \
          this build performs more effects than the recorded one"
     )]
-    ReplayOverrun { actual: EffectKey },
+    ReplayOverrun { actual: EffectKey, kind: String },
 }
 
 /// Authorization failure.
@@ -1323,6 +1356,34 @@ pub enum StoreError {
         kind: String,
         version: u16,
         reads: u16,
+    },
+
+    /// A record at the version this build writes whose shape this build does
+    /// not parse.
+    ///
+    /// **Also a build skew, and before the format freeze it is the only one
+    /// that can occur.** A shape change is a hard cut here and a hard cut does
+    /// not bump `v` ([`RecordKind::version`](crate::journal::RecordKind::version)
+    /// answers 1 for every kind), so the version a reader compares is the same
+    /// on both sides of the change and
+    /// [`UnknownRecordVersion`](Self::UnknownRecordVersion) never fires. What
+    /// reaches a reader instead is a field it has never heard of, or one whose
+    /// type moved.
+    ///
+    /// It is not damage, and the proof is the order the read happens in: the
+    /// stored hash is verified before the body is parsed, so a parse that fails
+    /// afterwards is a statement about the *reader*. Reporting it as an edited
+    /// record would spend the alarm [`Corrupt`](Self::Corrupt) exists to keep.
+    #[error(
+        "record {kind} is v{version}, the version this build writes, and its shape does not \
+         parse here: {detail}. The bytes are intact and hash as written, so another build \
+         wrote this journal — run the build that wrote it, or read this history from its \
+         export"
+    )]
+    UnreadableRecordShape {
+        kind: String,
+        version: u16,
+        detail: String,
     },
 
     #[error(transparent)]

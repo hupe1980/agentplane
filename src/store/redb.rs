@@ -31,7 +31,7 @@ use async_trait::async_trait;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::core::{Digest, EffectKey, Epoch, RunId, Seq, StoreError};
-use crate::journal::{Append, Cancellation, Head, JournalStore, Lease, Record};
+use crate::journal::{Append, Cancellation, Head, JournalStore, Lease, Record, WaitingRun};
 
 /// `(run_id, seq) -> encoded record`. Ordered by construction, so a run's
 /// history is a range scan and its head is the last entry of that range.
@@ -118,6 +118,27 @@ const RUN_ACTIVITY: TableDefinition<(&str, u64, &str), ()> = TableDefinition::ne
 /// `(tenant, run_id) -> updated_at`, for replacing the activity index row.
 const RUN_LAST_ACTIVITY: TableDefinition<(&str, &str), u64> =
     TableDefinition::new("run_last_activity");
+
+/// `(tenant, until, run_key) -> reason`: the runs whose last record is a
+/// suspension, soonest-due first.
+///
+/// **Derived from the chain on every append, never appended to.** A run leaves
+/// this table by making any progress at all, which is what keeps an
+/// oldest-first page from stopping dead: the head of it is removed by the verb
+/// an operator came here to run. Scanning history for `RunSuspended` would be
+/// the wrong answer for the opposite reason — every run that ever waited
+/// carries one forever.
+///
+/// Ordered by the instant rather than by insertion, because the actionable
+/// question is *which of these should have moved by now*, and a run whose
+/// `until` is in the past is the one lying inert.
+const RUN_WAITING: TableDefinition<(&str, i64, &str), &str> = TableDefinition::new("run_waiting");
+/// `(tenant, run_key) -> until`, for removing the row above without scanning.
+///
+/// The same reverse-index shape [`RUN_OUTCOME`] uses, and for the same reason: a
+/// run that suspends twice under different instants would otherwise accumulate
+/// two rows, and the stale one would name a wait that is over.
+const RUN_WAITING_AT: TableDefinition<(&str, &str), i64> = TableDefinition::new("run_waiting_at");
 
 /// `log_index -> run_id`, the plane's Merkle log in seal order.
 ///
@@ -229,6 +250,8 @@ impl RedbStore {
             w.open_table(RUN_SEAL).map_err(|e| be(&e))?;
             w.open_table(RUN_BY_OUTCOME).map_err(|e| be(&e))?;
             w.open_table(RUN_OUTCOME).map_err(|e| be(&e))?;
+            w.open_table(RUN_WAITING).map_err(|e| be(&e))?;
+            w.open_table(RUN_WAITING_AT).map_err(|e| be(&e))?;
             w.open_table(SEAL_LOG).map_err(|e| be(&e))?;
             w.open_table(RUN_CANCEL).map_err(|e| be(&e))?;
             w.open_table(COUNTERS).map_err(|e| be(&e))?;
@@ -801,6 +824,10 @@ impl JournalStore for RedbStore {
 
                 let mut head = head_of(&journal, &key)?;
                 let mut sealed = Vec::with_capacity(batch.len());
+                // A run that suspends and then makes any progress has
+                // stopped waiting, and a listing an operator re-arms from must
+                // not still name it.
+                let mut waiting: Option<crate::core::SuspendReason> = None;
 
                 for append in batch {
                     let effect_key = append.effect_key.map(EffectKey::to_hex);
@@ -816,6 +843,13 @@ impl JournalStore for RedbStore {
                             ..
                         } => (None, Some(k.clone())),
                         _ => (None, None),
+                    };
+                    // Cleared and re-set on every record rather than only on a
+                    // suspension: that is what makes the index track the run's
+                    // *last* record instead of accumulating.
+                    waiting = match &body.kind {
+                        crate::journal::RecordKind::RunSuspended { reason } => Some(reason.clone()),
+                        _ => None,
                     };
                     let record = Record::seal_signed(body, head.hash, signer.as_deref())?;
                     let seq = record.seq();
@@ -925,6 +959,33 @@ impl JournalStore for RedbStore {
                     };
                     sealed.push(record);
                 }
+                {
+                    let mut index = w.open_table(RUN_WAITING).map_err(|e| be(&e))?;
+                    let mut at = w.open_table(RUN_WAITING_AT).map_err(|e| be(&e))?;
+                    if let Some(prior) = at
+                        .remove((tenant.as_str(), key.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map(|v| v.value())
+                    {
+                        index
+                            .remove((tenant.as_str(), prior, key.as_str()))
+                            .map_err(|e| be(&e))?;
+                    }
+                    if let Some(reason) = &waiting {
+                        let until = reason.until().unix_timestamp();
+                        let encoded = String::from_utf8(
+                            crate::core::canon::to_bytes(reason)
+                                .map_err(|e| StoreError::Backend(e.to_string()))?,
+                        )
+                        .map_err(|e| StoreError::Backend(e.to_string()))?;
+                        index
+                            .insert((tenant.as_str(), until, key.as_str()), encoded.as_str())
+                            .map_err(|e| be(&e))?;
+                        at.insert((tenant.as_str(), key.as_str()), until)
+                            .map_err(|e| be(&e))?;
+                    }
+                }
+
                 let updated = now_secs();
                 let mut activity = w.open_table(RUN_ACTIVITY).map_err(|e| be(&e))?;
                 let mut last = w.open_table(RUN_LAST_ACTIVITY).map_err(|e| be(&e))?;
@@ -1176,6 +1237,44 @@ impl JournalStore for RedbStore {
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn waiting_runs(&self, limit: usize) -> Result<Vec<WaitingRun>, StoreError> {
+        let tenant = self.tenant.to_string();
+        let prefix = format!("{}/", self.tenant);
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let index = r.open_table(RUN_WAITING).map_err(|e| be(&e))?;
+            let mut out = Vec::new();
+            // A range over this tenant's slice in key order, which is `until`
+            // order — no sort, and no read of a row past the page. The index
+            // holds one row per *currently* waiting run rather than one per
+            // suspension ever recorded, so its size is the backlog an operator
+            // is looking at rather than the history.
+            for entry in index
+                .range((tenant.as_str(), i64::MIN, "")..=(tenant.as_str(), i64::MAX, "\u{10FFFF}"))
+                .map_err(|e| be(&e))?
+                .take(limit)
+            {
+                let (k, v) = entry.map_err(|e| be(&e))?;
+                let (_, _, key) = k.value();
+                // Corruption rather than a skip, for the reason
+                // `abandoned_runs` gives: a waiting run dropped from this
+                // listing is one nobody re-arms, and this is its one page.
+                let id = key.strip_prefix(prefix.as_str()).unwrap_or(key);
+                let run = RunId::parse(id).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_waiting holds an unparsable run id '{id}': {e}"),
+                })?;
+                let reason = serde_json::from_str(v.value()).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_waiting holds an unreadable reason for {id}: {e}"),
+                })?;
+                out.push(WaitingRun { run, reason });
+            }
+            Ok(out)
         })
         .await
     }

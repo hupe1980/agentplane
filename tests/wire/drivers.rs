@@ -30,7 +30,7 @@ use agentplane::model::{
     ModelCall, ModelError, ModelId, ModelProvider, ProviderContinuation, ReasoningEffort, Request,
     SchemaMode, ToolDeclaration, ToolExchange,
 };
-use agentplane::peers::a2a::{A2aClient, EXTENSION_URI, Endpoint, PROTOCOL_VERSION};
+use agentplane::peers::a2a::{A2aClient, EXT_CALLER_CONTEXT, Endpoint, PROTOCOL_VERSION};
 use agentplane::peers::{PeerClient, PeerError, PeerId};
 use agentplane::testkit::FakeProvider;
 use axum::Router;
@@ -911,16 +911,16 @@ async fn the_chain_does_not_travel_in_the_message() {
         "A2A 1.0 removed the legacy part discriminator: {body}"
     );
     assert_eq!(
-        msg["extensions"][0], EXTENSION_URI,
+        msg["extensions"][0], EXT_CALLER_CONTEXT,
         "the extension is not declared, so a peer cannot say it understood it"
     );
     assert_eq!(
-        msg["metadata"][EXTENSION_URI]["capability"], "audit.check",
+        msg["metadata"][EXT_CALLER_CONTEXT]["capability"], "audit.check",
         "the extension stopped carrying the request's own metadata, so the \
          absence check below would pass for the wrong reason: {body}"
     );
     assert!(
-        msg["metadata"][EXTENSION_URI]["chain"].is_null(),
+        msg["metadata"][EXT_CALLER_CONTEXT]["chain"].is_null(),
         "the delegation chain is in the message — a receiver cannot verify it, \
          so publishing it invites a peer to authorize on the sender's own claim \
          about its authority: {body}"
@@ -929,7 +929,7 @@ async fn the_chain_does_not_travel_in_the_message() {
     let headers = seen_headers.lock().unwrap();
     let headers = headers.as_ref().expect("the server saw headers");
     assert_eq!(headers["a2a-version"], PROTOCOL_VERSION);
-    assert_eq!(headers["a2a-extensions"], EXTENSION_URI);
+    assert_eq!(headers["a2a-extensions"], EXT_CALLER_CONTEXT);
 }
 
 /// A successful response that violates the `SendMessageResponse` oneof is
@@ -2732,7 +2732,7 @@ async fn a_peer_call_carries_attested_provenance() {
         .expect("the peer answers");
 
     let sent = seen.lock().unwrap().clone().expect("the peer saw a body");
-    let ext = &sent["params"]["message"]["metadata"][EXTENSION_URI];
+    let ext = &sent["params"]["message"]["metadata"][EXT_CALLER_CONTEXT];
     let meta = ext["provenance"]
         .as_object()
         .expect("provenance rides under the extension");
@@ -2780,7 +2780,7 @@ async fn a_peer_call_without_provenance_sends_none() {
 
     let sent = seen.lock().unwrap().clone().unwrap();
     assert!(
-        sent["params"]["message"]["metadata"][EXTENSION_URI]["provenance"].is_null(),
+        sent["params"]["message"]["metadata"][EXT_CALLER_CONTEXT]["provenance"].is_null(),
         "the client fabricated provenance nobody gave it"
     );
 }

@@ -1197,7 +1197,96 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_refused_admission_leaves_its_key_free(fresh, &mut r).await;
     an_unkeyed_admission_claims_nothing(fresh, &mut r).await;
     retiring_a_key_frees_it_and_leaves_the_run(fresh, &mut r).await;
+    the_waiting_listing_follows_the_last_record(fresh, &mut r).await;
     r
+}
+
+/// A run is listed as waiting while its **last** record is a suspension, and
+/// leaves the listing the moment it makes any progress.
+///
+/// Both halves, and the second is the one a store gets wrong. An index that
+/// only ever gains rows is the shape that makes an oldest-first page stop
+/// changing: its head becomes permanent and everything behind it unreachable,
+/// so the operator re-arming suspended runs works the same page forever. What
+/// licenses the ascending order is exactly that resuming removes the entry.
+///
+/// Scanning history for `RunSuspended` fails the same test from the other side —
+/// every run that ever waited carries one forever — which is why this asks the
+/// store for a *derived* answer rather than reading the chain.
+async fn the_waiting_listing_follows_the_last_record(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+
+    let waiting = RunId::generate();
+    let resumed = RunId::generate();
+    let until =
+        crate::core::Timestamp::from_unix_timestamp(1_800_000_000).expect("a fixed instant parses");
+    let suspension = |run: RunId| {
+        Append::new(
+            run,
+            RecordKind::RunSuspended {
+                reason: crate::core::SuspendReason::AwaitingTime { until },
+            },
+        )
+    };
+
+    for run in [waiting, resumed] {
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        if store
+            .append(lease.epoch, vec![admitted(run), suspension(run)])
+            .await
+            .is_err()
+        {
+            r.record("waiting", "a suspension could not be appended");
+            return;
+        }
+        // The resumed one makes progress: any record at all ends the wait.
+        if run == resumed {
+            let note = Append::new(
+                run,
+                RecordKind::Note {
+                    text: "resumed".into(),
+                },
+            );
+            if store.append(lease.epoch, vec![note]).await.is_err() {
+                r.record("waiting", "an append after a suspension failed");
+                return;
+            }
+        }
+    }
+
+    match store.waiting_runs(10).await {
+        Ok(listed) => {
+            let named: Vec<RunId> = listed.iter().map(|w| w.run).collect();
+            if !named.contains(&waiting) {
+                r.record(
+                    "waiting",
+                    "a run whose last record is a suspension was not listed — the \
+                     recovery runbook's last step has no argument an operator can obtain",
+                );
+            }
+            if named.contains(&resumed) {
+                r.record(
+                    "waiting",
+                    "a run that made progress after suspending is still listed as \
+                     waiting — an index that only gains rows makes an oldest-first page \
+                     stop changing",
+                );
+            }
+            if let Some(entry) = listed.iter().find(|w| w.run == waiting)
+                && entry.reason.until() != until
+            {
+                r.record(
+                    "waiting",
+                    "the listing named a different instant than the record — what it \
+                     waits for is the half that says whether waiting is still reasonable",
+                );
+            }
+        }
+        Err(e) => r.record("waiting", format!("waiting_runs failed: {e}")),
+    }
 }
 
 /// A retired key is free again, and the run it named is untouched.

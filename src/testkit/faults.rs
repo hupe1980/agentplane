@@ -439,6 +439,13 @@ impl JournalStore for Faulty {
         self.inner.abandoned_runs(limit).await
     }
 
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::journal::WaitingRun>, StoreError> {
+        self.inner.waiting_runs(limit).await
+    }
+
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
         self.inner.seal(run, epoch, outcome).await
     }
@@ -573,6 +580,12 @@ mod tests {
             unreachable!("the test reads capabilities only")
         }
         async fn abandoned_runs(&self, _: usize) -> Result<Vec<RunId>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn waiting_runs(
+            &self,
+            _: usize,
+        ) -> Result<Vec<crate::journal::WaitingRun>, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn release_lease(&self, _: RunId, _: Epoch) -> Result<(), StoreError> {

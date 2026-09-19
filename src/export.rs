@@ -570,6 +570,9 @@ pub fn verify<R: std::io::BufRead>(
                 .push("a line is not valid JSON, so the export is unreadable from there on".into());
             break;
         };
+        if let Some(kind) = value.get("kind").and_then(Value::as_str) {
+            note_unknown_members(kind, &value, &mut report);
+        }
         match value.get("kind").and_then(Value::as_str) {
             Some("agentplane.export") => {
                 header_seen = true;
@@ -1174,12 +1177,9 @@ fn read_record(
     let raw_bytes = raw.as_bytes();
     // The body verification reads is parsed from the wire bytes — the one
     // source the hash actually covers.
-    let Ok(body) = serde_json::from_slice::<crate::journal::RecordBody>(raw_bytes) else {
-        report
-            .findings
-            .push(format!("run {current}: a record line is malformed"));
-        pass.clean = false;
-        return;
+    let body = match serde_json::from_slice::<crate::journal::RecordBody>(raw_bytes) {
+        Ok(body) => body,
+        Err(parse) => return unparsed_record(raw_bytes, parse, pass, report),
     };
     // The readable `body` is a courtesy copy, and it is held to the bytes: a
     // file whose display half says something its hashed half does not is the
@@ -1247,25 +1247,140 @@ fn read_record(
         .get("attestation")
         .and_then(|a| serde_json::from_value::<Option<crate::core::Attestation>>(a.clone()).ok())
         .flatten();
-    if let Ok(record) = crate::journal::Record::from_stored_attested(
+    // **Why the failure is matched on rather than summarised.** Not every way
+    // this read fails is an incident. The hash is checked before the body is
+    // parsed, so a record whose bytes were edited fails as `Corrupt` and
+    // everything past that point has bytes the chain commits to — a version
+    // this build does not read is then a statement about the reader, not about
+    // the file. Collapsing the two spends a tampering verdict on the one
+    // artifact this project hands to somebody who does not run it, and an
+    // export carries the incident kinds most often: a cancelled run, a
+    // withheld authority, a decided quarantine.
+    //
+    // A *shape* skew cannot arrive here, and the reason is checkable rather
+    // than assumed: the body above is parsed from these same bytes into the
+    // same struct, so a body this build cannot read has already returned
+    // through `unparsed_record`. Only the version survives that gate, because
+    // nothing above compares it.
+    match crate::journal::Record::from_stored_attested(
         raw_bytes.to_vec(),
         pass.prev,
         claimed,
         attestation,
     ) {
-        pass.prev = record.hash;
-        pass.resealed.push(record);
-    } else {
-        report.findings.push(format!(
-            "run {current}: record {} does not recompute to the hash it carries \
-             — it was edited after it was sealed",
-            pass.last_seq
+        Ok(record) => {
+            pass.prev = record.hash;
+            pass.resealed.push(record);
+        }
+        Err(skew @ crate::core::StoreError::UnknownRecordVersion { .. }) => {
+            report.findings.push(format!(
+                "run {current}: record {} is at a version this build does not read, and \
+                 its bytes hash as written — this is a build skew rather than an edit: \
+                 {skew}",
+                pass.last_seq
+            ));
+            pass.clean = false;
+            pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
+        }
+        Err(_) => {
+            report.findings.push(format!(
+                "run {current}: record {} does not recompute to the hash it carries \
+                 — it was edited after it was sealed",
+                pass.last_seq
+            ));
+            pass.clean = false;
+            // The head walks forward over the bytes actually present, so the
+            // leaf comparison at the end of the block speaks about what this
+            // file carries rather than about the first mismatch.
+            pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
+        }
+    }
+}
+
+/// Members of a framing line this build does not know, reported as unchecked.
+///
+/// **A verdict is only as wide as the claims the reader understood.** A framing
+/// line carries claims that are checked — a checkpoint, a leaf, the trailer's
+/// accounting — so a member added by a later writer may carry one more, and a
+/// reader that passes over it reports *sound* about a file it read part of.
+///
+/// This is `not_checked` rather than a finding, and the difference is the one
+/// the record path draws for the same question. A record's bytes are hashed, so
+/// a member nobody knows is refused: the verdict would otherwise be reached over
+/// evidence the reader did not see. A framing line is not hashed and carries no
+/// evidence of its own, so an unknown member does not falsify anything already
+/// checked — it bounds what the check covered, which is what this field is for.
+fn note_unknown_members(kind: &str, value: &serde_json::Value, report: &mut VerifyReport) {
+    let known: &[&str] = match kind {
+        "agentplane.export" => &["kind", "version", "checkpoint", "canon"],
+        "agentplane.export.run" => &["kind", "run", "index", "seal"],
+        "agentplane.export.case" => &["kind", "case", "deadlines", "blobs"],
+        "agentplane.export.end" => &[
+            "kind",
+            "runs_requested",
+            "runs_exported",
+            "records",
+            "cases",
+            "unreadable",
+        ],
+        // Not a frame: a record line carries no top-level `kind`, and its own
+        // members are refused rather than noted, one level down.
+        _ => return,
+    };
+    let Some(object) = value.as_object() else {
+        return;
+    };
+    let unknown: Vec<&str> = object
+        .keys()
+        .map(String::as_str)
+        .filter(|member| !known.contains(member))
+        .collect();
+    if !unknown.is_empty() {
+        report.not_checked.push(format!(
+            "a {kind} line carries {} this build does not know — whatever they claim was \
+             not checked, and a later build wrote this file",
+            unknown.join(", ")
         ));
-        pass.clean = false;
-        // The head walks forward over the bytes actually present, so the
-        // leaf comparison at the end of the block speaks about what this
-        // file carries rather than about the first mismatch.
-        pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
+    }
+}
+
+/// A record line this reader cannot parse, filed under what that means.
+///
+/// **A line this reader cannot parse is not the same as a line nobody can.**
+/// This is the first gate a record from a newer build meets, so answering
+/// *malformed* for both would report an export written one hard cut ahead as a
+/// damaged file, record by record, to the one audience that has no other copy.
+fn unparsed_record(
+    raw_bytes: &[u8],
+    parse: serde_json::Error,
+    pass: &mut RunPass,
+    report: &mut VerifyReport,
+) {
+    let current = pass.run;
+    let classified = crate::journal::unreadable(raw_bytes, parse);
+    match &classified {
+        crate::core::StoreError::UnreadableRecordShape { .. } => {
+            report.findings.push(format!(
+                "run {current}: a record is at a shape this build does not read — a build \
+                 skew rather than a damaged file: {classified}"
+            ));
+        }
+        _ => report
+            .findings
+            .push(format!("run {current}: a record line is malformed")),
+    }
+    pass.clean = false;
+    // The head and the sequence walk forward over what the file carries, so the
+    // records after this one are compared against the history the file actually
+    // holds. Without it one unreadable line makes every later record in the
+    // block report a broken link and a gap — a cascade of incident-shaped
+    // findings from one old reader.
+    pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
+    if let Some(seq) = serde_json::from_slice::<serde_json::Value>(raw_bytes)
+        .ok()
+        .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64))
+    {
+        pass.last_seq = seq;
     }
 }
 

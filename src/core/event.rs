@@ -210,6 +210,22 @@ pub enum SuspendReason {
     },
 }
 
+impl SuspendReason {
+    /// When the wait stops being the system working.
+    ///
+    /// Both variants carry one, and neither means the same thing by it: for a
+    /// timer it is when the run is due to continue, and for an event it is when
+    /// waiting stops being reasonable. Shared here because the question a
+    /// listing of waiting runs is ordered by is the same either way — *which of
+    /// these should have moved by now*.
+    #[must_use]
+    pub const fn until(&self) -> Timestamp {
+        match self {
+            Self::AwaitingEvent { until, .. } | Self::AwaitingTime { until } => *until,
+        }
+    }
+}
+
 impl std::fmt::Display for SuspendReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

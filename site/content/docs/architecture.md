@@ -174,10 +174,38 @@ eventual crate split is mechanical; lose it and no crate layout recovers it.
 a *prefix* of what the current code does. A journal written by a different
 program is divergence, and the run is quarantined rather than continued.
 
+**A divergence says which call moved.** The party who has to act is whoever
+changed the code, so the run's conclusion names the effect on both sides rather
+than the two digests that differ:
+
+```text
+non-determinism at seq 42: history performed `tool://payments/charge` here and
+this build asks for `tool://payments/refund` — the code takes a different path
+than the code that wrote this journal (history ek:9f2c…, this build ek:41ab…)
+```
+
+Three sentences are possible and they send you to different places: a different
+**call** means the code path moved; the same call at a different **attempt**
+means the retry decisions moved; the same call at the same attempt means its
+**arguments** moved. The last one stops there rather than quoting them — an
+effect's arguments are a [sealed field](@/docs/erasure.md) and a run's
+conclusion is not, so printing one would leave a plaintext copy that an erasure
+could not reach. Comparing them is a read of the record, by somebody holding the
+key.
+
 The same hard boundary applies to authorization. Admission records a structured
 policy-bundle identity covering rules, schema, static entities, adapter
 configuration/extensions, and evaluator semantics. An open run may resume only
 under that exact bundle because resume can dispatch past the recorded prefix.
+
+**And to the declaration, on the same terms.** A declarative agent's behaviour
+*is* its manifest, so a resume under an edited one runs a different program over
+the first one's journal. The digest is recorded at admission, so the resume
+compares it and refuses by name — *the declaration for `x` changed: admitted
+under …, and this plane holds …* — rather than letting replay discover the same
+fact later as two differing effect keys. A coded skill has no such handle: its
+behaviour is the embedder's binary, which this crate cannot identify and does
+not claim to, and there divergence is the answer.
 Dynamic request facts are not bundle inputs; they stay in each policy request.
 An effect's request carries the run, step, tenant, whether it mutates, the
 arguments — and, when the call came through `sink`, the **label** of the value it

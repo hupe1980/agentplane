@@ -1820,6 +1820,8 @@ whether a run id exists by comparing a `400` against a `404`.
 |---|---|
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
 | `GET /runs/live` | What is executing **right now**, and under whose authority? Each entry carries the agent, the revision and the delegation subject, and `stranded` marks a lapsed lease → [the emergency stop](#the-emergency-stop) |
+| `GET /attention` | **Does anything here need a person right now** — and which thing? The roll-up over every backlog below, each condition named with what to do about it, and `not_checked` naming the ones this plane has no store for. `agentplane attention` is the same answer with a non-zero exit, for a scheduler |
+| `GET /runs/waiting` | What is this plane **waiting on**, and until when? Soonest due first, so what should have moved already sorts to the front. Neither of the two listings above holds these: a suspended run has concluded nothing and gave its admission slot back → [the recovery runbook](#recovery-drill) |
 | `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end, and on whose decision? |
 | `GET /runs/{run}/history` | What did it actually *do*? The journal, record by record, from `?from=<seq>` |
 | `GET /tasks` | What is waiting for me? |
@@ -1902,7 +1904,10 @@ authorization rule drifts, and the copy that drifts is the one people read.
 Same reasoning as the policy engine and the tracing exporter. `Authenticator` is
 handed the whole header map, because a deployment may authenticate by bearer
 token, mutual TLS, or a signed header from a gateway, and a parser baked in here
-would be wrong for one and load-bearing for the other.
+would be wrong for one and load-bearing for the other. What is asked of yours
+instead is a contract — `testkit::conformance_auth`, and the rule in it that is
+easiest to get wrong is that `Missing` and `Rejected` are different answers
+→ [testing](@/docs/testing.md#holding-your-own-authenticator-to-the-contract).
 
 ### Claiming is what stops duplicated work
 
@@ -2121,10 +2126,27 @@ grows with how much work was in flight:
    resumed.
 4. **Re-arm the suspended runs.** Resuming each one is what repairs its waits:
    replay reaches the announced wait, finds no terminal record, and re-arms the
-   timer, re-subscribes and re-opens the task row. A run waiting on a person is
-   in the worklist; a run waiting on a **timer or an event** is in no listing
-   today, so keep the run ids from before the incident — the export names every
-   run it carried.
+   timer, re-subscribes and re-opens the task row. Which runs those are is a
+   query rather than something to have kept:
+
+   ```sh
+   agentplane waiting --store ./restored.redb      # soonest due first
+   ```
+
+   Or `GET /runs/waiting` on a serving plane, under `api:run.waiting`. Both
+   answer from the **journal**, not from the timer and subscription tables —
+   which is the whole reason they work here, since an export carries neither and
+   those registrations are exactly what a restore is missing. A run leaves the
+   listing by being resumed, so it is a worklist that drains rather than a page
+   that stops changing.
+
+   **What it costs to read.** An index maintained by the write path, holding one
+   row per *currently* waiting run rather than one per suspension ever recorded
+   — so its size is the backlog you are looking at, not the history. Postgres
+   serves it from `run_waiting_due` in index order with no sort; redb ranges the
+   tenant's slice in key order and reads nothing past the page. Scanning history
+   for `RunSuspended` is the answer that does not work, and not for cost: every
+   run that ever waited carries one forever.
 
 ### The drill {#recovery-drill}
 
@@ -2153,7 +2175,7 @@ during an incident:
 
 | Not carried | What re-establishes it |
 |---|---|
-| Timers, event subscriptions, worklist rows | **Resuming the run.** Replay reaches the announced wait, finds no terminal record, and re-arms from the journal. `RestoreReport::awaiting` names every run this applies to |
+| Timers, event subscriptions, worklist rows | **Resuming the run.** Replay reaches the announced wait, finds no terminal record, and re-arms from the journal. `RestoreReport::awaiting` names every run the file carried; `agentplane waiting` names what the plane is waiting on now, and keeps naming it until somebody resumes it |
 | Leases | Nothing: a first lease starts one past the highest epoch the run's own journal records, so a fencing token cannot go backwards across a restore |
 | Webhook delivery cursors | Re-registration, then `POST /push/rearm`. A cursor is how far a receiver got and nothing journals it |
 | Record signatures | The restoring store attests as its own signer. Hashes and the Merkle root are unaffected; authorship is not |

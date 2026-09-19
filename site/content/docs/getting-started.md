@@ -14,6 +14,14 @@ Every snippet here is either lifted from a working example in `examples/` — wh
 CI runs on every push — or from the crate's own compile-checked rustdoc. If one
 does not build, that is a bug worth reporting.
 
+**The order is deliberate.** Sections 2 and 3 are two doorways onto the same
+guarantees, and the first one needs no Rust at all. It comes first because it is
+the one the [compatibility promise](@/docs/status.md#what-the-freeze-promises)
+attaches to: what the freeze commits is the record, the export and the operator
+vocabulary — the evidence — rather than either doorway. Writing skills in Rust
+buys expressiveness and takes the ordinary pre-alpha risk on function
+signatures.
+
 ---
 
 ## 1. See it work first 👀 {#see-it-work-first}
@@ -52,32 +60,7 @@ Read those five lines slowly, because they are the product:
   not silently accepted, and it is not a crash to recover from. Changing code and
   crashing are different things, and only one of them is recoverable.
 
-## 2. Add the crate 📦 {#add-the-crate}
-
-```sh
-cargo add agentplane
-```
-
-**Check what you got.** The MSRV is **1.94.1**, and the patch component is the
-part that bites: a workspace declaring `rust-version = "1.94"` does not fail
-against it. Cargo silently resolves an *older* agentplane and says so in a line
-that is easy to lose in a build log:
-
-```
-warning: ignoring agentplane@0.6.0 (which requires rustc 1.94.1)
-         to maintain <your crate>'s rust-version of 1.94
-```
-
-The first sign is that the API does not match this page. `cargo tree -p
-agentplane` says which version you have; declare `1.94.1` in your own manifest.
-
-Deliberately not a version number to copy. The version a reader should depend on
-is the latest **published** one, which is a fact this repository does not hold —
-`Cargo.toml` carries the version being *developed*, and the two differ for as
-long as a release takes. `cargo add` asks the registry, so the answer cannot go
-stale between a bump and a publish.
-
-## An agent with no Rust
+## 2. An agent with no Rust 📄 {#an-agent-with-no-rust}
 
 If the agent is a prompt, a model and a result shape, it needs no program at all
 — a file and a key are the whole thing. (Prefer to build this up one command at
@@ -320,6 +303,13 @@ An agent's declaration must not change when its credential does. And only
 the providers the manifest *names* are registered — otherwise exporting the wrong
 variable would make the agent runnable on a model its declaration never named.
 
+## 3. Add the crate 📦 {#add-the-crate}
+
+Everything above runs without a Rust toolchain. Past this point you are writing
+a **skill**, which is trusted code in this process — the reason there is no
+skill tier in any other language, and the line untrusted code does not cross:
+it goes behind the effect boundary as a tool instead.
+
 An embedded [redb](https://github.com/cberner/redb) store is the default backend
 — pure Rust, two crates deep, with a stable on-disk format and no C toolchain in
 your build. Everything else is opt-in:
@@ -365,7 +355,26 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `fake-model` | a model provider with no model behind it: deterministic answers, real usage figures. What makes `provider: fake` run without a key or a network; `cli` includes it |
 | `testkit` | fault injection, store conformance, a signer that mints its own attestations, and the plaintext-loopback exceptions. **Never in a shipped build** — no feature a release enables pulls it in, and a guard holds that |
 
-## 3. Write a skill 🛠️ {#write-a-skill}
+**Check what you got.** The MSRV is **1.94.1**, and the patch component is the
+part that bites: a workspace declaring `rust-version = "1.94"` does not fail
+against it. Cargo silently resolves an *older* agentplane and says so in a line
+that is easy to lose in a build log:
+
+```
+warning: ignoring agentplane@0.6.0 (which requires rustc 1.94.1)
+         to maintain <your crate>'s rust-version of 1.94
+```
+
+The first sign is that the API does not match this page. `cargo tree -p
+agentplane` says which version you have; declare `1.94.1` in your own manifest.
+
+Deliberately not a version number to copy. The version a reader should depend on
+is the latest **published** one, which is a fact this repository does not hold —
+`Cargo.toml` carries the version being *developed*, and the two differ for as
+long as a release takes. `cargo add` asks the registry, so the answer cannot go
+stale between a bump and a publish.
+
+## 4. Write a skill 🛠️ {#write-a-skill}
 
 A skill is one unit of work. It gets a `StepCtx`, which is how it reaches
 anything non-deterministic.
@@ -420,7 +429,7 @@ the lattice is a decision that gets journaled. See
 lint. Anything non-deterministic goes through `cx`, which journals it — and that
 is exactly what makes replay possible.
 
-## 4. Run it ▶️ {#run-it}
+## 5. Run it ▶️ {#run-it}
 
 ```rust
 // Everything below is already in scope from the prelude imported above.
@@ -477,7 +486,7 @@ would have been written, and never shown to anyone — you would have got
 This exact skill and run is on disk as a runnable file — `cargo run --example
 hello_skill` — so the shape above is something you execute, not only read.
 
-## 5. Do something to the outside world 🌍 {#do-something-to-the-outside-world}
+## 6. Do something to the outside world 🌍 {#do-something-to-the-outside-world}
 
 The point of the journal is effects. Here is a tool call:
 
@@ -538,7 +547,7 @@ let args = cx.release(
 This asks policy under `data:release`, retains provenance, and journals the
 releaser, scope, destination, basis and evidence. It never returns a bare value.
 
-## 6. Wait for a human ⏸️ {#wait-for-a-human}
+## 7. Wait for a human ⏸️ {#wait-for-a-human}
 
 ```rust
 let decision = cx.task(
@@ -553,7 +562,7 @@ The run **suspends**. Its frame goes to disk and the task is dropped — a
 suspended run costs bytes, not a thread, so a plane can hold 10⁵ of them waiting
 for approval. When someone decides, the run resumes exactly where it was.
 
-## 7. Test it 🧪 {#test-it}
+## 8. Test it 🧪 {#test-it}
 
 The `fake-model` feature — which `testkit` and `cli` both enable — gives you a
 model provider with no model behind it, so a test can exercise the whole path

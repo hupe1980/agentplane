@@ -237,8 +237,45 @@ identity that does not move between calls, and a `digest` that is the bundle's.
 What it cannot tell you is whether your rules are **right**: an engine that
 permits everything passes every check in it.
 
+
 The blob rule that is least obvious — an expired address stays expired — is
 argued where its reader is, on [erasure](@/docs/erasure.md#an-expired-address-stays-expired).
+
+## Holding your own authenticator to the contract
+
+The **authenticator battery** is the one for a seam this crate ships no
+implementation of, because it cannot: establishing who is calling is your
+identity provider's job, and the surface believes whatever `authenticate`
+returns.
+
+```rust
+use agentplane::testkit::conformance::Report;
+use agentplane::testkit::{conformance_auth, conformance_auth::Requests};
+
+let mut report = Report::default();
+let requests = Requests {
+    accepted: Some((bearer("a-token-you-issue"), "alice@example.com".into())),
+    rejected: vec![("expired", bearer(&expired)), ("wrong audience", bearer(&other))],
+};
+conformance_auth::check(&my_auth, &requests, &mut report).await;
+report.assert_conforms("MyAuth");
+```
+
+You supply the requests because only you know what a credential looks like —
+the trait takes a whole `HeaderMap` so a bearer token, a mutual-TLS header and a
+gateway assertion are all expressible. It checks that an empty request is
+`Missing` rather than an anonymous caller, that your own examples of bad
+credentials come back `Rejected`, and that the accepted one names the actor you
+say it should.
+
+The rule worth knowing before you write one: **`Rejected` and `Missing` are
+different answers**. `Missing` means *there was nothing here I can use* — no
+header, or a scheme this server does not speak. A credential you looked at and
+refused is `Rejected`, whatever was wrong with it. Answering `Missing` for it
+tells whoever is probing that the token was at least the right shape, which is
+the one thing a refusal is not supposed to say. Neither variant carries a
+reason, and that is deliberate: expired, unknown signer and wrong audience are
+one sentence to a caller.
 
 ## Testing a policy against the *real* context
 

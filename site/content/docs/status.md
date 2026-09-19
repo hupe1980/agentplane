@@ -35,24 +35,29 @@ equally likely to, and an adopter deciding what to build against deserves the
 difference rather than one blanket warning.
 
 Nothing here is a compatibility promise. It is a statement about where the
-remaining design pressure is.
+remaining design pressure is — grouped by
+[what the freeze will be a promise about](#what-the-freeze-promises), so the two
+readings of this table do not have to be held apart by hand.
 
 | Surface | Expect | Why |
 |---|---|---|
+| *What the freeze will cover* | | |
 | **Effect / disposition / recovery vocabulary** | stable | `DidNotHappen`/`InDoubt`/`Landed` and the recovery classes are the load-bearing idea; changing them would be a different system |
-| **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
-| **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
 | **Journal record format** | **will change** | not frozen. Upcasters exist, but a format-freeze milestone has not happened and hard cuts are preferred until it does — see the freeze conditions below for what has to land first, and for the export-as-the-durable-artifact position in the meantime |
-| **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. A reference names a server and a tool, never a transport, so the key does not move when the transport does |
+| *Additive either way — a new field or variant, never a removed one* | | |
 | **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` makes an added field safe and a *removed* one a hard failure. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
-| **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
 | **Error enums** | additive; `#[non_exhaustive]` | they gain variants as the runtime learns to say more — a rate limit is its own variant rather than a generic rejection, and the next distinction will be too. Match with a `_` arm |
 | **`RetryPolicy` fields** | additive | it is a plain struct, so a literal breaks when a field lands. Build with `RetryPolicy::attempts(n)` and the builder methods, or spread `..RetryPolicy::default()` |
 | **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled; `context` gains attributes as the runtime learns to say more. Guard optional ones with `has` → [security](@/docs/security.md#the-authorization-context) |
 | **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
+| **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
+| *Outside the promise — pin an exact version* | | |
+| **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
+| **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
+| **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
+| **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. A reference names a server and a tool, never a transport, so the key does not move when the transport does |
 | **Store schemas — SQL, redb, and what a blob store writes** | **will change without migration** | there is no migration tooling: recreate rather than migrate. Widening a redb table fails at open rather than at read, and a tombstone carries a version a later build refuses rather than guesses at |
 | **A2A / MCP wire behaviour** | tracks the specs | exact released revisions, not a compatibility range: a revision this crate has not been held to is one it does not claim, and the serving and calling roles differ → [which revisions this plane speaks](@/docs/interop.md#protocol-revisions) |
-| **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
 
 ## 🧊 Format freeze: the conditions, and where they stand {#format-freeze}
 
@@ -72,40 +77,45 @@ asking.
 ✅ met · 🟨 half, and the remaining half is named · ⬜ open. A half is a row
 whose *mechanics* are built and whose remaining work is a document or an
 exercise — stated as its own state rather than rounded to either neighbour,
-because rounding up is how a condition list stops being checkable.
+because rounding up is how a condition list stops being checkable. No row is a
+half today, and the mark is kept because the next row to move will pass through
+that state rather than skip it.
 
 | # | Condition | State |
 |---|---|---|
 | 1 | **Canonicalization is versioned and vector-checked.** A rule change must read as *unverifiable* rather than as a divergence | ✅ done — versioned at the run, a complete RFC 8785 implementation held to the standard's own number vectors |
 | 2 | **Golden corpora for the journal record format.** A fixed set of records, byte-for-byte, that every future build must still read and still hash identically | ✅ done — one canonical record per kind and its chain digest in `tests/golden/records.jsonl`, sealed through the same function every backend appends through, with a guard holding the corpus to the record vocabulary so a new kind cannot ship unpinned |
-| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | ✅ done — a sealed export with its case layer is checked in, and `tools/verify_export.py` verifies it from the [published specification](@/docs/format.md) alone, re-deriving all 29 record vectors rather than only accepting them |
-| 4 | **A stated unknown-field policy per durable format.** | ✅ done, and strict in both directions — a record is *evidence*, so a reader that drops a field reaches a verdict over evidence it did not see. Refusals are classified as build skew rather than damage, with the deployment order they imply written down beside them |
+| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | ✅ done — a sealed export with its case layer is checked in, and `tools/verify_export.py` verifies it from the [published specification](@/docs/format.md) alone, re-deriving every record vector rather than only accepting it |
+| 4 | **A stated unknown-field policy per durable format.** | ✅ done, per format rather than once — a record body and a sealed envelope's header refuse an unknown member; an export's *framing* line bounds the verdict instead, and says so. A refusal is a build skew rather than damage wherever the bytes are established |
 | 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — consulted on *every* record read, with a test lifting a record whose shape this build cannot parse and asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump |
-| 6 | **A migration and rollback procedure**, written down and rehearsed | 🟨 half — written down (readers before writers; rollback bounded by a *time window*), and the reader's half is pinned: a record from a shape this build does not know is refused as skew, not damage. What is left is the two-build exercise, which needs a version bump to have two builds to run |
+| 6 | **A migration and rollback procedure**, written down and rehearsed | ✅ done — rehearsed across two released builds, each refusing the other's records as a skew that names the remedy. Before the freeze a hard cut is unreadable in both directions, so the rollback window is zero and a shape change is a fresh journal |
 | 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility) and already implemented: hashes are agile by version, signatures by key, [digest domains](@/docs/format.md#digest-domains) carry their own, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
 | 8 | **The deferred format questions are settled**, each of which moved a record or a wire | ✅ done — the set is empty. The one that could still have added a record was whether a context branch belongs in the runtime at the loop tier, and the answer is a refusal: a branch lowers no label, so it adds no record and relieves none of the pressure it was aimed at |
-| 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ⬜ open — see below |
+| 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ✅ done — **the artifacts, not either doorway**: the record format, the export and the operator verbs' vocabulary. See below |
 
-**Condition 9 is a sentence, not a build.** Both surfaces exist and are
-published: a crate an embedder links, and a server an operator runs against a
-manifest with no Rust anywhere. What is unwritten is which one an adopter is
-expected to depend on, and therefore what the freeze is a promise *about*. It is
-a row rather than a footnote because a compatibility commitment with no stated
-subject is one an adopter completes in their own favour.
+### What the freeze is a promise about {#what-the-freeze-promises}
 
-**What is left is an exercise and a sentence**, which is a different kind of
-waiting from the rest of this table: neither is a design question, and neither
-can still change a record shape.
+Both surfaces exist and are published — a crate an embedder links, and a server
+an operator runs against a manifest with no Rust anywhere — and they carry the
+[same guarantees](@/docs/concepts.md). So the promise does not attach to either
+doorway. It attaches to what the guarantees are *made of*:
 
-Two things follow that are worth stating plainly.
+| | Under the freeze | Terms |
+|---|---|---|
+| **The journal record format** | yes | a shape changes by upcaster and a version bump, never by a hard cut |
+| **The export format** | yes | the artifact a third party verifies, against a published specification a second implementation already reads |
+| **The operator verbs and their vocabulary** | yes | an outcome, a disposition, a recovery class and a run status keep their spelling; a verb gains arguments and does not lose them |
+| **The manifest schema** | additive | an added field is safe by construction, a removed one is a hard failure |
+| **The Rust API** — `Skill`, `StepCtx`, `Runtime`, the store traits | **no** | pre-alpha and additive in intent, pinned by an exact version in practice |
+| **Store schemas** | **no**, deliberately | the journal is the record and a store is an index derived from it; a store is rebuilt from an export rather than migrated |
 
-**Freezing the journal does not freeze everything.** Store schemas are a
-separate promise, and a weaker one on purpose: the journal is the record, the
-stores are indexes derived from it. A store rebuilt from an export is not a
-migration and does not need one, which is why `export`/`restore` are built and
-`ALTER TABLE` is not.
+**What an adopter depends on is the evidence, and both doorways produce the
+same evidence.** Linking the crate gets the same promise about everything it
+stores and exports, and takes the ordinary pre-alpha risk on the signatures it
+compiles against — the half a `cargo update` reports and a rebuild settles,
+rather than the half that strands a history.
 
-**Until then, the honest position for an adopter is:** treat the export as the
+**Until the freeze, the honest position for an adopter is:** treat the export as the
 long-term artifact and the store as disposable. `agentplane export` produces
 framed JSON Lines with a checkpoint, `agentplane verify` recomputes it from its
 own bytes, and `agentplane restore` rebuilds a store from it — three verbs that

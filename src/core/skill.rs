@@ -34,17 +34,6 @@ impl From<&str> for Capability {
     }
 }
 
-/// A fully-pinned reference to an agent: name, version, and manifest digest.
-///
-/// A run records the digest it executed under, so "which exact configuration
-/// produced this decision?" is answerable months later, byte-for-byte.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentRef {
-    pub name: String,
-    pub version: String,
-    pub digest: crate::core::Digest,
-}
-
 /// What a skill is and what it promises.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillDescriptor {

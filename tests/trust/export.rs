@@ -127,6 +127,185 @@ async fn an_open_runs_tail_is_reported_as_unpinned() {
     );
 }
 
+/// **A verdict is only as wide as the claims this reader understood.**
+///
+/// A framing line is not hashed and carries no evidence of its own, so a member
+/// a later writer added does not falsify anything already checked — which is
+/// why it is not a finding. What it does is bound the check: the member may
+/// carry a claim, and a report that says *sound* without mentioning it has
+/// described a file it read part of. `not_checked` is the field that exists for
+/// exactly that, and this is the same question the record path answers the
+/// other way, because a record's members are covered by a hash.
+#[tokio::test]
+async fn a_framing_member_this_build_does_not_know_bounds_the_verdict() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+
+    let text = String::from_utf8(out).expect("utf8");
+    let mut rewritten = 0_usize;
+    let file: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+                return line.to_owned();
+            };
+            if value["kind"] == json!("agentplane.export") {
+                value["attestation_bundle"] = json!({ "alg": "ml-dsa-65" });
+                rewritten += 1;
+            }
+            serde_json::to_string(&value).expect("serialises")
+        })
+        .collect();
+    assert_eq!(
+        rewritten, 1,
+        "the fixture added no member, so this test would measure itself"
+    );
+
+    let report =
+        agentplane::export::verify(std::io::Cursor::new(file.join("\n").as_bytes()), None, None)
+            .expect("the file reads");
+
+    assert!(
+        report.findings.is_empty(),
+        "an added framing member falsifies nothing this reader checked: {:?}",
+        report.findings
+    );
+    let said = report.not_checked.join("\n");
+    assert!(
+        said.contains("attestation_bundle"),
+        "the report has to name the member it passed over, or *sound* claims a width \
+         this reader did not have: {said}"
+    );
+}
+
+/// **An export one build ahead reads as a build skew, not as a damaged file.**
+///
+/// This is the artifact handed to somebody who does not run this crate, and
+/// until now every reason a record could not be read produced the same
+/// sentence: *it was edited after it was sealed*. A record from a newer build
+/// is not edited. Its bytes hash to what the chain says — the hash is checked
+/// before the body is parsed — so the failure is a statement about the reader,
+/// and the alarm that says otherwise is the one that has to stay believable.
+///
+/// It is not a hypothetical reader. Between two releases of this crate five
+/// record kinds moved a field from a string to a struct, at `v` 1 throughout:
+/// a cancelled run, a withheld authority, a decided quarantine, a reconciled
+/// effect and a break-glass — the kinds an export is *most* likely to be
+/// scrutinised over.
+///
+/// The cascade is asserted too. One unreadable line used to stop the block's
+/// head advancing, so every record after it reported a broken link and a gap
+/// as well: one old reader, a page of incident-shaped findings.
+#[tokio::test]
+async fn a_record_from_a_newer_build_is_not_reported_as_tampering() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+
+    // Rewrite one record the way a later build would have written it: a field
+    // this build has never heard of, at the version this build also writes,
+    // hashed over its own bytes and linked to the record before it. Everything
+    // downstream is re-linked, so the file is exactly as internally consistent
+    // as the newer build's own output — the only thing wrong with it is the
+    // age of the reader.
+    let text = String::from_utf8(out).expect("utf8");
+    let mut prev: Option<agentplane::core::Digest> = None;
+    let mut rewritten = 0_usize;
+    let mut lines: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("every export line is JSON"))
+        .collect();
+    for value in &mut lines {
+        if value.get("kind").is_some() {
+            continue; // A framing line.
+        }
+        let mut wire: Value =
+            serde_json::from_str(value["raw"].as_str().expect("wire bytes")).expect("json");
+        if wire["kind"] == json!("StepStarted") {
+            wire["settled_by"] = json!("a build that came later");
+            rewritten += 1;
+        }
+        let prev_hash = prev.unwrap_or_else(|| {
+            serde_json::from_value(value["prev_hash"].clone()).expect("a digest")
+        });
+        // The sealing record commits to the head it was drawn over, and the run
+        // block carries the leaf the log recorded. A re-linked history moves
+        // both, and leaving either stale would put a second, unrelated defect
+        // in the file — so the assertions below could not tell which finding
+        // they were reading.
+        if wire["kind"] == json!("RunConcluded") {
+            wire["chain_head"] = json!(prev_hash);
+        }
+        let raw = serde_json::to_string(&wire).expect("serialises");
+        let hash = agentplane::core::Digest::chain(prev_hash, raw.as_bytes());
+        prev = Some(hash);
+        value["body"] = wire;
+        value["prev_hash"] = json!(prev_hash);
+        value["hash"] = json!(hash);
+        value["raw"] = json!(raw);
+    }
+    let terminal = prev.expect("the run has records");
+    let root = agentplane::core::merkle::root(&[agentplane::core::merkle::leaf_hash(&terminal)]);
+    for value in &mut lines {
+        if value["kind"] == json!("agentplane.export.run") {
+            value["seal"] = json!(terminal);
+        }
+        // One run, so the log this file claims to copy has one leaf. Rebuilt
+        // here for the same reason the seal is: a newer build's export is
+        // internally consistent, and a fixture that is not would put defects
+        // in the file that no reader's age explains.
+        if value["kind"] == json!("agentplane.export") {
+            value["checkpoint"]["root"] = json!(root);
+        }
+    }
+
+    assert_eq!(
+        rewritten, 1,
+        "the fixture rewrote no record, so this test would measure itself"
+    );
+
+    let file = lines
+        .iter()
+        .map(|l| serde_json::to_string(l).expect("serialises"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let report = agentplane::export::verify(std::io::Cursor::new(file.as_bytes()), None, None)
+        .expect("the file reads");
+
+    let said = report.findings.join("\n");
+    assert_eq!(
+        report.findings.len(),
+        1,
+        "a file a newer build wrote is internally consistent — one record this reader \
+         cannot parse is the whole of what is wrong with it, and anything else here is a \
+         cascade: {said}"
+    );
+    assert!(
+        said.contains("build skew") && said.contains("settled_by"),
+        "a record from a newer build has to be named as one, and the finding has to \
+         carry what the reader choked on: {said}"
+    );
+    assert!(
+        !said.contains("edited after it was sealed"),
+        "a build skew reported as tampering, on the one artifact a third party holds: \
+         {said}"
+    );
+    assert!(
+        !said.contains("malformed"),
+        "the file is not malformed — a later build wrote it and it is internally \
+         consistent: {said}"
+    );
+    assert!(
+        !said.contains("is missing from the middle"),
+        "one unreadable line reported the records after it as removed: {said}"
+    );
+}
+
 /// A run id as it appears *in the file*.
 ///
 /// `RunId::to_string()` renders `run_01K…` and the JSON form is bare, so a
@@ -1202,6 +1381,12 @@ impl JournalStore for StaleCheckpoint {
     }
     async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.abandoned_runs(limit).await
+    }
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::WaitingRun>, StoreError> {
+        self.inner.waiting_runs(limit).await
     }
     async fn recent_runs(
         &self,

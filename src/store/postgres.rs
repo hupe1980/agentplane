@@ -79,7 +79,7 @@ use serde_json::Value;
 
 use crate::journal::{
     Append, AtomicJournal, AtomicTx, AtomicWork, Cancellation, Head, JournalStore, Lease, Record,
-    SqlValue,
+    SqlValue, WaitingRun,
 };
 
 /// The schema, applied on connect.
@@ -216,6 +216,34 @@ CREATE TABLE IF NOT EXISTS run_outcome (
 -- of the contract rather than a detail of this index.
 CREATE INDEX IF NOT EXISTS run_outcome_by_outcome
     ON run_outcome (tenant, outcome, ordinal);
+
+-- The runs that are waiting, and what each one waits for. **Derived**, not
+-- authoritative: fed by the run's *last* record inside `append`, in the same
+-- transaction, so the wait's home stays the chain and this table can be rebuilt
+-- from it.
+--
+-- One row per *currently* waiting run, deleted the moment the run makes any
+-- progress — which is what keeps an oldest-first page from stopping dead, since
+-- the verb an operator came here to run is what removes the head of it.
+--
+-- Deliberately not derived from the timer and subscription tables. Those answer
+-- this on a healthy plane and answer nothing on a restored one: an export
+-- carries neither, so after a restore the registrations are exactly what is
+-- missing and the runs are exactly what is inert.
+CREATE TABLE IF NOT EXISTS run_waiting (
+    tenant TEXT   NOT NULL,
+    run_id TEXT   NOT NULL,
+    -- When the wait stops being the system working. Seconds, signed for the
+    -- same reason every other instant here is.
+    until  BIGINT NOT NULL,
+    reason TEXT   NOT NULL,
+    PRIMARY KEY (tenant, run_id)
+);
+
+-- Soonest due first, which is the order an operator acts in: a run whose
+-- instant has already passed is the one lying inert.
+CREATE INDEX IF NOT EXISTS run_waiting_due
+    ON run_waiting (tenant, until, run_id);
 
 -- The admission keys this tenant has issued. **Derived**, not authoritative:
 -- fed by the `RunAdmitted` record inside `append`, in the same transaction, so
@@ -797,9 +825,16 @@ impl PostgresStore {
         let mut sealed = Vec::with_capacity(batch.len());
         let mut conclusion: Option<String> = None;
         let mut claimed: Option<String> = None;
+        let mut waiting: Option<crate::core::SuspendReason> = None;
         for append in batch {
             seq += 1;
             let body = append.into_body(seq, epoch);
+            // One pass over the kind for all three derived indexes. `waiting`
+            // is cleared first rather than only assigned on a suspension: that
+            // is what makes it track the run's *last* record instead of
+            // accumulating, so a run that suspends and then makes any progress
+            // has stopped waiting.
+            waiting = None;
             match &body.kind {
                 crate::journal::RecordKind::RunConcluded { outcome, .. } => {
                     conclusion = Some(outcome.clone());
@@ -808,6 +843,9 @@ impl PostgresStore {
                     idempotency_key: Some(key),
                     ..
                 } => claimed = Some(key.clone()),
+                crate::journal::RecordKind::RunSuspended { reason } => {
+                    waiting = Some(reason.clone());
+                }
                 _ => {}
             }
             let record = Record::seal_signed(body, prev, self.signer.as_deref())?;
@@ -843,6 +881,24 @@ impl PostgresStore {
             sealed.push(record);
         }
 
+        self.touch_activity(tx, run).await?;
+        self.derive_indexes(tx, run, claimed, conclusion, waiting)
+            .await?;
+
+        Ok(sealed)
+    }
+
+    /// Stamp this run as having been written to, now.
+    ///
+    /// The discovery index's own row, upserted in the same transaction as the
+    /// records that moved it — a timestamp committed separately from the append
+    /// it describes would order two runs by when their index writes landed
+    /// rather than by when they were written.
+    async fn touch_activity(
+        &self,
+        tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
+        run: RunId,
+    ) -> Result<(), StoreError> {
         tx.execute(
             "INSERT INTO run_activity (tenant, run_id, updated_at) VALUES ($1, $2, $3)
              ON CONFLICT (tenant, run_id) DO UPDATE SET updated_at = EXCLUDED.updated_at",
@@ -854,10 +910,7 @@ impl PostgresStore {
         )
         .await
         .map_err(|error| be(&error))?;
-
-        self.derive_indexes(tx, run, claimed, conclusion).await?;
-
-        Ok(sealed)
+        Ok(())
     }
 
     /// The two indexes that derive from a record in this batch.
@@ -871,6 +924,7 @@ impl PostgresStore {
         run: RunId,
         claimed: Option<String>,
         conclusion: Option<String>,
+        waiting: Option<crate::core::SuspendReason>,
     ) -> Result<(), StoreError> {
         // Claimed in the same transaction as the record that carries it, so
         // the claim and the run are one event. Never an upsert: the conflict
@@ -917,6 +971,37 @@ impl PostgresStore {
                  ON CONFLICT (tenant, run_id) DO UPDATE
                     SET outcome = EXCLUDED.outcome, ordinal = EXCLUDED.ordinal",
                 &[&self.tenant_name(), &run.to_string(), &outcome],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        }
+
+        // The waiting index, on the same terms and in the same transaction.
+        // Written as delete-then-insert rather than an upsert because the
+        // common case is a *removal*: every append that is not a suspension
+        // takes the run out of the listing, and a run that was not in it is the
+        // no-op that costs one indexed delete.
+        tx.execute(
+            "DELETE FROM run_waiting WHERE tenant = $1 AND run_id = $2",
+            &[&self.tenant_name(), &run.to_string()],
+        )
+        .await
+        .map_err(|error| be(&error))?;
+        if let Some(reason) = waiting {
+            let encoded = String::from_utf8(
+                crate::core::canon::to_bytes(&reason)
+                    .map_err(|e| StoreError::Backend(e.to_string()))?,
+            )
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO run_waiting (tenant, run_id, until, reason)
+                 VALUES ($1, $2, $3, $4)",
+                &[
+                    &self.tenant_name(),
+                    &run.to_string(),
+                    &reason.until().unix_timestamp(),
+                    &encoded,
+                ],
             )
             .await
             .map_err(|error| be(&error))?;
@@ -1396,6 +1481,45 @@ impl JournalStore for PostgresStore {
             owner: owner.to_owned(),
             epoch,
         })
+    }
+
+    async fn waiting_runs(&self, limit: usize) -> Result<Vec<WaitingRun>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        // An index scan on `run_waiting_due`, bounded by the page: the table
+        // holds one row per *currently* waiting run rather than one per
+        // suspension ever recorded, so its size is the backlog rather than the
+        // history. Ordered by the index, so no sort node.
+        let rows = client
+            .query(
+                "SELECT run_id, reason FROM run_waiting
+                 WHERE tenant = $1
+                 ORDER BY until, run_id
+                 LIMIT $2",
+                &[
+                    &self.tenant_name(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                let encoded: String = row.get(1);
+                // Corruption rather than a skip, for the reason
+                // `abandoned_runs` gives: a waiting run dropped from this
+                // listing is one nobody re-arms, and this is its one page.
+                let run = RunId::parse(&id).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_waiting holds an unparsable run id '{id}': {e}"),
+                })?;
+                let reason = serde_json::from_str(&encoded).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("run_waiting holds an unreadable reason for {id}: {e}"),
+                })?;
+                Ok(WaitingRun { run, reason })
+            })
+            .collect()
     }
 
     async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {

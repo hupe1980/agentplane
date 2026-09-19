@@ -226,6 +226,13 @@ impl JournalStore for NoExactlyOnce {
         self.inner.abandoned_runs(limit).await
     }
 
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::WaitingRun>, agentplane::core::StoreError> {
+        self.inner.waiting_runs(limit).await
+    }
+
     async fn recent_runs(
         &self,
         after: Option<(u64, agentplane::core::RunId)>,
@@ -480,6 +487,124 @@ fn every_policy_engine_satisfies_the_contract() {
         conformance_policy::check(&engine, &mut report);
         report.assert_conforms("CedarEngine");
     }
+}
+
+/// **Every authenticator, against the contract the trait states in prose.**
+///
+/// `Authenticator` is the one seam whose answer nothing downstream can
+/// re-derive: it returns a `Caller` and the surface believes it, because
+/// establishing who is calling is exactly what this crate cannot do for a
+/// deployment. So what the trait asks for in prose has to be asked here.
+///
+/// The case worth a battery is the refusal that says *why*. `AuthError` stops
+/// most of it by being two variants with fixed messages, so what is left is one
+/// bit: answering `Missing` for a credential the implementation looked at and
+/// refused separates *the right shape* from *nothing here*, which is what a
+/// prober reads. Nothing a deployment would think to write catches it, because
+/// a bad credential *is* refused either way.
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn every_authenticator_satisfies_the_contract() {
+    use agentplane::api::tokens::{TokenAuthenticator, TokenEntry};
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_auth::{self, Requests};
+    use axum::http::HeaderMap;
+
+    let bearer = |token: &str| {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        h
+    };
+
+    let auth = TokenAuthenticator::new(vec![TokenEntry {
+        token: "s3cret-token-value-long-enough".to_owned(),
+        actor: "ada".to_owned(),
+        roles: vec!["compliance-officer".to_owned()],
+        tenant: None,
+        scope: None,
+        not_after: None,
+    }])
+    .expect("a token file the battery can run against");
+
+    let mut report = Report::default();
+    conformance_auth::check(
+        &auth,
+        &Requests {
+            accepted: Some((bearer("s3cret-token-value-long-enough"), "ada".to_owned())),
+            // Both in the scheme this server speaks, both refused. A `Basic`
+            // header would not belong here: *I cannot use what you sent* is a
+            // different answer from *I used it and refused it*, and neither
+            // says which tokens exist.
+            rejected: vec![
+                ("an unissued token", bearer("nobody-issued-this-one-at-all")),
+                (
+                    "a token of the right shape",
+                    bearer("s3cret-token-value-wrong-tail"),
+                ),
+            ],
+        },
+        &mut report,
+    )
+    .await;
+    report.assert_conforms("TokenAuthenticator");
+}
+
+/// The battery refuses an authenticator that reports a refusal as an absence.
+///
+/// Without this the battery is a function that returns "no violations" for
+/// everything, which is the shape it exists to catch elsewhere.
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn the_auth_battery_rejects_an_oracle() {
+    use agentplane::api::{AuthError, Authenticator, Caller};
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_auth::{self, Requests};
+    use axum::http::HeaderMap;
+
+    /// Recognises one token and calls everything else absent — so a credential
+    /// it looked at and refused is reported the same way as no credential at
+    /// all, which is the one bit `AuthError`'s shape still leaves free to leak.
+    #[derive(Debug)]
+    struct Coy;
+
+    #[async_trait::async_trait]
+    impl Authenticator for Coy {
+        async fn authenticate(&self, headers: &HeaderMap) -> Result<Caller, AuthError> {
+            match headers.get("authorization").and_then(|v| v.to_str().ok()) {
+                Some(v) if v.contains("expired") => Err(AuthError::Rejected),
+                None | Some(_) => Err(AuthError::Missing),
+            }
+        }
+    }
+
+    let header = |v: &str| {
+        let mut h = HeaderMap::new();
+        h.insert("authorization", v.parse().unwrap());
+        h
+    };
+
+    let mut report = Report::default();
+    conformance_auth::check(
+        &Coy,
+        &Requests {
+            accepted: None,
+            rejected: vec![
+                ("an expired token", header("Bearer expired-one")),
+                ("a token nobody issued", header("Bearer never-existed")),
+            ],
+        },
+        &mut report,
+    )
+    .await;
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|v| v.invariant == "a presented credential is rejected, not missing"),
+        "the battery accepted an authenticator that reports a refused \
+         credential as an absent one: {:?}",
+        report.violations
+    );
 }
 
 /// The battery refuses an engine that answers differently the second time.

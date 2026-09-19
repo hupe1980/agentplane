@@ -298,6 +298,63 @@ async fn an_orphaned_event_wait_is_resubscribed_on_resume() {
     store.verify(out.run_id).await.unwrap();
 }
 
+/// **A wait that has not expired is not a finding.**
+///
+/// The roll-up filters on the instant precisely so that scheduling something
+/// for next Tuesday does not page somebody every day until Tuesday. A control
+/// that cries wolf is one people stop reading, which retires it without anyone
+/// deciding to — so both directions are asserted, and the clock being the
+/// caller's is what makes that assertable rather than a claim in prose.
+#[tokio::test]
+async fn a_wait_needs_a_person_only_once_its_instant_has_passed() {
+    let (run, bytes) = a_run_awaiting_a_message().await;
+
+    let rebuilt = Arc::new(RedbStore::open_in_memory().unwrap());
+    let fresh: Arc<dyn JournalStore> = rebuilt.clone();
+    let fresh_cases: Arc<dyn CaseStore> = rebuilt.clone();
+    agentplane::export::from_jsonl(&fresh, Some(&fresh_cases), std::io::Cursor::new(&bytes))
+        .await
+        .expect("the restore reads it");
+
+    let due = fresh
+        .waiting_runs(100)
+        .await
+        .unwrap()
+        .iter()
+        .find(|w| w.run == run)
+        .map(|w| w.reason.until())
+        .expect("the listing carries the instant");
+
+    let probe = Runtime::builder(Arc::clone(&fresh))
+        .owner("probe")
+        .cases(rebuilt.clone() as Arc<dyn CaseStore>)
+        .events(rebuilt.clone() as Arc<dyn EventStore>)
+        .build();
+    let expired = |a: &agentplane::runtime::Attention| {
+        a.conditions.iter().any(|c| c.kind == "run.wait_expired")
+    };
+
+    let before = probe
+        .attention(due - std::time::Duration::from_secs(60), 50)
+        .await
+        .expect("attention reads");
+    assert!(
+        !expired(&before),
+        "a wait whose instant has not arrived was reported as needing a person: {:?}",
+        before.conditions
+    );
+
+    let after = probe
+        .attention(due + std::time::Duration::from_secs(60), 50)
+        .await
+        .expect("attention reads");
+    assert!(
+        expired(&after),
+        "a wait whose instant has passed is a run lying inert, and nothing said so: {:?}",
+        after.conditions
+    );
+}
+
 /// A plane that suspended a run awaiting a message, and the export of it.
 ///
 /// Split out because the sequence under test starts where this ends — and
@@ -341,9 +398,14 @@ async fn a_run_awaiting_a_message() -> (RunId, Vec<u8>) {
 /// events do, and an export carries neither — so a restored run awaiting a
 /// message has an announcement in its journal, no subscription anywhere, and a
 /// lease it released cleanly when it suspended, which keeps it out of the
-/// recovery pass. Nothing in the system names it except
-/// `RestoreReport::awaiting`, and that field is advice rather than a control,
-/// so what makes the advice worth printing is that acting on it works.
+/// recovery pass.
+///
+/// Two things name it, and they answer different questions. `RestoreReport::
+/// awaiting` names what *this restore* carried, which is advice at the moment
+/// the file is read; `JournalStore::waiting_runs` names what the plane is
+/// waiting on *now*, which is the backlog an operator works through and which
+/// survives the report being lost. Both are asserted here, because the second
+/// exists precisely so the first does not have to be kept.
 ///
 /// The sharper failure is the one after the repair: an event that arrives at a
 /// plane with no subscription **buffers**, and a buffered event nobody claims
@@ -371,8 +433,26 @@ async fn a_restored_event_wait_is_subscribed_by_nothing_until_the_run_is_resumed
     let abandoned = fresh.abandoned_runs(100).await.unwrap();
     assert!(
         !abandoned.contains(&run),
-        "a cleanly suspended run appeared in the recovery queue, so the claim \
-         that nothing else names it is wrong: {abandoned:?}"
+        "a cleanly suspended run appeared in the recovery queue, which is the \
+         wrong backlog: nothing crashed: {abandoned:?}"
+    );
+
+    // The listing the runbook's last step re-arms from, on a store that has
+    // never executed anything — the index came back with the history, because
+    // a restore replays through `append`.
+    let waiting = fresh.waiting_runs(100).await.unwrap();
+    assert!(
+        waiting.iter().any(|w| w.run == run),
+        "a restored run that came back waiting is in no listing, so re-arming it \
+         needs run ids somebody kept from before the incident: {waiting:?}"
+    );
+    assert!(
+        matches!(
+            waiting.iter().find(|w| w.run == run).map(|w| &w.reason),
+            Some(agentplane::core::SuspendReason::AwaitingEvent { .. })
+        ),
+        "the listing must say a message is awaited rather than an instant — one \
+         of those is a correlation defect and the other is the system working"
     );
 
     let done = Arc::new(AtomicUsize::new(0));
@@ -531,6 +611,12 @@ impl JournalStore for CountsAcquires {
     }
     async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.abandoned_runs(limit).await
+    }
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::WaitingRun>, StoreError> {
+        self.inner.waiting_runs(limit).await
     }
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
         self.inner.seal(run, epoch, outcome).await

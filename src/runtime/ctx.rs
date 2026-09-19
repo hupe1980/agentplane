@@ -454,8 +454,9 @@ impl<'a> StepCtx<'a> {
     pub(crate) fn cursor_next(
         &mut self,
         key: EffectKey,
+        asked: &EffectDescriptor,
     ) -> Result<Option<crate::journal::EffectReplay>, StepError> {
-        self.cursor.next(key)
+        self.cursor.next(key, asked, 1)
     }
 
     pub(crate) const fn epoch(&self) -> Epoch {
@@ -1665,10 +1666,11 @@ impl<'a> StepCtx<'a> {
     async fn replayed_wait(
         &mut self,
         key: EffectKey,
+        descriptor: &EffectDescriptor,
         spec: &AwaitSpec,
         cx: &CaseContext,
     ) -> Result<Option<ReplayedWait>, StepError> {
-        match self.cursor.next(key)? {
+        match self.cursor.next(key, descriptor, 1)? {
             Some(EffectReplay::Done {
                 output,
                 source,
@@ -1726,7 +1728,10 @@ impl<'a> StepCtx<'a> {
                     Err(StepError::Suspended(self.suspend_reason(spec, cx).await?))
                 }
             }
-            None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun { actual: key }),
+            None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun {
+                actual: key,
+                kind: descriptor.kind.clone(),
+            }),
             None => Ok(None),
         }
     }
@@ -2339,7 +2344,7 @@ impl<'a> StepCtx<'a> {
         recovery: &crate::core::Recovery,
         policy: &crate::core::RetryPolicy,
     ) -> Result<Replayed<E::Output>, StepError> {
-        match self.cursor.next(key)? {
+        match self.cursor.next(key, descriptor, attempt)? {
             Some(EffectReplay::Done {
                 output,
                 spend,
@@ -2411,7 +2416,10 @@ impl<'a> StepCtx<'a> {
             }
             // History exhausted: this attempt runs live, unless a strict pass
             // is verifying — where reaching the end is itself the finding.
-            None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun { actual: key }),
+            None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun {
+                actual: key,
+                kind: descriptor.kind.clone(),
+            }),
             None => Ok(Replayed::Live),
         }
     }
@@ -2475,7 +2483,10 @@ impl<'a> StepCtx<'a> {
         // starting the next attempt. A strict pass reports that rather than
         // performing anything; a resume carries on live.
         if self.mode == Mode::Strict {
-            return Err(StepError::ReplayOverrun { actual: next });
+            return Err(StepError::ReplayOverrun {
+                actual: next,
+                kind: descriptor.kind.clone(),
+            });
         }
         Ok(attempt + 1)
     }
@@ -2631,7 +2642,7 @@ impl<'a> StepCtx<'a> {
 
         // ── Replay: the timer already fired ────────────────────────────────
         if self.mode.is_replaying() {
-            match self.cursor.next(key)? {
+            match self.cursor.next(key, &descriptor, 1)? {
                 Some(EffectReplay::Done { spend, .. }) => {
                     // A durable sleep sends nothing; it is registered.
                     self.bill_replayed(spend, 0);
@@ -2692,7 +2703,10 @@ impl<'a> StepCtx<'a> {
                     ));
                 }
                 None if self.mode == Mode::Strict => {
-                    return Err(StepError::ReplayOverrun { actual: key });
+                    return Err(StepError::ReplayOverrun {
+                        actual: key,
+                        kind: descriptor.kind.clone(),
+                    });
                 }
                 None => {}
             }
@@ -3250,7 +3264,7 @@ impl<'a> StepCtx<'a> {
         let key = self.next_effect_key(&descriptor);
 
         if self.mode.is_replaying() {
-            match self.cursor.next(key)? {
+            match self.cursor.next(key, &descriptor, 1)? {
                 Some(EffectReplay::Done { .. }) => return Ok(released),
                 Some(EffectReplay::Denied {
                     reason,
@@ -3264,10 +3278,16 @@ impl<'a> StepCtx<'a> {
                     });
                 }
                 Some(_) => {
-                    return Err(StepError::ReplayOverrun { actual: key });
+                    return Err(StepError::ReplayOverrun {
+                        actual: key,
+                        kind: descriptor.kind.clone(),
+                    });
                 }
                 None if self.mode == Mode::Strict => {
-                    return Err(StepError::ReplayOverrun { actual: key });
+                    return Err(StepError::ReplayOverrun {
+                        actual: key,
+                        kind: descriptor.kind.clone(),
+                    });
                 }
                 None => {}
             }
@@ -5208,7 +5228,7 @@ impl StepCtx<'_> {
         // survived the crash that followed.
         let mut repair = false;
         if self.mode.is_replaying() {
-            match self.replayed_wait(key, spec, &cx).await? {
+            match self.replayed_wait(key, &descriptor, spec, &cx).await? {
                 Some(ReplayedWait::Recorded(recorded)) => return Ok(recorded),
                 Some(ReplayedWait::Repair) => repair = true,
                 None => {}

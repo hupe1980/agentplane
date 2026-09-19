@@ -9,12 +9,11 @@
 // brings their own backend must not be forced to compile SQLite.
 #![cfg(feature = "redb")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
-    Digest, Outcome, Release, ReleaseScope, Sensitivity, Skill, SkillDescriptor, SourceId,
-    StepError, Tainted,
+    Digest, Outcome, Release, ReleaseScope, Sensitivity, Skill, SkillDescriptor, SourceId, Tainted,
 };
 use agentplane::journal::{JournalStore, Record, RecordKind};
 use agentplane::runtime::effects::Recorded;
@@ -84,6 +83,33 @@ impl Skill for VariableEffects {
             .await
             .map_err(agentplane::core::SkillError::Step)?;
         }
+        Ok(Outcome::done(input))
+    }
+}
+
+/// Performs one effect whose *name* comes from a knob, so a replay can be made
+/// to ask for a different call at the same position — the shape a code change
+/// produces, as opposed to a different *number* of calls.
+#[derive(Debug)]
+struct NamedEffect {
+    name: Arc<Mutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl Skill for NamedEffect {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("named").provides("demo.named")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, agentplane::core::SkillError> {
+        let name = self.name.lock().unwrap().clone();
+        cx.sink(Recorded::new(name), &Tainted::trusted(Value::Null))
+            .await
+            .map_err(agentplane::core::SkillError::Step)?;
         Ok(Outcome::done(input))
     }
 }
@@ -294,8 +320,9 @@ async fn strict_replay_rejects_a_build_that_does_more_than_the_record() {
     let replayed = rt.replay(first.run_id, Mode::Strict).await.unwrap();
     match replayed.status {
         RunStatus::Quarantined(msg) => assert!(
-            msg.contains("replay overrun"),
-            "expected an overrun diagnosis, got: {msg}"
+            msg.contains("replay overrun") && msg.contains("test.step-1"),
+            "an overrun has to name the call this build made past the end of history, \
+             or it is a digest: {msg}"
         ),
         other => panic!("divergence must quarantine, got {other:?}"),
     }
@@ -329,8 +356,9 @@ async fn strict_replay_rejects_a_build_that_does_something_different() {
     let replayed = rt.replay(first.run_id, Mode::Strict).await.unwrap();
     match replayed.status {
         RunStatus::Quarantined(msg) => assert!(
-            msg.contains("never requested"),
-            "the finding must name the first unconsumed effect: {msg}"
+            msg.contains("never requested") && msg.contains("test.step-"),
+            "the finding must name the effect that went missing — its key alone sends \
+             an operator to read the journal by hand: {msg}"
         ),
         other => panic!(
             "a build performing fewer effects than the record passed strict \
@@ -437,8 +465,9 @@ async fn a_strict_pass_that_stops_early_still_checks_unconsumed_effects() {
     let replayed = rt.replay(first.run_id, Mode::Strict).await.unwrap();
     match replayed.status {
         RunStatus::Quarantined(msg) => assert!(
-            msg.contains("never requested"),
-            "the finding must name the first unconsumed effect: {msg}"
+            msg.contains("never requested") && msg.contains("test.prep-"),
+            "the finding must name the effect that went missing — its key alone sends \
+             an operator to read the journal by hand: {msg}"
         ),
         other => panic!(
             "a build performing fewer effects than the record passed strict \
@@ -773,17 +802,47 @@ async fn skills_resolve_by_capability() {
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
-/// The `StepError` for a divergence names both keys, so an operator can see
-/// which effect moved without reading the journal by hand.
-#[test]
-fn divergence_errors_are_diagnosable() {
-    let e = StepError::NonDeterminism {
-        seq: 7,
-        expected: agentplane::core::EffectKey::from_hex(&Digest::of(b"a").to_hex()).unwrap(),
-        actual: agentplane::core::EffectKey::from_hex(&Digest::of(b"b").to_hex()).unwrap(),
+/// **A divergence says which call moved, not merely that one did.**
+///
+/// Two effect keys are two digests. The party who has to act is whoever changed
+/// the code, and a pair of hashes sends them to read the journal by hand — on
+/// the one failure whose whole purpose is to stop a build that no longer
+/// matches its own history. The reason is journaled into the run's conclusion,
+/// so the unhelpful version is also the permanent one.
+///
+/// Asserted through a real run rather than a constructed error: the sentence is
+/// composed from the record, and a test that built the error itself would be
+/// checking its own format string.
+#[tokio::test]
+async fn a_divergence_names_the_call_that_moved() {
+    let name = Arc::new(Mutex::new("charge".to_owned()));
+    let rt = Runtime::builder(store())
+        .skill(NamedEffect {
+            name: Arc::clone(&name),
+        })
+        .build();
+
+    let first = rt
+        .run("demo.named", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(first.status, RunStatus::Succeeded);
+
+    // Ship a change that calls something else at the same position.
+    *name.lock().unwrap() = "refund".to_owned();
+
+    let replayed = rt.replay(first.run_id, Mode::Strict).await.unwrap();
+    let RunStatus::Quarantined(msg) = replayed.status else {
+        panic!("divergence must quarantine, got {:?}", replayed.status);
     };
-    let msg = e.to_string();
-    assert!(msg.contains("seq 7") && msg.contains("ek:"));
+    assert!(
+        msg.contains("test.charge") && msg.contains("test.refund"),
+        "the reason has to name both calls, or it is two digests: {msg}"
+    );
+    assert!(
+        msg.contains("different path"),
+        "and say what kind of divergence it is: {msg}"
+    );
 }
 
 /// Strict replay must be a pure read. It verifies; it does not write.

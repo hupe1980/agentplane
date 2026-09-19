@@ -230,6 +230,97 @@ fn plan() -> PlanIR {
     ])
 }
 
+/// **One question, and it names which thing — not how many.**
+///
+/// Four reports each answer *did I find something*: the sweep, the witness
+/// pass, the push run, a batch. None answers the question an operator actually
+/// asks, which is about the plane rather than about an operation they just ran
+/// — and asked that way it reaches the conditions no report has, like a
+/// quarantine standing since last week.
+///
+/// Two properties are asserted and the second is the one that makes this more
+/// than a convenience. The answer **names** each condition, because an operator
+/// acts on which one and a total across conditions is a number nobody can act
+/// on. And a backlog this plane has no store for is reported as *not checked*
+/// rather than omitted: a plane that looked and a plane that could not would
+/// otherwise produce the same empty answer.
+#[tokio::test]
+async fn attention_names_each_condition_and_what_it_could_not_check() {
+    let f = fixture();
+
+    // Nothing wrong yet — and the plane is built with a journal only, so most
+    // backlogs are unreadable rather than empty.
+    let quiet =
+        f.rt.attention(agentplane::core::Timestamp::now_utc(), 50)
+            .await
+            .expect("attention reads");
+    assert!(
+        !quiet.any(),
+        "a plane with nothing wrong reported a condition: {:?}",
+        quiet.conditions
+    );
+    for backlog in [
+        "obligations",
+        "worklist",
+        "dead letters",
+        "push registrations",
+    ] {
+        assert!(
+            quiet.not_checked.iter().any(|n| n.contains(backlog)),
+            "no store is wired for {backlog}, and an empty answer that does not say \
+             so reads as `nothing is wrong`: {:?}",
+            quiet.not_checked
+        );
+    }
+
+    let run = quarantined(&f).await;
+
+    let found =
+        f.rt.attention(agentplane::core::Timestamp::now_utc(), 50)
+            .await
+            .expect("attention reads");
+    assert!(found.any(), "a standing quarantine needs a person");
+    let quarantines = found
+        .conditions
+        .iter()
+        .find(|c| c.kind == "run.quarantined")
+        .expect("the condition is named, not summed");
+    assert_eq!(quarantines.found, 1, "{found:?}");
+    assert!(
+        !quarantines.at_least,
+        "a page that did not fill must not read as a floor"
+    );
+    assert!(
+        !quarantines.remedy.is_empty(),
+        "a finding that reaches somebody without saying what they do about it is \
+         delivery in name only"
+    );
+
+    // And it stops being a condition when somebody answers it. A roll-up whose
+    // level only rises is the oversight queue that floods, which retires the
+    // control without anyone deciding to.
+    f.rt.decide_quarantine(
+        run,
+        &operator("ada"),
+        "written off",
+        agentplane::core::QuarantineDecision::Abandon,
+    )
+    .await
+    .expect("abandon");
+    let cleared =
+        f.rt.attention(agentplane::core::Timestamp::now_utc(), 50)
+            .await
+            .expect("attention reads");
+    assert!(
+        !cleared
+            .conditions
+            .iter()
+            .any(|c| c.kind == "run.quarantined"),
+        "an answered quarantine is still listed: {:?}",
+        cleared.conditions
+    );
+}
+
 /// A run stopped on an unanswerable payment, with the booking standing.
 async fn quarantined(f: &Fixture) -> RunId {
     let out =

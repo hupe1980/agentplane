@@ -85,7 +85,7 @@ pub use policy::{
 };
 pub use retry::{RetryPolicy, retry_after_seconds};
 pub use secret::Secret;
-pub use skill::{AgentRef, Capability, Compensation, Outcome, Skill, SkillDescriptor};
+pub use skill::{Capability, Compensation, Outcome, Skill, SkillDescriptor};
 pub use task::{
     ClaimError, Decision, Justification, OnExpiry, Priority, Task, TaskId, TaskSpec, TaskState,
 };

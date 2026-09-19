@@ -29,6 +29,10 @@ pub mod conformance_calendar;
 // gate has to be "a backend exists", not "the embedded one does". Read as `redb`
 // it made the *shared-store* backend's own contract untestable without linking
 // the embedded one, which is the configuration a Postgres deployment ships.
+// Gated on `http`, which is where `Authenticator` lives: the seam only exists
+// for a deployment serving the operator surface.
+#[cfg(feature = "http")]
+pub mod conformance_auth;
 #[cfg(any(feature = "redb", feature = "postgres"))]
 pub mod conformance_case;
 #[cfg(feature = "keyring")]

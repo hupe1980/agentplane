@@ -298,6 +298,19 @@ impl PolicyDecision {
 /// against the same policy set must return the same decision, or a run stops
 /// being replayable for reasons nobody can see.
 ///
+/// # This is not where a content classifier hangs
+///
+/// A `sink` request carries the outbound value's fields and its label, so
+/// scanning here looks like one line of work. Two clauses above forbid it: a
+/// classifier is I/O, and only *denials* are journaled — so a value a
+/// classifier **passed** would leave no trace of having been examined.
+///
+/// Put the inspection behind an effect and let it produce a
+/// [`Label`](crate::core::Label): journaled, replayed rather than re-run, and
+/// the structural gates then decide on it. A heuristic may describe a value;
+/// only a rule may refuse one. [Why, and what a false positive
+/// costs](https://hupe1980.github.io/agentplane/docs/security/).
+///
 /// # What you will be asked
 ///
 /// An engine is consulted at more than one place, and a first one written for

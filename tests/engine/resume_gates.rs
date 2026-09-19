@@ -109,6 +109,84 @@ spec:
   budgets: {}
 "#;
 
+/// **An edited declaration is refused at the frontier, not discovered inside
+/// it.**
+///
+/// The policy bundle gate covers who may authorize an effect; this covers what
+/// the agent *is*. A declarative agent's behaviour is its manifest, so resuming
+/// under an edited one runs a different program over the first one's journal.
+/// Replay would eventually notice — as a key mismatch, several effects in, able
+/// to say only that two digests differ — and the refusal that names the two
+/// revisions is worth more than the diagnosis that follows the work.
+///
+/// The digest is already on the record at admission, so this is a comparison
+/// rather than a format change. Both engines this design is measured against
+/// take the same position: a workflow is tagged with the code version it
+/// started on, and recovery under another is refused rather than attempted.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn an_edited_declaration_is_refused_before_the_resume_replays() {
+    let store = store();
+    let crash = Arc::new(AtomicBool::new(true));
+    let staged = Arc::new(AtomicUsize::new(0));
+    let leaked = Arc::new(AtomicUsize::new(0));
+    let plane = |yaml: &str, crash: &Arc<AtomicBool>| {
+        let manifest = agentplane::manifest::Manifest::parse(yaml).expect("parse");
+        Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+            .agent(
+                agentplane::runtime::Agent::new(&manifest).skill(LeakAfterCrash {
+                    crash: Arc::clone(crash),
+                    staged: Arc::clone(&staged),
+                    leaked: Arc::clone(&leaked),
+                }),
+            )
+            .build()
+    };
+
+    let crashed = plane(LEAKY, &crash)
+        .run("demo.leak", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(crashed.status, RunStatus::Failed(_)));
+
+    // The same agent, one line of its declaration edited: the ceiling it was
+    // admitted under is no longer the ceiling this plane holds.
+    let edited = LEAKY.replace(
+        "max_sensitivity_egress: internal",
+        "max_sensitivity_egress: confidential",
+    );
+    assert_ne!(edited, LEAKY, "the fixture edited nothing");
+    crash.store(false, Ordering::SeqCst);
+
+    let err = plane(&edited, &crash)
+        .replay(crashed.run_id, Mode::Resume)
+        .await
+        .expect_err("a resume under an edited declaration must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("declaration for `leaky` changed"),
+        "the refusal has to name the agent whose declaration moved: {msg}"
+    );
+    assert!(
+        msg.contains("resume under the revision that wrote the journal"),
+        "and hand over the remedy, since the recorded digest is the argument \
+         for it: {msg}"
+    );
+    assert_eq!(
+        leaked.load(Ordering::SeqCst),
+        0,
+        "the refused resume dispatched the very effect the edit would have allowed"
+    );
+
+    // And the unedited plane still resumes, or this test would pass against a
+    // gate that refuses every resume.
+    let same = plane(LEAKY, &crash)
+        .replay(crashed.run_id, Mode::Resume)
+        .await
+        .expect("an unchanged declaration resumes");
+    assert!(matches!(same.status, RunStatus::Failed(_)), "{same:?}");
+}
+
 /// A run refused by the egress ceiling live is refused by it on resume too.
 ///
 /// The crash-then-resume shape: the ceiling gates fired only when

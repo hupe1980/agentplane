@@ -35,6 +35,26 @@ CASE_KIND = "agentplane.export.case"
 TRAILER_KIND = "agentplane.export.end"
 FRAMING = {HEADER_KIND, RUN_KIND, CASE_KIND, TRAILER_KIND}
 
+# The members each framing line is specified to carry. A later writer may add
+# one; this reader passes over it and says so, because a verdict is only as wide
+# as the claims the reader understood. Not a refusal: a framing line is not
+# hashed and carries no evidence of its own, so an added member falsifies
+# nothing already checked — it bounds what "sound" covered. A record line is the
+# other answer, and for the reason its members are covered by a hash.
+FRAMING_MEMBERS = {
+    HEADER_KIND: {"kind", "version", "checkpoint", "canon"},
+    RUN_KIND: {"kind", "run", "index", "seal"},
+    CASE_KIND: {"kind", "case", "deadlines", "blobs"},
+    TRAILER_KIND: {
+        "kind",
+        "runs_requested",
+        "runs_exported",
+        "records",
+        "cases",
+        "unreadable",
+    },
+}
+
 ZERO = bytes(32)
 
 
@@ -116,6 +136,15 @@ def verify(lines: list[str], expected_root: bytes | None = None) -> Report:
         if not isinstance(value, dict):
             report.note(f"line {number} is not a JSON object")
             return report
+        known = FRAMING_MEMBERS.get(value.get("kind"))
+        if known is not None:
+            unknown = sorted(set(value) - known)
+            if unknown:
+                report.unchecked.append(
+                    f"a {value['kind']} line carries {', '.join(unknown)} this reader "
+                    "does not know — whatever they claim was not checked, and a later "
+                    "writer produced this file"
+                )
         parsed.append(value)
 
     if not parsed:
@@ -530,8 +559,10 @@ def canon_check(path: str) -> int:
 # ── Proving this verifier bites ────────────────────────────────────────────
 # A second implementation that reports "0 findings" for everything agrees with
 # the first one perfectly and is worth nothing. `--self-test` takes a file that
-# verifies, damages it six ways, and asserts each damage is reported — so the
-# gate checks that this reader can still fail, not only that it passed.
+# verifies, damages it, and asserts each damage is reported — so the gate checks
+# that this reader can still fail, not only that it passed. It also checks the
+# other direction: a file that is *not* damaged but carries something this
+# reader does not understand has to bound its own verdict rather than pass.
 
 def _damaged(lines: list[dict]) -> list[tuple[str, list[dict], str]]:
     import copy
@@ -570,6 +601,22 @@ def _damaged(lines: list[dict]) -> list[tuple[str, list[dict], str]]:
     return cases
 
 
+def _bounded(lines: list[dict]) -> list[tuple[str, list[dict], str]]:
+    """Files that are sound and carry something this reader cannot account for.
+
+    Each must verify with no findings and say what it passed over. A reader that
+    reports these as damage is wrong in the expensive direction, and one that
+    reports them not at all has described a file it read part of.
+    """
+    import copy
+
+    ahead = copy.deepcopy(lines)
+    for line in ahead:
+        if line.get("kind") == HEADER_KIND:
+            line["attestation_bundle"] = {"alg": "ml-dsa-65"}
+    return [("a framing member from a later writer", ahead, "attestation_bundle")]
+
+
 def self_test(lines: list[str]) -> int:
     clean = verify(lines)
     if clean.findings:
@@ -587,7 +634,18 @@ def self_test(lines: list[str]) -> int:
         else:
             print(f"MISS {name}: nothing reported {expected!r}; got {report.findings}")
             failures += 1
-    print(f"{len(_damaged(parsed)) - failures}/{len(_damaged(parsed))} damages reported")
+    for name, ahead, expected in _bounded(parsed):
+        report = verify([json.dumps(line) for line in ahead])
+        if report.findings:
+            print(f"MISS {name}: reported as damage; got {report.findings}")
+            failures += 1
+        elif any(expected in note for note in report.unchecked):
+            print(f"ok   {name}")
+        else:
+            print(f"MISS {name}: nothing said it passed over {expected!r}")
+            failures += 1
+
+    print(f"{failures} case(s) not reported" if failures else "every case reported")
     return 1 if failures else 0
 
 

@@ -59,10 +59,20 @@ Both directions are refused, and the policy is the strict one on purpose:
   a reader that drops one reaches a verdict over evidence it did not see and
   reports it as an ordinary result.
 
-Both are classified as a **build skew, never as damage**. A rolling deploy that
-put a writer ahead of its readers reaching an operator as *the history has been
-altered* would spend the one alarm that has to stay believable. The refusal says
-what to do instead: deploy readers before writers.
+Both are classified as a **build skew, never as damage** — `UnknownRecordVersion`
+for a version this build does not read, `UnreadableRecordShape` for a shape at
+the version it does. A rolling deploy that put a writer ahead of its readers
+reaching an operator as *the history has been altered* would spend the one alarm
+that has to stay believable. Each refusal carries its own remedy: which binary
+wrote the journal, and which one to run.
+
+**Before the freeze, the second is the only one you will meet.** A shape change
+here is a [hard cut](@/docs/format.md) and a hard cut does not bump the version
+— so the two builds either side of one agree about `v` and disagree about the
+shape. The classification is safe to make because of the order a read happens
+in: the stored hash is checked before the body is parsed, so a record that
+reaches the parse carries the bytes that were written and the chain commits to
+them. A failure after that point is a statement about the reader.
 
 An upcast is a **read-time view**. The bytes the chain commits to are the ones
 that were written, so tamper evidence does not depend on the age of the reader —

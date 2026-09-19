@@ -651,6 +651,33 @@ two graphs would exist only in the checks this crate happens to have written.
 is **not** trusted: a rule requiring a source simply does not match, so it fails
 closed.
 
+### Where a content classifier hangs, and where it does not
+
+The policy seam looks like the place: a `sink` request already carries the
+outbound value's fields in `context.args` and its label in `context.label`, so
+scanning here is one line of work. It is the wrong place, for reasons that are
+the seam's own contract rather than a matter of taste.
+
+`authorize` must be **total and pure** — no I/O, no clock, no randomness —
+because an engine that can fail open under load is not an authorization layer.
+A model call or a scanning service is exactly the I/O that forbids. And only
+**denials** are journaled: a replayed effect never reaches the gate, so a value
+a classifier *passed* leaves no trace of having been examined. That inverts the
+claim this whole page is about.
+
+**Put the inspection behind an effect, and let it produce a label.** An
+inspection is an observation of the outside world, so it crosses the effect
+protocol like every other one: its verdict is journaled, and a replay reads that
+verdict back instead of re-running a classifier over a value it can no longer
+reproduce. What the verdict yields is a sensitivity, a trust or a provenance
+entry — and the structural gates above then decide exactly. A heuristic may
+*describe* a value; only a rule may refuse one.
+
+That division is also what a false positive costs. Behind an effect it raises a
+label, the sink gate refuses on it, and the journal holds both the classifier's
+verdict and the refusal — so an operator can see which of the two was wrong. On
+the policy seam it stops the run with a rule name and no evidence at all.
+
 ### A decision somebody else can check
 
 Policy is total and side-effect free so that a third party can re-derive a
@@ -1730,7 +1757,6 @@ model effect; strict replay performs no DNS, HTTP or blob read. The result stays
 or screenshot safe instructions. Network-layer egress controls remain required
 defence in depth, as recommended by the
 [OWASP SSRF guidance](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html).
-
 
 Stated plainly, because a reader who assumes otherwise will size their risk
 wrongly:

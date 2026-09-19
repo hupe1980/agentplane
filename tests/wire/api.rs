@@ -805,6 +805,8 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
     let mut requests = vec![
         get("/runs?outcome=quarantined", None),
         get("/runs/live", None),
+        get("/runs/waiting", None),
+        get("/attention", None),
         get("/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV", None),
         post(
             "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/cancel",
@@ -870,21 +872,13 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// Authentication is not authorization: a denying policy stops every route.
+/// Every route this surface serves, as a request under `bob`'s roles.
 ///
-/// The check is `403`, not `404` or `400` — a route that parses the path or
-/// touches the store before asking the policy engine has already leaked whether
-/// the thing exists.
-#[tokio::test]
-async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
-    let policy = Arc::new(Recording {
-        seen: Mutex::new(Vec::new()),
-        deny: true,
-    });
-    let f = fixture_with(&policy);
-    let router = f.router();
-
-    let mut requests = vec![
+/// Lifted out of the test rather than inlined because the list is the *data*
+/// the test walks: a route added next year belongs here, and a hundred-line
+/// function is where an addition stops being noticed.
+fn every_declared_route() -> Vec<axum::http::Request<axum::body::Body>> {
+    vec![
         get("/runs/not-an-id", Some("bob")),
         // Its own verb, and asked before the id is even parsed: the records of
         // a run are its inputs and every argument it sent, which is not what a
@@ -941,6 +935,8 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
         // never writes a rule for it.
         get("/runs", Some("bob")),
         get("/runs/live", Some("bob")),
+        get("/runs/waiting", Some("bob")),
+        get("/attention", Some("bob")),
         get("/cases", Some("bob")),
         get("/obligations", Some("bob")),
         post(
@@ -949,7 +945,24 @@ async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
             &json!({ "case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "obligation": "ack" }),
         ),
         get("/dead-letters", Some("bob")),
-    ];
+    ]
+}
+
+/// Authentication is not authorization: a denying policy stops every route.
+///
+/// The check is `403`, not `404` or `400` — a route that parses the path or
+/// touches the store before asking the policy engine has already leaked whether
+/// the thing exists.
+#[tokio::test]
+async fn a_denying_policy_stops_every_route_before_it_touches_anything() {
+    let policy = Arc::new(Recording {
+        seen: Mutex::new(Vec::new()),
+        deny: true,
+    });
+    let f = fixture_with(&policy);
+    let router = f.router();
+
+    let mut requests = every_declared_route();
     requests.extend(hold_routes(Some("bob")));
     requests.extend(halt_routes(Some("bob")));
     requests.extend(push_routes(Some("bob")));

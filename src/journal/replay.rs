@@ -97,10 +97,27 @@ pub enum EffectReplay {
         resource: String,
     },
     /// It started and we do not know whether it landed.
-    Orphan {
-        descriptor: Box<EffectDescriptor>,
-        recovery: Recovery,
-    },
+    ///
+    /// The recorded [`Recovery`] is what decides whether re-performing it is
+    /// safe. What history asked for is not here: it is on every entry rather
+    /// than on this one variant, because the question *what did the run do at
+    /// this position* is what a divergence has to answer, and a divergence can
+    /// land on any of them.
+    Orphan { recovery: Recovery },
+}
+
+/// The clear half of a journaled attempt.
+///
+/// **Clear is the operative word.** An effect's arguments are a sealed field on
+/// its record, so a message composed from them would write caller data into a
+/// run's conclusion, which is not sealed — the plaintext copy an erasure could
+/// not reach. Its `kind` and its attempt number are clear on the record by the
+/// same decision, and they are enough to say which *kind* of divergence this
+/// is. Which argument moved is a question for a reader holding the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Attempted {
+    kind: String,
+    attempt: u32,
 }
 
 impl EffectReplay {
@@ -140,8 +157,43 @@ impl EffectReplay {
 /// between them.
 #[derive(Debug, Clone, Default)]
 pub struct StepCursor {
-    effects: Vec<(EffectKey, Seq, EffectReplay)>,
+    effects: Vec<Journaled>,
     pos: usize,
+}
+
+/// A journaled effect this build never asked for.
+///
+/// Carries the call rather than only its key, for the reason a divergence does:
+/// the finding is *an effect went missing*, and an operator hunting one needs to
+/// know which. `kind` is absent exactly where history announced nothing — a
+/// refusal has no descriptor to name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unconsumed {
+    pub key: EffectKey,
+    pub kind: Option<String>,
+}
+
+impl std::fmt::Display for Unconsumed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            Some(kind) => write!(f, "`{kind}` ({})", self.key),
+            None => write!(f, "a refused call ({})", self.key),
+        }
+    }
+}
+
+/// One position in a step's recorded history.
+#[derive(Debug, Clone)]
+struct Journaled {
+    key: EffectKey,
+    seq: Seq,
+    /// What the record says was attempted here, where anything was.
+    ///
+    /// `None` for a position nothing announced: a budget refusal and a policy
+    /// denial both stop a call before `EffectStarted`, so history has no
+    /// descriptor to name. Saying that is better than inventing one.
+    what: Option<Attempted>,
+    replay: EffectReplay,
 }
 
 impl StepCursor {
@@ -160,11 +212,38 @@ impl StepCursor {
     /// would replay the same run for less. A slot is one announced attempt,
     /// and its spend is everything that attempt's records report.
     fn settle(&mut self, key: EffectKey, state: EffectReplay) {
-        if let Some(slot) = self.effects.iter_mut().rev().find(|(k, _, _)| *k == key) {
-            let carried = slot.2.spend();
-            slot.2 = state;
-            slot.2.add_spend(carried);
+        if let Some(slot) = self.effects.iter_mut().rev().find(|e| e.key == key) {
+            let carried = slot.replay.spend();
+            slot.replay = state;
+            slot.replay.add_spend(carried);
         }
+    }
+
+    /// Open a slot for an announced attempt.
+    ///
+    /// An `EffectStarted` with no terminal record after it is an orphan, so the
+    /// slot starts in that state and a later record settles it. What the slot
+    /// keeps besides the outcome is the *clear* half of what was asked for —
+    /// which is what a divergence at this position quotes back.
+    fn announce(
+        &mut self,
+        key: EffectKey,
+        seq: Seq,
+        descriptor: &EffectDescriptor,
+        recovery: &Recovery,
+        attempt: u32,
+    ) {
+        self.effects.push(Journaled {
+            key,
+            seq,
+            what: Some(Attempted {
+                kind: descriptor.kind.clone(),
+                attempt,
+            }),
+            replay: EffectReplay::Orphan {
+                recovery: recovery.clone(),
+            },
+        });
     }
 
     /// Fold one record into this step's replay sequence.
@@ -173,17 +252,9 @@ impl StepCursor {
             RecordKind::EffectStarted {
                 descriptor,
                 recovery,
+                attempt,
                 ..
-            } => {
-                self.effects.push((
-                    key,
-                    seq,
-                    EffectReplay::Orphan {
-                        descriptor: Box::new(descriptor.clone()),
-                        recovery: recovery.clone(),
-                    },
-                ));
-            }
+            } => self.announce(key, seq, descriptor, recovery, *attempt),
             RecordKind::EffectDone {
                 output,
                 source,
@@ -216,14 +287,15 @@ impl StepCursor {
             // is that nothing was announced — so it pushes its own entry
             // rather than updating one.
             RecordKind::BudgetRefused { limit, used } => {
-                self.effects.push((
+                self.effects.push(Journaled {
                     key,
                     seq,
-                    EffectReplay::Refused {
+                    what: None,
+                    replay: EffectReplay::Refused {
                         limit: limit.clone(),
                         used: used.clone(),
                     },
-                ));
+                });
             }
             // A re-admission supersedes the refusal it was journaled beside: a
             // resume asked the ledger then in force and was answered yes, so a
@@ -237,7 +309,7 @@ impl StepCursor {
                 if let Some(pos) = self
                     .effects
                     .iter()
-                    .rposition(|(k, _, r)| *k == key && matches!(r, EffectReplay::Refused { .. }))
+                    .rposition(|e| e.key == key && matches!(e.replay, EffectReplay::Refused { .. }))
                 {
                     self.effects.remove(pos);
                 }
@@ -247,15 +319,16 @@ impl StepCursor {
                 action,
                 resource,
             } => {
-                self.effects.push((
+                self.effects.push(Journaled {
                     key,
                     seq,
-                    EffectReplay::Denied {
+                    what: None,
+                    replay: EffectReplay::Denied {
                         reason: reason.clone(),
                         action: action.clone(),
                         resource: resource.clone(),
                     },
-                ));
+                });
             }
             RecordKind::Released { .. } => self.record_release(key, seq),
             RecordKind::EffectFailed {
@@ -317,10 +390,11 @@ impl StepCursor {
     }
 
     fn record_release(&mut self, key: EffectKey, seq: Seq) {
-        self.effects.push((
+        self.effects.push(Journaled {
             key,
             seq,
-            EffectReplay::Done {
+            what: None,
+            replay: EffectReplay::Done {
                 output: serde_json::Value::Null,
                 source: None,
                 spend: crate::core::Spend::default(),
@@ -330,7 +404,7 @@ impl StepCursor {
                 // being the one synthesized `Done` that means *trusted*.
                 declared: crate::core::DeclaredOutput::untrusted(),
             },
-        ));
+        });
     }
 
     /// Whether this step's history is used up.
@@ -349,8 +423,11 @@ impl StepCursor {
     /// name the key rather than merely count — an operator hunting a missing
     /// effect needs to know which one went missing.
     #[must_use]
-    pub fn first_unconsumed(&self) -> Option<EffectKey> {
-        self.effects.get(self.pos).map(|(k, _, _)| *k)
+    pub fn first_unconsumed(&self) -> Option<Unconsumed> {
+        self.effects.get(self.pos).map(|e| Unconsumed {
+            key: e.key,
+            kind: e.what.as_ref().map(|w| w.kind.clone()),
+        })
     }
 
     /// Whether the next journaled effect is `key`, without consuming it.
@@ -361,9 +438,7 @@ impl StepCursor {
     /// instead would let a policy edit rewrite what happened.
     #[must_use]
     pub fn peek_is(&self, key: EffectKey) -> bool {
-        self.effects
-            .get(self.pos)
-            .is_some_and(|(k, _, _)| *k == key)
+        self.effects.get(self.pos).is_some_and(|e| e.key == key)
     }
 
     /// Consume the next journaled effect, verifying it is the one being asked
@@ -371,19 +446,83 @@ impl StepCursor {
     ///
     /// Returns `None` once history is exhausted, meaning "perform this one
     /// live".
-    pub fn next(&mut self, recomputed: EffectKey) -> Result<Option<EffectReplay>, StepError> {
-        let Some((expected, seq, replay)) = self.effects.get(self.pos) else {
+    ///
+    /// `asked` and `attempt` describe the call this build is making, and they
+    /// are here for the failure path: two effect keys are two digests, and a
+    /// developer who changed a code path needs to know *which* call moved.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError::NonDeterminism`] if the recomputed key is not the one
+    /// history records at this position.
+    pub fn next(
+        &mut self,
+        recomputed: EffectKey,
+        asked: &EffectDescriptor,
+        attempt: u32,
+    ) -> Result<Option<EffectReplay>, StepError> {
+        let Some(entry) = self.effects.get(self.pos) else {
             return Ok(None);
         };
-        if *expected != recomputed {
+        if entry.key != recomputed {
             return Err(StepError::NonDeterminism {
-                seq: *seq,
-                expected: *expected,
+                seq: entry.seq,
+                expected: entry.key,
                 actual: recomputed,
+                detail: entry.diverged_from(asked, attempt),
             });
         }
         self.pos += 1;
-        Ok(Some(replay.clone()))
+        Ok(Some(entry.replay.clone()))
+    }
+}
+
+impl Journaled {
+    /// Say how the call this build is making differs from the one recorded
+    /// here, in terms a reader can act on.
+    ///
+    /// **Bounded by what is clear on the record.** An effect's arguments are a
+    /// sealed field, and this sentence is composed into a run's conclusion,
+    /// which is not — so quoting an argument would leave a plaintext copy of
+    /// caller data that an erasure cannot reach. The kind and the attempt are
+    /// clear by the same decision, and between them they separate the three
+    /// ways a position can diverge.
+    ///
+    /// **Why "the arguments differ" is sound rather than a guess.** The key is
+    /// derived from the step, the phase, the ordinal, the attempt, the kind and
+    /// the canonical arguments. Step and phase are fixed — this cursor is one
+    /// step's — and the ordinal matches by construction at the *first*
+    /// divergence, because both sides advance one position per effect and an
+    /// earlier mismatch would have stopped the run already. With kind and
+    /// attempt equal too, the arguments are the only input left.
+    fn diverged_from(&self, asked: &EffectDescriptor, attempt: u32) -> String {
+        let Some(what) = &self.what else {
+            return format!(
+                "history announced no call at this position — it recorded a refusal, which \
+                 stops a call before it starts — and this build asks for `{}`",
+                asked.kind
+            );
+        };
+        if what.kind != asked.kind {
+            return format!(
+                "history performed `{}` here and this build asks for `{}` — the code takes a \
+                 different path than the code that wrote this journal",
+                what.kind, asked.kind
+            );
+        }
+        if what.attempt != attempt {
+            return format!(
+                "both perform `{}`, at different attempts — history recorded attempt {} and \
+                 this build is on attempt {}, so the retry decisions differ rather than the \
+                 call",
+                what.kind, what.attempt, attempt
+            );
+        }
+        format!(
+            "both perform `{}` at attempt {}, so the arguments differ — they are sealed with \
+             the record, so comparing them needs a reader holding the key",
+            what.kind, what.attempt
+        )
     }
 }
 
@@ -460,15 +599,15 @@ impl ReplayCursor {
     /// phase it belongs to — the strict verifier's witness that this build
     /// performs fewer effects than the record.
     #[must_use]
-    pub fn first_unconsumed(&self) -> Option<(StepId, Phase, EffectKey)> {
+    pub fn first_unconsumed(&self) -> Option<(StepId, Phase, Unconsumed)> {
         self.by_step.iter().find_map(|((step, phase), cursor)| {
-            cursor.first_unconsumed().map(|k| (*step, *phase, k))
+            cursor.first_unconsumed().map(|u| (*step, *phase, u))
         })
     }
 
     /// The first unconsumed effect in one `(step, phase)` slice, if any.
     #[must_use]
-    pub fn unconsumed_in(&self, step: StepId, phase: Phase) -> Option<EffectKey> {
+    pub fn unconsumed_in(&self, step: StepId, phase: Phase) -> Option<Unconsumed> {
         self.by_step
             .get(&(step, phase))
             .and_then(StepCursor::first_unconsumed)
@@ -659,8 +798,19 @@ mod tests {
         step: StepId,
         key: EffectKey,
     ) -> Result<Option<EffectReplay>, StepError> {
+        next_asked(cur, step, key, &desc())
+    }
+
+    /// The same, naming the call this build is making — which is what a
+    /// divergence quotes back.
+    fn next_asked(
+        cur: &mut ReplayCursor,
+        step: StepId,
+        key: EffectKey,
+        asked: &EffectDescriptor,
+    ) -> Result<Option<EffectReplay>, StepError> {
         let mut slice = cur.take(step, Phase::Forward);
-        let out = slice.next(key);
+        let out = slice.next(key, asked, 1);
         cur.restore(step, Phase::Forward, slice);
         out
     }
@@ -715,6 +865,80 @@ mod tests {
             next(&mut cur, S0, key(99)).unwrap_err(),
             StepError::NonDeterminism { .. }
         ));
+    }
+
+    /// **The three shapes a position can diverge in, told apart.**
+    ///
+    /// Two effect keys are two digests, and the party who has to act is whoever
+    /// changed the code. What separates *a different call*, *a different
+    /// attempt* and *the same call with different arguments* is worth saying,
+    /// because each sends a reader somewhere else — and the sentence is
+    /// journaled into the run's conclusion, so the unhelpful version would be
+    /// the permanent one.
+    ///
+    /// The third arm is bounded by what may be said: an effect's arguments are
+    /// a sealed field and a conclusion is not, so quoting one would leave a
+    /// plaintext copy of caller data that an erasure cannot reach.
+    #[test]
+    fn a_divergence_says_which_of_the_three_things_moved() {
+        let recs = records(vec![(S0, key(1), started())]);
+
+        let elsewhere = EffectDescriptor::nullary("test.somewhere-else");
+        let msg = next_asked(
+            &mut ReplayCursor::from_records(&recs),
+            S0,
+            key(99),
+            &elsewhere,
+        )
+        .expect_err("diverges")
+        .to_string();
+        assert!(
+            msg.contains("test.effect") && msg.contains("test.somewhere-else"),
+            "a changed call must name both sides: {msg}"
+        );
+
+        // Same call, and the key differs anyway: nothing else is left.
+        let msg = next_asked(&mut ReplayCursor::from_records(&recs), S0, key(99), &desc())
+            .expect_err("diverges")
+            .to_string();
+        assert!(
+            msg.contains("the arguments differ") && msg.contains("sealed"),
+            "the remaining input has to be named, and named as unquotable: {msg}"
+        );
+
+        // A retry this build takes and history did not.
+        let mut slice = ReplayCursor::from_records(&recs).take(S0, Phase::Forward);
+        let msg = slice
+            .next(key(99), &desc(), 2)
+            .expect_err("diverges")
+            .to_string();
+        assert!(
+            msg.contains("attempt 1") && msg.contains("attempt 2"),
+            "a differing attempt is a different finding from a differing argument: {msg}"
+        );
+
+        // A position history refused announced no call at all, and saying so
+        // beats inventing a descriptor for it.
+        let refused = records(vec![(
+            S0,
+            key(1),
+            RecordKind::BudgetRefused {
+                limit: "spend".into(),
+                used: "1".into(),
+            },
+        )]);
+        let msg = next_asked(
+            &mut ReplayCursor::from_records(&refused),
+            S0,
+            key(99),
+            &desc(),
+        )
+        .expect_err("diverges")
+        .to_string();
+        assert!(
+            msg.contains("announced no call"),
+            "a refusal has no descriptor and the reason must say so: {msg}"
+        );
     }
 
     /// Same effects, wrong order within a step, is still divergence.

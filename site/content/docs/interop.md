@@ -311,9 +311,12 @@ happened is how a half-finished transfer gets sent twice. Symmetrically, a task
 in a terminal unsuccessful state is not in doubt: the peer created a task and
 reported its outcome, so `Recovery` has nothing left to discover.
 
-The capability and the provenance travel under a declared extension URI rather
-than being smuggled into a free-form field, so a peer that does not understand it
-still receives a well-formed message. The delegation chain is not among them:
+The capability and the provenance travel under a declared extension URI —
+`…/a2a/ext/caller-context/v1`, one of the family the card also uses — rather
+than being smuggled into a free-form field, so a peer that does not understand
+it still receives a well-formed message. **"caller" is the half to read first:**
+what is under that key is the sender's account of its own request, and a
+receiver may not take it as authority. The delegation chain is not among them:
 [the hop is checked against it here](#the-chain-a-hop-is-checked-against-is-the-run-s)
 and the peer derives its own from the credential. The provenance block is
 separately attested and bound to the call, so a peer with the workload verifier

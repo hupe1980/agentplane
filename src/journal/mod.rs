@@ -21,9 +21,10 @@ mod witness_http;
 
 pub use atomic::{AtomicJournal, AtomicResource, AtomicTx, AtomicWork, SqlValue};
 pub use note::{NoteSignature, SignedNote, key_id};
+pub(crate) use record::unreadable;
 pub use record::{AgentIdentity, Append, Record, RecordBody, RecordKind};
 pub use replay::{EffectReplay, ReplayCursor, StepCursor, undecided_effects};
-pub use store::{Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease};
+pub use store::{Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease, WaitingRun};
 pub use upcast::{Identity, Upcaster};
 pub use witness::{
     Cosignature, CosignedCheckpoint, MemoryWitness, QuorumOutcome, SplitView, Witness,

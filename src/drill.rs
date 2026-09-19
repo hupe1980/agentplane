@@ -306,6 +306,16 @@ async fn check_sealed(
             "case {case}: {e}. Run the plane on a build that reads this version, or restore \
              this case from an export written by one — nothing here needs a key operation"
         )),
+        // The one cause this build cannot name. A header at a version it reads
+        // that it cannot parse is either damage or another build's shape, and
+        // nothing has authenticated the bytes at that point — so this arm
+        // exists to *stop* the one below asserting a cause. A drill that sends
+        // somebody to hunt tampering when the remedy is a binary spends the
+        // same alarm as the reverse, and the reverse is worse.
+        Some(Err(e @ KeyError::UnreadableHeader { .. })) => report.findings.push(format!(
+            "case {case}: {e}. Establish which before acting: if another build has written \
+             this store, run that build; if none has, these bytes are damaged"
+        )),
         Some(Err(e)) => report.findings.push(format!(
             "case {case}: sealed state neither opens nor was its key destroyed ({e}) — \
              an erasure would have said so, which makes this loss or tampering"
@@ -400,6 +410,57 @@ mod sealed_classification_tests {
             report.findings[0].contains("loss or tampering"),
             "damage inside a version this build reads must still page somebody: {}",
             report.findings[0]
+        );
+    }
+
+    /// **A cause this build cannot establish is not asserted.**
+    ///
+    /// A header at a version this build reads that it nevertheless cannot parse
+    /// has two explanations — damaged bytes, or a build whose header shape
+    /// differs — and nothing has authenticated the bytes at that point, because
+    /// the tag that would is inside the payload and reaching it needs the key
+    /// this header names. The arm above it names a version and hands over a
+    /// remedy; the arm below it names an incident. This one is neither, and a
+    /// drill that folded it into either is telling somebody something it does
+    /// not know.
+    #[tokio::test]
+    async fn a_header_this_build_cannot_parse_names_both_causes() {
+        let ring = MemoryKeyRing::new();
+        // This build's own version, then a header that is valid JSON and is not
+        // a wrapped key — the shape a hard cut produces.
+        let header = br#"{"scope":"acme/matter","kdf":"argon2id"}"#;
+        let mut bytes = vec![crate::keyring::ENVELOPE_FORMAT_VERSION];
+        bytes.extend_from_slice(&u32::try_from(header.len()).expect("fits").to_be_bytes());
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0_u8; 24]);
+        bytes.extend_from_slice(b"ciphertext");
+
+        let mut report = blank();
+        check_sealed(
+            &mut report,
+            &ring,
+            CaseId::generate(),
+            &crate::journal::payload::wrap(&bytes),
+        )
+        .await;
+
+        assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
+        let finding = &report.findings[0];
+        assert!(
+            finding.contains("another build wrote them"),
+            "the benign cause has to be offered, or this pages somebody for a rollback: \
+             {finding}"
+        );
+        assert!(
+            finding.contains("Establish which before acting"),
+            "the finding has to hand over the step that separates the two causes: {finding}"
+        );
+        // Asserted on the *drill's own* sentence rather than on the error's,
+        // because the arm below embeds the error too — so a test that only read
+        // the error text would pass with this arm deleted.
+        assert!(
+            !finding.contains("an erasure would have said so"),
+            "a cause this build cannot establish, reported as an incident: {finding}"
         );
     }
 

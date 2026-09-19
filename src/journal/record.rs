@@ -773,6 +773,35 @@ fn version_claimed(raw: &[u8]) -> Option<(String, u16)> {
     Some((kind, version))
 }
 
+/// What a failure to parse a record's wire bytes means, once the version has
+/// been ruled out as the explanation.
+///
+/// **Pre-freeze this is the whole of build skew.** A shape change is a hard cut
+/// and a hard cut leaves `v` alone, so the two sides of every change this
+/// project has shipped agree about the version and disagree about the shape —
+/// and the arm that names a skew and says which binary to run is reached by
+/// nothing. What arrives here instead is a field the reader has never heard of,
+/// or one whose type moved.
+///
+/// Naming it a skew is sound only where the caller has already verified the
+/// hash, which is why this is not public: the bytes must be known to be the
+/// bytes that were written before a parse failure can be a statement about the
+/// reader. Where they are not, it is a statement about the bytes.
+///
+/// Bytes that do not name a kind at a version are left as an encoding fault.
+/// There is nobody to blame: a payload that hashes correctly and is not a
+/// record is not evidence that somebody is running a different build.
+pub(crate) fn unreadable(raw: &[u8], parse: serde_json::Error) -> StoreError {
+    match version_claimed(raw) {
+        Some((kind, version)) => StoreError::UnreadableRecordShape {
+            kind,
+            version,
+            detail: parse.to_string(),
+        },
+        None => StoreError::Encoding(parse),
+    }
+}
+
 /// The hashed portion of a record.
 ///
 /// Field order here *is* the wire order (serde preserves struct declaration
@@ -936,8 +965,11 @@ impl Record {
     ///
     /// [`StoreError::Corrupt`] if the stored hash does not cover the bytes,
     /// [`StoreError::UnknownRecordVersion`] if no upcaster can reach this
-    /// build's shape from the one on the record, and
-    /// [`StoreError::Encoding`] if the bytes are not a record at all.
+    /// build's shape from the one on the record,
+    /// [`StoreError::UnreadableRecordShape`] if the record is at the version
+    /// this build writes and still does not parse — the skew a hard cut
+    /// produces — and [`StoreError::Encoding`] if the bytes are not a record
+    /// at all.
     pub fn from_stored_with(
         upcaster: &dyn super::Upcaster,
         raw: Vec<u8>,
@@ -975,7 +1007,7 @@ impl Record {
                 Some((kind, v)) if v != upcaster.current_version(&kind) => {
                     lift(upcaster, &raw, &kind, v)?
                 }
-                _ => return Err(StoreError::Encoding(parse)),
+                _ => return Err(unreadable(&raw, parse)),
             },
         };
         Ok(Self {

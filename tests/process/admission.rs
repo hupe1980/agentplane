@@ -790,6 +790,12 @@ impl JournalStore for BlindToKeys {
     ) -> Result<Vec<agentplane::RunId>, agentplane::core::StoreError> {
         self.0.abandoned_runs(limit).await
     }
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::WaitingRun>, agentplane::core::StoreError> {
+        self.0.waiting_runs(limit).await
+    }
     async fn release_lease(
         &self,
         run: agentplane::RunId,

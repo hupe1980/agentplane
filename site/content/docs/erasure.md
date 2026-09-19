@@ -557,6 +557,14 @@ case** is a finding — the last most of all, because erasing that case destroys
 key which does not reach those bytes, so the data would survive the deletion
 request.
 
+**Three findings, and they send different people.** A version this build does not
+read is a skew, and the remedy is which binary is running. Damage at a version it
+does read is an incident. Between them sits the header it reads the version of
+and cannot parse: nothing has authenticated the bytes at that point, so it is
+either damage or another build's shape, and the report says so instead of
+choosing. A drill that guessed there would either page somebody for a rollback or
+shrug at a real loss, and it is the same alarm either way.
+
 The version stays `1` until the durable-format freeze, and an envelope at any
 other version is refused rather than lifted. Pre-alpha shape changes are hard
 cuts, and here more sharply than anywhere else in the crate: sealed bytes cannot

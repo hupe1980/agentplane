@@ -21,6 +21,14 @@ This page maps obligations to mechanisms **that exist**, and is equally explicit
 about the ones that do not. A compliance page that lists only what a tool offers
 is a sales document.
 
+**This is the only place the mapping lives, and it is downstream of the
+mechanisms.** Each row names something defined elsewhere — the journal, the
+worklist, the export, the witness — and those definitions are authoritative
+about what they do; a row is authoritative about which obligation they are being
+read against. So when a mechanism changes, the row moves. Nothing in the other
+direction: a statute does not become satisfied because a page says so, which is
+the sentence at the top of this one.
+
 ---
 
 ## 📅 Where the EU AI Act actually stands {#where-the-eu-ai-act-actually-stands}

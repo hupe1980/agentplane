@@ -57,10 +57,26 @@ use agentplane::model::ModelProvider;
 use agentplane::runtime::{Mode, RunStatus, Runtime, RuntimeBuilder};
 use agentplane::store::RedbStore;
 
-fn install_tracing() {
+/// Install the log subscriber, deciding whether metric events are part of the
+/// output.
+///
+/// **Metrics carry their own `tracing` target so that a subscriber can filter
+/// them out cheaply**, and this binary is a subscriber. A one-shot verb has
+/// nobody collecting a counter: printing two metric events per run buries the
+/// two lines the run is actually about, on the first command a new reader
+/// types. A serving plane is the case where somebody is collecting, and there
+/// the stream is the fallback export when no collector is wired.
+///
+/// `RUST_LOG` overrides the whole decision, so a one-shot run that *is* being
+/// measured stays reachable.
+fn install_tracing(metrics: bool) {
     use tracing_subscriber::{EnvFilter, fmt};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,agentplane=info"));
+    let default = if metrics {
+        "warn,agentplane=info"
+    } else {
+        "warn,agentplane=info,agentplane.metric=off"
+    };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     // `try_init` rather than `init`: failing to install a subscriber must not
     // take down a run that would otherwise have worked.
     let _ = fmt()
@@ -125,6 +141,10 @@ enum Verb {
     Halt(HaltArgs),
     /// List every emergency stop standing on a tenant.
     Halts(HaltsArgs),
+    /// List the runs that are waiting, and what each one waits for.
+    Waiting(WaitingArgs),
+    /// Ask whether anything on this plane needs a person right now.
+    Attention(WaitingArgs),
     /// Place, lift, or list the legal holds that stop a retention pass.
     Hold(HoldArgs),
 }
@@ -248,6 +268,28 @@ struct HaltsArgs {
     /// The store holding the halts, and whose to read.
     #[command(flatten)]
     at: StoreRef,
+}
+
+/// The runs that are waiting, as a verb.
+///
+/// The recovery runbook's last step is *re-arm the suspended runs*, and until
+/// this existed that step named a verb with no argument an operator could
+/// obtain: a run waiting on a person is in the worklist, and a run waiting on a
+/// timer or an event was in no listing at all.
+///
+/// Answered from the journal rather than from the timer and subscription
+/// tables, which is the difference that matters here: an export carries
+/// neither, so on a plane restored from one the registrations are exactly what
+/// is missing and these runs are exactly what is inert.
+#[derive(clap::Args, Debug)]
+struct WaitingArgs {
+    /// The store holding the runs, and whose to read.
+    #[command(flatten)]
+    at: StoreRef,
+    /// How many to list. Soonest due first, so a smaller page is the most
+    /// overdue work rather than an arbitrary slice.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
 }
 
 /// Retention for the admission index, as a verb.
@@ -1545,6 +1587,93 @@ fn halts_verb(opts: &HaltsArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// List the runs whose last record is a suspension.
+fn waiting_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let store = opts.at.open().await?.journal();
+        let waiting = store
+            .waiting_runs(opts.limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows: Vec<serde_json::Value> = waiting
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "run": w.run.to_string(),
+                    // The tagged reason, so a script tells a timer from a
+                    // correlation without parsing prose: the two fail
+                    // differently and only one of them is a defect.
+                    "waiting_for": w.reason,
+                    "until": w.reason.until().to_string(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "waiting": rows }))
+                .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Ask the plane whether anything needs a person, and exit non-zero if so.
+///
+/// **The exit code is the point.** This is a verb a scheduler runs, and a check
+/// that always exits zero is a check nobody notices has stopped working — the
+/// same reason `drill` and `verify` report through their status rather than
+/// only on stdout.
+fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        let backend = opts.at.open().await?;
+        let plane = Runtime::builder_with(backend.stores())
+            .tenant(backend.tenant())
+            .build();
+        // The clock is this verb's, which is what makes the runtime's own
+        // escapes stay at three: a binary reading the wall clock to ask "what
+        // is overdue right now" is not the deterministic zone reaching for it.
+        #[allow(clippy::disallowed_methods)]
+        let now = agentplane::core::Timestamp::now_utc();
+        let found = plane
+            .attention(now, opts.limit)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "needs_attention": found.any(),
+                "conditions": found
+                    .conditions
+                    .iter()
+                    .map(|c| serde_json::json!({
+                        "condition": c.kind,
+                        "found": c.found,
+                        "at_least": c.at_least,
+                        "remedy": c.remedy,
+                    }))
+                    .collect::<Vec<_>>(),
+                "not_checked": found.not_checked,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        Ok(if found.any() {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        })
+    })
+}
+
 /// Whichever backend `--store` names.
 ///
 /// One flag rather than `--store` plus `--database-url`: two flags are mutually
@@ -1767,6 +1896,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Verb::Halt(a) => halt_verb(&a),
         Verb::Hold(a) => hold_verb(&a),
         Verb::Halts(a) => halts_verb(&a),
+        Verb::Waiting(a) => waiting_verb(&a),
+        Verb::Attention(a) => attention_verb(&a),
         Verb::Restore(a) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1960,10 +2091,11 @@ fn card(opts: &CardArgs) -> Result<ExitCode, String> {
 }
 
 fn main() -> ExitCode {
-    install_tracing();
     // `clap` prints its own diagnostics and exits; everything past the parse is
-    // this binary's own vocabulary.
+    // this binary's own vocabulary. Parsed before the subscriber is installed
+    // because which verb this is decides what belongs in the output.
     let cli = <Cli as clap::Parser>::parse();
+    install_tracing(matches!(cli.verb, Verb::Serve(_)));
     match dispatch(cli) {
         Ok(code) => code,
         Err(e) => {

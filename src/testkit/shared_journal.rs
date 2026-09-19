@@ -86,6 +86,13 @@ impl JournalStore for SharedJournal {
         self.inner.abandoned_runs(limit).await
     }
 
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::journal::WaitingRun>, StoreError> {
+        self.inner.waiting_runs(limit).await
+    }
+
     async fn admitted_as(&self, key: &str) -> Result<Option<crate::core::RunId>, StoreError> {
         self.inner.admitted_as(key).await
     }

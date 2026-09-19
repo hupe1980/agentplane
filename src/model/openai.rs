@@ -1353,11 +1353,10 @@ mod tool_tests {
     /// Responses rejects outright with *"Missing required parameter:
     /// `tools[0].name`"*.
     ///
-    /// This test previously asserted the nested shape. It was written from the
-    /// same misreading as the code, so it passed forever and gave the wrong
-    /// contract the appearance of being pinned — a stubbed provider accepts any
-    /// shape, so nothing else could disagree. A live call against the real API
-    /// found it on its first run.
+    /// **A stub cannot pin this.** A fake provider accepts either shape, so a
+    /// test written from the same reading as the code agrees with it and looks
+    /// pinned. What establishes which shape is right is a live call, and this
+    /// test exists to fail fast against what that call established.
     #[test]
     fn a_declared_tool_is_rendered_in_openais_shape() {
         let body = OpenAi::new("test-key")

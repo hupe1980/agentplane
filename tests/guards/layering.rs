@@ -854,6 +854,127 @@ fn no_public_enum_variant_is_dead() {
     );
 }
 
+/// **Every A2A extension this project publishes is one of a family.**
+///
+/// An extension URI is a *published identifier*: a peer negotiates on it, may
+/// fetch it, and reads it before any prose this project writes. Four of the
+/// five already shared a shape — `…/agentplane/a2a/ext/<name>/v1` — and the
+/// fifth did not, which is how it also came to be named after the one member
+/// the block deliberately does not carry. A name that is odd one out is a name
+/// nobody compared against its siblings.
+///
+/// The shape is the check rather than a list of the URIs, because a list is a
+/// second copy of the constants and the next one gets added to the constants
+/// only.
+#[test]
+fn every_a2a_extension_uri_is_one_of_the_family() {
+    const PREFIX: &str = "https://hupe1980.github.io/agentplane/a2a/";
+    let src: String = walk("src").iter().map(|f| read(f)).collect();
+
+    let mut checked = 0;
+    for tail in src.split(PREFIX).skip(1) {
+        let uri: String = tail.chars().take_while(|c| *c != '"').collect();
+        checked += 1;
+        let mut parts = uri.split('/');
+        let (ext, name, version) = (parts.next(), parts.next(), parts.next());
+        assert_eq!(
+            ext,
+            Some("ext"),
+            "`{PREFIX}{uri}` is missing the `ext/` segment its four siblings carry"
+        );
+        let name = name.unwrap_or_default();
+        assert!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "`{PREFIX}{uri}` does not name itself in kebab-case"
+        );
+        let version = version.unwrap_or_default();
+        assert!(
+            version
+                .strip_prefix('v')
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())),
+            "`{PREFIX}{uri}` does not end in a version a peer can negotiate on"
+        );
+        assert_eq!(parts.next(), None, "`{PREFIX}{uri}` has a segment too many");
+    }
+    assert!(
+        checked >= 5,
+        "only {checked} extension URIs were read — this guard has been blinded \
+         by a spelling change and is now inert"
+    );
+}
+
+/// **A public struct nobody names is a capability that does not exist.**
+///
+/// The sibling of [`no_public_enum_variant_is_dead`], and it was missing: the
+/// variant sweep covers what a public enum promises and nothing covered what a
+/// public *type* does. `core::AgentRef` sat in the crate's own prelude with a
+/// doc saying *a run records the digest it executed under* — which is true, and
+/// is `journal::AgentIdentity` doing it. Nothing constructed `AgentRef`, nothing
+/// read it, and an embedder reaching for the obvious name in the prelude found
+/// the one that leads nowhere.
+///
+/// The rule is the variant guard's: a type earns its place by being exercised,
+/// not by being declared, and a **test** counts. Re-exports do not — naming a
+/// type in a `pub use` is how it reaches a caller, not evidence that one came.
+///
+/// **`dead_code` cannot do this, and the re-export is why.** A type nobody
+/// builds inside a private module is a compiler warning; the same type carried
+/// out through a `pub use` becomes reachable public API, and the lint goes
+/// quiet. So the export that makes a dead type *visible to everybody* is
+/// exactly what stops the compiler mentioning it.
+#[test]
+fn no_public_struct_is_dead() {
+    let sources: Vec<(String, String)> = walk("src")
+        .into_iter()
+        .map(|p| (p.clone(), read(&p)))
+        .collect();
+    let everything: String = sources
+        .iter()
+        .map(|(_, s)| s.clone())
+        .chain(walk("tests").into_iter().map(|p| read(&p)))
+        .chain(walk("examples").into_iter().map(|p| read(&p)))
+        .map(|s| code_only(&s))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut dead = Vec::new();
+    for (path, text) in &sources {
+        for line in code_only(text).lines() {
+            let Some(rest) = line.trim_start().strip_prefix("pub struct ") else {
+                continue;
+            };
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() {
+                continue;
+            }
+            // The declaration itself, and any `pub use` carrying it, are not
+            // uses. Everything else is: a constructor, a field type, a
+            // signature, a test.
+            let mentions = everything.matches(&name).count();
+            let reexports = everything
+                .lines()
+                .filter(|l| l.trim_start().starts_with("pub use") && l.contains(&name))
+                .count();
+            if mentions.saturating_sub(1 + reexports) == 0 {
+                dead.push(format!("{path}: {name}"));
+            }
+        }
+    }
+
+    assert!(
+        dead.is_empty(),
+        "these public structs are declared and named nowhere else — delete them, \
+         or exercise them from a test if they are for callers:\n  {}",
+        dead.join("\n  ")
+    );
+}
+
 /// Drop everything to the left of a `=>`, which is where patterns live.
 ///
 /// Deliberately a heuristic rather than a parser: it can only ever make the

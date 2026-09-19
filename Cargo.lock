@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "agentplane"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "a2a-lf",
  "a2a-server-lf",

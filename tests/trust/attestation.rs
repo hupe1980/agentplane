@@ -644,6 +644,12 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
             self.0.abandoned_runs(limit).await
         }
+        async fn waiting_runs(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<agentplane::journal::WaitingRun>, StoreError> {
+            self.0.waiting_runs(limit).await
+        }
         async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, StoreError> {
             self.0.admitted_as(key).await
         }
@@ -1729,6 +1735,12 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         }
         async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
             self.inner.abandoned_runs(limit).await
+        }
+        async fn waiting_runs(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<agentplane::journal::WaitingRun>, StoreError> {
+            self.inner.waiting_runs(limit).await
         }
         async fn recent_runs(
             &self,

@@ -255,6 +255,15 @@ The version leads, so no offset is trusted before the layout is known. A reader
 that cannot interpret the version reports a **build skew**, not tampering:
 those two reach different people.
 
+The wrapped key is canonical JSON with the members `scope`, `wrapped_by` and
+`sealed`, and **a member this reader does not know is refused** — the same rule
+a record body is held to, for the same reason. This header travels with the
+payload it sealed, so a reader that skipped a member would unwrap under
+parameters somebody else wrote down. Unlike a record, nothing has established
+the bytes at that point — the tag that would is inside the payload — so the
+refusal cannot claim which of the two causes it is, and a drill that meets one
+must say so rather than call it tampering.
+
 Sealed bytes are rotation-immutable. The chain commits to the envelope, which
 carries the wrapped key inline, so re-wrapping is not expressible — the erasure
 scope is the rotation unit.
@@ -273,6 +282,18 @@ dispatch rule, and it is the only one: a line whose top-level `kind` is one of
 the four framing names is that kind of frame, and a line with no top-level
 `kind` is a record belonging to the run block above it. A record's *own* kind
 is inside its body, one level down, and must not be mistaken for the frame's.
+
+**A framing member this reader does not know bounds the verdict; it does not
+fail it.** This is the opposite answer from the one a record body gets, and the
+difference is what covers the bytes. A record's members are inside the hash, so
+skipping one reaches a verdict over evidence the reader did not see and is
+refused. A framing line is not hashed and carries no evidence of its own — the
+claims on it (a checkpoint, a leaf, the trailer's accounting) are each checked
+against something else — so a member added by a later writer falsifies nothing
+already established. What it can do is carry one more claim, so a reader that
+passed over it reports *sound* about a file it read part of. The rule is
+therefore: **verify as normal, and say which members you did not account for.**
+Both implementations of this specification do so.
 
 ### Header {#header}
 

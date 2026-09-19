@@ -137,8 +137,13 @@ fn parse(envelope: &[u8]) -> Result<Parsed<'_>, KeyError> {
         ));
     }
     let (wrapped_bytes, rest) = rest.split_at(len);
-    let wrapped: WrappedKey = serde_json::from_slice(wrapped_bytes)
-        .map_err(|e| KeyError::Refused(format!("the wrapped key would not parse: {e}")))?;
+    // Not `Refused`: the version matched, so this is a header at a construction
+    // this build claims to read that it nevertheless cannot. Which of the two
+    // causes it is cannot be established here, and the variant says so.
+    let wrapped: WrappedKey =
+        serde_json::from_slice(wrapped_bytes).map_err(|e| KeyError::UnreadableHeader {
+            detail: e.to_string(),
+        })?;
     let (nonce, sealed) = rest.split_at(NONCE);
     // `split_at(NONCE)` already fixes the width, so this cannot fail; it is
     // written fallibly anyway because the alternative is a panic on bytes that
@@ -266,6 +271,46 @@ mod format_tests {
             }),
             "reading the scope must refuse the same envelope `open` refuses, or a \
              probe reconstructs an AAD from a header it could not parse"
+        );
+    }
+
+    /// **A member this build does not know is refused, not skipped.**
+    ///
+    /// The envelope is a durable format and travels with the payload it sealed,
+    /// so the same argument the record vocabulary is held to applies here: a
+    /// reader that drops a member unwraps under parameters somebody else wrote
+    /// down and this build never saw. The version byte gates *declared*
+    /// evolution; this gates the undeclared kind, and before the format freeze
+    /// it is the only kind a hard cut produces.
+    ///
+    /// Asserted through `open` rather than on the struct, because
+    /// `deny_unknown_fields` on a type nothing deserializes from stored bytes
+    /// would be a decoration.
+    #[tokio::test]
+    async fn a_header_member_this_build_does_not_know_is_refused() {
+        let ring = MemoryKeyRing::new();
+        let key = ring.data_key("acme/matter").await.expect("a data key");
+        let mut header = serde_json::to_value(&key.1).expect("the wrapped key serialises");
+        header["kdf"] = serde_json::json!("argon2id");
+        // `canon`, not `serde_json`: this file writes bytes an envelope is
+        // parsed out of, and the layering guard holds every one of them to the
+        // canonical writer.
+        let header = crate::core::canon::to_bytes(&header).expect("serialises");
+
+        let mut bytes = vec![FORMAT_VERSION];
+        bytes.extend_from_slice(&u32::try_from(header.len()).expect("fits").to_be_bytes());
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&[0_u8; NONCE]);
+        bytes.extend_from_slice(b"ciphertext");
+
+        let error = open(&ring, AAD, &bytes).await.expect_err("must refuse");
+        assert!(
+            format!("{error}").contains("kdf"),
+            "the refusal has to name the member nobody knows: {error}"
+        );
+        assert!(
+            !format!("{error}").contains("authenticate"),
+            "an unknown member reported in the vocabulary of tampering: {error}"
         );
     }
 

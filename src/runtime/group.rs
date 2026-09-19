@@ -908,7 +908,7 @@ impl StepCtx<'_> {
                 // than returned: an atomic member's result is not handed back
                 // to the caller in the first place, because it cannot be seen
                 // before the frontier it commits with.
-                match self.cursor_next(key)? {
+                match self.cursor_next(key, &descriptor)? {
                     // Billed on the way past, like every other announced
                     // attempt: the live pass takes this member's slot when the
                     // gate below admits it, so a replay that skipped the count
@@ -960,7 +960,10 @@ impl StepCtx<'_> {
                         });
                     }
                     None if self.is_strict() => {
-                        return Err(StepError::ReplayOverrun { actual: key });
+                        return Err(StepError::ReplayOverrun {
+                            actual: key,
+                            kind: descriptor.kind.clone(),
+                        });
                     }
                     None => {}
                 }

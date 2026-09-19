@@ -9,6 +9,18 @@ use crate::core::{Digest, Epoch, RunId, Seq, StoreError};
 
 use super::{Append, Record};
 
+/// A run whose last record is a suspension.
+///
+/// The pair an operator re-arms from: which run, and what it is waiting for —
+/// because the two waits fail differently. An instant that has not arrived is
+/// the system working; a message that never came is a correlation defect, and
+/// telling them apart is the difference between waiting and investigating.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitingRun {
+    pub run: RunId,
+    pub reason: crate::core::SuspendReason,
+}
+
 /// A run's current chain position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Head {
@@ -578,6 +590,40 @@ pub trait JournalStore: Send + Sync + Debug {
     ///
     /// If the store is unreachable.
     async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError>;
+
+    /// The runs that are waiting, and what each one waits for.
+    ///
+    /// **The door the recovery runbook's last step needs.** Re-arming a
+    /// suspended run is what repairs its waits, and until this existed nothing
+    /// on the plane could name them: `runs_by_outcome` answers *concluded* runs
+    /// and a suspended run has no outcome; `abandoned_runs` answers lapsed
+    /// leases; and the live listing reads admission slots, which a suspension
+    /// gives back by design — holding one would let a tenant waiting on a
+    /// hundred approvals start nothing.
+    ///
+    /// **Derived from the journal, not from the registrations, and that is the
+    /// whole point.** A timer row or an event subscription would answer this on
+    /// a healthy plane and answer *nothing* on a restored one — an export
+    /// deliberately carries neither, so after a restore the registrations are
+    /// exactly what is missing and the runs are exactly what is inert. The index
+    /// behind this is maintained by `append`, and a restore replays through
+    /// `append`, so it comes back with the history.
+    ///
+    /// **A run is waiting when its last record is a suspension**, so it leaves
+    /// this listing by making any progress at all. That is what licenses the
+    /// ascending order below: [I13](https://hupe1980.github.io/agentplane/docs/concepts/)
+    /// permits an oldest-first page only where a verb removes entries from it,
+    /// and resuming is that verb.
+    ///
+    /// **Soonest `until` first**, which is the order an operator acts in: the
+    /// runs whose instant has already passed are the ones lying inert, and they
+    /// sort to the front. Bounded, and the bound is visible — `limit` results
+    /// means *at least* that many.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn waiting_runs(&self, limit: usize) -> Result<Vec<WaitingRun>, StoreError>;
 
     /// Hand a lease back, so the next instance need not wait out the TTL.
     ///

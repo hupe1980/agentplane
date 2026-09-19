@@ -240,6 +240,13 @@ impl JournalStore for SealedJournal {
         self.inner.abandoned_runs(limit).await
     }
 
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::journal::WaitingRun>, StoreError> {
+        self.inner.waiting_runs(limit).await
+    }
+
     async fn runs_by_outcome(&self, outcome: &str, limit: usize) -> Result<Vec<RunId>, StoreError> {
         self.inner.runs_by_outcome(outcome, limit).await
     }

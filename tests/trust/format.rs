@@ -508,6 +508,95 @@ fn a_field_this_build_does_not_know_is_refused() {
     );
 }
 
+/// **The skew a hard cut produces is classified, and it is the only skew a
+/// pre-freeze deployment can meet.**
+///
+/// The version gates *declared* evolution, and until the format freezes
+/// nothing declares: a shape change is a hard cut and `v` stays at 1 on both
+/// sides of it. So the arm that names a build skew and says which binary to
+/// run is the arm no shipped change reaches, while every rolling deploy this
+/// project has actually performed lands on the other one — which handed an
+/// operator `invalid type: map, expected a string at line 1 column 388`.
+///
+/// Read against a real pair of builds rather than imagined: between two
+/// releases five record kinds moved `actor` from a string to a struct and one
+/// gained a field, at `v` 1 throughout. Each direction refuses the other's
+/// records, which is the hard cut working; what was missing was the sentence
+/// saying so.
+///
+/// The classification is safe to make because of the order the read happens
+/// in. The stored hash is verified before the body is parsed, so a record that
+/// reaches the parse carries the bytes that were written and the chain commits
+/// to them. A failure after that point cannot be an edit.
+#[test]
+fn a_shape_this_build_cannot_read_at_its_own_version_is_a_build_skew() {
+    for (case, mutate) in [
+        // The undeclared field: a later build extended the record.
+        (
+            "an added field",
+            (|value: &mut Value| value["settlement_id"] = json!("stl-1")) as fn(&mut Value),
+        ),
+        // The moved type: the shape of a field a later build kept the name of.
+        // This is the one that actually happened, five kinds at once.
+        ("a field whose type moved", |value: &mut Value| {
+            value["skill"] = json!({ "name": "orders.book", "basis": "asserted" });
+        }),
+    ] {
+        let mut value = serde_json::to_value(body(RecordKind::StepStarted {
+            skill: "orders.book".into(),
+        }))
+        .expect("serialises");
+        mutate(&mut value);
+        let raw = serde_json::to_vec(&value).expect("serialises");
+        let hash = Digest::chain(Digest::ZERO, &raw);
+
+        let err = Record::from_stored(raw, Digest::ZERO, hash).expect_err("refused");
+        assert!(
+            matches!(
+                err,
+                agentplane::core::StoreError::UnreadableRecordShape { ref kind, version: 1, .. }
+                    if kind == "StepStarted"
+            ),
+            "{case}: a shape skew reported as an encoding fault: {err:?}"
+        );
+
+        let lifted = agentplane::core::RuntimeError::from_store(err);
+        assert!(
+            !matches!(lifted, agentplane::core::RuntimeError::ChainBroken { .. }),
+            "{case}: a build skew reported as a broken chain sends an operator to hunt \
+             tampering: {lifted}"
+        );
+        let text = lifted.to_string();
+        assert!(
+            text.contains("hash as written"),
+            "{case}: the refusal has to say the bytes are intact, or it reads as damage: \
+             {text}"
+        );
+        assert!(
+            text.contains("another build wrote this journal"),
+            "{case}: the refusal has to name the remedy: {text}"
+        );
+    }
+}
+
+/// Bytes that are not a record keep the parse error, which is the answer.
+///
+/// The arm above claims a skew from two facts: the hash verified, and the
+/// bytes name a kind at a version. Without the second there is nobody to
+/// blame — a blob that hashes correctly and is not a record is not evidence
+/// that somebody is running a different build.
+#[test]
+fn bytes_that_are_not_a_record_are_still_an_encoding_fault() {
+    let raw = br#"{"not":"a record"}"#.to_vec();
+    let hash = Digest::chain(Digest::ZERO, &raw);
+
+    let err = Record::from_stored(raw, Digest::ZERO, hash).expect_err("refused");
+    assert!(
+        matches!(err, agentplane::core::StoreError::Encoding(_)),
+        "a line with no kind and no version cannot be attributed to a build: {err:?}"
+    );
+}
+
 /// **The upcaster seam, exercised end to end before it is needed.**
 ///
 /// The first migration after the format freeze must not also be the first time
