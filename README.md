@@ -352,12 +352,11 @@ mutant must be caught by the *specific* invariant written for it.
 normative prose, and `tools/verify_export.py` is written from it and reads none
 of this crate's Rust — enforced by a guard, because a verifier that consulted
 `src/` would agree with the implementation by construction. `just verify-golden`
-runs it: it **re-derives** every record vector from its parsed value with its
-own canonicalizer and chain digest, verifies the sealed export end to end, and
-then damages that export — an edited body, a flipped byte, a removed record, a
-rewritten leaf, a dropped case layer, a cut trailer — and asserts each one is
-reported. Vectors a project generates and then checks are that project agreeing
-with itself; this is the part that is not.
+runs it: it **re-derives** all 29 record vectors from their parsed values with
+its own canonicalizer and chain digest, verifies the sealed export end to end,
+and then damages that export six ways and asserts each is reported. Vectors a
+project generates and then checks are that project agreeing with itself; this
+is the part that is not.
 
 **🧯 A recovery drill, not a backup.** The restore path is exercised against a
 real `PostgreSQL` server — restoring one tenant's history into another tenant of
