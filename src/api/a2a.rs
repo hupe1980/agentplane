@@ -2085,6 +2085,10 @@ async fn continue_task(
         kind,
         correlation,
         payload: message.to_input(),
+        // A counterparty's message, so nobody on this plane minted it. The
+        // sender is provenance, not an operator, and the one thing this field
+        // must not become is somewhere a peer can claim to be a person here.
+        by: None,
     };
     match server.runtime.deliver_to(run, &event).await {
         // `Buffered` is a success too: when the owner's lease is stalled the

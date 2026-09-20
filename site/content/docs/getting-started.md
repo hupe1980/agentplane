@@ -201,9 +201,18 @@ public address is the one a peer holds, and putting the worklist and task
 decisions behind it is one policy mistake away from a peer reading every run.
 
 The separation is enforced by **policy**, not by the port. In
-`serve-policy.cedar` the `peer` role reaches `a2a:*` and the `operator` role
-reaches `api:*`, so a peer token that reaches the operator socket is still
+`serve-policy.cedar` the `peer` role reaches the A2A actions and the `operator`
+role the API ones, so a peer token that reaches the operator socket is still
 refused — the separate port is defence in depth rather than the control itself.
+
+**That file is a starting point, and it grants less than its name suggests.**
+It permits the verbs this quickstart uses, not the vocabulary: the incident
+verbs — `api:halt.place`, `api:run.abandon`, `api:effect.reconcile` — are
+listed in its comment and permitted by no rule, and neither is `data:release`,
+so a run that reaches a typed release is refused. Cedar denies what no rule
+permits, which is the right default and an opaque one: the caller is told only
+that it was declined. Before a deployment carries work, grant the verbs whoever
+is on call will need, and read [security](../security/) for the release gate.
 
 `--push-host <host>` (repeatable) turns on **A2A push notifications** to that
 exact host. Without one, push is not wired and the Agent Card advertises it as

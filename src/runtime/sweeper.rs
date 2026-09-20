@@ -866,8 +866,9 @@ impl Runtime {
                     // replayed run would compute different downstream deadlines
                     // than the original.
                     output: serde_json::json!({ "fired_at": timer.fire_at.unix_timestamp() }),
-                    // A timer has no sender.
+                    // A timer has no sender and nobody minted it.
                     source: None,
+                    by: None,
                     spend: crate::core::Spend::default(),
                     // The runtime's own instant, chosen and journaled here —
                     // one of the few values that crosses no trust boundary.
@@ -1111,6 +1112,19 @@ impl Runtime {
         )
         .correlate(crate::core::CorrelationKey::new("task", id.to_hex()));
 
+        // The decider, lifted out of the payload and onto the event.
+        //
+        // The whole decision travels as this effect's output, and that output
+        // is a **sealed** journal field: erase the run's payloads and the
+        // reason goes, as it must, taking the approver's name with it. Every
+        // operator act that *stops* a run already names its actor in the
+        // clear; this is the same rule for the one act that lets a run carry
+        // on. An expiry names nobody, and nobody is what it carries.
+        let event = match decision.decided.operator() {
+            Some(by) => event.minted_by(by.clone()),
+            None => event,
+        };
+
         self.deliver(&event).await
     }
 
@@ -1119,6 +1133,16 @@ impl Runtime {
     /// The claim is checked before the decision is recorded: an approval from
     /// somebody who was not permitted to give it is worse than no approval,
     /// because it looks like one.
+    ///
+    /// # Only a person's answer
+    ///
+    /// [`Decided::OnExpiry`](crate::core::Decided::OnExpiry) is refused here.
+    /// It is the sweeper's to apply, from the policy the task declared, and it
+    /// is the one decision with nobody to claim against: four-eyes has no
+    /// actor to exclude and eligibility has no name to check, so every control
+    /// this function exists to run would pass by having nothing to test. A
+    /// caller reaching this door with one is either applying an expiry from
+    /// outside the sweeper or dressing a person's answer as the policy's.
     pub async fn decide_task(
         &self,
         id: crate::core::TaskId,
@@ -1129,11 +1153,19 @@ impl Runtime {
             .tasks()
             .ok_or_else(|| RuntimeError::PlanContract("this runtime has no task store".into()))?;
 
+        let Some(by) = decision.decided.operator() else {
+            return Err(RuntimeError::PlanContract(
+                "an expired window is the sweeper's to apply: this door records a person's \
+                 answer, and an expiry has no actor to check a claim or an exclusion against"
+                    .to_owned(),
+            ));
+        };
+
         // The claim protocol's refusals surface as
         // [`RuntimeError::TaskClaim`], exactly as the claim verb reports them.
         // Wrapped as a policy denial they would claim a rule fired when none
         // did, and collapse three different answers into one class.
-        tasks.claim(id, &decision.actor, roles).await?;
+        tasks.claim(id, by.actor(), roles).await?;
 
         let delivery = self.answer_task(id, decision).await?;
         tasks

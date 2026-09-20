@@ -1882,6 +1882,19 @@ impl CaseStore for InstrumentedCases {
     ) -> Result<agentplane::case::CaseCensus, agentplane::core::StoreError> {
         self.inner.census(now).await
     }
+
+    async fn record_drill(
+        &self,
+        record: &agentplane::case::DrillRecord,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.record_drill(record).await
+    }
+
+    async fn last_drill(
+        &self,
+    ) -> Result<Option<agentplane::case::DrillRecord>, agentplane::core::StoreError> {
+        self.inner.last_drill().await
+    }
 }
 
 /// Strict replay does not re-register a run's obligations.

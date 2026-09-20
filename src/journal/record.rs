@@ -304,6 +304,31 @@ pub enum RecordKind {
         /// provenance, so a field requiring it is refused rather than admitted.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        /// The operator who produced it, when the awaited event was a person
+        /// on this plane acting rather than a counterparty sending.
+        ///
+        /// **Clear, while the payload beside it is sealed, and that asymmetry
+        /// is the point.** A worklist decision travels as this effect's
+        /// output, so without this field the only record of *who approved* is
+        /// inside a sealed value — and a lawful erasure of the run's payloads
+        /// takes the approver's name with it while leaving the chain readable,
+        /// verifiable and auditable. Every operator act that *stops* a run
+        /// already names its actor in the clear
+        /// ([`RunCancelled`](Self::RunCancelled),
+        /// [`QuarantineDecided`](Self::QuarantineDecided),
+        /// [`AuthorityWithheld`](Self::AuthorityWithheld),
+        /// [`BreakGlass`](Self::BreakGlass),
+        /// [`EffectReconciled`](Self::EffectReconciled)); this is the same rule
+        /// for the one act that lets a run carry on.
+        ///
+        /// What stays sealed is the rest of the decision — the reason and any
+        /// amendment — because those are free text over the caller's values,
+        /// which who decided is not.
+        ///
+        /// `None` for a counterparty's message, for a timer, and for every
+        /// effect that is not an awaited event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<crate::core::Operator>,
         /// What this effect consumed.
         ///
         /// Recorded so replay adds up the same figures the original run did,
@@ -542,9 +567,24 @@ pub enum RecordKind {
         /// result to measure.
         #[serde(default, skip_serializing_if = "Spend::is_free_ref")]
         spend: Spend,
-        /// What the probe reported, when it failed or could not tell.
+        /// What the **probe** reported, when it failed or could not tell.
+        ///
+        /// A provider's words, echoing the request it was asked about, which
+        /// is why it seals with the rest of the caller's data. An operator's
+        /// account of the same effect goes in [`note`](Self::EffectReconciled)
+        /// instead — one field with two authors and one sealing rule would
+        /// have destroyed the person's justification and kept the machine's.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        /// What the **operator** established, and how.
+        ///
+        /// Present exactly when [`asserted_by`](Self::EffectReconciled) is,
+        /// and clear for the same reason the name is: a person overruling the
+        /// runtime's *I do not know* is the whole content of this record, and
+        /// their justification behind a key an erasure destroys leaves a name
+        /// against a decision nobody can read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
         /// The trust and sensitivity declared for a recovered output.
         ///
         /// Present exactly when `output` is: a probe that recovered nothing
@@ -613,13 +653,21 @@ pub enum RecordKind {
     /// than one of these, and why the *last* one is the run's answer.
     RunConcluded {
         outcome: String,
-        /// Why the run ended this way, when the ending has a why.
+        /// The run's **own** account of why it ended — and only that.
         ///
-        /// `None` for a success, which has none. Without it the chain records
-        /// *that* a run failed and not *why*, so the reason survives only in
-        /// the log of the process that wrote it — and an operator asking six
-        /// weeks later, or a redelivery asking which conclusion it is being
-        /// answered with, gets the word "failed" and nothing else.
+        /// Present for the endings the runtime reached by itself: a failure, a
+        /// replan request, a quarantine. In every one of those the text comes
+        /// from a skill, a tool or a provider and quotes the values it was
+        /// handed, which is why it is a sealed payload.
+        ///
+        /// **Absent for every ending a person caused**, and that is the rule
+        /// rather than an omission. A cancellation, an abandonment, a
+        /// break-glass crossing and a withdrawal each write their own record
+        /// carrying the actor *and* the reason in the clear, and repeating the
+        /// reason here would put a second copy of one sentence behind a key an
+        /// erasure destroys — so the two copies would disagree about whether
+        /// the fact is knowable at all. The conclusion names the outcome; the
+        /// record beside it says who and why.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
         /// The typed ceiling verdict when `outcome == "exhausted"`.
@@ -1417,6 +1465,7 @@ mod tests {
                 declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!(1),
                 source: None,
+                by: None,
                 spend: Spend::default(),
             },
         )

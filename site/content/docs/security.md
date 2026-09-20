@@ -11,8 +11,8 @@ group = "Trust"
 > actually ask — and keep re-asking, because the answers are spread across
 > pages — are collected in one table:
 > [answers evaluators have had to ask for](@/docs/regulation.md#evaluator-questions).
-> It is on the regulation page for historical reasons and is not a statutory
-> table; start there and follow the links.
+> It sits on the regulation page and is not a statutory table; start there and
+> follow the links.
 
 What this runtime defends, how, and — the part most security documents omit —
 **what it does not cover**. The residual column in every table below is not
@@ -848,6 +848,15 @@ not help. Here is what a request actually looks like.
 | action | `Action::"effect:perform"`, `Action::"run:admit"`, `Action::"data:release"` |
 | resource | `Resource::"<effect kind>"` — `tool.call`, `model.complete`, `clock.now`, `memory.recall`… |
 | context | the record below |
+
+**All three are asked, and an action no rule mentions is denied.** That is the
+correct default and an invisible one: the caller is told only that it was
+declined, and `preflight` will not warn you, because it reports rules that
+cannot *evaluate* and a rule nobody wrote evaluates fine. `data:release` is the
+one this costs people — a bundle written for effects and admission passes both
+and then refuses every typed release. The bundle shipped at
+`examples/serve-policy.cedar` denies it deliberately, and says so where the rule
+would go.
 
 At **`effect:perform`**:
 
@@ -1769,4 +1778,4 @@ wrongly:
 | **Revocation** | A delegation is valid until it expires; there is no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |
-| **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL; the Bedrock driver takes no `Egress`, because the AWS SDK will not disclose the endpoint it dialled. What stands in its place is the deployment's own network policy, and the driver's documentation says so rather than leaving a missing method to be inferred |
+| **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL; the Bedrock driver takes no `Egress`, because the AWS SDK will not disclose the endpoint it dialled. What stands in its place is the deployment's own network policy |

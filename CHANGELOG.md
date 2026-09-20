@@ -16,7 +16,122 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.41.0] — unreleased
+## [0.42.0] — unreleased
+
+### Added
+
+- **The remedy verbs on the CLI: `reconcile`, `quarantine`, `decide`,
+  `acknowledge`, `cancel`, `rearm`.** `agentplane attention` names a remedy
+  for every condition it reports, and those remedies were HTTP-only — on the
+  embedded backend, unreachable exactly when the plane is down. A new guard
+  holds the two lists together.
+
+- **A rehearsal leaves a record.** `drill` wrote its verdict to a log and
+  nowhere else, so *when did you last rehearse, and did it pass* was
+  answerable only from whatever ran the verb. `CaseStore` gains
+  `record_drill`/`last_drill`; `Runtime::last_drill`, `agentplane drill --last`
+  and `GET /drill` read it, and `attention` reports a failed one. The record
+  names its checkpoint origin, so a drill over a restored copy cannot read as
+  one over production.
+
+- **`Runtime::record_quarantine_decision` — answer a quarantine without
+  driving the run.** What a terminal can do: it holds the journal and not the
+  agent. The decision is durable and the next resume applies it, which the
+  verb says rather than reporting the run as moved.
+
+### Fixed
+
+- **A task's `evidence` was unsealed in the worklist.** The trail behind a
+  proposal is assembled from what tools and models produced, and the journal
+  sealed its copy while the task store did not — so it outlived a case erasure
+  in the one store an operator browses by hand. Each entry keeps its trust
+  label, which is not the caller's data.
+
+- **A withheld run read back as `quarantined`.** `GET /runs/{run}`, `export`
+  and the MCP task view all go through one reader, and it had no arm for
+  `withheld` — so a run paused under a withdrawn credential answered *this
+  build does not recognise its own record*. The guard that should have caught
+  it iterated the export's outcome list rather than the writer's.
+
+- **`attention` named remedies the runtime refuses.** An exhausted or withheld
+  run cannot be abandoned — that answers a doubt, and neither is one. Both now
+  name `cancel`.
+
+- **The shipped policy bundle listed a third of the operator vocabulary as
+  "the full sets".** `examples/serve-policy.cedar` enumerated 16 actions against
+  40, missing every incident verb. Cedar denies what no rule permits, so a
+  bundle copied from it refuses `api:halt.place` during the incident. The list
+  is complete and a guard holds it to `api::action::ALL`, `a2a::action::ALL`
+  and `core::ACTIONS`.
+
+- **`data:release` was permitted by nothing in that bundle.** A bundle granting
+  admission and effects refuses every typed release, silently: `preflight`
+  reports rules that cannot evaluate, and a rule nobody wrote evaluates fine. It
+  stays denied, and the file says so where the rule would go →
+  [security](https://hupe1980.github.io/agentplane/docs/security/).
+
+### Known
+
+- **A recall is screened item by item, not as a set.** Collusive and salami
+  poisoning split an objective into fragments that are individually
+  innocuous. No runtime screen catches that: a set-level rule needs a
+  similarity threshold, which is a deployment's number wearing a runtime's
+  authority. The writes behind a recalled set stay enumerable from the
+  journal, which detects rather than prevents.
+
+### Changed
+
+- **BREAKING: `opendal` 0.59.** `OpenDalBlobs::new` takes an
+  `opendal::Operator`, so an embedder constructing one moves with it. The 0.58
+  hold is gone: 0.59.0 did not build, and 0.59.2 does. `jsonschema` moves to
+  0.56, which is internal.
+
+- **BREAKING: every sentence on a task carries who wrote it.**
+  `Justification`'s `summary`, `cost` and `evidence` are `Tainted<String>`. A
+  declared dry-run preview is a tool's answer over the caller's data and reached
+  the worklist as a plain `String`, indistinguishable from the runtime's own
+  notes beside it. `TaskView.has_untrusted_prose` answers it once for a
+  reviewer's client.
+
+- **BREAKING: `EffectDone` carries `by`, the operator who minted an awaited
+  event.** An approval travels as the effect's output and that field is sealed,
+  so a lawful erasure destroyed the approver's name. Every operator act that
+  stops a run already named its actor in the clear; this is the same rule for
+  the one that lets a run carry on. `InboundEvent` gains `by`, and the store
+  contract checks it round-trips.
+
+- **BREAKING: a conclusion no longer repeats a reason its own record holds.**
+  `RunConcluded.reason` is the run's own account — a failure, a replan, a
+  quarantine. A cancellation, abandonment, crossing or withdrawal carries the
+  actor and the reason together on its own record, in the clear; the sealed
+  copy beside it made one sentence two facts that disagreed after an erasure.
+
+- **BREAKING: an approval names its decider as an `Operator`, and an
+  unanswered window names nobody.** `Decision::actor` becomes
+  `Decision::decided` — `Decided::By(Operator)` or `Decided::OnExpiry`. The
+  reserved names `system:unattended` and `system:expiry` are gone, and the
+  record now carries the basis that established the decider →
+  [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+- **BREAKING: `Runtime::decide_task` refuses an expiry decision.** That door
+  runs the claim, the eligibility check and four-eyes; an expiry has nobody to
+  run them against, so accepting one passed every control by having nothing to
+  test. Applying an expiry stays the sweeper's.
+
+### Assurance
+
+- **What a model may be shown over MCP is a rule about the resource *kind*.**
+  A kind crosses only where the runtime can bound what crosses without reading
+  it: that admits the declaration and an audit report, and refuses journals and
+  cases. A new test holds the report to it.
+
+- **The list every run-status agreement test walks is pinned by a mutation.**
+  `every_status` cannot be derived, so a variant added to `RunStatus` and
+  forgotten there leaves those tests walking a list that no longer describes the
+  type. `every_run_status_variant_is_listed` reads the enum out of the source; a
+  mutation now removes a variant and holds the guard to catching it.
+
+## [0.41.0] — 2026-09-20
 
 ### Added
 

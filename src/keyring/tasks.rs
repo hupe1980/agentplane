@@ -6,12 +6,20 @@
 //! seals its copy; this seals the worklist's, which is the copy an operator
 //! queries.
 //!
-//! `summary` is deliberately **not** sealed. It is the line a reviewer reads in
-//! a queue, it is authored by the deployment rather than assembled from
-//! caller data, and sealing it would leave a worklist of unreadable rows. A
-//! deployment that writes personal data into a summary has put it somewhere
-//! this does not reach, and that is worth knowing rather than papering over:
-//! the structured field is the one the runtime fills from the actual call.
+//! **`evidence` is sealed for the same reason `proposed_action` is**, and the
+//! reason is structural rather than a guess about content: the trail behind a
+//! proposal is *assembled from what tools and models produced*. A declared
+//! dry-run preview is the clearest case — it is the answer a tool gave when
+//! asked what the call would do, so it quotes the caller's data by
+//! construction. The journal seals its copy; without this, the worklist's
+//! copy outlived a case erasure in the one store an operator queries by hand.
+//!
+//! `summary` is deliberately **not** sealed. It is the line a reviewer reads
+//! in a queue, and sealing it would leave a worklist of unreadable rows. That
+//! it is the deployment's own sentence is checkable rather than assumed: it
+//! is a `Tainted<String>`, so a summary built from a completion says so, and
+//! a deployment that writes personal data into one has put it somewhere this
+//! does not reach — visibly, rather than silently.
 
 use std::sync::Arc;
 
@@ -79,18 +87,27 @@ impl SealedTasks {
     }
 
     async fn opened(&self, mut task: Task) -> Task {
-        let Some(envelope) = payload::unwrap(&task.justification.proposed_action) else {
-            return task;
-        };
         let aad = Self::aad(&self.tenant, task.id);
         // Left sealed when it will not open: an erased proposal must not make
         // the queue unreadable, and a reviewer seeing a sealed row knows the
         // matter was erased rather than that the plane is broken.
-        if let Ok(plain) =
-            super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await
+        if let Some(envelope) = payload::unwrap(&task.justification.proposed_action)
+            && let Ok(plain) =
+                super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await
             && let Ok(value) = serde_json::from_slice(&plain)
         {
             task.justification.proposed_action = value;
+        }
+        for item in &mut task.justification.evidence {
+            // Each entry on its own, so one unopenable line does not take the
+            // rest of the trail with it.
+            if let Some(envelope) = payload::unwrap_text(item.peek())
+                && let Ok(plain) =
+                    super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await
+                && let Ok(text) = String::from_utf8(plain)
+            {
+                *item = item.clone().map(|_| text);
+            }
         }
         task
     }
@@ -124,6 +141,20 @@ impl TaskStore for SealedTasks {
 
         let mut sealed = task.clone();
         sealed.justification.proposed_action = payload::wrap(&envelope);
+        for item in &mut sealed.justification.evidence {
+            let wrapped = super::envelope::seal(
+                self.keys.as_ref(),
+                &self.scope_for(task),
+                Self::aad(&self.tenant, task.id).as_bytes(),
+                item.peek().as_bytes(),
+            )
+            .await
+            .map_err(|e| StoreError::Backend(format!("sealing a task's evidence failed: {e}")))?;
+            // The label rides through untouched: *who wrote this* is what the
+            // reviewer needs whether or not the words are still readable, and
+            // it is not the caller's data.
+            *item = item.clone().map(|_| payload::wrap_text(&wrapped));
+        }
         let written = self.inner.open(&sealed).await?;
         // Handed back opened, so the caller that just wrote a proposal reads
         // back what it wrote rather than its envelope.

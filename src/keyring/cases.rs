@@ -349,6 +349,17 @@ impl CaseStore for SealedCases {
     async fn census(&self, now: Timestamp) -> Result<crate::case::CaseCensus, StoreError> {
         self.inner.census(now).await
     }
+
+    /// Passed through unsealed, like the census beside it: a rehearsal's
+    /// verdict is counts, an instant and a checkpoint origin — this plane's
+    /// own facts about itself, with nothing of a caller's in it.
+    async fn record_drill(&self, record: &crate::case::DrillRecord) -> Result<(), StoreError> {
+        self.inner.record_drill(record).await
+    }
+
+    async fn last_drill(&self) -> Result<Option<crate::case::DrillRecord>, StoreError> {
+        self.inner.last_drill().await
+    }
 }
 
 #[cfg(all(test, feature = "testkit"))]

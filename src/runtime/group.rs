@@ -854,6 +854,9 @@ impl crate::journal::AtomicWork for GroupCommit {
                 self.stamp(RecordKind::EffectDone {
                     output,
                     source: None,
+                    // An atomic member is dispatched by the run, not minted by
+                    // a person.
+                    by: None,
                     spend: crate::core::Spend::default(),
                     // An atomic member's result never reaches the caller — it
                     // commits with the frontier, so `commit` returns only the

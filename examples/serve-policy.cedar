@@ -21,12 +21,32 @@
 //     step with the caller told only that it was declined, and the operator
 //     side of that refusal is a `tracing` event.
 //
-// The full sets, for a policy that needs more:
+// The complete vocabulary, for a policy that needs more. A guard holds this
+// block to the action lists in the crate, so an action added there and not
+// added here stops the build — a comment claiming to be a full set is worth
+// only what checks it.
+//
+// Asked by the *runtime*, underneath the surface. All three, always:
+//   run:admit         effect:perform  data:release
+//
+// Asked by the A2A surface, for a peer:
 //   a2a:message.send  a2a:task.read   a2a:task.continue
 //   a2a:task.cancel   a2a:task.push   a2a:card.extended
-//   api:run.read      api:run.list    api:run.cancel
-//   api:task.list     api:task.read   api:task.claim
-//   api:task.release  api:task.decide api:case.read   api:event.deliver
+//
+// Asked by the operator API. The incident verbs are the ones to notice: a
+// bundle missing them denies during the incident, which is the one time
+// nobody is reading policy files.
+//   api:run.read      api:run.list    api:run.history api:run.live
+//   api:run.waiting   api:run.cancel  api:run.reopen  api:run.abandon
+//   api:attention     api:drill.read  api:effect.reconcile
+//   api:task.list     api:task.read   api:task.claim  api:task.release
+//   api:task.takeover api:task.decide
+//   api:case.read     api:case.list
+//   api:obligation.list                api:obligation.acknowledge
+//   api:hold.list     api:hold.place  api:hold.release
+//   api:halt.list     api:halt.place  api:halt.lift
+//   api:event.deliver api:deadletter.list
+//   api:push.list     api:push.rearm
 
 // A peer may ask this agent to do work, and read back what it asked for.
 permit(
@@ -66,6 +86,18 @@ permit(
 // To key the runtime's gates on *who asked*, give the run a delegation chain:
 // its context is merged into these requests, which is the supported path for
 // caller attributes below the surface.
+//
+// **`data:release` is deliberately not permitted here, and that is a refusal
+// rather than an omission.** It is the third runtime action, asked on every
+// typed release, and Cedar denies what no rule permits — so this bundle passes
+// a run's effects and refuses to let a labelled value out. That is the right
+// default for a starting policy, because the release gate is the one whose
+// rules depend on what a deployment considers sensitive, and there is no
+// answer to that which an example can supply. `preflight` will not warn you:
+// it reports rules that cannot evaluate, and a rule nobody wrote evaluates
+// fine. To open it, permit `data:release` on the labels you mean, reading
+// `context.label` — never as a blanket permit beside the two above, which
+// silently turns the lattice off.
 permit(
     principal,
     action in [Action::"run:admit", Action::"effect:perform"],

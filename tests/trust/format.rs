@@ -165,6 +165,7 @@ fn effects() -> Vec<RecordKind> {
         RecordKind::EffectDone {
             output: json!({ "charge": "ch_9RtQ" }),
             source: Some("acme.psp".into()),
+            by: None,
             spend: Spend::tokens(70),
             declared: DeclaredOutput {
                 trust: Trust::Untrusted,
@@ -181,7 +182,12 @@ fn effects() -> Vec<RecordKind> {
             disposition: Disposition::Landed,
             output: Some(json!({ "charge": "ch_9RtQ" })),
             spend: Spend::tokens(30),
-            detail: Some("the provider's console lists it".into()),
+            // A person asserted this, so their account is the clear `note`
+            // and the provider-facing `detail` is empty. The vector carried
+            // the operator's own sentence in `detail` — which is the
+            // conflation the two fields now separate.
+            detail: None,
+            note: Some("the provider's console lists it".into()),
             declared: Some(DeclaredOutput::untrusted()),
             asserted_by: Some(operator("ada")),
         },

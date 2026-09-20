@@ -1307,6 +1307,28 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                 ApiError(StatusCode::CONFLICT, e)
             }""",
     ),
+    "TheApiClaimsABasisItDidNotEstablish": (
+        "src/api/mod.rs",
+        "the_decision_is_recorded_under_the_authenticated_caller",
+        "every decision is journaled as merely asserted, so the one surface "
+        "that verified a credential records the same claim a terminal makes — "
+        "an auditor reading an approval can no longer tell a name an identity "
+        "provider vouched for from one somebody typed",
+        """            crate::core::Operator::authenticated(s.caller.actor.clone())""",
+        """            crate::core::Operator::asserted(s.caller.actor.clone())""",
+    ),
+    "AnExpiryIsFiledAsAPersonsAnswer": (
+        "src/runtime/sweeper.rs",
+        "an_expiry_may_not_be_filed_as_a_persons_answer",
+        "the person's door accepts the policy's answer by inventing a name for "
+        "it, so a claim, an eligibility check and a four-eyes exclusion all run "
+        "against `system:expiry` — every control passes by having nothing to "
+        "test, and the worklist records a decider who does not exist",
+        """        let Some(by) = decision.decided.operator() else {""",
+        """        let fabricated = crate::core::Operator::asserted("system:expiry")
+            .expect("a constant name");
+        let Some(by) = decision.decided.operator().or(Some(&fabricated)) else {""",
+    ),
     "ADecideRefusalLosesItsClass": (
         "src/runtime/sweeper.rs",
         "a_mistyped_id_is_a_404_not_a_conflict",
@@ -1314,10 +1336,10 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "denial, so a task id that names nothing reads as 'you are not "
         "allowed' — the permanent answer for the transient mistake — and no "
         "surface downstream can tell a typo from a four-eyes exclusion",
-        """        tasks.claim(id, &decision.actor, roles).await?;""",
-        """        tasks.claim(id, &decision.actor, roles).await.map_err(|e| {
+        """        tasks.claim(id, by.actor(), roles).await?;""",
+        """        tasks.claim(id, by.actor(), roles).await.map_err(|e| {
             RuntimeError::PolicyDenied(crate::core::PolicyError::Denied {
-                principal: decision.actor.clone(),
+                principal: by.actor().to_owned(),
                 action: "task/decide".into(),
                 resource: format!("{id}: {e}"),
             })
@@ -2663,8 +2685,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/runtime/executor.rs",
         "a_stopped_run_is_not_resumed_by_a_later_event",
         "a stopped run is resumed by the next event and carries on",
-        '        "cancelled" => Some(recorded_canceller(records).map_or_else(',
-        '        "cancelled" if false => Some(recorded_canceller(records).map_or_else(',
+        '        "cancelled" => Some(recorded_cancellation(records).map_or_else(',
+        '        "cancelled" if false => Some(recorded_cancellation(records).map_or_else(',
     ),
     "AStopRequestOverwritesTheAsker": (
         "src/store/redb.rs",
@@ -6116,16 +6138,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "every later checkpoint attests — the failure the 'a conclusion is not "
         "a closure' work removed for `failed`, reachable again the moment the "
         "sealing set and the resumable set disagree",
-        '        "abandoned" => Some(recorded_decider(records).map_or_else(\n'
+        '        "abandoned" => Some(recorded_abandonment(records).map_or_else(\n'
         "            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),\n"
-        "            |actor| {\n"
-        "                RunStatus::Abandoned {\n"
-        "                    actor,\n"
-        '                    reason: "recorded as abandoned; its outcome was never established and nothing \\\n'
-        '                         was unwound"\n'
-        "                        .into(),\n"
-        "                }\n"
-        "            },\n"
+        "            |(actor, reason)| RunStatus::Abandoned { actor, reason },\n"
         "        )),",
         '        "abandoned" => None,',
     ),
@@ -6275,13 +6290,15 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "fabricated operator name instead of being quarantined — and a "
         "fabricated actor is indistinguishable from a real operator with that "
         "name on the surface an incident review reads",
-        '        "cancelled" => recorded_canceller(records).map_or_else(\n'
-        "            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),",
-        '        "cancelled" => recorded_canceller(records).map_or_else(\n'
+        '        "cancelled" => recorded_cancellation(records).map_or_else(\n'
+        "            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),\n"
+        "            |(actor, reason)| RunStatus::Cancelled { actor, reason },",
+        '        "cancelled" => recorded_cancellation(records).map_or_else(\n'
         '            || RunStatus::Cancelled {\n'
         '                actor: crate::core::Operator::asserted("unknown").expect("a name"),\n'
-        "                reason: said(),\n"
-        "            },",
+        '                reason: "unattributed".to_owned(),\n'
+        "            },\n"
+        "            |(actor, reason)| RunStatus::Cancelled { actor, reason },",
     ),
     "AHaltForgetsHowItsOperatorWasNamed": (
         "src/store/redb_quota.rs",
@@ -6640,12 +6657,14 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         RUN_LIVE,
         RUN_WAITING,
         ATTENTION,
+        DRILL_READ,
         RUN_CANCEL,""",
         """        RUN_READ,
         RUN_HISTORY,
         RUN_LIVE,
         RUN_WAITING,
         ATTENTION,
+        DRILL_READ,
         RUN_CANCEL,""",
     ),
     "EscalatedCasesAreNotListable": (
@@ -7034,6 +7053,90 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """        effect.sink_arguments().map_or(0, |args| {""",
         """        effect.sink_arguments().map_or(1, |args| {""",
     ),
+    "ARehearsalDoesNotSayWhichStore": (
+        "src/runtime/executor.rs",
+        "a_rehearsal_leaves_a_record_the_plane_can_be_asked_for",
+        "the rehearsal's record does not say which store it ran against, so a "
+        "drill over a restored copy reads exactly like one over production — "
+        "the obvious mistake, and the one an auditor most needs the record to "
+        "make impossible",
+        """                origin: checkpoint.origin.clone(),""",
+        """                origin: String::new(),""",
+    ),
+    "AnIncidentVerbIsAbsentFromTheExampleBundle": (
+        "examples/serve-policy.cedar",
+        "the_example_bundle_names_every_action_the_crate_asks_about",
+        "the only policy bundle this project ships — the one getting-started "
+        "hands a newcomer and docker-smoke runs — stops naming an action the "
+        "crate asks about, while its comment still claims to be the complete "
+        "vocabulary; Cedar denies what no rule permits, so a deployment that "
+        "copied the list finds the verb refused at the point of use, and for "
+        "a halt that point is the incident",
+        """//   api:halt.list     api:halt.place  api:halt.lift""",
+        """//   api:halt.list     api:halt.lift""",
+    ),
+    "AStatusIsMissingFromTheAgreementList": (
+        "src/runtime/executor.rs",
+        "every_run_status_variant_is_listed",
+        "a run status the enum declares is absent from the one list every "
+        "agreement test walks, so nothing decides whether it seals, whether a "
+        "resume may continue from it, or which A2A state it surfaces as — and "
+        "the length assertions beside that list stay green, because they fire "
+        "when somebody edits it rather than when somebody forgets to",
+        """        RunStatus::Swept,""",
+        """        RunStatus::Quarantined("a second".into()),""",
+    ),
+    "ATasksEvidenceIsLeftUnsealed": (
+        "src/keyring/tasks.rs",
+        "a_tasks_evidence_is_sealed_but_its_provenance_is_not",
+        "the trail behind a proposal is written to the worklist in the clear, "
+        "so a dry-run preview — a tool's answer quoting the caller's data — "
+        "outlives the case erasure that reached the journal's copy, in the "
+        "one store an operator browses by hand",
+        """            *item = item.clone().map(|_| payload::wrap_text(&wrapped));""",
+        """            let _ = &wrapped;""",
+    ),
+    "APreviewIsShownAsTheRuntimesOwnWord": (
+        "src/runtime/declarative.rs",
+        "a_declared_preview_shows_the_reviewer_what_the_call_will_touch",
+        "a dry run's answer reaches the worklist as a sentence the run "
+        "vouches for, indistinguishable from the runtime's own notes beside "
+        "it — so the most persuasive line on the task, and the one a "
+        "compromised tool writes, is the one a reviewer has no reason to "
+        "doubt",
+        """            answer.map(|_| rendered)""",
+        """            crate::core::Tainted::trusted(rendered)""",
+    ),
+    "TheApproverIsSealedWithWhatTheySaid": (
+        "src/core/event.rs",
+        "the_approver_outlives_an_erasure_of_what_they_said",
+        "the decider is left inside the decision payload, so the only record "
+        "of who approved an action sits in a sealed field — a lawful erasure "
+        "of the run's payloads destroys the approver's name while leaving the "
+        "chain readable, verifiable and auditable, and nothing reports the loss",
+        """        self.by = Some(by);""",
+        """        let _: crate::core::Operator = by;""",
+    ),
+    "AWithdrawalIsUnrecognised": (
+        "src/runtime/executor.rs",
+        "every_outcome_this_build_writes_is_one_it_can_read_back",
+        "the reader loses the arm for a withdrawal, so a run this plane paused "
+        "under a withdrawn credential reads back as quarantined with 'this "
+        "build does not recognise it' — and the operator deciding whether to "
+        "lift the halt or cancel is told the runtime cannot say what happened",
+        """        WITHHELD_OUTCOME => recorded_withholding(records).map_or_else(""",
+        """        "never-written-by-this-build" => recorded_withholding(records).map_or_else(""",
+    ),
+    "AnEndingRepeatsTheReasonItsRecordHolds": (
+        "src/runtime/executor.rs",
+        "the_conclusion_does_not_repeat_a_reason_its_own_record_holds",
+        "the conclusion copies the reason an operator gave, so one sentence "
+        "becomes two facts — and the copy is a sealed payload while the "
+        "original is clear, so after a lawful erasure the chain says both that "
+        "the reason is knowable and that it is not",
+        """            | Self::Exhausted(_) => None,""",
+        """            | Self::Exhausted(_) => self.reason(),""",
+    ),
     "ABreakGlassCrossingIsUnrecognised": (
         "src/runtime/executor.rs",
         "every_outcome_this_build_writes_is_one_it_can_read_back",
@@ -7041,8 +7144,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "itself reads back as quarantined with 'this build does not recognise "
         "it' in place of the operator's reason — on the one surface the docs "
         "send an incident review to",
-        """        BREAK_GLASS_OUTCOME => recorded_crosser(records).map_or_else(""",
-        """        "never-written-by-this-build" => recorded_crosser(records).map_or_else(""",
+        """        BREAK_GLASS_OUTCOME => recorded_crossing(records).map_or_else(""",
+        """        "never-written-by-this-build" => recorded_crossing(records).map_or_else(""",
     ),
     "ACrossingIsAnonymous": (
         "src/runtime/executor.rs",
@@ -7050,7 +7153,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "the crossing's actor is not read back from the chain, so the control "
         "whose whole content is who crossed and why answers with the reason and "
         "nobody's name against it",
-        """        RecordKind::BreakGlass { actor, .. } => Some(actor.clone()),""",
+        """        RecordKind::BreakGlass { actor, reason, .. } => Some((actor.clone(), reason.clone())),""",
         """        RecordKind::BreakGlass { .. } => None,""",
     ),
     "UnknownOutcomeResumes": (

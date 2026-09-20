@@ -650,6 +650,7 @@ async fn two_producers_sharing_an_id_are_not_one_event() {
         kind: "ack.received".to_owned(),
         correlation: vec![CorrelationKey::new("document", "DOC-1")],
         payload: serde_json::json!({"from": source}),
+        by: None,
     };
 
     assert!(
@@ -822,6 +823,7 @@ async fn one_tenants_event_does_not_resume_another_tenants_run() {
         kind: "ack.received".to_owned(),
         correlation: vec![CorrelationKey::new("document", "DOC-1")],
         payload: serde_json::json!({"ok": true}),
+        by: None,
     };
 
     // Buffered *in acme*, which is what makes this a tenancy question rather
@@ -927,7 +929,10 @@ async fn one_tenants_tasks_are_not_another_tenants_to_decide() {
         run,
         case: None,
         kind: "approval".into(),
-        justification: Justification::new("needs a person", serde_json::json!({})),
+        justification: Justification::new(
+            agentplane::core::Tainted::trusted("needs a person".to_owned()),
+            serde_json::json!({}),
+        ),
         candidate_roles: vec!["ops".into()],
         escalate_to: Vec::new(),
         excluded_actors: Vec::new(),
@@ -1061,6 +1066,7 @@ async fn one_tenants_dead_letters_are_not_another_tenants() {
         kind: "ack.received".to_owned(),
         correlation: vec![CorrelationKey::new("document", "DOC-9")],
         payload: serde_json::json!({"payer": "Ada Lovelace"}),
+        by: None,
     };
     assert!(acme.buffer(&event, ts(1)).await.expect("acme buffers"));
     assert_eq!(

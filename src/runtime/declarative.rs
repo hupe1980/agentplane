@@ -501,7 +501,7 @@ impl Declarative {
                 // an operator can act on and "Carol refused, because X" is.
                 return Ok(Outcome::fail(format!(
                     "{} refused this answer: {}",
-                    decision.actor, decision.reason
+                    decision.decided, decision.reason
                 )));
             }
         }
@@ -546,7 +546,12 @@ impl Declarative {
                 .await?;
             let mut spec = crate::core::TaskSpec::new(
                 rule.task_kind(),
-                crate::core::Justification::new(rule.summary.clone(), answer.peek().clone()),
+                crate::core::Justification::new(
+                    // The manifest's own sentence, reviewed and pinned by
+                    // digest at admission.
+                    Tainted::trusted(rule.summary.clone()),
+                    answer.peek().clone(),
+                ),
                 rule.deadline.name.clone(),
             );
             spec.candidate_roles.clone_from(&rule.audience);
@@ -902,7 +907,7 @@ impl Declarative {
                         if !decision.approved {
                             return Ok(Outcome::fail(format!(
                                 "{} refused the call to {reference}: {}",
-                                decision.actor, decision.reason
+                                decision.decided, decision.reason
                             )));
                         }
                         // As in the loop: the approval's amendment is the
@@ -1294,7 +1299,9 @@ impl Proposal {
     fn task(&self, kind: &str, summary: impl Into<String>, action: Value) -> crate::core::TaskSpec {
         let mut spec = crate::core::TaskSpec::new(
             kind,
-            crate::core::Justification::new(summary, action),
+            // Every summary this tier writes is the runtime's own, over the
+            // operator's catalogue reference — never a model's prose.
+            crate::core::Justification::new(Tainted::trusted(summary.into()), action),
             self.deadline.name.clone(),
         );
         spec.candidate_roles.clone_from(&self.approvers);
@@ -1346,9 +1353,13 @@ async fn preview_evidence(
     client: &Arc<dyn crate::tools::ToolClient>,
     preview: &str,
     args: &Tainted<Value>,
-) -> String {
+) -> Tainted<String> {
     let Some(id) = crate::tools::ToolId::parse(preview) else {
-        return format!("preview '{preview}' is not a tool reference, so none was computed");
+        // The runtime's own sentence about a misconfigured manifest, not a
+        // tool's answer — so it is trusted, and a reviewer can tell.
+        return Tainted::trusted(format!(
+            "preview '{preview}' is not a tool reference, so none was computed"
+        ));
     };
     let dispatched = if id.server == crate::tools::AGENT_SERVER {
         cx.commission(&id.tool, args.clone()).await
@@ -1373,11 +1384,20 @@ async fn preview_evidence(
     match dispatched {
         // The value, not a summary of it. A preview the runtime paraphrased
         // would be one more thing between the reviewer and the consequences.
-        Ok(answer) => bounded_evidence(preview, &answer.peek().to_string()),
-        Err(why) => format!(
+        //
+        // **And the label travels with it.** This is a tool's answer over the
+        // caller's data — the single most persuasive sentence in front of a
+        // reviewer, and the one a compromised tool would write. Rendering it
+        // through `peek` produced a `String` indistinguishable from the
+        // runtime's own words in the same list.
+        Ok(answer) => {
+            let rendered = bounded_evidence(preview, &answer.peek().to_string());
+            answer.map(|_| rendered)
+        }
+        Err(why) => Tainted::trusted(format!(
             "preview from {preview} could not be produced ({why}) — this task is being \
              decided without it"
-        ),
+        )),
     }
 }
 

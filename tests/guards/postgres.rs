@@ -951,6 +951,7 @@ async fn events_are_apart(
         kind: "ack.received".to_owned(),
         correlation: vec![CorrelationKey::new("shipment", "SHP-9")],
         payload: serde_json::json!({"ok": true}),
+        by: None,
     };
     assert!(acme.buffer(&event, at).await.expect("acme buffers"));
     assert!(
@@ -1060,6 +1061,7 @@ mod atomic_fixtures {
                     declared: agentplane::core::DeclaredOutput::untrusted(),
                     output,
                     source: None,
+                    by: None,
                     spend: agentplane::core::Spend::default(),
                 },
             )])
@@ -1612,7 +1614,10 @@ async fn postgres_task_claim_admits_exactly_one_reviewer() {
         run,
         case: None,
         kind: "approval".into(),
-        justification: Justification::new("needs a person", serde_json::json!({})),
+        justification: Justification::new(
+            agentplane::core::Tainted::trusted("needs a person".to_owned()),
+            serde_json::json!({}),
+        ),
         candidate_roles: vec!["ops".into()],
         assignee: None,
         priority: Priority::Normal,

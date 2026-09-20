@@ -17,7 +17,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::{CaseId, Digest, EffectKey, RunId, StoreError, Timestamp};
+use crate::core::{CaseId, Digest, EffectKey, Operator, RunId, StoreError, Timestamp};
 
 /// Why a claim was refused.
 ///
@@ -303,12 +303,34 @@ impl OnExpiry {
 }
 
 /// What a reviewer needs in order to disagree.
+///
+/// # Every sentence carries who wrote it
+///
+/// A reviewer is a control, and the thing that defeats a control made of
+/// human judgement is not refusal — it is being told something persuasive by
+/// the party under review. So each free-text field here is a
+/// [`Tainted<String>`](crate::core::Tainted): the run's own words arrive as
+/// [`Tainted::trusted`](crate::core::Tainted::trusted), and anything a model,
+/// a tool or a counterparty produced keeps the label it was handed out with.
+///
+/// **A `String` would launder it, and did.** A dry-run preview is a tool's
+/// answer to *what would this call do*; it is exactly the sentence a reviewer
+/// leans on, and reading it out of a `Tainted` with `peek` dropped the one
+/// fact that says whether to lean on it. The type is what keeps that from
+/// being a matter of remembering.
+///
+/// This does not refuse untrusted content, deliberately. A worklist that only
+/// carried trusted sentences would carry nothing worth reviewing; what a
+/// reviewer is owed is not a sanitised task but an honest one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Justification {
     /// One line: what is being proposed and why.
-    pub summary: String,
+    pub summary: crate::core::Tainted<String>,
     /// The action itself, so the reviewer sees what will happen rather than a
     /// description of it.
+    ///
+    /// Unlabelled on purpose: this is the artifact under review, and that the
+    /// agent proposed it is the premise of the task rather than news.
     pub proposed_action: Value,
     /// How sure the proposer is, where that is meaningful.
     ///
@@ -319,17 +341,27 @@ pub struct Justification {
     pub confidence: Option<f64>,
     /// What acting will cost, in whatever unit the deployment uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost: Option<String>,
+    pub cost: Option<crate::core::Tainted<String>>,
     /// Journal notes, tool outputs, prior decisions — the trail behind the
     /// proposal.
+    ///
+    /// The field where the two authors mix: a runtime's own note about why no
+    /// preview could be computed sits beside the preview itself, which is a
+    /// tool's output over the caller's data. One `Vec`, two provenances, and
+    /// the label is what tells them apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<String>,
+    pub evidence: Vec<crate::core::Tainted<String>>,
 }
 
 impl Justification {
-    pub fn new(summary: impl Into<String>, proposed_action: Value) -> Self {
+    /// A proposal, with the sentence that heads it and where it came from.
+    ///
+    /// `Tainted::trusted(..)` for the run's own words — a manifest summary, a
+    /// constant, an operator's catalogue reference. Anything derived from a
+    /// completion or a tool answer keeps the label it arrived with.
+    pub fn new(summary: crate::core::Tainted<String>, proposed_action: Value) -> Self {
         Self {
-            summary: summary.into(),
+            summary,
             proposed_action,
             confidence: None,
             cost: None,
@@ -344,15 +376,30 @@ impl Justification {
     }
 
     #[must_use]
-    pub fn cost(mut self, c: impl Into<String>) -> Self {
-        self.cost = Some(c.into());
+    pub fn cost(mut self, c: crate::core::Tainted<String>) -> Self {
+        self.cost = Some(c);
         self
     }
 
     #[must_use]
-    pub fn evidence(mut self, e: impl Into<String>) -> Self {
-        self.evidence.push(e.into());
+    pub fn evidence(mut self, e: crate::core::Tainted<String>) -> Self {
+        self.evidence.push(e);
         self
+    }
+
+    /// Whether any sentence here was written by something the run does not
+    /// trust.
+    ///
+    /// The question a reviewer's surface asks once, rather than walking three
+    /// fields and remembering which ones are text. `proposed_action` is not
+    /// consulted: it is the artifact under review, not a claim about it.
+    #[must_use]
+    pub fn has_untrusted_prose(&self) -> bool {
+        let untrusted =
+            |t: &crate::core::Tainted<String>| t.label().trust != crate::core::Trust::Trusted;
+        untrusted(&self.summary)
+            || self.cost.as_ref().is_some_and(untrusted)
+            || self.evidence.iter().any(untrusted)
     }
 }
 
@@ -522,13 +569,62 @@ impl Task {
     }
 }
 
+/// Who answered, and on what footing.
+///
+/// Two variants rather than one name with reserved spellings, because they are
+/// two different facts. `system:unattended` in an actor field puts *nobody
+/// answered* into the shape of *somebody did*: a reader has to know the
+/// convention to tell an approval from a timeout, every consumer re-implements
+/// the same prefix test, and nothing stops a deployment having a principal by
+/// that name. [`I14`](crate::journal) forbids the flattening for the same
+/// reason [`ActorView`](crate::api::ActorView) is two fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Decided {
+    /// A person answered, with what established their name.
+    By(Operator),
+    /// Nobody answered inside the window, and the declared
+    /// [`OnExpiry`] was applied.
+    OnExpiry(OnExpiry),
+}
+
+impl Decided {
+    /// The operator who answered, when a person did.
+    ///
+    /// `None` for an expiry, and that is the distinction callers need: a
+    /// four-eyes check has nobody to exclude when nobody decided, and an
+    /// eligibility check run against a fabricated name would pass or fail for
+    /// reasons unrelated to the control.
+    #[must_use]
+    pub const fn operator(&self) -> Option<&Operator> {
+        match self {
+            Self::By(op) => Some(op),
+            Self::OnExpiry(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Decided {
+    /// What a message names, where a sentence needs a subject.
+    ///
+    /// The basis is deliberately absent: it belongs on the record, and a
+    /// rendered `alice (asserted)` is a string a reader would have to parse
+    /// back — the defect [`ActorView`](crate::api::ActorView) exists to avoid.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::By(op) => f.write_str(op.actor()),
+            Self::OnExpiry(policy) => write!(f, "the declared policy ({})", policy.as_str()),
+        }
+    }
+}
+
 /// A human's answer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub approved: bool,
     /// Who decided. Recorded permanently: an approval with no name attached is
     /// not an approval.
-    pub actor: String,
+    pub decided: Decided,
     pub reason: String,
     /// Anything the decision adds — and on an approved call task, the call:
     /// the declarative tiers dispatch an approving reviewer's amendment in
@@ -539,19 +635,26 @@ pub struct Decision {
 }
 
 impl Decision {
-    pub fn approve(actor: impl Into<String>, reason: impl Into<String>) -> Self {
+    /// An approval, from a named operator.
+    ///
+    /// Taking an [`Operator`] rather than a name is the point: an approval is
+    /// evidence about a person, and how strongly the name is established is
+    /// half of what it is worth. A caller who has only a string has to say
+    /// which constructor applies, and that is the claim a reviewer reads.
+    pub fn approve(by: Operator, reason: impl Into<String>) -> Self {
         Self {
             approved: true,
-            actor: actor.into(),
+            decided: Decided::By(by),
             reason: reason.into(),
             amendment: Value::Null,
         }
     }
 
-    pub fn reject(actor: impl Into<String>, reason: impl Into<String>) -> Self {
+    /// A refusal, from a named operator.
+    pub fn reject(by: Operator, reason: impl Into<String>) -> Self {
         Self {
             approved: false,
-            actor: actor.into(),
+            decided: Decided::By(by),
             reason: reason.into(),
             amendment: Value::Null,
         }
@@ -566,19 +669,16 @@ impl Decision {
     /// The decision the runtime records when a window closes unanswered.
     #[must_use]
     pub fn expired(on_expiry: OnExpiry) -> Self {
-        match on_expiry {
-            OnExpiry::Proceed => Self {
-                approved: true,
-                actor: "system:unattended".into(),
-                reason: "no answer within the window; proceeding was pre-authorised".into(),
-                amendment: Value::Null,
+        Self {
+            approved: on_expiry == OnExpiry::Proceed,
+            decided: Decided::OnExpiry(on_expiry),
+            reason: match on_expiry {
+                OnExpiry::Proceed => {
+                    "no answer within the window; proceeding was pre-authorised".to_owned()
+                }
+                OnExpiry::Deny | OnExpiry::Escalate => "no answer within the window".to_owned(),
             },
-            OnExpiry::Deny | OnExpiry::Escalate => Self {
-                approved: false,
-                actor: "system:expiry".into(),
-                reason: "no answer within the window".into(),
-                amendment: Value::Null,
-            },
+            amendment: Value::Null,
         }
     }
 }
@@ -589,6 +689,10 @@ mod tests {
 
     use super::*;
 
+    fn rita() -> Operator {
+        Operator::asserted("rita").expect("a fixture names its operator")
+    }
+
     /// `amend` attaches the amendment and disturbs nothing else.
     ///
     /// An approval's other three fields are what make it an approval — who, and
@@ -597,17 +701,17 @@ mod tests {
     /// The builder had no caller and no test, so nothing could tell.
     #[test]
     fn an_amendment_rides_along_without_disturbing_the_verdict() {
-        let plain = Decision::approve("rita", "within her limit");
-        let amended = Decision::approve("rita", "within her limit").amend(json!({"cap": 5000}));
+        let plain = Decision::approve(rita(), "within her limit");
+        let amended = Decision::approve(rita(), "within her limit").amend(json!({"cap": 5000}));
 
         assert_eq!(amended.amendment, json!({"cap": 5000}));
         assert_eq!(plain.amendment, Value::Null, "the default carries none");
         assert_eq!(amended.approved, plain.approved);
-        assert_eq!(amended.actor, plain.actor);
+        assert_eq!(amended.decided, plain.decided);
         assert_eq!(amended.reason, plain.reason);
 
         // A rejection may be amended too — "no, and here is what would pass".
-        let rejected = Decision::reject("rita", "over her limit").amend(json!({"cap": 5000}));
+        let rejected = Decision::reject(rita(), "over her limit").amend(json!({"cap": 5000}));
         assert!(!rejected.approved, "amending must not approve");
     }
 }

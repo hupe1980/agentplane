@@ -255,7 +255,7 @@ async fn missing_stores_are_unchecked_not_passed() {
     .cases(Arc::clone(&f.cases))
     .blobs(Arc::clone(&f.blobs))
     .build();
-    let wired = rt.drill().await.expect("runtime drill");
+    let wired = rt.drill(ts(5_000)).await.expect("runtime drill");
     assert_eq!(wired.cases, report.cases, "same case layer walked");
     assert!(
         wired.not_checked.iter().any(|n| n.contains("key ring"))
@@ -617,4 +617,67 @@ async fn retention_without_a_blob_store_still_destroys_the_case_key() {
         after.sealed_erased, 1,
         "the sealed state must read as erased by design through the key: {after:#?}"
     );
+}
+
+/// **A rehearsal leaves a record, and a plane that never drilled says so.**
+///
+/// What an audit asks is not *can you rehearse* but **when you last did, and
+/// whether it passed**. Left to the caller, that answer lives in whatever ran
+/// the verb — a CI log or a wiki page, which is the artifact this project
+/// argues against relying on everywhere else. So the verdict is a row the
+/// plane holds, and `None` before the first rehearsal is a finding rather
+/// than a clean answer.
+#[tokio::test]
+async fn a_rehearsal_leaves_a_record_the_plane_can_be_asked_for() {
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::Runtime;
+    use std::sync::Arc;
+
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .origin("drill-plane"),
+    );
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .build();
+
+    // Never rehearsed: not an error, and not a pass.
+    assert_eq!(
+        rt.last_drill().await.expect("readable"),
+        None,
+        "a plane that never drilled must not answer as though it had"
+    );
+
+    let report = rt.drill(ts(5_000)).await.expect("the drill runs");
+    let recorded = rt
+        .last_drill()
+        .await
+        .expect("readable")
+        .expect("the rehearsal was recorded");
+
+    assert_eq!(recorded.sound, report.is_sound());
+    assert_eq!(recorded.cases, report.cases as u64);
+    assert_eq!(recorded.findings, report.findings.len() as u64);
+    // Kept apart from `sound`: this plane has no blob store and no key ring,
+    // so the pass established less than a complete one would, and a reader
+    // has to be able to see that rather than infer it.
+    assert_eq!(recorded.not_checked, report.not_checked.len() as u64);
+    assert!(
+        recorded.not_checked > 0,
+        "a drill with neither blobs nor keys wired reported a complete pass"
+    );
+
+    // Which store it ran against, from the plane's own checkpoint — so a
+    // rehearsal over a restored copy cannot be read as one over production.
+    assert_eq!(recorded.origin, "drill-plane");
+
+    // The latest replaces, rather than accumulating a history nobody prunes.
+    let again = rt.drill(ts(6_000)).await.expect("the drill runs again");
+    let second = rt.last_drill().await.expect("readable").expect("recorded");
+    assert!(
+        second.at >= recorded.at,
+        "the later rehearsal did not replace the earlier one"
+    );
+    assert_eq!(second.cases, again.cases as u64);
 }

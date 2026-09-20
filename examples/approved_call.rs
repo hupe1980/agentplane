@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentplane::case::TaskStore;
-use agentplane::core::Decision;
+use agentplane::core::{Decision, Operator};
 use agentplane::manifest::Manifest;
 use agentplane::model::ModelProvider;
 use agentplane::model::fake::FakeProvider;
@@ -173,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("the call is on the worklist");
     let shown = &task.justification.proposed_action;
     println!("   the reviewer sees the call itself, not a description of it:");
-    println!("     summary    → {}", task.justification.summary);
+    println!("     summary    → {}", task.justification.summary.peek());
     println!("     tool       → {}", shown["tool"]);
     println!("     arguments  → {}", shown["arguments"]);
     assert_eq!(shown["arguments"]["amount"], 250_000);
@@ -184,7 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n2. dana approves the call as proposed");
     rt.decide_task(
         task.id,
-        &Decision::approve("dana", "matches the approved invoice INV-7"),
+        &Decision::approve(
+            Operator::asserted("dana")?,
+            "matches the approved invoice INV-7",
+        ),
         &officer(),
     )
     .await?;
@@ -261,8 +264,11 @@ async fn an_amendment_is_the_call() -> Result<(), Box<dyn std::error::Error>> {
     // lists `task:agent.approve_call` beside the model.
     rt.decide_task(
         task.id,
-        &Decision::approve("dana", "wrong account; settle via AC-2, capped")
-            .amend(json!({ "recipient": "AC-2", "amount": 120_000 })),
+        &Decision::approve(
+            Operator::asserted("dana")?,
+            "wrong account; settle via AC-2, capped",
+        )
+        .amend(json!({ "recipient": "AC-2", "amount": 120_000 })),
         &officer(),
     )
     .await?;
@@ -311,7 +317,10 @@ async fn refusal_is_not_an_incident() -> Result<(), Box<dyn std::error::Error>> 
         .expect("the call is on the worklist");
     rt.decide_task(
         task.id,
-        &Decision::reject("dana", "AC-13 is not on the settlement list"),
+        &Decision::reject(
+            Operator::asserted("dana")?,
+            "AC-13 is not on the settlement list",
+        ),
         &officer(),
     )
     .await?;

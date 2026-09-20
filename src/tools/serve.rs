@@ -399,12 +399,22 @@ impl ServerHandler for McpServer {
     /// **Only what carries no labelled payload.**
     ///
     /// One resource per agent: the declaration itself, which is the reviewed,
-    /// content-addressed document `agentplane card` already publishes. Journals,
-    /// cases and audit reports are **not** here, and the line is structural
-    /// rather than a judgement call — a resource read is an egress into a
-    /// model's context, and sensitivity governs what may leave a *run*, so a
-    /// read verb that answers for an operator answers a different question for
-    /// a model. A declaration has no payload to answer it about.
+    /// content-addressed document `agentplane card` already publishes.
+    ///
+    /// **The line is the kind, not the request.** A resource read is an egress
+    /// into a model's context, and a kind may cross only where the runtime can
+    /// bound what crosses *without reading it* — where it cannot carry a
+    /// caller's payload by construction. Deciding per request would need a
+    /// sink gate, and a sink gate needs a declared ceiling for the
+    /// destination; a resource read names no agent, so there is none to apply.
+    ///
+    /// Journals and cases are refused by that rule: records and case state
+    /// exist to carry the caller's data. An **audit report** passes it —
+    /// identifiers, checkpoints, digests and this runtime's own findings — and
+    /// is still not here, which is a different sentence. A model reads a
+    /// resource to do its work, and *did this history check out* is an
+    /// operator's question asked of `audit` on a store; serving it would buy
+    /// reach and no capability, over an artifact that grows with the plane.
     fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,

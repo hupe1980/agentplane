@@ -205,7 +205,7 @@ impl Skill for NeedsApproval {
             .await?;
         let spec = TaskSpec::new(
             "approval",
-            Justification::new("needs a person", json!({})),
+            Justification::new(Tainted::trusted("needs a person".to_owned()), json!({})),
             "approval",
         )
         .role("ops")

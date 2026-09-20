@@ -1845,3 +1845,76 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
     );
     assert!(report.is_sound(), "{:?}", report.findings);
 }
+
+/// **An audit report carries no caller payload, by construction.**
+///
+/// This is the property that decides whether a report may be served to a
+/// **model** over MCP. A resource read is an egress into somebody's context,
+/// so the question is not *may an operator read this* — they may — but
+/// *can the runtime bound what crosses without reading it*. For a journal it
+/// cannot: records exist to carry the caller's data. For a report it can,
+/// because every field is an identifier, a digest or the runtime's own prose.
+///
+/// Held here rather than argued in a document, because "by construction" is
+/// a claim about a struct that somebody will later add a field to. A `detail`
+/// that started quoting the record it found would pass every other test and
+/// silently turn an admissible resource into an exfiltration channel.
+#[tokio::test]
+async fn an_audit_report_carries_no_caller_payload() {
+    #[derive(Debug)]
+    struct Echoes;
+
+    #[async_trait::async_trait]
+    impl agentplane::core::Skill for Echoes {
+        fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+            agentplane::core::SkillDescriptor::new("echo").provides("demo.echo")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut agentplane::runtime::StepCtx<'_>,
+            input: Tainted<serde_json::Value>,
+        ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+            // Through an effect, so it reaches the journal the way real data
+            // does rather than only as the run's input.
+            let _ = cx.now().await?;
+            Ok(agentplane::core::Outcome::done(input))
+        }
+    }
+
+    // A string no runtime sentence would ever contain.
+    const SECRET: &str = "zq-patient-8814-Ada-Lovelace";
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Echoes)
+        .build();
+    let out = rt
+        .run_plan(
+            agentplane::core::PlanIR::single("demo.echo"),
+            Tainted::trusted(json!({ "note": SECRET })),
+        )
+        .await
+        .unwrap();
+
+    // The journal really does hold it — otherwise this test proves nothing.
+    let records = (store.clone() as Arc<dyn JournalStore>)
+        .read(out.run_id, 1)
+        .await
+        .unwrap();
+    assert!(
+        format!("{records:?}").contains(SECRET),
+        "the fixture never wrote the caller's data, so the check below is empty"
+    );
+
+    let s = store.clone() as Arc<dyn JournalStore>;
+    let report =
+        agentplane::audit::audit(&s, &[out.run_id], &agentplane::audit::Evidence::default())
+            .await
+            .unwrap();
+    let rendered = serde_json::to_string(&report).expect("a report serialises");
+    assert!(
+        !rendered.contains(SECRET),
+        "an audit report quoted the caller's data, so it is not servable to a \
+         model: {rendered}"
+    );
+}

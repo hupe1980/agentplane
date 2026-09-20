@@ -123,7 +123,10 @@ impl Skill for HoldThenAsk {
             .task(
                 &TaskSpec::new(
                     "release-hold",
-                    Justification::new("a person decides whether the hold stands", json!({})),
+                    Justification::new(
+                        Tainted::trusted("a person decides whether the hold stands".to_owned()),
+                        json!({}),
+                    ),
                     "review",
                 )
                 .role("dispute-officer"),

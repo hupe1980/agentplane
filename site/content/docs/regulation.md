@@ -33,8 +33,8 @@ the sentence at the top of this one.
 
 ## 📅 Where the EU AI Act actually stands {#where-the-eu-ai-act-actually-stands}
 
-The Digital Omnibus on AI was adopted by Parliament on **16 June 2026** and the
-Council on **29 June 2026**, entering into force that July. It moved the
+The Digital Omnibus on AI — **Regulation (EU) 2026/1744**, published in the
+Official Journal on 24 July 2026 and in force from 27 July — moved the
 high-risk dates and left the transparency ones alone:
 
 | | Applies from |

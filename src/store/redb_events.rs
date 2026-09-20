@@ -22,7 +22,7 @@ fn phase_from(s: &str) -> Result<crate::core::Phase, StoreError> {
 }
 
 /// `(source, id) -> (source, id, kind, payload, received_at, claimed_by,
-/// claimed_at, has_claim, dead, dead_reason)`.
+/// claimed_at, has_claim, dead, dead_reason, by_actor, by_basis)`.
 ///
 /// Keyed by the pair, not by `id`: `id` is unique only within one producer, so
 /// two counterparties numbering their messages from one would silently
@@ -42,7 +42,36 @@ type EventRow<'a> = (
     u8,
     u8,
     &'a str,
+    // The operator this plane minted the message for, and what established
+    // the name — empty for everything that arrived over a wire. Two slots
+    // rather than a rendered string, as every other operator row here is.
+    &'a str,
+    &'a str,
 );
+
+/// The two slots an operator occupies in a row, or empty for a wire message.
+///
+/// One encoder, because two would agree until the day a basis is added.
+fn encode_minter(by: Option<&crate::core::Operator>) -> (String, String) {
+    by.map_or_else(
+        || (String::new(), String::new()),
+        |o| (o.actor().to_owned(), o.basis().as_str().to_owned()),
+    )
+}
+
+/// The inverse. Empty means nobody minted it; half-filled is corruption.
+fn decode_minter(actor: &str, basis: &str) -> Result<Option<crate::core::Operator>, StoreError> {
+    match (actor.is_empty(), basis.is_empty()) {
+        (true, true) => Ok(None),
+        (false, false) => super::decode_operator(actor, basis, "inbound_events").map(Some),
+        _ => Err(StoreError::Corrupt {
+            seq: 0,
+            detail: "inbound_events holds half an operator: a minted event carries a \
+                     name and what established it, or neither"
+                .to_owned(),
+        }),
+    }
+}
 
 const EVENTS: TableDefinition<(&str, &str), EventRow<'static>> =
     TableDefinition::new("inbound_events");
@@ -163,6 +192,7 @@ fn claim_row(
     key: (&str, &str),
     row: (&str, &str, &str, &str, i64),
     claim: (&str, i64),
+    by: (&str, &str),
 ) -> Result<(), StoreError> {
     let (tenant, id) = key;
     let (src, bare, kind, payload, received) = row;
@@ -170,7 +200,9 @@ fn claim_row(
     events
         .insert(
             (tenant, id),
-            (src, bare, kind, payload, received, run, at, 1u8, 0u8, ""),
+            (
+                src, bare, kind, payload, received, run, at, 1u8, 0u8, "", by.0, by.1,
+            ),
         )
         .map_err(|e| be(&e))?;
     Ok(())
@@ -190,7 +222,7 @@ fn strip_payload(
     key: &str,
 ) -> Result<bool, StoreError> {
     let Some(row) = events.get((tenant, key)).map_err(|e| be(&e))?.map(|v| {
-        let (src, bid, kd, _, ra, cb, ca, hc, dead, reason) = v.value();
+        let (src, bid, kd, _, ra, cb, ca, hc, dead, reason, ba, bb) = v.value();
         (
             src.to_owned(),
             bid.to_owned(),
@@ -201,6 +233,12 @@ fn strip_payload(
             hc,
             dead,
             reason.to_owned(),
+            // Kept, like the claim state and the dead-letter accounting: an
+            // erasure destroys the counterparty's content, and *who on this
+            // plane minted the message* is not that. It is the same rule the
+            // journal holds for an operator's name.
+            ba.to_owned(),
+            bb.to_owned(),
         )
     }) else {
         return Ok(false);
@@ -219,6 +257,8 @@ fn strip_payload(
                 row.6,
                 row.7,
                 row.8.as_str(),
+                row.9.as_str(),
+                row.10.as_str(),
             ),
         )
         .map_err(|e| be(&e))?;
@@ -333,6 +373,7 @@ impl EventStore for RedbStore {
         let id = event.dedup_key();
         let bare_id = event.id.clone();
         let source = event.source.clone();
+        let (by_actor, by_basis) = encode_minter(event.by.as_ref());
         let kind = event.kind.clone();
         let payload = serde_json::to_string(&event.payload)?;
         let keys = event.correlation.clone();
@@ -360,6 +401,8 @@ impl EventStore for RedbStore {
                             0u8,
                             0u8,
                             "",
+                            by_actor.as_str(),
+                            by_basis.as_str(),
                         ),
                     )
                     .map_err(|e| be(&e))?;
@@ -485,7 +528,8 @@ impl EventStore for RedbStore {
                             .get((tenant.as_str(), id.as_str()))
                             .map_err(|e| be(&e))?
                             .map(|v| {
-                                let (src, bid, kd, pl, ra, claimed_by, _, hc, dead, _) = v.value();
+                                let (src, bid, kd, pl, ra, claimed_by, _, hc, dead, _, ba, bb) =
+                                    v.value();
                                 (
                                     kd.to_owned(),
                                     pl.to_owned(),
@@ -495,6 +539,8 @@ impl EventStore for RedbStore {
                                     src.to_owned(),
                                     bid.to_owned(),
                                     claimed_by.to_owned(),
+                                    ba.to_owned(),
+                                    bb.to_owned(),
                                 )
                             })
                         else {
@@ -521,7 +567,7 @@ impl EventStore for RedbStore {
 
                 match hit {
                     None => None,
-                    Some((id, (kd, payload, received, _, _, src, bid, _))) => {
+                    Some((id, (kd, payload, received, _, _, src, bid, _, ba, bb))) => {
                         // Claimed in the same transaction that selected it: two
                         // runs waiting on one key must not both consume a single
                         // message.
@@ -539,6 +585,8 @@ impl EventStore for RedbStore {
                                     1u8,
                                     0u8,
                                     "",
+                                    ba.as_str(),
+                                    bb.as_str(),
                                 ),
                             )
                             .map_err(|e| be(&e))?;
@@ -564,6 +612,7 @@ impl EventStore for RedbStore {
                                 kind: kd,
                                 correlation,
                                 payload: serde_json::from_str(&payload)?,
+                                by: decode_minter(&ba, &bb)?,
                             },
                             received_at: from_ts(received)?,
                         })
@@ -608,7 +657,7 @@ impl EventStore for RedbStore {
                             .get((tenant.as_str(), id.as_str()))
                             .map_err(|e| be(&e))?
                             .map(|v| {
-                                let (src, bid, kd, pl, ra, _, _, hc, dead, _) = v.value();
+                                let (src, bid, kd, pl, ra, _, _, hc, dead, _, ba, bb) = v.value();
                                 (
                                     kd.to_owned(),
                                     pl.to_owned(),
@@ -617,21 +666,24 @@ impl EventStore for RedbStore {
                                     dead,
                                     src.to_owned(),
                                     bid.to_owned(),
+                                    ba.to_owned(),
+                                    bb.to_owned(),
                                 )
                             });
                         // Absent, already claimed, or dead: somebody else took it
                         // between the select and here.
                         let claimable = row
                             .as_ref()
-                            .is_some_and(|(_, _, _, hc, dead, _, _)| *hc == 0 && *dead == 0);
+                            .is_some_and(|(_, _, _, hc, dead, ..)| *hc == 0 && *dead == 0);
                         if claimable {
-                            let (kd, pl, ra, _, _, src, bid) =
+                            let (kd, pl, ra, _, _, src, bid, ba, bb) =
                                 row.expect("claimable implies present");
                             claim_row(
                                 &mut events,
                                 (&tenant, &id),
                                 (&src, &bid, &kd, &pl, ra),
                                 (&run, ts(at)),
+                                (&ba, &bb),
                             )?;
                             drop(events);
                             w.open_table(EVENTS_LIVE)
@@ -767,6 +819,7 @@ impl EventStore for RedbStore {
         let kind = event.kind.clone();
         let payload = serde_json::to_string(&event.payload)?;
         let keys = event.correlation.clone();
+        let (by_actor, by_basis) = encode_minter(event.by.as_ref());
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let outcome = {
@@ -775,7 +828,7 @@ impl EventStore for RedbStore {
                     .get((tenant.as_str(), id.as_str()))
                     .map_err(|e| be(&e))?
                     .map(|row| {
-                        let (_, _, _, _, _, claimed_by, _, has_claim, _, _) = row.value();
+                        let (_, _, _, _, _, claimed_by, _, has_claim, _, _, _, _) = row.value();
                         (claimed_by.to_owned(), has_claim)
                     });
                 let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
@@ -879,6 +932,8 @@ impl EventStore for RedbStore {
                                 1u8,
                                 0u8,
                                 "",
+                                by_actor.as_str(),
+                                by_basis.as_str(),
                             ),
                         )
                         .map_err(|e| be(&e))?;
@@ -1018,6 +1073,7 @@ impl EventStore for RedbStore {
             kind: String::new(),
             correlation: Vec::new(),
             payload: serde_json::Value::Null,
+            by: None,
         }
         .dedup_key();
         self.with_db(move |db| {
@@ -1068,7 +1124,7 @@ impl EventStore for RedbStore {
                         .get((tenant.as_str(), id.as_str()))
                         .map_err(|e| be(&e))?
                         .map(|v| {
-                            let (src, bid, kd, pl, ra, _, _, hc, d, _) = v.value();
+                            let (src, bid, kd, pl, ra, _, _, hc, d, _, ba, bb) = v.value();
                             (
                                 kd.to_owned(),
                                 pl.to_owned(),
@@ -1077,6 +1133,8 @@ impl EventStore for RedbStore {
                                 d,
                                 src.to_owned(),
                                 bid.to_owned(),
+                                ba.to_owned(),
+                                bb.to_owned(),
                             )
                         })
                     else {
@@ -1103,6 +1161,12 @@ impl EventStore for RedbStore {
                                 0u8,
                                 1u8,
                                 reason.as_str(),
+                                // A dead letter keeps its minter, exactly as
+                                // it keeps its identity: the queue is read by
+                                // an operator diagnosing where a message came
+                                // from.
+                                row.7.as_str(),
+                                row.8.as_str(),
                             ),
                         )
                         .map_err(|e| be(&e))?;
@@ -1146,7 +1210,7 @@ impl EventStore for RedbStore {
                 let Some(v) = events.get((tenant.as_str(), id)).map_err(|e| be(&e))? else {
                     continue;
                 };
-                let (source, bare, kind, payload, received, _, _, _, _, reason) = v.value();
+                let (source, bare, kind, payload, received, _, _, _, _, reason, ba, bb) = v.value();
                 out.push(DeadLetter {
                     event: InboundEvent {
                         source: source.to_owned(),
@@ -1154,6 +1218,7 @@ impl EventStore for RedbStore {
                         kind: kind.to_owned(),
                         correlation: load_correlation(&corr, &tenant, id)?,
                         payload: serde_json::from_str(payload)?,
+                        by: decode_minter(ba, bb)?,
                     },
                     received_at: from_ts(received)?,
                     reason: if reason.is_empty() {

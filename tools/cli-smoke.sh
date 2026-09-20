@@ -347,5 +347,32 @@ grep -q '"retired"' <<<"$out" || {
 quiet one: $out"; exit 1; }
 echo "ok: retirement requires a window and reports what it retired"
 
+echo "── every remedy verb names itself, and each refuses a nameless actor ──"
+# The half a unit test cannot reach: the guard holds the *lists* together, and
+# this holds the parser to them. An operator act a terminal records is
+# `asserted`, so the name beside it is the whole of its evidence — a verb that
+# took it as optional would write an act attributed to nobody.
+for verb in reconcile quarantine decide acknowledge cancel; do
+    "${BIN[@]}" "$verb" --help >/dev/null 2>&1 || {
+        echo "FAIL: \`$verb\` is named in an \`attention\` remedy and does not exist"; exit 1; }
+done
+echo "ok: every remedy verb exists"
+
+if "${BIN[@]}" cancel some-run --store "$jdir/j.redb" --reason x >/dev/null 2>&1; then
+    echo "FAIL: \`cancel\` recorded an act with nobody named on it"; exit 1
+fi
+if "${BIN[@]}" decide some-task --store "$jdir/j.redb" --actor a --reason x >/dev/null 2>&1; then
+    echo "FAIL: \`decide\` accepted a decision with no verdict"; exit 1
+fi
+if "${BIN[@]}" quarantine some-run --store "$jdir/j.redb" --actor a --reason x \
+        --decision sideways >/dev/null 2>&1; then
+    echo "FAIL: \`quarantine\` accepted a decision it cannot make"; exit 1
+fi
+if "${BIN[@]}" reconcile some-run --store "$jdir/j.redb" --actor a --note n \
+        --effect 00 --outcome did-not-happen --output '{}' >/dev/null 2>&1; then
+    echo "FAIL: \`reconcile\` accepted a result for an effect that did not happen"; exit 1
+fi
+echo "ok: each refuses the argument it cannot honestly record"
+
 echo
 echo "the CLI runs an agent that is only a file"

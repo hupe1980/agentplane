@@ -1413,6 +1413,27 @@ agentplane serve agent.yaml \
 Feature `http`, off by default. A library embedded in someone else's process
 should not open a port unless asked.
 
+**There are two surfaces, and the second one matters most when the first is
+gone.** The HTTP API acts on a *running plane*; each CLI verb opens a *store*.
+On the embedded backend that division is load-bearing, because redb admits one
+writer process: a verb that opens the store is a verb that runs while the
+plane is down — which is exactly when somebody is reaching for it.
+
+So every remedy `agentplane attention` names is a verb the CLI has.
+`reconcile` establishes an effect the runtime could not decide; `quarantine`
+reopens or abandons the run afterwards; `decide` answers a task on the
+worklist; `acknowledge` accounts for a breached obligation; `cancel` stops a
+run the ceiling or the halt will not release; `rearm` revives a parked push
+registration. Each takes `--actor`, recorded as **asserted** — nothing at a
+terminal verified the name, and the record says so, where the same act through
+the API records `authenticated`.
+
+Two of them cannot finish the job from a terminal, and say so rather than
+pretending. `quarantine` records the decision and reports `"applied": false`:
+a terminal holds the journal and not the agent, so the next resume applies it.
+`decide` records the decision durably and reports what the delivery did; a run
+waiting on it resumes when something can run it.
+
 ### Serving it
 
 Embedders wire `Api` into their own process; the `agentplane` binary's `serve`
@@ -1464,6 +1485,13 @@ pub struct DecisionRequest {   // no `actor`. no `roles`.
 The handler builds the `Decision` from the authenticated `Caller`, because there
 is no other source available to it. A later maintainer cannot be talked into
 reading the body's actor, since there is nothing to read.
+
+What lands on the record is an `Operator` whose basis is `authenticated`, and
+this is the only surface entitled to claim it — an `Authenticator` named the
+caller before the route ran. The same approval given at a terminal records
+`asserted`, which says the name is whoever ran the command's own account of
+themselves. An auditor can tell the two apart, which is half of what an
+approval is worth as evidence.
 
 `deny_unknown_fields` is the other half. Without it, a body carrying
 `"actor": "alice"` is accepted and silently ignored — the integrator who wrote it
@@ -1819,9 +1847,10 @@ whether a run id exists by comparing a `400` against a `404`.
 | Route | The question it answers |
 |---|---|
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
-| `GET /runs/live` | What is executing **right now**, and under whose authority? Each entry carries the agent, the revision and the delegation subject, and `stranded` marks a lapsed lease → [the emergency stop](#the-emergency-stop) |
-| `GET /attention` | **Does anything here need a person right now** — and which thing? The roll-up over every backlog below, each condition named with what to do about it, and `not_checked` naming the ones this plane has no store for. `agentplane attention` is the same answer with a non-zero exit, for a scheduler |
-| `GET /runs/waiting` | What is this plane **waiting on**, and until when? Soonest due first, so what should have moved already sorts to the front. Neither of the two listings above holds these: a suspended run has concluded nothing and gave its admission slot back → [the recovery runbook](#recovery-drill) |
+| `GET /runs/live` | What is executing **right now**, and under whose authority? `stranded` marks a lapsed lease → [the emergency stop](#the-emergency-stop) |
+| `GET /drill` | **When did this plane last rehearse recovery, and did it pass?** `{"drilled": false}` for a plane that never has is a finding, not a clean answer → [recovery drill](#recovery-drill) |
+| `GET /attention` | **Does anything here need a person, and which thing?** One roll-up over every backlog below, each condition with its remedy. `agentplane attention` exits non-zero when something does |
+| `GET /runs/waiting` | What is this plane **waiting on**, and until when? Soonest due first, so what should have moved already sorts to the front → [the recovery runbook](#recovery-drill) |
 | `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end, and on whose decision? |
 | `GET /runs/{run}/history` | What did it actually *do*? The journal, record by record, from `?from=<seq>` |
 | `GET /tasks` | What is waiting for me? |
@@ -2187,6 +2216,35 @@ during an incident:
 assumption: it walks every case, holds each reference against the live stores,
 and reports *unchecked* for a store it was not given. A restore that reads as
 sound while every artifact is unreachable is the outcome it exists to prevent.
+
+**The verdict stays on the plane.** An audit does not ask whether you *can*
+rehearse; it asks when you last did and whether it passed — and left in the
+job that ran the verb, that answer is a CI log that rotates. Every drill
+writes one row, which the next drill replaces:
+
+```sh
+agentplane drill --last --store "$DATABASE_URL" --tenant acme
+# {"drilled":true,"at":"2026-09-20T04:11:02Z","sound":true,
+#  "cases":812,"findings":0,"not_checked":1,
+#  "origin":"acme-prod","log_size":91_204}
+```
+
+`GET /drill` serves the same answer under `api:drill.read` — its own
+capability, so a read-only auditor credential need not carry the operational
+roll-up as well. Three things to read off it:
+
+* **`drilled: false` is a finding**, not a clean answer. *Nobody has rehearsed
+  this plane* is exactly what a missing log cannot tell you from a rotated
+  one, so both verbs exit non-zero on it.
+* **`origin` says which store it ran against**, from the plane's own
+  checkpoint. A drill over a restored copy proves that copy recoverable and
+  says nothing about production; without an origin the two read identically.
+* **`not_checked` sits beside `sound`, not inside it.** A pass over nothing is
+  not a pass — the example above checked cases and was given no key ring, and
+  a reader has to see that rather than infer it.
+
+`agentplane attention` reports a failed rehearsal as `drill.failed`, and keeps
+reporting it until a later drill passes.
 
 A message delivered to a restored plane **before** its run is resumed buffers,
 and a buffered message nobody claims dead-letters. So the order is: restore,

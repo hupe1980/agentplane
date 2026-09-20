@@ -599,6 +599,16 @@ pub struct TaskView {
     /// not theirs to approve — rather than finding out from a refusal after
     /// they have read the case and made up their mind.
     pub decidable_by_you: bool,
+    /// Whether any sentence in `justification` was written by something the
+    /// run does not trust.
+    ///
+    /// The labels are in `justification` already, so this is derivable — and
+    /// it is served anyway, for the reason `decidable_by_you` is: the failure
+    /// mode is a client that renders the text and never walks the labels, and
+    /// a reviewer who is not shown the distinction has not been given it. A
+    /// flag a UI must actively ignore is harder to miss than a field it must
+    /// actively read.
+    pub has_untrusted_prose: bool,
 }
 
 impl TaskView {
@@ -608,6 +618,7 @@ impl TaskView {
             // it. A second copy of an authorization rule drifts, and the copy
             // that drifts is the one people read.
             decidable_by_you: task.may_decide(&caller.actor, &caller.roles),
+            has_untrusted_prose: task.justification.has_untrusted_prose(),
             assignee: task.assignee,
             id: task.id.to_hex(),
             run: task.run.to_string(),
@@ -927,6 +938,7 @@ impl Api {
             .route("/runs/live", get(live_runs))
             .route("/runs/waiting", get(waiting_runs))
             .route("/attention", get(attention))
+            .route("/drill", get(last_drill))
             .route("/runs/{run}", get(run_view))
             .route("/runs/{run}/history", get(run_history))
             .route("/runs/{run}/cancel", post(cancel_run))
@@ -1061,6 +1073,13 @@ pub mod action {
     /// thereby said they may enumerate every overdue approval and every
     /// unaccounted obligation in one request.
     pub const ATTENTION: &str = "api:attention";
+    /// Read the last recovery rehearsal's verdict.
+    ///
+    /// Its own capability rather than folded into `api:attention`: *has this
+    /// plane ever rehearsed recovery, and did it pass* is an auditor's
+    /// question, and a deployment that wants to hand an auditor a read-only
+    /// credential should not have to hand them the operational roll-up too.
+    pub const DRILL_READ: &str = "api:drill.read";
     pub const RUN_CANCEL: &str = "api:run.cancel";
     /// Handing a quarantined run back to be judged again.
     ///
@@ -1177,6 +1196,7 @@ pub mod action {
         RUN_LIVE,
         RUN_WAITING,
         ATTENTION,
+        DRILL_READ,
         RUN_CANCEL,
         RUN_REOPEN,
         RUN_ABANDON,
@@ -1788,6 +1808,42 @@ async fn attention(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Va
     })))
 }
 
+/// **When this plane last rehearsed recovery, and whether it passed.**
+///
+/// The half that makes `drill` evidence rather than a command. Left to the
+/// process that ran the verb, the answer is a CI log — the artifact this
+/// project argues against relying on everywhere else.
+///
+/// A plane that has never rehearsed answers `{"drilled": false}` rather than
+/// 404: *nobody has drilled this* is a finding an auditor came for, and a
+/// missing resource reads as a missing feature.
+async fn last_drill(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+    let s = api.gate(&headers, action::DRILL_READ, "*").await?;
+    let found = s.plane.last_drill().await.map_err(|e| match e {
+        crate::core::RuntimeError::PlanContract(detail) => ApiError(StatusCode::NOT_FOUND, detail),
+        _ => store_failed(),
+    })?;
+    Ok(Json(match found {
+        None => json!({ "drilled": false }),
+        Some(d) => json!({
+            "drilled": true,
+            "at": d.at.to_string(),
+            "sound": d.sound,
+            "cases": d.cases,
+            "findings": d.findings,
+            // Kept beside `sound` rather than folded into it: a pass over
+            // nothing is not a pass, and a reader who sees only the verdict
+            // cannot tell the two apart.
+            "not_checked": d.not_checked,
+            // Which store it ran against, from the plane's own checkpoint —
+            // so a rehearsal over a restored copy cannot be read as one over
+            // production.
+            "origin": d.origin,
+            "log_size": d.size,
+        }),
+    }))
+}
+
 /// Narrowing the live listing.
 ///
 /// Absent means every run this tenant holds a slot for. `subject` is the
@@ -1970,10 +2026,15 @@ async fn decide(
 
     // The actor is the authenticated caller. There is no other source for it:
     // `DecisionRequest` has no such field, so this is not a convention being
-    // followed but the only construction available.
+    // followed but the only construction available. `authenticated` is the
+    // honest basis on this surface and only on this surface — an
+    // `Authenticator` named the caller before the route ran.
     let decision = Decision {
         approved: body.approved,
-        actor: s.caller.actor.clone(),
+        decided: crate::core::Decided::By(
+            crate::core::Operator::authenticated(s.caller.actor.clone())
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?,
+        ),
         reason: body.reason,
         amendment: body.amendment,
     };

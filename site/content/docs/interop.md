@@ -762,9 +762,27 @@ A resource read is an **egress into a model's context**, not an operator reading
 their own journal. The sensitivity lattice governs what may leave a *run*, so the
 read verb that answers for an operator answers a different question for a model —
 and the protocol's caching directives would put a payload copy somewhere no
-erasure reaches. A manifest raises neither question: it is the reviewed,
-content-addressed document `agentplane card` already publishes, served with its
-digest. Journals, cases and audit reports are **not** served.
+erasure reaches.
+
+**The rule is about the kind, not the request.** A kind may cross only where
+the runtime can bound what crosses *without reading it* — where it cannot
+carry your caller's payload by construction. Deciding per request would mean
+a sink gate, and a sink gate needs a declared ceiling for the destination; a
+resource read names no agent, so there is nothing whose
+`max_sensitivity_egress` applies.
+
+| Kind | Served? | |
+|---|---|---|
+| The declaration | **yes** | No payload: the reviewed, content-addressed document `agentplane card` publishes, with its digest so a reader can say which one they saw |
+| An audit report | admissible, **not served** | Run ids, checkpoints and digests — safe to cross, and a model has no use for *did this history check out*, which is an operator's question asked of `audit` on a store |
+| A journal | **no** | Records exist to carry your caller's data |
+| A case | **no** | Case state *is* the business record |
+
+**What leaves your erasure boundary when a resource crosses: nothing an
+erasure would have destroyed.** That falls out of the same rule — a kind with
+no caller payload has nothing crypto-erasure reaches. So the cache you cannot
+follow holds a reviewed document and a digest, which is why it is tolerable
+here and would not be for the refused kinds above.
 
 ### Model providers (`providers`, `bedrock`)
 

@@ -87,6 +87,7 @@ pub use retry::{RetryPolicy, retry_after_seconds};
 pub use secret::Secret;
 pub use skill::{Capability, Compensation, Outcome, Skill, SkillDescriptor};
 pub use task::{
-    ClaimError, Decision, Justification, OnExpiry, Priority, Task, TaskId, TaskSpec, TaskState,
+    ClaimError, Decided, Decision, Justification, OnExpiry, Priority, Task, TaskId, TaskSpec,
+    TaskState,
 };
 pub use tenant::{TenantError, TenantId, erasure_scope};

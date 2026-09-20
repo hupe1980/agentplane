@@ -97,7 +97,7 @@ impl Skill for PostsThenWaits {
             .await?;
         let spec = TaskSpec::new(
             "release",
-            Justification::new("needs a person", json!({})),
+            Justification::new(Tainted::trusted("needs a person".to_owned()), json!({})),
             "approval",
         )
         .role("officer");
@@ -537,4 +537,57 @@ async fn cancelling_a_running_run_acknowledges_and_lands_at_the_boundary() {
         "the running owner did not observe the durable stop at its boundary: {:?}",
         out.status
     );
+}
+
+/// **One sentence, one record.**
+///
+/// The operator's reason lives on the record that names the operator, in the
+/// clear. The conclusion names the outcome and stops. A second copy on the
+/// conclusion would be worse than redundant: `RunConcluded.reason` is a sealed
+/// payload and `RunCancelled.reason` is not, so after a lawful erasure the one
+/// chain would say both that the reason is knowable and that it is not — and
+/// the readable half is the one nobody would think to check.
+#[tokio::test]
+async fn the_conclusion_does_not_repeat_a_reason_its_own_record_holds() {
+    let f = fixture(PostsThenWaits);
+    let run = suspended_run(&f, "demo.post").await;
+    f.rt.request_cancel(run, &operator("ops-carol"), "counterparty withdrew")
+        .await
+        .unwrap();
+
+    let records = (f.store.clone() as Arc<dyn JournalStore>)
+        .read(run, 1)
+        .await
+        .unwrap();
+
+    let carrying: Vec<&'static str> = records
+        .iter()
+        .filter(|r| {
+            serde_json::to_string(r.kind())
+                .unwrap()
+                .contains("counterparty withdrew")
+        })
+        .map(|r| r.kind().kind_str())
+        .collect();
+    assert_eq!(
+        carrying,
+        vec!["RunCancelled"],
+        "the reason an operator gave is recorded {} times; it belongs on the \
+         record that names them and nowhere else",
+        carrying.len()
+    );
+
+    // And the reader still answers with it, from there.
+    let status =
+        f.rt.recorded_outcome(run)
+            .await
+            .unwrap()
+            .expect("concluded");
+    match status.status {
+        RunStatus::Cancelled { actor, reason } => {
+            assert_eq!(actor, operator("ops-carol"));
+            assert_eq!(reason, "counterparty withdrew");
+        }
+        other => panic!("read back as {other:?}"),
+    }
 }

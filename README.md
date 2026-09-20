@@ -226,8 +226,8 @@ coexist and so do an operator's verbs and a serving process.
 
 Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too, on
 its **own** listener, off unless asked for, and separated from the peer surface
-by *policy* (`peer` reaches `a2a:*`, `operator` reaches `api:*`) rather than by
-the port. It is an HTTP API rather than a console: **anything holding a
+by *policy* — the example bundle gives `peer` the A2A actions and `operator`
+the API ones it uses, not the whole vocabulary — rather than by the port. It is an HTTP API rather than a console: **anything holding a
 delegation that carries the verbs can drive it**, and who is acting comes from
 the authenticated identity, never from the request body — the decision type has
 no actor field to spoof. It serves the worklist and task

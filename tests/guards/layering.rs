@@ -2980,3 +2980,174 @@ fn every_public_function_is_called_or_tested_somewhere() {
          it to ALLOWED with the reason"
     );
 }
+
+/// **Every verb a remedy names is one the surface printing it has.**
+///
+/// `agentplane attention` exists to answer *does anything here need a person*.
+/// It opens a store, exits non-zero, and names each condition's remedy in the
+/// operator's own vocabulary — so a remedy naming a verb this binary does not
+/// have is a diagnosis whose prescription the diagnosing surface cannot fill.
+/// That is [I13](https://docs.rs/agentplane) applied to verbs: the finding is
+/// findable and the fix is not.
+///
+/// It bit. `reconcile`, `reopen`, `abandon`, `acknowledge` and re-arming were
+/// all HTTP-only while `attention` told a terminal to perform them — and on
+/// the embedded backend the HTTP surface is unreachable exactly when the plane
+/// is down, which is when somebody is most likely to be typing.
+///
+/// Held from the two files that hold both lists, because neither can drift
+/// without the other noticing: the remedies are `&'static str` in the runtime
+/// and the verbs are clap's `Commands` block.
+#[test]
+fn every_verb_an_attention_remedy_names_is_one_the_cli_has() {
+    let remedies = read("src/runtime/attention.rs");
+    let cli = read("src/bin/agentplane.rs");
+
+    // Backticked words inside the `remedy` strings. A remedy names a verb in
+    // code font or describes an act in prose; only the first is a promise
+    // this binary can be held to.
+    let mut named: Vec<String> = Vec::new();
+    for line in remedies.lines() {
+        let t = line.trim_start();
+        // The remedy literals live in the condition table and in `note`
+        // calls; both are plain string content, so scan any line that is not
+        // a doc comment.
+        if t.starts_with("///") || t.starts_with("//") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(open) = rest.find('`') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('`') else { break };
+            let word = &after[..close];
+            // `halt --lift` names a verb plus a flag; the verb is the part a
+            // command list can answer for.
+            let verb = word.split_whitespace().next().unwrap_or("");
+            if !verb.is_empty() && verb.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
+                named.push(verb.to_owned());
+            }
+            rest = &after[close + 1..];
+        }
+    }
+    named.sort();
+    named.dedup();
+    assert!(
+        named.len() >= 5,
+        "this guard read {named:?} out of the remedy table — it is scanning the \
+         wrong thing, and a guard that finds nothing passes"
+    );
+
+    // clap derives the verb from the variant name, so the command list is the
+    // enum: `    Reconcile(ReconcileArgs),` → `reconcile`.
+    let commands = cli
+        .lines()
+        .skip_while(|l| !l.contains("enum Verb {"))
+        .take_while(|l| !l.starts_with('}'))
+        .filter_map(|l| {
+            let t = l.trim();
+            let head = t.split(['(', ',']).next()?;
+            (!head.is_empty()
+                && head.chars().next()?.is_ascii_uppercase()
+                && head.chars().all(char::is_alphanumeric))
+            .then(|| {
+                // `ForgetAdmissions` → `forget-admissions`, clap's default.
+                let mut out = String::new();
+                for (i, c) in head.chars().enumerate() {
+                    if c.is_ascii_uppercase() && i > 0 {
+                        out.push('-');
+                    }
+                    out.push(c.to_ascii_lowercase());
+                }
+                out
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        commands.len() > 10,
+        "this guard read {commands:?} as the command list — it is scanning the \
+         wrong thing"
+    );
+
+    let missing: Vec<&String> = named.iter().filter(|v| !commands.contains(v)).collect();
+    assert!(
+        missing.is_empty(),
+        "`attention` tells an operator to run {missing:?}, and this binary has no \
+         such verb. A surface that reports what needs a person and cannot perform \
+         the remedy it names is a control nobody can reach during an incident.\n\
+         remedies named: {named:?}\ncommands: {commands:?}"
+    );
+}
+
+/// The example policy bundle names every action the crate can ask about.
+///
+/// `examples/serve-policy.cedar` is the only bundle this project ships, the one
+/// `getting-started` hands a newcomer and the one `docker-smoke` runs, and its
+/// comment block claims to be the complete vocabulary. Cedar denies what no
+/// rule permits, so an action absent from a deployment's bundle is refused at
+/// the point of use with the caller told only that it was declined — and
+/// `preflight` cannot help, because it reports rules that fail to *evaluate*
+/// and a rule nobody wrote evaluates fine.
+///
+/// That makes the claim load-bearing for whoever copies the file, and a
+/// hand-written list is worth what checks it. The verbs whose absence costs
+/// most are the incident ones — `halt.place`, `run.abandon`,
+/// `effect.reconcile` — because that absence is found during the incident.
+///
+/// Both directions, because they fail differently. An action in the crate and
+/// not in the file is a verb somebody will find denied; a token in the file
+/// naming no action is a rule that silently never matches.
+#[test]
+fn the_example_bundle_names_every_action_the_crate_asks_about() {
+    // The canonical list is `ALL`, not every declared constant: a constant
+    // outside it is not part of the vocabulary the API offers.
+    fn canonical(src: &str, prefix: &str) -> Vec<String> {
+        let all = src.split("pub const ALL:").nth(1).expect("an ALL list");
+        let all = &all[..all.find("];").expect("the end of ALL")];
+        src.lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("pub const ")?;
+                let (name, tail) = rest.split_once(':')?;
+                let open = tail.find(&format!("\"{prefix}"))? + 1;
+                let close = open + tail[open..].find('"')?;
+                all.contains(name.trim())
+                    .then(|| tail[open..close].to_owned())
+            })
+            .collect()
+    }
+
+    let bundle = read("examples/serve-policy.cedar");
+    let mut expected = canonical(&read("src/api/mod.rs"), "api:");
+    assert!(
+        expected.len() > 20,
+        "found {expected:?} — the extraction broke and this guard now proves nothing"
+    );
+    expected.extend(canonical(&read("src/api/a2a.rs"), "a2a:"));
+    // The runtime's own three, taken from the type rather than from source:
+    // `core` is unconditional, so nothing here depends on a feature.
+    expected.extend(agentplane::core::ACTIONS.iter().map(|a| (*a).to_owned()));
+
+    for action in &expected {
+        assert!(
+            bundle.contains(action.as_str()),
+            "`{action}` is asked by this crate and is named nowhere in \
+             examples/serve-policy.cedar — a bundle copied from that file denies \
+             it at the point of use, and the file's own comment claims to list \
+             the complete vocabulary"
+        );
+    }
+
+    for token in bundle.split(|c: char| !(c.is_alphanumeric() || c == ':' || c == '.' || c == '_'))
+    {
+        // A bare `api:` or `a2a:` is the prose wildcard `api:*` with the star
+        // eaten by the tokenizer, not a malformed action.
+        let named = token
+            .strip_prefix("api:")
+            .or_else(|| token.strip_prefix("a2a:"));
+        assert!(
+            named.is_none_or(str::is_empty) || expected.iter().any(|a| a == token),
+            "examples/serve-policy.cedar names `{token}`, which is not an action \
+             this crate asks about — a rule written over it never matches, and a \
+             reader copying the list is told a verb exists that does not"
+        );
+    }
+}

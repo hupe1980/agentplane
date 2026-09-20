@@ -63,6 +63,24 @@ pub struct InboundEvent {
     /// ids; they carry document numbers and meter ids.
     pub correlation: Vec<CorrelationKey>,
     pub payload: Value,
+    /// The operator who minted this message, when this plane minted it.
+    ///
+    /// Distinct from [`source`](Self::source), which is a producer's URI and
+    /// which anyone may claim. This is set only where the runtime itself
+    /// builds an event out of an operator act it already authenticated or
+    /// witnessed — today that is a worklist decision, whose deciding actor
+    /// would otherwise exist only inside [`payload`](Self::payload).
+    ///
+    /// It matters because the payload is a **sealed** journal field and this
+    /// is not: an erasure takes the decision's reason with it, as it must, and
+    /// must not take *who approved* with it.
+    ///
+    /// **Never read off a wire.** A counterparty's message leaves this `None`
+    /// — a sender naming its own operator is an assertion the transport did
+    /// not check, and the one thing this field must not become is a place to
+    /// claim an identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<crate::core::Operator>,
 }
 
 impl InboundEvent {
@@ -78,12 +96,24 @@ impl InboundEvent {
             kind: kind.into(),
             correlation: Vec::new(),
             payload,
+            by: None,
         }
     }
 
     #[must_use]
     pub fn correlate(mut self, key: CorrelationKey) -> Self {
         self.correlation.push(key);
+        self
+    }
+
+    /// Name the operator this plane minted the message for.
+    ///
+    /// Only for events the runtime builds out of an act it authenticated or
+    /// witnessed — see [`by`](Self::by). A message that arrived over a wire
+    /// has no business calling this.
+    #[must_use]
+    pub fn minted_by(mut self, by: crate::core::Operator) -> Self {
+        self.by = Some(by);
         self
     }
 

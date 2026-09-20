@@ -29,8 +29,8 @@ use std::sync::Arc;
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{
     AwaitSpec, Calendar, CalendarError, CaseStatus, CorrelationKey, DeadlineSpec, DeadlineState,
-    Decision, Delivery, Digest, InboundEvent, Justification, OnExpiry, Priority, TaskSpec,
-    Timestamp,
+    Decision, Delivery, Digest, InboundEvent, Justification, OnExpiry, Operator, Priority,
+    TaskSpec, Timestamp,
 };
 use agentplane::journal::RecordKind;
 use agentplane::prelude::*;
@@ -157,12 +157,20 @@ impl Skill for SendRequest {
                     &TaskSpec::new(
                         "rejection-handling",
                         Justification::new(
-                            "counterparty rejected the switch request",
+                            // This skill's own sentence, so the reviewer is
+                            // told the run vouches for it.
+                            Tainted::trusted("counterparty rejected the switch request".to_owned()),
                             json!({ "action": "resubmit-with-corrected-meter" }),
                         )
                         .confidence(0.55)
-                        .cost("one further exchange, ~5 working days")
-                        .evidence(format!("rejection payload: {}", ack.peek())),
+                        .cost(Tainted::trusted(
+                            "one further exchange, ~5 working days".to_owned(),
+                        ))
+                        // The counterparty's own words. `map` carries the
+                        // label across the rendering, where `peek` would have
+                        // handed the reviewer a sentence indistinguishable
+                        // from the two above it.
+                        .evidence(ack.clone().map(|v| format!("rejection payload: {v}"))),
                         "decision",
                     )
                     .role("mako-operator")
@@ -182,7 +190,7 @@ impl Skill for SendRequest {
                 json!({
                     "stage": "decided",
                     "approved": decision.approved,
-                    "by": decision.actor,
+                    "by": decision.decided.to_string(),
                 }),
             )
             .await?;
@@ -191,7 +199,7 @@ impl Skill for SendRequest {
             return Ok(Outcome::done(Tainted::trusted(json!({
                 "outcome": "human-decided",
                 "approved": decision.approved,
-                "by": decision.actor,
+                "by": decision.decided.to_string(),
             }))));
         }
 
@@ -299,7 +307,7 @@ async fn handle_rejection(
     let self_approval = rt
         .decide_task(
             task.id,
-            &Decision::approve("agent:switch-bot", "I am sure"),
+            &Decision::approve(Operator::asserted("agent:switch-bot")?, "I am sure"),
             &["mako-operator".to_owned()],
         )
         .await;
@@ -310,7 +318,10 @@ async fn handle_rejection(
 
     rt.decide_task(
         task.id,
-        &Decision::approve("frank", "meter id corrected in the master data"),
+        &Decision::approve(
+            Operator::asserted("frank")?,
+            "meter id corrected in the master data",
+        ),
         &["mako-operator".to_owned()],
     )
     .await?;

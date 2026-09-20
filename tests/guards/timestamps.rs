@@ -174,7 +174,10 @@ fn a_task_carries_no_component_array() {
         run: RunId::generate(),
         case: None,
         kind: "agent.triage/breach".to_owned(),
-        justification: Justification::new("a deadline was missed", serde_json::json!({})),
+        justification: Justification::new(
+            agentplane::core::Tainted::trusted("a deadline was missed".to_owned()),
+            serde_json::json!({}),
+        ),
         candidate_roles: vec!["grid-operations".to_owned()],
         escalate_to: Vec::new(),
         excluded_actors: Vec::new(),

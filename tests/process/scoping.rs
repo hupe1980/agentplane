@@ -537,7 +537,7 @@ async fn a_matching_answer_returns_and_opens_a_task_beside_it() {
     assert_eq!(queued[0].kind, "agent.triage/breach");
     assert_eq!(queued[0].priority, agentplane::core::Priority::High);
     assert_eq!(
-        queued[0].justification.summary,
+        queued[0].justification.summary.peek(),
         "a regulatory deadline was missed"
     );
     assert_eq!(

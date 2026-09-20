@@ -55,9 +55,15 @@ impl Skill for ProposesRefund {
         let spec = TaskSpec::new(
             "refund-approval",
             Justification::new(
-                "invoice disputed",
+                Tainted::trusted("invoice disputed".to_owned()),
                 json!({ "action": "refund", "amount_eur": 4200 }),
-            ),
+            )
+            // A line the run did not write — here a counterparty's, as a
+            // dry-run preview or a completion would be.
+            .evidence(Tainted::from_source(
+                "counterparty says the meter was replaced".to_owned(),
+                agentplane::core::SourceId::new("peer:utility-co"),
+            )),
             "approval",
         )
         .role("compliance-officer")
@@ -68,7 +74,7 @@ impl Skill for ProposesRefund {
         let decision = cx.task(&spec).await?;
         Ok(Outcome::done(Tainted::trusted(json!({
             "approved": decision.approved,
-            "by": decision.actor,
+            "by": decision.decided.to_string(),
         }))))
     }
 }
@@ -294,6 +300,37 @@ async fn a_body_that_names_an_actor_is_refused_rather_than_ignored() {
     );
 }
 
+/// **A reviewer is told which sentences the run did not write.**
+///
+/// The labels are inside `justification` already, so this flag is derivable —
+/// and it is served anyway, because the failure mode is a client that renders
+/// the text and never walks the labels. A reviewer who is not shown the
+/// distinction has not been given it.
+#[tokio::test]
+async fn a_task_says_whether_it_carries_prose_the_run_did_not_write() {
+    let f = fixture();
+    let task = f.pending_task().await;
+    let router = f.router();
+
+    let (status, body) = send(&router, get(&format!("/tasks/{task}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["has_untrusted_prose"], true,
+        "the task carries a counterparty's sentence and does not say so: {body}"
+    );
+
+    // And the label is on the sentence itself, so a client that wants to badge
+    // one line rather than the whole task can.
+    assert_eq!(
+        body["justification"]["evidence"][0]["label"]["trust"], "untrusted",
+        "the evidence entry lost its provenance on the wire: {body}"
+    );
+    assert_eq!(
+        body["justification"]["summary"]["label"]["trust"], "trusted",
+        "the run's own sentence was served as somebody else's: {body}"
+    );
+}
+
 /// The decision is recorded under the authenticated caller.
 #[tokio::test]
 async fn the_decision_is_recorded_under_the_authenticated_caller() {
@@ -327,14 +364,25 @@ async fn the_decision_is_recorded_under_the_authenticated_caller() {
         )
         .await
         .unwrap();
-    let text = format!("{records:?}");
-    assert!(
-        text.contains("bob"),
-        "the journal does not name the decider"
-    );
-    assert!(
-        !text.contains("alice\""),
-        "the journal names somebody who did not decide"
+    let decided = records
+        .iter()
+        .find_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::EffectDone { output, .. } => {
+                output.get("decided").cloned()
+            }
+            _ => None,
+        })
+        .expect("the awaited decision is on the record");
+
+    // The basis, not only the name. This is the one surface that can say
+    // `authenticated` — an `Authenticator` named the caller before the route
+    // ran — and a terminal holding the store cannot. Recording every decision
+    // the same way would make the strong claim on behalf of the weak one, and
+    // an auditor reading `bob` would have no way to tell which happened.
+    assert_eq!(
+        decided,
+        json!({ "by": { "actor": "bob", "basis": "authenticated" } }),
+        "the journal must carry what established the decider's name"
     );
 }
 
@@ -807,6 +855,7 @@ async fn an_unauthenticated_request_is_refused_everywhere() {
         get("/runs/live", None),
         get("/runs/waiting", None),
         get("/attention", None),
+        get("/drill", None),
         get("/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV", None),
         post(
             "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/cancel",
@@ -937,6 +986,7 @@ fn every_declared_route() -> Vec<axum::http::Request<axum::body::Body>> {
         get("/runs/live", Some("bob")),
         get("/runs/waiting", Some("bob")),
         get("/attention", Some("bob")),
+        get("/drill", Some("bob")),
         get("/cases", Some("bob")),
         get("/obligations", Some("bob")),
         post(
@@ -1359,6 +1409,7 @@ async fn a_dead_letter_is_readable_and_carries_no_payload() {
         kind: "acknowledgement.received".into(),
         correlation: vec![CorrelationKey::new("document", "INV-9")],
         payload: json!({ "iban": "DE02120300000000202051" }),
+        by: None,
     };
     events.buffer(&event, arrived).await.unwrap();
     let retired = events

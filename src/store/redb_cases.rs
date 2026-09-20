@@ -48,6 +48,11 @@ type CaseRow<'a> = (&'a str, &'a str, &'a str, u64, i64);
 /// `(tenant, case_id) -> `[`CaseRow`].
 const CASES: TableDefinition<(&str, &str), CaseRow<'static>> = TableDefinition::new("cases");
 
+/// `tenant -> the last drill's verdict`, one row that the latest write
+/// replaces. A history of rehearsals is a different artifact and a larger
+/// promise than the question an audit asks.
+const LAST_DRILL: TableDefinition<&str, &str> = TableDefinition::new("case_last_drill");
+
 /// `(tenant, namespace, value) -> case_id`, open cases only. One open case per key.
 /// The tenant leads: a correlation key is a *business* value, and two tenants
 /// will legitimately use the same one. Without it, one tenant's run joins
@@ -1242,6 +1247,41 @@ impl CaseStore for RedbStore {
             Ok(())
         })
         .await
+    }
+
+    async fn record_drill(&self, record: &crate::case::DrillRecord) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let encoded = serde_json::to_string(record)?;
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            w.open_table(LAST_DRILL)
+                .map_err(|e| be(&e))?
+                .insert(tenant.as_str(), encoded.as_str())
+                .map_err(|e| be(&e))?;
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn last_drill(&self) -> Result<Option<crate::case::DrillRecord>, StoreError> {
+        let tenant = self.tenant_name();
+        let row = self
+            .with_db(move |db| {
+                let r = db.begin_read().map_err(|e| be(&e))?;
+                // Absent before the first rehearsal — which is the answer an
+                // auditor most wants, and the one a missing log cannot give.
+                let Ok(t) = r.open_table(LAST_DRILL) else {
+                    return Ok(None);
+                };
+                Ok(t.get(tenant.as_str())
+                    .map_err(|e| be(&e))?
+                    .map(|v| v.value().to_owned()))
+            })
+            .await?;
+        row.map(|raw| serde_json::from_str::<crate::case::DrillRecord>(&raw))
+            .transpose()
+            .map_err(StoreError::from)
     }
 
     async fn census(&self, now: Timestamp) -> Result<CaseCensus, StoreError> {

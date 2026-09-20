@@ -269,6 +269,7 @@ mod aad_tests {
             kind: "reply".to_owned(),
             correlation: Vec::new(),
             payload: serde_json::Value::Null,
+            by: None,
         }
     }
 
@@ -372,6 +373,7 @@ mod aad_tests {
             kind: "reply".to_owned(),
             correlation: vec![crate::core::CorrelationKey::new("order", "O-1")],
             payload: serde_json::json!({"pii": "erase me"}),
+            by: None,
         };
         assert!(sealed.buffer(&message, at(1_000)).await.expect("buffer"));
         assert_eq!(

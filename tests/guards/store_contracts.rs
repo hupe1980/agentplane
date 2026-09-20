@@ -44,7 +44,10 @@ mod embedded {
             run,
             case: None,
             kind: "approval".into(),
-            justification: Justification::new("needs a person", serde_json::json!({})),
+            justification: Justification::new(
+                agentplane::core::Tainted::trusted("needs a person".to_owned()),
+                serde_json::json!({}),
+            ),
             candidate_roles: Vec::new(),
             assignee: None,
             priority,
@@ -258,6 +261,7 @@ mod embedded {
             kind: "ack.received".to_owned(),
             correlation: vec![CorrelationKey::new("shipment", "SHP-1")],
             payload: serde_json::json!({ "ok": true }),
+            by: None,
         };
         match store
             .deliver_to(run, &event, at(3_000))
@@ -286,6 +290,7 @@ mod embedded {
             kind: "ack.received".to_owned(),
             correlation: vec![CorrelationKey::new("shipment", format!("SHP-{n}"))],
             payload: serde_json::json!({}),
+            by: None,
         };
 
         store.buffer(&event(1), at(1_000)).await.expect("buffer");
@@ -558,7 +563,10 @@ mod shared {
             run,
             case: None,
             kind: "approval".into(),
-            justification: Justification::new("needs a person", serde_json::json!({})),
+            justification: Justification::new(
+                agentplane::core::Tainted::trusted("needs a person".to_owned()),
+                serde_json::json!({}),
+            ),
             candidate_roles: Vec::new(),
             assignee: None,
             priority,
@@ -680,6 +688,7 @@ mod shared {
             kind: "ack.received".to_owned(),
             correlation: vec![CorrelationKey::new("shipment", "SHP-1")],
             payload: serde_json::json!({ "ok": true }),
+            by: None,
         };
         match store
             .deliver_to(run, &event, at(3_000))
@@ -703,6 +712,7 @@ mod shared {
             kind: "nobody.waits".to_owned(),
             correlation: vec![CorrelationKey::new("order", format!("ORD-{n}"))],
             payload: serde_json::json!({}),
+            by: None,
         };
         store.buffer(&stray(1), at(1_000)).await.expect("buffer");
         assert_eq!(

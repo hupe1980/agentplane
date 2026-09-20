@@ -145,6 +145,25 @@ CREATE TABLE IF NOT EXISTS case_legal_holds (
 CREATE INDEX IF NOT EXISTS case_legal_holds_by_time
     ON case_legal_holds (tenant, placed_at, case_id);
 
+-- The last recovery rehearsal, one row per tenant that the latest write
+-- replaces. A history of drills is a different artifact and a larger promise
+-- than the question an audit asks: *when did you last rehearse, and did it
+-- pass*. The columns are counts, an instant and the checkpoint the plane was
+-- serving — no case is referenced, so nothing cascades and a drill's verdict
+-- outlives the matters it walked, which is the point.
+CREATE TABLE IF NOT EXISTS case_last_drill (
+    tenant      TEXT    NOT NULL,
+    ran_at      BIGINT  NOT NULL,
+    sound       BOOLEAN NOT NULL,
+    cases       BIGINT  NOT NULL,
+    findings    BIGINT  NOT NULL,
+    -- Kept apart from `sound`: a pass over nothing is not a pass.
+    not_checked BIGINT  NOT NULL,
+    origin      TEXT    NOT NULL,
+    log_size    BIGINT  NOT NULL,
+    PRIMARY KEY (tenant)
+);
+
 CREATE TABLE IF NOT EXISTS case_deadlines (
     tenant          TEXT   NOT NULL,
     case_id         TEXT   NOT NULL,
@@ -188,6 +207,13 @@ CREATE TABLE IF NOT EXISTS inbound_events (
     bare_id     TEXT    NOT NULL,
     kind        TEXT    NOT NULL,
     payload     TEXT    NOT NULL,
+    -- The operator this plane minted the message for, where it minted one.
+    -- Two columns rather than a rendered string, for the reason every other
+    -- operator column here is two: a name and what established it are two
+    -- facts, and `alice (asserted)` is a sentence a reader has to parse back.
+    -- Null for everything that arrived over a wire.
+    by_actor    TEXT,
+    by_basis    TEXT,
     received_at BIGINT  NOT NULL,
     claimed_by  TEXT,
     claimed_at  BIGINT,
@@ -1473,6 +1499,59 @@ impl CaseStore for PostgresStore {
         Ok(out)
     }
 
+    async fn record_drill(&self, record: &crate::case::DrillRecord) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        client
+            .execute(
+                "INSERT INTO case_last_drill
+                   (tenant, ran_at, sound, cases, findings, not_checked, origin, log_size)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (tenant) DO UPDATE SET
+                   ran_at = EXCLUDED.ran_at, sound = EXCLUDED.sound,
+                   cases = EXCLUDED.cases, findings = EXCLUDED.findings,
+                   not_checked = EXCLUDED.not_checked, origin = EXCLUDED.origin,
+                   log_size = EXCLUDED.log_size",
+                &[
+                    &self.tenant_name(),
+                    &record.at.unix_timestamp(),
+                    &record.sound,
+                    &i64::try_from(record.cases).unwrap_or(i64::MAX),
+                    &i64::try_from(record.findings).unwrap_or(i64::MAX),
+                    &i64::try_from(record.not_checked).unwrap_or(i64::MAX),
+                    &record.origin,
+                    &i64::try_from(record.size).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn last_drill(&self) -> Result<Option<crate::case::DrillRecord>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                "SELECT ran_at, sound, cases, findings, not_checked, origin, log_size
+                   FROM case_last_drill WHERE tenant = $1",
+                &[&self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        row.map(|r| {
+            Ok(crate::case::DrillRecord {
+                at: Timestamp::from_unix_timestamp(r.get::<_, i64>(0))
+                    .map_err(|e| corrupt("unrepresentable drill instant", e))?,
+                sound: r.get(1),
+                cases: u64::try_from(r.get::<_, i64>(2)).unwrap_or(0),
+                findings: u64::try_from(r.get::<_, i64>(3)).unwrap_or(0),
+                not_checked: u64::try_from(r.get::<_, i64>(4)).unwrap_or(0),
+                origin: r.get(5),
+                size: u64::try_from(r.get::<_, i64>(6)).unwrap_or(0),
+            })
+        })
+        .transpose()
+    }
+
     async fn census(&self, now: Timestamp) -> Result<CaseCensus, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let row = client
@@ -1584,8 +1663,9 @@ impl EventStore for PostgresStore {
         let inserted = tx
             .execute(
                 "INSERT INTO inbound_events
-                   (event_id, source, bare_id, kind, payload, received_at, tenant)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   (event_id, source, bare_id, kind, payload, received_at, tenant,
+                    by_actor, by_basis)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                  ON CONFLICT (tenant, event_id) DO NOTHING",
                 &[
                     &event.dedup_key(),
@@ -1595,6 +1675,8 @@ impl EventStore for PostgresStore {
                     &event.payload.to_string(),
                     &at.unix_timestamp(),
                     &self.tenant_name(),
+                    &event.by.as_ref().map(|o| o.actor().to_owned()),
+                    &event.by.as_ref().map(|o| o.basis().as_str().to_owned()),
                 ],
             )
             .await
@@ -1693,7 +1775,8 @@ impl EventStore for PostgresStore {
                            ORDER BY e.received_at ASC
                            FOR UPDATE SKIP LOCKED
                            LIMIT 1)
-                  RETURNING bare_id, kind, payload, received_at, source, event_id",
+                  RETURNING bare_id, kind, payload, received_at, source, event_id, \
+                            by_actor, by_basis",
                     &[
                         &sub.run.to_string(),
                         &at.unix_timestamp(),
@@ -1901,8 +1984,8 @@ impl EventStore for PostgresStore {
             .execute(
                 "INSERT INTO inbound_events
                    (event_id, source, bare_id, kind, payload, received_at,
-                    claimed_by, claimed_at, tenant)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8)
+                    claimed_by, claimed_at, tenant, by_actor, by_basis)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8, $9, $10)
                  ON CONFLICT (tenant, event_id) DO NOTHING",
                 &[
                     &event_id,
@@ -1913,6 +1996,8 @@ impl EventStore for PostgresStore {
                     &at.unix_timestamp(),
                     &target.to_string(),
                     &tenant,
+                    &event.by.as_ref().map(|o| o.actor().to_owned()),
+                    &event.by.as_ref().map(|o| o.basis().as_str().to_owned()),
                 ],
             )
             .await
@@ -1988,6 +2073,7 @@ impl EventStore for PostgresStore {
             kind: String::new(),
             correlation: Vec::new(),
             payload: serde_json::Value::Null,
+            by: None,
         }
         .dedup_key();
         // The row survives with its identity, claim state and dead-letter
@@ -2034,7 +2120,8 @@ impl EventStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT bare_id, kind, payload, received_at, dead_reason, source, event_id
+                "SELECT bare_id, kind, payload, received_at, dead_reason, source, event_id,
+                        by_actor, by_basis
                    FROM inbound_events WHERE tenant = $2 AND dead
                   ORDER BY received_at DESC LIMIT $1",
                 &[
@@ -2066,6 +2153,15 @@ impl EventStore for PostgresStore {
                     source: row.get(5),
                     id: row.get(0),
                     kind: row.get(1),
+                    by: match (
+                        row.get::<_, Option<String>>(7),
+                        row.get::<_, Option<String>>(8),
+                    ) {
+                        (Some(actor), Some(basis)) => {
+                            Some(super::decode_operator(&actor, &basis, "inbound_events")?)
+                        }
+                        _ => None,
+                    },
                     correlation: corr
                         .iter()
                         .map(|r| CorrelationKey::new(r.get::<_, String>(0), r.get::<_, String>(1)))
@@ -2159,6 +2255,26 @@ async fn buffered_from(
                 .map(|r| CorrelationKey::new(r.get::<_, String>(0), r.get::<_, String>(1)))
                 .collect(),
             payload: serde_json::from_str(&payload)?,
+            // Both columns or neither: a name with no basis is an
+            // attribution this build cannot state, and inventing one would
+            // claim the strong form for a row that never held it.
+            by: match (
+                row.get::<_, Option<String>>(6),
+                row.get::<_, Option<String>>(7),
+            ) {
+                (Some(actor), Some(basis)) => {
+                    Some(super::decode_operator(&actor, &basis, "inbound_events")?)
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(StoreError::Corrupt {
+                        seq: 0,
+                        detail: "inbound_events holds half an operator: a minted event \
+                                 carries a name and what established it, or neither"
+                            .to_owned(),
+                    });
+                }
+            },
         },
         received_at: Timestamp::from_unix_timestamp(row.get::<_, i64>(3))
             .map_err(|e| corrupt("unrepresentable received_at", e))?,

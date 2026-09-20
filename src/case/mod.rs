@@ -385,6 +385,87 @@ pub trait CaseStore: Send + Sync + Debug {
     /// `now` is passed in so the reading is testable against arbitrary ageing
     /// and needs no escape from the determinism gate.
     async fn census(&self, now: Timestamp) -> Result<CaseCensus, StoreError>;
+
+    /// Record what the last recovery rehearsal found.
+    ///
+    /// **One row, replaced.** A history of drills is a different artifact and
+    /// a larger promise; what an audit asks is *when did you last rehearse and
+    /// did it pass*, and a row that the latest write replaces answers exactly
+    /// that without becoming a table nobody prunes.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the store is unreachable. A rehearsal whose verdict
+    /// could not be written is reported to its caller rather than swallowed:
+    /// the next audit would otherwise read the *previous* drill's date as the
+    /// most recent one.
+    async fn record_drill(&self, record: &DrillRecord) -> Result<(), StoreError>;
+
+    /// The last recovery rehearsal, or `None` if this plane has never run one.
+    ///
+    /// `None` is the honest answer and a meaningful one: *nobody has
+    /// rehearsed* is what an auditor most wants to know and is exactly what a
+    /// missing CI log cannot distinguish from *the log rotated*.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the store is unreachable.
+    async fn last_drill(&self) -> Result<Option<DrillRecord>, StoreError>;
+}
+
+/// What the last recovery rehearsal found, and when.
+///
+/// # Why a row rather than a journal record
+///
+/// A drill is about the **plane**, not a run: it walks the case layer against
+/// the blob store and the key ring it is actually wired to. It has no run id
+/// and no chain to append to, which is the position a standing halt is in and
+/// gets the same answer — a row that the latest write replaces.
+///
+/// # Why it is stored at all
+///
+/// What an audit asks is not *can you rehearse* but **when you last did, and
+/// whether it passed**. Left in the process that ran the verb, that answer is
+/// a CI log or a wiki page — the artifact this project argues against relying
+/// on everywhere else. `serve --drill-every` makes the rehearsal a scheduled
+/// job; this makes its verdict a fact the plane can be asked for.
+///
+/// # What it does not carry
+///
+/// The findings themselves. A drill's report names each unrecoverable
+/// reference and is unbounded in a way a single row must not be; what belongs
+/// here is the verdict and enough to re-run for detail. The counts are kept
+/// **separately from `sound`** because a pass over nothing is not a pass: a
+/// drill that could not check the blob store reports no findings and has
+/// established almost nothing, which is the same rule
+/// [`AuditReport::not_checked`](crate::audit::AuditReport::not_checked) is
+/// held to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DrillRecord {
+    /// When the rehearsal ran. The caller's clock: a drill is an operational
+    /// act in the outside world, not a journaled observation.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: Timestamp,
+    /// Whether it found nothing unrecoverable.
+    pub sound: bool,
+    /// Cases walked.
+    pub cases: u64,
+    /// Unrecoverable references found.
+    pub findings: u64,
+    /// Questions this pass could not answer — an absent blob store, a key
+    /// ring it was not given. Non-zero with `sound` true means *incomplete*,
+    /// not *clean*.
+    pub not_checked: u64,
+    /// The log this plane was serving when it ran, and how far along it was.
+    ///
+    /// **Which store, answered so a reader cannot be fooled by the obvious
+    /// mistake**: a drill against a restored copy proves that copy
+    /// recoverable and says nothing about production. An origin and a size
+    /// pin both, and both come from the plane's own checkpoint rather than
+    /// from a string somebody typed.
+    pub origin: String,
+    /// The checkpoint size at the time of the rehearsal.
+    pub size: u64,
 }
 
 /// What the case store is currently holding.

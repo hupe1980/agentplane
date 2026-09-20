@@ -167,6 +167,12 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         K::EffectDone {
             output,
             source: _,
+            // Clear, and it is the one field on this record whose whole value
+            // is surviving the erasure of the payload beside it: an approval's
+            // decider rides in `output`, so a sealed-only record answers *who
+            // let this run carry on* with nothing. An operator's name is
+            // control-plane, exactly as `EffectReconciled.asserted_by` is.
+            by: _,
             spend: _,
             declared: _,
         } => vec![SealedField::Value(output)],
@@ -188,6 +194,11 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             // needed a key to read would make an unopenable journal unable to
             // say who decided a run could carry on.
             asserted_by: _,
+            // And their account with it. `detail` above is a provider's words
+            // over the caller's request; this is a person's words about what
+            // they checked, which is the same class as a cancellation's
+            // reason and stays readable for the same reason.
+            note: _,
         } => output
             .as_mut()
             .map(SealedField::Value)

@@ -1450,6 +1450,13 @@ metered, and replayed rather than repeated. What the reviewer saw is on the
 record beside what they decided; a long answer is cut at 64 KiB with the total
 and a digest of the whole stated on the row, never silently.
 
+**And it arrives labelled.** A preview is the tool's own answer over the
+caller's data, which makes it the most persuasive line on the task and the one
+a compromised tool would write. `evidence` is `Vec<Tainted<String>>`, so it
+sits beside the runtime's own notes without being mistaken for one, and
+`GET /tasks/{task}` reports `has_untrusted_prose` so a reviewer's client
+cannot render the text and quietly skip the labels.
+
 **The trap:** a preview that is not read-only. A dry run that changes the world
 is the opposite of a dry run, so a `preview` naming a grant this manifest
 declares `mutates: true` is refused at parse — along with a `preview` without
@@ -2090,8 +2097,9 @@ agentplane serve examples/served.yaml \
 Serves the public Agent Card and the A2A 1.0 methods, sweeps deadlines and due
 timers every 30s, and — on a **separate** listener — the operator surface:
 `GET /runs?outcome=quarantined`, the worklist, task decisions. The two are
-separated by *policy* (`peer` reaches `a2a:*`, `operator` reaches `api:*`), so
-the port split is defence in depth rather than the control.
+separated by *policy* — the example bundle gives `peer` the A2A actions and
+`operator` the API ones it uses — so the port split is defence in depth rather
+than the control.
 
 The worklist's claim protocol has three verbs, and the third has its own
 policy action on purpose. A reviewer `claim`s a task and only the holder can

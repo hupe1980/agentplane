@@ -1646,7 +1646,9 @@ impl<'a> StepCtx<'a> {
                 detail,
                 // The effect asked its own provider. Nobody asserted anything,
                 // and naming the run here would attribute a machine's answer to
-                // a person.
+                // a person — so neither the name nor the note a person would
+                // have written.
+                note: None,
                 asserted_by: None,
             },
         )
@@ -3582,8 +3584,10 @@ impl<'a> StepCtx<'a> {
                         RecordKind::EffectDone {
                             output: json,
                             // Not an inbound event: only an awaited delivery has
-                            // a sender to record.
+                            // a sender to record, and only an operator-minted
+                            // one has somebody to name.
                             source: None,
+                            by: None,
                             spend,
                             declared: crate::core::DeclaredOutput::of(effect),
                         },
@@ -5296,6 +5300,7 @@ impl StepCtx<'_> {
                 RecordKind::EffectDone {
                     output: buffered.event.payload.clone(),
                     source: Some(buffered.event.source.clone()),
+                    by: buffered.event.by.clone(),
                     spend: crate::core::Spend::default(),
                     // What `label_inbound` builds, stated rather than derived:
                     // an inbound payload is another party's data, and the

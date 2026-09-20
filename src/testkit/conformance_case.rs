@@ -66,6 +66,77 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     a_cases_blob_list_holds_only_its_own(store, r).await;
     a_hold_is_placed_once_listed_and_lifted(store, r).await;
     a_hold_on_a_missing_matter_is_not_found(store, r).await;
+    the_last_drill_is_absent_then_replaced(store, r).await;
+}
+
+/// **A rehearsal's verdict: absent before the first, replaced by the latest.**
+///
+/// Two halves, and the first is the one a store is most likely to get subtly
+/// wrong. *Nobody has rehearsed this plane* must read as `None` and not as a
+/// zeroed record — an auditor asking *when did you last drill* has to be able
+/// to tell "never" from "cleanly, at the epoch", and a store that invented a
+/// default would answer the wrong one silently.
+///
+/// The second is that the row is **replaced**, not appended: this answers
+/// *when did you last rehearse*, and a store accumulating history would make
+/// the newest verdict a query rather than a read — and eventually a table
+/// nobody prunes.
+async fn the_last_drill_is_absent_then_replaced(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    use crate::case::DrillRecord;
+
+    r.checked += 1;
+    // Not asserted as `None` up front: a battery runs against a store that may
+    // already hold one, and a case that demanded a virgin store would fail for
+    // a reason unrelated to the contract. What is asserted is what each write
+    // does to the answer.
+    let first = DrillRecord {
+        at: ts(7_000),
+        sound: false,
+        cases: 12,
+        findings: 3,
+        not_checked: 1,
+        origin: "conformance-plane".into(),
+        size: 41,
+    };
+    if let Err(e) = store.record_drill(&first).await {
+        r.record("drill record", format!("record_drill failed: {e}"));
+        return;
+    }
+    match store.last_drill().await {
+        Ok(Some(got)) if got == first => {}
+        Ok(other) => r.record(
+            "drill record",
+            format!("a rehearsal was written and read back as {other:?}"),
+        ),
+        Err(e) => r.record("drill record", format!("last_drill failed: {e}")),
+    }
+
+    // The later rehearsal is the answer. A store that kept both would leave
+    // an operator reading a stale verdict as current.
+    let second = DrillRecord {
+        at: ts(9_000),
+        sound: true,
+        cases: 14,
+        findings: 0,
+        not_checked: 0,
+        origin: "conformance-plane".into(),
+        size: 57,
+    };
+    if let Err(e) = store.record_drill(&second).await {
+        r.record("drill record", format!("a second record_drill failed: {e}"));
+        return;
+    }
+    match store.last_drill().await {
+        Ok(Some(got)) if got == second => {}
+        Ok(other) => r.record(
+            "drill record",
+            format!(
+                "a second rehearsal did not replace the first — read back {other:?}, \
+                 so an operator sees a stale verdict as current"
+            ),
+        ),
+        Err(e) => r.record("drill record", format!("last_drill failed: {e}")),
+    }
 }
 
 /// **The one control that can refuse an erasure, held to all four of its
@@ -1517,6 +1588,71 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_satisfied_waiter_does_not_claim_a_second_event(store, r).await;
     a_zero_grace_sweep_retires_an_event_received_this_second(store, r).await;
     a_dead_letter_carries_the_keys_it_was_routed_on(store, r).await;
+    a_minted_event_keeps_the_operator_who_minted_it(store, r).await;
+}
+
+/// **An event this plane minted comes back naming who minted it.**
+///
+/// [`InboundEvent::by`] is how an operator act reaches the journal's *clear*
+/// side. A worklist decision travels as an awaited effect's output, and that
+/// output is a sealed payload — so the approver's name reaches
+/// `EffectDone.by` through this field or it reaches the record only inside
+/// something a lawful erasure destroys.
+///
+/// A store that drops it is not obviously broken: every existing case still
+/// passes, delivery still works, and the loss shows up years later as an
+/// approval nobody can attribute. So the contract asks for it directly, and
+/// asks for **both halves** — an actor with no basis is an attribution this
+/// runtime cannot state, and a store that flattened the pair would return a
+/// name whose strength it invented.
+async fn a_minted_event_keeps_the_operator_who_minted_it(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let by = crate::core::Operator::authenticated("rita").expect("a fixture names its operator");
+    let event = InboundEvent {
+        source: "agentplane://worklist".to_owned(),
+        id: "evt-minted".into(),
+        kind: "ack".into(),
+        correlation: keys("E-MINTED"),
+        payload: serde_json::json!({}),
+        by: Some(by.clone()),
+    };
+    let sub = Subscription {
+        run: RunId::generate(),
+        case: None,
+        effect: effect(24),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "ack".into(),
+        correlation: keys("E-MINTED"),
+    };
+    let _ = store.subscribe(&sub, ts(1_000)).await;
+    let _ = store.buffer(&event, ts(1_000)).await;
+
+    match store.match_waiter(&event, ts(1_100)).await {
+        Ok(Some(_)) => match store.claim_for(&sub, ts(1_100)).await {
+            Ok(Some(buffered)) => {
+                if buffered.event.by.as_ref() != Some(&by) {
+                    r.record(
+                        "minted events",
+                        format!(
+                            "an event minted by {by:?} came back as {:?} — the operator \
+                             who authorised it is how an approval reaches the journal's \
+                             readable side, and a store that drops it leaves the name \
+                             only inside a payload an erasure destroys",
+                            buffered.event.by
+                        ),
+                    );
+                }
+            }
+            Ok(None) => r.record("minted events", "the claimed event came back empty"),
+            Err(e) => r.record("minted events", format!("claim_for failed: {e}")),
+        },
+        Ok(None) => r.record("minted events", "the waiter did not match its own event"),
+        Err(e) => r.record("minted events", format!("match_waiter failed: {e}")),
+    }
 }
 
 /// **Two distinct events racing one wait: exactly one is consumed, and the
@@ -1559,6 +1695,7 @@ async fn a_waiter_is_consumed_by_one_of_two_distinct_events(
         kind: "ack".into(),
         correlation: keys("E-TWO-EVENTS"),
         payload: serde_json::json!({}),
+        by: None,
     };
     let first = event("evt-two-1");
     let second = event("evt-two-2");
@@ -1646,6 +1783,7 @@ async fn a_zero_grace_sweep_retires_an_event_received_this_second(
         kind: "ack".into(),
         correlation: keys("E-BOUNDARY"),
         payload: serde_json::json!({}),
+        by: None,
     };
     let _ = store.buffer(&event, ts(5_000)).await;
     match store.sweep_unclaimed(ts(5_000), "zero grace").await {
@@ -1688,6 +1826,7 @@ async fn a_dead_letter_carries_the_keys_it_was_routed_on(
         kind: "ack".into(),
         correlation: keys("E-DEAD-KEYS"),
         payload: serde_json::json!({}),
+        by: None,
     };
     let _ = store.buffer(&event, ts(6_000)).await;
     let _ = store.sweep_unclaimed(ts(9_999), "nobody was waiting").await;
@@ -1751,6 +1890,7 @@ async fn a_satisfied_waiter_does_not_claim_a_second_event(
         kind: "ack".into(),
         correlation: keys("E-ONESHOT"),
         payload: serde_json::json!({}),
+        by: None,
     };
     let first = event("evt-oneshot-1");
     let second = event("evt-oneshot-2");
@@ -1817,6 +1957,7 @@ async fn a_claimed_event_is_recoverable_by_its_own_run(
         kind: "ack".into(),
         correlation: keys("E-RECLAIM"),
         payload: serde_json::json!({"n": 1}),
+        by: None,
     };
     let _ = store.buffer(&event, ts(1_001)).await;
 
@@ -1897,6 +2038,7 @@ async fn a_targeted_event_resumes_only_its_named_run(store: &Arc<dyn EventStore>
         kind: "continue".into(),
         correlation: keys("E-TARGET"),
         payload: serde_json::json!({"answer": 42}),
+        by: None,
     };
     match store.deliver_to(target, &event, ts(1_002)).await {
         Ok(TargetedDelivery::Matched(sub)) if sub.run == target => {}
@@ -1966,6 +2108,7 @@ async fn a_claimed_event_is_never_retired(store: &Arc<dyn EventStore>, r: &mut R
         kind: "ack".into(),
         correlation: keys("E-9"),
         payload: serde_json::json!({}),
+        by: None,
     };
     let _ = store.buffer(&event, ts(1_000)).await;
 
@@ -2012,6 +2155,7 @@ async fn a_repeated_event_id_is_not_buffered_twice(store: &Arc<dyn EventStore>, 
         kind: "ack".into(),
         correlation: keys("E-1"),
         payload: serde_json::json!({}),
+        by: None,
     };
     let first = store.buffer(&event, ts(1_000)).await;
     let second = store.buffer(&event, ts(1_001)).await;
@@ -2038,6 +2182,7 @@ async fn an_event_is_claimed_by_one_waiter_only(store: &Arc<dyn EventStore>, r: 
         kind: "ack".into(),
         correlation: keys("E-2"),
         payload: serde_json::json!({}),
+        by: None,
     };
     let _ = store.buffer(&event, ts(1_000)).await;
 
@@ -2091,6 +2236,7 @@ async fn a_waiter_is_matched_by_one_event_only(store: &Arc<dyn EventStore>, r: &
         kind: "ack".into(),
         correlation: keys("E-3"),
         payload: serde_json::json!({}),
+        by: None,
     };
     // Buffered first, which is the delivery order the runtime uses and the
     // reason it uses it: the message is durable before anyone looks for a
@@ -2533,7 +2679,10 @@ fn task(id: u8, excluded: Option<&str>) -> Task {
         run,
         case: None,
         kind: "approval".into(),
-        justification: Justification::new("needs a person", serde_json::json!({})),
+        justification: Justification::new(
+            crate::core::Tainted::trusted("needs a person".to_owned()),
+            serde_json::json!({}),
+        ),
         candidate_roles: vec!["ops".into()],
         escalate_to: Vec::new(),
         assignee: None,

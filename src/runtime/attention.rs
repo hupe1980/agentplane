@@ -90,29 +90,39 @@ impl super::Runtime {
     pub async fn attention(&self, at: Timestamp, page: usize) -> Result<Attention, RuntimeError> {
         let mut out = Attention::default();
 
-        for (outcome, remedy) in [
+        // The condition key beside the outcome it reads, rather than derived
+        // from it by a second match with a catch-all: a fourth outcome added
+        // to this list would have taken the wildcard and been reported to an
+        // operator under the third one's name and the third one's remedy.
+        for (outcome, kind, remedy) in [
             (
                 "quarantined",
-                "answer the doubt with `reconcile`, then `reopen` or `abandon`",
+                "run.quarantined",
+                "establish the undecided effect with `reconcile`, then `quarantine` \
+                 to reopen or abandon",
             ),
-            ("exhausted", "raise the ceiling and resume, or abandon"),
-            ("withheld", "restore the authority and resume, or abandon"),
+            // Not *abandon*: that answers a doubt, and an exhaustion is not
+            // one — `quarantine` refuses any run whose conclusion is
+            // something else. The operator who is not raising the ceiling is
+            // stopping the run.
+            (
+                "exhausted",
+                "run.exhausted",
+                "raise the ceiling and `replay`, or `cancel` the run",
+            ),
+            (
+                "withheld",
+                "run.withheld",
+                "lift the withdrawal with `halt --lift`, then `replay` — or `cancel` \
+                 the run",
+            ),
         ] {
             let found = self
                 .store()
                 .runs_by_outcome(outcome, page)
                 .await
                 .map_err(RuntimeError::from_store)?;
-            out.note(
-                match outcome {
-                    "quarantined" => "run.quarantined",
-                    "exhausted" => "run.exhausted",
-                    _ => "run.withheld",
-                },
-                found.len(),
-                page,
-                remedy,
-            );
+            out.note(kind, found.len(), page, remedy);
         }
 
         let abandoned = self
@@ -143,7 +153,7 @@ impl super::Runtime {
             "run.wait_expired",
             overdue,
             page,
-            "resume the run: replay reaches the announced wait and re-arms it",
+            "`replay` the run: it reaches the announced wait and re-arms it",
         );
 
         self.backlogs(&mut out, page, at).await?;
@@ -173,12 +183,45 @@ impl super::Runtime {
                     "obligation.breached",
                     breached.len(),
                     page,
-                    "account for the breach, then `acknowledge` to clear it",
+                    "`acknowledge` the breach, saying what was done about it",
                 );
             }
             None => out.not_checked.push(
                 "obligations — this plane holds no case store, so whether any went \
                  unaccounted for was not established",
+            ),
+        }
+
+        // A recovery rehearsal that found unrecoverable references is the
+        // clearest "somebody must look" this plane has, and it stays true
+        // until a later drill passes — which is the point, not noise.
+        //
+        // Deliberately **not** raised for a plane that has never drilled: a
+        // fresh plane is not broken, and a condition that fires on every new
+        // deployment is one operators learn to clear without reading. Nor for
+        // `not_checked`, which on a plane with no blob store is permanent and
+        // would make this condition unclearable.
+        match self.cases() {
+            Some(cases) => {
+                let failed = cases
+                    .last_drill()
+                    .await
+                    .map_err(RuntimeError::from_store)?
+                    .is_some_and(|d| !d.sound);
+                out.note(
+                    "drill.failed",
+                    usize::from(failed),
+                    // Not a page: there is one row, so it can never be a
+                    // ceiling, and reporting it as one would be a lie in the
+                    // shape of a number.
+                    usize::MAX,
+                    "the last recovery rehearsal found unrecoverable references — \
+                     re-run `drill` and resolve what it names",
+                );
+            }
+            None => out.not_checked.push(
+                "recovery rehearsal — this plane holds no case store, so there is \
+                 nothing to drill and no verdict to read",
             ),
         }
 
@@ -192,7 +235,8 @@ impl super::Runtime {
                     "task.overdue",
                     overdue.len(),
                     page,
-                    "decide them, or escalate to the audience the task names",
+                    "`decide` them. Escalation is not an operator act — the sweeper widens \
+                 the audience itself when the window closes",
                 );
             }
             None => out.not_checked.push(
@@ -233,7 +277,7 @@ impl super::Runtime {
                     "push.parked",
                     parked.len(),
                     page,
-                    "fix the endpoint, then re-arm the registration",
+                    "fix the endpoint, then `rearm` the registration",
                 );
             }
             None => out.not_checked.push(

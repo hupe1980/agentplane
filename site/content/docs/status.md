@@ -11,8 +11,8 @@ group = "Operate"
 > actually ask — and keep re-asking, because the answers are spread across
 > pages — are collected in one table:
 > [answers evaluators have had to ask for](@/docs/regulation.md#evaluator-questions).
-> It is on the regulation page for historical reasons and is not a statutory
-> table; start there and follow the links.
+> It sits on the regulation page and is not a statutory table; start there and
+> follow the links.
 
 `agentplane` is published on crates.io and pre-alpha. This page answers three questions an
 adopter has to answer before writing any code: **what will move**, **what is
@@ -69,29 +69,29 @@ path.** Every other gap an adopter finds is closable with integration work.
 This one is not.
 
 There is no date, and inventing one would be the kind of claim this page exists
-to avoid. What there is instead is a **condition list**: freeze happens when
-every row below is met, and each row is checkable rather than a matter of
-judgement. An adopter tracking this page can see how far along it is without
-asking.
+to avoid. What there is instead is a condition list, each row naming what it
+demanded and where the evidence is — so *met* is something you can check rather
+than something this page asserts.
 
-✅ met · 🟨 half, and the remaining half is named · ⬜ open. A half is a row
-whose *mechanics* are built and whose remaining work is a document or an
-exercise — stated as its own state rather than rounded to either neighbour,
-because rounding up is how a condition list stops being checkable. No row is a
-half today, and the mark is kept because the next row to move will pass through
-that state rather than skip it.
+**Every condition below is met, and the freeze has not happened. Those are two
+different statements and this page owes you both.** The conditions were the
+*readiness* question and they are answered. What remains is a deliberate act —
+the point at which hard cuts stop being available and a shape change becomes an
+upcaster plus a version bump — held at the maintainer's discretion, with no
+target release. So this list says the obstacles are gone, not that the promise
+is imminent.
 
-| # | Condition | State |
+| # | Condition | Where the evidence is |
 |---|---|---|
-| 1 | **Canonicalization is versioned and vector-checked.** A rule change must read as *unverifiable* rather than as a divergence | ✅ done — versioned at the run, a complete RFC 8785 implementation held to the standard's own number vectors |
-| 2 | **Golden corpora for the journal record format.** A fixed set of records, byte-for-byte, that every future build must still read and still hash identically | ✅ done — one canonical record per kind and its chain digest in `tests/golden/records.jsonl`, sealed through the same function every backend appends through, with a guard holding the corpus to the record vocabulary so a new kind cannot ship unpinned |
-| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | ✅ done — a sealed export with its case layer is checked in, and `tools/verify_export.py` verifies it from the [published specification](@/docs/format.md) alone, re-deriving all 29 record vectors rather than only accepting them |
-| 4 | **A stated unknown-field policy per durable format.** | ✅ done, per format rather than once — a record body and a sealed envelope's header refuse an unknown member; an export's *framing* line bounds the verdict instead, and says so. A refusal is a build skew rather than damage wherever the bytes are established |
-| 5 | **Upcasters exercised end-to-end, not only unit-tested.** | ✅ done — consulted on *every* record read, with a test lifting a record whose shape this build cannot parse and asserting the chain still commits to the bytes as written. A corpus of genuinely old records arrives with the first post-freeze bump |
-| 6 | **A migration and rollback procedure**, written down and rehearsed | ✅ done — rehearsed across two released builds, each refusing the other's records as a skew that names the remedy. Before the freeze a hard cut is unreadable in both directions, so the rollback window is zero and a shape change is a fresh journal |
-| 7 | **An algorithm-agility plan** for every durable or signed format: how SHA-256 is replaced without invalidating history | ✅ done — [written down](@/docs/format.md#algorithm-agility) and already implemented: hashes are agile by version, signatures by key, [digest domains](@/docs/format.md#digest-domains) carry their own, and nothing rehashes stored bytes, so history stays verifiable under the algorithm that wrote it |
-| 8 | **The deferred format questions are settled**, each of which moved a record or a wire | ✅ done — the set is empty. The one that could still have added a record was whether a context branch belongs in the runtime at the loop tier, and the answer is a refusal: a branch lowers no label, so it adds no record and relieves none of the pressure it was aimed at |
-| 9 | **The surface the promise attaches to is named** — whether the freeze commits a library API, an operator service, or both | ✅ done — **the artifacts, not either doorway**: the record format, the export and the operator verbs' vocabulary. See below |
+| 1 | **Canonicalization is versioned and vector-checked** — a rule change must read as *unverifiable*, never as a divergence | RFC 8785 held to the standard's own number vectors → [canonical JSON](@/docs/format.md#canonical-json) |
+| 2 | **Golden corpora for the journal record format** — a fixed set of records every future build must still read and still hash identically | `tests/golden/records.jsonl`, with a guard holding the corpus to the record vocabulary |
+| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | `tools/verify_export.py`, re-deriving all 29 record vectors from the [specification](@/docs/format.md#vectors) alone |
+| 4 | **A stated unknown-field policy per durable format** | per format, not once — a record body, a sealed header and an export's framing each say what they refuse → [format](@/docs/format.md#not-promised) |
+| 5 | **Upcasters exercised end-to-end**, not only unit-tested | consulted on every record read; a test lifts a record this build cannot parse → [versioning](@/docs/format.md#versioning) |
+| 6 | **A migration and rollback procedure**, written down and rehearsed | rehearsed across two released builds → [operations](@/docs/operations.md) |
+| 7 | **An algorithm-agility plan** — how SHA-256 is replaced without invalidating history | [written down](@/docs/format.md#algorithm-agility): hashes agile by version, signatures by key, and nothing rehashes stored bytes |
+| 8 | **The deferred format questions are settled** | the set is empty |
+| 9 | **The surface the promise attaches to is named** | the artifacts, not either doorway — [below](#what-the-freeze-promises) |
 
 ### What the freeze is a promise about {#what-the-freeze-promises}
 
@@ -123,7 +123,7 @@ already work, and the reason a format change is a rebuild rather than a loss.
 That is a real answer, not a promise: an export taken today is verifiable today
 by a party who has never run this crate.
 
-## ⬜ Deliberately not built {#deliberately-not-built}
+## 🚫 Deliberately not built {#deliberately-not-built}
 
 Two kinds, and conflating them is what makes a gap list useless. **Refused** will
 not arrive: something in the design forecloses it, and the entry says what.
@@ -221,11 +221,6 @@ adaptive, defence-aware evaluation, over A2A, graded from the journal — the
 methodology exists in published form
 ([2606.26479](https://arxiv.org/abs/2606.26479)).
 
-**The rest of format freeze.** The mechanics are built and the
-[record format](@/docs/format.md) is specified, with a second implementation
-deriving the same bytes from that specification alone. *Waiting on:* the open
-rows in [Format freeze](#format-freeze) above.
-
 ## 🔍 How to check any of this {#how-to-check-any-of-this}
 
 Nothing on this page is a promise; all of it is checkable.
@@ -247,15 +242,8 @@ MUTANTS_SHARD=2/10 just mutants          # one slice, for a machine that is not 
 ```
 
 The mutation sweep is the one that matters most: it breaks each guarantee on
-purpose and requires the test *written for it* to fail. A capability that could
-be deleted without a test noticing is caught by that sweep, not by review — which
-is why this page asserts no inventory of them. An inventory is a claim a
-reader has to trust; a sweep is one they can run.
-
-`--verify` is the same check for a single guarantee, and it exists because the
-cheap one is not enough. `just anchors` proves a mutation still *matches* the
-code; only running it proves the mutation still *kills*. A test rewritten around
-a mutation passes quietly, and a guarantee that stopped being checked looks
-exactly like one that is. The command distinguishes **survived** from **never
-ran**, because a run that compiled nothing reports zero failures and reads like
-success.
+purpose and requires the test *written for it* to fail. That is why this page
+asserts no inventory of guarantees — an inventory is a claim a reader has to
+trust, and a sweep is one they can run. What the sweep reports, and why
+`just anchors` is not a substitute for running it, is on
+[assurance](@/docs/assurance.md).

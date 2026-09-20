@@ -1016,6 +1016,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         output: Some(serde_json::json!({ "claimant": "Ada Lovelace" })),
                         spend: agentplane::core::Spend::default(),
                         detail: None,
+                        note: None,
                         declared: Some(agentplane::core::DeclaredOutput::untrusted()),
                         asserted_by: None,
                     },
@@ -1249,6 +1250,7 @@ async fn a_buffered_event_payload_is_sealed_and_erasable_on_its_own() {
         kind: "payment.settled".to_owned(),
         correlation: vec![agentplane::core::CorrelationKey::new("claim", "NOBODY")],
         payload: serde_json::json!({ "payer": "Ada Lovelace", "amount": 4200 }),
+        by: None,
     };
     assert!(sealed.buffer(&event, at).await.expect("buffer"));
 
@@ -1789,5 +1791,100 @@ fn a_deserialized_tenant_name_cannot_carry_a_scope_separator() {
         serde_json::from_value::<TenantId>(serde_json::json!("x".repeat(TenantId::MAX_LEN + 1)))
             .is_err(),
         "and the length bound is a metric-cardinality bound, so it binds here too"
+    );
+}
+
+/// **A task's evidence is sealed at rest, and its label is not.**
+///
+/// `Justification.evidence` is the trail behind a proposal, and it is
+/// assembled from what tools and models produced: a declared dry-run preview
+/// is literally the answer a tool gave when asked what the call would do, so
+/// it quotes the caller's data by construction. The journal seals its copy of
+/// that effect's output. The worklist's copy — the one an operator queries by
+/// hand — was passing through in the clear, so a case erasure left it
+/// readable in the store most likely to be browsed.
+///
+/// What must *not* seal with it is **who wrote it**. A reviewer reading a row
+/// whose words are gone still needs to know whether the run vouched for them,
+/// and the label is not the caller's data.
+#[tokio::test]
+async fn a_tasks_evidence_is_sealed_but_its_provenance_is_not() {
+    use agentplane::case::TaskStore;
+    use agentplane::core::{
+        Justification, OnExpiry, Priority, RunId, SourceId, Tainted, Task, TaskId, TaskState,
+        TenantId,
+    };
+    use agentplane::keyring::SealedTasks;
+
+    let tenant = TenantId::default();
+    let keys = Arc::new(MemoryKeyRing::default());
+    let raw = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let plain: Arc<dyn TaskStore> = Arc::clone(&raw) as Arc<dyn TaskStore>;
+    let sealed = SealedTasks::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant.clone(),
+    );
+
+    let run = RunId::generate();
+    let id = TaskId::derive(
+        run,
+        agentplane::core::EffectKey::for_effect(
+            agentplane::core::StepId(0),
+            agentplane::core::Phase::Forward,
+            0,
+            1,
+            &agentplane::core::EffectDescriptor::new("approval", serde_json::json!({})),
+        ),
+    );
+    let task = Task {
+        id,
+        run,
+        case: None,
+        kind: "approve".into(),
+        justification: Justification::new(
+            Tainted::trusted("approve this call".to_owned()),
+            serde_json::json!({ "tool": "archive/purge" }),
+        )
+        .evidence(Tainted::from_source(
+            "preview: 4000 records for alice@example.com".to_owned(),
+            SourceId::new("tool:archive/purge_preview"),
+        )),
+        candidate_roles: vec![],
+        escalate_to: vec![],
+        excluded_actors: vec![],
+        assignee: None,
+        priority: Priority::Normal,
+        state: TaskState::Open,
+        on_expiry: OnExpiry::Deny,
+        created_at: agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("t"),
+        due_at: None,
+    };
+    sealed.open(&task).await.expect("opened");
+
+    // What the *underlying* store holds — the copy an operator queries.
+    let at_rest = plain.task(id).await.expect("read").expect("present");
+    let stored = at_rest.justification.evidence[0].peek();
+    assert!(
+        !stored.contains("alice@example.com"),
+        "a tool's answer over the caller's data sat unsealed in the worklist: {stored}"
+    );
+
+    // And the reviewer still learns who wrote it, sealed or not.
+    assert_eq!(
+        at_rest.justification.evidence[0].label().trust,
+        agentplane::core::Trust::Untrusted,
+        "sealing took the provenance with the words"
+    );
+
+    // Through the decorator, the reviewer reads it back whole.
+    let opened = sealed.task(id).await.expect("read").expect("present");
+    assert_eq!(
+        opened.justification.evidence[0].peek(),
+        "preview: 4000 records for alice@example.com"
+    );
+    assert_eq!(
+        opened.justification.evidence[0].label().trust,
+        agentplane::core::Trust::Untrusted
     );
 }

@@ -241,6 +241,19 @@ key reaches every copy at once — including one somebody exported last month.
 A sealed JSON payload is the object `{"$sealed": "<base64 envelope>"}`; a sealed
 string field is `"$sealed:<base64 envelope>"`.
 
+**What is never sealed, and why you can rely on it.** Two classes stay
+readable with no key at all. The first is everything the runtime routes on —
+the record kind, `seq`, `run`, `case`, `effect_key`, a disposition, a
+conclusion's outcome — so exactly-once, the case scan and the chain all work
+against an erased journal. The second is **who did it**: every operator act
+names its actor in the clear, and where the act was a person's judgement
+rather than a machine's, their own account of it is clear beside the name.
+A run whose payloads a lawful erasure destroyed still answers *who cancelled
+this, who withheld the authority, who crossed under break-glass, who declared
+an undecided effect landed and on what grounds, and who approved the action it
+took*. What goes is what a provider, a tool or a model said — free text over
+the caller's values, which is what the erasure was for.
+
 The envelope is binary:
 
 ```

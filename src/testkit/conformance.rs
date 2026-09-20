@@ -926,6 +926,7 @@ pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
         kind: "reply".to_owned(),
         correlation: vec![CorrelationKey::new("order", id.to_owned())],
         payload,
+        by: None,
     };
     let sub = |run: RunId, effect, id: &str| Subscription {
         run,

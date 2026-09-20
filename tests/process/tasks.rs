@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{
-    CaseStatus, CorrelationKey, DeadlineSpec, DeadlineState, Decision, Justification, OnExpiry,
-    Outcome, Priority, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec, TaskState, Timestamp,
+    CaseStatus, CorrelationKey, DeadlineSpec, DeadlineState, Decided, Decision, Justification,
+    OnExpiry, Outcome, Priority, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec, TaskState,
+    Timestamp,
 };
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
@@ -22,6 +23,15 @@ use serde_json::{Value, json};
 
 fn key(v: &str) -> CorrelationKey {
     CorrelationKey::new("document", v)
+}
+
+/// A decider, named from a terminal rather than by an authenticator.
+///
+/// `asserted` is the honest basis in a fixture: nothing here verified the
+/// name, and recording it as authenticated would claim an identity provider
+/// vouched for a string this file wrote.
+fn by(actor: &str) -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted(actor).expect("a fixture names its operator")
 }
 
 /// Proposes a refund and waits for a human.
@@ -57,13 +67,17 @@ impl Skill for ProposesRefund {
             .await?;
 
         let justification = Justification::new(
-            "invoice disputed; deviation exceeds the 20% threshold",
+            Tainted::trusted("invoice disputed; deviation exceeds the 20% threshold".to_owned()),
             json!({ "action": "refund", "amount_eur": 4200 }),
         )
         .confidence(0.62)
-        .cost("€4,200")
-        .evidence("meter reading is 35% above the twelve-month mean")
-        .evidence("no correction was filed by the counterparty");
+        .cost(Tainted::trusted("€4,200".to_owned()))
+        .evidence(Tainted::trusted(
+            "meter reading is 35% above the twelve-month mean".to_owned(),
+        ))
+        .evidence(Tainted::trusted(
+            "no correction was filed by the counterparty".to_owned(),
+        ));
 
         let mut spec = TaskSpec::new("refund-approval", justification, "approval")
             .role("compliance-officer")
@@ -86,7 +100,7 @@ impl Skill for ProposesRefund {
 
         Ok(Outcome::done(Tainted::trusted(json!({
             "approved": decision.approved,
-            "by": decision.actor,
+            "by": decision.decided.to_string(),
         }))))
     }
 }
@@ -160,7 +174,10 @@ async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     let j = &task.justification;
 
-    assert!(j.summary.contains("deviation"), "the reviewer sees why");
+    assert!(
+        j.summary.peek().contains("deviation"),
+        "the reviewer sees why"
+    );
     assert_eq!(
         j.proposed_action,
         json!({ "action": "refund", "amount_eur": 4200 }),
@@ -171,7 +188,10 @@ async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
         Some(0.62),
         "a confident-sounding proposal is not evidence"
     );
-    assert_eq!(j.cost.as_deref(), Some("€4,200"));
+    assert_eq!(
+        j.cost.as_ref().map(Tainted::peek),
+        Some(&"€4,200".to_owned())
+    );
     assert_eq!(
         j.evidence.len(),
         2,
@@ -196,7 +216,7 @@ async fn a_decision_resumes_the_run_and_names_the_decider() {
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     f.rt.decide_task(
         task.id,
-        &Decision::approve("alice", "reading confirmed by the field team"),
+        &Decision::approve(by("alice"), "reading confirmed by the field team"),
         &officer(),
     )
     .await
@@ -212,6 +232,94 @@ async fn a_decision_resumes_the_run_and_names_the_decider() {
     assert_eq!(
         f.store.task(task.id).await.unwrap().unwrap().state,
         TaskState::Completed
+    );
+
+    // The half this test was named for and did not check. An approval is
+    // evidence about a person, so the record has to carry *what established
+    // the name* and not only the name: `alice` alone cannot be told from a
+    // deployment principal spelled the same way, and a reader cannot tell an
+    // authenticated approval from one somebody typed at a terminal.
+    let decided = finished
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::EffectDone { output, .. } => output.get("decided").cloned(),
+            _ => None,
+        })
+        .expect("the awaited decision is on the record");
+    assert_eq!(
+        decided,
+        json!({ "by": { "actor": "alice", "basis": "asserted" } }),
+        "the decider and the basis travel together"
+    );
+}
+
+/// An unanswered window names nobody, and does not borrow a person's shape.
+///
+/// A reserved name in a field that otherwise holds people is a convention
+/// every reader has to know: a worklist report counts it as a decider, a
+/// four-eyes audit sees an approver who does not exist, and nothing stops a
+/// deployment having a principal by that name. So the two are different
+/// shapes, and a consumer matches rather than parses.
+#[tokio::test]
+async fn an_expired_window_is_not_recorded_as_somebody_deciding() {
+    let expired = Decision::expired(OnExpiry::Proceed);
+    assert_eq!(expired.decided, Decided::OnExpiry(OnExpiry::Proceed));
+    assert!(expired.approved, "proceed was pre-authorised");
+    assert!(
+        expired.decided.operator().is_none(),
+        "nobody decided, so there is no operator to name"
+    );
+
+    let denied = Decision::expired(OnExpiry::Deny);
+    assert!(!denied.approved);
+    assert_eq!(denied.decided, Decided::OnExpiry(OnExpiry::Deny));
+
+    // Serialised, the two are different shapes rather than two spellings of
+    // one — which is what stops a consumer parsing prefixes out of a name.
+    assert_eq!(
+        serde_json::to_value(&expired.decided).unwrap(),
+        json!({ "on_expiry": "proceed" })
+    );
+    assert_eq!(
+        serde_json::to_value(Decided::By(by("alice"))).unwrap(),
+        json!({ "by": { "actor": "alice", "basis": "asserted" } })
+    );
+}
+
+/// The door that records a person's answer refuses the policy's.
+///
+/// `decide_task` runs the claim, the eligibility check and four-eyes. An
+/// expiry has nobody to run them against, so accepting one here would pass
+/// every control by having nothing to test — and would let a caller file the
+/// sweeper's answer against a task the sweeper never reached.
+#[tokio::test]
+async fn an_expiry_may_not_be_filed_as_a_persons_answer() {
+    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    f.rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-4")],
+    )
+    .await
+    .unwrap();
+
+    let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let refused =
+        f.rt.decide_task(task.id, &Decision::expired(OnExpiry::Proceed), &officer())
+            .await
+            .expect_err("an expiry is the sweeper's to apply");
+    assert!(
+        refused.to_string().contains("sweeper"),
+        "the refusal must name whose answer this is: {refused}"
+    );
+
+    // And the control held rather than merely reporting: the task is still
+    // open for the person it was raised for.
+    assert_eq!(
+        f.store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Open,
+        "a refused decision must not complete the task"
     );
 }
 
@@ -237,7 +345,7 @@ async fn the_proposer_may_not_approve_their_own_proposal() {
     let err =
         f.rt.decide_task(
             task.id,
-            &Decision::approve("alice", "looks fine to me"),
+            &Decision::approve(by("alice"), "looks fine to me"),
             &officer(),
         )
         .await
@@ -250,7 +358,7 @@ async fn the_proposer_may_not_approve_their_own_proposal() {
     // A different person can.
     f.rt.decide_task(
         task.id,
-        &Decision::approve("bob", "independently verified"),
+        &Decision::approve(by("bob"), "independently verified"),
         &officer(),
     )
     .await
@@ -274,7 +382,7 @@ async fn a_reviewer_without_the_role_is_refused() {
     let err =
         f.rt.decide_task(
             task.id,
-            &Decision::approve("carol", "sure"),
+            &Decision::approve(by("carol"), "sure"),
             &["intern".to_owned()],
         )
         .await
@@ -385,7 +493,7 @@ async fn two_runs_of_one_plan_do_not_share_one_task() {
 
     // And deciding one does not decide the other.
     let first = queued[0].id;
-    f.rt.decide_task(first, &Decision::approve("bob", "checked"), &officer())
+    f.rt.decide_task(first, &Decision::approve(by("bob"), "checked"), &officer())
         .await
         .unwrap();
 
@@ -570,9 +678,13 @@ async fn an_escalation_naming_nobody_is_refused() {
         ) -> Result<Outcome, SkillError> {
             cx.deadline("approval", &DeadlineSpec::days(2), None)
                 .await?;
-            let spec = TaskSpec::new("bare", Justification::new("x", json!({})), "approval")
-                .role("ops")
-                .on_expiry(OnExpiry::Escalate);
+            let spec = TaskSpec::new(
+                "bare",
+                Justification::new(Tainted::trusted("x".to_owned()), json!({})),
+                "approval",
+            )
+            .role("ops")
+            .on_expiry(OnExpiry::Escalate);
             let d = cx.task(&spec).await?;
             Ok(Outcome::done(Tainted::trusted(json!(d.approved))))
         }
@@ -594,9 +706,13 @@ async fn an_escalation_naming_nobody_is_refused() {
         ) -> Result<Outcome, SkillError> {
             cx.deadline("approval", &DeadlineSpec::days(2), None)
                 .await?;
-            let spec = TaskSpec::new("noesc", Justification::new("x", json!({})), "approval")
-                .role("ops")
-                .escalate_to("ops-lead");
+            let spec = TaskSpec::new(
+                "noesc",
+                Justification::new(Tainted::trusted("x".to_owned()), json!({})),
+                "approval",
+            )
+            .role("ops")
+            .escalate_to("ops-lead");
             let d = cx.task(&spec).await?;
             Ok(Outcome::done(Tainted::trusted(json!(d.approved))))
         }
@@ -832,7 +948,7 @@ async fn a_resubmitted_decision_is_a_duplicate() {
     .unwrap();
     let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
 
-    let d = Decision::approve("alice", "ok");
+    let d = Decision::approve(by("alice"), "ok");
     f.rt.decide_task(task.id, &d, &officer()).await.unwrap();
 
     let again = f.rt.answer_task(task.id, &d).await.unwrap();
@@ -929,7 +1045,7 @@ async fn a_refused_answer_is_not_written_into_memory() {
     let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     rt.decide_task(
         task.id,
-        &Decision::reject("carol", "that is not what the customer said"),
+        &Decision::reject(by("carol"), "that is not what the customer said"),
         &officer(),
     )
     .await
@@ -1222,6 +1338,7 @@ spec:
     assert!(
         task.justification
             .summary
+            .peek()
             .contains("tool://ledger/transfer"),
         "the reviewer is told what they are approving by the summary, and it \
          does not name the call: {:?}",
@@ -1230,7 +1347,7 @@ spec:
 
     rt.decide_task(
         task.id,
-        &Decision::reject("carol", "that account is not on the settlement list"),
+        &Decision::reject(by("carol"), "that account is not on the settlement list"),
         &officer(),
     )
     .await
@@ -1378,7 +1495,14 @@ spec:
     );
 
     let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
-    let evidence = task.justification.evidence.join("\n");
+    let evidence = task
+        .justification
+        .evidence
+        .iter()
+        .map(Tainted::peek)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         evidence.contains("4000"),
         "the reviewer was shown the instruction and not its consequences: {evidence}"
@@ -1386,6 +1510,33 @@ spec:
     assert!(
         evidence.contains("tool://archive/purge_preview"),
         "the evidence must say where it came from: {evidence}"
+    );
+
+    // **And the reviewer is told the preview is not the run's own word.** A
+    // dry run is a tool's answer over the caller's data: the most persuasive
+    // sentence on the task, and the one a compromised tool writes. Rendering
+    // it out of its `Tainted` produced a `String` sitting in the same list as
+    // the runtime's own notes, indistinguishable from them.
+    let preview = task
+        .justification
+        .evidence
+        .iter()
+        .find(|e| e.peek().contains("tool://archive/purge_preview"))
+        .expect("the preview is on the task");
+    assert_eq!(
+        preview.label().trust,
+        agentplane::core::Trust::Untrusted,
+        "a tool's answer was shown to a reviewer as though the run vouched for it"
+    );
+    assert!(
+        task.justification.has_untrusted_prose(),
+        "the task does not report that it carries prose the run does not trust"
+    );
+    // The summary beside it is the runtime's own, and stays distinguishable.
+    assert_eq!(
+        task.justification.summary.label().trust,
+        agentplane::core::Trust::Trusted,
+        "the runtime's own sentence was marked as somebody else's"
     );
     // The instruction is still there. A preview is shown *beside* the call, not
     // instead of it.
@@ -1396,7 +1547,10 @@ spec:
 
     rt.decide_task(
         task.id,
-        &Decision::reject("carol", "that reaches further back than the retention rule"),
+        &Decision::reject(
+            by("carol"),
+            "that reaches further back than the retention rule",
+        ),
         &officer(),
     )
     .await
@@ -1525,7 +1679,14 @@ spec:
     .expect("the run suspends on the approval rather than failing on the preview's size");
 
     let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
-    let evidence = task.justification.evidence.join("\n");
+    let evidence = task
+        .justification
+        .evidence
+        .iter()
+        .map(Tainted::peek)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
         evidence.len() < agentplane::runtime::PREVIEW_EVIDENCE_BYTES + 512,
         "the evidence was not bounded: {} bytes",
@@ -1658,7 +1819,7 @@ async fn an_approval_alone_does_not_make_the_arguments_trusted() {
     let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     rt.decide_task(
         task.id,
-        &Decision::approve("dana", "looks fine to me"),
+        &Decision::approve(by("dana"), "looks fine to me"),
         &officer(),
     )
     .await
@@ -1729,7 +1890,7 @@ async fn a_reviewers_amendment_is_the_call_that_runs() {
     let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     rt.decide_task(
         task.id,
-        &Decision::approve("dana", "use the settlement account, and cap it")
+        &Decision::approve(by("dana"), "use the settlement account, and cap it")
             .amend(json!({ "recipient": "AC-7", "amount": 100_000 })),
         &officer(),
     )
@@ -1810,7 +1971,7 @@ async fn a_malformed_amendment_never_dispatches() {
     let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     rt.decide_task(
         task.id,
-        &Decision::approve("dana", "typo in a hurry")
+        &Decision::approve(by("dana"), "typo in a hurry")
             .amend(json!({ "recipient": 7, "amount": "lots" })),
         &officer(),
     )
@@ -1883,7 +2044,7 @@ async fn an_amendment_is_still_source_checked() {
     let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
     rt.decide_task(
         task.id,
-        &Decision::approve("dana", "use the settlement account")
+        &Decision::approve(by("dana"), "use the settlement account")
             .amend(json!({ "recipient": "AC-7", "amount": 100_000 })),
         &officer(),
     )
@@ -2160,7 +2321,7 @@ spec:
 
     rt.decide_task(
         task.id,
-        &Decision::reject("carol", "not on the settlement list"),
+        &Decision::reject(by("carol"), "not on the settlement list"),
         &officer(),
     )
     .await
@@ -2345,5 +2506,95 @@ async fn a_task_proposal_is_sealed_in_the_worklist() {
         "the amount is in the stored bytes"
     );
     // The summary stays readable, which is what keeps a queue usable.
-    assert!(raw.justification.summary.contains("deviation"));
+    assert!(raw.justification.summary.peek().contains("deviation"));
+}
+
+/// **Who approved survives the erasure that destroys what they said.**
+///
+/// A governed wait is an effect whose output is the inbound event, so the
+/// whole decision — verdict, reason, amendment — travels as `EffectDone.output`,
+/// and that field is sealed. Erase the case's key the way a retention pass
+/// does and the chain stays readable, verifiable and auditable while the
+/// payload goes. The reason *must* go: it is free text over the caller's
+/// values. The approver must not, and the rest of the run vocabulary already
+/// agrees — `RunCancelled`, `QuarantineDecided`, `AuthorityWithheld`,
+/// `BreakGlass` and `EffectReconciled` all name their operator in the clear.
+/// This is the one act that lets a run carry on rather than stopping it, and
+/// it was the only one whose attribution a lawful erasure destroyed.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn the_approver_outlives_an_erasure_of_what_they_said() {
+    use agentplane::core::TenantId;
+
+    let raw = Arc::new(RedbStore::open_in_memory().unwrap());
+    let keys = Arc::new(agentplane::testkit::MemoryKeyRing::default());
+    let tenant = TenantId::default();
+    let rt = Runtime::builder(raw.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant.clone())
+        .cases(raw.clone() as Arc<dyn CaseStore>)
+        .events(raw.clone() as Arc<dyn EventStore>)
+        .tasks(raw.clone() as Arc<dyn TaskStore>)
+        .keyring(keys.clone() as Arc<dyn agentplane::keyring::KeyRing>)
+        .skill(ProposesRefund::new(OnExpiry::Deny))
+        .build();
+
+    let out = rt
+        .run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-9")],
+        )
+        .await
+        .unwrap();
+
+    let task = rt
+        .tasks()
+        .unwrap()
+        .queue(&officer(), 10)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let case = task.case.unwrap();
+    rt.decide_task(
+        task.id,
+        &Decision::approve(by("alice"), "the meter reading checks out"),
+        &officer(),
+    )
+    .await
+    .unwrap();
+
+    // A lawful erasure of this matter: the retention pass destroys the key.
+    let ring: Arc<dyn agentplane::keyring::KeyRing> = keys.clone();
+    ring.destroy(
+        &agentplane::keyring::scope(&tenant, &case.to_string()),
+        agentplane::core::Timestamp::from_unix_timestamp(1_800_000_000).unwrap(),
+        "retention",
+    )
+    .await
+    .unwrap();
+
+    let after = rt.store().read(out.run_id, 1).await.unwrap();
+
+    // The chain is still checkable with the payloads gone — the property the
+    // whole sealing design exists to keep.
+    rt.store().verify(out.run_id).await.expect("chain intact");
+
+    let decided = after
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::EffectDone { by, .. } => by.clone(),
+            _ => None,
+        })
+        .expect("the approver is on the record after the payload is gone");
+    assert_eq!(decided.actor(), "alice");
+    assert_eq!(decided.basis().as_str(), "asserted");
+
+    // And what they *said* is gone, which is the other half of the guarantee.
+    let text = format!("{after:?}");
+    assert!(
+        !text.contains("the meter reading checks out"),
+        "the erasure did not reach the reason the approver gave"
+    );
 }

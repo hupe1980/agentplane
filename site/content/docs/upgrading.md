@@ -25,6 +25,152 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## A rehearsal leaves a record, and `drill` takes the clock
+
+**Affected:** anyone implementing `CaseStore`; anyone calling `Runtime::drill`.
+
+**Why.** `drill` wrote its verdict to a log and nowhere else, so *when did you
+last rehearse, and did it pass* — the question an audit actually asks — was
+answerable only from whatever ran the verb. That is a CI log or a wiki page,
+which is the artifact this project argues against relying on everywhere else.
+
+**What to do.** `CaseStore` gains `record_drill` and `last_drill`: one row per
+tenant that the latest rehearsal replaces, absent before the first. Absence is
+meaningful, so return `None` rather than a zeroed record — *nobody has
+rehearsed this plane* is exactly what a missing log cannot distinguish from a
+rotated one, and `testkit::conformance_case` checks both halves. Both shipped
+backends gained storage for it (recreate; there is no migration).
+
+`Runtime::drill` now takes the instant: `drill(at)`. The clock is the
+caller's, as it already is for `attention` and the push sweep — a rehearsal's
+instant is a fact about the outside world, and taking it inside the runtime
+would have been a fourth ambient-clock escape in the deterministic zone for a
+value the caller already holds.
+
+Reading it: `Runtime::last_drill`, `agentplane drill --last`, or `GET /drill`.
+**`api:drill.read` is a new action and must be granted**, or the route is
+refused to everybody — it is deliberately its own capability rather than part
+of `api:attention`, so a read-only auditor credential need not carry the
+operational roll-up. A failed rehearsal also shows up in `attention` as
+`drill.failed` until a later drill passes.
+
+---
+
+## Every sentence on a task carries who wrote it
+
+**Affected:** anyone building a `core::Justification`; anyone reading
+`summary`, `cost` or `evidence` off a task.
+
+**Why.** A reviewer is a control made of human judgement, and what defeats
+that control is not refusal — it is being told something persuasive by the
+party under review. `Justification`'s text fields were `String`, so the label
+that says whether the run vouches for a sentence was dropped at the point it
+mattered most.
+
+It was not hypothetical. A declared dry-run preview — `preview:` on a tool
+grant — is computed by *calling the tool*, and the answer came back as a
+`Tainted<Value>` and went onto the task through `peek`. That preview is the
+most persuasive line a reviewer reads, it is the one a compromised tool
+writes, and it sat in the same `Vec<String>` as the runtime's own note about
+why no preview could be computed.
+
+**What to do.** `summary` and `cost` are `Tainted<String>`; `evidence` is
+`Vec<Tainted<String>>`. Wrap your own words with `Tainted::trusted(..)` — the
+same explicit act `Runtime::run` already asks for on an operator's literal —
+and carry a model's or a tool's label across with
+`Tainted::map`:
+
+```rust
+// The skill's own sentence.
+Justification::new(Tainted::trusted("refund disputed".to_owned()), action)
+    // A counterparty's payload, rendered without losing what it is.
+    .evidence(reply.map(|v| format!("rejection payload: {v}")))
+```
+
+Reading: `justification.summary.peek()` for the text,
+`.label().trust` for the answer. `Justification::has_untrusted_prose()` asks
+across all three at once, and `GET /tasks/{task}` serves it as
+`has_untrusted_prose` so a client cannot render the text and quietly skip the
+labels.
+
+Nothing is refused. A worklist carrying only trusted sentences would carry
+nothing worth reviewing; what a reviewer is owed is an honest task, not a
+sanitised one.
+
+---
+
+## `EffectDone` names who minted an awaited event, and a conclusion stops repeating itself
+
+**Affected:** anyone matching on `journal::RecordKind::EffectDone` or
+`RunConcluded`; anyone building a `core::InboundEvent` literal; anyone
+implementing `EventStore`; anyone reading `RunConcluded.reason` for a run an
+operator stopped.
+
+**Why.** Two facts an auditor needs were reachable only through something a
+lawful erasure destroys, and one was recorded twice with the copies
+disagreeing.
+
+An approval travels as an awaited effect's output, and `EffectDone.output` is
+a sealed payload. Destroy the run's key the way a retention pass does and the
+chain still lists, verifies and audits — with the approver's name gone. Every
+operator act that *stops* a run already named its actor in the clear
+(`RunCancelled`, `QuarantineDecided`, `AuthorityWithheld`, `BreakGlass`,
+`EffectReconciled`); the one act that lets a run carry on did not.
+
+Separately, `RunConcluded.reason` repeated the words an operator gave when
+they cancelled, abandoned, crossed or withdrew — sealed, beside a clear
+original on the record that names them. One sentence, two facts, and after an
+erasure the chain said both that it was knowable and that it was not.
+
+**What to do.** `EffectDone` gains `by: Option<Operator>`, clear, set when the
+awaited event was minted by an operator of this plane and `None` for anything
+off a wire. `InboundEvent` gains the same field; build it with
+`InboundEvent::new(..)` and `minted_by(..)` rather than a literal. A custom
+`EventStore` must round-trip it — `testkit::conformance_case` checks that, and
+both shipped backends gained columns for it (recreate the store; there is no
+migration).
+
+`RunConcluded.reason` now carries only the run's own account: a failure, a
+replan, a quarantine. For the endings a person caused, read the attribution
+record — `RunStatus` still answers `reason()` in full, because the reader
+reaches that record for you.
+
+---
+
+## An approval names its decider as an `Operator`, and an expiry names nobody
+
+**Affected:** anyone constructing `Decision`, reading `Decision::actor`, or
+matching on a `system:` actor name to detect an unattended outcome.
+
+**Why.** `Decision` carried the decider as a bare string, with
+`system:unattended` and `system:expiry` reserved inside it for the case where
+nobody decided at all. That put *nobody answered* into the shape of *somebody
+did*: every consumer had to know the convention, a worklist report counted the
+reserved name as a decider, and nothing stopped a deployment having a principal
+spelled that way. The string also carried no **basis**, so an approval an
+authenticator vouched for was indistinguishable on the record from one somebody
+typed at a terminal — which is half of what an approval is worth as evidence.
+
+**What to do.** `Decision::actor` becomes `Decision::decided`, a `Decided`
+enum: `By(Operator)` when a person answered, `OnExpiry(OnExpiry)` when the
+window closed. `Decision::approve` and `Decision::reject` take an `Operator`
+rather than a name — pick the constructor that states what established it
+(`Operator::authenticated` behind an `Authenticator`, `Operator::asserted` from
+a terminal). To render a subject, `Decided` implements `Display`; to test for
+an unattended outcome, match the variant instead of the name.
+`Runtime::decide_task` refuses a `Decided::OnExpiry` — applying an expiry is the
+sweeper's, and that door runs the claim, eligibility and four-eyes checks an
+expiry has nobody to check.
+
+**A decision already recorded is the old shape.** The awaited event's payload
+is what a resume reads back, so a run suspended on an approval decided before
+this change fails at that read with a serde error naming the missing `decided`
+field, and a decision buffered but not yet consumed fails the same way. Both
+are loud and neither loses anything: the record is intact and the chain still
+verifies. Decide such a run under the build that opened it, or abandon it.
+
+---
+
 ## Every replay finding names the call, not its digest
 
 **Affected:** anyone matching on `StepError::NonDeterminism` or

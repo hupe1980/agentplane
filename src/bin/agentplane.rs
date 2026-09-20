@@ -147,6 +147,178 @@ enum Verb {
     Attention(WaitingArgs),
     /// Place, lift, or list the legal holds that stop a retention pass.
     Hold(HoldArgs),
+    /// Establish what happened to an effect the runtime could not decide.
+    Reconcile(ReconcileArgs),
+    /// Answer a quarantine: hand the run back, or close it where it stands.
+    Quarantine(QuarantineArgs),
+    /// Decide a task on the worklist, as the person named.
+    Decide(DecideArgs),
+    /// Account for a breached obligation so it leaves the backlog.
+    Acknowledge(AcknowledgeArgs),
+    /// Re-arm a push registration that was parked after a failed delivery.
+    #[cfg(feature = "push")]
+    Rearm(RearmArgs),
+    /// Stop a run and unwind what it did.
+    Cancel(CancelArgs),
+}
+
+/// The operator behind a verb a terminal carries.
+///
+/// `--actor` is required on every one of these, and recorded as
+/// [`Basis::Asserted`](agentplane::core::Basis::Asserted): nothing here
+/// verified the name, and the honest record of a terminal act says so. The
+/// HTTP surface records the same acts as `authenticated`, because an
+/// `Authenticator` ran before the route did.
+#[derive(clap::Args, Debug)]
+struct ActingAs {
+    /// Who is doing this. Recorded permanently, as asserted.
+    #[arg(long)]
+    actor: String,
+}
+
+impl ActingAs {
+    fn operator(&self) -> Result<agentplane::core::Operator, String> {
+        agentplane::core::Operator::asserted(&self.actor).map_err(|e| e.to_string())
+    }
+}
+
+/// Establish what happened to an undecided effect.
+#[derive(clap::Args, Debug)]
+struct ReconcileArgs {
+    /// The run holding it.
+    run_id: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// The effect key, as `audit` and the run's history print it.
+    #[arg(long)]
+    effect: String,
+
+    /// What was established: `landed` or `did-not-happen`.
+    ///
+    /// No default. A person is asserting a fact the runtime could not
+    /// establish, and a default would pick the answer for them.
+    #[arg(long)]
+    outcome: String,
+
+    /// The result the run reads back, as JSON. Only with `--outcome landed`,
+    /// and recorded untrusted: nothing here produced it.
+    #[arg(long)]
+    output: Option<String>,
+
+    /// What was checked, and how. Required and recorded.
+    #[arg(long)]
+    note: String,
+
+    #[command(flatten)]
+    who: ActingAs,
+}
+
+/// Answer a quarantine.
+#[derive(clap::Args, Debug)]
+struct QuarantineArgs {
+    /// The run to answer for.
+    run_id: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// `reopen` to hand the run back to the executor, `abandon` to close it
+    /// where it stands, unwinding nothing.
+    #[arg(long)]
+    decision: String,
+
+    /// What was looked at, and what was found. Required and recorded.
+    #[arg(long)]
+    reason: String,
+
+    #[command(flatten)]
+    who: ActingAs,
+}
+
+/// Decide a task on the worklist.
+#[derive(clap::Args, Debug)]
+struct DecideArgs {
+    /// The task, as `attention` and the worklist print it.
+    task_id: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// Approve it. Without this the decision is a refusal.
+    #[arg(long, conflicts_with = "reject")]
+    approve: bool,
+
+    /// Refuse it, recording why.
+    #[arg(long)]
+    reject: bool,
+
+    /// The words that go on the record beside the verdict. Required.
+    #[arg(long)]
+    reason: String,
+
+    /// A role this decider holds. Repeatable; the store checks eligibility
+    /// and four-eyes against them, exactly as the HTTP route does.
+    #[arg(long = "role")]
+    roles: Vec<String>,
+
+    #[command(flatten)]
+    who: ActingAs,
+}
+
+/// Account for a breached obligation.
+#[derive(clap::Args, Debug)]
+struct AcknowledgeArgs {
+    /// The case the obligation belongs to.
+    case_id: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// The obligation's declared name.
+    #[arg(long)]
+    obligation: String,
+
+    /// What happened, and what was done about it. Required and recorded.
+    #[arg(long)]
+    note: String,
+
+    #[command(flatten)]
+    who: ActingAs,
+}
+
+/// Stop a run.
+#[derive(clap::Args, Debug)]
+struct CancelArgs {
+    /// The run to stop.
+    run_id: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// Why, recorded permanently beside who asked. Required: the next person
+    /// to read this run is somebody else.
+    #[arg(long)]
+    reason: String,
+
+    #[command(flatten)]
+    who: ActingAs,
+}
+
+/// Re-arm a parked push registration.
+#[cfg(feature = "push")]
+#[derive(clap::Args, Debug)]
+struct RearmArgs {
+    /// The run the registration belongs to.
+    run_id: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// The registration's id, as `attention` and the parked listing print it.
+    #[arg(long)]
+    id: String,
 }
 
 /// Retention, as a verb, for the tier that is a manifest and this binary.
@@ -336,6 +508,16 @@ struct DrillArgs {
     /// cases, and a memory store this process did not write holds none.
     #[command(flatten)]
     at: StoreRef,
+
+    /// Read the last rehearsal's verdict instead of running one.
+    ///
+    /// The question an audit asks — *when did you last rehearse, and did it
+    /// pass* — answered from the plane rather than from whatever scheduled
+    /// the verb. Exits non-zero when the recorded verdict was not sound, and
+    /// when no rehearsal has ever run: *nobody has drilled this plane* is a
+    /// finding, not a clean answer.
+    #[arg(long)]
+    last: bool,
 }
 
 /// Rebuild a journal from an export.
@@ -1230,6 +1412,40 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
         // that is the wiring, whole. Blobs and keys are not in it, and the
         // report says so instead of this verb pretending otherwise.
         let cases = backend.cases();
+
+        if opts.last {
+            let record = cases.last_drill().await.map_err(|e| e.to_string())?;
+            let Some(record) = record else {
+                // Not an error and not a pass. *Nobody has rehearsed this
+                // plane* is the finding an auditor came for, and it is
+                // exactly what a missing CI log cannot tell from a rotated
+                // one — so it exits non-zero and says which it is.
+                println!("{}", serde_json::json!({ "drilled": false }));
+                return Ok(ExitCode::FAILURE);
+            };
+            let sound = record.sound;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "drilled": true,
+                    "at": record.at.to_string(),
+                    "sound": sound,
+                    "cases": record.cases,
+                    "findings": record.findings,
+                    "not_checked": record.not_checked,
+                    // Which store, so a rehearsal against a restored copy
+                    // cannot be read as one against production.
+                    "origin": record.origin,
+                    "log_size": record.size,
+                }))
+                .map_err(|e| e.to_string())?
+            );
+            return Ok(if sound {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            });
+        }
         // The tenant scopes blob addresses and key scopes. This verb wires
         // neither store, so it reaches neither — but the value is the one the
         // operator named, so a future flag that wires blobs inherits the right
@@ -1251,6 +1467,34 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
         let report = agentplane::drill::drill(&stores)
             .await
             .map_err(|e| e.to_string())?;
+
+        // Recorded here as well as on `Runtime::drill`, because otherwise the
+        // plane's answer to *when did you last rehearse* would depend on
+        // which surface ran it. This verb reaches neither the blob store nor
+        // the key ring, so its `not_checked` is large — and writing that
+        // honestly is right even though it replaces a richer scheduled
+        // drill's verdict: it *is* the last rehearsal, and it *was*
+        // incomplete.
+        #[allow(clippy::disallowed_methods)]
+        let at = agentplane::core::Timestamp::now_utc();
+        let checkpoint = backend
+            .journal()
+            .checkpoint()
+            .await
+            .map_err(|e| e.to_string())?;
+        cases
+            .record_drill(&agentplane::case::DrillRecord {
+                at,
+                sound: report.is_sound(),
+                cases: report.cases as u64,
+                findings: report.findings.len() as u64,
+                not_checked: report.not_checked.len() as u64,
+                origin: checkpoint.origin.clone(),
+                size: checkpoint.size,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+
         println!(
             "{}",
             serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -1628,6 +1872,272 @@ fn waiting_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
 /// that always exits zero is a check nobody notices has stopped working — the
 /// same reason `drill` and `verify` report through their status rather than
 /// only on stdout.
+/// One async runtime, for the verbs that only touch stores.
+fn blocking<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?
+        .block_on(f)
+}
+
+/// Establish what happened to an effect the runtime could not decide.
+///
+/// The first of the remedies `attention` names for a quarantine, and the one
+/// that has to come first: reopening a run whose doubt is unanswered
+/// quarantines it again, correctly, on the same effect.
+fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, String> {
+    let assertion = match opts.outcome.as_str() {
+        "landed" => {
+            let raw = opts.output.as_deref().unwrap_or("null");
+            agentplane::core::Assertion::Landed(
+                serde_json::from_str(raw).map_err(|e| format!("--output is not JSON: {e}"))?,
+            )
+        }
+        "did-not-happen" => {
+            if opts.output.is_some() {
+                return Err(
+                    "--output belongs to `--outcome landed`: an effect that did not happen \
+                     produced no result to read back"
+                        .to_owned(),
+                );
+            }
+            agentplane::core::Assertion::DidNotHappen
+        }
+        other => {
+            return Err(format!(
+                "'{other}' is not an outcome: use `landed` or `did-not-happen`"
+            ));
+        }
+    };
+    let by = opts.who.operator()?;
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
+    let effect = agentplane::core::EffectKey::from_hex(&opts.effect).map_err(|e| e.to_string())?;
+
+    blocking(async move {
+        let backend = opts.at.open().await?;
+        let plane = Runtime::builder_with(backend.stores())
+            .tenant(backend.tenant())
+            .build();
+        plane
+            .reconcile_effect(run, effect, assertion, &by, &opts.note)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "run": run.to_string(),
+                "effect": opts.effect,
+                "outcome": opts.outcome,
+                "by": by.actor(),
+                "basis": by.basis().as_str(),
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Answer a quarantine, recording the instruction where the run will find it.
+///
+/// **It does not drive the run, and says so.** A terminal holds the journal
+/// and not the agent — a declarative run's program is a manifest this process
+/// was not handed — so the decision is recorded and the next resume applies
+/// it. Reporting the run as moved would be the one dishonest thing available
+/// here.
+fn quarantine_verb(opts: &QuarantineArgs) -> Result<ExitCode, String> {
+    use agentplane::core::QuarantineDecision;
+
+    let decision = match opts.decision.as_str() {
+        "reopen" => QuarantineDecision::Reopen,
+        "abandon" => QuarantineDecision::Abandon,
+        other => {
+            return Err(format!(
+                "'{other}' is not a decision: use `reopen` or `abandon`"
+            ));
+        }
+    };
+    let by = opts.who.operator()?;
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
+
+    blocking(async move {
+        let backend = opts.at.open().await?;
+        let plane = Runtime::builder_with(backend.stores())
+            .tenant(backend.tenant())
+            .build();
+        plane
+            .record_quarantine_decision(run, &by, &opts.reason, decision)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "run": run.to_string(),
+                "decision": opts.decision,
+                "by": by.actor(),
+                "basis": by.basis().as_str(),
+                // The half an operator has to be told, rather than left to
+                // infer from a silent success.
+                "applied": false,
+                "next": "recorded; the next resume of this run applies it",
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Decide a task on the worklist.
+///
+/// The claim, the eligibility check and four-eyes all run in the task store,
+/// which is why `--role` is taken: the exclusion this enforces is the reason
+/// an approval is worth anything, and a terminal that skipped it would be a
+/// second door into the control the HTTP route goes through.
+fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, String> {
+    // The verdict first: it is an argument error, answerable without a store
+    // or a well-formed id, and an operator who forgot it should be told that
+    // rather than shown a parse failure for something else.
+    if !opts.approve && !opts.reject {
+        return Err(
+            "say which: `--approve` or `--reject`. A decision with no verdict is not one"
+                .to_owned(),
+        );
+    }
+    let by = opts.who.operator()?;
+    let id = agentplane::core::TaskId::parse(&opts.task_id).map_err(|e| e.to_string())?;
+    let decision = if opts.approve {
+        agentplane::core::Decision::approve(by.clone(), opts.reason.clone())
+    } else {
+        agentplane::core::Decision::reject(by.clone(), opts.reason.clone())
+    };
+
+    blocking(async move {
+        let backend = opts.at.open().await?;
+        let plane = Runtime::builder_with(backend.stores())
+            .tenant(backend.tenant())
+            .build();
+        let delivery = plane
+            .decide_task(id, &decision, &opts.roles)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "task": opts.task_id,
+                "approved": opts.approve,
+                "by": by.actor(),
+                "basis": by.basis().as_str(),
+                // Buffered rather than resumed is the ordinary answer here: a
+                // terminal holds no agent to run the waiting run with, and the
+                // decision is durable either way.
+                "delivery": format!("{delivery:?}"),
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Account for a breached obligation so it leaves the backlog.
+fn acknowledge_verb(opts: &AcknowledgeArgs) -> Result<ExitCode, String> {
+    let by = opts.who.operator()?;
+    let case = agentplane::core::CaseId::parse(&opts.case_id).map_err(|e| e.to_string())?;
+
+    blocking(async move {
+        let backend = opts.at.open().await?;
+        // Wall clock by design, as a halt's instant is: when somebody
+        // accounted for a breach is a fact about the outside world.
+        #[allow(clippy::disallowed_methods)]
+        let at = agentplane::core::Timestamp::now_utc();
+        let note = agentplane::core::BreachNote {
+            by: by.actor().to_owned(),
+            note: opts.note.clone(),
+            at,
+        };
+        let recorded = backend
+            .cases()
+            .acknowledge_breach(case, &opts.obligation, &note)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "case": opts.case_id,
+                "obligation": opts.obligation,
+                // Whether *this* call recorded it: acknowledging is
+                // idempotent and first note wins, so a second one must not
+                // read as having replaced the first.
+                "recorded": recorded,
+                "by": by.actor(),
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Stop a run, and unwind what it did.
+///
+/// The remedy for the two conclusions a quarantine decision cannot answer: an
+/// exhausted run whose ceiling nobody will raise, and a run paused under a
+/// withdrawn credential that is not coming back. `quarantine --decision
+/// abandon` is refused for both — it answers a doubt, and neither is one.
+///
+/// A request, not an interruption: the run reads it at its next step
+/// boundary, so an effect between announcing and recording is never cut in
+/// half.
+fn cancel_verb(opts: &CancelArgs) -> Result<ExitCode, String> {
+    let by = opts.who.operator()?;
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
+    blocking(async move {
+        let backend = opts.at.open().await?;
+        let plane = Runtime::builder_with(backend.stores())
+            .tenant(backend.tenant())
+            .build();
+        let first = plane
+            .request_cancel(run, &by, &opts.reason)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "run": run.to_string(),
+                "by": by.actor(),
+                "basis": by.basis().as_str(),
+                // A second asker does not take the first one's place, and must
+                // not be told they did.
+                "requested": first,
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Re-arm a parked push registration.
+#[cfg(feature = "push")]
+fn rearm_verb(opts: &RearmArgs) -> Result<ExitCode, String> {
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
+    blocking(async move {
+        let backend = opts.at.open().await?;
+        let plane = Runtime::builder_with(backend.stores())
+            .tenant(backend.tenant())
+            .push(backend.push())
+            .build();
+        let rearmed = plane
+            .rearm_push(run, &opts.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "run": run.to_string(),
+                "id": opts.id,
+                // Whether one was parked to re-arm. A re-arm that found
+                // nothing must not read as success, for the reason lifting a
+                // halt that was not standing must not.
+                "rearmed": rearmed,
+            })
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
 fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1895,6 +2405,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
         Verb::Retain(a) => retain_verb(&a),
         Verb::Halt(a) => halt_verb(&a),
         Verb::Hold(a) => hold_verb(&a),
+        Verb::Reconcile(a) => reconcile_verb(&a),
+        Verb::Quarantine(a) => quarantine_verb(&a),
+        Verb::Decide(a) => decide_verb(&a),
+        Verb::Acknowledge(a) => acknowledge_verb(&a),
+        #[cfg(feature = "push")]
+        Verb::Rearm(a) => rearm_verb(&a),
+        Verb::Cancel(a) => cancel_verb(&a),
         Verb::Halts(a) => halts_verb(&a),
         Verb::Waiting(a) => waiting_verb(&a),
         Verb::Attention(a) => attention_verb(&a),
@@ -2552,7 +3069,12 @@ fn spawn_drill(runtime: &Arc<Runtime>, every: u32, stop: Stop) -> Option<Task> {
             if !next_tick(&mut tick, &mut stop).await {
                 break;
             }
-            match plane.drill().await {
+            // The scheduler's clock, as the sweep's is: the runtime takes the
+            // instant rather than reaching for one, so its deterministic zone
+            // keeps the escapes it already argued for.
+            #[allow(clippy::disallowed_methods)]
+            let at = agentplane::core::Timestamp::now_utc();
+            match plane.drill(at).await {
                 Ok(report) if !report.is_sound() => {
                     tracing::error!(?report, "the recovery drill found unrecoverable references");
                 }

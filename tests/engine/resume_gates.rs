@@ -713,6 +713,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         declared: agentplane::core::DeclaredOutput::untrusted(),
                         output: json!({"did": "first"}),
                         source: None,
+                        by: None,
                         spend: agentplane::core::Spend::default(),
                     },
                 )
