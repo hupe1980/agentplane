@@ -1509,6 +1509,7 @@ fn every_conclusion_but_success_carries_a_reason() {
             subject: "alice".into(),
             reason: "credential withdrawn: laptop lost".into(),
         },
+        RunStatus::Observed,
     ];
 
     for status in statuses {
@@ -1517,7 +1518,10 @@ fn every_conclusion_but_success_carries_a_reason() {
             // A sweep is beside a success here for the same reason: it pursued
             // no goal, so there is no ending to explain. What it did is on its
             // own records, not in a one-line summary.
-            RunStatus::Succeeded | RunStatus::Swept => assert!(
+            // An observed session is beside them for the third version of the
+            // same reason: this plane did not run it, so it has no account of
+            // why it ended and must not manufacture one.
+            RunStatus::Succeeded | RunStatus::Swept | RunStatus::Observed => assert!(
                 reason.is_none(),
                 "a success has no reason to give, and inventing one would put a \
                  sentence in a field an embedder renders as a failure note"

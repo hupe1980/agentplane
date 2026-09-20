@@ -954,3 +954,77 @@ loop spend against a ceiling reading zero — so it is treated as safe to repeat
 ceiling may under-count by at most one call. A streaming driver whose wire reports usage
 must report `Interrupted` with what it saw, rather than the `Unaccounted` a
 driver that merely did not look would produce.
+
+## Observing an agent you do not run {#observing-an-agent-you-do-not-run}
+
+Everything above is about work this plane *dispatches*. There is one more
+altitude, and it is a different kind of answer rather than a weaker version of
+the same one: keeping a **record** beside an agent you do not run at all.
+
+What a seat like that can honestly produce is evidence, not control. The
+oversight wires on offer put the verdict in the hands of the party being
+governed — a client answers a permission request by picking from a list the
+*agent* wrote — so what is worth keeping is what the agent was asked, what it
+reported doing, and what a person allowed. Nothing in the editor ecosystem
+produces a tamper-evident, offline-verifiable, independently anchored account of
+that, and this does:
+
+```rust
+use agentplane::observe::{acp, Session};
+
+let mut session = Session::new(journal.clone(), notification.session_id.clone());
+if let acp::Mapped::Step { step, detail } = acp::step_of(&notification.update) {
+    session.step(step, detail).await?;
+}
+let run = session.seal().await?;   // None if the session reported nothing
+```
+
+**It is a run of its own, with no admission.** The records share the chain, the
+canonical form, the Merkle log and the witness with everything else — an
+`export` carries them, an `audit` reports over them, and a verifier written
+against the [format](@/docs/format.md) checks them without being taught what an
+observation is. What they never share is a record kind with a dispatched
+effect: an observation is the observed party's *account of itself*, and letting
+it wear an effect's kind would make every answer the journal gives about what
+authorized an action false. Such runs seal under the outcome `observed`, and an
+audit lists them as **unadmitted** — which is the honest word, because nothing
+here admitted them.
+
+**Bind it to a matter if you want to find it again.** The records carry the
+session id, so without a case *show me the record for session X* means listing
+runs by the `observed` outcome and reading the first record of each — correct,
+bounded, and a scan rather than a lookup. Correlating a case on the session id
+makes it one indexed read, and puts the session on the same footing as any other
+matter for obligations and legal holds:
+
+```rust
+let case = cases
+    .correlate_or_open("acp-session", &[CorrelationKey::new("session", &id)], now)
+    .await?
+    .case_id();
+let mut session = Session::new(journal.clone(), id).in_case(case);
+```
+
+Optional rather than automatic: opening a business matter per editor session is
+a decision about what a case *means* in your deployment, and this crate does not
+get to make it.
+
+**What carries evidence is recorded; the rest are named rather than dropped.**
+Message and thought chunks, plans, mode changes and command lists are
+presentation; keeping them would turn an evidence log into a chat history whose
+bulk hides the four events that matter. What you get back for one of those is
+`Mapped::NotRecorded`, carrying the wire's own spelling, so your own report can
+say what it does not cover. An update kind from a revision this build has never
+seen comes back the same way rather than failing — a plane that refused a
+notification over an unfamiliar word would stop recording the session it is
+there to record.
+
+**The mapping is pinned to `acp/v1`** (`acp::REVISION`), the stable revision,
+and the types are written out here rather than taken from the protocol's own
+crate — that crate has moved to a **v2** major which is still a draft, and a
+durable record must not be pinned to a wire with no stabilization commitment
+behind it. One thing the draft did decide: its permission options gain an open
+kind, so the kind an agent gave an option is carried as a string. A closed
+vocabulary would be wrong the first time the party under observation offered a
+word this plane had not heard of — and *that party owns the vocabulary* is the
+whole reason this wire is a record rather than a control plane.

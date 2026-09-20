@@ -348,6 +348,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `mcp-http` | reach an MCP server over **streamable HTTP** — the transport remote servers speak |
 | `mcp-server` | the other direction: serve **this plane's agents as MCP tools** and their reviewed instructions as MCP prompts, so a host you do not run can call a governed agent |
 | `a2a` | A2A peer transport — calling other agents |
+| `acp` | record what an agent you do **not** run reported doing: the Agent Client Protocol's session updates mapped onto observation records. Types only — the session stays with the editor that holds it |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
 | `push` | Persistent A2A registration cursors, retrying worker API, and SSRF-guarded webhook delivery; `a2a-server` includes it |
 | `providers` | Anthropic, OpenAI, Google Gemini and OpenAI-compatible model drivers, plus the `OpenAI`-compatible and Gemini **embeddings** drivers semantic retrieval needs |

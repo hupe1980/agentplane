@@ -514,7 +514,7 @@ impl VerifyReport {
 pub fn verify<R: std::io::BufRead>(
     input: R,
     verifier: Option<&dyn crate::core::Verifier>,
-    expected: Option<&Checkpoint>,
+    anchors: &[crate::journal::Anchor],
 ) -> Result<VerifyReport, std::io::Error> {
     use crate::core::Digest;
     use serde_json::Value;
@@ -619,7 +619,7 @@ pub fn verify<R: std::io::BufRead>(
     // this is the one place that holds both numbers, and passed on rather than
     // recounted.
     let open_runs = run_blocks.saturating_sub(leaves.len());
-    settle(&mut report, header_seen, leaves, expected);
+    settle(&mut report, header_seen, leaves, anchors);
     settle_trailer(
         &mut report,
         &claims,
@@ -991,6 +991,69 @@ struct RunPass {
     clean: bool,
 }
 
+/// Hold the export's header to every anchor, and return one it matched.
+///
+/// Three answers, because the size relation decides which applies: an anchor
+/// *above* the file, or of another log, names a history the file cannot be part
+/// of; an anchor *at* the file's size either matches it or names a second
+/// history of that size; and an anchor *below* it might be a prefix — which a
+/// file cannot settle either way, since it carries no consistency proof.
+/// Collapsing the third into the other two is what would let an operator pick
+/// whichever observer their export happens to satisfy.
+fn compare_anchors(
+    report: &mut VerifyReport,
+    header_seen: bool,
+    anchors: &[crate::journal::Anchor],
+) -> Option<Checkpoint> {
+    let mut matched = None;
+    if !header_seen {
+        return matched;
+    }
+    for anchor in anchors {
+        let given = &anchor.checkpoint;
+        if given.origin != report.checkpoint.origin || given.size > report.checkpoint.size {
+            report.findings.push(format!(
+                "the export's header names log '{}' at size {} with root {}, and the \
+                 checkpoint held by {} names '{}' at size {} with root {} — the file \
+                 describes a different history than the one it is being checked against",
+                report.checkpoint.origin,
+                report.checkpoint.size,
+                report.checkpoint.root.to_hex(),
+                anchor.obtained_from,
+                given.origin,
+                given.size,
+                given.root.to_hex(),
+            ));
+        } else if given.size == report.checkpoint.size {
+            if given.root == report.checkpoint.root {
+                if matched.is_none() {
+                    matched = Some(given.clone());
+                }
+            } else {
+                report.findings.push(format!(
+                    "the export's header names log '{}' at size {} with root {}, and the \
+                     checkpoint held by {} holds that same size with root {} — one tree of \
+                     a given size has one root, so these are two histories",
+                    report.checkpoint.origin,
+                    report.checkpoint.size,
+                    report.checkpoint.root.to_hex(),
+                    anchor.obtained_from,
+                    given.root.to_hex(),
+                ));
+            }
+        } else {
+            report.not_checked.push(format!(
+                "the checkpoint held by {} is at size {} and this export is at size {} — a \
+                 file carries no consistency proof, so whether the export extends it was \
+                 not established here. Run `audit` against the store with that checkpoint, \
+                 which can ask the log for the proof",
+                anchor.obtained_from, anchor.checkpoint.size, report.checkpoint.size
+            ));
+        }
+    }
+    matched
+}
+
 /// The checks that can only be made once the whole file has been read.
 ///
 /// Separated because they answer a different question from the per-record pass:
@@ -1000,42 +1063,39 @@ fn settle(
     report: &mut VerifyReport,
     header_seen: bool,
     mut leaves: Vec<(u64, crate::core::merkle::LeafHash)>,
-    expected: Option<&Checkpoint>,
+    anchors: &[crate::journal::Anchor],
 ) {
     use crate::core::merkle;
 
     // Which checkpoint the rebuild is held to, and everything below turns on
-    // it. The header's own is a claim by whoever wrote the file; `expected` is
+    // it. The header's own is a claim by whoever wrote the file; an anchor is
     // one the reader was given by somebody else — printed by an earlier audit,
     // cosigned by a witness, pasted into a ticket. Only the second makes the
     // Merkle rebuild evidence about *deletion*; against the header it is
     // evidence that the file is self-consistent, which an editor who dropped a
     // run and rewrote the header also achieves.
-    let against = if let Some(given) = expected {
-        if header_seen && *given != report.checkpoint {
-            report.findings.push(format!(
-                "the export's header names log '{}' at size {} with root {}, and the \
-                 checkpoint this pass was given names '{}' at size {} with root {} — \
-                 the file describes a different history than the one it is being \
-                 checked against",
-                report.checkpoint.origin,
-                report.checkpoint.size,
-                report.checkpoint.root.to_hex(),
-                given.origin,
-                given.size,
-                given.root.to_hex(),
-            ));
-        }
-        given.clone()
+    //
+    // **Every anchor is consulted, and what cannot be is said.** Three answers,
+    // because the size relation decides which one applies: an anchor *above*
+    // the file is a log that shrank, an anchor *at* the file's size either
+    // matches it or names a different history, and an anchor *below* it might
+    // be a prefix — which a file cannot prove either way, since it carries no
+    // consistency proof. Collapsing the third into the first two is what lets
+    // an operator pick whichever observer their export happens to satisfy.
+    let matched = compare_anchors(report, header_seen, anchors);
+    let against = if let Some(checkpoint) = matched {
+        checkpoint
     } else {
-        report.not_checked.push(
-            "deletion — no checkpoint was supplied, so the Merkle root could only be \
-             rebuilt and compared against this file's own header. That proves the \
-             file is internally consistent, which is also what an editor who dropped \
-             a run and rewrote the header achieves. Pass the checkpoint an earlier \
-             audit printed, or one a witness cosigned"
-                .to_owned(),
-        );
+        if anchors.is_empty() {
+            report.not_checked.push(
+                "deletion — no checkpoint was supplied, so the Merkle root could only be \
+                 rebuilt and compared against this file's own header. That proves the \
+                 file is internally consistent, which is also what an editor who dropped \
+                 a run and rewrote the header achieves. Pass the checkpoint an earlier \
+                 audit printed, or one a witness cosigned"
+                    .to_owned(),
+            );
+        }
         report.checkpoint.clone()
     };
 

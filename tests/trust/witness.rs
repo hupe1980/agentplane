@@ -1072,10 +1072,14 @@ fn a_quorum_no_round_can_meet_is_refused_before_the_plane_runs() {
 /// other disagreement is not.
 ///
 /// The negative halves carry the weight. Witnesses observing at *different*
-/// sizes is the ordinary case — they looked at different times — and reporting
-/// that as a split view would page an operator for the system working, which
-/// is the failure this crate's witness handling is arranged around. Equal
-/// size with equal roots is agreement.
+/// sizes must not be reported here — they may have looked at different times,
+/// and paging an operator for the system working is the failure this crate's
+/// witness handling is arranged around. What that silence is **not** is a
+/// verdict of agreement: two observers at different sizes may equally be on
+/// two forks, and telling those apart needs a consistency proof the log has to
+/// supply. That is the append-only check's job, held against every anchor —
+/// see `a_fork_is_caught_by_the_shorter_anchor_the_highest_would_have_hidden`.
+/// Equal size with equal roots is agreement.
 #[test]
 fn a_split_view_is_equal_sizes_with_unequal_roots_and_nothing_else() {
     use agentplane::core::Digest;

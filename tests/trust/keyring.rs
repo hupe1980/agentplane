@@ -495,7 +495,10 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
         "the case could not read its own bytes, so sealing broke the run"
     );
 
-    // Erase the case. Tombstones *and* the key.
+    // Erase the case: closed first, then tombstones *and* the key.
+    agentplane::case::CaseStore::close(store.as_ref(), case_id)
+        .await
+        .expect("close");
     let n = agentplane::blob::erase_case(
         Some(disk.as_ref()),
         store.as_ref(),
@@ -1047,6 +1050,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
     assert!(blobs.get(digest).await.is_ok());
 
     // ── One erasure ─────────────────────────────────────────────────────────
+    cases_plain.close(case).await.expect("close");
     agentplane::blob::erase_case(
         Some(&blobs),
         cases_plain.as_ref(),
@@ -1587,15 +1591,22 @@ mod sealed_push {
         .await
         .expect("raw put");
 
-        let moved = sealed
-            .get(task, "cfg-2")
-            .await
-            .expect("get")
-            .expect("present");
-        assert!(
-            moved.token.is_none(),
-            "a credential sealed for one registration opened on another"
-        );
+        // **Refused, loudly.** A credential that will not authenticate under
+        // its own registration's associated data is somebody having moved
+        // ciphertext, which is the one cause here that is neither an erasure
+        // nor an outage. Answering it by dropping the credential and handing
+        // back a deliverable registration would send the notification without
+        // the authentication it was registered with.
+        let moved = sealed.get(task, "cfg-2").await;
+        match moved {
+            Err(agentplane::core::StoreError::Backend(why)) => assert!(
+                why.contains("did not authenticate"),
+                "a lifted credential must name what happened: {why}"
+            ),
+            other => panic!(
+                "a credential sealed for one registration was accepted on another: {other:?}"
+            ),
+        }
         // And the original still opens, so the refusal above is the binding
         // working rather than the ring being broken.
         let original = sealed
@@ -1887,4 +1898,323 @@ async fn a_tasks_evidence_is_sealed_but_its_provenance_is_not() {
         opened.justification.evidence[0].label().trust,
         agentplane::core::Trust::Untrusted
     );
+}
+
+// ── One lenient open, three causes ──────────────────────────────────────────
+//
+// Every decorator in `keyring` leaves a payload sealed when it will not open,
+// so that a lawful erasure cannot make a queue, a listing or an audit
+// unreadable. `KeyError` names five causes for an open failing and argues, at
+// each variant, why collapsing it into *erased* sends somebody to the wrong
+// place. These hold the decorators to that vocabulary.
+
+/// A key ring that can be taken away and put back.
+#[derive(Debug)]
+struct FlakyRing {
+    inner: Arc<MemoryKeyRing>,
+    down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FlakyRing {
+    fn new() -> (Arc<Self>, Arc<std::sync::atomic::AtomicBool>) {
+        let down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            Arc::new(Self {
+                inner: Arc::new(MemoryKeyRing::default()),
+                down: Arc::clone(&down),
+            }),
+            down,
+        )
+    }
+
+    fn unavailable(&self) -> Result<(), KeyError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(KeyError::Unavailable("the KMS did not answer".into()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyRing for FlakyRing {
+    async fn data_key(
+        &self,
+        scope: &str,
+    ) -> Result<
+        (
+            agentplane::keyring::DataKey,
+            agentplane::keyring::WrappedKey,
+        ),
+        KeyError,
+    > {
+        self.unavailable()?;
+        self.inner.data_key(scope).await
+    }
+    async fn open(
+        &self,
+        w: &agentplane::keyring::WrappedKey,
+    ) -> Result<agentplane::keyring::DataKey, KeyError> {
+        self.unavailable()?;
+        self.inner.open(w).await
+    }
+    async fn destroy(
+        &self,
+        scope: &str,
+        at: agentplane::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), KeyError> {
+        self.inner.destroy(scope, at, reason).await
+    }
+}
+
+/// **A journal read during a key-ring outage is not a run that was erased.**
+///
+/// The two are one byte apart on the wire — a payload left sealed — and they
+/// call for opposite actions: an outage is *come back in a minute*, an erasure
+/// is *this is gone, in every copy, for good*. Reported as the same thing, an
+/// operator reads a discharged obligation where there is a KMS to restart, and
+/// an auditor reads a run whose evidence was destroyed while it is sitting
+/// intact in the store.
+///
+/// The blob path has always kept these apart
+/// (`a_key_ring_outage_is_not_reported_as_an_erasure`). The journal path is
+/// where an audit and a replay both read, and it did not.
+#[tokio::test]
+async fn a_journal_read_during_a_key_ring_outage_is_not_an_erasure() {
+    use agentplane::core::{Label, RunId, TenantId};
+    use agentplane::journal::{Append, JournalStore, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+
+    let (flaky, down) = FlakyRing::new();
+    let ring = flaky as Arc<dyn KeyRing>;
+    let raw: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let journal = SealedJournal::wrap(Arc::clone(&raw), Arc::clone(&ring), TenantId::default());
+
+    let run = RunId::generate();
+    let lease = journal
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    journal
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "intake".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "patient": "Ada Lovelace" }),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    match journal.read(run, 1).await {
+        Err(agentplane::core::StoreError::Backend(why)) => assert!(
+            why.contains("unavailable"),
+            "the read failed without naming the outage: {why}"
+        ),
+        Ok(records) => {
+            let sealed = match records[0].kind() {
+                RecordKind::RunAdmitted { input, .. } => payload::is_sealed(input),
+                _ => false,
+            };
+            panic!(
+                "a key-ring outage read back as an ordinary record (payload sealed: \
+                 {sealed}) — an operator cannot tell it from a completed erasure"
+            );
+        }
+        other => panic!("an unreachable ring must fail loudly: {other:?}"),
+    }
+
+    // And the ring coming back is all it takes.
+    down.store(false, std::sync::atomic::Ordering::SeqCst);
+    match journal.read(run, 1).await.expect("read")[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => {
+            assert_eq!(input["patient"], "Ada Lovelace", "the payload was intact");
+        }
+        other => panic!("unexpected record: {other:?}"),
+    }
+}
+
+/// **A credential that will not open is not silently dropped.**
+///
+/// The sharpest of the three, because the fallback is not an unreadable row
+/// but a *delivery*: `None` means the notification goes out without the
+/// authentication it was registered with. For an erased credential that is
+/// right — there is no header to send. For a ring that is briefly unreachable
+/// it is a transient fault downgrading an authenticated channel.
+#[cfg(all(feature = "push", feature = "redb"))]
+#[tokio::test]
+async fn a_push_credential_is_not_dropped_because_the_ring_is_down() {
+    use agentplane::core::Secret;
+    use agentplane::core::{RunId, TenantId};
+    use agentplane::push::{PushConfig, PushStore};
+
+    let (flaky, down) = FlakyRing::new();
+    let ring = flaky as Arc<dyn KeyRing>;
+    let raw: Arc<dyn PushStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let sealed = agentplane::keyring::SealedPush::wrap(Arc::clone(&raw), ring, TenantId::default());
+
+    let task = RunId::generate();
+    sealed
+        .put(
+            &PushConfig {
+                id: "cfg-1".to_owned(),
+                task,
+                url: "https://hooks.acme.example/a".to_owned(),
+                token: Some(Secret::new("opaque-a2a-token")),
+                authentication: None,
+            },
+            1,
+        )
+        .await
+        .expect("put");
+
+    down.store(true, std::sync::atomic::Ordering::SeqCst);
+    match sealed.get(task, "cfg-1").await {
+        Err(agentplane::core::StoreError::Backend(why)) => assert!(
+            why.contains("unavailable"),
+            "the read failed without naming the outage: {why}"
+        ),
+        Ok(Some(config)) => panic!(
+            "a registration came back during a key-ring outage with its token {} — \
+             the delivery would go out unauthenticated",
+            if config.token.is_some() {
+                "still sealed"
+            } else {
+                "dropped"
+            }
+        ),
+        other => panic!("an unreachable ring must fail loudly: {other:?}"),
+    }
+}
+
+/// **An erased run says so, and an operator can still close it.**
+///
+/// Destroying a case's key freezes every run it covers: their plans and effect
+/// outputs stop opening, so none of them can be replayed or unwound again.
+/// That state is reachable — a run bound to no case is erased by run, and a
+/// case closed with work still suspended is erased by window — so the question
+/// is not how to prevent it here but what an operator is holding when it
+/// happens.
+///
+/// Two properties, and the second is the one that makes this a control rather
+/// than a dead end. The refusal **names the erasure**: a sealed payload
+/// deserialises into *missing field `version`*, which sends somebody looking
+/// for a corrupt journal. And the run is still **concludable**: a decision is
+/// recorded in the clear, needs no plan, and abandonment is the ending that
+/// does not promise an unwind erased arguments make impossible.
+#[tokio::test]
+async fn an_erased_run_names_the_erasure_and_can_still_be_abandoned() {
+    use agentplane::core::{CorrelationKey, QuarantineDecision, TenantId, Timestamp};
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{Mode, RunStatus, Runtime};
+
+    let tenant = TenantId::default();
+    let ring = Arc::new(MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+
+    let crash = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
+        .keyring(Arc::clone(&ring))
+        .skill(Stalls {
+            crash: Arc::clone(&crash),
+        })
+        .build();
+
+    let cases = Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).expect("time");
+    let case = cases
+        .correlate_or_open("matter", &[CorrelationKey::new("matter", "M-1")], now)
+        .await
+        .expect("open case")
+        .case_id();
+    let run = rt
+        .run_in_case(
+            "demo.stalls",
+            agentplane::core::Tainted::trusted(serde_json::json!({})),
+            case,
+        )
+        .await
+        .expect("run")
+        .run_id;
+
+    // The matter is erased while the run is unfinished.
+    ring.destroy(
+        &agentplane::core::erasure_scope(&tenant, &case.to_string()),
+        now,
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("destroy");
+
+    crash.store(false, std::sync::atomic::Ordering::SeqCst);
+    match rt.replay(run, Mode::Resume).await {
+        Err(agentplane::core::RuntimeError::PayloadsErased { run: named }) => {
+            assert_eq!(named, run.to_string());
+        }
+        other => panic!(
+            "a resume of an erased run must name the erasure, not the shape of a \
+             sealed payload: {other:?}"
+        ),
+    }
+
+    // The door: a decision needs no plan, and abandonment is the ending that
+    // does not promise to put back what cannot be read.
+    rt.record_quarantine_decision(
+        run,
+        &agentplane::core::Operator::asserted("ops").expect("operator"),
+        "the matter was erased at the subject's request",
+        QuarantineDecision::Abandon,
+    )
+    .await
+    .expect("an erased run is answerable");
+
+    let closed = rt.replay(run, Mode::Resume).await.expect("the run closes");
+    assert!(
+        matches!(closed.status, RunStatus::Abandoned { .. }),
+        "an erased run must reach a conclusion an operator chose: {:?}",
+        closed.status
+    );
+}
+
+/// A skill that performs one effect and can be made to die after it.
+#[derive(Debug)]
+struct Stalls {
+    crash: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl agentplane::core::Skill for Stalls {
+    fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+        agentplane::core::SkillDescriptor::new("stalls").provides("demo.stalls")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut agentplane::runtime::StepCtx<'_>,
+        input: agentplane::core::Tainted<serde_json::Value>,
+    ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+        cx.sink(
+            agentplane::runtime::effects::Recorded::new("stage")
+                .payload(serde_json::json!({"amount": 100})),
+            &agentplane::core::Tainted::trusted(serde_json::json!({"amount": 100})),
+        )
+        .await
+        .map_err(agentplane::core::SkillError::Step)?;
+        if self.crash.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(agentplane::core::SkillError::Other("crash".into()));
+        }
+        Ok(agentplane::core::Outcome::done(input))
+    }
 }

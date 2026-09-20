@@ -1000,20 +1000,24 @@ struct ServeArgs {
 /// that a checkpoint *extends*, and cannot check who vouched for it.
 #[derive(Debug, Default, serde::Serialize)]
 struct Anchor {
-    /// The checkpoint itself, held for the caller and **not serialized**.
+    /// Every checkpoint obtained, held for the caller and **not serialized**.
     ///
-    /// The report already names it — `held_to` on an audit, the header
+    /// The report already names them — `held_to` on an audit, the header
     /// comparison on a verify — and one document carrying one checkpoint in
     /// two fields is two answers waiting to disagree. What this object adds is
-    /// the half the report cannot have: how the checkpoint was obtained.
-    #[serde(skip)]
-    checkpoint: Option<agentplane::journal::Checkpoint>,
-    /// Where it came from: a witness's monitoring prefix, or a file.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    obtained_from: Option<String>,
-    /// The witness keys whose cosignature over **this** checkpoint verified.
+    /// the half the report cannot have: how each was obtained.
     ///
-    /// Empty for a checkpoint read from a file: a file carries no signature
+    /// **All of them, not the highest.** The append-only check is run against
+    /// each one, because they are independent observations of the same log: an
+    /// operator that forks and feeds the fork to a fresh witness holds the
+    /// *longest* history anybody has, so keeping only the largest keeps
+    /// exactly the observation a fork is invisible from and drops the one it
+    /// is visible from.
+    #[serde(skip)]
+    checkpoints: Vec<agentplane::audit::Anchor>,
+    /// The witness keys whose cosignatures verified, by monitoring prefix.
+    ///
+    /// Absent for a checkpoint read from a file: a file carries no signature
     /// this command can check, so it is an asserted fact and saying nothing is
     /// how that is said.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -1136,24 +1140,25 @@ async fn anchor_from_witnesses(
                     cosigned.checkpoint.root.to_hex(),
                     cosigned.cosignatures.len(),
                 );
-                // The highest wins: the append-only check asks *since when*,
-                // so the later anchor is the stronger claim. The basis is
-                // taken from the same answer, never assembled separately —
-                // a basis describing a checkpoint other than the one used
-                // would be the laundering this records exist to prevent.
-                if anchor
-                    .checkpoint
-                    .as_ref()
-                    .is_none_or(|b| b.size < cosigned.checkpoint.size)
-                {
-                    anchor.checkpoint = Some(cosigned.checkpoint.clone());
-                    anchor.obtained_from = Some(format!("witness {prefix}"));
-                    anchor.cosigned_by = cosigned
+                // **Kept, not compared.** Every witness answer is an
+                // independent observation, and the audit is held to all of
+                // them: dropping the lower ones would drop the only
+                // observation a fork is visible from, since the history an
+                // equivocating operator feeds a fresh witness is the longest
+                // one anybody holds. The cosignature keys are taken from the
+                // same answer, never assembled separately — a basis describing
+                // a checkpoint other than the one used would be the laundering
+                // these records exist to prevent.
+                anchor.checkpoints.push(agentplane::audit::Anchor::new(
+                    cosigned.checkpoint.clone(),
+                    format!("witness {prefix}"),
+                ));
+                anchor.cosigned_by.extend(
+                    cosigned
                         .cosignatures
                         .iter()
-                        .map(|c| c.key_id.clone())
-                        .collect();
-                }
+                        .map(|c| format!("{prefix}:{}", c.key_id)),
+                );
                 held.push((prefix.clone(), cosigned.checkpoint));
             }
             // An answer, and one an auditor acts on: submission never reached
@@ -1232,27 +1237,25 @@ async fn audit_report(
     // named is not a conflict to resolve — a witness holding a size the
     // saved checkpoint has passed is ordinary, and the reverse is a
     // finding the check below produces on its own.
-    // A checkpoint read from a file wins only where no witness answered
-    // higher, and the basis moves with it: whichever checkpoint is used, the
-    // record says how *that* one was obtained. Reporting a witness's
-    // cosignatures beside a file's checkpoint would be the exact laundering
-    // this field exists to prevent.
+    // A checkpoint read from a file joins the witnesses' rather than competing
+    // with them. They are answers to the same question from different
+    // observers, and the audit is held to each: a saved checkpoint an earlier
+    // audit printed is exactly the observation that exposes a store which has
+    // since been rewritten, and dropping it because a witness answered higher
+    // would drop the evidence for the reason it is evidence.
     let mut anchor = fetched;
-    match (prior, anchor.checkpoint.as_ref()) {
-        (Some(saved), Some(found)) if found.size >= saved.size => {}
-        (Some(saved), _) => {
-            anchor.obtained_from = Some(match &audit.prior {
+    if let Some(saved) = prior {
+        anchor.checkpoints.push(agentplane::audit::Anchor::new(
+            saved,
+            match &audit.prior {
                 Some(path) => format!("file {path}"),
                 None => "file".to_owned(),
-            });
-            anchor.cosigned_by.clear();
-            anchor.checkpoint = Some(saved);
-        }
-        (None, _) => {}
+            },
+        ));
     }
 
     let evidence = agentplane::audit::Evidence {
-        prior: anchor.checkpoint.as_ref(),
+        anchors: &anchor.checkpoints,
         verifier: verifier
             .as_ref()
             .map(|v| v as &dyn agentplane::core::Verifier),
@@ -2537,32 +2540,29 @@ fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, String> {
             Anchor::default()
         }
     };
-    // The same rule `audit` applies, for the same reason: whichever checkpoint
-    // is used, the record says how *that* one was obtained.
+    // The same rule `audit` applies, for the same reason: the file is held to
+    // every observation the reader could obtain, and each says how it was
+    // obtained.
     let mut anchor = fetched;
-    match (saved, anchor.checkpoint.as_ref()) {
-        (Some(saved), Some(found)) if found.size >= saved.size => {}
-        (Some(saved), _) => {
-            anchor.obtained_from = Some(match &opts.checkpoint {
+    if let Some(saved) = saved {
+        anchor.checkpoints.push(agentplane::audit::Anchor::new(
+            saved,
+            match &opts.checkpoint {
                 Some(path) => format!("file {path}"),
                 None => "file".to_owned(),
-            });
-            anchor.cosigned_by.clear();
-            anchor.checkpoint = Some(saved);
-        }
-        (None, _) => {}
+            },
+        ));
     }
-    let expected = anchor.checkpoint.clone();
     let verifier = verifier
         .as_ref()
         .map(|v| v as &dyn agentplane::core::Verifier);
     let report = if opts.file == "-" {
-        agentplane::export::verify(std::io::stdin().lock(), verifier, expected.as_ref())
+        agentplane::export::verify(std::io::stdin().lock(), verifier, &anchor.checkpoints)
             .map_err(|e| e.to_string())
     } else {
         let file =
             std::fs::File::open(&opts.file).map_err(|e| format!("reading {}: {e}", opts.file))?;
-        agentplane::export::verify(std::io::BufReader::new(file), verifier, expected.as_ref())
+        agentplane::export::verify(std::io::BufReader::new(file), verifier, &anchor.checkpoints)
             .map_err(|e| e.to_string())
     }?;
     println!(

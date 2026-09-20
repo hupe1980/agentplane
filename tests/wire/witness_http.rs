@@ -1118,11 +1118,15 @@ async fn a_deleted_run_is_caught_by_the_anchor_a_witness_holds() {
         .await
         .expect("the witness answers")
         .expect("it cosigned this log");
+    let held = [agentplane::journal::Anchor::new(
+        anchor.checkpoint.clone(),
+        "witness under test",
+    )];
     let armed = agentplane::audit::audit(
         &journal,
         &survivors,
         &agentplane::audit::Evidence {
-            prior: Some(&anchor.checkpoint),
+            anchors: &held,
             ..Default::default()
         },
     )

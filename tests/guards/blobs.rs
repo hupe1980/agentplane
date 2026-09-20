@@ -414,6 +414,9 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
         .expect("correlate")
         .expect("a case");
     let tenant = TenantId::default();
+    // Closed first: erasing under a live run is refused, because destroying the
+    // key freezes every run the case covers.
+    cases.close(case).await.expect("close");
     let erased = erase_case(
         Some(blobs.as_ref()),
         store.as_ref(),
@@ -431,7 +434,15 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
         "the run's blob was not linked, so nothing was erased"
     );
 
-    // The same matter, the same work, the same bytes.
+    // **The same matter, reopened.** Erasing needs the case closed, so the
+    // scenario this guards is the one where somebody puts the matter back: the
+    // erasure scope is the case's, so reopening it points ordinary work at the
+    // scope whose bytes are gone. A new correlation would open a *new* case
+    // with a new scope, which is different work rather than a resurrection.
+    cases
+        .set_status(case, agentplane::core::CaseStatus::Open)
+        .await
+        .expect("reopen");
     let again = rt
         .run_correlated("records.file", Tainted::trusted(json!({})), "claim", &keys)
         .await
@@ -541,6 +552,7 @@ async fn erasing_a_case_leaves_other_cases_alone() {
         .await
         .expect("link");
 
+    cases.close(mine).await.expect("close");
     let n = erase_case(
         Some(blobs.as_ref()),
         cases.as_ref(),
@@ -1590,5 +1602,76 @@ async fn erasing_a_held_case_directly_is_refused_before_anything_is_destroyed() 
     assert!(
         held_blobs.get(kept).await.is_ok(),
         "a refused erasure still expired the matter's bytes"
+    );
+}
+
+/// **Erasing under a live matter is refused at the operation, not by whoever
+/// calls it.**
+///
+/// A retention pass selects closed cases only, and says why: erasing the data
+/// under a live run turns a pass into an outage. Stated only there, the rule
+/// held for exactly as long as nothing else called `erase_case` — and the
+/// Article 17 path does, naming a matter rather than a window. Destroying the
+/// key freezes every run the case covers: their plans stop opening, so none of
+/// them can be replayed or unwound again and the only ending left is one an
+/// operator has to reach for by hand.
+///
+/// The precondition-versus-invariant distinction, on the verb where getting it
+/// wrong is unrecoverable: nothing here puts bytes back.
+#[tokio::test]
+async fn erasing_a_case_that_is_still_open_is_refused() {
+    use agentplane::blob::{EraseError, erase_case};
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CaseStatus, CorrelationKey, TenantId};
+    use agentplane::store::RedbStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let cases: Arc<dyn CaseStore> = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+    let tenant = TenantId::default();
+
+    let case = cases
+        .correlate_or_open("claim", &[CorrelationKey::new("claim", "CLM-1")], ts(1))
+        .await
+        .expect("open")
+        .case_id();
+
+    match erase_case(
+        Some(blobs.as_ref()),
+        cases.as_ref(),
+        #[cfg(feature = "keyring")]
+        None,
+        &tenant,
+        case,
+        ts(500),
+        "art-17 request",
+    )
+    .await
+    {
+        Err(EraseError::CaseStillOpen { case: named, .. }) => {
+            assert_eq!(named, case.to_string());
+        }
+        other => panic!("an open matter was erased under its own live work: {other:?}"),
+    }
+
+    // Closed, and the same call goes through — the refusal is about the state
+    // of the matter, not a verb that stopped working.
+    cases.close(case).await.expect("close");
+    erase_case(
+        Some(blobs.as_ref()),
+        cases.as_ref(),
+        #[cfg(feature = "keyring")]
+        None,
+        &tenant,
+        case,
+        ts(500),
+        "art-17 request",
+    )
+    .await
+    .expect("a closed matter erases");
+
+    assert_eq!(
+        cases.case(case).await.expect("read").expect("case").status,
+        CaseStatus::Closed
     );
 }

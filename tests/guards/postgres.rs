@@ -2335,7 +2335,7 @@ async fn the_log_grew_from_the_one_restored(
     .await
     .expect("re-export");
     let verified =
-        agentplane::export::verify(std::io::Cursor::new(&again), None, None).expect("verify");
+        agentplane::export::verify(std::io::Cursor::new(&again), None, &[]).expect("verify");
     assert!(
         verified.is_sound(),
         "a restored store exported something that does not verify: {:#?}",

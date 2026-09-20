@@ -281,6 +281,17 @@ fn endings() -> Vec<RecordKind> {
             action: SweptAction::DeadlineBreached,
             detail: Some("the window closed unmet".into()),
         },
+        RecordKind::Observed {
+            session: "sess_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            reported: agentplane::core::ObservedStep::Decision {
+                call: "call_1".into(),
+                outcome: agentplane::core::ObservedDecision::Selected {
+                    option: "allow".into(),
+                    kind: "allow_once".into(),
+                },
+            },
+            detail: Some("write to src/main.rs".into()),
+        },
     ]
 }
 
@@ -709,7 +720,7 @@ fn a_frozen_export_still_verifies_offline() {
     let bytes = std::fs::read(&path).expect(
         "tests/golden/export.jsonl is missing — regenerate it with AGENTPLANE_BLESS_GOLDEN=1",
     );
-    let report = agentplane::export::verify(std::io::Cursor::new(&bytes), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(&bytes), None, &[])
         .expect("the file reads");
 
     assert!(
@@ -877,7 +888,7 @@ async fn an_export_names_the_operational_state_it_cannot_carry() {
         .expect("an empty export still writes a header and a trailer");
 
     let report =
-        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("the file reads");
+        agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("the file reads");
     let said = report.not_checked.join("\n");
     assert!(
         said.contains("webhook delivery cursors"),

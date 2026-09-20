@@ -83,18 +83,26 @@ impl SealedCases {
         format!("case-state:{}:{case}", self.tenant)
     }
 
-    async fn open_state(&self, case: CaseId, state: Value) -> Value {
+    /// One case's sealed state, back in the clear.
+    ///
+    /// # Errors
+    ///
+    /// Every key failure but an erasure. State sealed to a **destroyed** key
+    /// stays sealed — a completed erasure must leave the case listable,
+    /// countable and closable — and a ring that cannot be reached is an outage
+    /// whose answer is to come back, not a case that reads as erased.
+    async fn open_state(&self, case: CaseId, state: Value) -> Result<Value, StoreError> {
         let Some(envelope) = payload::unwrap(&state) else {
-            return state;
+            return Ok(state);
         };
         let aad = self.aad(case);
-        // Left sealed when it will not open. A destroyed key is a completed
-        // erasure, not an outage: the case must stay listable, countable and
-        // closable afterwards.
-        match super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await {
-            Ok(plain) => serde_json::from_slice(&plain).unwrap_or(state),
-            Err(_) => state,
-        }
+        let opened = super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(match opened {
+            Some(plain) => serde_json::from_slice(&plain).unwrap_or(state),
+            None => state,
+        })
     }
 
     /// Open one case's sealed state in place.
@@ -103,18 +111,22 @@ impl SealedCases {
     /// removes a case from a listing: a state sealed to a destroyed key reads
     /// as absent *state*, and the case itself is still a case. Writing this as
     /// an `Option` invited a caller to treat it as a filter, and one did.
-    async fn open_case(&self, mut case: Case) -> Case {
+    ///
+    /// # Errors
+    ///
+    /// As [`open_state`](Self::open_state).
+    async fn open_case(&self, mut case: Case) -> Result<Case, StoreError> {
         case.state = self
             .open_state(case.id, std::mem::take(&mut case.state))
-            .await;
-        case
+            .await?;
+        Ok(case)
     }
 
-    async fn opened(&self, case: Option<Case>) -> Option<Case> {
-        match case {
-            Some(case) => Some(self.open_case(case).await),
+    async fn opened(&self, case: Option<Case>) -> Result<Option<Case>, StoreError> {
+        Ok(match case {
+            Some(case) => Some(self.open_case(case).await?),
             None => None,
-        }
+        })
     }
 }
 
@@ -210,14 +222,14 @@ impl CaseStore for SealedCases {
 
     async fn case(&self, id: CaseId) -> Result<Option<Case>, StoreError> {
         let found = self.inner.case(id).await?;
-        Ok(self.opened(found).await)
+        self.opened(found).await
     }
 
     async fn by_status(&self, status: CaseStatus, limit: usize) -> Result<Vec<Case>, StoreError> {
         let cases = self.inner.by_status(status, limit).await?;
         let mut out = Vec::with_capacity(cases.len());
         for case in cases {
-            out.push(self.open_case(case).await);
+            out.push(self.open_case(case).await?);
         }
         Ok(out)
     }

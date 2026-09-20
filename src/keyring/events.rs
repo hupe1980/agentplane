@@ -109,21 +109,29 @@ impl SealedEvents {
         Ok(sealed)
     }
 
-    async fn opened(&self, mut event: InboundEvent) -> InboundEvent {
+    /// One buffered message's payload, back in the clear.
+    ///
+    /// # Errors
+    ///
+    /// Every key failure but an erasure. A message whose key was **destroyed**
+    /// stays sealed, because an erased message must not make the dead-letter
+    /// list unreadable — that list is how a wrong correlation key is found in
+    /// the first place. A ring that is merely unreachable is a different
+    /// answer and gets one.
+    async fn opened(&self, mut event: InboundEvent) -> Result<InboundEvent, StoreError> {
         let Some(envelope) = payload::unwrap(&event.payload) else {
-            return event;
+            return Ok(event);
         };
         let aad = Self::aad(&self.tenant, &event);
-        // Left sealed when it will not open: an erased message must not make
-        // the dead-letter list unreadable, since that list is how a wrong
-        // correlation key is found in the first place.
-        if let Ok(plain) =
-            super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await
+        if let Some(plain) =
+            super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))?
             && let Ok(value) = serde_json::from_slice(&plain)
         {
             event.payload = value;
         }
-        event
+        Ok(event)
     }
 
     /// Cryptographically erase one buffered message, then shed its ciphertext.
@@ -185,7 +193,7 @@ impl EventStore for SealedEvents {
         let claimed = self.inner.claim_for(sub, at).await?;
         Ok(match claimed {
             Some(mut buffered) => {
-                buffered.event = self.opened(buffered.event).await;
+                buffered.event = self.opened(buffered.event).await?;
                 Some(buffered)
             }
             None => None,
@@ -246,7 +254,7 @@ impl EventStore for SealedEvents {
         let letters = self.inner.dead_letters(limit).await?;
         let mut out = Vec::with_capacity(letters.len());
         for mut letter in letters {
-            letter.event = self.opened(letter.event).await;
+            letter.event = self.opened(letter.event).await?;
             out.push(letter);
         }
         Ok(out)

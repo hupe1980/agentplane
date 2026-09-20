@@ -1379,7 +1379,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "src/audit.rs",
         "an_audit_reports_what_it_could_not_look_at",
         "an audit that checked nothing reports itself as sound",
-        "    if evidence.prior.is_none() {",
+        "    if evidence.anchors.is_empty() {",
         "    if false {",
     ),
     "AnOpenRunAuditsAsDeleted": (
@@ -1432,9 +1432,9 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     "TheAuditIgnoresThePriorCheckpoint": (
         "src/audit.rs",
         "only_an_outside_checkpoint_detects_a_deletion",
-        "an audit ignores the checkpoint the auditor brought, so deletion goes unseen",
-        "    if let Some(prior) = evidence.prior {",
-        "    if let Some(prior) = None::<&Checkpoint> {",
+        "an audit ignores the checkpoints the auditor brought, so deletion goes unseen",
+        "    for anchor in evidence.anchors {",
+        "    for anchor in std::iter::empty::<&Anchor>() {",
     ),
     "TheTreeIndexIsTheStoredIndex": (
         "src/store/redb.rs",
@@ -6369,7 +6369,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "an editor who drops a run and rewrites the header produces a file "
         "that verifies clean — the same 'it agrees with itself' the record "
         "rehash exists to refuse, one level up",
-        """        if header_seen && *given != report.checkpoint {""",
+        """        if given.origin != report.checkpoint.origin || given.size > report.checkpoint.size {""",
         """        if false {""",
     ),
     "AnIncoherentCheckpointIsRemembered": (
@@ -6512,6 +6512,16 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         """    if open_runs > 0 {""",
         """    if false {""",
     ),
+    "AnAuditKeepsOnlyTheHighestAnchor": (
+        "src/audit.rs",
+        "a_fork_is_caught_by_the_shorter_anchor_the_highest_would_have_hidden",
+        "the append-only check runs against the tallest checkpoint the auditor "
+        "brought instead of against each one, so an operator who forks and has "
+        "a fresh witness cosign the fork is audited against the fork — the "
+        "shorter, honest observation being exactly the one dropped",
+        "    for anchor in evidence.anchors {",
+        "    for anchor in evidence.anchors.iter().max_by_key(|a| a.checkpoint.size) {",
+    ),
     "AnAuditDoesNotNameItsAnchor": (
         "src/audit.rs",
         "an_audit_names_the_checkpoint_it_was_held_to",
@@ -6520,8 +6530,8 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "indistinguishable from a clean verdict that compared the store with "
         "itself — to a SIEM, a ticket attachment and a compliance reviewer "
         "alike, which are the three readers of this JSON",
-        """        held_to: evidence.prior.cloned(),""",
-        """        held_to: None,""",
+        """        held_to: evidence.anchors.to_vec(),""",
+        """        held_to: Vec::new(),""",
     ),
     "AConcludedRunCountsAsInFlight": (
         "src/export.rs",
@@ -6997,6 +7007,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
                 | Self::Abandoned { .. }
                 | Self::Swept
                 | Self::BrokeGlass { .. }
+                | Self::Observed
         )""",
         """        matches!(
             self,
@@ -8679,6 +8690,149 @@ pub struct WrappedKey {""",
     "succeeded",
     "cancelled",
     "abandoned",""",
+    ),
+    # ── The asserted rung ───────────────────────────────────────────────────
+    #
+    # A seat beside somebody else's agent records that agent's account of
+    # itself. Every bug here has the same shape: a report acquires the standing
+    # of something this runtime dispatched.
+    "AnObservationSealsAsThisPlanesWork": (
+        "src/observe/mod.rs",
+        "an_acp_session_is_recorded_audited_and_never_reads_as_an_effect",
+        "an observed session is sealed under `succeeded`, so a session this "
+        "plane only watched is indistinguishable in the outcome index from work "
+        "it ran, governed and authorized",
+        """                outcome: crate::runtime::OBSERVED_OUTCOME.to_owned(),""",
+        """                outcome: "succeeded".to_owned(),""",
+    ),
+    "AnObservationWearsAnOrdinaryRecordKind": (
+        "src/observe/mod.rs",
+        "an_acp_session_is_recorded_audited_and_never_reads_as_an_effect",
+        "an observed step is written as an ordinary note, so the rung is lost "
+        "and a reader cannot tell what this runtime dispatched from what "
+        "somebody else's agent said it did",
+        """            RecordKind::Observed {
+                session: self.id.clone(),
+                reported: step,
+                // Labelled here, from the one source it can have had.
+                detail: detail.map(|d| Tainted::from_source(d, self.source()).peek().clone()),
+            },""",
+        """            RecordKind::Note {
+                text: format!("{}: {:?}", self.id, step),
+            },""",
+    ),
+    "AnObservedRecordEscapesItsCase": (
+        "src/observe/mod.rs",
+        "an_observed_session_is_reachable_through_the_case_it_names",
+        "an observed session's records are written without the case stamp, so "
+        "the matter correlated on the session id walks past the very records it "
+        "was opened to make findable",
+        """        if let Some(case) = self.case {
+            entry = entry.case(case);
+        }""",
+        """        let _ = self.case;""",
+    ),
+    "AnUnknownToolStatusReadsAsFinished": (
+        "src/observe/acp.rs",
+        "an_unfamiliar_tool_status_claims_the_least",
+        "a tool-call status this build does not recognise is recorded as "
+        "`completed`, so a word from a newer revision puts a claim on the record "
+        "that the observed agent never made",
+        """        _ => ObservedStatus::Pending,""",
+        """        _ => ObservedStatus::Completed,""",
+    ),
+    "APresentationUpdateIsRecordedAsATurn": (
+        "src/observe/acp.rs",
+        "a_presentation_update_is_reported_rather_than_dropped",
+        "every update this plane does not map is recorded as a user turn, so a "
+        "streamed thought chunk enters the evidence log as something a person "
+        "asked for",
+        """        _ => unrecorded(),
+    }
+}""",
+        """        _ => Mapped::Step {
+            step: ObservedStep::Prompted,
+            detail: update.title.clone(),
+        },
+    }
+}""",
+    ),
+
+    # ── Erasure, and the three causes it is confused with ───────────────────
+    "AnOutageReadsAsAnErasure": (
+        "src/keyring/journal.rs",
+        "a_journal_read_during_a_key_ring_outage_is_not_an_erasure",
+        "the journal's sealed read swallows every key failure, so a KMS that is "
+        "briefly unreachable reads back exactly like a run whose data was "
+        "lawfully destroyed",
+        """                        if let Some(plain) = super::envelope::open_or_erased(
+                            self.keys.as_ref(),
+                            aad.as_bytes(),
+                            &envelope,
+                        )
+                        .await
+                        .map_err(|e| StoreError::Backend(e.to_string()))?
+                        {
+                            *field = serde_json::from_slice(&plain)?;
+                            changed = true;
+                        }""",
+        """                        if let Ok(plain) =
+                            super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope)
+                                .await
+                        {
+                            *field = serde_json::from_slice(&plain)?;
+                            changed = true;
+                        }""",
+    ),
+    "APushCredentialIsDroppedOnAnyFailure": (
+        "src/keyring/push.rs",
+        "a_push_credential_is_not_dropped_because_the_ring_is_down",
+        "a credential that will not open is dropped whatever the cause, so a key "
+        "ring that is down sends the notification without the authentication it "
+        "was registered with",
+        """        let opened = super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
+            .await
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(opened""",
+        """        let opened = super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope)
+            .await
+            .ok();
+        Ok(opened""",
+    ),
+    "AnErasedRunFailsAsAMalformedRecord": (
+        "src/runtime/executor.rs",
+        "an_erased_run_names_the_erasure_and_can_still_be_abandoned",
+        "a resume of a run whose payloads were erased falls through to the "
+        "parser, which reports a missing field — sending an operator to look for "
+        "a corrupt journal instead of telling them the data is gone",
+        """    if sealed_payload(&frozen) {
+        return Err(RuntimeError::PayloadsErased {
+            run: run.to_string(),
+        });
+    }""",
+        """    if false {
+        return Err(RuntimeError::PayloadsErased {
+            run: run.to_string(),
+        });
+    }""",
+    ),
+    "AnErasureRunsUnderLiveWork": (
+        "src/blob/mod.rs",
+        "erasing_a_case_that_is_still_open_is_refused",
+        "the rule that a matter must be closed before it is erased lives in the "
+        "retention pass's selection only, so the Article 17 path destroys the key "
+        "under runs that can then never be replayed or unwound",
+        """    if let Some(open) = cases
+        .case(case)
+        .await?
+        .filter(|c| c.status != crate::core::CaseStatus::Closed)
+    {
+        return Err(EraseError::CaseStillOpen {
+            case: case.to_string(),
+            status: format!("{:?}", open.status).to_lowercase(),
+        });
+    }""",
+        """    let _ = cases.case(case).await?;""",
     ),
 }
 

@@ -212,15 +212,23 @@ against a store it did not write, taking inputs the auditor holds:
 |---|---|
 | nothing | Is each run's chain internally consistent? |
 | a public key | Who wrote each record? |
-| a **prior checkpoint** | Has anything been *removed* since it was issued? |
+| **checkpoints from outside** | Has anything been *removed* since they were issued? |
 
-Only the third detects deletion, and only because the checkpoint came from
+Only the third detects deletion, and only because the checkpoints came from
 outside. The test that makes this concrete audits a store somebody deleted a run
-from **twice**: with no prior checkpoint it comes back clean — honestly, because
-there is nothing to compare against — and with one it fails. A second test does
-the same thing with the checkpoint fetched from a witness rather than saved
-earlier, which is the version an auditor can run without the operator's
-cooperation.
+from **twice**: with no anchor it comes back clean — honestly, because there is
+nothing to compare against — and with one it fails. A second test does the same
+thing with the checkpoint fetched from a witness rather than saved earlier,
+which is the version an auditor can run without the operator's cooperation.
+
+**Bring every checkpoint you can get, and the audit holds the store to each.**
+They are independent observations, so reducing them to the strongest is the one
+thing that must not happen: an operator who forks a log and has a fresh witness
+cosign the fork ends up holding the *longest* history anybody has, and the
+honest observer's shorter checkpoint is the only evidence of the divergence. A
+finding names which anchor the store failed to extend, because that observer
+holds the history it no longer has. Audit with one anchor and `not_checked`
+says what is still unknown.
 
 That asymmetry is why `AuditReport` carries `not_checked` as prominently as
 `findings`, and why `assert_complete` fails on a skipped check as well as a

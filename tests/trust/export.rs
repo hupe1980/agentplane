@@ -95,7 +95,7 @@ async fn an_open_runs_tail_is_reported_as_unpinned() {
         .await
         .expect("export");
     let report =
-        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("the file reads");
+        agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("the file reads");
     assert!(
         report.findings.is_empty(),
         "an open run is a state, not a defect: {:?}",
@@ -118,8 +118,8 @@ async fn an_open_runs_tail_is_reported_as_unpinned() {
     agentplane::export::to_jsonl(&sealed_store, None, &[sealed], &mut done)
         .await
         .expect("export");
-    let clean = agentplane::export::verify(std::io::Cursor::new(&done), None, None)
-        .expect("the file reads");
+    let clean =
+        agentplane::export::verify(std::io::Cursor::new(&done), None, &[]).expect("the file reads");
     assert!(
         !clean.not_checked.iter().any(|n| n.contains("open run(s)")),
         "a wholly sealed export reported open runs: {:?}",
@@ -165,7 +165,7 @@ async fn a_framing_member_this_build_does_not_know_bounds_the_verdict() {
     );
 
     let report =
-        agentplane::export::verify(std::io::Cursor::new(file.join("\n").as_bytes()), None, None)
+        agentplane::export::verify(std::io::Cursor::new(file.join("\n").as_bytes()), None, &[])
             .expect("the file reads");
 
     assert!(
@@ -274,7 +274,7 @@ async fn a_record_from_a_newer_build_is_not_reported_as_tampering() {
         .map(|l| serde_json::to_string(l).expect("serialises"))
         .collect::<Vec<_>>()
         .join("\n");
-    let report = agentplane::export::verify(std::io::Cursor::new(file.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(file.as_bytes()), None, &[])
         .expect("the file reads");
 
     let said = report.findings.join("\n");
@@ -553,8 +553,7 @@ async fn a_faithful_export_verifies_from_the_file_alone() {
         .await
         .expect("export");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("verify");
     assert!(
         report.is_sound(),
         "a faithful export did not verify: {:#?}",
@@ -631,7 +630,7 @@ async fn a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root() {
         "the fixture did not actually remove the run"
     );
 
-    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         !report.is_sound(),
@@ -693,7 +692,7 @@ async fn an_edited_record_fails_to_recompute() {
          that checks no hashes at all"
     );
 
-    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         !report.is_sound(),
@@ -735,7 +734,7 @@ async fn tampered_wire_bytes_are_caught_even_when_the_readable_body_is_pristine(
         "the fixture edited nothing, so this test would pass against any verifier"
     );
 
-    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         !report.is_sound(),
@@ -773,7 +772,7 @@ async fn an_edited_display_body_is_a_finding_though_every_hash_verifies() {
     let text = original.replace("\"n\":1", "\"n\":9");
     assert_ne!(original, text, "the fixture edited nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("wire bytes")),
@@ -1043,7 +1042,7 @@ async fn a_restored_store_rebuilds_the_same_checkpoint() {
         .await
         .expect("re-export");
     let verified =
-        agentplane::export::verify(std::io::Cursor::new(&again), None, None).expect("verify");
+        agentplane::export::verify(std::io::Cursor::new(&again), None, &[]).expect("verify");
     assert!(
         verified.is_sound(),
         "a restored store exported something that does not verify: {:#?}",
@@ -1189,7 +1188,7 @@ async fn an_export_of_a_foreign_format_version_is_named_not_guessed_at() {
          that never looks at the version"
     );
 
-    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("format version")),
@@ -1252,9 +1251,8 @@ async fn a_relabelled_run_block_is_caught_by_its_own_records() {
          verifier that never compares the block to its records"
     );
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(relabelled.as_bytes()), None, None)
-            .expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(relabelled.as_bytes()), None, &[])
+        .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("belongs to run")),
         "a run block wearing another run's records verified clean: {:#?}",
@@ -1319,7 +1317,7 @@ async fn a_duplicated_log_position_is_named_rather_than_left_as_a_root_mismatch(
          that never reads the positions"
     );
 
-    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("log positions")),
@@ -1474,8 +1472,7 @@ async fn a_run_sealed_after_the_checkpoint_exports_as_still_open() {
         .await
         .expect("export");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("verify");
     assert!(
         report.is_sound(),
         "an export racing a concurrent seal reported tampering where there was \
@@ -1552,7 +1549,7 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
     // The untouched export lists the open run sound — the positive half, so
     // the assertion below is about the edit rather than about open runs.
     let clean =
-        agentplane::export::verify(std::io::Cursor::new(&bytes), None, None).expect("verify");
+        agentplane::export::verify(std::io::Cursor::new(&bytes), None, &[]).expect("verify");
     assert!(
         clean.sound.contains(&out.run_id),
         "an untouched open run did not verify: {:#?}",
@@ -1567,7 +1564,7 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
         .replace("\"n\":1", "\"n\":9");
     assert_ne!(original, edited, "the fixture edited nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         report
@@ -1642,7 +1639,7 @@ async fn the_case_layer_survives_export_and_restore() {
 
     // The file alone: sound, and the two halves cover each other.
     let verified =
-        agentplane::export::verify(std::io::Cursor::new(&bytes), None, None).expect("verify");
+        agentplane::export::verify(std::io::Cursor::new(&bytes), None, &[]).expect("verify");
     assert!(
         verified.is_sound(),
         "the export does not verify: {:#?}",
@@ -1743,7 +1740,7 @@ async fn a_dropped_case_layer_is_a_finding_not_a_quiet_file() {
         });
     assert_ne!(text, dropped, "the fixture removed nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(dropped.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(dropped.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         report
@@ -1811,7 +1808,7 @@ async fn a_sealed_journals_export_carries_no_plaintext() {
          is measuring the fixture"
     );
 
-    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         report.is_sound(),
@@ -1871,7 +1868,7 @@ async fn a_deleted_tail_record_fails_the_trailer_accounting() {
     let (_, text) = open_run_export().await;
 
     // The positive half first: the untouched file verifies.
-    let clean = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, None)
+    let clean = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, &[])
         .expect("verify");
     assert!(clean.is_sound(), "{:#?}", clean.findings);
 
@@ -1892,7 +1889,7 @@ async fn a_deleted_tail_record_fails_the_trailer_accounting() {
         .join("\n");
     assert_ne!(cut, text, "the fixture removed nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(cut.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(cut.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         !report.is_sound(),
@@ -1928,7 +1925,7 @@ async fn a_run_block_with_no_records_is_never_sound() {
         .join("\n");
     assert_ne!(stripped, text, "the fixture removed nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(stripped.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(stripped.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         !report.sound.contains(&run),
@@ -1984,8 +1981,7 @@ async fn a_declared_unreadable_run_is_unchecked_not_a_tamper_finding() {
         .await
         .expect("export");
 
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("verify");
     assert!(
         report.is_sound(),
         "an honestly-declared unreadable run was reported as tampering — an \
@@ -2051,7 +2047,7 @@ async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
         .join("\n");
     assert_ne!(foreign, text, "the fixture edited nothing");
 
-    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None, None)
+    let report = agentplane::export::verify(std::io::Cursor::new(foreign.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         report.is_sound(),
@@ -2075,7 +2071,7 @@ async fn a_foreign_canon_rule_is_narrowed_coverage_not_a_finding() {
         .replace("\\\"n\\\":1", "\\\"n\\\":9")
         .replace("\"n\":1", "\"n\":9");
     assert_ne!(edited, foreign, "the fixture edited nothing");
-    let caught = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+    let caught = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         caught
@@ -2146,8 +2142,7 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
     agentplane::export::to_jsonl(&store, None, &[run], &mut out)
         .await
         .expect("export");
-    let report =
-        agentplane::export::verify(std::io::Cursor::new(&out), None, None).expect("verify");
+    let report = agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("verify");
     assert!(
         report.findings.iter().any(|f| f.contains("chain head")),
         "a conclusion drawn over a different history verified offline — the \
@@ -2166,7 +2161,7 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
         .await
         .expect("export");
     let clean =
-        agentplane::export::verify(std::io::Cursor::new(&honest), None, None).expect("verify");
+        agentplane::export::verify(std::io::Cursor::new(&honest), None, &[]).expect("verify");
     assert!(
         !clean.findings.iter().any(|f| f.contains("chain head")),
         "an honest sealing record was flagged: {:#?}",
@@ -2322,7 +2317,7 @@ async fn an_export_with_a_rewritten_header_needs_an_outside_checkpoint() {
 
     // Without an outside checkpoint the file is internally perfect, and the
     // report must not call that sound-with-nothing-to-say.
-    let blind = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, None)
+    let blind = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &[])
         .expect("verify");
     assert!(
         blind.findings.is_empty(),
@@ -2339,12 +2334,13 @@ async fn an_export_with_a_rewritten_header_needs_an_outside_checkpoint() {
 
     // With the checkpoint an auditor was actually given, the deletion is a
     // finding — and it names the discrepancy rather than only the root.
-    let checked = agentplane::export::verify(
-        std::io::Cursor::new(edited.as_bytes()),
-        None,
-        Some(&genuine),
-    )
-    .expect("verify");
+    let anchors = [agentplane::journal::Anchor::new(
+        genuine.clone(),
+        "file auditor-held.json",
+    )];
+    let checked =
+        agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &anchors)
+            .expect("verify");
     assert!(
         !checked.is_sound(),
         "a run was deleted and the header rewritten to match, and the pass holding the \
@@ -2370,9 +2366,8 @@ async fn an_export_with_a_rewritten_header_needs_an_outside_checkpoint() {
 
     // And the honest file, against the real checkpoint, still passes — or this
     // is a verifier that refuses everything.
-    let honest =
-        agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, Some(&genuine))
-            .expect("verify");
+    let honest = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, &anchors)
+        .expect("verify");
     assert!(
         honest.is_sound(),
         "the unedited export failed against its own genuine checkpoint: {honest:#?}"

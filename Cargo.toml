@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.42.0"
+version      = "0.43.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -115,6 +115,11 @@ witness-http = ["dep:reqwest", "signing"]
 # A2A transport: the JSON-RPC client. See `mcp` for why this is a wire and not
 # the seam.
 a2a = ["dep:reqwest"]
+# Mapping the Agent Client Protocol's session updates onto observation records.
+# Types only, and no dependency on the protocol's own crate: the connection
+# belongs to the editor that already holds the session, and `observe::acp` says
+# why the types are written against a named revision instead.
+acp = []
 # Serve this plane as an A2A agent. `push` is not optional: A2A 1.0 defines
 # push notification configs as part of the protocol.
 a2a-server = ["http", "manifest", "push", "dep:async-stream"]

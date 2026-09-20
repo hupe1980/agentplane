@@ -129,6 +129,28 @@ pub enum EraseError {
         reason: String,
     },
 
+    /// The matter is still open, so **nothing was destroyed**.
+    ///
+    /// The second refusal, and it protects the plane rather than the data
+    /// subject. Destroying a key freezes the runs it covers: their plans and
+    /// effect outputs stop opening, so none of them can be replayed, resumed
+    /// or unwound again — and a run left mid-flight by an erasure is one an
+    /// operator can only abandon. Erasing under live work is therefore a
+    /// decision about the *work*, and it is the operator's to make
+    /// deliberately: conclude the runs, then erase.
+    ///
+    /// The rule is not new; where it lived was the defect. A retention pass
+    /// selects closed cases only and says why, and everything else about
+    /// erasure ran on the honour system of that one caller
+    /// — including the path an Article 17 request actually takes, which names
+    /// a matter rather than a window.
+    #[error(
+        "case {case} is {status} rather than closed, so nothing was erased: erasing the \
+         data under a live run leaves work that can no longer be replayed or unwound. \
+         Conclude the case's runs and close it, then erase"
+    )]
+    CaseStillOpen { case: String, status: String },
+
     /// A tombstone could not be written.
     #[error(transparent)]
     Blob(#[from] BlobError),
@@ -338,6 +360,21 @@ pub async fn erase_case(
             case: case.to_string(),
             placed_at: hold.placed_at.to_string(),
             reason: hold.reason,
+        });
+    }
+
+    // **Checked here rather than by whoever calls this.** A retention pass
+    // already selects closed cases and documents why; stated only there, it
+    // held for exactly as long as nothing else called this function — and the
+    // Article 17 path does, naming a matter rather than a window.
+    if let Some(open) = cases
+        .case(case)
+        .await?
+        .filter(|c| c.status != crate::core::CaseStatus::Closed)
+    {
+        return Err(EraseError::CaseStillOpen {
+            case: case.to_string(),
+            status: format!("{:?}", open.status).to_lowercase(),
         });
     }
 

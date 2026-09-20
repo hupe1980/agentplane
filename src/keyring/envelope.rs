@@ -201,6 +201,40 @@ pub(super) async fn open(
         .map_err(|_| KeyError::Refused("the sealed payload did not authenticate".to_owned()))
 }
 
+/// Open an envelope, distinguishing a completed erasure from every other
+/// failure.
+///
+/// **`Ok(None)` means the key was destroyed, and nothing else does.** Every
+/// decorator in this module leaves a payload sealed when it will not open, so
+/// that a lawful erasure cannot make a queue, a listing or an audit
+/// unreadable. That leniency is correct for exactly one cause and wrong for
+/// all the others: a key service that is briefly unreachable, a wrapping-key
+/// version retired by policy, an envelope written by a newer build, and a
+/// payload that does not authenticate are each *recoverable or serious*, and
+/// each was reported to an operator as **erased** for as long as the open was
+/// written `if let Ok(..)`.
+///
+/// [`KeyError`] exists to keep those apart — every variant's documentation
+/// argues why collapsing it into [`Destroyed`](KeyError::Destroyed) sends
+/// somebody to the wrong place — so the collapse is undone here, once, rather
+/// than in each decorator where the next one would forget it.
+///
+/// # Errors
+///
+/// Every failure that is not a destroyed key, unchanged, so the caller reports
+/// what the ring actually said.
+pub(super) async fn open_or_erased(
+    keys: &dyn KeyRing,
+    aad: &[u8],
+    envelope: &[u8],
+) -> Result<Option<Vec<u8>>, KeyError> {
+    match open(keys, aad, envelope).await {
+        Ok(plain) => Ok(Some(plain)),
+        Err(KeyError::Destroyed { .. }) => Ok(None),
+        Err(other) => Err(other),
+    }
+}
+
 #[cfg(all(test, feature = "testkit"))]
 mod format_tests {
     use super::*;

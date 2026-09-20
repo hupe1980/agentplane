@@ -406,6 +406,11 @@ impl std::fmt::Display for RunFailure {
             RunStatus::Exhausted(limit) => write!(f, "a budget stopped it — {limit}"),
             RunStatus::Quarantined(reason) => write!(f, "it is quarantined — {reason}"),
             RunStatus::Replanning(reason) => write!(f, "it asked to replan — {reason}"),
+            RunStatus::Observed => write!(
+                f,
+                "it is a session this plane observed rather than executed, so it \
+                 neither succeeded nor failed"
+            ),
             RunStatus::Cancelled { actor, reason } => {
                 write!(f, "{actor} cancelled it — {reason}")
             }
@@ -520,6 +525,26 @@ pub enum RunStatus {
         subject: String,
         reason: String,
     },
+    /// A session this plane **observed** rather than executed, closed.
+    ///
+    /// The one status that is not about work this runtime did. A seat beside
+    /// somebody else's agent produces records at the *asserted* rung
+    /// ([`RecordKind::Observed`](crate::journal::RecordKind::Observed)), in a
+    /// run of their own with no admission — the shape a sweep's run already
+    /// takes — so that they share the chain, the Merkle log and the witness
+    /// while sharing no record kind with a dispatched effect.
+    ///
+    /// **It carries nothing, and the absence is the design.** There is no
+    /// reason to give: the session ended because the party running it ended
+    /// it, and this plane is in no position to say why. The session's own
+    /// identifier is on every observation record rather than here, so a plane
+    /// that stopped mid-session still leaves evidence that says which session
+    /// it describes.
+    ///
+    /// Sealed like any other ending, so an external verifier checks it without
+    /// being taught what an observation is. Never resumable: there is nothing
+    /// to resume onto, because nothing here was executing.
+    Observed,
 }
 
 impl RunStatus {
@@ -542,7 +567,10 @@ impl RunStatus {
     pub fn reason(&self) -> Option<std::borrow::Cow<'_, str>> {
         use std::borrow::Cow;
         match self {
-            Self::Succeeded | Self::Swept => None,
+            // Nothing to say, for three different reasons and one answer: a
+            // success has no why, a sweep's records carry theirs, and an
+            // observed session ended because somebody else ended it.
+            Self::Succeeded | Self::Swept | Self::Observed => None,
             Self::Failed(reason)
             | Self::Quarantined(reason)
             | Self::Replanning(reason)
@@ -597,6 +625,9 @@ impl RunStatus {
             | Self::Withheld { .. }
             | Self::Succeeded
             | Self::Swept
+            // The account is the observation records themselves, and this plane
+            // has none of its own to add: it did not run the session.
+            | Self::Observed
             | Self::Suspended(_)
             | Self::Exhausted(_) => None,
         }
@@ -629,6 +660,7 @@ impl RunStatus {
             Self::Swept => super::sweeper::SWEEP_OUTCOME,
             Self::BrokeGlass { .. } => BREAK_GLASS_OUTCOME,
             Self::Withheld { .. } => WITHHELD_OUTCOME,
+            Self::Observed => OBSERVED_OUTCOME,
         }
     }
 
@@ -655,7 +687,11 @@ impl RunStatus {
             | Self::Quarantined(_)
             | Self::Replanning(_)
             | Self::Withheld { .. }
-            | Self::Swept => None,
+            | Self::Swept
+            // Somebody was at the keyboard, and it was not this plane's
+            // operator. Naming the observed party's user here would report a
+            // person this runtime never authenticated as one of its own.
+            | Self::Observed => None,
         }
     }
 
@@ -700,6 +736,7 @@ impl RunStatus {
                 | Self::Abandoned { .. }
                 | Self::Swept
                 | Self::BrokeGlass { .. }
+                | Self::Observed
         )
     }
 }
@@ -727,6 +764,7 @@ pub const SEALED_OUTCOMES: &[&str] = &[
     "abandoned",
     super::sweeper::SWEEP_OUTCOME,
     BREAK_GLASS_OUTCOME,
+    OBSERVED_OUTCOME,
 ];
 
 /// What an offline verb sweeps when the operator names no outcome.
@@ -751,6 +789,7 @@ pub const OUTCOMES_OF_RECORD: &[&str] = &[
     "quarantined",
     super::sweeper::SWEEP_OUTCOME,
     BREAK_GLASS_OUTCOME,
+    OBSERVED_OUTCOME,
 ];
 
 /// A run that exists but has not run.
@@ -1632,7 +1671,14 @@ impl Runtime {
             )));
         }
         let status = recorded_conclusion(&records);
-        if status.as_deref() != Some("quarantined") {
+        // A run whose payloads were erased is asking the same question a
+        // quarantine asks — *the runtime cannot go on, and a person must
+        // decide* — so it is answered by the same verb whatever outcome it was
+        // left under. Without this it has no verb at all: it cannot be
+        // resumed, and a cancellation promises an unwind that erased arguments
+        // make impossible. Abandonment is the honest ending and this is the
+        // door to it.
+        if status.as_deref() != Some("quarantined") && !payloads_erased(&records) {
             return Err(RuntimeError::NotQuarantined {
                 run: run.to_string(),
                 status: status.unwrap_or_else(|| "still running".to_owned()),
@@ -4144,23 +4190,6 @@ impl Runtime {
             return Ok(outcome);
         }
 
-        let input = records.iter().find_map(recorded_input).ok_or_else(|| {
-            RuntimeError::PlanContract("journal has no RunAdmitted record".into())
-        })?;
-
-        // The plan is read back from history rather than recompiled. Recompiling
-        // could produce a different graph — a changed manifest, a different
-        // router — and replay would then verify a run against a plan that never
-        // governed it.
-        let plan: PlanIR = records
-            .iter()
-            .find_map(|r| match r.kind() {
-                RecordKind::PlanFrozen { plan, .. } => Some(plan.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| RuntimeError::PlanContract("journal has no PlanFrozen record".into()))
-            .and_then(|v| serde_json::from_value(v).map_err(RuntimeError::Encoding))?;
-
         if mode == Mode::Resume
             && let Some(outcome) = self
                 .closed_resume_outcome(run, &records, lease.expect("resume holds a lease"))
@@ -4184,6 +4213,18 @@ impl Runtime {
         if mode == Mode::Resume {
             refuse_resume_over_undone_work(run, &records)?;
         }
+
+        // **Read after the conclusions above, and that ordering is the rule.**
+        // A plan is what a run needs to *execute*; concluding one needs no
+        // plan, and a cancellation and an abandonment are recorded in the
+        // clear. Reading here rather than at the top of this function is what
+        // leaves an operator a verb when the plan can no longer be read at all
+        // — which is an ordinary state, because erasing a case's key erases
+        // the plan of every run in it.
+        let input = records.iter().find_map(recorded_input).ok_or_else(|| {
+            RuntimeError::PlanContract("journal has no RunAdmitted record".into())
+        })?;
+        let plan = frozen_plan(run, &records)?;
 
         // Resume can dispatch new effects after it reaches the end of history.
         // They must be judged by the same complete bundle recorded at
@@ -6199,6 +6240,10 @@ fn severity(status: &RunStatus) -> u8 {
         | RunStatus::Suspended(_)
         | RunStatus::Succeeded
         | RunStatus::Swept
+        // Unreachable for the same reason, and named rather than left to a
+        // wildcard: an observed session has no steps of this plane's to
+        // compete, because this plane ran none of it.
+        | RunStatus::Observed
         | RunStatus::BrokeGlass { .. } => 0,
     }
 }
@@ -7399,6 +7444,11 @@ fn recorded_status(
             |(subject, reason)| RunStatus::Withheld { subject, reason },
         ),
         super::sweeper::SWEEP_OUTCOME => RunStatus::Swept,
+        // Read back as itself, like every other ending this build writes. The
+        // catch-all below would answer `Quarantined` — this plane calling its
+        // own record foreign, on a run whose whole point is that somebody else
+        // ran it.
+        OBSERVED_OUTCOME => RunStatus::Observed,
         BREAK_GLASS_OUTCOME => recorded_crossing(records).map_or_else(
             || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
             |(actor, reason)| RunStatus::BrokeGlass { actor, reason },
@@ -7413,6 +7463,65 @@ fn recorded_status(
             "recorded as '{other}', which this build does not recognise"
         )),
     }
+}
+
+/// Whether this value is a sealed payload rather than a readable one.
+///
+/// Always false without `keyring`: nothing seals, so nothing can be sealed, and
+/// a build with no key ring must not carry a dependency on the module that
+/// defines the wrapper.
+fn sealed_payload(value: &serde_json::Value) -> bool {
+    #[cfg(feature = "keyring")]
+    {
+        crate::journal::payload::is_sealed(value)
+    }
+    #[cfg(not(feature = "keyring"))]
+    {
+        let _ = value;
+        false
+    }
+}
+
+/// The plan a run was admitted under, read back from its own history.
+///
+/// Read back rather than recompiled. Recompiling could produce a different
+/// graph — a changed manifest, a different router — and replay would then
+/// verify a run against a plan that never governed it.
+///
+/// # Errors
+///
+/// [`RuntimeError::PayloadsErased`] when the record is still sealed, named
+/// before it is parsed: a sealed payload deserialises into a *missing field*,
+/// and that sentence sends an operator looking for a corrupt journal rather
+/// than telling them the data was erased on request.
+fn frozen_plan(run: RunId, records: &[Record]) -> Result<PlanIR, RuntimeError> {
+    let frozen = records
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::PlanFrozen { plan, .. } => Some(plan.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| RuntimeError::PlanContract("journal has no PlanFrozen record".into()))?;
+    if sealed_payload(&frozen) {
+        return Err(RuntimeError::PayloadsErased {
+            run: run.to_string(),
+        });
+    }
+    serde_json::from_value(frozen).map_err(RuntimeError::Encoding)
+}
+
+/// Whether this run's history is sealed to a key that no longer exists.
+///
+/// Read from the frozen plan, which every admitted run has and which is sealed
+/// under the run's own erasure scope — so it is gone exactly when the run's
+/// data is gone. Checking a payload rather than asking the key ring keeps this
+/// a property of the records in hand: the same answer offline, on a restored
+/// copy, and in a build with no ring wired.
+fn payloads_erased(records: &[Record]) -> bool {
+    records.iter().any(|r| match r.kind() {
+        RecordKind::PlanFrozen { plan, .. } => sealed_payload(plan),
+        _ => false,
+    })
 }
 
 /// Who asked for the stop, read back from the chain.
@@ -7492,6 +7601,14 @@ const BREAK_GLASS_OUTCOME: &str = "broke-glass";
 /// [`SEALED_OUTCOMES`] and [`OUTCOMES_OF_RECORD`]: the run has not ended, it is
 /// waiting for somebody to lift a halt or to cancel it properly.
 pub const WITHHELD_OUTCOME: &str = "withheld";
+
+/// The outcome a session this plane only **observed** is sealed under.
+///
+/// Its own word, and not `succeeded`: a session this runtime did not execute
+/// has no success to report, and answering with one would put somebody else's
+/// agent's work in the column an operator reads as *this plane did it*. The
+/// distinction is the whole reason the status exists.
+pub const OBSERVED_OUTCOME: &str = "observed";
 
 /// One governed identity: a declaration and the skills that serve it.
 ///
@@ -9653,6 +9770,7 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
             subject: "alice".into(),
             reason: "credential withdrawn".into(),
         },
+        RunStatus::Observed,
     ]
 }
 
@@ -9685,7 +9803,7 @@ mod resume_agreement_tests {
         let statuses = every_status();
         assert_eq!(
             statuses.len(),
-            11,
+            12,
             "a RunStatus variant was added or removed — decide whether it seals \
              and whether a resume may continue from it, then update this list"
         );

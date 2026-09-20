@@ -173,6 +173,29 @@ fn unsafe_code_is_forbidden() {
 /// Which test checks each spec invariant against the implementation:
 /// `(spec, invariant, test)`.
 const CLAIMS: &[(&str, &str, &str)] = &[
+    // A witness settles what a single witness can settle, and the test is the
+    // refusal itself: a history that does not extend what it recorded is not
+    // cosigned, so nothing it vouched for contradicts anything else it
+    // vouched for.
+    (
+        "Equivocation",
+        "NoWitnessVouchesForTwoHistories",
+        "a_forked_history_is_refused",
+    ),
+    // The reader's half, and the one the model exists for: a fork between two
+    // witnesses is seen only by an audit held to each of their answers.
+    (
+        "Equivocation",
+        "EveryForkIsSeen",
+        "a_fork_is_caught_by_the_shorter_anchor_the_highest_would_have_hidden",
+    ),
+    // The other direction, which is what keeps the alarm worth believing: two
+    // witnesses that merely observed at different times are not a finding.
+    (
+        "Equivocation",
+        "NoFalseAlarm",
+        "a_split_view_is_equal_sizes_with_unequal_roots_and_nothing_else",
+    ),
     (
         "EffectGroup",
         "DeferredOnlyPastTheFrontier",
@@ -3150,4 +3173,91 @@ fn the_example_bundle_names_every_action_the_crate_asks_about() {
              reader copying the list is told a verb exists that does not"
         );
     }
+}
+
+/// **No record kind's field may collide with the body's.**
+///
+/// `RecordKind` is `#[serde(flatten)]`ed into [`RecordBody`], so a variant's
+/// field and a body field of the same name are one key on the wire. The rule
+/// was written down — on `CaseBound`, naming `kind` and `case` — and it was a
+/// comment on one variant about two of the body's seven fields.
+///
+/// The failure it does not prevent is worse than a dangling comment, because
+/// **everything upstream of the read passes**. A variant with a `step` field
+/// seals, hashes, lands in the golden corpus, and is re-derived by the second
+/// implementation of the published format — all of which read the bytes the
+/// writer produced. The collision only surfaces when something deserialises a
+/// record back into its own type, where `step` is a `StepId` and the variant's
+/// value is a map: *invalid type: map, expected u32*, from a format whose whole
+/// job is to be readable by strangers.
+///
+/// So the rule is checked rather than remembered, against **every** body field
+/// and every variant.
+#[test]
+fn no_record_kind_field_collides_with_the_record_body() {
+    let src = read("src/journal/record.rs");
+
+    let body_start = src
+        .find("pub struct RecordBody {")
+        .expect("the RecordBody struct");
+    let body_end = src[body_start..].find("\n}\n").expect("end of struct") + body_start;
+    let body_fields: Vec<String> = src[body_start..body_end]
+        .lines()
+        .filter_map(|l| {
+            l.trim()
+                .strip_prefix("pub ")?
+                .split(':')
+                .next()
+                .map(str::to_owned)
+        })
+        .filter(|f| !f.is_empty())
+        .collect();
+    assert!(
+        body_fields.len() > 5,
+        "found {body_fields:?} — the guard is reading the wrong span rather than passing"
+    );
+
+    let enum_start = src
+        .find("pub enum RecordKind {")
+        .expect("the RecordKind enum");
+    let enum_end = src[enum_start..].find("\n}\n").expect("end of enum") + enum_start;
+    let body = &src[enum_start..enum_end];
+
+    // Variant fields sit at eight spaces; variant names at four. Doc lines and
+    // attributes are skipped by the first-character test, as in the sibling
+    // guard over `RunStatus`.
+    let mut variant = String::new();
+    let mut collisions: Vec<String> = Vec::new();
+    for line in body.lines() {
+        if let Some(code) = line.strip_prefix("    ")
+            && !code.starts_with(' ')
+            && code.starts_with(char::is_uppercase)
+        {
+            variant = code
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+        }
+        let Some(code) = line.strip_prefix("        ") else {
+            continue;
+        };
+        if code.starts_with(' ') || !code.starts_with(char::is_lowercase) {
+            continue;
+        }
+        let field: String = code
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if body_fields.contains(&field) || field == "kind" {
+            collisions.push(format!("RecordKind::{variant}.{field}"));
+        }
+    }
+
+    assert!(
+        collisions.is_empty(),
+        "these fields are flattened onto a body field of the same name, so the two \
+         are one key on the wire — the record seals, hashes and re-derives, and \
+         fails only when something reads it back into its own type:\n  {}",
+        collisions.join("\n  ")
+    );
 }

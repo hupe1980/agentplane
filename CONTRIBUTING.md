@@ -36,7 +36,7 @@ backend or the key ring.
 | `just audit` | seconds | before pushing; part of `just ci` |
 | `just ci` | ~5 minutes | before pushing |
 | `just mutants` | ~1.5 hours, or a tenth of that per shard | before a release, or after touching a guarantee |
-| `just specs` | ~2 minutes | after changing the effect protocol, sagas, fencing, or authorization |
+| `just specs` | ~2 minutes | after changing anything [`tla/README.md`](tla/README.md) names a spec for |
 | `just test-live` | seconds, and real money | after touching a model driver or a schema this crate sends |
 
 `just audit` needs `cargo-audit` (`cargo install cargo-audit`, or

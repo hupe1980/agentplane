@@ -125,6 +125,7 @@ check_spec EffectGroup
 check_spec Fencing
 check_spec Authorization
 check_spec Delegation
+check_spec Equivocation
 
 printf '\n%smutants — each must be caught%s\n' "$DIM" "$OFF"
 while IFS=$'\t' read -r mutant _spec invariant description; do

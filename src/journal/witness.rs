@@ -9,10 +9,20 @@
 //!
 //! A witness breaks the symmetry by being somebody else. It keeps the last
 //! checkpoint it saw for a log and will only cosign a new one that **provably
-//! extends** it. Two divergent histories cannot both be cosigned, so a split
-//! view stops being invisible and starts being a witness that refuses — or, if
-//! the operator publishes anyway, two cosignatures that contradict each other
-//! and can be shown to anyone.
+//! extends** it, so no *single* witness can be made to vouch for two divergent
+//! histories.
+//!
+//! **Across witnesses it is detection rather than prevention, and the
+//! difference decides how a reader has to use this.** A witness that has never
+//! seen a log has nothing to check a first submission against, so an operator
+//! who forks and hands the fork to a fresh witness gets both histories
+//! cosigned — by different parties, each of which behaved correctly. What
+//! exposes that is comparison, and comparison only works if the reader keeps
+//! **every** answer: the fork fed to a fresh witness is the longest history
+//! anybody holds, so a reader who keeps the tallest checkpoint keeps the fork
+//! and drops the honest observation it diverged from. [`split_views`] catches
+//! the case that needs no proof — one size, two roots — and the rest is the
+//! append-only check, run against each observation separately.
 //!
 //! What this module is *not* is a network protocol. It is the seam and the
 //! decision — "does this checkpoint extend what I last saw?" — which is the
@@ -360,14 +370,52 @@ impl std::fmt::Display for SplitView {
     }
 }
 
+/// A checkpoint somebody brought, and where they got it.
+///
+/// **The provenance is the holder's label, not a claim anything here checked.**
+/// A check can verify that a checkpoint *extends* — that is the append-only
+/// proof — and cannot verify who vouched for it. What the label buys is that a
+/// finding names the observer whose history the store failed to extend, which
+/// is who an investigator goes to next.
+///
+/// A list of these is how a reader holds a log to **every** observation it can
+/// obtain rather than to one. That distinction is the whole of what witnessing
+/// buys: see [`split_views`] for the half that needs no proof, and the
+/// append-only check for the half that does.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Anchor {
+    /// The checkpoint itself.
+    pub checkpoint: Checkpoint,
+    /// How it was obtained — `witness sigsum.org`, `file prior.json`.
+    pub obtained_from: String,
+}
+
+impl Anchor {
+    /// An anchor with its provenance.
+    pub fn new(checkpoint: Checkpoint, obtained_from: impl Into<String>) -> Self {
+        Self {
+            checkpoint,
+            obtained_from: obtained_from.into(),
+        }
+    }
+}
+
 /// Every disagreement in a set of witness answers about one log.
 ///
-/// **Equal sizes with unequal roots, and nothing else.** Two witnesses at
-/// *different* sizes is the ordinary case — they observed at different times,
-/// and the smaller one is a prefix of the larger unless something proves
-/// otherwise, which is what the consistency check at submission is for. Equal
-/// size with unequal roots admits no such reading: one tree of a given size
-/// has one root, so two of them is two histories.
+/// **Equal sizes with unequal roots, and nothing else.** That case admits no
+/// second reading: one tree of a given size has one root, so two of them is two
+/// histories, and no proof from anybody is needed to say so.
+///
+/// Two witnesses at *different* sizes is **not** agreement, and this function
+/// is not where it is settled. They may have observed at different times, and
+/// the smaller may be a prefix of the larger — or they may be on two forks,
+/// which is what an operator feeding a fresh witness a rewritten history
+/// produces. Telling those apart needs a consistency proof between the two
+/// roots, which only the log can supply: that is the append-only check, run
+/// against each observation separately
+/// ([`Anchor`]). Reporting different sizes here would page an operator for the
+/// system working; treating them as checked is the mistake in the other
+/// direction, and it is the one a caller makes silently.
 ///
 /// Pairwise over the set, so three witnesses disagreeing produce all three
 /// pairs rather than one summary. An operator reading this has to know which

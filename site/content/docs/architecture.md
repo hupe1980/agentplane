@@ -108,6 +108,10 @@ src/
   policy/    authorization-engine adapters; the seam itself is core::policy
   memory/    what an agent remembers between runs: versioned items, journaled
              retrieval, and labels taken from provenance rather than content
+  observe/   a record beside an agent this plane does not execute: the
+             asserted rung, in a run of its own with no admission, sharing the
+             chain and the Merkle log and sharing no record kind with a
+             dispatched effect (feature `acp` for the wire mapping)
   netguard/  what an outbound call may do to this process: which IP addresses
              it may reach, and how many bytes an answer may cost — one rule each,
              by governed media, webhook delivery and both A2A URL legs, applied

@@ -126,25 +126,38 @@ impl SealedPush {
         Ok(sealed)
     }
 
-    /// A stored credential back in the clear, or `None` once its key is gone.
+    /// A stored credential back in the clear, or `None` once its key is
+    /// **destroyed**.
     ///
     /// A secret that never was sealed passes through unchanged — the rows a
     /// deployment wrote before it configured a key ring must stay deliverable,
     /// exactly as the other decorators leave pre-sealing payloads readable.
-    async fn opened_secret(&self, aad: &str, secret: Secret) -> Option<Secret> {
+    ///
+    /// # Errors
+    ///
+    /// Every key failure that is not an erasure. This is the sharpest place in
+    /// the crate where those differ: `None` drops the credential and delivers
+    /// the notification *without it*, which is the right answer for a
+    /// credential that has been erased and a silent downgrade of an
+    /// authenticated channel for a key service that is merely unreachable. A
+    /// caller that cannot get a credential it was given must not send the
+    /// request; it must come back.
+    async fn opened_secret(&self, aad: &str, secret: Secret) -> Result<Option<Secret>, StoreError> {
         let Some(envelope) = payload::unwrap_text(secret.expose()) else {
-            return Some(secret);
+            return Ok(Some(secret));
         };
-        let plain = super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope)
+        let opened = super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
             .await
-            .ok()?;
-        String::from_utf8(plain).ok().map(Secret::new)
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok(opened
+            .and_then(|plain| String::from_utf8(plain).ok())
+            .map(Secret::new))
     }
 
-    async fn opened(&self, mut config: PushConfig) -> PushConfig {
+    async fn opened(&self, mut config: PushConfig) -> Result<PushConfig, StoreError> {
         let aad = Self::aad(&self.tenant, config.task, &config.id);
         if let Some(token) = config.token.take() {
-            config.token = self.opened_secret(&aad, token).await;
+            config.token = self.opened_secret(&aad, token).await?;
         }
         // The scheme stays; the credentials decide. An authentication whose
         // credentials were erased is no authentication at all, not a header
@@ -152,22 +165,25 @@ impl SealedPush {
         if let Some(authentication) = config.authentication.take() {
             config.authentication = self
                 .opened_secret(&aad, authentication.credentials)
-                .await
+                .await?
                 .map(|credentials| crate::push::PushAuthentication {
                     scheme: authentication.scheme,
                     credentials,
                 });
         }
-        config
+        Ok(config)
     }
 
-    async fn opened_all(&self, rows: Vec<PushRegistration>) -> Vec<PushRegistration> {
+    async fn opened_all(
+        &self,
+        rows: Vec<PushRegistration>,
+    ) -> Result<Vec<PushRegistration>, StoreError> {
         let mut out = Vec::with_capacity(rows.len());
         for mut registration in rows {
-            registration.config = self.opened(registration.config).await;
+            registration.config = self.opened(registration.config).await?;
             out.push(registration);
         }
-        out
+        Ok(out)
     }
 }
 
@@ -184,7 +200,7 @@ impl PushStore for SealedPush {
     async fn get(&self, task: RunId, id: &str) -> Result<Option<PushConfig>, StoreError> {
         let found = self.inner.get(task, id).await?;
         Ok(match found {
-            Some(config) => Some(self.opened(config).await),
+            Some(config) => Some(self.opened(config).await?),
             None => None,
         })
     }
@@ -193,7 +209,7 @@ impl PushStore for SealedPush {
         let configs = self.inner.list(task).await?;
         let mut out = Vec::with_capacity(configs.len());
         for config in configs {
-            out.push(self.opened(config).await);
+            out.push(self.opened(config).await?);
         }
         Ok(out)
     }
@@ -202,7 +218,7 @@ impl PushStore for SealedPush {
         // The delivery worker's read: this is where the credentials come back,
         // because the POST that needs them happens on the other side of it.
         let rows = self.inner.due(at, limit).await?;
-        Ok(self.opened_all(rows).await)
+        self.opened_all(rows).await
     }
 
     async fn due_in(
@@ -215,7 +231,7 @@ impl PushStore for SealedPush {
         // over `self.due` and pay the decode twice — and would lose whatever
         // native filter the wrapped store implements.
         let mut batch = self.inner.due_in(at, limit, namespace).await?;
-        batch.rows = self.opened_all(batch.rows).await;
+        batch.rows = self.opened_all(batch.rows).await?;
         Ok(batch)
     }
 
@@ -242,7 +258,7 @@ impl PushStore for SealedPush {
         // an operator reading a parked row is about to decide whether to
         // re-arm it, and a sealed URL or scheme tells them nothing.
         let rows = self.inner.parked(limit).await?;
-        Ok(self.opened_all(rows).await)
+        self.opened_all(rows).await
     }
 
     async fn unpark(&self, task: RunId, id: &str, at: u64) -> Result<bool, StoreError> {

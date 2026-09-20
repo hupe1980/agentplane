@@ -320,9 +320,20 @@ impl SealedJournal {
     /// A **read-time view**, exactly as upcasting is: `raw`, `hash` and
     /// `prev_hash` are untouched, so the chain still verifies over what was
     /// written and no proof changes meaning. A payload whose key has been
-    /// destroyed stays sealed rather than failing the read — erasure is a
+    /// **destroyed** stays sealed rather than failing the read — erasure is a
     /// completed operation, not an outage, and a run whose data is gone must
     /// still be listable, verifiable and auditable.
+    ///
+    /// Every other key failure fails the read. A key service that cannot be
+    /// reached is a transient fault whose remedy is waiting; reported as a
+    /// sealed payload it is indistinguishable from a discharged erasure, and
+    /// the two call for opposite actions — one is *come back later*, the other
+    /// is *this is gone for good*. `open_or_erased` is where that line is
+    /// drawn.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the ring said, for every cause but a destroyed key.
     async fn open_all(&self, records: Vec<Record>) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::with_capacity(records.len());
         for record in records {
@@ -331,18 +342,18 @@ impl SealedJournal {
             let mut kind = record.kind().clone();
             let mut changed = false;
             for field in payload::payloads(&mut kind) {
-                // A payload that will not open is left sealed on purpose: the
-                // alternative — failing the read — would make a
-                // cryptographically erased run unreadable *and* unauditable,
-                // turning a discharged obligation into an outage.
                 match field {
                     payload::SealedField::Value(field) => {
                         let Some(envelope) = payload::unwrap(field) else {
                             continue;
                         };
-                        if let Ok(plain) =
-                            super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope)
-                                .await
+                        if let Some(plain) = super::envelope::open_or_erased(
+                            self.keys.as_ref(),
+                            aad.as_bytes(),
+                            &envelope,
+                        )
+                        .await
+                        .map_err(|e| StoreError::Backend(e.to_string()))?
                         {
                             *field = serde_json::from_slice(&plain)?;
                             changed = true;
@@ -352,9 +363,13 @@ impl SealedJournal {
                         let Some(envelope) = payload::unwrap_text(field) else {
                             continue;
                         };
-                        if let Ok(plain) =
-                            super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope)
-                                .await
+                        if let Some(plain) = super::envelope::open_or_erased(
+                            self.keys.as_ref(),
+                            aad.as_bytes(),
+                            &envelope,
+                        )
+                        .await
+                        .map_err(|e| StoreError::Backend(e.to_string()))?
                             && let Ok(text) = String::from_utf8(plain)
                         {
                             *field = text;

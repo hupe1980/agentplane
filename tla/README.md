@@ -1,6 +1,6 @@
 # Formal specifications
 
-Seven TLA+ models covering the parts of the runtime that must be unconditionally
+Eight TLA+ models covering the parts of the runtime that must be unconditionally
 correct, and that are hardest to convince yourself of by reading code:
 
 | Spec | Question it answers |
@@ -12,6 +12,7 @@ correct, and that are hardest to convince yourself of by reading code:
 | [`Fencing.tla`](Fencing.tla) | Can a paused instance wake up after its run was taken over and still land a write? |
 | [`Authorization.tla`](Authorization.tla) | Can a replay re-open a decision policy already made, and is a refusal always on the record? |
 | [`Delegation.tla`](Delegation.tla) | Can authority grow as it is passed on, and is a chain read from storage trusted or re-checked? |
+| [`Equivocation.tla`](Equivocation.tla) | An operator shows two histories of one log. Which reader still sees it — and which way of combining several witnesses' answers stops seeing it? |
 
 These check the **design**. The implementation is checked against deliberately
 the same invariant list by deterministic fault injection at the store seam
@@ -35,6 +36,7 @@ them is checked too:
 | `Fencing` | verified | 231 distinct states |
 | `Authorization` | verified | 32 distinct states |
 | `Delegation` | verified | 9510 distinct states |
+| `Equivocation` | verified | 7086 distinct states |
 
 The counts are TLC's `distinct states found`, and the command below is what
 derives them — if a number here disagrees with what it prints, the number

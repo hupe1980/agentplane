@@ -27,7 +27,7 @@ pub use replay::{EffectReplay, ReplayCursor, StepCursor, undecided_effects};
 pub use store::{Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease, WaitingRun};
 pub use upcast::{Identity, Upcaster};
 pub use witness::{
-    Cosignature, CosignedCheckpoint, MemoryWitness, QuorumOutcome, SplitView, Witness,
+    Anchor, Cosignature, CosignedCheckpoint, MemoryWitness, QuorumOutcome, SplitView, Witness,
     WitnessError, WitnessQuorum, cosign_quorum, split_views,
 };
 #[cfg(feature = "witness-http")]

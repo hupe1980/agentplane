@@ -26,6 +26,7 @@ mod identity;
 #[cfg(feature = "keyring")]
 mod keyring;
 mod manifest;
+mod observation;
 mod peers;
 mod planned;
 mod policy;

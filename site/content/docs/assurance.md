@@ -99,7 +99,7 @@ agree with it by construction. It runs in the gate, and it does three things:
 just verify-golden
 ```
 
-- **`--canon-check`** re-derives all 29 record vectors from their *parsed
+- **`--canon-check`** re-derives all 30 record vectors from their *parsed
   values* — an independent canonicalizer, an independent chain digest. This is
   the half that **produces** bytes rather than accepting them, and it is
   non-circular: the input is what each record means, the output is what the

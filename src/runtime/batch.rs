@@ -310,11 +310,14 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
         // for the same reason abandonment is: the answer to *what does a person
         // do next* is hands off, and filing it under `Failed` would hand it to
         // the readers who re-run.
-        RunStatus::Swept | RunStatus::BrokeGlass { .. } => ItemOutcome::Quarantined(
-            "this item's run id resolves to one of the plane's own records, not to \
-             the item's run — the reservation and the journal disagree"
-                .to_owned(),
-        ),
+        RunStatus::Swept | RunStatus::BrokeGlass { .. } | RunStatus::Observed => {
+            ItemOutcome::Quarantined(
+                "this item's run id resolves to one of the plane's own records, or to \
+                 a session it only observed, rather than to the item's run — the \
+                 reservation and the journal disagree"
+                    .to_owned(),
+            )
+        }
         RunStatus::Cancelled { actor, reason } => {
             ItemOutcome::Failed(format!("cancelled by '{actor}': {reason}"))
         }

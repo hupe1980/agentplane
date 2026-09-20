@@ -732,6 +732,50 @@ pub enum RecordKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
     },
+
+    /// Something an agent this plane does **not** execute reported doing.
+    ///
+    /// **The rung is the record kind, and that is the whole design.** A seat
+    /// beside somebody else's agent produces that agent's own account of what
+    /// it did — *asserted* on the trust-basis spectrum — where every other
+    /// record here is *deterministically attached*: this runtime announced the
+    /// effect, dispatched it under authority, and recorded the outcome.
+    /// [`EffectStarted`](Self::EffectStarted) and its terminals are what make
+    /// that stronger claim, and an observation satisfies neither half of it —
+    /// there is no runtime-derived effect key and no durable intent preceding
+    /// it, because nothing here decided to take the step.
+    ///
+    /// So an observation may never wear an effect's record kind. Sharing one
+    /// would launder a report into an execution record and falsify every
+    /// answer the journal gives about what authorized an action. Sharing the
+    /// *chain*, the canonical form, the Merkle log and the witness costs
+    /// nothing and is the point: an observed session is a run of its own in
+    /// the one journal, with no [`RunAdmitted`](Self::RunAdmitted) at all —
+    /// the shape a sweep's run already takes — so an external verifier checks
+    /// it without being taught what an observation is.
+    Observed {
+        /// The session, as the observed party names it.
+        ///
+        /// On every record rather than on the conclusion alone: a plane that
+        /// stops mid-session leaves observations and no conclusion, and
+        /// evidence that cannot say which session it describes is not
+        /// evidence. Clear, like every other routing field — sealing it would
+        /// make the observation unfindable by the only identifier the party
+        /// who asked for it holds.
+        session: String,
+        /// What the observed party reported, in this plane's vocabulary.
+        ///
+        /// Named `reported` rather than `step`: this variant is flattened into
+        /// the body, and [`RecordBody::step`] is a `StepId` — the collision
+        /// read back as *invalid type: map, expected u32*, having sealed,
+        /// hashed and re-derived cleanly on the way in.
+        reported: crate::core::ObservedStep,
+        /// The observed party's own words for it — a tool's title, the text a
+        /// person was shown. Sealed: it is their data, not this plane's
+        /// routing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
 }
 
 impl RecordKind {
@@ -768,6 +812,7 @@ impl RecordKind {
             Self::RunConcluded { .. } => "RunConcluded",
             Self::BreakGlass { .. } => "BreakGlass",
             Self::Swept { .. } => "Swept",
+            Self::Observed { .. } => "Observed",
         }
     }
 

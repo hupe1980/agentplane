@@ -103,6 +103,7 @@ pub mod media;
 pub mod memory;
 pub mod model;
 pub mod netguard;
+pub mod observe;
 pub mod peers;
 pub mod plan;
 pub mod policy;

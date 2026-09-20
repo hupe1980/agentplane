@@ -72,15 +72,21 @@ pub struct AuditReport {
     /// an anchor, and the reader could not tell which history the append-only
     /// check had actually compared against.
     ///
-    /// `None` says the deletion check did not run, which
+    /// Empty says the deletion check did not run, which
     /// [`not_checked`](Self::not_checked) also says in words. Both, because
     /// this one is machine-readable and that one is for a person.
     ///
-    /// It does not say where the checkpoint came from. An audit can verify a
-    /// checkpoint *extends* — that is the append-only check below — and cannot
-    /// verify who vouched for it, so recording a provenance here would be this
-    /// report repeating a claim it did not check.
-    pub held_to: Option<Checkpoint>,
+    /// **Every anchor, not the strongest one.** A reader has to be able to see
+    /// which observations the store was held to, because the answer to *is
+    /// this history forked* is only as strong as the set: one honest observer
+    /// among several is enough to expose a fork, and a report naming one
+    /// anchor cannot say whether that observer was consulted.
+    ///
+    /// Each carries the auditor's own label for where it came from. That is
+    /// provenance this report did not check — an audit can verify a checkpoint
+    /// *extends* and cannot verify who vouched for it — and it is recorded so
+    /// a finding names the observer to go and ask.
+    pub held_to: Vec<Anchor>,
     /// Runs whose chain, signatures and inclusion all checked out.
     ///
     /// An **open** run — one whose last conclusion does not seal, or which has
@@ -350,21 +356,39 @@ pub enum Finding {
     },
 
     /// The one that needs an outside artifact.
+    ///
+    /// Names **which** anchor it failed against, because an audit is held to
+    /// every checkpoint an auditor brought rather than to one: a fork is
+    /// visible from whichever observer saw the history it diverged from, and
+    /// that observer is the first thing an investigator has to go and ask.
     #[error(
-        "the log cannot prove it only grew since the checkpoint of size {old_size} — \
-         something committed to earlier is no longer committed to now"
+        "the log cannot prove it only grew since the checkpoint of size {old_size} held by \
+         {obtained_from} — something committed to earlier is no longer committed to now"
     )]
-    NotAppendOnly { old_size: u64 },
+    NotAppendOnly {
+        old_size: u64,
+        obtained_from: String,
+    },
 
-    #[error("the prior checkpoint names log '{theirs}', this store is '{ours}'")]
-    WrongLog { theirs: String, ours: String },
+    #[error("the checkpoint held by {obtained_from} names log '{theirs}', this store is '{ours}'")]
+    WrongLog {
+        theirs: String,
+        ours: String,
+        obtained_from: String,
+    },
 
     #[error(
-        "the prior checkpoint is larger ({old_size}) than this log ({now}) — a log \
-         cannot shrink, so runs were removed or this is a different plane"
+        "the checkpoint held by {obtained_from} is larger ({old_size}) than this log ({now}) — \
+         a log cannot shrink, so runs were removed or this is a different plane"
     )]
-    Shrunk { old_size: u64, now: u64 },
+    Shrunk {
+        old_size: u64,
+        now: u64,
+        obtained_from: String,
+    },
 }
+
+pub use crate::journal::Anchor;
 
 /// What an auditor brought with them.
 ///
@@ -372,8 +396,16 @@ pub enum Finding {
 /// rendering, and deriving would demand one.
 #[derive(Default)]
 pub struct Evidence<'a> {
-    /// A checkpoint issued earlier, from outside this store.
-    pub prior: Option<&'a Checkpoint>,
+    /// Every checkpoint issued earlier, from outside this store.
+    ///
+    /// **All of them, and that is the point.** Each is an independent
+    /// observation of this log, so each is an independent constraint: the
+    /// store must prove it extends every one. Holding the store to a single
+    /// anchor — the largest, say — is exactly the shape an equivocating
+    /// operator wants, because the fork it feeds a fresh observer is the
+    /// longest history anybody holds, and the observer that saw the honest
+    /// prefix is the one whose answer gets dropped.
+    pub anchors: &'a [Anchor],
     /// The key the records should carry.
     pub verifier: Option<&'a dyn Verifier>,
     /// Whether an unsigned record is a failure.
@@ -387,7 +419,7 @@ pub struct Evidence<'a> {
 impl std::fmt::Debug for Evidence<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Evidence")
-            .field("prior", &self.prior)
+            .field("anchors", &self.anchors)
             .field("verifier", &self.verifier.is_some())
             .field("require_signatures", &self.require_signatures)
             .finish()
@@ -622,9 +654,9 @@ fn warrant_in(run: RunId, records: &[Record]) -> Option<Warrant> {
 
 /// What an audit cannot conclude from the evidence it was given.
 ///
-/// Reported up front and as loudly as failures: an audit that quietly skipped
-/// a check it had no inputs for, and then said "verified", is the
-/// reassuring-but-empty artifact this module exists to avoid.
+/// Gathered before any check runs, so a report is never missing a line because
+/// the walk stopped early. Why it is reported at all is on
+/// [`AuditReport::not_checked`], which is where a reader meets it.
 fn missing_evidence(evidence: &Evidence<'_>) -> Vec<String> {
     let mut out = Vec::new();
     if evidence.verifier.is_none() {
@@ -634,7 +666,7 @@ fn missing_evidence(evidence: &Evidence<'_>) -> Vec<String> {
                 .to_owned(),
         );
     }
-    if evidence.prior.is_none() {
+    if evidence.anchors.is_empty() {
         out.push(
             "deletion — no earlier checkpoint was supplied, so this audit cannot \
              detect a run that was removed. Every check below passes over a store \
@@ -643,6 +675,14 @@ fn missing_evidence(evidence: &Evidence<'_>) -> Vec<String> {
              audit printed, or the one this plane's witnesses hold"
                 .to_owned(),
         );
+    } else if evidence.anchors.len() == 1 {
+        out.push(format!(
+            "equivocation — one anchor was supplied ({}), so this audit says the store \
+             extends that observer's history and nothing about whether a second observer \
+             holds a different one. A fork is visible only from an observer that saw the \
+             history it diverged from, so bring every checkpoint you can obtain",
+            evidence.anchors[0].obtained_from
+        ));
     }
     out
 }
@@ -684,15 +724,17 @@ fn seal_claim_holds(records: &[Record]) -> bool {
 /// entry says in words.
 async fn check_append_only(
     store: &Arc<dyn JournalStore>,
-    prior: &Checkpoint,
+    anchor: &Anchor,
     current: &mut Checkpoint,
     findings: &mut Vec<Finding>,
     not_checked: &mut Vec<String>,
 ) -> Result<(), StoreError> {
+    let prior = &anchor.checkpoint;
     if prior.origin != current.origin {
         findings.push(Finding::WrongLog {
             theirs: prior.origin.clone(),
             ours: current.origin.clone(),
+            obtained_from: anchor.obtained_from.clone(),
         });
         return Ok(());
     }
@@ -700,6 +742,7 @@ async fn check_append_only(
         findings.push(Finding::Shrunk {
             old_size: prior.size,
             now: current.size,
+            obtained_from: anchor.obtained_from.clone(),
         });
         return Ok(());
     }
@@ -721,15 +764,17 @@ async fn check_append_only(
         if !ok {
             findings.push(Finding::NotAppendOnly {
                 old_size: prior.size,
+                obtained_from: anchor.obtained_from.clone(),
             });
         }
     } else {
         *current = latest;
-        not_checked.push(
-            "append-only consistency: the log grew throughout the audit, so the proof \
-             could not be pinned to one checkpoint — re-run against a quiesced store"
-                .to_owned(),
-        );
+        not_checked.push(format!(
+            "append-only consistency against {}: the log grew throughout the audit, so \
+             the proof could not be pinned to one checkpoint — re-run against a quiesced \
+             store",
+            anchor.obtained_from
+        ));
     }
     Ok(())
 }
@@ -884,13 +929,18 @@ pub async fn audit(
     }
 
     // ── Against what the auditor brought ───────────────────────────────────
-    if let Some(prior) = evidence.prior {
-        check_append_only(store, prior, &mut current, &mut findings, &mut not_checked).await?;
+    //
+    // Every anchor, each on its own. They are independent observations, so a
+    // store that extends one and not another is forked — and which one it
+    // failed is the finding, because that observer is who an investigator asks
+    // for the history the store no longer has.
+    for anchor in evidence.anchors {
+        check_append_only(store, anchor, &mut current, &mut findings, &mut not_checked).await?;
     }
 
     Ok(AuditReport {
         current,
-        held_to: evidence.prior.cloned(),
+        held_to: evidence.anchors.to_vec(),
         sound,
         findings,
         not_checked,

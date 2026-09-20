@@ -292,8 +292,9 @@ batch runs over 10⁵ items with per-item journals and an item-granular resume,
 the scoped emergency stop, the audited sweeper, a scheduled recovery drill, a
 retention pass that says what it could not reach and the legal holds that stop
 one, model drivers and streaming, MCP and A2A on both sides, signed Agent Cards,
-governed media and memory, multi-tenancy, quotas, witnessing, break-glass, and
-why there is no `AllowAll` anywhere — is documented mechanism by mechanism on
+a tamper-evident record beside an agent this plane does *not* run, governed
+media and memory, multi-tenancy, quotas, witnessing, break-glass, and why there
+is no `AllowAll` anywhere — is documented mechanism by mechanism on
 the site:
 **[what you get, in full](https://hupe1980.github.io/agentplane/docs/)**.
 
@@ -343,7 +344,8 @@ Two are unusual enough to name:
 
 **🔬 Formal specs.** TLA+ specifications are model-checked on every push — the
 effect protocol, effect groups, retry safety, sagas, fencing, authorization,
-delegation. And because a spec whose invariants cannot be violated proves
+delegation, and equivocation: showing two histories of one log, and which
+reader can still see it. And because a spec whose invariants cannot be violated proves
 nothing, each is re-checked against deliberately broken copies of itself; every
 mutant must be caught by the *specific* invariant written for it.
 
@@ -352,7 +354,7 @@ mutant must be caught by the *specific* invariant written for it.
 normative prose, and `tools/verify_export.py` is written from it and reads none
 of this crate's Rust — enforced by a guard, because a verifier that consulted
 `src/` would agree with the implementation by construction. `just verify-golden`
-runs it: it **re-derives** all 29 record vectors from their parsed values with
+runs it: it **re-derives** all 30 record vectors from their parsed values with
 its own canonicalizer and chain digest, verifies the sealed export end to end,
 and then damages that export six ways and asserts each is reported. Vectors a
 project generates and then checks are that project agreeing with itself; this

@@ -3198,8 +3198,13 @@ row by row before deciding what may enter a run.
 ## 🔎 Audit a store you do not trust {#audit-a-store-you-do-not-trust}
 
 ```rust
+let anchors = [
+    Anchor::new(from_witness_a, "witness a.example"),
+    Anchor::new(from_witness_b, "witness b.example"),
+    Anchor::new(saved_earlier,  "file prior.json"),
+];
 let report = agentplane::audit::audit(&store, &runs, &Evidence {
-    prior: Some(&checkpoint),   // handed over earlier — this is what detects deletion
+    anchors: &anchors,          // every observation you can obtain, not the best one
     verifier: Some(&verifier),
     require_signatures: true,
 }).await?;
@@ -3207,6 +3212,16 @@ report.assert_complete();
 ```
 
 **The trap:** reading "no findings" as "verified". `assert_complete` fails on a
-*skipped* check as well as a failed one. Without a prior checkpoint, deletion is
+*skipped* check as well as a failed one. With no anchor, deletion is
 undetectable — every remaining run still verifies — so the report carries
 `not_checked` as prominently as its findings.
+
+**The second trap, and it is the one that costs more: keeping the best anchor.**
+The store is held to *each* of them, because they are independent observations
+rather than competing answers. An operator who forks a log and has a witness
+that never saw it cosign the fork now holds the **longest** history anybody
+has — so "use the tallest checkpoint" selects the fork and discards the honest
+observer whose shorter history exposes it. One anchor is not an error and the
+report says what it cost: `not_checked` carries an `equivocation` line, because
+a single observation can say the store extends *that* history and nothing about
+whether a second observer holds a different one.

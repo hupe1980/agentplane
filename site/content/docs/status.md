@@ -85,7 +85,7 @@ is imminent.
 |---|---|---|
 | 1 | **Canonicalization is versioned and vector-checked** — a rule change must read as *unverifiable*, never as a divergence | RFC 8785 held to the standard's own number vectors → [canonical JSON](@/docs/format.md#canonical-json) |
 | 2 | **Golden corpora for the journal record format** — a fixed set of records every future build must still read and still hash identically | `tests/golden/records.jsonl`, with a guard holding the corpus to the record vocabulary |
-| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | `tools/verify_export.py`, re-deriving all 29 record vectors from the [specification](@/docs/format.md#vectors) alone |
+| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | `tools/verify_export.py`, re-deriving all 30 record vectors from the [specification](@/docs/format.md#vectors) alone |
 | 4 | **A stated unknown-field policy per durable format** | per format, not once — a record body, a sealed header and an export's framing each say what they refuse → [format](@/docs/format.md#not-promised) |
 | 5 | **Upcasters exercised end-to-end**, not only unit-tested | consulted on every record read; a test lifts a record this build cannot parse → [versioning](@/docs/format.md#versioning) |
 | 6 | **A migration and rollback procedure**, written down and rehearsed | rehearsed across two released builds → [operations](@/docs/operations.md) |
@@ -157,6 +157,10 @@ field-level gate nothing to bind to. The filesystem and terminal a client offers
 are a convenience for reading unsaved buffers, not a sandbox — the agent is a
 subprocess holding the client's own access.
 
+Recording what such a session did is a different question and the answer is
+yes — see [keeping a record beside an agent you do not
+run](@/docs/interop.md#observing-an-agent-you-do-not-run).
+
 **The operator verbs on the MCP tool list.** Every operator route already
 carries its own `api:` capability over HTTP, so an external agent can drive the
 plane today; projecting those verbs onto a tool list would add discovery, not
@@ -203,23 +207,20 @@ approval task is `ASK`, a suspension is `DEFER`, and the audit chain is already
 in the other order. *Waiting on:* the wire. Where such a session goes is settled
 (below).
 
-**ACP as a record** — journaling what an agent this runtime does not execute was
-asked, and what a person allowed. A session update is the agent's own report,
-while a journal record means *this runtime announced the effect, dispatched it
-under authority and recorded the outcome*; writing a report into that vocabulary
-would make every answer the journal gives about authorization false. So an
-observed session is a **run of its own** in the one journal — sharing the
-canonical form, the Merkle log and the witness, sharing no record kind with a
-dispatched effect, and reported as unadmitted by an `audit`. That is the shape
-the sweeper's own runs already take: one history, one root, one audit.
-*Waiting on:* the wire, for either protocol.
-
 **A measured containment claim.** The runtime claims injection *containment*, not
 immunity, and no external measurement is attached to it. A static attack set
 would manufacture exactly the confidence this project refuses. *Waiting on:* one
 adaptive, defence-aware evaluation, over A2A, graded from the journal — the
 methodology exists in published form
 ([2606.26479](https://arxiv.org/abs/2606.26479)).
+
+Two things will be published as part of that number rather than under it,
+because each moves it more than the attack set does: **the policy bundle it ran
+under**, since a deterministic gate has no attack-success rate and a deployment
+does, and **how open the tasks were**, since an adaptive attacker does far
+better against a task that leaves the agent latitude about what to do
+([2606.15057](https://arxiv.org/abs/2606.15057)). A containment figure quoted
+without both is a figure about somebody's configuration.
 
 ## 🔍 How to check any of this {#how-to-check-any-of-this}
 

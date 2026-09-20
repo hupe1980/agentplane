@@ -230,6 +230,18 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         // Reasoning recorded beside the effects it explains — model output
         // over the caller's data, and nothing routes on it.
         K::Note { text } => vec![SealedField::Text(text)],
+        // An observed step's own words: the instruction a user typed, a tool's
+        // title, the sentence a person was shown before they allowed a call.
+        // It is the *observed party's* data — this plane neither produced it
+        // nor governs the agent that did — so it is sealed like any caller's.
+        // `session` and `step` stay clear: they are what an operator searches
+        // by, and a session nobody can find is evidence nobody has.
+        K::Observed {
+            detail,
+            session: _,
+            reported: _,
+        } => detail.as_mut().map(SealedField::Text).into_iter().collect(),
+
         // A conclusion's reason is the same free text `EffectFailed.error` is —
         // a provider or tool's refusal, quoting the request it refused — lifted
         // to the run. `outcome` and `chain_head` route and stay clear.

@@ -1824,6 +1824,7 @@ const ABSENT_BY_DESIGN: &[(&str, &str)] = &[
     ("QuotaStore", "accrue"),
     ("PushSweepReport", "abandoned"),
     ("KeyRing", "rewrap"),
+    ("Evidence", "prior"),
 ];
 
 /// Types this crate does not own.

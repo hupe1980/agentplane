@@ -596,7 +596,7 @@ re-addressing, because a record names the digest it always named and that run's
 
 ## Vocabulary {#vocabulary}
 
-There are 29 record kinds. A verifier does not interpret them; a reader that
+There are 30 record kinds. A verifier does not interpret them; a reader that
 does must refuse one it has never heard of, for the reason
 [the record body](#record-body) gives.
 
@@ -606,7 +606,19 @@ does must refuse one it has never heard of, for the reason
 `BudgetRefused`, `BudgetReadmitted`, `AuthorityWithheld`, `AuthorityRestored`,
 `IdentityBound`, `PolicyDenied`, `RunSuspended`, `CaseBound`,
 `DeadlineRegistered`, `DeadlineTransition`, `Released`, `RunCancelled`,
-`RunConcluded`, `BreakGlass`, `Swept`.
+`RunConcluded`, `BreakGlass`, `Swept`, `Observed`.
+
+**One of them is not this plane's own work, and a reader must not treat it as
+such.** `Observed` records what an agent this plane does **not** execute
+reported doing — it is that agent's account, at the *asserted* rung, where every
+other kind here is deterministically attached: this runtime announced the
+effect, dispatched it under authority and recorded the outcome. It shares the
+chain, the canonical form, the Merkle log and the witness with everything else,
+and it shares no kind with a dispatched effect, so a reader that takes an
+`Observed` record as evidence an effect happened is making a claim the format
+does not support. Such records live in a run of their own with no `RunAdmitted`
+at all, sealed under the outcome `observed` — the shape a sweep's run already
+has.
 
 **Two pairs supersede rather than replace.** `BudgetReadmitted` follows a
 `BudgetRefused` and `AuthorityRestored` follows an `AuthorityWithheld`; in both

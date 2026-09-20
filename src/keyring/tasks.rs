@@ -86,38 +86,48 @@ impl SealedTasks {
         format!("task:{tenant}:{id}")
     }
 
-    async fn opened(&self, mut task: Task) -> Task {
+    /// One task's sealed proposal and evidence, back in the clear.
+    ///
+    /// # Errors
+    ///
+    /// Every key failure but an erasure. A proposal whose key was
+    /// **destroyed** stays sealed — an erased matter must not make the queue
+    /// unreadable, and a reviewer seeing a sealed row knows the matter was
+    /// erased. A ring that is unreachable must not produce that same row,
+    /// because the reviewer would decide on a trail that is intact and
+    /// temporarily unreadable while being shown one that is gone.
+    async fn opened(&self, mut task: Task) -> Result<Task, StoreError> {
         let aad = Self::aad(&self.tenant, task.id);
-        // Left sealed when it will not open: an erased proposal must not make
-        // the queue unreadable, and a reviewer seeing a sealed row knows the
-        // matter was erased rather than that the plane is broken.
+        let open = async |envelope: Vec<u8>| {
+            super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))
+        };
         if let Some(envelope) = payload::unwrap(&task.justification.proposed_action)
-            && let Ok(plain) =
-                super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await
+            && let Some(plain) = open(envelope).await?
             && let Ok(value) = serde_json::from_slice(&plain)
         {
             task.justification.proposed_action = value;
         }
         for item in &mut task.justification.evidence {
-            // Each entry on its own, so one unopenable line does not take the
-            // rest of the trail with it.
+            // Each entry on its own, so one erased line does not take the rest
+            // of the trail with it.
             if let Some(envelope) = payload::unwrap_text(item.peek())
-                && let Ok(plain) =
-                    super::envelope::open(self.keys.as_ref(), aad.as_bytes(), &envelope).await
+                && let Some(plain) = open(envelope).await?
                 && let Ok(text) = String::from_utf8(plain)
             {
                 *item = item.clone().map(|_| text);
             }
         }
-        task
+        Ok(task)
     }
 
-    async fn opened_all(&self, tasks: Vec<Task>) -> Vec<Task> {
+    async fn opened_all(&self, tasks: Vec<Task>) -> Result<Vec<Task>, StoreError> {
         let mut out = Vec::with_capacity(tasks.len());
         for task in tasks {
-            out.push(self.opened(task).await);
+            out.push(self.opened(task).await?);
         }
-        out
+        Ok(out)
     }
 }
 
@@ -158,20 +168,20 @@ impl TaskStore for SealedTasks {
         let written = self.inner.open(&sealed).await?;
         // Handed back opened, so the caller that just wrote a proposal reads
         // back what it wrote rather than its envelope.
-        Ok(self.opened(written).await)
+        self.opened(written).await
     }
 
     async fn task(&self, id: TaskId) -> Result<Option<Task>, StoreError> {
         let found = self.inner.task(id).await?;
         Ok(match found {
-            Some(task) => Some(self.opened(task).await),
+            Some(task) => Some(self.opened(task).await?),
             None => None,
         })
     }
 
     async fn claim(&self, id: TaskId, actor: &str, roles: &[String]) -> Result<Task, ClaimError> {
         let claimed = self.inner.claim(id, actor, roles).await?;
-        Ok(self.opened(claimed).await)
+        Ok(self.opened(claimed).await?)
     }
 
     async fn take_over(
@@ -182,7 +192,7 @@ impl TaskStore for SealedTasks {
         roles: &[String],
     ) -> Result<Task, ClaimError> {
         let taken = self.inner.take_over(id, from, actor, roles).await?;
-        Ok(self.opened(taken).await)
+        Ok(self.opened(taken).await?)
     }
 
     async fn release(&self, id: TaskId, actor: &str) -> Result<(), ClaimError> {
@@ -195,17 +205,17 @@ impl TaskStore for SealedTasks {
 
     async fn escalate(&self, id: TaskId) -> Result<Task, StoreError> {
         let escalated = self.inner.escalate(id).await?;
-        Ok(self.opened(escalated).await)
+        self.opened(escalated).await
     }
 
     async fn queue(&self, roles: &[String], limit: usize) -> Result<Vec<Task>, StoreError> {
         let tasks = self.inner.queue(roles, limit).await?;
-        Ok(self.opened_all(tasks).await)
+        self.opened_all(tasks).await
     }
 
     async fn for_case(&self, case: CaseId) -> Result<Vec<Task>, StoreError> {
         let tasks = self.inner.for_case(case).await?;
-        Ok(self.opened_all(tasks).await)
+        self.opened_all(tasks).await
     }
 
     async fn open_count(&self) -> Result<u64, StoreError> {
@@ -214,6 +224,6 @@ impl TaskStore for SealedTasks {
 
     async fn overdue(&self, now: Timestamp, limit: usize) -> Result<Vec<Task>, StoreError> {
         let tasks = self.inner.overdue(now, limit).await?;
-        Ok(self.opened_all(tasks).await)
+        self.opened_all(tasks).await
     }
 }

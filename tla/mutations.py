@@ -450,6 +450,37 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
     /\\ steps' = steps + 1
     /\\ UNCHANGED <<leaseOwner, leaseLive, takeovers, journal>>""",
     ),
+    # The reduction that looks sound. A later checkpoint does establish more
+    # about append-only growth, so ranking the anchors and keeping the tallest
+    # reads as strictly better evidence — and it selects the fork, because the
+    # history an operator feeds a fresh witness is the longest anybody holds.
+    #
+    # The Rust side of this same bug is pinned by
+    # `a_fork_is_caught_by_the_shorter_anchor_the_highest_would_have_hidden`
+    # (tests/trust/attestation.rs) and by the `AnAuditKeepsOnlyTheHighestAnchor`
+    # row in tools/mutants.py.
+    "AuditKeepsTallest": (
+        "Equivocation",
+        "EveryForkIsSeen",
+        "the audit keeps the tallest anchor instead of checking each one",
+        """AuditRule(s) == \\E a \\in s : ~Extends(Hist(a), store)""",
+        """AuditRule(s) ==
+    /\\ s # {}
+    /\\ LET tallest == CHOOSE a \\in s : \\A b \\in s : b.size <= a.size
+       IN ~Extends(Hist(tallest), store)""",
+    ),
+    # A witness that signs without recording. It then has nothing to hold the
+    # next submission to, so it vouches for two histories itself — the
+    # equivocation it exists to refuse, committed by the refusing party. The
+    # implementation's remedy is ordering: `seen.insert` happens BEFORE the
+    # signature, so a crash between them only ever refuses more.
+    "WitnessForgetsWhatItSigned": (
+        "Equivocation",
+        "NoWitnessVouchesForTwoHistories",
+        "a witness cosigns without recording what it vouched for",
+        """    /\\ seen' = [seen EXCEPT ![w] = store]""",
+        """    /\\ UNCHANGED seen""",
+    ),
 }
 
 

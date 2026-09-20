@@ -537,24 +537,25 @@ async fn an_audit_names_the_checkpoint_it_was_held_to() {
         .await
         .unwrap();
     assert!(
-        blind.held_to.is_none(),
+        blind.held_to.is_empty(),
         "an audit given no checkpoint claimed one: {:?}",
         blind.held_to
     );
 
     let prior = s.checkpoint().await.unwrap();
+    let anchor = agentplane::journal::Anchor::new(prior.clone(), "file prior.json");
     let armed = agentplane::audit::audit(
         &s,
         &runs,
         &agentplane::audit::Evidence {
-            prior: Some(&prior),
+            anchors: std::slice::from_ref(&anchor),
             ..Default::default()
         },
     )
     .await
     .unwrap();
     assert_eq!(
-        armed.held_to.as_ref(),
+        armed.held_to.first().map(|a| &a.checkpoint),
         Some(&prior),
         "the report does not say which history it compared against, so a clean \
          verdict cannot be told from one that checked nothing"
@@ -956,6 +957,7 @@ async fn only_an_outside_checkpoint_detects_a_deletion() {
 
     // What the auditor was handed, before.
     let prior = s.checkpoint().await.unwrap();
+    let anchor = agentplane::journal::Anchor::new(prior.clone(), "file prior.json");
 
     // The operator removes a run and carries on.
     store.delete_run_for_test(runs[1]).await.unwrap();
@@ -983,7 +985,7 @@ async fn only_an_outside_checkpoint_detects_a_deletion() {
         &s,
         &survivors,
         &agentplane::audit::Evidence {
-            prior: Some(&prior),
+            anchors: std::slice::from_ref(&anchor),
             ..Default::default()
         },
     )
@@ -1012,11 +1014,12 @@ async fn a_checkpoint_from_another_plane_is_refused() {
         size: 1,
         root: Digest::ZERO,
     };
+    let theirs = agentplane::journal::Anchor::new(theirs, "file another-plane.json");
     let report = agentplane::audit::audit(
         &s,
         &runs,
         &agentplane::audit::Evidence {
-            prior: Some(&theirs),
+            anchors: std::slice::from_ref(&theirs),
             ..Default::default()
         },
     )
@@ -1059,12 +1062,18 @@ async fn an_audit_with_a_key_checks_who_wrote_it() {
         )
         .unwrap();
     let prior = s.checkpoint().await.unwrap();
+    // Two observers holding the same checkpoint: agreement, and the only shape
+    // in which an audit can say anything about a fork at all.
+    let held = [
+        agentplane::journal::Anchor::new(prior.clone(), "witness a.example"),
+        agentplane::journal::Anchor::new(prior.clone(), "witness b.example"),
+    ];
 
     let report = agentplane::audit::audit(
         &s,
         &[out.run_id],
         &agentplane::audit::Evidence {
-            prior: Some(&prior),
+            anchors: &held,
             verifier: Some(&verifier),
             require_signatures: true,
         },
@@ -1085,7 +1094,7 @@ async fn an_audit_with_a_key_checks_who_wrote_it() {
         &s,
         &[out.run_id],
         &agentplane::audit::Evidence {
-            prior: Some(&prior),
+            anchors: &held,
             verifier: Some(&wrong),
             require_signatures: true,
         },
@@ -1810,6 +1819,7 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         .checkpoint()
         .await
         .unwrap();
+    let anchor = agentplane::journal::Anchor::new(prior.clone(), "file prior.json");
     // What the audit reads at its start.
     sealed_runs(&store, 1).await;
     let stale = (store.clone() as Arc<dyn JournalStore>)
@@ -1828,7 +1838,7 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         &racing,
         &[],
         &agentplane::audit::Evidence {
-            prior: Some(&prior),
+            anchors: std::slice::from_ref(&anchor),
             ..Default::default()
         },
     )
@@ -1916,5 +1926,119 @@ async fn an_audit_report_carries_no_caller_payload() {
         !rendered.contains(SECRET),
         "an audit report quoted the caller's data, so it is not servable to a \
          model: {rendered}"
+    );
+}
+
+/// **An audit is held to every observation, not to the strongest one.**
+///
+/// The attack this closes, and it is the one witnessing exists for. An
+/// operator forks the log and hands the fork to a witness that has never seen
+/// this origin — a first submission needs no consistency proof, so it is
+/// cosigned. The honest witness still holds the shorter prefix it saw before
+/// the fork.
+///
+/// A reader who keeps only the *highest* anchor keeps the fork, verifies the
+/// forked store against it, and passes: the one observation that would expose
+/// the divergence is the one they dropped, because it is shorter. And
+/// `split_views` cannot save them — it reports equal sizes with unequal roots,
+/// and these two observers are at different sizes, which is the ordinary case
+/// it must not page on.
+///
+/// So the check has to be *every anchor, independently*. One honest observer
+/// anywhere in the set is then enough, and the finding names which one, because
+/// that observer is who an investigator asks for the history the store no
+/// longer has.
+#[tokio::test]
+async fn a_fork_is_caught_by_the_shorter_anchor_the_highest_would_have_hidden() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let runs = sealed_runs(&store, 5).await;
+    let s = store.clone() as Arc<dyn JournalStore>;
+
+    // The honest observer saw the log at size 5, before anything was touched.
+    let honest =
+        agentplane::journal::Anchor::new(s.checkpoint().await.unwrap(), "witness honest.example");
+
+    // The operator removes a run and carries on, so the store is now a history
+    // that no longer extends what the honest observer saw.
+    store.delete_run_for_test(runs[1]).await.unwrap();
+    let survivors: Vec<_> = runs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != 1)
+        .map(|(_, r)| *r)
+        .collect();
+    sealed_runs(&store, 3).await;
+
+    // A fresh observer is handed the rewritten history and cosigns it: it has
+    // nothing to compare against, so there is nothing for it to refuse. This is
+    // the **higher** of the two anchors.
+    let fresh =
+        agentplane::journal::Anchor::new(s.checkpoint().await.unwrap(), "witness fresh.example");
+    assert!(
+        fresh.checkpoint.size > honest.checkpoint.size,
+        "the fixture must make the fork the longer history, or it is not the attack"
+    );
+
+    // Against the fresh observer alone the store is perfectly consistent.
+    let fooled = agentplane::audit::audit(
+        &s,
+        &survivors,
+        &agentplane::audit::Evidence {
+            anchors: std::slice::from_ref(&fresh),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        fooled.findings.is_empty(),
+        "the fixture is wrong: the fork must be self-consistent against the observer \
+         it was fed to, or this test proves nothing about choosing anchors: {:?}",
+        fooled.findings
+    );
+    assert!(
+        fooled
+            .not_checked
+            .iter()
+            .any(|n| n.starts_with("equivocation")),
+        "an audit against a single anchor must say it can see nothing about a fork: {:?}",
+        fooled.not_checked
+    );
+
+    // Against both — which is what a reader who kept every answer holds — the
+    // divergence is a finding, and it names the observer that exposed it.
+    let held = [fresh.clone(), honest.clone()];
+    let caught = agentplane::audit::audit(
+        &s,
+        &survivors,
+        &agentplane::audit::Evidence {
+            anchors: &held,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let named: Vec<_> = caught
+        .findings
+        .iter()
+        .filter_map(|f| match f {
+            agentplane::audit::Finding::NotAppendOnly { obtained_from, .. } => {
+                Some(obtained_from.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        named,
+        vec!["witness honest.example".to_owned()],
+        "the fork was not caught by the observer that saw the history it diverged \
+         from — the whole point of holding the store to every anchor: {:?}",
+        caught.findings
+    );
+    assert_eq!(
+        caught.held_to.len(),
+        2,
+        "the report must name every observation it was held to, or a reader cannot \
+         tell how strong the verdict is"
     );
 }

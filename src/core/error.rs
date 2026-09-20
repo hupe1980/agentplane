@@ -214,6 +214,31 @@ pub enum RuntimeError {
     )]
     CanonicalizationChanged { recorded: u16, implemented: u16 },
 
+    /// The run's own history is sealed to a key that was destroyed, so this
+    /// build cannot read the plan it must replay.
+    ///
+    /// **A completed erasure, not a fault**, and the two call for opposite
+    /// responses — which is why this is its own variant rather than the
+    /// deserialization error the payload's shape produces. A sealed payload
+    /// arrives at the parser as `{"$sealed": "…"}`, and the parser says what a
+    /// parser says: a field is missing. An operator reading that goes looking
+    /// for a corrupt journal, for a version skew, for a bug. The journal is
+    /// intact, the chain still verifies, and nothing is wrong with the build:
+    /// the data is gone because somebody asked for it to be.
+    ///
+    /// **What is still available is the part that matters.** A run whose data
+    /// is erased can never execute again — its recorded effects cannot be read
+    /// back, so there is nothing to resume onto — but it can still be
+    /// *concluded*. A cancellation and an abandonment are recorded in the
+    /// clear and need no plan, so an operator is never left holding a run with
+    /// no verb that clears it.
+    #[error(
+        "run {run}'s recorded plan is sealed to a destroyed key: its payloads were \
+         erased, so it cannot be replayed or resumed. The journal is intact and \
+         still verifies, and nothing is wrong with this build"
+    )]
+    PayloadsErased { run: String },
+
     /// Nothing on this plane answers to the name `run` was given.
     ///
     /// Carries what the plane *does* provide, because the question a reader has

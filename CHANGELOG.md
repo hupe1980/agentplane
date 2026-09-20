@@ -16,7 +16,85 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.42.0] — unreleased
+## [0.43.0] — unreleased
+
+### Added
+
+- **A record beside an agent this plane does not run.** `observe::Session`
+  writes what somebody else's agent was asked, reported doing and was allowed
+  to do, as a run of its own with no admission, sealed under the outcome
+  `observed` and sharing no record kind with a dispatched effect. An `audit`
+  lists such runs as unadmitted; an `export` carries them. New:
+  `RecordKind::Observed`, `RunStatus::Observed`, `core::ObservedStep` →
+  [interop](https://hupe1980.github.io/agentplane/docs/interop/#observing-an-agent-you-do-not-run).
+
+- **`observe::Session::in_case` — bind an observed session to a matter.**
+  Correlate a case on the session id and *show me the record for session X* is
+  one indexed read. Without it, the answer is a scan of runs with the
+  `observed` outcome.
+
+- **`acp` — the Agent Client Protocol's session updates, mapped onto those
+  records.** Types only, pinned to `acp/v1`: the connection stays with the
+  editor that holds the session. The updates that carry evidence are recorded;
+  the rest come back as `Mapped::NotRecorded` carrying the wire's own spelling.
+
+### Fixed
+
+- **BREAKING: an audit is held to every checkpoint the auditor brought, not
+  the tallest one.** Picking the highest anchor picks a fork, because the
+  history fed to a fresh witness is the longest anybody holds.
+  `Evidence::anchors` replaces `prior` and each is checked separately;
+  `NotAppendOnly`, `WrongLog` and `Shrunk` name which one failed;
+  `export::verify` takes the same slice →
+  [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+- **BREAKING: a key ring that is down no longer reads as a completed
+  erasure.** Every sealing decorator left a payload sealed on any `KeyError`,
+  so an unreachable KMS was indistinguishable from data somebody had lawfully
+  destroyed. Only `Destroyed` is forgiven now. `SealedCases`, `SealedTasks`,
+  `SealedEvents` and `SealedPush` return `Result` where they returned a
+  value.
+
+- **BREAKING: a webhook credential is no longer dropped because the key ring
+  was down.** `SealedPush` returned the registration with its token removed and
+  the notification went out unauthenticated. A read that cannot get the
+  credential now fails, and the outbox retries.
+
+- **`erase_case` refuses a matter that is still open** —
+  `EraseError::CaseStillOpen`. Destroying the key freezes every run the case
+  covers: nothing can be replayed or unwound again. Conclude the runs, close
+  the matter, then erase.
+
+- **A run whose payloads were erased says so.** Resuming one complained about
+  a missing `version` field; it answers `RuntimeError::PayloadsErased` now.
+  Such a run could previously be neither resumed nor cancelled — `abandon`
+  closes it.
+
+- **An A2A task read could panic on a caller's argument.** `tasks/get` matched
+  an over-budget arm with `unreachable!`, correct only because that call site
+  passed no budget. The unmetered read is its own entry point now and cannot
+  return that variant.
+
+### Assurance
+
+- **A record kind's fields are held against the record body's.** `RecordKind`
+  is flattened into the body, so a variant field named after a body field is
+  one key on the wire — and it seals, hashes and re-derives cleanly, failing
+  only when something reads the record back. The rule was a comment on one
+  variant; it is a guard over every variant and every field now.
+
+- **Equivocation is model-checked.** `tla/Equivocation.tla` covers an operator
+  showing two histories of one log: what a single witness settles, what it
+  cannot, and which reader still sees the fork. Its two mutants are a reader
+  that keeps the tallest anchor and a witness that signs without recording.
+
+- **The containment measurement this project owes says what it has to
+  publish.** A deterministic gate has no attack-success rate — a deployment
+  does — so the policy bundle a run used, and how open its tasks were, are part
+  of the figure rather than footnotes under it →
+  [status](https://hupe1980.github.io/agentplane/docs/status/).
+
+## [0.42.0] — 2026-09-20
 
 ### Added
 

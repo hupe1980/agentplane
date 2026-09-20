@@ -25,6 +25,107 @@ same fact in two places, and the copy that drifts is always the second one.
 
 ---
 
+## An audit is held to every checkpoint you bring, not the tallest one
+
+**Affected:** anyone calling `audit::audit` or `export::verify`.
+
+`Evidence::prior` was one checkpoint, and the CLI picked the **highest** of
+whatever the witnesses answered. That ranking is sound about append-only growth
+and wrong about forks, which is what witnessing is for: an operator who forks a
+log and hands the fork to a witness that has never seen it gets it cosigned — a
+first submission has nothing to be checked against — and that fork is then the
+longest history anybody holds. Keeping the tallest anchor keeps the fork and
+discards the honest observer whose shorter checkpoint is the only evidence the
+divergence happened. `split_views` does not cover it either: the two
+observations are at *different* sizes, which it must not report on.
+
+```rust
+// Before
+Evidence { prior: Some(&checkpoint), .. }
+
+// Now — every observation, each checked separately
+let anchors = [
+    Anchor::new(from_a, "witness a.example"),
+    Anchor::new(from_b, "witness b.example"),
+];
+Evidence { anchors: &anchors, .. }
+```
+
+`Anchor` is `journal::Anchor` (re-exported as `audit::Anchor`): a checkpoint
+plus your own label for where you got it. The label is not a claim the audit
+checked — it cannot verify who vouched for a checkpoint — it is so a finding
+names the observer to go and ask.
+
+`AuditReport::held_to` is a `Vec<Anchor>` rather than `Option<Checkpoint>`, and
+`Finding::NotAppendOnly`, `WrongLog` and `Shrunk` each carry `obtained_from`.
+`export::verify` takes `&[Anchor]` in place of `Option<&Checkpoint>`; pass
+`&[]` where you passed `None`. An anchor at a size the export does not reach is
+reported in `not_checked` rather than silently ignored — a file carries no
+consistency proof, so `audit` against the store is what settles it.
+
+Auditing with a single anchor still works and now says what it cost: a
+`not_checked` line noting that one observation cannot see a fork.
+
+---
+
+## A sealed read that will not open fails, unless the key was destroyed
+
+**Affected:** anyone wiring `SealedCases`, `SealedTasks`, `SealedEvents` or
+`SealedPush` by hand; anyone calling `blob::erase_case`; anyone resuming a run
+whose case was erased.
+
+Every decorator left a payload sealed when it would not open, so that a lawful
+erasure could not make a worklist, a case listing, a dead-letter list or an
+audit unreadable. That is owed to one cause, and the code applied it to five:
+a key service you cannot reach, a wrapping-key version you retired, an envelope
+from a newer build and a payload that does not authenticate all read back as
+*erased*. An operator seeing that concludes the data is gone while it is
+sitting intact in the store — and on the push path the credential was dropped
+and the notification **delivered without the authentication it was registered
+with**.
+
+Only `KeyError::Destroyed` is forgiven now. Everything else is raised:
+
+```rust
+// Before: infallible, and an outage was indistinguishable from an erasure.
+let case: Option<Case> = cases.case(id).await?;      // sealed state, silently
+
+// Now: the same call, and a ring that is down says so.
+let case: Option<Case> = cases.case(id).await?;      // Err(StoreError::Backend(..))
+```
+
+The trait methods already returned `Result`, so most call sites do not move.
+What moves is the decorators' own helpers, which return `Result` where they
+returned a value — visible only if you call them directly rather than through
+the store traits.
+
+**`erase_case` refuses a matter that is still open.** Destroying the key
+freezes every run the case covers: their plans and effect outputs stop opening,
+so nothing can be replayed, resumed or unwound again. The rule was always the
+retention pass's — it selects closed cases and says why — and it now lives on
+the verb, where the Article 17 path meets it too. Conclude the runs, close the
+case, then erase:
+
+```rust
+cases.close(case).await?;
+blob::erase_case(blobs, cases, keyring, &tenant, case, at, reason).await?;
+```
+
+**A run whose payloads were erased says so.** Resuming one reported a parser's
+complaint about a missing `version` field; it answers
+`RuntimeError::PayloadsErased` now. Such a run can
+never execute again, and it is still closable — a quarantine decision is
+recorded in the clear and needs no plan, so `abandon` ends it:
+
+```rust
+plane.record_quarantine_decision(run, &operator, reason, QuarantineDecision::Abandon).await?;
+```
+
+Abandonment rather than cancellation, because a cancellation promises to put the
+world back and the arguments that would take are what was erased.
+
+---
+
 ## A rehearsal leaves a record, and `drill` takes the clock
 
 **Affected:** anyone implementing `CaseStore`; anyone calling `Runtime::drill`.

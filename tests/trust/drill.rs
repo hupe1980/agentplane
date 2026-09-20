@@ -105,8 +105,10 @@ async fn the_drill_tells_erasure_from_loss() {
     // Intact: sealed state that opens, bytes that hash.
     matter(&f, "SOUND-1", b"the artifact").await;
 
-    // Erased: the full ceremony — tombstones, then the case scope key.
+    // Erased: the full ceremony — closed first, because erasing under a live
+    // run is refused, then tombstones, then the case scope key.
     let erased = matter(&f, "ERASED-1", b"personal data").await;
+    f.cases.close(erased).await.expect("close");
     agentplane::blob::erase_case(
         Some(f.blobs.as_ref()),
         f.cases.as_ref(),

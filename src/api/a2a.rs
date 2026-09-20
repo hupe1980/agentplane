@@ -330,7 +330,14 @@ fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
         // request. Nothing narrows further here on purpose — which of this
         // plane's internal runs exists is not a peer's question, so the answer
         // is the same one for a run that does not exist at all.
-        RunStatus::Swept | RunStatus::BrokeGlass { .. } => TaskState::Rejected,
+        // An observed session joins them for the same reason and one more: it
+        // is not even this plane's work. No peer submitted it, nothing here
+        // executed it, and the only honest thing to tell a caller asking about
+        // somebody else's agent is the answer they get for a run that is none
+        // of their business.
+        RunStatus::Swept | RunStatus::BrokeGlass { .. } | RunStatus::Observed => {
+            TaskState::Rejected
+        }
     }
 }
 
@@ -1343,12 +1350,34 @@ impl A2aServer {
         self
     }
 
+    /// The single-task read, where one replay is the request's stated cost.
+    ///
+    /// A separate entry point rather than `artifacts_bounded(.., None)`,
+    /// because the caller that passes no budget cannot be handed
+    /// [`ArtifactRead::OverBudget`] — and saying that with `unreachable!` in a
+    /// request handler makes a caller's argument the only thing between a
+    /// JSON-RPC method and a panic. Here the type says it instead.
+    async fn artifacts_unmetered(
+        &self,
+        run: RunId,
+        state: TaskState,
+    ) -> Result<Option<Vec<A2aArtifact>>, crate::core::RuntimeError> {
+        match self.artifacts_bounded(run, state, None).await? {
+            ArtifactRead::Artifacts(artifacts) => Ok(artifacts),
+            // Unreachable by construction — no budget, nothing to exceed — and
+            // answered rather than asserted: an empty artifact list is what a
+            // task with none looks like, which is the honest reading of "this
+            // read produced none".
+            ArtifactRead::OverBudget => Ok(None),
+        }
+    }
+
     /// A task's artifacts, replaying at most once per sealed run.
     ///
     /// Consults [`ArtifactCache`] first and fills it for completed runs; the
     /// uncached fall-through is [`task_artifacts`]. `budget` is decremented on
-    /// every actual replay, and `None` for the budget means unmetered — the
-    /// single-task paths, where one replay is the request's stated cost.
+    /// every actual replay; `None` means unmetered, which reaches here only
+    /// through [`artifacts_unmetered`](Self::artifacts_unmetered).
     ///
     /// A budget hit comes back as [`ArtifactRead::OverBudget`], never as an
     /// absent list, so the caller must decide how to mark it — silence here
@@ -2502,14 +2531,10 @@ async fn load_task(
     task.history = task_history(id, &records, history_length, case.as_deref());
     // Unmetered: one task, one replay, and the sealed-run cache spares the
     // poll loop that reads the same finished task every few seconds.
-    task.artifacts = match server
-        .artifacts_bounded(id, state, None)
+    task.artifacts = server
+        .artifacts_unmetered(id, state)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?
-    {
-        ArtifactRead::Artifacts(artifacts) => artifacts,
-        ArtifactRead::OverBudget => unreachable!("an unmetered read has no budget to exceed"),
-    };
+        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
     serde_json::to_value(task)
         .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))
 }
@@ -2917,10 +2942,11 @@ pub(super) fn sealed_state(outcome: &str) -> TaskState {
         "succeeded" => TaskState::Completed,
         "cancelled" => TaskState::Canceled,
         "suspended" => TaskState::InputRequired,
-        // Not tasks at all: nobody submitted this plane's record of a sweep or
-        // of an operator crossing a tenant boundary. `state_of` decides that
-        // and this agrees, which is the direction the test beside it enforces.
-        "swept" | "broke-glass" => TaskState::Rejected,
+        // Not tasks at all: nobody submitted this plane's record of a sweep, of
+        // an operator crossing a tenant boundary, or of a session it merely
+        // watched somebody else's agent run. `state_of` decides that and this
+        // agrees, which is the direction the test beside it enforces.
+        "swept" | "broke-glass" | crate::runtime::OBSERVED_OUTCOME => TaskState::Rejected,
         _ => TaskState::Failed,
     }
 }
@@ -3332,7 +3358,7 @@ mod state_agreement_tests {
         let statuses = crate::runtime::every_status();
         assert_eq!(
             statuses.len(),
-            11,
+            12,
             "a RunStatus variant was added or removed — decide which A2A state it \
              surfaces as, in `state_of` and in `sealed_state` both"
         );

@@ -25,6 +25,26 @@ Three rules, all of them stated in `concepts/README.md`:
    folder, and `cargo doc` never sees these files. A renamed method leaves the
    design document quietly describing a surface that no longer exists, which is
    worse here than a dangling link — the reader has no reason to doubt it.
+6. **A published deferral is owned by the roadmap.** `site/content/docs/status.md`
+   tells an adopter what this project is waiting on, "so a reader can tell
+   whether their own need would move it". An entry there the roadmap does not
+   claim is a promise made outside the building with no work behind it — and it
+   happened: symbolic policy analysis was published as deferred and appeared
+   nowhere in this folder ([§10.5](SHAPES.md#105-shapes-of-mistake) shape 60).
+   Whatever claims it carries `**Published as deferred:**` with the entry's own
+   words, and both directions are checked. An *item* is the usual claimant and
+   not the only honest one: a wait that is prose rather than work — because
+   nothing here can start it — owns its deferral the same way, by naming it and
+   saying what would settle it.
+5. **A deferred cost is named where it will be paid.** A decision that parks a
+   durable-format change until the format freeze marks itself a *pre-freeze
+   record change*, and the freeze act is the one place that list is worth
+   reading — because the act is what converts "cheapest moment" into "upcaster
+   and a version bump, forever". Recorded only at the decision, each is
+   findable and the act is still priced by nobody
+   ([§10.5](SHAPES.md#105-shapes-of-mistake) shape 59). Both directions are
+   checked: a marked decision the freeze item does not name, and a cost the
+   freeze item names that no decision carries any more.
 """
 
 from __future__ import annotations
@@ -178,6 +198,85 @@ def main() -> int:
                     f"A design document describing a surface that no longer exists "
                     f"is worse than a dangling link: the reader has no reason to doubt it"
                 )
+
+    # 5. Deferred format costs, named where they will be paid.
+    #
+    # The subject is the decision's own bolded lead, so the two lists are held
+    # together by the sentence a reader searches for rather than by a tag only
+    # this script understands — which is `concepts/README.md`'s citation rule
+    # ("quote the decision's claim, or name it") made checkable for the one
+    # class where forgetting is expensive.
+    decisions = docs.get("DECISIONS.md", "")
+    deferred: set[str] = set()
+    for m in re.finditer(r"^- (.+?)(?=\n- |\n#|\Z)", decisions, re.M | re.S):
+        body = m.group(1)
+        if "pre-freeze record change" not in body.replace("*", ""):
+            continue
+        lead = re.match(r"\*\*(.+?)\*\*", body, re.S)
+        if not lead:
+            faults.append(
+                "DECISIONS.md: a pre-freeze record change with no bolded subject "
+                "— the freeze item has nothing to quote"
+            )
+            continue
+        deferred.add(" ".join(lead.group(1).split()).rstrip("."))
+
+    freeze = re.search(
+        r"^### Perform the freeze$(.*?)(?=^#{1,3} )", docs.get("ROADMAP.md", ""), re.M | re.S
+    )
+    if deferred and not freeze:
+        faults.append(
+            "ROADMAP.md: no `### Perform the freeze` item, and DECISIONS.md defers "
+            "a record change to it"
+        )
+    elif freeze:
+        listed = {
+            " ".join(m.group(1).split()).rstrip(".")
+            for m in re.finditer(r"^- \*\*(.+?)\*\*", freeze.group(1), re.M | re.S)
+        }
+        for subject in sorted(deferred - listed):
+            faults.append(
+                f"DECISIONS.md: {subject!r} is a pre-freeze record change and the "
+                f"freeze item does not name it. A cost recorded only where it was "
+                f"deferred is priced by nobody at the act that pays it"
+            )
+        for subject in sorted(listed - deferred):
+            faults.append(
+                f"ROADMAP.md: the freeze item names {subject!r}, and no decision "
+                f"carries it as a pre-freeze record change any more"
+            )
+
+    # 6. Published deferrals, owned by an item.
+    #
+    # The site is tracked and this folder is not, which is why the join lives
+    # here and not in `tests/guards/docs.rs`: a test cannot read the roadmap.
+    status = ROOT.parent / "site" / "content" / "docs" / "status.md"
+    if status.is_file():
+        section = re.search(r"^### Deferred$(.*?)(?=^## )", status.read_text(), re.M | re.S)
+        published: set[str] = set()
+        if section:
+            for entry in re.finditer(r"^\*\*(.+?)\*\*", section.group(1), re.M | re.S):
+                lead = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", entry.group(1))
+                published.add(" ".join(lead.split()).rstrip(".").strip(" —-"))
+        claimed = {
+            " ".join(m.group(1).split()).rstrip(".")
+            for m in re.finditer(
+                r"^\*\*Published as deferred:\*\*\s+(.+?)$",
+                docs.get("ROADMAP.md", ""),
+                re.M,
+            )
+        }
+        for subject in sorted(published - claimed):
+            faults.append(
+                f"status.md defers {subject!r} and the roadmap does not claim it. A "
+                f"gap named to an adopter and to nobody here is a promise with no "
+                f"work behind it"
+            )
+        for subject in sorted(claimed - published):
+            faults.append(
+                f"ROADMAP.md claims {subject!r} as published-deferred, and the "
+                f"status page does not defer it under that name"
+            )
 
     checked = sum(len(re.findall(r"\]\([A-Z][A-Za-z]*\.md", t)) for t in docs.values())
     print(

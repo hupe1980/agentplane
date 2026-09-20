@@ -221,6 +221,28 @@ and the chain keep working with no key at all. And the chain commits to the
 run whose payloads have been erased — hashing the plaintext would have tied
 the tamper evidence to the key and destroyed both together.
 
+**A payload that will not open means one thing only: the key was destroyed.**
+Every surface that reads sealed data leaves such a payload sealed rather than
+failing — an erased matter must not make a worklist, a case listing, a
+dead-letter list or an audit unreadable. Nothing else is forgiven. A key
+service you cannot reach, a wrapping-key version you retired, an envelope
+written by a newer build, and a payload that does not authenticate are each
+raised as themselves, because reported as *erased* they tell you data is gone
+that is sitting intact in your store. The sharpest case is a webhook
+credential: dropped, the notification goes out **without the authentication it
+was registered with**, so a `KeyError::Unavailable` there is a read that fails
+and a delivery that waits.
+
+**A run whose payloads were erased says so, and you can still close it.**
+Resuming one answers `RuntimeError::PayloadsErased` rather than a parser's
+complaint about a missing field — the journal is intact and still verifies;
+the data is gone because somebody asked. Such a run can never execute again,
+and it is still concludable: `POST /runs/{run}/abandon` (or
+`Runtime::record_quarantine_decision` with `QuarantineDecision::Abandon`) is
+recorded in the clear, needs no plan, and ends it. Abandonment rather than
+cancellation, because a cancellation promises to put the world back and the
+arguments it would need are what was erased.
+
 **Events are the one thing not erased by the case, and that is forced.** An
 event is buffered *before* any subscription matches it, and one nobody claims
 becomes a **dead letter** — which by definition matched no case at all, and is
@@ -261,6 +283,14 @@ key and takes the journal copies with it — or keeps the data out, which is wha
 
 `erase_case` and `erase_run` erase one unit. Retention is the same act on a
 clock: a window, applied to every closed case, by the plane.
+
+**`erase_case` refuses a matter that is still open**, for the same reason the
+pass only selects closed ones: destroying the key freezes every run the case
+covers. Their plans and effect outputs stop opening, so none of them can be
+replayed, resumed or unwound again — the work is over whether or not anybody
+decided it should be. Conclude the runs, close the case, then erase. The
+refusal is typed (`EraseError::CaseStillOpen`) and nothing is destroyed before
+it.
 
 ```rust
 let report = plane.retain(cutoff, now, "retention: 7 years from opening").await?;
