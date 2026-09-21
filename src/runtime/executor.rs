@@ -2464,10 +2464,14 @@ impl Runtime {
     /// because a ceiling that yields when its accounting is down is a ceiling an
     /// attacker removes by taking the accounting down.
     ///
-    /// Live admission only. Replay and resume never come through here, which is
-    /// deliberate — re-checking a quota during replay would let a run that
-    /// happened produce a different history when it is re-read, and a ceiling
-    /// crossed since admission would rewrite the past into a refusal.
+    /// Live admission only, and replay and resume are skipped for **different**
+    /// reasons. Re-checking during replay would let a run that happened produce
+    /// a different history when it is re-read: a ceiling crossed since admission
+    /// would rewrite the past into a refusal. Resume is not that — it decides
+    /// only what happens next — and it is ungated because refusing it strands a
+    /// run mid-saga with its reversals unrun. What that costs the ceiling is
+    /// stated where the ceiling is defined ([`crate::quota`]); it is a real cost
+    /// rather than an absent one.
     async fn check_quota(
         &self,
         run: RunId,

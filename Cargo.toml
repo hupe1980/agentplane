@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.43.0"
+version      = "0.44.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -201,7 +201,10 @@ serde_yaml_ng = { version = "0.10", optional = true }
 # that makes sense to assume.
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"], optional = true }
 opendal     = { version = "0.59", default-features = false, features = ["services-fs"], optional = true }
-cedar-policy = { version = "4.12.0", default-features = false, optional = true }
+# The lower bound is load-bearing: `first_unreachable` matches
+# `ValidationWarning::InvalidActionApplication`, which 4.13.0 is the first
+# release to have. Earlier ones do not compile.
+cedar-policy = { version = "4.13.0", default-features = false, optional = true }
 tokio-postgres = { version = "0.7.18", optional = true, features = [
   # `jsonb` parameters for a co-located resource. Without it `SqlValue::Json`
   # would have to be bound as text, and a resource updating a jsonb column
@@ -484,8 +487,8 @@ missing_errors_doc      = "allow"
 missing_panics_doc      = "allow"
 must_use_candidate      = "allow"
 
-# Seven from `nursery`, named individually rather than by group, because each
-# catches something *wrong* rather than merely unusual: work done on a path that
+# Named individually rather than by group, because each of these catches
+# something *wrong* rather than merely unusual: work done on a path that
 # discards it, a clone nothing needs, a `&mut` that does not mutate, a doc
 # summary too long to read in an index.
 #

@@ -470,6 +470,42 @@ fn a_record_from_a_shape_this_build_does_not_know_is_refused() {
     );
 }
 
+/// **A field this build does not know is refused at a version it does know.**
+///
+/// The version check above cannot see this one. Every durable version here is
+/// `1` until the format freezes, and a hard cut changes a shape without touching
+/// it, so *same version, different shape* is the skew this format actually meets
+/// — and the arm that would catch a version difference is never taken for it.
+///
+/// What refuses it is `deny_unknown_fields` on `RecordKind`, which is flattened
+/// into the body. That pairing is a serde combination with its own caveats
+/// rather than an obvious one, so it is pinned here: a reader that took serde's
+/// defaults for a field it could not see would decide over a record it had not
+/// fully read, which is the same danger the version arm exists for.
+#[test]
+fn a_record_with_a_field_this_build_does_not_know_is_refused() {
+    let mut value = serde_json::to_value(body(RecordKind::StepStarted {
+        skill: "orders.book".into(),
+    }))
+    .expect("serialises");
+    value
+        .as_object_mut()
+        .expect("a record body is an object")
+        .insert("smuggled".into(), json!("x"));
+    let raw = serde_json::to_vec(&value).expect("serialises");
+    let hash = Digest::chain(Digest::ZERO, &raw);
+
+    let err = Record::from_stored(raw, Digest::ZERO, hash)
+        .expect_err("an unknown field is not read past");
+    assert!(
+        matches!(
+            err,
+            agentplane::core::StoreError::UnreadableRecordShape { version: 1, .. }
+        ),
+        "got {err:?}"
+    );
+}
+
 /// And it is refused as a **version**, never as damage.
 ///
 /// A rolling deploy that put a writer ahead of its readers must not reach an

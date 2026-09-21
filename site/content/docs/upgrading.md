@@ -12,9 +12,11 @@ call site that stops working is the intended way to find out. What this page owe
 you is the *reason* and the shortest correct fix — a refusal you have to reverse
 engineer costs an afternoon, which is one afternoon more than the change saved.
 
-Every entry here is a **parse-time, build-time, read-time or replay-time**
-refusal. None of them changes what a running agent does silently, which is the
-property that makes a hard cut acceptable at this stage.
+Almost every entry here is a **parse-time, build-time, read-time or
+replay-time** refusal: you find out by something failing, not by something
+quietly behaving differently. That is what makes a hard cut acceptable at this
+stage, and where an entry is **not** of that kind it says so in its own first
+line and tells you what to do before upgrading.
 
 **How to read it.** Entries are newest first, in the same order the
 [changelog](https://github.com/hupe1980/agentplane/blob/main/CHANGELOG.md)
@@ -22,6 +24,38 @@ releases them. Start at the top and stop at the first change you already have �
 everything above that point is what moved since you last looked. The changelog
 is where the version each landed in is recorded; repeating it here would be the
 same fact in two places, and the copy that drifts is always the second one.
+
+---
+
+## A producer-scoped key is length-prefixed, and this one is not a refusal
+
+**Read this before upgrading — it is the only silent change on this page.**
+
+**Affected:** anyone whose event buffer holds undelivered messages, and anyone
+whose A2A peers retry a `messageId`, at the moment of the upgrade.
+
+**Why.** `(source, id)` was joined with U+001F, and a separator makes a pair
+look unforgeable without making it so: `("bus\u{1f}x", "EV-1")` and
+`("bus", "x\u{1f}EV-1")` spell the same bytes. A producer that chose either half
+of its own pair could spell another's, and the victim's next message then
+arrives, matches, and is dropped as that producer's own retry — suppressed, not
+refused. `core::origin_key` puts the source's byte length in front instead, so
+the split is read rather than searched for and no pair can spell another
+whatever either half contains. Validating the halves would not do: one is
+derived from a deployment's own `Authenticator`.
+
+**What it costs, and it is the reason this entry exists.** Every such key moves,
+and nothing refuses an old one — there is no old key to read, only a new key that
+matches no row. A message redelivered across the upgrade is buffered a second
+time. A peer retrying a `messageId` across the upgrade is admitted as a **second
+run** in the right case, which is the exact defect the key exists to prevent,
+caused once by the upgrade itself.
+
+**What to do.** Drain before you upgrade: let waiting runs take their events and
+let peers settle their retries, then cut over. If you cannot drain, the exposure
+is bounded — at most one duplicate per message actually in flight — and
+`agentplane attention` lists the runs to look at afterwards. A store keyed on the
+old spelling is rebuilt the ordinary way, from an export.
 
 ---
 

@@ -91,11 +91,11 @@ anchors:
 # specification and reads no Rust. Three checks, and the last is the one that
 # keeps the others honest:
 #
-#   --canon-check  re-derives all 27 record vectors from their parsed values,
-#                  so the bytes are *produced* by a second implementation and
-#                  not merely accepted by one
+#   --canon-check  re-derives every record vector from its parsed values, so
+#                  the bytes are *produced* by a second implementation and not
+#                  merely accepted by one
 #   (no flag)      verifies the sealed export, chain, log, cases and frame
-#   --self-test    damages that export six ways and asserts each is reported —
+#   --self-test    damages that export and asserts every damage is reported —
 #                  a reader that answers "0 findings" for everything agrees
 #                  with this crate perfectly and is worth nothing
 #

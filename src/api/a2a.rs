@@ -2358,14 +2358,16 @@ async fn spawn_a2a(
 /// message id, inside the case the caller named or a fresh one, and **acting
 /// as the caller** where the credential carried a chain.
 ///
-/// The key carries its producer, in the spelling `InboundEvent::dedup_key`
-/// blesses: a bare `messageId` would let two counterparties swallow each
-/// other's messages as apparent retries — or *join* each other's cases, since
-/// correlation matches any open case in the tenant. And it is an **admission**
-/// key, not only a correlation key: this crate's own client keeps `messageId`
-/// stable across retries precisely so a peer can deduplicate, and a server
-/// that correlates without deduplicating starts a second run inside the right
-/// case.
+/// The key carries its producer, in
+/// [`origin_key`](crate::core::origin_key)'s spelling: a bare `messageId` would
+/// let two counterparties swallow each other's messages as apparent retries —
+/// or *join* each other's cases, since correlation matches any open case in the
+/// tenant. And it is an **admission** key, not only a correlation key: this
+/// crate's own client keeps `messageId` stable across retries precisely so a
+/// peer can deduplicate, and a server that correlates without deduplicating
+/// starts a second run inside the right case. A different key space from an
+/// event's, and the same construction, because the forgery it refuses is the
+/// same one.
 ///
 /// The chain is the caller's, never the plane's: a plane that admitted every
 /// peer's run under its own chain would answer "on whose behalf" with the same
@@ -2375,7 +2377,7 @@ fn run_terms(
     caller: &Caller,
 ) -> Result<crate::runtime::RunTerms, crate::core::RuntimeError> {
     let source = super::peer_source(&caller.actor);
-    let keyed = format!("{source}\u{1f}{}", message.message_id);
+    let keyed = crate::core::origin_key(&source, &message.message_id);
     let mut terms = crate::runtime::RunTerms::default().once(&keyed);
     if let Some(chain) = caller.acting_as.as_ref() {
         terms = terms.acting_as(chain.clone());

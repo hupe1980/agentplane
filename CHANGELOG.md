@@ -16,7 +16,64 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.43.0] — unreleased
+## [0.44.0] — unreleased
+
+### Security
+
+- **BREAKING (wire): a producer can no longer spell another producer's
+  `(source, id)`.** Joined with U+001F, `("bus\u{1f}x", "EV-1")` and
+  `("bus", "x\u{1f}EV-1")` were one key, so an emitter could pre-empt another's
+  next message as an apparent retry — a silent suppression. `core::origin_key`
+  puts the source's length in front instead. Event dedup and A2A admission keys
+  both move; **drain before upgrading** →
+  [upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/).
+
+### Fixed
+
+- **`cedar-policy`'s lower bound is `4.13.0`, the first release this adapter
+  compiles against.** It said `4.12.0`, which has no
+  `ValidationWarning::InvalidActionApplication` — so a build resolving the low
+  end of the range did not compile. Nothing else changes; every resolution that
+  worked still resolves the same version.
+
+- **The export self-test is published with the damage it actually does.** The
+  assurance page and the README said six cases and listed six; the seventh — a
+  framing member from a later writer — has run all along and was named in
+  neither. The check is unchanged; what an evaluator reads about it is not.
+
+- **The tenant spend ceiling's overshoot is documented as what it is.** The
+  crate and the operator guide both said *at most the concurrency ceiling times
+  the per-run budget*. Resumes are never gated and suspended runs are unbounded,
+  so a tenant with a thousand runs awaiting approval can carry a thousand per-run
+  budgets past a crossed ceiling. No code changes; what you size ceilings from
+  does.
+
+- **Every metered budget refusal states its rule rather than a tally.** These
+  ceilings stop the *next* operation once the figure is **at** the limit, so
+  `1s permitted, 1s elapsed` read as an off-by-one. Effects, tokens, money and
+  wallclock now read `nothing further starts at or past 1s; 1s elapsed`. The
+  record's structured `exhaustion` is unchanged, and `elapsed_secs` documents
+  that it counts second boundaries.
+
+### Known
+
+- **Per-capability aggregates are refused, and the page an adopter reads says
+  so.** A plane query for run count, effect count, outbound bytes, denials and
+  outcome mix per capability is not coming: an export already carries every
+  record, so each effect's `outbound_bytes` joins to its run's `capability` — a
+  distribution, where the query would be a summary, and the *median* such a
+  baseline is wanted for cannot be computed from totals at all →
+  [status](https://hupe1980.github.io/agentplane/docs/status/#deliberately-not-built).
+
+### Assurance
+
+- **An unknown field at a known record version is pinned as refused.** The
+  version arm is never taken for it — every durable version is `1` until the
+  freeze, and a hard cut changes a shape without touching it — so the refusal
+  rested on `deny_unknown_fields` surviving a `flatten`, which nothing checked.
+  It does, and now a mutation says so.
+
+## [0.43.0] — 2026-09-20
 
 ### Added
 
@@ -792,8 +849,8 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
 ### Assurance
 
-- **The disaster-recovery release blocker is discharged, and the roadmap's
-  release-blocker list is empty.** The drill now runs against a real
+- **The disaster-recovery release blocker is discharged, and no release
+  blockers remain.** The drill now runs against a real
   `PostgreSQL` server, restores into a tenant of a database another tenant is
   using, and ends by admitting new work whose seal extends the restored log.
   RPO/RTO targets are on the operations page.
@@ -809,8 +866,8 @@ Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
   on work that cannot block it. Eight remain.
 - **The design is graded against the OWASP Top 10 for Agentic Applications.**
   Five of ten rows carry no residual, four carry one that is now written down,
-  and one states a non-goal — and the residuals are what the roadmap's
-  milestones are made of. Internal documents only; nothing in the crate moved.
+  and one states a non-goal, with every residual written down. Internal
+  documents only; nothing in the crate moved.
 - The mutation harness can anchor a unit test inside a binary.
 - Mutation count **738**.
 

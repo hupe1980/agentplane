@@ -107,10 +107,10 @@ just verify-golden
   8785's own number vectors, the one part of canonicalization no record reaches.
 - The default pass **verifies the sealed export**: chains, log positions, the
   Merkle root, the case layer, the frame.
-- **`--self-test`** damages that export six ways — an edited readable body, a
-  flipped wire byte, a record removed from the middle, a rewritten log leaf,
-  the case layer dropped, the trailer cut off — and asserts each one is
-  reported. A second reader that answers *0 findings* for everything agrees
+- **`--self-test`** damages that export — an edited readable body, a flipped
+  wire byte, a record removed from the middle, a rewritten log leaf, the case
+  layer dropped, the trailer cut off, a framing member from a later writer —
+  and asserts each one is reported. A second reader that answers *0 findings* for everything agrees
   with this crate perfectly and is worth nothing.
 
 What it still does not buy: it is one reader, written by the same project, from

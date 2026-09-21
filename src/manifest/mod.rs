@@ -1641,8 +1641,8 @@ impl Manifest {
     /// first step or its first effect — of any kind, on any agent. Reported
     /// from a deployment that wrote `max_tokens: 0` on an agent with no models
     /// at all, meaning "this one does not get to spend money"; every run it
-    /// ever made died on a read-only tool call with `token budget exhausted: 0
-    /// permitted, 0 consumed`.
+    /// ever made died on a read-only tool call with `token budget exhausted:
+    /// nothing further starts at or past 0 token(s); 0 consumed`.
     ///
     /// It is refused rather than reinterpreted because both readings are
     /// defensible — "no budget" and "no limit" are the two things a zero could

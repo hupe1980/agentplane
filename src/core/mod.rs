@@ -67,7 +67,7 @@ pub use error::{
     Disposition, EffectError, PolicyError, REFUSED, RuntimeError, SkillError, StepError, StoreError,
 };
 pub use event::{
-    AwaitSpec, DeadLetter, Delivery, InboundEvent, Subscription, SuspendReason, Timer,
+    AwaitSpec, DeadLetter, Delivery, InboundEvent, Subscription, SuspendReason, Timer, origin_key,
 };
 pub use id::{
     BatchId, CaseId, Digest, EffectKey, Epoch, MAX_WINDOW_SECONDS, Phase, RunId, Seq, StepId,

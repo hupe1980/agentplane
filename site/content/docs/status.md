@@ -161,6 +161,24 @@ Recording what such a session did is a different question and the answer is
 yes — see [keeping a record beside an agent you do not
 run](@/docs/interop.md#observing-an-agent-you-do-not-run).
 
+**Per-capability aggregates as a plane query** — run count, effect count,
+outbound bytes, denials and outcome mix for a capability over a window. The
+figures are already yours in a stronger form: an export carries **every** record,
+so each effect's `outbound_bytes` joins to its run's `capability`, and that is a
+distribution rather than a summary. *Forty times the median for its capability*
+needs the distribution; a fixed vector of totals can only give you a mean, so the
+query would not answer the question that motivates it. Load an export into
+whatever you already run and you get medians, percentiles and any window you
+like.
+
+The two queries that look like precedent are not. `count_by_outcome` and
+`waiting_runs` each answer an operator verb — a worklist to clear, runs to
+re-arm — and exist because [a finding must reach whoever must act on
+it](@/docs/concepts.md). A baseline names nothing anybody does next; it is input
+to a detector a deployment builds, and the deployment is where it belongs. What
+would change this: a figure an operator acts on *in the plane* that an export
+cannot supply, which is a different request from this one.
+
 **The operator verbs on the MCP tool list.** Every operator route already
 carries its own `api:` capability over HTTP, so an external agent can drive the
 plane today; projecting those verbs onto a tool list would add discovery, not

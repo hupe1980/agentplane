@@ -1617,9 +1617,15 @@ strand a run waiting on something that has now happened.
 admission checks that key and settlement charges the pass to the same key even
 when midnight or month-end passes before it finishes. A later resume is a new
 pass in its resume period. Recomputing at completion would authorize against one
-ledger and debit another. A run already executing when the ceiling is crossed
-therefore runs to completion, so the overshoot is at most the concurrency
-ceiling times the per-run budget.
+ledger and debit another.
+
+**Size for what it leaves unbounded.** The period ceiling bounds what a tenant
+may *start*. Work already admitted finishes, resumes are not refused, and each
+is held only to its own budget — so a tenant with a thousand runs awaiting
+approval can carry a thousand per-run budgets past a crossed ceiling. Only the
+period ceiling and the per-run budget together bound a period. A halt does not
+close it: the workload scopes stop admission, and only a `subject:` halt reaches
+work already running.
 
 Wiring a quota store records every active run even when all ceilings are
 `None`. That keeps `running()` truthful for operators and means adding a limit

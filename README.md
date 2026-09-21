@@ -356,7 +356,7 @@ of this crate's Rust — enforced by a guard, because a verifier that consulted
 `src/` would agree with the implementation by construction. `just verify-golden`
 runs it: it **re-derives** all 30 record vectors from their parsed values with
 its own canonicalizer and chain digest, verifies the sealed export end to end,
-and then damages that export six ways and asserts each is reported. Vectors a
+and then damages that export and asserts every damage is reported. Vectors a
 project generates and then checks are that project agreeing with itself; this
 is the part that is not.
 

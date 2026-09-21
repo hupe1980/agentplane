@@ -448,6 +448,16 @@ It stops the **next** step. Nothing here interrupts a call already in flight —
 a ceiling that could would have to abort mid-effect, which is the thing the
 whole runtime is arranged to avoid.
 
+**It counts second boundaries rather than measuring a duration.** Elapsed time
+is the difference between two journaled unix timestamps, so the same 1.4 s of
+work reads as `1` or `2` depending on where in a second it began. That is what
+makes the ceiling replayable, and it means you set this as an outer bound on a
+run, never as a stopwatch on a step.
+
+A run permitted `1s` and refused at `1s` elapsed has not hit an off-by-one:
+every metered ceiling here stops the *next* operation once the figure is **at**
+the limit. The refusal says so rather than leaving you to infer it.
+
 Budgets bind the whole run including delegation: `commission` is an effect, so a
 sub-run's reported spend is billed to the run that ordered it.
 

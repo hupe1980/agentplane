@@ -255,8 +255,10 @@ pub struct Budget {
     /// Wall-clock ceiling.
     ///
     /// Costs one journaled clock read per step boundary when set — see the
-    /// module docs. Checked against elapsed time, which starts at zero, so a
-    /// zero ceiling refuses the first step.
+    /// module docs. Checked against
+    /// [`Consumed::elapsed_secs`](Consumed::elapsed_secs), which counts second
+    /// boundaries rather than measuring a duration and starts at zero, so a zero
+    /// ceiling refuses the first step.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_wallclock_secs: Option<u64>,
     /// How many of a plan's ready steps may run at once.
@@ -478,6 +480,17 @@ pub struct Consumed {
     /// failing call retried forever, costing nothing on paper.
     pub effects: usize,
     pub spend: Spend,
+    /// Whole seconds between the first and last journaled clock reading.
+    ///
+    /// A difference of unix timestamps rather than a duration, so it counts
+    /// second *boundaries crossed*: the same 1.4 s of work reads as `1` or `2`
+    /// depending on where in a second it began, and two runs of one workload
+    /// can report different figures. That is deliberate and is what makes the
+    /// ceiling replayable — a duration measured off the wall clock would give a
+    /// different verdict on every look, and a resumed run would replay as
+    /// healthy. What it costs is that this is not a stopwatch: a ceiling set
+    /// close to a step's real cost admits a step at one starting instant and
+    /// refuses the same step a fraction of a second later.
     pub elapsed_secs: u64,
     /// Policy refusals this run has accrued.
     #[serde(default)]
@@ -498,6 +511,20 @@ pub struct Consumed {
 ///
 /// Carries the numbers rather than a message: an operator raising a limit needs
 /// to know what it actually reached, and "budget exhausted" does not say.
+///
+/// # Why the messages state a rule and not a tally
+///
+/// Every metered ceiling here is a **pre-dispatch gate on reaching the limit**:
+/// nothing further starts once the figure is at the ceiling, because a step that
+/// would exceed it must not half-run and then be stopped. The refusal is
+/// therefore raised at `used == allowed`, where *`{allowed} permitted, {used}
+/// consumed`* prints two equal numbers beside the word *exhausted* and reads
+/// like an off-by-one. Telling otherwise means finding the comparison in this
+/// file, and a refusal message is the one artifact put in front of somebody who
+/// never will. So each states its rule. [`Egress`](Self::Egress) is the
+/// exception twice over: an outbound size is known before dispatch, so that
+/// ceiling is exact rather than reached, and its message says what the refused
+/// call would have sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[non_exhaustive]
 #[serde(tag = "limit", rename_all = "snake_case")]
@@ -505,7 +532,10 @@ pub enum BudgetExceeded {
     #[error("step budget exhausted: {allowed} step(s) permitted")]
     Steps { allowed: usize },
 
-    #[error("effect budget exhausted: {allowed} operation(s) permitted, {used} performed")]
+    #[error(
+        "effect budget exhausted: nothing further starts at or past {allowed} \
+         operation(s); {used} performed"
+    )]
     Effects { allowed: usize, used: usize },
 
     #[error("replan budget exhausted: {allowed} replan(s) permitted")]
@@ -529,13 +559,22 @@ pub enum BudgetExceeded {
         used: String,
     },
 
-    #[error("token budget exhausted: {allowed} permitted, {used} consumed")]
+    #[error(
+        "token budget exhausted: nothing further starts at or past {allowed} \
+         token(s); {used} consumed"
+    )]
     Tokens { allowed: u64, used: u64 },
 
-    #[error("cost budget exhausted: {allowed} minor units permitted, {used} spent")]
+    #[error(
+        "cost budget exhausted: nothing further starts at or past {allowed} \
+         minor unit(s); {used} spent"
+    )]
     Money { allowed: u64, used: u64 },
 
-    #[error("time budget exhausted: {allowed}s permitted, {used}s elapsed")]
+    #[error(
+        "time budget exhausted: nothing further starts at or past {allowed}s; \
+         {used}s elapsed"
+    )]
     Wallclock { allowed: u64, used: u64 },
 
     /// The run tried to send more than it may.

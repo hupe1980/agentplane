@@ -36,12 +36,23 @@
 //! work a tenant can push in, which is the lever a noisy neighbour actually
 //! pulls.
 //!
-//! **Spend** bounds a period, and it is checked at admission rather than
-//! mid-run. A run already executing when the ceiling is crossed finishes. The
-//! overshoot is therefore bounded and computable rather than unknown: at most
-//! the concurrency ceiling times the per-run budget, both of which the
-//! deployment sets. A tighter cap would mean consulting the store on every
+//! **Spend** bounds *admission*, and it is checked there rather than mid-run. A
+//! run already admitted when the ceiling is crossed keeps spending until it
+//! finishes, and so does one that resumes afterwards — a resume is not gated,
+//! for the reason above. A tighter cap would mean consulting the store on every
 //! effect, which buys exactness at the cost of a round trip per step.
+//!
+//! **The overshoot is therefore not what it looks like.** Each run is bounded by
+//! its own budget, which survives suspension: the ledger bills replayed history
+//! as it was billed live, so no number of resumes buys a second allowance. What
+//! nothing here bounds is how many such runs exist — the concurrency ceiling
+//! covers the ones executing, and the suspended population it deliberately holds
+//! no slot for is unbounded. So the period ceiling bounds what a tenant may
+//! *start* and the per-run budget bounds what already started; only the pair
+//! bounds a period. A halt does not close it either, and
+//! [`Runtime::set_halt`](crate::runtime::Runtime::set_halt) says so: the
+//! workload scopes stop admission, and only a subject-scoped halt reaches work
+//! already running.
 //!
 //! One live execution pass belongs to the period in which it starts. Admission
 //! checks that period and settlement accrues the pass's spend to the same key,

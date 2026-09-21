@@ -449,6 +449,39 @@ async fn one_id_from_two_emitters_is_two_messages() {
     assert_eq!(f.runs.load(Ordering::SeqCst), 2);
 }
 
+/// One emitter cannot spell another emitter's pair.
+///
+/// Joining `(source, id)` with a separator makes the pair look unforgeable
+/// without making it so: `("bus\u{1f}x", "EV-1")` and `("bus", "x\u{1f}EV-1")`
+/// spell the same bytes. An emitter that chooses either half of its own pair
+/// then pre-empts the other's next message as an apparent retry, and a
+/// suppression is the one failure nobody is told about. `origin_key` puts the
+/// source's length in front so the split is read rather than searched for.
+#[tokio::test]
+async fn one_emitter_cannot_spell_anothers_pair() {
+    let f = fixture();
+    for (source, id) in [
+        ("urn:test:bus\u{1f}x", "EV-1"),
+        ("urn:test:bus", "x\u{1f}EV-1"),
+    ] {
+        let out =
+            f.rt.run_correlated_once(
+                "demo.counts",
+                Tainted::trusted(json!({})),
+                "matter",
+                &[key("D-2")],
+                &dedup_key(source, id),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.is_fresh(),
+            "{source:?}/{id:?} was swallowed as another emitter's retry"
+        );
+    }
+    assert_eq!(f.runs.load(Ordering::SeqCst), 2);
+}
+
 // ── Refusals ────────────────────────────────────────────────────────────────
 
 /// An admission that was refused spends no key.

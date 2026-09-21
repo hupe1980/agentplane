@@ -298,15 +298,13 @@ impl CloudEvent {
 
     /// The pair `CloudEvents` defines uniqueness by, as one string.
     ///
-    /// `id` alone is unique only within one producer: two counterparties
-    /// numbering their messages from one collide, and the collision is silent
-    /// because the second message looks exactly like a retry of the first. The
-    /// separator is a unit separator (U+001F) so that no `source`/`id` pair a
-    /// producer can write spells another — the same construction, and the same
-    /// reason, as [`InboundEvent::dedup_key`].
+    /// [`origin_key`](crate::core::origin_key) is the construction and says why
+    /// it is shaped that way. The control-character refusal below is not what
+    /// makes this unforgeable — the encoding is — it is `CloudEvents` holding
+    /// its own attributes to what the specification allows.
     #[must_use]
     pub fn origin_id(&self) -> String {
-        format!("{}\u{1f}{}", self.source, self.id)
+        crate::core::origin_key(&self.source, &self.id)
     }
 
     /// This event as something a run can wait for.

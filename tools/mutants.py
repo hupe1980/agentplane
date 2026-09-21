@@ -68,6 +68,23 @@ TIMEOUT_SECONDS = int(os.environ.get("MUTANTS_TIMEOUT_SECS", "900"))
 # `find` must appear verbatim, exactly once.
 MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
     # ── Exactly-once ────────────────────────────────────────────────────────
+    "ARecordReadsPastAFieldItDoesNotKnow": (
+        "src/journal/record.rs",
+        "a_record_with_a_field_this_build_does_not_know_is_refused",
+        "a record carrying a field this build does not know is read anyway, so "
+        "every field it could not see takes a serde default and the decisions "
+        "downstream are made over a record nobody fully read",
+        r"""#[serde(tag = "kind", rename_all = "PascalCase", deny_unknown_fields)]""",
+        r"""#[serde(tag = "kind", rename_all = "PascalCase")]""",
+    ),
+    "OriginKeyIsForgeable": (
+        "src/core/event.rs",
+        "one_emitter_cannot_spell_anothers_pair",
+        "a producer can spell another producer's (source, id) pair, so its next "
+        "message is swallowed as an apparent retry",
+        r"""    format!("{}\u{1f}{source}\u{1f}{id}", source.len())""",
+        r"""    format!("{source}\u{1f}{id}")""",
+    ),
     "ReplayRePerforms": (
         "src/runtime/ctx.rs",
         "a_committed_but_lost_effect_record_is_not_performed_again",
@@ -3724,7 +3741,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "two_producers_sharing_an_id_are_not_one_event",
         "events deduplicate on id alone, so two producers sharing an id swallow "
         "each other's messages with nothing reporting it",
-        '        format!("{}\\u{1f}{}", self.source, self.id)',
+        "        origin_key(&self.source, &self.id)",
         "        self.id.clone()",
     ),
     "ADeliveredEventChoosesItsOwnSource": (
@@ -3742,7 +3759,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "CloudEvents' `(source, id)` pair, so a gateway relaying two "
         "counterparties that both number their messages from one swallows the "
         "second as a retry of the first, silently",
-        "        format!(\"{}\\u{1f}{}\", self.source, self.id)",
+        "        crate::core::origin_key(&self.source, &self.id)",
         "        self.id.clone()",
     ),
     "AnUnknownEnvelopeIsGuessedAt": (
@@ -7983,7 +8000,7 @@ MUTANTS: dict[str, tuple[str, str, str, str, str]] = {
         "another's messageId is treated as that peer's retry — it is handed "
         "the victim's task id and a seat inside the victim's case",
         """    let source = super::peer_source(&caller.actor);
-    let keyed = format!("{source}\\u{1f}{}", message.message_id);""",
+    let keyed = crate::core::origin_key(&source, &message.message_id);""",
         """    let source = super::peer_source(&caller.actor);
     let _ = source;
     let keyed = message.message_id.clone();""",

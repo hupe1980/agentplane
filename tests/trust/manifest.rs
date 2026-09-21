@@ -343,9 +343,9 @@ async fn each_agents_budget_bounds_only_its_own_runs() {
 ///
 /// Reported as `budgets: { max_tokens: 0 }` on an agent declaring `models: {}`,
 /// written to mean "this one does no inference and gets no permission to
-/// spend". Every run it ever made failed with `token budget exhausted: 0
-/// permitted, 0 consumed` — on a **read-only tool call**, with no model
-/// anywhere near it.
+/// spend". Every run it ever made failed with `token budget exhausted: nothing
+/// further starts at or past 0 token(s); 0 consumed` — on a **read-only tool
+/// call**, with no model anywhere near it.
 ///
 /// The mechanism is the same for every ceiling here, which is why this is a
 /// table rather than one field's bug. They are accumulate-and-compare, checked

@@ -119,18 +119,43 @@ impl InboundEvent {
 
     /// The identity a store deduplicates on: `(source, id)`.
     ///
-    /// Derived here and nowhere else. Every store has to agree byte for byte
-    /// about which two messages are the same message, and a second place
-    /// building this string is a second answer to that question.
-    ///
-    /// The separator is a unit separator (U+001F) rather than a printable
-    /// character because a `source` is a URI and an `id` is arbitrary: any
-    /// character a producer might reasonably use would let one pair spell
-    /// another, and two distinct messages would deduplicate into one.
+    /// [`origin_key`] is the construction, and this is one of its three
+    /// callers — every store has to agree byte for byte about which two
+    /// messages are the same message.
     #[must_use]
     pub fn dedup_key(&self) -> String {
-        format!("{}\u{1f}{}", self.source, self.id)
+        origin_key(&self.source, &self.id)
     }
+}
+
+/// A producer-scoped identity — `(source, id)` — as one key.
+///
+/// # Why a separator is not enough
+///
+/// `id` is unique only within one producer: two counterparties numbering their
+/// messages from one collide, and the collision is silent because the second
+/// message looks exactly like a retry of the first. So the key is the pair.
+///
+/// Joining the pair with a separator makes it *look* unforgeable and does not
+/// make it so. `("a\u{1f}b", "c")` and `("a", "b\u{1f}c")` spell the same
+/// bytes, so a producer that can choose either half of its own pair can spell
+/// another producer's — and pre-empt that producer's next message as an
+/// apparent duplicate, which is a silent suppression rather than a rejected
+/// one. Refusing the separator in both halves closes it only where something
+/// refuses; a `source` derived from a deployment's own
+/// [`Authenticator`](crate::api::Authenticator) is not this crate's to validate,
+/// and a guarantee resting on every producer of every half being well behaved
+/// is a guarantee nobody can check.
+///
+/// So the length of `source` goes in front. A reader takes the digits, takes
+/// that many bytes, and the rest is `id` — the split is *read* rather than
+/// searched for, no pair can spell another whatever either half contains, and
+/// the property holds without anybody validating anything.
+///
+/// The separator stays for legibility: a key is a store row an operator reads.
+#[must_use]
+pub fn origin_key(source: &str, id: &str) -> String {
+    format!("{}\u{1f}{source}\u{1f}{id}", source.len())
 }
 
 /// What a run is waiting for.
