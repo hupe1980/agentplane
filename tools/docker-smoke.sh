@@ -89,8 +89,13 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
   sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$PEER_TOKEN/" \
       -e "s/replace-me:ops-alice:openssl-rand-hex-32/$OPS_TOKEN/" \
       "$ROOT/examples/serve-tokens.yaml" >"$secrets/tokens.yaml"
+  # `mktemp -d` is 0700 and owned by the runner; the image runs as another,
+  # non-root user, who must be able to enter the directory to read the file.
+  chmod 0755 "$secrets"
   chmod 0644 "$secrets/tokens.yaml"
-  cid=$(docker run -d --rm -p 18080:8080 -p 19090:9090 -v "$ROOT/examples:/work:ro" \
+  # No `--rm`: a server that exits at startup must leave its logs behind for
+  # the refusal below to print. The trap removes the container either way.
+  cid=$(docker run -d -p 18080:8080 -p 19090:9090 -v "$ROOT/examples:/work:ro" \
           -v "$secrets:/secrets:ro" "$IMAGE" \
           serve /work/served.yaml --addr 0.0.0.0:8080 --url http://localhost:18080 \
           --policy /work/serve-policy.cedar --tokens /secrets/tokens.yaml \
