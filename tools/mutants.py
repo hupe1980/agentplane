@@ -9818,12 +9818,15 @@ pub struct Label {""",
     "AGuardrailInterventionIsAnAnswer": (
         "src/model/bedrock.rs",
         "a_buffered_guardrail_intervention_is_a_refusal_not_an_answer",
-        "the buffered path stops checking the stop reason, so a guardrail "
-        "intervention comes back as a successful completion — the canned "
-        "refusal message wearing an answer, on exactly the path a "
+        "the buffered path's stop-reason allowlist admits a guardrail "
+        "intervention as an answer, so the canned refusal message comes back "
+        "as a successful completion — on exactly the path a "
         "streaming-by-default deployment never exercises",
-        """        if output.stop_reason() == &aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened {""",
-        """        if output.stop_reason() == &aws_sdk_bedrockruntime::types::StopReason::StopSequence {""",
+        """            StopReason::EndTurn | StopReason::ToolUse | StopReason::StopSequence => false,""",
+        """            StopReason::EndTurn
+            | StopReason::ToolUse
+            | StopReason::StopSequence
+            | StopReason::GuardrailIntervened => false,""",
     ),
     "TheAsyncPathDeclassifies": (
         "src/tools/mcp.rs",

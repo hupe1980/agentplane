@@ -888,25 +888,16 @@ impl Bedrock {
                     .unwrap_or_default(),
             )
         });
-        // Metered and landed: the model was invoked and the assessment was
-        // billed. An intervention is a refusal whichever path carries it —
-        // passed through, it would be the guardrail's canned message wearing
-        // a successful answer.
-        if output.stop_reason() == &aws_sdk_bedrockruntime::types::StopReason::GuardrailIntervened {
-            return Err(ModelError::Unusable {
-                model: model.clone(),
-                usage,
-                detail: "a Bedrock guardrail intervened on this call".to_owned(),
-            });
-        }
         // An allowlist. `end_turn`, `tool_use` and `stop_sequence` are an
         // answer; `max_tokens` and a full context window are a typed
-        // truncation; everything else ended without one. The malformed stops
-        // are the provider disowning what reached the content blocks — a
-        // fragment passed through would hand a tool loop a call the provider
-        // itself could not parse — and `content_filtered` or a reason this SDK
-        // reports as unknown is no more an answer. Metered, because the tokens
-        // were generated and billed either way.
+        // truncation; everything else ended without one. A guardrail
+        // intervention passed through would be the guardrail's canned message
+        // wearing a successful answer. The malformed stops are the provider
+        // disowning what reached the content blocks — a fragment passed
+        // through would hand a tool loop a call the provider itself could not
+        // parse — and `content_filtered` or a reason this SDK reports as
+        // unknown is no more an answer. Metered, because the tokens were
+        // generated and billed either way.
         let truncated = match output.stop_reason() {
             StopReason::EndTurn | StopReason::ToolUse | StopReason::StopSequence => false,
             StopReason::MaxTokens | StopReason::ModelContextWindowExceeded => true,
