@@ -1280,3 +1280,213 @@ async fn a_quarantined_run_is_never_unwound_without_a_mutating_doubt() {
          effect was taken back while the run waits for a human to look at it"
     );
 }
+
+/// Posts a landed mutation, then waits on an approval that never comes.
+#[derive(Debug)]
+struct PostsThenAwaits(Log, &'static str);
+
+#[async_trait::async_trait]
+impl Skill for PostsThenAwaits {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("posts-then-awaits").provides("posts-then-awaits")
+    }
+    fn compensation(&self) -> Compensation {
+        Compensation::Compensatable
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        use agentplane::core::{AwaitSpec, CorrelationKey, DeadlineSpec};
+        cx.effect(Mutation {
+            what: "do:posts".into(),
+            log: Arc::clone(&self.0),
+            fails: false,
+        })
+        .await?;
+        cx.deadline("w", &DeadlineSpec::days(1), None).await?;
+        let v = cx
+            .await_event(
+                &AwaitSpec::new("approval.never.arrives", "w")
+                    .correlate(CorrelationKey::new("matter", self.1)),
+            )
+            .await?;
+        Ok(Outcome::done(v))
+    }
+    async fn compensate(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _o: &Tainted<Value>,
+    ) -> Result<(), SkillError> {
+        cx.effect(Mutation {
+            what: "undo:posts".into(),
+            log: Arc::clone(&self.0),
+            fails: false,
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+/// Fails without touching anything.
+#[derive(Debug)]
+struct SaysNo;
+
+#[async_trait::async_trait]
+impl Skill for SaysNo {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("says-no").provides("says-no")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::fail("the counterparty said no"))
+    }
+}
+
+/// **An interrupted sibling's landed work is unwound even when nothing
+/// completed.**
+///
+/// Whether a failure unwinds was decided by the completed steps alone. With
+/// no completed step to compensate, a failure that interrupted a sibling
+/// holding a landed mutation concluded `failed` and left the posting in the
+/// world — the unwind list reaches interrupted siblings, and the question
+/// that opens it did not look at them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_siblings_landed_work_is_unwound_with_nothing_completed() {
+    use agentplane::case::{CaseStore, EventStore};
+    use agentplane::core::{CorrelationKey, PlanIR as Plan};
+
+    let l = log();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .skill(PostsThenAwaits(Arc::clone(&l), "M-12"))
+        .skill(SaysNo)
+        .skill(Step::new("c", &l))
+        .build();
+    let plan = Plan::new(vec![
+        PlanNode::new(0, "posts-then-awaits").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "says-no").arg("input", ArgSource::run_input()),
+        PlanNode::new(2, "c")
+            .arg("l", ArgSource::node(StepId(0)))
+            .arg("r", ArgSource::node(StepId(1)))
+            .terminal(),
+    ]);
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        rt.run_plan_correlated(
+            plan,
+            Tainted::trusted(json!({})),
+            "matter",
+            &[CorrelationKey::new("matter", "M-12")],
+        ),
+    )
+    .await
+    .expect("the run concludes")
+    .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "got {:?}",
+        out.status
+    );
+    let seen = entries(&l);
+    assert!(seen.contains(&"do:posts".to_string()), "{seen:?}");
+    assert!(
+        seen.contains(&"undo:posts".to_string()),
+        "a failure with no completed step left an interrupted sibling's landed \
+         mutation standing: {seen:?}"
+    );
+}
+
+/// Lands a mutation, then fails on its own account.
+#[derive(Debug)]
+struct LandsAndFails(Log);
+
+#[async_trait::async_trait]
+impl Skill for LandsAndFails {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("lands-and-fails").provides("lands-and-fails")
+    }
+    fn compensation(&self) -> Compensation {
+        Compensation::Compensatable
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.effect(Mutation {
+            what: "do:lands".into(),
+            log: Arc::clone(&self.0),
+            fails: false,
+        })
+        .await?;
+        Ok(Outcome::fail("failed after landing"))
+    }
+    async fn compensate(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _o: &Tainted<Value>,
+    ) -> Result<(), SkillError> {
+        cx.effect(Mutation {
+            what: "undo:lands".into(),
+            log: Arc::clone(&self.0),
+            fails: false,
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+/// **A failed run holding landed work it did not undo needs a person.**
+///
+/// The failing step stays resumable, so its own landed mutation is left for
+/// a resume to finish — which nothing drives. `failed` alone is left off the
+/// attention roll-up because a resume may clear it; one standing on landed,
+/// uncompensated work is on it, with the verbs that finish or unwind it. A
+/// failure that touched nothing stays off.
+#[tokio::test]
+async fn a_failed_run_standing_on_landed_work_is_on_the_attention_roll_up() {
+    let l = log();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(LandsAndFails(Arc::clone(&l)))
+        .skill(SaysNo)
+        .build();
+    let landed = rt
+        .run("lands-and-fails", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(landed.status, RunStatus::Failed(_)),
+        "{:?}",
+        landed.status
+    );
+    let clean = rt
+        .run("says-no", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(clean.status, RunStatus::Failed(_)),
+        "{:?}",
+        clean.status
+    );
+
+    let attention = rt
+        .attention(agentplane::core::Timestamp::now_utc(), 50)
+        .await
+        .unwrap();
+    let condition = attention
+        .conditions
+        .iter()
+        .find(|c| c.kind == "run.failed_with_landed_work")
+        .unwrap_or_else(|| panic!("no condition for a failed run on landed work: {attention:?}"));
+    assert_eq!(condition.subjects, vec![landed.run_id.to_string()]);
+}

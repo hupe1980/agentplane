@@ -939,6 +939,7 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
         registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         transitions: Arc::clone(&transitions),
         escalation_fails: false,
+        settles_on_due: std::sync::Mutex::default(),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&counted))
@@ -1253,18 +1254,17 @@ async fn a_sweep_whose_evidence_fails_to_write_is_flagged_not_silent() {
     );
 }
 
-/// **A decision that cannot be recorded is not applied.**
+/// **A breach whose record cannot be written stays owed its record.**
 ///
-/// I2, aimed at the sweeper itself: the note announcing a breach is durable
-/// *before* the deadline state moves. The old order — apply, then buffer the
-/// note for the tick's end — orphaned the decision permanently on a crash in
-/// between, because the transition is idempotent and the next tick found it
-/// already applied and re-decided nothing. Written first, the failure mode
-/// inverts: the obligation stays `Pending`, and the next tick breaches it
-/// *with* its record.
+/// The breach is acted on first and noted after, and the store marks it as
+/// owing its account in the same write that applies it. A note that cannot be
+/// written therefore fails the tick loudly and leaves the obligation breached
+/// *and owed*: the next tick finds it on the owed list — `due` no longer lists
+/// a breached obligation — and writes the record then. Without the mark the
+/// transition would be idempotent and the record lost for good.
 #[cfg(feature = "testkit")]
 #[tokio::test]
-async fn a_sweep_decision_that_cannot_be_recorded_is_not_applied() {
+async fn a_breach_whose_record_cannot_be_written_stays_owed_its_record() {
     use agentplane::core::{Deadline, DeadlineState};
     use agentplane::testkit::{Fault, Faulty, Schedule};
 
@@ -1290,7 +1290,7 @@ async fn a_sweep_decision_that_cannot_be_recorded_is_not_applied() {
         .await
         .unwrap();
 
-    // The sweep's `Swept` note cannot be written, so the breach must not be.
+    // The sweep's `Swept` note cannot be written after the breach applied.
     let journal: Arc<dyn JournalStore> = Arc::new(Faulty::new(
         Arc::clone(&inner) as Arc<dyn JournalStore>,
         Schedule::healthy().on_kind("Swept", Fault::FailedClean),
@@ -1301,22 +1301,17 @@ async fn a_sweep_decision_that_cannot_be_recorded_is_not_applied() {
         .await
         .expect_err("a decision whose record cannot be written fails the tick loudly");
 
-    let standing = cases
-        .deadlines(case)
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|d| d.name == "respond-by")
-        .expect("the obligation still exists");
-    assert_eq!(
-        standing.state,
-        DeadlineState::Pending,
-        "the breach was applied without its record — announce-before-act \
-         inverted, and a crash here orphans the decision forever"
+    let owed = cases.breaches_to_note(16).await.unwrap();
+    assert!(
+        owed.iter().any(|d| d.case == case
+            && d.name == "respond-by"
+            && d.state == DeadlineState::Breached),
+        "a breach applied without its record is not owed one — the next tick \
+         cannot find it, and the decision is orphaned for good: {owed:?}"
     );
 
     // The store heals — modelled as a plane over the un-faulted backend — and
-    // the next tick breaches the obligation *with* its record.
+    // the next tick writes the owed record.
     let healed = Runtime::builder(Arc::clone(&inner) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&cases))
         .build();
@@ -1363,11 +1358,11 @@ async fn sweep_evidence_survives_a_later_phase_failure() {
         async fn disarm(&self, _: RunId, _: agentplane::core::EffectKey) -> Result<(), StoreError> {
             Ok(())
         }
-        async fn pending_count(&self) -> Result<u64, StoreError> {
+        async fn disarm_run(&self, _: RunId) -> Result<usize, StoreError> {
             Ok(0)
         }
-        async fn pending(&self, _: usize) -> Result<Vec<Timer>, StoreError> {
-            Ok(Vec::new())
+        async fn pending_count(&self) -> Result<u64, StoreError> {
+            Ok(0)
         }
     }
 
@@ -1699,9 +1694,12 @@ struct InstrumentedCases {
     /// Obligation transitions attempted, so a replay that re-performs one is
     /// visible even where the transition itself is idempotent.
     transitions: Arc<std::sync::atomic::AtomicUsize>,
-    /// Makes `set_status` fail, standing in for the process dying at that exact
-    /// point in the sweep.
+    /// Makes `set_status` and `breach_deadline` fail, standing in for the
+    /// process dying at that exact point in the sweep.
     escalation_fails: bool,
+    /// Obligations a run meets — and whose case it then closes — between the
+    /// sweep's `due` read and its writes.
+    settles_on_due: std::sync::Mutex<Vec<(agentplane::core::CaseId, &'static str)>>,
 }
 
 #[async_trait::async_trait]
@@ -1848,11 +1846,39 @@ impl CaseStore for InstrumentedCases {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.set_deadline_state(case, name, state).await
     }
+    async fn breach_deadline(
+        &self,
+        case: agentplane::core::CaseId,
+        name: &str,
+        now: Timestamp,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.transitions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.escalation_fails {
+            return Err(agentplane::core::StoreError::Backend(
+                "instrumented failure".to_owned(),
+            ));
+        }
+        self.inner.breach_deadline(case, name, now).await
+    }
     async fn breached(
         &self,
         limit: usize,
     ) -> Result<Vec<agentplane::core::Deadline>, agentplane::core::StoreError> {
         self.inner.breached(limit).await
+    }
+    async fn breaches_to_note(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Deadline>, agentplane::core::StoreError> {
+        self.inner.breaches_to_note(limit).await
+    }
+    async fn mark_breach_noted(
+        &self,
+        case: agentplane::core::CaseId,
+        name: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.mark_breach_noted(case, name).await
     }
     async fn acknowledge_breach(
         &self,
@@ -1867,7 +1893,16 @@ impl CaseStore for InstrumentedCases {
         now: Timestamp,
         limit: usize,
     ) -> Result<Vec<agentplane::core::Deadline>, agentplane::core::StoreError> {
-        self.inner.due(now, limit).await
+        let due = self.inner.due(now, limit).await?;
+        let settling = std::mem::take(&mut *self.settles_on_due.lock().unwrap());
+        for (case, name) in settling {
+            self.inner
+                .set_deadline_state(case, name, agentplane::core::DeadlineState::Met)
+                .await?;
+            // Closed where nothing else is owed, as the run that met it would.
+            let _ = self.inner.close(case).await;
+        }
+        Ok(due)
     }
     async fn by_status(
         &self,
@@ -1915,6 +1950,7 @@ async fn strict_replay_does_not_re_register_an_obligation() {
         registered: Arc::clone(&registered),
         transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         escalation_fails: false,
+        settles_on_due: std::sync::Mutex::default(),
     });
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(cases)
@@ -1948,22 +1984,19 @@ async fn strict_replay_does_not_re_register_an_obligation() {
 
 // ── A breach survives the crash that interrupts it ──────────────────────────
 
-/// A sweep interrupted between escalating and breaching leaves the obligation
+/// A sweep interrupted before the breach lands leaves the obligation
 /// outstanding, so the next tick makes the decision again.
 ///
 /// `due` selects obligations that are still `pending` or `warned`, which makes
 /// writing `Breached` the write that removes one from the only pass that looks
-/// at it. Ordered the other way, a crash in the window between the two writes
-/// is unrecoverable in the strict sense: the obligation is breached, the case
-/// still says nothing happened, and no later tick will ever select it again —
-/// the sweep would have spent its one chance to notice. Escalating twice is a
-/// no-op, so the order that repeats work is the order that is safe.
+/// at it. The breach and the escalation it pays for are one store verb, so an
+/// interruption leaves neither: the obligation is still selected, and the next
+/// tick decides it again.
 ///
-/// The failure is injected at `set_status` rather than by killing a process
-/// because that is the write the fix moved. Both halves are asserted: the
-/// interrupted tick must leave the obligation outstanding, and a healthy tick
-/// over the same fixture must actually breach it — a store that refused
-/// everything would satisfy the first half alone.
+/// The failure is injected at that verb rather than by killing a process.
+/// Both halves are asserted: the interrupted tick must leave the obligation
+/// outstanding, and a healthy tick over the same fixture must actually breach
+/// it — a store that refused everything would satisfy the first half alone.
 #[tokio::test]
 async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding() {
     use agentplane::core::{Deadline, DeadlineState};
@@ -2003,6 +2036,7 @@ async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding
         registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         escalation_fails: true,
+        settles_on_due: std::sync::Mutex::default(),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&crashing))
@@ -2058,5 +2092,251 @@ async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding
             .any(|d| d.case == case && d.name == "respond-by"),
         "the breach is not listable, so it reaches whoever must answer for it \
          only if they already suspected it: {listed:?}"
+    );
+}
+
+// ── The sweep decides from a read that is already stale ─────────────────────
+
+/// **A run that meets its obligation while the sweep is deciding wins.**
+///
+/// The sweep reads `due`, then writes. A run that met the obligation and
+/// closed its case in between has settled it: breaching it anyway reopens a
+/// closed matter — re-claiming correlation keys another matter may now hold —
+/// and reports a met duty as missed. And the refusal the store answers with is
+/// somebody getting there first, not a failure: it must not end the tick, or
+/// the other obligations and every later phase wait on a race that was lost
+/// correctly.
+#[tokio::test]
+async fn an_obligation_met_during_the_sweep_is_not_breached() {
+    use agentplane::core::{Deadline, DeadlineState, SweptAction};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let plain = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+    let hour = std::time::Duration::from_secs(3600);
+
+    let open = |label: &'static str, resolved: Timestamp, warn: Option<Timestamp>| {
+        let cases = Arc::clone(&plain);
+        async move {
+            let case = cases
+                .correlate_or_open("matter", &[key("matter", label)], now)
+                .await
+                .unwrap()
+                .case_id();
+            cases
+                .register_deadline(&Deadline {
+                    case,
+                    name: "respond-by".to_owned(),
+                    resolved_at: resolved,
+                    calendar_digest: Digest::of(b"test-calendar"),
+                    warn_at: warn,
+                    state: DeadlineState::Pending,
+                    acknowledged: None,
+                })
+                .await
+                .unwrap();
+            case
+        }
+    };
+    let met = open("RACE-MET", now - hour, None).await;
+    let missed = open("RACE-MISSED", now - hour, None).await;
+    let warned = open("RACE-WARNED", now + hour * 24, Some(now - hour)).await;
+
+    let racing = Arc::new(InstrumentedCases {
+        inner: Arc::clone(&plain),
+        registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        escalation_fails: false,
+        settles_on_due: std::sync::Mutex::new(vec![(met, "respond-by"), (warned, "respond-by")]),
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(racing as Arc<dyn CaseStore>)
+        .build();
+    let report = rt
+        .sweep(now, std::time::Duration::from_mins(5))
+        .await
+        .expect("an obligation settled since the read is somebody getting there first");
+
+    assert_eq!(report.breached, 1, "{report:?}");
+    let state = |case| {
+        let cases = Arc::clone(&plain);
+        async move { cases.deadlines(case).await.unwrap()[0].state }
+    };
+    let status = |case| {
+        let cases = Arc::clone(&plain);
+        async move { cases.case(case).await.unwrap().unwrap().status }
+    };
+    assert_eq!(state(met).await, DeadlineState::Met);
+    assert_eq!(
+        status(met).await,
+        CaseStatus::Closed,
+        "the sweep reopened a matter whose obligation was met while it was deciding"
+    );
+    assert_eq!(state(warned).await, DeadlineState::Met);
+    assert_eq!(state(missed).await, DeadlineState::Breached);
+    assert_eq!(status(missed).await, CaseStatus::Escalated);
+
+    // A breach is acted on before it is noted, so the loser of that race
+    // wrote nothing about the duty that was met. A warning is noted before it
+    // is set, so the loser of that one said "warned" — and its journal must
+    // not end on the claim: the last word about each subject is what actually
+    // happened to it.
+    let run = report
+        .record
+        .expect("the sweep that breached left a record");
+    let records = store.read(run, 1).await.unwrap();
+    let last = |case: agentplane::core::CaseId| {
+        records
+            .iter()
+            .filter_map(|r| match r.kind() {
+                RecordKind::Swept {
+                    subject, action, ..
+                } if *subject == case.to_string() => Some(*action),
+                _ => None,
+            })
+            .next_back()
+    };
+    assert_eq!(
+        last(met),
+        None,
+        "the sweep's journal says something about a breach it never applied"
+    );
+    assert_eq!(
+        last(warned),
+        Some(SweptAction::NotApplied),
+        "the sweep's journal ends on a warning it never applied"
+    );
+    assert_eq!(
+        last(missed),
+        Some(SweptAction::CaseEscalated),
+        "an applied breach was withdrawn on the record"
+    );
+}
+
+/// **A warned obligation does not hide an overdue one from a short page.**
+///
+/// The sweep's page is the head of the due order. An obligation that has
+/// warned stays outstanding until it comes due, and kept at its warning
+/// instant it sorts ahead of a pending obligation that is already past due —
+/// so a page of warned obligations starves the breach the sweep exists for.
+#[tokio::test]
+async fn a_warned_obligation_does_not_hide_an_overdue_one() {
+    use agentplane::core::{Deadline, DeadlineState};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let t = |secs: i64| Timestamp::from_unix_timestamp(1_800_000_000 + secs).unwrap();
+
+    let open = |label: &'static str, resolved: Timestamp, warn: Option<Timestamp>| {
+        let cases = Arc::clone(&cases);
+        async move {
+            let case = cases
+                .correlate_or_open("matter", &[key("matter", label)], t(0))
+                .await
+                .unwrap()
+                .case_id();
+            cases
+                .register_deadline(&Deadline {
+                    case,
+                    name: "respond-by".to_owned(),
+                    resolved_at: resolved,
+                    calendar_digest: Digest::of(b"test-calendar"),
+                    warn_at: warn,
+                    state: DeadlineState::Pending,
+                    acknowledged: None,
+                })
+                .await
+                .unwrap();
+            case
+        }
+    };
+    let warned = open("WARNED-LONG", t(100), Some(t(0))).await;
+    let overdue = open("OVERDUE", t(5), None).await;
+    cases
+        .set_deadline_state(warned, "respond-by", DeadlineState::Warned)
+        .await
+        .unwrap();
+
+    let page = cases.due(t(6), 1).await.unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(
+        page[0].case, overdue,
+        "the page held an obligation that has already warned and is not due, and \
+         the overdue one behind it waits for a tick that never reaches it"
+    );
+}
+
+/// **A breach the sweep applied and never noted is noted by the next tick —
+/// once.**
+///
+/// The breach is the act and the notes are its account; the act lands first,
+/// with the obligation marked as owing its account in the same write. A crash
+/// between the two leaves a breached obligation `due` no longer lists, so a
+/// sweep that only noted what `due` handed it never wrote the account at all.
+/// The next tick drains what is owed, and the one after owes nothing.
+#[tokio::test]
+async fn a_breach_whose_notes_were_lost_is_noted_by_the_next_tick_once() {
+    use agentplane::core::{Deadline, DeadlineState, SweptAction};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::clone(&store) as Arc<dyn CaseStore>;
+    let now = Timestamp::from_unix_timestamp(1_800_000_000).unwrap();
+    let case = cases
+        .correlate_or_open("matter", &[key("matter", "M-LOST")], now)
+        .await
+        .unwrap()
+        .case_id();
+    cases
+        .register_deadline(&Deadline {
+            case,
+            name: "respond-by".to_owned(),
+            resolved_at: now - std::time::Duration::from_secs(3600),
+            calendar_digest: Digest::of(b"test-calendar"),
+            warn_at: None,
+            state: DeadlineState::Pending,
+            acknowledged: None,
+        })
+        .await
+        .unwrap();
+
+    // The crashed tick: the breach landed, its notes did not.
+    assert!(
+        cases
+            .breach_deadline(case, "respond-by", now)
+            .await
+            .unwrap()
+    );
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases))
+        .build();
+    let mut notes = 0;
+    for _ in 0..2 {
+        let report = rt
+            .sweep(now, std::time::Duration::from_mins(5))
+            .await
+            .unwrap();
+        if let Some(run) = report.record {
+            notes += store
+                .read(run, 1)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r.kind(),
+                        RecordKind::Swept {
+                            subject,
+                            action: SweptAction::DeadlineBreached,
+                            ..
+                        } if *subject == case.to_string()
+                    )
+                })
+                .count();
+        }
+    }
+    assert_eq!(
+        notes, 1,
+        "a breach the sweep applied was noted {notes} times across the ticks after the crash"
     );
 }

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use agentplane::batch::{BatchItem, BatchStatus, BatchStore, ItemOutcome, ItemSource, SourceError};
 use agentplane::core::{
     ArgSource, BatchId, Effect, EffectDescriptor, EffectError, Outcome, PlanIR, PlanNode, Recovery,
-    RetryPolicy, Skill, SkillDescriptor, SkillError, Spend, StoreError, Tainted,
+    RetryPolicy, Skill, SkillDescriptor, SkillError, SourceId, Spend, StoreError, Tainted,
 };
 use agentplane::journal::JournalStore;
 use agentplane::runtime::{BatchSpec, Runtime, StepCtx};
@@ -323,6 +323,86 @@ async fn every_item_gets_its_own_run_and_its_own_journal() {
     }
 }
 
+/// A source vouching for its items, when the operator says it may.
+#[derive(Debug)]
+struct Vouched(agentplane::core::Label);
+
+#[async_trait::async_trait]
+impl ItemSource for Vouched {
+    async fn next(&self, after: Option<&str>, _: usize) -> Result<Vec<BatchItem>, SourceError> {
+        Ok(match after {
+            None => vec![
+                BatchItem::new("item-001", json!({ "meter": "item-001" })).labelled(self.0.clone()),
+            ],
+            Some(_) => Vec::new(),
+        })
+    }
+}
+
+/// The label each item's run was admitted under.
+async fn admitted_labels(store: &Arc<RedbStore>, id: BatchId) -> Vec<agentplane::core::Label> {
+    let mut labels = Vec::new();
+    for item in store.items(id, 100).await.unwrap() {
+        let records = store.read(item.run, 1).await.unwrap();
+        labels.extend(records.iter().find_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::RunAdmitted { input_label, .. } => {
+                Some(input_label.clone())
+            }
+            _ => None,
+        }));
+    }
+    labels
+}
+
+/// A batch item is somebody else's data until the operator says otherwise.
+///
+/// A source reading a paged API or a file is the normal case, and its items
+/// were admitted trusted — so a model-free plan could hand a scraped value to
+/// a mutating sink's protected field with no release anywhere on the record.
+/// Untrusted from `batch:<id>` is the default; trusted is a label somebody
+/// wrote down.
+#[tokio::test]
+async fn a_batch_item_is_admitted_untrusted_unless_its_source_vouches() {
+    let store = db();
+    let world: World = Arc::default();
+    let rt = runtime(&store, &world, vec![]);
+
+    let id = BatchId::generate();
+    rt.run_batch(id, &BatchSpec::new(plan(), Arc::new(Keys::upto(2))))
+        .await
+        .unwrap();
+    let labels = admitted_labels(&store, id).await;
+    assert_eq!(labels.len(), 2);
+    for label in &labels {
+        assert!(
+            label.is_untrusted(),
+            "a batch item was admitted trusted: {label:?}"
+        );
+        assert!(
+            label
+                .provenance
+                .contains(&SourceId::new(format!("batch:{id}"))),
+            "the item does not name the batch it came from: {label:?}"
+        );
+    }
+
+    let vouched = BatchId::generate();
+    rt.run_batch(
+        vouched,
+        &BatchSpec::new(
+            plan(),
+            Arc::new(Vouched(agentplane::core::Label::trusted())),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        admitted_labels(&store, vouched).await,
+        vec![agentplane::core::Label::trusted()],
+        "an item the operator vouched for keeps the label it was given"
+    );
+}
+
 /// One bad item must not take down the batch.
 #[tokio::test]
 async fn a_failing_item_does_not_stop_the_ones_after_it() {
@@ -535,6 +615,52 @@ async fn a_source_that_errors_stops_the_batch_loudly() {
     );
 }
 
+/// **A source that pages out of byte order is refused before it runs an item
+/// out of order.**
+///
+/// The resume cursor is the greatest finished key, compared as bytes. A source
+/// that sorts numerically offers `9` before `10`; the cursor after both is `9`,
+/// and a resume asks for keys after `9` — offering `10` a second time, and on
+/// a collated source skipping keys that never ran. The batch would report
+/// complete either way, so the page is refused where it arrives.
+#[tokio::test]
+async fn a_source_paging_out_of_byte_order_is_refused() {
+    #[derive(Debug)]
+    struct Numeric;
+
+    #[async_trait::async_trait]
+    impl ItemSource for Numeric {
+        async fn next(&self, after: Option<&str>, _: usize) -> Result<Vec<BatchItem>, SourceError> {
+            Ok(if after.is_none() {
+                ["9", "10"]
+                    .iter()
+                    .map(|k| BatchItem::new(*k, json!({ "meter": k })))
+                    .collect()
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    let store = db();
+    let world: World = Arc::default();
+    let err = runtime(&store, &world, vec![])
+        .run_batch(
+            BatchId::generate(),
+            &BatchSpec::new(plan(), Arc::new(Numeric)),
+        )
+        .await
+        .expect_err("a page out of cursor order must be refused");
+    assert!(
+        err.to_string().contains("byte order"),
+        "the refusal must say which order the cursor needs: {err}"
+    );
+    assert!(
+        world.lock().unwrap().is_empty(),
+        "an item ran before the page was checked"
+    );
+}
+
 /// An empty source is a completed batch with nothing in it, not an error.
 #[tokio::test]
 async fn an_empty_source_completes_with_zero_items() {
@@ -634,6 +760,48 @@ async fn a_suspended_item_keeps_the_batch_running() {
         report.in_flight, 1,
         "the suspended item is still outstanding"
     );
+}
+
+/// A withheld item is its own pause, not an exhaustion.
+///
+/// Both leave the item's work standing, and the moves differ: a ceiling is
+/// raised, a withdrawn authority's halt is lifted. Counted under `exhausted`,
+/// the census would send an operator to raise a budget that is not the reason
+/// the item stopped.
+#[tokio::test]
+async fn a_withheld_item_is_counted_as_withheld_and_keeps_the_batch_running() {
+    let store = db();
+    let id = BatchId::generate();
+    store.open(id, "digest").await.unwrap();
+
+    let run = agentplane::core::RunId::generate();
+    store.reserve(id, "item-001", run).await.unwrap();
+    store
+        .record(
+            id,
+            "item-001",
+            &ItemOutcome::Withheld("authority 'alice' withdrawn: key rotated".into()),
+            Spend::default(),
+        )
+        .await
+        .unwrap();
+
+    let census = store.census(id).await.unwrap();
+    assert_eq!(
+        census.withheld, 1,
+        "the pause must be reported as what it is"
+    );
+    assert_eq!(census.exhausted, 0, "a withdrawal is not a ceiling");
+    assert_eq!(census.terminal(), 0, "a pause is not a settlement");
+
+    let world: World = Arc::default();
+    let report = runtime(&store, &world, vec![])
+        .batch_report(id)
+        .await
+        .unwrap();
+    assert_eq!(report.status, BatchStatus::Running);
+    assert_eq!(report.withheld, 1);
+    assert!(report.needs_attention(), "a withheld item needs a person");
 }
 
 /// A second reservation must return the first run id, never mint a new one.

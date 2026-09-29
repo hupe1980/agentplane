@@ -258,6 +258,12 @@ async fn check_blobs(
                 "case {case}, blob {digest}: {e} — the bytes are gone and nothing here \
                  can say whether that was retention doing its job"
             )),
+            // The bytes are there and a reversible cause keeps them shut: a
+            // finding with a remedy, never loss and never an erasure.
+            Err(e @ BlobError::Unopened { .. }) => report.findings.push(format!(
+                "case {case}, blob {digest}: {e} — no erasure record accounts for it, so \
+                 this plane cannot read a blob it is holding"
+            )),
             Err(BlobError::Backend(e)) => report.not_checked.push(format!(
                 "case {case}, blob {digest}: the blob store could not be reached ({e}) — \
                  presence was not established either way"

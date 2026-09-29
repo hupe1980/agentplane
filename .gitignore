@@ -32,6 +32,13 @@ tla/*.out
 .env
 # The internal architecture constitution — never published, never packaged.
 concepts/
+# This project's own feature specifications and the Spec Kit machinery that
+# produces them (`/speckit-*` skills, templates, `.specify/memory/constitution.md`).
+# Same rule as `concepts/`: internal, and the published tree may not cite a path
+# its reader does not have — `just _concepts-check` fails on one that does.
+# Not to be confused with `tla/`, which holds the formal models and ships.
+/specs/
+/.specify/
 # Backups written by tools/mutants.py while a mutation is applied. Present only
 # between apply and revert; an interrupted sweep leaves one behind, and it must
 # not be mistaken for source.

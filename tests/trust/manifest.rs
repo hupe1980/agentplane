@@ -398,6 +398,9 @@ spec:
             "not merely no model spend",
             // Both spellings of what the author actually meant.
             "Omit the field to mean 'no limit'",
+            // The stop in both vocabularies: a YAML author holds this binary,
+            // an embedder holds the trait.
+            "agentplane halt --scope agent:",
             "QuotaStore::set_halt",
         ] {
             assert!(
@@ -1734,7 +1737,7 @@ spec:
 fn swapping_a_model_changes_the_manifest_identity() {
     let with_models = GOOD.replace(
         "  tools:",
-        "  models:\n    privileged: { provider: anthropic, model: claude-sonnet-5 }\n  tools:",
+        "  models:\n    privileged: { provider: anthropic, model: claude-sonnet-5, pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 } }\n  tools:",
     );
     let a = Manifest::parse(&with_models).expect("parse");
     assert_eq!(
@@ -2527,7 +2530,7 @@ fn oversight_without_a_declarative_agent_is_refused() {
 
 /// Acting unattended has to be written down.
 ///
-/// The runtime already refuses `OnExpiry::Proceed` without explicit consent. The
+/// A coded skill can only spell it `Expiry::ProceedUnattended`. The
 /// file demands the same, so the decision is greppable in the document a
 /// reviewer reads rather than only in the code they do not.
 #[test]
@@ -2877,7 +2880,7 @@ async fn republishing_with_another_signer_cannot_reassign_the_publisher() {
 /// A signature made for one purpose cannot be reused for another.
 ///
 /// `Signer::sign` takes a bare digest, so a manifest signature and a record
-/// attestation are structurally identical — same key, same algorithm, same input
+/// signature are structurally identical — same key, same algorithm, same input
 /// shape, and nothing in either saying which question it answered. Domain
 /// separation is what stops one being presented as the other.
 ///
@@ -2891,7 +2894,7 @@ async fn a_manifest_signature_is_bound_to_being_a_manifest() {
     use agentplane::testkit::StubSigner;
 
     /// Accepts exactly one thing: a signature over the manifest's **bare**
-    /// digest — which is what a record attestation over the same value would be.
+    /// digest — which is what a record signature over the same value would be.
     ///
     /// It ignores the hash it is handed, on purpose. The registry chooses that
     /// input, so a verifier that recomputed from it would agree with whatever
@@ -2931,7 +2934,7 @@ async fn a_manifest_signature_is_bound_to_being_a_manifest() {
         Err(e) => panic!("wrong refusal: {e}"),
         Ok(_) => panic!(
             "a signature over the bare digest verified as approval of a manifest — \
-             a record attestation could then be presented as a publisher's blessing"
+             a record signature could then be presented as a publisher's blessing"
         ),
     }
 
@@ -3217,6 +3220,285 @@ spec:
         provider.calls(),
         1,
         "the secret result re-entered the model"
+    );
+}
+
+/// **A money ceiling binds on a priced model.**
+///
+/// Every built-in driver reports zero minor units, so before a role could state
+/// its price a `max_minor_units` ceiling read zero after a million-token turn
+/// and the run went on spending. Priced, the first turn exhausts it and the
+/// tool the model asked for is never reached.
+#[cfg(all(feature = "redb", feature = "testkit"))]
+#[tokio::test]
+async fn a_money_ceiling_binds_on_a_priced_model() {
+    use agentplane::core::{BudgetExceeded, Sensitivity};
+    use agentplane::runtime::{Agent, RunStatus, Runtime};
+    use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Counts(AtomicUsize);
+    #[async_trait::async_trait]
+    impl ToolClient for Counts {
+        async fn call(
+            &self,
+            _tool: &ToolId,
+            _arguments: &Value,
+            _provenance: Option<&agentplane::core::Provenance>,
+        ) -> Result<Value, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "balance": 42 }))
+        }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
+    }
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: priced-loop, version: "1.0.0" }
+spec:
+  capabilities: { provides: [priced.ask] }
+  models:
+    privileged:
+      provider: fake
+      model: declared-1
+      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+  tools:
+    - ref: tool://ledger/read
+      mutates: false
+      description: Read a balance.
+      arguments: { type: object, additionalProperties: false }
+  execution: { kind: tool-calling, max_turns: 3 }
+  security: { max_sensitivity_egress: internal }
+  budgets: { max_minor_units: 1 }
+"#,
+    )
+    .expect("a priced role may carry a money ceiling");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_answer(agentplane::model::Completion {
+        text: String::new(),
+        model: None,
+        tool_calls: vec![agentplane::model::ToolCall {
+            id: "c1".to_owned(),
+            name: "ledger__read".to_owned(),
+            arguments: json!({}),
+        }],
+        usage: agentplane::model::Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 10,
+            ..Default::default()
+        },
+        stop_reason: Some("tool_use".to_owned()),
+        truncated: false,
+        structured: None,
+        continuation: None,
+    });
+    provider.will_say("this turn must not run");
+    let tool = Arc::new(Counts::default());
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let runtime = Runtime::builder(store)
+        .provider("fake", Arc::clone(&provider) as Arc<_>)
+        .tools(
+            Arc::new(ToolCatalog::new().allow(
+                ToolId::new("ledger", "read"),
+                ToolSafety::read_only().max_sensitivity(Sensitivity::Internal),
+            )),
+            Arc::clone(&tool) as Arc<_>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+
+    let outcome = runtime
+        .run("priced.ask", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    match &outcome.status {
+        RunStatus::Exhausted(BudgetExceeded::Money { allowed, used }) => {
+            assert_eq!(*allowed, 1);
+            // 1M input at 300/M plus 10 output at 1500/M, rounded up.
+            assert_eq!(*used, 301, "the turn was priced at {used}");
+        }
+        other => panic!("a million-token turn left a one-cent ceiling unspent: {other:?}"),
+    }
+    assert_eq!(
+        tool.0.load(Ordering::SeqCst),
+        0,
+        "the tool ran past an exhausted money ceiling"
+    );
+}
+
+/// A money ceiling beside a model that states no price is a control that never
+/// binds, and is refused at load.
+#[test]
+fn a_money_ceiling_beside_an_unpriced_model_is_refused() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: unpriced, version: "1.0.0" }
+spec:
+  capabilities: { provides: [unpriced.ask] }
+  models:
+    privileged: { provider: fake, model: declared-1, pricing: { input: 1, output: 1, cache_read: 1, cache_write: 1 } }
+    quarantined: { provider: fake, model: reader-1 }
+  budgets: { max_minor_units: 250 }
+"#;
+    match Manifest::parse(yaml) {
+        Err(ManifestError::Unenforceable { field, detail }) => {
+            assert_eq!(field, "spec.models.quarantined.pricing");
+            assert!(detail.contains("max_minor_units"), "{detail}");
+        }
+        other => panic!("an unpriced role was accepted beside a money ceiling: {other:?}"),
+    }
+    // The same roles without the ceiling are fine: nothing claims to bind.
+    Manifest::parse(&yaml.replace("{ max_minor_units: 250 }", "{}"))
+        .expect("an unpriced role with no money ceiling claims nothing");
+}
+
+/// A run's per-call bound is derived from its model roles, and only when
+/// every role bounds its input.
+///
+/// This is the figure a tenant's spend quota reserves per step beside the
+/// ceiling, so a role that leaves one call unbounded leaves the whole run's
+/// worst case unbounded — not bounded by the other role's figure.
+#[test]
+fn a_manifest_derives_its_per_call_bound_from_every_role() {
+    let yaml = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: bounded, version: "1.0.0" }
+spec:
+  capabilities: { provides: [bounded.ask] }
+  models:
+    privileged: { provider: fake, model: declared-1, max_tokens: 100, max_input_tokens: 900, pricing: { input: 1000000, output: 2000000, cache_read: 0, cache_write: 0 } }
+    quarantined: { provider: fake, model: reader-1, max_tokens: 50, max_input_tokens: 2000, pricing: { input: 1000000, output: 1000000, cache_read: 0, cache_write: 0 } }
+  budgets: { max_tokens: 10000, max_minor_units: 50000 }
+"#;
+    let m = Manifest::parse(yaml).expect("parses");
+    let budget = m.budget();
+    // The dearest role per unit: 2050 tokens from the reader, and money from
+    // the reader's 2000 input + 50 output at one each.
+    assert_eq!(budget.max_call_tokens, Some(2_050));
+    assert_eq!(budget.max_call_minor_units, Some(2_050));
+
+    let open = Manifest::parse(&yaml.replace(", max_input_tokens: 2000", "")).expect("parses");
+    assert_eq!(
+        (
+            open.budget().max_call_tokens,
+            open.budget().max_call_minor_units
+        ),
+        (None, None),
+        "one role with unbounded input left the run's per-call bound set by the other role"
+    );
+
+    match Manifest::parse(&yaml.replace("max_input_tokens: 900", "max_input_tokens: 0")) {
+        Err(ManifestError::Unenforceable { field, .. }) => {
+            assert_eq!(field, "spec.models.privileged.max_input_tokens");
+        }
+        other => panic!("a zero input ceiling, which fails every call, was accepted: {other:?}"),
+    }
+}
+
+/// A tool's error text carries the tool's label, exactly as its answer does.
+///
+/// An MCP `isError` result is the tool's own content rendered into the failure
+/// detail, and the loop hands that detail to the model. Unlabelled, a
+/// confidential tool reached a model cleared for `internal` by failing instead
+/// of answering.
+#[cfg(all(feature = "redb", feature = "testkit"))]
+#[tokio::test]
+async fn a_tool_failure_above_the_model_ceiling_never_reenters_the_provider() {
+    use agentplane::core::Sensitivity;
+    use agentplane::runtime::{Agent, RunStatus, Runtime};
+    use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety};
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct FailsWithASecret(AtomicUsize);
+    #[async_trait::async_trait]
+    impl ToolClient for FailsWithASecret {
+        async fn call(
+            &self,
+            tool: &ToolId,
+            _arguments: &Value,
+            _provenance: Option<&agentplane::core::Provenance>,
+        ) -> Result<Value, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(ToolError::ToolFailed {
+                tool: tool.clone(),
+                detail: "SECRET: the vault key is 0xdeadbeef".to_owned(),
+            })
+        }
+
+        /// In-process: this double opens no connection, so there is no host for
+        /// the plane's egress allowlist to judge.
+        fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
+    }
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: guarded-loop, version: "1.0.0" }
+spec:
+  capabilities: { provides: [guarded.ask] }
+  models: { privileged: { provider: fake, model: declared-1 } }
+  tools:
+    - ref: tool://vault/read
+      mutates: false
+      description: Read a value.
+      arguments: { type: object, additionalProperties: false }
+  execution: { kind: tool-calling, max_turns: 3 }
+  security: { max_sensitivity_egress: internal }
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_call_tool("secret-1", "vault__read", json!({}));
+    provider.will_say("this turn must not run");
+    let catalog = Arc::new(
+        ToolCatalog::new().allow(
+            ToolId::new("vault", "read"),
+            ToolSafety::read_only()
+                .max_sensitivity(Sensitivity::Internal)
+                .output_sensitivity(Sensitivity::Confidential),
+        ),
+    );
+    let tool = Arc::new(FailsWithASecret::default());
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let runtime = Runtime::builder(store)
+        .provider("fake", Arc::clone(&provider) as Arc<_>)
+        .tools(catalog, Arc::clone(&tool) as Arc<_>)
+        .agent(Agent::new(&manifest))
+        .build();
+
+    let outcome = runtime
+        .run("guarded.ask", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(tool.0.load(Ordering::SeqCst), 1, "the tool was not reached");
+    assert!(
+        matches!(outcome.status, RunStatus::Failed(_)),
+        "{:?}",
+        outcome.status
+    );
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the confidential tool's error text re-entered a model cleared for internal"
     );
 }
 
@@ -4163,7 +4445,7 @@ fn the_extended_card_discloses_more_but_not_the_model() {
     // passes without exercising the disclosure it names.
     let m = Manifest::parse(&GOOD.replace(
         "  tools:",
-        "  models:\n    privileged: { provider: secret-provider, model: crown-model-7 }\n  tools:",
+        "  models:\n    privileged: { provider: secret-provider, model: crown-model-7, pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 } }\n  tools:",
     ))
     .expect("parse");
     let public = AgentCard::derive(&m, "https://plane/a2a").expect("public");
@@ -6948,17 +7230,13 @@ spec:
     Manifest::parse(&doc("", ""))
         .expect("a skill-backed agent declares no execution and needs no model");
 
-    // The sibling refusal: a declarative agent's driver is registered once per
-    // capability it provides, so an empty `provides` registers nothing and no
-    // run can ever reach the model, tools and prompt the file names.
+    // A declarative agent's driver is registered once per capability it
+    // provides, so an empty `provides` takes the agent's own name rather than
+    // registering nothing and leaving the model, tools and prompt unreachable.
     let silent = doc("  execution: { kind: completion }\n", named)
         .replace("provides: [work.do]", "provides: []");
-    let err = Manifest::parse(&silent)
-        .expect_err("a declarative agent advertising nothing can never be reached");
-    assert!(
-        err.to_string().contains("advertises no capability"),
-        "the refusal must say what is missing: {err}"
-    );
+    let m = Manifest::parse(&silent).expect("an empty provides takes the agent's name");
+    assert_eq!(m.spec.capabilities.provides, vec![m.metadata.name.clone()]);
 }
 
 /// **A capability served but not advertised is a door the review cannot see.**
@@ -7079,5 +7357,148 @@ fn an_input_schema_that_permits_anything_is_refused() {
             Err(ManifestError::NotASchema { .. })
         ),
         "an input schema that is not a schema object at all was accepted"
+    );
+}
+
+/// **The single-model shorthand and the name default are spellings, not
+/// declarations.**
+///
+/// `model:` is `models: { privileged: … }`, and a declarative agent that
+/// names no capability provides its own name. Each pair must be one document
+/// to everything downstream — the same digest, the same models, the same
+/// capability — or a reviewer pinning one spelling would be pinning a
+/// different agent from the one deployed in the other.
+#[test]
+fn the_shorthands_have_the_longhands_digest() {
+    let long = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: short, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise", constraints: "Be brief." }
+  capabilities: { provides: [short] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  budgets: { max_tokens: 1000 }
+"#;
+    let short = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: short, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise", constraints: "Be brief." }
+  model: { provider: fake, model: m-1 }
+  budgets: { max_tokens: 1000 }
+"#;
+    let long = Manifest::parse(long).expect("the longhand parses");
+    let short = Manifest::parse(short).expect("the shorthand parses");
+    assert_eq!(short.spec.capabilities.provides, vec!["short".to_owned()]);
+    assert_eq!(
+        short
+            .spec
+            .models
+            .as_ref()
+            .and_then(|m| m.privileged.as_ref()),
+        long.spec
+            .models
+            .as_ref()
+            .and_then(|m| m.privileged.as_ref())
+    );
+    assert_eq!(
+        short.digest().expect("digest"),
+        long.digest().expect("digest"),
+        "two spellings of one declaration carry two identities"
+    );
+
+    let both = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: short, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise", constraints: "Be brief." }
+  model: { provider: fake, model: m-1 }
+  models: { privileged: { provider: fake, model: m-2 } }
+  budgets: { max_tokens: 1000 }
+"#;
+    let err = Manifest::parse(both).expect_err("two answers to one question");
+    assert!(
+        err.to_string().contains("spec.model and spec.models"),
+        "{err}"
+    );
+}
+
+/// [`GOOD`] with a rate ceiling on its one grant.
+fn rated(rate_limit: &str) -> String {
+    GOOD.replace(
+        "      max_sensitivity: internal\n",
+        &format!("      max_sensitivity: internal\n      rate_limit: {rate_limit}\n"),
+    )
+}
+
+/// **A rate ceiling that admits nothing, or whose window has no end, is
+/// refused at parse.**
+///
+/// A zero count is a grant that forbids its own tool, which a reviewer reads
+/// as a grant; a zero window counts nothing; and a window past the calendar
+/// has no instant to subtract it from.
+#[test]
+fn a_rate_ceiling_that_admits_nothing_is_refused() {
+    let parsed = Manifest::parse(&rated("{ count: 20, window_seconds: 3600 }"))
+        .expect("a ceiling of twenty an hour parses");
+    assert_eq!(
+        parsed.spec.tools[0].rate_limit,
+        Some(agentplane::manifest::RateLimit {
+            count: 20,
+            window_seconds: 3_600
+        })
+    );
+    for (declared, what) in [
+        ("{ count: 0, window_seconds: 3600 }", "a zero count"),
+        ("{ count: 20, window_seconds: 0 }", "a zero window"),
+        (
+            "{ count: 20, window_seconds: 631107417600 }",
+            "a window past the calendar",
+        ),
+    ] {
+        match Manifest::parse(&rated(declared)) {
+            Err(ManifestError::Syntax(detail)) => assert!(
+                detail.contains("rate_limit"),
+                "the refusal of {what} must name the field: {detail}"
+            ),
+            Err(other) => panic!("{what} was refused for another reason: {other}"),
+            Ok(_) => panic!("{what} parsed as a rate ceiling"),
+        }
+    }
+}
+
+/// **A rate ceiling on an agent grant is refused.** An agent consultation
+/// dispatches through `commission`, which no rate is counted on.
+#[test]
+fn a_rate_ceiling_on_an_agent_grant_is_refused() {
+    let with_rate = ROOM_EDITOR.replace(
+        "      description: Ask the researcher to summarise a topic.",
+        "      rate_limit: { count: 5, window_seconds: 60 }\n      description: Ask the researcher to summarise a topic.",
+    );
+    assert!(
+        matches!(
+            Manifest::parse(&with_rate),
+            Err(ManifestError::Unenforceable { field, .. }) if field == "spec.tools[].rate_limit"
+        ),
+        "a rate ceiling on the commission path would be reviewed and never counted"
+    );
+}
+
+/// **The rate ceiling is part of the reviewed digest.**
+#[test]
+fn a_rate_ceiling_changes_the_manifest_digest() {
+    let twenty = Manifest::parse(&rated("{ count: 20, window_seconds: 3600 }")).unwrap();
+    let forty = Manifest::parse(&rated("{ count: 40, window_seconds: 3600 }")).unwrap();
+    assert_ne!(
+        twenty.digest().unwrap(),
+        forty.digest().unwrap(),
+        "raising a rate ceiling left the digest unchanged, so the revision that ran \
+         cannot say which ceiling bound it"
     );
 }

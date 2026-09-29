@@ -721,6 +721,7 @@ impl Effect for SweepExpiredMemory {
         self.memories
             .sweep_expired(self.at)
             .await
+            .map(|swept| swept.len())
             .map_err(|error| EffectError::Other(error.to_string()))
     }
 }
@@ -899,7 +900,7 @@ impl Effect for OpenTask {
                 "kind": self.spec.kind,
                 "deadline": self.spec.deadline,
                 "roles": self.spec.candidate_roles,
-                "escalate_to": self.spec.escalate_to,
+                "escalate_to": self.spec.on_expiry.escalate_roles(),
                 "priority": self.spec.priority.as_str(),
                 // In the key: two findings that differ only in what they say
                 // are two rows, and collapsing them would silently drop one.
@@ -971,14 +972,15 @@ impl Effect for OpenTask {
                 kind: self.spec.kind.clone(),
                 justification: self.spec.justification.clone(),
                 candidate_roles: self.spec.candidate_roles.clone(),
-                escalate_to: self.spec.escalate_to.clone(),
+                escalate_to: self.spec.on_expiry.escalate_roles().to_vec(),
                 excluded_actors: self.spec.excluded_actors.clone(),
                 assignee: None,
                 priority: self.spec.priority,
                 state: crate::core::TaskState::Open,
-                on_expiry: self.spec.on_expiry,
+                on_expiry: self.spec.on_expiry.policy(),
                 created_at: self.at,
                 due_at: Some(self.due_at),
+                withheld: None,
             })
             .await
             .map_err(|e| EffectError::Other(e.to_string()))?;
@@ -1013,6 +1015,9 @@ impl Effect for OpenTask {
 pub struct DrawOnAuthority {
     pub(crate) authorities: std::sync::Arc<dyn crate::authority::AuthorityStore>,
     pub(crate) id: crate::authority::AuthorityId,
+    /// Whom the drawing run acts for — see [`crate::authority::holder_of`].
+    /// `None` for a run that holds nothing.
+    pub(crate) holder: Option<crate::authority::Holder>,
     pub(crate) amount: crate::core::Spend,
     pub(crate) at: Timestamp,
     /// Filled by [`Effect::attach`]; the runtime owns the key, not the caller.
@@ -1028,6 +1033,7 @@ impl Effect for DrawOnAuthority {
             "authority.draw",
             json!({
                 "authority": self.id,
+                "holder": self.holder,
                 "amount": self.amount,
                 "at": crate::core::format_timestamp(self.at),
             }),
@@ -1040,8 +1046,10 @@ impl Effect for DrawOnAuthority {
         self.key = Some(provenance.dispatch.unwrap_or(provenance.effect));
     }
 
-    /// It changes durable state that authorizes spending. Saying otherwise would
-    /// exempt it from the whole-value taint gate.
+    /// It changes durable state that authorizes spending, and says so to every
+    /// rule reading `context.mutates`. The id it draws on is checked before
+    /// this effect exists: [`StepCtx::draw`](crate::runtime::StepCtx::draw)
+    /// refuses one untrusted data chose.
     fn mutates(&self) -> bool {
         true
     }
@@ -1065,27 +1073,56 @@ impl Effect for DrawOnAuthority {
                     .to_owned(),
             )
         })?;
-        self.authorities
-            .draw(&self.id, key, self.amount, self.at)
+        // The holder is part of the terms, which are written once and never
+        // updated — so reading it before the draw leaves no window a
+        // concurrent writer could change it through.
+        let held = self
+            .authorities
+            .state(&self.id)
             .await
-            .map_err(|error| match &error {
-                // The store could not answer. Retrying is safe *because of*
-                // the receipt dedup — even a draw whose commit acknowledgement
-                // was lost returns its original receipt on the retry — which
-                // is the same reason `recovery()` is `Retry`.
-                crate::authority::AuthorityError::Unavailable(_) => EffectError::Unavailable {
-                    driver: "authority-store".to_owned(),
-                    detail: error.to_string(),
-                },
-                // Answers, not faults: nothing was consumed, and no retry of
-                // the same draw changes a revocation, an expiry, a spent
-                // ceiling or an unknown id. `Other` would read as **in-doubt**,
-                // so a refusal the module docs call "not retryable, ever" would
-                // be retried under the full policy, reported upward as "may well
-                // have been applied", and would quarantine any group it was
-                // deferred in where the cheap abort is the truthful settlement.
-                // The refusal's own message says which of the five it was.
-                _ => EffectError::Refused(error.to_string()),
-            })
+            .map_err(|e| crate::authority::AuthorityError::Unavailable(e.to_string()))
+            .and_then(|state| {
+                let state = state
+                    .ok_or_else(|| crate::authority::AuthorityError::Unknown(self.id.clone()))?;
+                if self.holder.as_ref() == Some(&state.authority.holder) {
+                    Ok(())
+                } else {
+                    Err(crate::authority::AuthorityError::NotHolder {
+                        authority: self.id.clone(),
+                        holder: state.authority.holder,
+                        drawer: self
+                            .holder
+                            .as_ref()
+                            .map_or_else(|| "nobody".to_owned(), ToString::to_string),
+                    })
+                }
+            });
+        let drawn = match held {
+            Ok(()) => {
+                self.authorities
+                    .draw(&self.id, key, self.amount, self.at)
+                    .await
+            }
+            Err(refused) => Err(refused),
+        };
+        drawn.map_err(|error| match &error {
+            // The store could not answer. Retrying is safe *because of*
+            // the receipt dedup — even a draw whose commit acknowledgement
+            // was lost returns its original receipt on the retry — which
+            // is the same reason `recovery()` is `Retry`.
+            crate::authority::AuthorityError::Unavailable(_) => EffectError::Unavailable {
+                driver: "authority-store".to_owned(),
+                detail: error.to_string(),
+            },
+            // Answers, not faults: nothing was consumed, and no retry of
+            // the same draw changes a revocation, an expiry, a spent
+            // ceiling or an unknown id. `Other` would read as **in-doubt**,
+            // so a refusal the module docs call "not retryable, ever" would
+            // be retried under the full policy, reported upward as "may well
+            // have been applied", and would quarantine any group it was
+            // deferred in where the cheap abort is the truthful settlement.
+            // The refusal's own message says which one it was.
+            _ => EffectError::Refused(error.to_string()),
+        })
     }
 }

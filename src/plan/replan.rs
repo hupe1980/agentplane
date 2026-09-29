@@ -43,11 +43,16 @@ pub trait Replanner: Send + Sync + Debug {
     /// again, so a successor that drops them is not undoing them — it is only
     /// declining to do more.
     ///
-    /// **A completed step's id may not be reused for different work.** Keep it
-    /// with the same capability, or leave it out. Effect keys are derived from
-    /// the step id, so putting new work at a used id makes the run unreplayable
-    /// and makes the saga compensate something that never happened. The runtime
-    /// checks this and refuses a successor that breaks it.
+    /// **A completed step carries over unchanged or not at all.** Copy its node
+    /// from `current` — capability, arguments, dependencies and flags — or leave
+    /// it out. Effect keys are derived from the step id, so putting new work at
+    /// a used id makes the run unreplayable and makes the saga compensate
+    /// something that never happened; and a completed step counts as done by
+    /// id, so a redeclared node would be satisfied by work done before it
+    /// existed. The same holds for the id of a step that started and journaled
+    /// an effect without completing — the one that asked for this replan, if
+    /// it touched anything first: keep its capability or leave it out. The
+    /// runtime checks both and refuses a successor that breaks either.
     ///
     /// The result is validated against the same contract a first plan faces. A
     /// successor that fails validation stops the run rather than half-applying.

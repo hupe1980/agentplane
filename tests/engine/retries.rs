@@ -324,13 +324,19 @@ async fn an_idempotency_key_makes_a_mutating_timeout_retryable() {
     assert_eq!(f.calls.load(Ordering::SeqCst), 2);
 }
 
-/// A call that landed is never repeated, however many attempts remain. Its
-/// response was unusable; sending it again would perform it a second time and
-/// produce a second unusable response.
+/// A mutating call that landed is never repeated, however many attempts remain
+/// and whatever its recovery says. Its response was unusable; sending it again
+/// would perform it a second time. (A non-mutating call that landed changed
+/// nothing and falls through to its policy.)
 #[tokio::test]
 async fn an_effect_that_landed_is_never_repeated() {
     let (e, calls) = scripted(&[Attempt::LandedUndecodable, Attempt::Succeed]);
-    let f = fixture(e.policy(RetryPolicy::attempts(5)), calls);
+    let f = fixture(
+        e.mutating()
+            .recovery(Recovery::Retry)
+            .policy(RetryPolicy::attempts(5)),
+        calls,
+    );
 
     let out =
         f.rt.run("demo.once", Tainted::trusted(json!({})))
@@ -758,6 +764,8 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 ),
                 Append::new(

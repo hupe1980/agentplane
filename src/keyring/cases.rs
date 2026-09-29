@@ -341,8 +341,25 @@ impl CaseStore for SealedCases {
         self.inner.set_deadline_state(case, name, state).await
     }
 
+    async fn breach_deadline(
+        &self,
+        case: CaseId,
+        name: &str,
+        now: Timestamp,
+    ) -> Result<bool, StoreError> {
+        self.inner.breach_deadline(case, name, now).await
+    }
+
     async fn due(&self, now: Timestamp, limit: usize) -> Result<Vec<Deadline>, StoreError> {
         self.inner.due(now, limit).await
+    }
+
+    async fn breaches_to_note(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {
+        self.inner.breaches_to_note(limit).await
+    }
+
+    async fn mark_breach_noted(&self, case: CaseId, name: &str) -> Result<(), StoreError> {
+        self.inner.mark_breach_noted(case, name).await
     }
 
     async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {

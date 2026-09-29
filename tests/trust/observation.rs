@@ -228,6 +228,25 @@ fn an_unfamiliar_tool_status_claims_the_least() {
     );
 }
 
+/// An update that changes no status records no status.
+///
+/// ACP updates carry only the fields that changed, so a `tool_call_update`
+/// with no `status` left the call where it was. Mapped as `Pending`, a call the
+/// agent reported completed would read on the record as having gone back.
+#[test]
+fn a_tool_update_without_a_status_does_not_record_a_regression() {
+    let u = update(
+        r#"{"sessionId":"s","update":{"sessionUpdate":"tool_call_update",
+            "toolCallId":"c1","title":"retitled"}}"#,
+    );
+    assert_eq!(
+        acp::step_of(&u),
+        Mapped::NotRecorded {
+            session_update: "tool_call_update".to_owned()
+        }
+    );
+}
+
 /// The refusal an agent leaves when it offers no refusing option.
 ///
 /// ACP's client cannot answer *deny*: it selects from a list the agent wrote,

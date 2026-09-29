@@ -2816,3 +2816,94 @@ async fn a_resumed_atomic_member_consumes_its_recorded_denial() {
         "the resume performed a member or a reversal a second time"
     );
 }
+
+/// A group that aborted cleanly leaves its step with nothing to undo.
+///
+/// Every member landed and was reversed, and the journal says so in
+/// `GroupSettled { Aborted }`. Reading only the members' `EffectStarted`
+/// counted the step as having changed the world, so an unwind triggered by
+/// that same failure quarantined a checkout that declares no compensation —
+/// or, for one that did, would have undone the group a second time.
+#[tokio::test]
+async fn a_cleanly_aborted_group_leaves_its_step_nothing_to_unwind() {
+    use agentplane::core::{ArgSource, Compensation, PlanIR, PlanNode};
+
+    #[derive(Debug)]
+    struct Reserves {
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Reserves {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("reserve").provides("reserve")
+        }
+
+        fn compensation(&self) -> Compensation {
+            Compensation::Compensatable
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.effect(Call::new("seat.hold", "seat held", &self.world))
+                .await
+                .map_err(SkillError::Step)?;
+            Ok(Outcome::done(Tainted::trusted(json!("reserved"))))
+        }
+
+        async fn compensate(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _output: &Tainted<Value>,
+        ) -> Result<(), SkillError> {
+            cx.effect(Call::new("seat.release", "seat released", &self.world))
+                .await
+                .map_err(SkillError::Step)?;
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let world = World::new();
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .skill(Reserves {
+            world: Arc::clone(&world),
+        })
+        .skill(Checkout {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let plan = PlanIR::new(vec![
+        PlanNode::new(0, "reserve").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "checkout")
+            .arg("script", ArgSource::run_input())
+            .after(0)
+            .terminal(),
+    ]);
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({ "ending": "invariant" })))
+        .await
+        .expect("run");
+
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "a cleanly aborted group was read as a mutation nobody can undo: {:?}",
+        out.status
+    );
+    assert_eq!(
+        world.entries(),
+        vec![
+            "seat held",
+            "held sku-1",
+            "authorised",
+            "voided",
+            "released sku-1",
+            "seat released"
+        ],
+        "the group was not taken back exactly once, or step 0 was not compensated"
+    );
+}

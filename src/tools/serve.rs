@@ -47,7 +47,7 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 
 use crate::core::RunId;
-use crate::core::{SourceId, Tainted};
+use crate::core::{RuntimeError, SourceId, Tainted};
 use crate::manifest::{Identity, Manifest};
 use crate::runtime::{Admission, RunStatus, RunTerms, Runtime};
 
@@ -74,7 +74,42 @@ pub enum ServeError {
          the tool would be offered to a model and refused at every call"
     )]
     NoProvider { agent: String, capability: String },
+    /// The runtime has no [`PolicyEngine`](crate::core::PolicyEngine).
+    ///
+    /// Refused at build, as the operator API and the A2A server refuse it: a
+    /// catalogue offered to any host that connects, admitting runs under no
+    /// rule at all, is a plane somebody believes is governed.
+    #[error("this plane has no policy engine, so nothing would govern what a host may run")]
+    NoPolicy,
+    /// The policy engine cannot evaluate a request this surface's runs make.
+    ///
+    /// A host acts under no chain, so every run this catalogue admits asks
+    /// the engine under a context with no identity in it — a shape a plane
+    /// holding a chain of its own never builds for itself.
+    #[error("the policy set cannot evaluate a run a host admits: {problems}")]
+    PolicyUnevaluable { problems: String },
 }
+
+/// The `source` every admission this surface makes is keyed under.
+///
+/// What makes a run this surface's: `tasks/get` and `tasks/cancel` act only on
+/// runs whose admission key carries it, so a task id is not a handle on
+/// whatever the plane happens to be running.
+const ADMISSION_SOURCE: &str = "mcp/client";
+
+/// The request `_meta` key a host sets to make a retried `tools/call` one run.
+///
+/// The protocol carries no idempotency key of its own, and a JSON-RPC request
+/// id is unique only within one session — a host that retries after a lost
+/// response sends a new one. A host that wants a retry to be the same call
+/// names the call here; the same value answers with the run it already
+/// admitted.
+///
+/// **Within the session that sent it.** This surface authenticates no host, so
+/// the session is the only thing that says whose key it is; a key honoured
+/// across sessions would hand one host another's run for the price of
+/// guessing its key. A host that reconnects before retrying makes a new call.
+pub const IDEMPOTENCY_META_KEY: &str = "io.agentplane/idempotencyKey";
 
 /// One agent, as this catalogue offers it.
 #[derive(Debug, Clone)]
@@ -98,10 +133,28 @@ struct Served {
 ///
 /// Built from the manifests whose agents are wired into `runtime`; an agent the
 /// runtime cannot serve is a build-time refusal rather than a call-time one.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct McpServer {
     runtime: Arc<Runtime>,
     served: Vec<Served>,
+    /// This session, so neither a request id nor a host's key collides with
+    /// another session's.
+    ///
+    /// Minted per value, and **fresh on every clone**: a transport serving
+    /// several sessions clones the server once per session, and a clone that
+    /// copied the id would key two hosts' calls into one run — the second
+    /// host handed the first one's output.
+    session: String,
+}
+
+impl Clone for McpServer {
+    fn clone(&self) -> Self {
+        Self {
+            runtime: Arc::clone(&self.runtime),
+            served: self.served.clone(),
+            session: RunId::generate().to_string(),
+        }
+    }
 }
 
 impl McpServer {
@@ -109,10 +162,22 @@ impl McpServer {
     ///
     /// # Errors
     ///
+    /// [`ServeError::NoPolicy`] for a runtime with no policy engine,
+    /// [`ServeError::PolicyUnevaluable`] for one whose rules cannot evaluate a
+    /// run admitted under no chain,
     /// [`ServeError::NoInputSchema`] for an agent with no reviewed argument
     /// shape, and [`ServeError::Duplicate`] where two agents would answer to
     /// one tool name.
     pub fn new(runtime: Arc<Runtime>, manifests: &[Manifest]) -> Result<Self, ServeError> {
+        if runtime.policy().is_none() {
+            return Err(ServeError::NoPolicy);
+        }
+        let problems = runtime.served_policy_problems();
+        if !problems.is_empty() {
+            return Err(ServeError::PolicyUnevaluable {
+                problems: problems.join("; "),
+            });
+        }
         let mut served: Vec<Served> = Vec::new();
         for manifest in manifests {
             // The description a model reads is the *reviewed* one: `role` is
@@ -160,11 +225,90 @@ impl McpServer {
                 });
             }
         }
-        Ok(Self { runtime, served })
+        Ok(Self {
+            runtime,
+            served,
+            session: RunId::generate().to_string(),
+        })
     }
 
     fn find(&self, name: &str) -> Option<&Served> {
         self.served.iter().find(|s| s.capability == name)
+    }
+
+    /// The admission key for one call: the host's own, when it named one, or
+    /// the request id — either one scoped to this session.
+    fn admission_key(
+        &self,
+        request: &CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+    ) -> String {
+        let named = request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get(IDEMPOTENCY_META_KEY))
+            .or_else(|| context.meta.get(IDEMPOTENCY_META_KEY))
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| !key.trim().is_empty());
+        let id = named.map_or_else(
+            || format!("request:{}/{}", self.session, context.id),
+            |key| format!("host:{}/{key}", self.session),
+        );
+        crate::core::origin_key(ADMISSION_SOURCE, &id)
+    }
+
+    /// The run a task id names, if this surface admitted it.
+    ///
+    /// A run another surface admitted — a peer's A2A task, the embedder's own
+    /// — answers exactly as one that does not exist.
+    async fn our_run(
+        &self,
+        task_id: &str,
+    ) -> Result<(RunId, Vec<crate::journal::Record>), McpError> {
+        let run =
+            RunId::parse(task_id).map_err(|_| McpError::invalid_params("no such task", None))?;
+        let records = self
+            .runtime
+            .journal()
+            .read(run, 1)
+            .await
+            .map_err(|e| internal("reading a task's journal", &e))?;
+        if records
+            .first()
+            .and_then(crate::journal::Record::admission_source)
+            != Some(ADMISSION_SOURCE)
+        {
+            return Err(McpError::invalid_params("no such task", None));
+        }
+        Ok((run, records))
+    }
+}
+
+/// A fault on this plane's side, told to the host in one fixed sentence —
+/// see [`withheld_fault`](crate::core::withheld_fault).
+fn internal(doing: &str, error: &dyn std::fmt::Display) -> McpError {
+    McpError::internal_error(crate::core::withheld_fault("mcp", doing, error), None)
+}
+
+/// What a finished call answers with, for `tools/call` and `tasks/get` alike.
+///
+/// Every non-success is `isError`, and the reason is the run's status word —
+/// a refusal, an exhausted ceiling and a quarantine are different facts to an
+/// operator, and to a calling model they are all *this did not happen*. What
+/// must not happen is a failure rendered as an empty success.
+fn finished(
+    run: RunId,
+    status: &RunStatus,
+    output: Option<&Tainted<serde_json::Value>>,
+) -> CallToolResult {
+    match status {
+        RunStatus::Succeeded => {
+            CallToolResult::structured(output.map_or(serde_json::Value::Null, |o| o.peek().clone()))
+        }
+        other => CallToolResult::error(vec![ContentBlock::text(format!(
+            "run {run} did not succeed: {}",
+            other.as_str()
+        ))]),
     }
 }
 
@@ -310,7 +454,7 @@ impl ServerHandler for McpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let Some(served) = self.find(&request.name) else {
             return Err(McpError::invalid_params(
@@ -322,55 +466,67 @@ impl ServerHandler for McpServer {
         // Untrusted, and named for what composed it. A model's arguments get
         // the same admission any other caller's input gets, which is why the
         // sink gates downstream are not decorative.
+        let key = self.admission_key(&request, &context);
         let input = Tainted::from_source(
             serde_json::Value::Object(request.arguments.unwrap_or_default()),
             SourceId::new("mcp://client"),
         );
-        let admission = self
+        // Keyed, so a host's retry of one call is one run; and acting under no
+        // chain, because a host on this surface presents none and the plane's
+        // own is for the runs its embedder starts.
+        let terms = RunTerms::default().once(&key).served(None);
+        let admission = match self
             .runtime
-            .run_under(&served.capability, input, RunTerms::default())
+            .run_under(&served.capability, input, terms)
             .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        {
+            Ok(admission) => admission,
+            // The agent declining is an answer, not an outage, and its reason
+            // stays on the operator's side.
+            Err(RuntimeError::PolicyDenied(_) | RuntimeError::Delegation(_)) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
+                    "this agent declined the request",
+                )])
+                .into());
+            }
+            Err(e) => return Err(internal("admitting a tool call", &e)),
+        };
 
         let outcome = match admission {
+            // A retry of a call that already rested. The journal answers what
+            // happened, not the value, so a success is re-derived by strict
+            // replay — no effect is performed — and the retry gets the answer
+            // the first call got rather than an empty success.
+            Admission::Replayed(outcome) if matches!(outcome.status, RunStatus::Succeeded) => self
+                .runtime
+                .replay(outcome.run_id, crate::runtime::Mode::Strict)
+                .await
+                .map_err(|e| internal("replaying a retried call", &e))?,
             Admission::Fresh(outcome) | Admission::Replayed(outcome) => outcome,
-            // A key this server never sets cannot collide, so an in-flight
-            // answer is unreachable here rather than unhandled.
+            // The same call is executing right now, here or on another
+            // instance: a task the host can poll, never a failure it retries.
             Admission::InFlight(run) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "run {run} is already in flight for this call"
-                ))])
+                let now = protocol_now();
+                return Ok(CreateTaskResult::new(
+                    Task::new(run.to_string(), TaskStatus::Working, &now, &now)
+                        .with_status_message("already in flight"),
+                )
                 .into());
             }
         };
 
-        // Every non-success is `isError`, and the reason travels as text: a
-        // refusal, an exhausted ceiling and a quarantine are different facts to
-        // an operator, and to a calling model they are all *this did not
-        // happen, and here is why*. What must not happen is a failure rendered
-        // as an empty success.
         Ok(match outcome.status {
-            RunStatus::Succeeded => {
-                let value = outcome
-                    .output
-                    .map_or(serde_json::Value::Null, |o| o.peek().clone());
-                CallToolResult::structured(value).into()
-            }
             // A suspension is a task, and the id is the run's own — never a
             // generated handle. See `get_task` for what that buys.
             RunStatus::Suspended(ref why) => {
                 let now = protocol_now();
                 CreateTaskResult::new(
                     Task::new(outcome.run_id.to_string(), TaskStatus::Working, &now, &now)
-                        .with_status_message(format!("{why:?}")),
+                        .with_status_message(why.to_string()),
                 )
                 .into()
             }
-            other => CallToolResult::error(vec![ContentBlock::text(format!(
-                "run {} did not succeed: {other:?}",
-                outcome.run_id
-            ))])
-            .into(),
+            ref status => finished(outcome.run_id, status, outcome.output.as_ref()).into(),
         })
     }
 
@@ -491,28 +647,30 @@ impl ServerHandler for McpServer {
         request: GetTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        let run = RunId::parse(&request.task_id)
-            .map_err(|_| McpError::invalid_params("no such task", None))?;
-        let records = self
-            .runtime
-            .journal()
-            .read(run, 1)
-            .await
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        if records.is_empty() {
-            return Err(McpError::invalid_params("no such task", None));
-        }
+        let (run, records) = self.our_run(&request.task_id).await?;
 
         // A run with records and no conclusion is still working. `None` here is
         // *in flight*, not *unknown*: the records exist, so the run does.
         let status = crate::runtime::observed_status(&records);
         let payload = match &status {
-            Some(RunStatus::Succeeded) => TaskPayload::Completed {
-                result: serde_json::Map::new(),
-            },
-            Some(RunStatus::Cancelled { .. }) => TaskPayload::Failed {
-                error: error_object("the run was cancelled"),
-            },
+            // The call's own result, as `tools/call` would have answered it:
+            // a completed task that hands back an empty object has lost the
+            // answer the host suspended for. Recovered by strict replay — the
+            // output is a projection of the journal, and nothing is re-run.
+            Some(RunStatus::Succeeded) => {
+                let outcome = self
+                    .runtime
+                    .replay(run, crate::runtime::Mode::Strict)
+                    .await
+                    .map_err(|e| internal("replaying a completed task", &e))?;
+                let result =
+                    serde_json::to_value(finished(run, &outcome.status, outcome.output.as_ref()))
+                        .map_err(|e| internal("encoding a task's result", &e))?;
+                TaskPayload::Completed {
+                    result: result.as_object().cloned().unwrap_or_default(),
+                }
+            }
+            Some(RunStatus::Cancelled { .. }) => TaskPayload::Cancelled,
             // A suspension is not a conclusion. The run is parked on a timer,
             // an event or somebody's decision, and *working* is what that is to
             // a caller polling it — the alternative reports a run that will
@@ -524,7 +682,7 @@ impl ServerHandler for McpServer {
             // The distinction is not lost, it is in the journal, which is where
             // somebody who can act on it looks.
             Some(other) => TaskPayload::Failed {
-                error: error_object(&format!("{other:?}")),
+                error: error_object(&format!("the run did not succeed: {}", other.as_str())),
             },
         };
         let now = protocol_now();
@@ -543,8 +701,7 @@ impl ServerHandler for McpServer {
         request: CancelTaskParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        let run = RunId::parse(&request.task_id)
-            .map_err(|_| McpError::invalid_params("no such task", None))?;
+        let (run, _) = self.our_run(&request.task_id).await?;
         self.runtime
             // The actor is the *channel*, not a person: an MCP host cancelling
             // the task it started is identified by the connection this runtime
@@ -558,7 +715,10 @@ impl ServerHandler for McpServer {
             )
             .await
             .map(|_| ())
-            .map_err(|e| McpError::invalid_params(e.to_string(), None))
+            .map_err(|e| match e {
+                RuntimeError::Store(_) => internal("requesting a cancellation", &e),
+                other => McpError::invalid_params(other.to_string(), None),
+            })
     }
 
     fn get_prompt(

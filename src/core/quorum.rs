@@ -40,15 +40,15 @@ use serde::{Deserialize, Serialize};
 ///
 /// A derived `Deserialize` would reach the private fields directly, which is
 /// the `Quorum::new(need, lenses)` this type deliberately does not offer. It is
-/// the door that matters most here: a [`PlanNode`] carries an optional quorum,
-/// plans are deserialized — from a store, from a journal, from a [`Replanner`]
-/// parsing a model's proposal — and a panel is exactly the control a hijacked
-/// plan wants weakened. `need: 0` then reports [`Verdict::Pass`] having judged
-/// nothing, and a non-majority threshold reports whichever side `tally`
-/// happens to count first.
+/// the door that matters most here: a panel's quorum is configuration the
+/// aggregating skill reads — from a file, a store, a step's arguments — and a
+/// panel is exactly the control a hijacked input wants weakened. `need: 0` then
+/// reports [`Verdict::Pass`] having judged nothing, and a non-majority
+/// threshold reports whichever side `tally` happens to count first. A plan
+/// node carries no quorum ([`PlanNode`] says why): the panel is *k* verifier
+/// nodes and a terminal aggregator that decides with this type.
 ///
 /// [`PlanNode`]: crate::core::PlanNode
-/// [`Replanner`]: crate::plan::Replanner
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "DeclaredQuorum")]
 pub struct Quorum {

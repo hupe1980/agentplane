@@ -194,9 +194,12 @@ async fn altered_bytes_are_a_finding_not_a_presence() {
         .link_blob(case, claimed, ts(1_001))
         .await
         .expect("linked");
+    // One byte of the sealed payload flipped: the envelope still parses, and
+    // its tag no longer authenticates.
     let address = unit_address(&erasure_scope(&f.tenant, &case.to_string()), claimed);
-    f.raw
-        .tamper_for_test(address, b"what is there now".to_vec());
+    let mut stored = f.raw.get_raw(address).await.expect("the envelope");
+    *stored.last_mut().expect("a non-empty envelope") ^= 1;
+    f.raw.tamper_for_test(address, stored);
 
     let report = drill(&Stores {
         cases: &f.cases,
@@ -394,16 +397,23 @@ async fn a_retired_key_version_is_not_reported_as_loss_or_as_erasure() {
         "a retired version was counted as a completed erasure — an obligation \
          reported discharged that nobody requested, over data that is intact"
     );
-    assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
-    let finding = &report.findings[0];
+    // One for the sealed case state and one for its blob: both are intact
+    // bytes behind the same floor.
+    assert_eq!(report.findings.len(), 2, "{:#?}", report.findings);
+    for finding in &report.findings {
+        assert!(
+            !finding.contains("loss or tampering") && finding.contains("retired"),
+            "a reversible version floor reached the operator as an incident: {finding}"
+        );
+    }
     assert!(
-        !finding.contains("loss or tampering"),
-        "a reversible version floor reached the operator as an incident: {finding}"
-    );
-    assert!(
-        finding.contains("retired") && finding.contains("lower the floor"),
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.contains("lower the floor")),
         "the finding must name the remedy, or it is an incident by another \
-         name: {finding}"
+         name: {:#?}",
+        report.findings
     );
     assert!(
         !report.is_sound(),
@@ -682,4 +692,42 @@ async fn a_rehearsal_leaves_a_record_the_plane_can_be_asked_for() {
         "the later rehearsal did not replace the earlier one"
     );
     assert_eq!(second.cases, again.cases as u64);
+}
+
+/// **A retention pass names every copy a case walk cannot reach.**
+///
+/// A pass that erased every closed case and reported nothing else would read
+/// as *the obligation is discharged* while memory bound to the matter, the
+/// event buffer's copies, externally retained media and semantic-index vectors
+/// all survive it. Each is out of reach for its own reason, and each is named.
+#[tokio::test]
+async fn a_retention_pass_names_what_a_case_walk_does_not_reach() {
+    use agentplane::retention::{Stores as RetentionStores, retain};
+
+    let f = fixture();
+    let report = retain(
+        &RetentionStores {
+            cases: &f.cases,
+            blobs: Some(&f.blobs),
+            keys: Some(&f.keys),
+            tenant: &f.tenant,
+        },
+        ts(1_001),
+        ts(5_000),
+        "retention",
+    )
+    .await
+    .expect("retention");
+    for named in [
+        "`$case`",
+        "event buffer",
+        "external retention",
+        "semantic-index vectors",
+    ] {
+        assert!(
+            report.not_erasable.iter().any(|line| line.contains(named)),
+            "the report does not name {named}: {:#?}",
+            report.not_erasable
+        );
+    }
 }

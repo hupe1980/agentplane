@@ -8,7 +8,6 @@
 //! reviewable, lets the whole runtime be swapped under a simulator, and makes an
 //! eventual crate split mechanical rather than archaeological.
 
-mod attest;
 pub(crate) mod b64;
 mod budget;
 mod calendar;
@@ -30,20 +29,22 @@ pub(crate) mod poison;
 mod policy;
 mod retry;
 pub(crate) mod secret;
+mod signature;
 mod skill;
 mod task;
 mod tenant;
+mod visible;
 
-pub use attest::{
-    AttestError, Attestation, CheckpointSigner, DOMAIN_MANIFEST, DOMAIN_PROVENANCE, DOMAIN_RECORD,
-    KeyId, SignError, Signer, Verifier, signing_hash,
-};
 pub use budget::{Budget, BudgetExceeded, Consumed, Ledger, Spend};
 pub use calendar::{Calendar, CalendarError, WallClock};
 pub use cloudevent::{
     CONTENT_TYPE as CLOUDEVENT_CONTENT_TYPE, CloudEvent, CloudEventError,
     HEADER_PREFIX as CLOUDEVENT_HEADER_PREFIX, SPEC_VERSION as CLOUDEVENT_SPEC_VERSION,
     is_structured_media_type as is_cloudevent_media_type,
+};
+pub use signature::{
+    CheckpointSigner, DOMAIN_MANIFEST, DOMAIN_PROVENANCE, DOMAIN_RECORD, KeyId, KeySignature,
+    SignError, SignatureError, Signer, Verifier, signing_hash,
 };
 mod quorum;
 pub use quorum::{Outcome as QuorumOutcome, Quorum, QuorumError, Tally, Verdict};
@@ -63,11 +64,15 @@ pub use effect::{
     AnyEffect, DeclaredOutput, Effect, EffectDescriptor, GenAiRequest, GenAiResponse, GroupOutcome,
     Reconciliation, Recovery,
 };
+#[cfg(any(feature = "a2a-server", feature = "mcp-server"))]
+pub(crate) use error::withheld_fault;
 pub use error::{
     Disposition, EffectError, PolicyError, REFUSED, RuntimeError, SkillError, StepError, StoreError,
 };
+pub(crate) use event::is_reserved_kind;
 pub use event::{
     AwaitSpec, DeadLetter, Delivery, InboundEvent, Subscription, SuspendReason, Timer, origin_key,
+    origin_source,
 };
 pub use id::{
     BatchId, CaseId, Digest, EffectKey, Epoch, MAX_WINDOW_SECONDS, Phase, RunId, Seq, StepId,
@@ -89,7 +94,7 @@ pub use retry::{RetryPolicy, retry_after_seconds};
 pub use secret::Secret;
 pub use skill::{Capability, Compensation, Outcome, Skill, SkillDescriptor};
 pub use task::{
-    ClaimError, Decided, Decision, Justification, OnExpiry, Priority, Task, TaskId, TaskSpec,
-    TaskState,
+    ClaimError, Decided, Decision, Expiry, Justification, MixedScript, OnExpiry, Priority,
+    Rendering, Task, TaskId, TaskSpec, TaskState, Withheld,
 };
 pub use tenant::{TenantError, TenantId, erasure_scope};

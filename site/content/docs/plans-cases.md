@@ -163,16 +163,26 @@ describing exactly the attack.
 **Bounded.** `Budget::max_replans` caps it. A run that replans without bound has
 stopped making progress and started thrashing.
 
-**A completed step's id may not be reused for other work.** Effect keys are
+**A completed step carries over unchanged, or not at all.** Effect keys are
 derived from the step id, so new work at a used id cannot be replayed — and the
 unwind, which undoes what actually ran, would compensate whatever now occupies
-that slot. The runtime rejects such a successor and names both capabilities. The
-successor may keep a completed step, or leave it out; it may not repurpose it.
+that slot. The runtime rejects such a successor and names both capabilities.
+Redeclaring the same capability with different arguments, dependencies or flags
+is refused too: a completed step counts as done by its id, so the new node — a
+terminal verifier moved behind new work, say — would be satisfied by work done
+before it existed. Copy the node from the current plan, or leave it out.
+
+The same rule covers a step that **started and journaled an effect without
+completing** — typically the step that asked for the replan after charging
+something. Its id keeps its capability or stays empty. A step that asked before
+touching anything leaves its id free for a fallback.
 
 **The unwind resolves from what ran, not from the plan in force.** `completed`
 records the capability alongside the step id, because a successor may drop a
 completed step entirely — and resolving the compensation from the live plan then
-finds nothing and silently skips it, leaving the mutation in place.
+finds nothing and silently skips it, leaving the mutation in place. A step that
+changed something and never completed is undone as the skill its `StepStarted`
+record names, for the same reason.
 
 **Read back on replay, never re-synthesised.** A planner asked twice can answer
 differently — a changed router, a different model — and replay would then verify
@@ -259,7 +269,7 @@ continuity must be explicit (case state, not local variables), which is the
 right trade when the alternative is an auditor asking about a process whose code
 no longer exists.
 
-That explicit state carries two obligations, and both were learned the hard way.
+That explicit state has rules of its own.
 
 **It is read through the effect protocol, not directly.** Case state is mutable
 storage shared by every run on the case, so reading it is exactly as
@@ -273,9 +283,9 @@ whose replay is supposed to perform nothing. `cx.case_state()` and
 several runs write it over a process that may last months, and the engine never
 interprets a byte of it, so a read is only as trustworthy as the least
 trustworthy thing anybody ever wrote — and nothing in the runtime knows what that
-was. Handing it back trusted made it an exit from the lattice: a skill holding a
-model completion could put it into case state and read it back clean in a later
-step, or a later *run*, having passed none of `cx.release`'s policy check and
+was. Handed back trusted, it would be an exit from the lattice: a skill holding
+a model completion could put it into case state and read it back clean in a
+later step, or a later *run*, having passed none of `cx.release`'s policy check and
 leaving no record that a declassification happened.
 
 Storing the writing step's label instead would be no better, because it describes
@@ -572,6 +582,11 @@ so that one is exact however wide the plan runs.
 Money is tracked in **integer minor units**. Money that rounds differently on
 two machines is money that produces two different budget verdicts.
 
+A run's ceiling bounds one run. A tenant's spend quota bounds a period across
+runs, and it reserves each run's worst case — its ceiling plus one call per
+step in flight — at admission, so suspended and concurrent runs cannot carry
+the period past it → [per-tenant ceilings](@/docs/operations.md#per-tenant-ceilings).
+
 ### A wall-clock ceiling is measured from the journal
 
 Elapsed time cannot be checked without reading a clock, and a clock read is an
@@ -663,6 +678,12 @@ order to **disagree**:
 checked inside the same transaction that reserves the task. Without an enforced
 exclusion, dual control is a naming convention.
 
+Whoever **asked for the run** is barred without a line of code: a served surface
+admits each run with its authenticated caller (`RunTerms::admitted_by` for an
+embedder), the run's `RunAdmitted` record keeps the name, and every task the run
+opens excludes it — including the approvals of a declarative agent, which has no
+code in which to say so.
+
 Claiming is also atomic: two reviewers opening one queue must not both believe
 they hold a task, and a check followed by a separate write has exactly that
 window.
@@ -678,7 +699,7 @@ reviewer or stops applying an expiry policy plane-wide.
 | `open` | ✅ | ✅ | ✅ |
 | `claimed` | — | ✅ | ✅ |
 | `escalated` | ✅ | ✅ | — |
-| `completed`, `expired` | — | — | — |
+| `completed`, `expired`, `withdrawn` | — | — | — |
 
 A claimed task leaves the queue because it is nobody else's to take, and stays
 in the backlog because it is still a decision the plane is waiting on. An
@@ -688,16 +709,31 @@ nothing further by the sweep, because its expiry policy has already fired. The
 three predicates are `TaskState::is_queued`, `is_pending` and `awaits_expiry`;
 an implementation of `TaskStore` should call them rather than re-deciding.
 
+A task is `withdrawn` when the run waiting on it concludes closed — cancelled,
+abandoned, or finished some other way — before anybody answered it: nobody can
+answer a task whose run is sealed. A task opened *beside* an answer
+(`StepCtx::open_task`) is not waited on and outlives its run. The same
+conclusion disarms the run's timers and retires its event subscriptions, so a closed run neither takes the next event a live
+run is waiting for nor wakes the sweep every lease period.
+
+A decision and an expiry race to settle one task, and the run consumes
+whichever answer reached it first. Settling is a compare-and-set from the
+pending states, so the loser never overwrites the winner's state, and a
+decision that loses is refused with `ClaimError::AlreadyAnswered` (HTTP 409)
+rather than reported as delivered.
+
 ### Expiry is declared, never decided in the moment
 
-| `OnExpiry` | Behaviour |
+| `Expiry` | Behaviour |
 |---|---|
 | `Deny` | Refuse the proposed action. The default. |
-| `Escalate` | Widen the audience and keep waiting. Idempotent, so the sweep is safe on a timer. |
-| `Proceed` | Act unattended — **requires `allow_unattended()`** |
+| `Escalate { to }` | Widen the audience by `to` and keep waiting. Idempotent, so the sweep is safe on a timer. `Expiry::escalate_to(["role"])` builds it. |
+| `ProceedUnattended` | Act unattended. |
 
-The separate opt-in exists so that acting without a human is an explicit,
-greppable decision rather than an enum variant somebody picked off a list.
+Each answer carries what it needs: an escalation names who it widens to, and
+acting without a human has one spelling, so it is an explicit, greppable
+decision rather than a variant somebody picked off a list. The stored task
+records the policy as `OnExpiry` beside its `escalate_to` roles.
 "The human did not answer, so we did it anyway" must be something signed in
 advance.
 
@@ -710,7 +746,8 @@ budget, and N unrelated runs leave nobody able to answer "did it finish".
 
 So a batch owns N runs sharing one frozen plan. Each item gets its own journal,
 its own budget, and its own outcome; the batch holds the cursor, the census, and
-the terminal state.
+the terminal state. An item is admitted untrusted unless its source vouches for
+it with `BatchItem::labelled`.
 
 "One frozen plan" is the store's to enforce, not a convention: the batch row
 records the plan digest it was opened with, and a resume offering a different
@@ -784,6 +821,12 @@ Two consequences:
 The cursor is the **contiguous terminal prefix**, not the highest finished key: an
 item suspended at 400 holds the cursor at 399 even if 401–500 have finished, or a
 resume steps over it and the batch reports complete with work outstanding.
+
+Keys are compared as **bytes**, so an `ItemSource` must page in strictly
+increasing byte order of `BatchItem::key` — zero-pad numeric keys, and do not
+page in a locale collation. A page out of that order is refused with an error
+naming the offending key, because a cursor over a differently sorted source
+resumes past items that never ran.
 
 And "every stored item is terminal" is **not** "the batch is finished" — a batch
 halted after 10,000 of 100,000 items has no unfinished item anywhere in its

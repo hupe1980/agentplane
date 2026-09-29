@@ -30,7 +30,12 @@ use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
 fn mandate() -> StandingAuthority {
-    StandingAuthority::new("mandate-42", "approval:SET-42", Spend::money(50_000))
+    StandingAuthority::new(
+        "mandate-42",
+        agentplane::authority::Holder::Tenant,
+        "approval:SET-42",
+        Spend::money(50_000),
+    )
 }
 
 /// A distinct dispatch key per logical draw.
@@ -160,7 +165,13 @@ async fn each_refusal_is_distinguishable_from_the_others() {
     );
 
     // Out of draws, while ceiling remains — the two bound different abuses.
-    let capped = StandingAuthority::new("capped", "approval:1", Spend::money(50_000)).max_draws(1);
+    let capped = StandingAuthority::new(
+        "capped",
+        agentplane::authority::Holder::Tenant,
+        "approval:1",
+        Spend::money(50_000),
+    )
+    .max_draws(1);
     store.issue(&capped).await.expect("issue");
     let id = AuthorityId::new("capped");
     store
@@ -177,8 +188,13 @@ async fn each_refusal_is_distinguishable_from_the_others() {
     );
 
     // Expired, evaluated against the instant handed in rather than a store clock.
-    let expiring = StandingAuthority::new("expiring", "approval:2", Spend::money(500))
-        .expires_at(Timestamp::from_unix_timestamp(1_000).expect("timestamp"));
+    let expiring = StandingAuthority::new(
+        "expiring",
+        agentplane::authority::Holder::Tenant,
+        "approval:2",
+        Spend::money(500),
+    )
+    .expires_at(Timestamp::from_unix_timestamp(1_000).expect("timestamp"));
     store.issue(&expiring).await.expect("issue");
     let expired = store
         .draw(
@@ -216,7 +232,12 @@ async fn terms_are_immutable_but_an_identical_reissue_is_not_an_error() {
         .await
         .expect("an identical re-issue is a retried deploy, not an attack");
 
-    let raised = StandingAuthority::new("mandate-42", "approval:SET-42", Spend::money(500_000));
+    let raised = StandingAuthority::new(
+        "mandate-42",
+        agentplane::authority::Holder::Tenant,
+        "approval:SET-42",
+        Spend::money(500_000),
+    );
     let error = store
         .issue(&raised)
         .await
@@ -276,12 +297,299 @@ impl Skill for Buys {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        let drawn = cx.draw(&AuthorityId::new("mandate-42"), self.0).await?;
+        let id = Tainted::trusted(AuthorityId::new("mandate-42"));
+        let drawn = cx.draw(&id, self.0).await?;
         Ok(Outcome::done(Tainted::trusted(json!({
             "remaining": drawn.remaining.minor_units,
             "draws": drawn.draws,
         }))))
     }
+}
+
+/// Draws on whichever authority its input names, carrying the input's label.
+#[derive(Debug)]
+struct BuysNamed;
+
+#[async_trait::async_trait]
+impl Skill for BuysNamed {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("buy-named").provides("commerce.buy_named")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let id = input.map(|v| AuthorityId::new(v["authority"].as_str().unwrap_or_default()));
+        cx.draw(&id, Spend::money(100)).await?;
+        Ok(Outcome::done(Tainted::trusted(json!({ "drawn": true }))))
+    }
+}
+
+/// Which mandate to spend is not a choice untrusted data makes.
+///
+/// A peer's message naming an authority id is the attack: the id is the only
+/// credential a draw checks, so a value somebody else chose would spend a
+/// mandate this run never selected.
+#[tokio::test]
+async fn an_authority_id_from_untrusted_data_is_refused() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    store.issue(&mandate()).await.expect("issue");
+    let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .authorities(Arc::clone(&store) as Arc<dyn AuthorityStore>)
+        .skill(BuysNamed)
+        .build();
+
+    let outcome = runtime
+        .run(
+            "commerce.buy_named",
+            Tainted::from_source(
+                json!({ "authority": "mandate-42" }),
+                agentplane::core::SourceId::new("peer:x"),
+            ),
+        )
+        .await
+        .expect("run");
+    assert!(
+        matches!(outcome.status, RunStatus::Failed(_)),
+        "a peer chose which authority to spend: {:?}",
+        outcome.status
+    );
+    let state = store
+        .state(&AuthorityId::new("mandate-42"))
+        .await
+        .expect("state")
+        .expect("issued");
+    assert_eq!(state.drawn, Spend::default(), "the peer's choice spent it");
+
+    // The same id, chosen by the operator, draws.
+    let outcome = runtime
+        .run(
+            "commerce.buy_named",
+            Tainted::trusted(json!({ "authority": "mandate-42" })),
+        )
+        .await
+        .expect("run");
+    assert_eq!(outcome.status, RunStatus::Succeeded);
+}
+
+/// An authority is spent only by runs acting for its holder.
+///
+/// Alice's mandate, drawn by a run acting for Bob, is the confused deputy the
+/// id alone cannot prevent: both runs are in the tenant, and both know the id.
+#[tokio::test]
+async fn a_run_acting_for_someone_else_cannot_draw() {
+    use agentplane::core::{Delegation, Principal, Scope};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    store
+        .issue(&StandingAuthority::new(
+            "mandate-42",
+            agentplane::authority::Holder::subject("user:alice"),
+            "approval:SET-42",
+            Spend::money(50_000),
+        ))
+        .await
+        .expect("issue");
+    let acting_for = |owner: &str| {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .authorities(Arc::clone(&store) as Arc<dyn AuthorityStore>)
+            .acting_as(Delegation::root(Principal::new(owner, Scope::root())))
+            .skill(Buys(Spend::money(100)))
+            .build()
+    };
+
+    let bob = acting_for("user:bob")
+        .run("commerce.buy", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        matches!(bob.status, RunStatus::Failed(_)),
+        "a run acting for bob spent alice's authority: {:?}",
+        bob.status
+    );
+    let state = store
+        .state(&AuthorityId::new("mandate-42"))
+        .await
+        .expect("state")
+        .expect("issued");
+    assert_eq!(state.drawn, Spend::default());
+
+    let alice = acting_for("user:alice")
+        .run("commerce.buy", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(alice.status, RunStatus::Succeeded, "the holder may draw");
+}
+
+/// The tenant's mandate is the deployment's, and neither a chain whose owner
+/// is spelled like the tenant nor a served caller that named no owner holds it.
+#[tokio::test]
+async fn a_tenant_mandate_is_drawn_only_by_the_planes_own_runs() {
+    use agentplane::core::{Delegation, Principal, Scope};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    store.issue(&mandate()).await.expect("issue");
+    let plane = |chain: Option<Delegation>| {
+        let mut builder = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .authorities(Arc::clone(&store) as Arc<dyn AuthorityStore>)
+            .skill(Buys(Spend::money(100)));
+        if let Some(chain) = chain {
+            builder = builder.acting_as(chain);
+        }
+        builder.build()
+    };
+    let drawn = || async {
+        store
+            .state(&AuthorityId::new("mandate-42"))
+            .await
+            .expect("state")
+            .expect("issued")
+            .drawn
+    };
+
+    // A chain whose owner is named like the tenant is still a subject.
+    let spoofed = plane(Some(Delegation::root(Principal::new(
+        "tenant:default",
+        Scope::root(),
+    ))))
+    .run("commerce.buy", Tainted::trusted(json!({})))
+    .await
+    .expect("run");
+    assert!(
+        matches!(spoofed.status, RunStatus::Failed(_)),
+        "a subject spelled like the tenant drew its mandate: {:?}",
+        spoofed.status
+    );
+
+    // A served caller with no chain holds nothing.
+    let served = plane(None)
+        .run_under(
+            "commerce.buy",
+            Tainted::trusted(json!({})),
+            agentplane::runtime::RunTerms::default().served(None),
+        )
+        .await
+        .expect("admitted");
+    let agentplane::runtime::Admission::Fresh(served) = served else {
+        panic!("a fresh admission");
+    };
+    assert!(
+        matches!(served.status, RunStatus::Failed(_)),
+        "a chainless served caller drew the tenant's mandate: {:?}",
+        served.status
+    );
+    assert_eq!(drawn().await, Spend::default());
+
+    // The plane's own run, with no chain, does.
+    let own = plane(None)
+        .run("commerce.buy", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(own.status, RunStatus::Succeeded);
+    assert_eq!(drawn().await, Spend::money(100));
+}
+
+/// Commissions the buying skill, and nothing else.
+#[derive(Debug)]
+struct DelegatesBuying;
+
+#[async_trait::async_trait]
+impl Skill for DelegatesBuying {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("delegates-buying").provides("commerce.delegate")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let answer = cx
+            .commission("commerce.buy", Tainted::trusted(json!({})))
+            .await?;
+        Ok(Outcome::done(answer))
+    }
+}
+
+/// A plane's own run commissions as the plane, not as a stranger.
+///
+/// On a plane with no chain of its own, the embedder's run holds the tenant's
+/// mandate. Its sub-run is the same plane's work and draws the same way: a
+/// commission that admitted it as a chainless *served* caller would journal
+/// `served_unchained: true` and refuse the draw the parent itself could take.
+#[tokio::test]
+async fn a_planes_own_commission_draws_as_the_plane() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    store.issue(&mandate()).await.expect("issue");
+    let plane = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .authorities(Arc::clone(&store) as Arc<dyn AuthorityStore>)
+        .skill(Buys(Spend::money(100)))
+        .skill(DelegatesBuying)
+        .build();
+    let out = plane
+        .run("commerce.delegate", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(
+        out.status,
+        RunStatus::Succeeded,
+        "the plane's own commission could not draw the tenant's mandate"
+    );
+    let state = store
+        .state(&AuthorityId::new("mandate-42"))
+        .await
+        .expect("state")
+        .expect("issued");
+    assert_eq!(state.drawn, Spend::money(100));
+
+    let runs = store.recent_runs(None, 16).await.expect("runs");
+    let mut children = 0;
+    for (run, _) in runs {
+        let first = store.read_page(run, 1, 1).await.expect("read");
+        for record in first {
+            if let agentplane::journal::RecordKind::RunAdmitted {
+                capability,
+                served_unchained,
+                ..
+            } = record.kind()
+                && capability == "commerce.buy"
+            {
+                children += 1;
+                assert!(
+                    !served_unchained,
+                    "an embedder's sub-run was journaled as a chainless served caller"
+                );
+            }
+        }
+    }
+    assert_eq!(children, 1, "exactly one sub-run was commissioned");
+
+    // The other half: a chainless *served* caller's commission holds nothing,
+    // so its sub-run cannot draw what its parent could not.
+    let served = plane
+        .run_under(
+            "commerce.delegate",
+            Tainted::trusted(json!({})),
+            agentplane::runtime::RunTerms::default().served(None),
+        )
+        .await
+        .expect("admitted");
+    let agentplane::runtime::Admission::Fresh(served) = served else {
+        panic!("a fresh admission");
+    };
+    assert!(
+        matches!(served.status, RunStatus::Failed(_)),
+        "a chainless served caller drew the tenant's mandate through a commission: {:?}",
+        served.status
+    );
+    let state = store
+        .state(&AuthorityId::new("mandate-42"))
+        .await
+        .expect("state")
+        .expect("issued");
+    assert_eq!(state.drawn, Spend::money(100));
 }
 
 /// Strict replay reproduces the receipt and consumes nothing.
@@ -341,6 +649,7 @@ async fn a_run_that_cannot_draw_does_not_succeed() {
     store
         .issue(&StandingAuthority::new(
             "mandate-42",
+            agentplane::authority::Holder::Tenant,
             "approval:SET-42",
             Spend::money(100),
         ))
@@ -428,6 +737,7 @@ async fn a_revoked_draw_is_answered_once_and_never_retried() {
     store
         .issue(&StandingAuthority::new(
             "mandate-42",
+            agentplane::authority::Holder::Tenant,
             "approval:SET-42",
             Spend::money(50_000),
         ))

@@ -82,6 +82,7 @@ impl EffectKey {
 /// with identical descriptors at the same position are, by definition, the same
 /// call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EffectDescriptor {
     /// Stable, low-cardinality family — `"clock.now"`, `"tool.call"`,
     /// `"model.complete"`. Appears in journal listings and traces.
@@ -133,6 +134,7 @@ impl EffectDescriptor {
 ///
 /// [`RecordKind::RunAdmitted`]: crate::journal::RecordKind::RunAdmitted
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeclaredOutput {
     pub trust: Trust,
     pub sensitivity: Sensitivity,
@@ -222,7 +224,7 @@ impl<T> Reconciliation<T> {
 /// the journal alone. The runtime refuses to guess, so every effect states its
 /// semantics — and the default is the conservative one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case", tag = "mode")]
+#[serde(rename_all = "snake_case", tag = "mode", deny_unknown_fields)]
 pub enum Recovery {
     /// Pure read or idempotent write — safe to re-run.
     Retry,
@@ -352,6 +354,19 @@ pub trait Effect: Send + Sync {
         RetryPolicy::default()
     }
 
+    /// Whether a failure that [landed](crate::core::Disposition::Landed) may
+    /// be tried again, within [`retry`](Self::retry).
+    ///
+    /// Only ever consulted for an effect that does not mutate: a mutating one
+    /// that landed is never repeated. Defaults to `true`, because re-asking a
+    /// read or a completion changes nothing but the bill — a model stream that
+    /// died after generating is the common case. An effect whose landed
+    /// failure is the far side's considered answer returns `false`, and the
+    /// failure is then final on its first attempt.
+    fn retries_landed(&self) -> bool {
+        true
+    }
+
     /// The highest data sensitivity this sink may receive.
     ///
     /// The runtime refuses to pass arguments above this ceiling, which is the
@@ -370,6 +385,24 @@ pub trait Effect: Send + Sync {
     /// the gate while the effect sent unrelated attacker-controlled arguments.
     fn sink_arguments(&self) -> Option<&Value> {
         None
+    }
+
+    /// How many bytes dispatching this effect sends out of the plane.
+    ///
+    /// What an egress ceiling counts. Defaults to the canonical size of
+    /// [`sink_arguments`](Self::sink_arguments) — zero for an effect binding
+    /// none — which is right wherever the bound value is the whole request. An
+    /// effect whose request carries more than its bound value overrides it: a
+    /// model call sends its tool declarations, every earlier tool result and
+    /// the materialized media beside a prompt that may be two bytes long, and
+    /// counting the prompt alone is a ceiling a 10 MB image walks through.
+    ///
+    /// Must be computed from the effect as constructed, never from I/O: a
+    /// replayed pass bills the same figure without dispatching.
+    fn outbound_bytes(&self) -> u64 {
+        self.sink_arguments().map_or(0, |args| {
+            crate::core::canon::to_bytes(args).map_or(0, |b| b.len() as u64)
+        })
     }
 
     /// Field-specific source and sensitivity rules for a structured sink.
@@ -588,8 +621,10 @@ pub trait AnyEffect: Send + Sync {
     fn mutates(&self) -> bool;
     fn recovery(&self) -> Recovery;
     fn retry(&self) -> RetryPolicy;
+    fn retries_landed(&self) -> bool;
     fn max_sensitivity(&self) -> Sensitivity;
     fn sink_arguments(&self) -> Option<&Value>;
+    fn outbound_bytes(&self) -> u64;
     fn protected_fields(&self) -> &[ProtectedField];
     fn delegation_depth(&self) -> Option<usize>;
     fn source(&self) -> SourceId;
@@ -623,11 +658,17 @@ where
     fn retry(&self) -> RetryPolicy {
         Effect::retry(self)
     }
+    fn retries_landed(&self) -> bool {
+        Effect::retries_landed(self)
+    }
     fn max_sensitivity(&self) -> Sensitivity {
         Effect::max_sensitivity(self)
     }
     fn sink_arguments(&self) -> Option<&Value> {
         Effect::sink_arguments(self)
+    }
+    fn outbound_bytes(&self) -> u64 {
+        Effect::outbound_bytes(self)
     }
     fn protected_fields(&self) -> &[ProtectedField] {
         Effect::protected_fields(self)
@@ -715,11 +756,17 @@ impl Effect for Box<dyn AnyEffect + '_> {
     fn retry(&self) -> RetryPolicy {
         (**self).retry()
     }
+    fn retries_landed(&self) -> bool {
+        (**self).retries_landed()
+    }
     fn max_sensitivity(&self) -> Sensitivity {
         (**self).max_sensitivity()
     }
     fn sink_arguments(&self) -> Option<&Value> {
         (**self).sink_arguments()
+    }
+    fn outbound_bytes(&self) -> u64 {
+        (**self).outbound_bytes()
     }
     fn protected_fields(&self) -> &[ProtectedField] {
         (**self).protected_fields()

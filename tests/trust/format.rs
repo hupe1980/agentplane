@@ -99,6 +99,8 @@ fn admission_and_plan() -> Vec<RecordKind> {
             ))),
             canon: 1,
             idempotency_key: Some("acme.erp\u{1f}MSG-1".into()),
+            admitted_by: None,
+            served_unchained: false,
         },
         RecordKind::QuotaPassStarted {
             period: Some("2026-09".into()),
@@ -456,7 +458,8 @@ fn a_record_from_a_shape_this_build_does_not_know_is_refused() {
     let raw = serde_json::to_vec(&value).expect("serialises");
     let hash = Digest::chain(Digest::ZERO, &raw);
 
-    let err = Record::from_stored(raw, Digest::ZERO, hash).expect_err("a v2 record is not read");
+    let err = Record::from_stored_signed(raw, Digest::ZERO, hash, None)
+        .expect_err("a v2 record is not read");
     assert!(
         matches!(
             err,
@@ -495,7 +498,7 @@ fn a_record_with_a_field_this_build_does_not_know_is_refused() {
     let raw = serde_json::to_vec(&value).expect("serialises");
     let hash = Digest::chain(Digest::ZERO, &raw);
 
-    let err = Record::from_stored(raw, Digest::ZERO, hash)
+    let err = Record::from_stored_signed(raw, Digest::ZERO, hash, None)
         .expect_err("an unknown field is not read past");
     assert!(
         matches!(
@@ -522,7 +525,7 @@ fn a_version_skew_is_not_reported_as_tampering() {
     let raw = serde_json::to_vec(&value).expect("serialises");
     let hash = Digest::chain(Digest::ZERO, &raw);
 
-    let err = Record::from_stored(raw, Digest::ZERO, hash).expect_err("refused");
+    let err = Record::from_stored_signed(raw, Digest::ZERO, hash, None).expect_err("refused");
     let lifted = agentplane::core::RuntimeError::from_store(err);
     assert!(
         !matches!(lifted, agentplane::core::RuntimeError::ChainBroken { .. }),
@@ -554,10 +557,78 @@ fn a_field_this_build_does_not_know_is_refused() {
     let raw = serde_json::to_vec(&value).expect("serialises");
     let hash = Digest::chain(Digest::ZERO, &raw);
 
-    let err = Record::from_stored(raw, Digest::ZERO, hash).expect_err("refused");
+    let err = Record::from_stored_signed(raw, Digest::ZERO, hash, None).expect_err("refused");
     assert!(
         err.to_string().contains("settlement_id"),
         "the refusal has to name the field nobody knows: {err}"
+    );
+}
+
+/// **A member nobody knows is refused inside the payload too, at every depth
+/// the record's own types reach.**
+///
+/// The top-level refusal covers the record's fields and none of the structs
+/// they hold. A nested struct that skipped an unknown member let a writer
+/// extend an effect descriptor, a spend, a principal or a label and have
+/// this reader decide over the part it happened to know. Every nested object
+/// the record types own is listed here, taken from the golden corpus; free
+/// payload values (`input`, `output`, `args`, `plan`) are the caller's JSON
+/// and are not on the list.
+#[test]
+fn a_member_nobody_knows_is_refused_inside_the_payload() {
+    const NESTED: &[(&str, &str)] = &[
+        ("RunAdmitted", "/governed_by"),
+        ("RunAdmitted", "/input_label"),
+        ("RunAdmitted", "/policy_bundle"),
+        ("EffectStarted", "/descriptor"),
+        ("EffectStarted", "/outbound_label"),
+        ("EffectStarted", "/recovery"),
+        ("EffectDone", "/declared"),
+        ("EffectDone", "/spend"),
+        ("EffectFailed", "/spend"),
+        ("EffectReconciled", "/asserted_by"),
+        ("EffectReconciled", "/declared"),
+        ("IdentityBound", "/chain/0"),
+        ("RunSuspended", "/reason"),
+        ("RunSuspended", "/reason/correlation/0"),
+        ("CaseBound", "/correlation/0"),
+        ("Released", "/label"),
+        ("Released", "/field_labels/~1iban"),
+        ("Released", "/release"),
+        ("RunConcluded", "/exhaustion"),
+        ("RunConcluded", "/live_spend"),
+        ("RunCancelled", "/actor"),
+        ("QuarantineDecided", "/decider"),
+        ("AuthorityWithheld", "/by"),
+        ("BreakGlass", "/actor"),
+        ("Observed", "/reported"),
+        ("Observed", "/reported/outcome"),
+    ];
+    let golden = std::fs::read_to_string(golden_path()).expect("the golden corpus");
+    let mut accepted = Vec::new();
+    for (kind, pointer) in NESTED {
+        let line = golden
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).expect("json"))
+            .find(|v| v["kind"] == json!(kind))
+            .unwrap_or_else(|| panic!("no golden {kind}"));
+        let mut body: Value =
+            serde_json::from_str(line["raw"].as_str().expect("raw")).expect("json");
+        assert!(
+            serde_json::from_value::<RecordBody>(body.clone()).is_ok(),
+            "the golden {kind} does not parse unedited"
+        );
+        body.pointer_mut(pointer)
+            .and_then(Value::as_object_mut)
+            .unwrap_or_else(|| panic!("golden {kind} has no object at {pointer}"))
+            .insert("smuggled".into(), json!(1));
+        if serde_json::from_value::<RecordBody>(body).is_ok() {
+            accepted.push(format!("{kind}{pointer}"));
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "a member nobody knows was read past inside: {accepted:?}"
     );
 }
 
@@ -603,7 +674,7 @@ fn a_shape_this_build_cannot_read_at_its_own_version_is_a_build_skew() {
         let raw = serde_json::to_vec(&value).expect("serialises");
         let hash = Digest::chain(Digest::ZERO, &raw);
 
-        let err = Record::from_stored(raw, Digest::ZERO, hash).expect_err("refused");
+        let err = Record::from_stored_signed(raw, Digest::ZERO, hash, None).expect_err("refused");
         assert!(
             matches!(
                 err,
@@ -643,7 +714,7 @@ fn bytes_that_are_not_a_record_are_still_an_encoding_fault() {
     let raw = br#"{"not":"a record"}"#.to_vec();
     let hash = Digest::chain(Digest::ZERO, &raw);
 
-    let err = Record::from_stored(raw, Digest::ZERO, hash).expect_err("refused");
+    let err = Record::from_stored_signed(raw, Digest::ZERO, hash, None).expect_err("refused");
     assert!(
         matches!(err, agentplane::core::StoreError::Encoding(_)),
         "a line with no kind and no version cannot be attributed to a build: {err:?}"
@@ -703,7 +774,7 @@ fn an_older_shape_is_lifted_and_the_hash_still_covers_the_written_bytes() {
     let hash = Digest::chain(Digest::ZERO, &raw);
 
     assert!(
-        Record::from_stored(raw.clone(), Digest::ZERO, hash).is_err(),
+        Record::from_stored_signed(raw.clone(), Digest::ZERO, hash, None).is_err(),
         "without an upcaster the older shape is refused, which is the default"
     );
 
@@ -793,6 +864,9 @@ fn a_frozen_export_still_verifies_offline() {
 /// its blob digests and the cross-layer settlement — a record naming a matter
 /// the file must also carry — with no checked-in bytes at all, in either this
 /// implementation or a second one.
+///
+/// One literal journal, top to bottom, so its length is the fixture's.
+#[allow(clippy::too_many_lines)]
 fn frozen_export() -> Vec<u8> {
     use agentplane::journal::{Append, JournalStore};
     use std::sync::Arc;
@@ -835,6 +909,20 @@ fn frozen_export() -> Vec<u8> {
             )
             .await
             .expect("import the case");
+        // Held, so the hold member carries a value rather than `null` and its
+        // shape is pinned by bytes a second reader can check.
+        cases
+            .place_hold(
+                case,
+                &agentplane::core::LegalHold {
+                    placed_at: at,
+                    reason: "litigation L-12".into(),
+                    by: agentplane::core::Operator::authenticated("counsel@example")
+                        .expect("an operator"),
+                },
+            )
+            .await
+            .expect("hold the case");
         let lease = store
             .acquire(run, "golden", std::time::Duration::from_secs(60))
             .await
@@ -853,6 +941,8 @@ fn frozen_export() -> Vec<u8> {
                             policy_bundle: None,
                             canon: agentplane::core::canon::VERSION,
                             idempotency_key: None,
+                            admitted_by: None,
+                            served_unchained: false,
                         },
                     ),
                     // Stamped with the case, so the file exercises the

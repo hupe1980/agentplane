@@ -2,12 +2,12 @@
 //! however many runs it takes, until they take it back.
 //!
 //! A `Budget` bounds one run and a `TenantQuota` bounds a billing period.
-//! Neither can hold *this customer approved €500* — so a delegated spend
-//! envelope had nowhere to live, and the three properties below are the reason
-//! it is an authorization rather than a throttle.
+//! Neither can hold *this customer approved €500*. A standing authority does,
+//! and the three properties below are the reason it is an authorization rather
+//! than a throttle.
 //!
 //! Run with:
-//! `cargo run --example standing_authority --features redb,testkit`
+//! `cargo run --example standing_authority --features redb,fake-model`
 
 use std::sync::Arc;
 
@@ -36,8 +36,14 @@ impl Skill for Purchase {
         // A journaled effect, because the balance is mutable state outside the
         // chain: a skill reading it directly would make a replay depend on what
         // the store happens to hold now rather than on what this run saw.
+        //
+        // The id is the skill's own constant, so it is trusted; one read out
+        // of a model's answer or a peer's message would be refused.
         match cx
-            .draw(&AuthorityId::new("mandate-42"), Spend::money(cents))
+            .draw(
+                &Tainted::trusted(AuthorityId::new("mandate-42")),
+                Spend::money(cents),
+            )
             .await
         {
             Ok(drawn) => Ok(Outcome::done(Tainted::trusted(json!({
@@ -65,6 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     store
         .issue(&StandingAuthority::new(
             "mandate-42",
+            agentplane::authority::Holder::Tenant,
             "approval:SET-42",
             Spend::money(50_000),
         ))
@@ -180,6 +187,7 @@ async fn revocation(
     let err = store
         .issue(&StandingAuthority::new(
             "mandate-42",
+            agentplane::authority::Holder::Tenant,
             "approval:SET-42",
             Spend::money(90_000),
         ))

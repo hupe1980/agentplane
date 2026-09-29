@@ -119,7 +119,7 @@ about you. See [status](@/docs/status.md).
 |---|---|
 | What the agent is, in one reviewable artifact | A manifest declares the prompt, grants, ceilings, models, result shape and oversight, and the runtime **refuses** effects the declaration never named. The A2A Agent Card is derived from the same file, so what a peer is told and what the runtime enforces cannot drift |
 | The version that runs is the version that was reviewed | The registry addresses a manifest by digest, refuses to replace a published version with different content, and lets a caller pin the digest they reviewed — the form that survives the registry itself being compromised |
-| Who published it | A domain-separated publisher attestation, verified on resolve, with publisher reassignment refused. An unsigned publish may adopt its first signature; an existing publisher may not be replaced |
+| Who published it | A domain-separated publisher signature, verified on resolve, with publisher reassignment refused. An unsigned publish may adopt its first signature; an existing publisher may not be replaced |
 | Facts a registry entry needs and a manifest could not hold | `metadata.annotations` — business owner, risk class, ticket — namespaced, never interpreted by the runtime, and covered by the digest |
 | *Which agents does this organisation run* | `Registry::names()`, against a **durable** registry: both shipped stores implement the registry, so the inventory survives the process that published it |
 
@@ -151,7 +151,7 @@ a retention policy nothing enforces is a document.
 |---|---|
 | Rehearse recovery | `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores, sorting them into *intact*, *erased by design*, *lost*, and *erased with no readable record of it*. `agentplane serve --drill-every 86400` runs it on a timer; `agentplane drill` runs one pass |
 | Prove a copy without this crate | `agentplane verify history.jsonl --checkpoint cp.note` recomputes an export from its own bytes; `restore` rebuilds a store and proves it by its own checkpoint |
-| Enforce a retention window | `Runtime::retain(older_than, at, reason)` erases every **closed** case opened before the window: blob tombstones, and the case's key scope destroyed, which reaches every replica and backup at once. `agentplane retain --older-than-days N --reason ... --dry-run` lists what that pass would erase, through the same selection rule, from a binary that wires no store able to erase |
+| Enforce a retention window | `Runtime::retain(older_than, at, reason)` erases every **closed** case opened before the window: blob tombstones, and the case's key scope destroyed, which reaches every replica and backup at once. `agentplane retention plan --older-than-days N` lists what that pass would erase, through the same selection rule, from a binary that wires no store able to erase |
 | Know what retention did *not* reach | Every pass returns `not_erasable`, and it is the half that matters: without a key ring, journal payloads stay verbatim. A count with no coverage statement beside it is how a deployment comes to believe an obligation is discharged |
 
 ### Art. 26 — deployers keep logs
@@ -220,7 +220,7 @@ refuses the erasure.
 agentplane hold --store ./journal.redb --case case_01JD... \
   --reason "Art. 26 retention floor; supervisory request 2026-114" \
   --actor compliance-dana
-agentplane hold --store ./journal.redb   # everything standing, with reasons and who placed them
+agentplane hold list --store ./journal.redb   # everything standing, with reasons and who placed them
 ```
 
 The standing holds are listable by somebody who does not already know which case
@@ -275,7 +275,7 @@ case and its adapter is single-node by contract — so wrap it explicitly.
 
 | Obligation | Why not |
 |---|---|
-| **Art. 9** risk management | There is a policy seam and a Cedar adapter, but no risk-tier model. Cedar's `symcc` could *prove* properties of a policy set rather than test them; nothing invokes it |
+| **Art. 9** risk management | There is a policy seam and a Cedar adapter, but no risk-tier model. `agentplane policy check` measures a candidate bundle against the requests an export records; nothing *proves* properties of a policy set |
 | **Art. 50** transparency to users | An interface obligation, not a runtime one (above) |
 | Anything about your **model** | Bias, accuracy, training data, and evaluation are properties of the model and its use. This is a runtime |
 | A **conformity assessment** | A person does that, about a system, in a context |
@@ -309,13 +309,11 @@ Three questions worth asking of any tool in this space, including this one:
 
 Each lives on a page you may not have opened, so they are collected here. **If
 you arrived with a security control catalogue rather than a statutory one, this
-table is still the right one** — three of the four below were asked again after
-they were answered, which is a finding about where they were filed rather than
-about whether they were written.
+table is still the right one.**
 
 | Question | Answer |
 |---|---|
-| Are format-freeze conditions 7 and 8 coupled? | No — [independent, with one join](@/docs/status.md#format-freeze). Agility is about how a digest says which function produced it; the deferred questions add fields to kinds that are already hashed. The join is the policy-bundle format, which is itself a hashed artifact, so 8 gates only the last line of 7's inventory |
+| Which format-freeze conditions are not met? | Upcasters exercised end to end, and a rehearsed migration and rollback procedure → [the conditions](@/docs/status.md#format-freeze) |
 | Who threw an emergency stop, or placed a legal hold? | On the row, with what established the name — `authenticated` when a credential named it, `asserted` when somebody with the store typed it → [the stop](@/docs/operations.md#the-emergency-stop). Who *lifted* one is deliberately not retained |
 | How much data did a run send? | `EffectStarted.outbound_bytes`, per effect → [volume](@/docs/security.md#volume-is-not-sensitivity-and-the-journal-records-it). `Budget::max_egress_bytes` bounds it, exactly — the size is known before dispatch, so the call that would cross the ceiling is the call refused |
 | How often did policy stop a run from *starting*? | The `agentplane.policy.denials` metric, by action. Not the journal, and [deliberately](@/docs/operations.md#what-no-audit-can-answer-the-runs-that-never-started) |

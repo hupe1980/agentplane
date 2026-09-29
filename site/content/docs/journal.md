@@ -100,11 +100,9 @@ would be a checkpoint attesting a prefix of a moving history.
 
 A **quarantine** is the case worth stating, because sealing one looks right and
 is not. It is the runtime saying it does not know: the story is not over, and a
-Merkle leaf claims a history is complete. The practical half is sharper — a
-sealed chain refuses appends, so freezing it locked out the one record that
-answers the doubt, and the design's own promise that a person resolves a
-quarantine named a remedy the durable format forbade. One chain can therefore carry more than one `RunConcluded`
-record, and the *last* one is the run's answer; the outcome index the
+Merkle leaf claims a history is complete. A sealed chain refuses appends, so
+sealing a quarantine would refuse the one record that answers the doubt. One
+chain can therefore carry more than one `RunConcluded` record, and the *last* one is the run's answer; the outcome index the
 operator queries derives from it in the same transaction, so a failed run
 that is resumed and succeeds moves between listings rather than being listed
 as failed forever.
@@ -121,7 +119,7 @@ That last clause is the problem. Anyone who can run SHA-256 can rebuild a
 consistent chain, and the party holding the store can always run SHA-256 — which
 is the party an auditor is being asked to trust.
 
-So every record also carries an optional **`Attestation`**: a key id and a
+So every record also carries an optional **`KeySignature`**: a key id and a
 signature over the record's chain hash. A hash says *what* the history is; a
 signature says *who wrote it*.
 
@@ -138,7 +136,7 @@ signature says *who wrote it*.
 * **A plane with no signer writes unsigned records, not self-signed ones.** A
   self-minted key produces records that look attested and prove nothing, because
   the party being audited chose the key.
-* **The attestation carries no algorithm field.** A self-described algorithm is
+* **The signature carries no algorithm field.** A self-described algorithm is
   how a verifier gets talked into checking a signature with something weaker than
   the one that made it. The verifier decides what it accepts.
 
@@ -185,16 +183,13 @@ consistency proof shows every leaf committed to before is still committed to, in
 the same position. Without it the log detects *a* change and cannot say what
 kind.
 
-Three details are decisions rather than implementation:
+Two details are decisions rather than implementation:
 
-* **Leaf and interior hashes are domain-separated by a prefix byte.** Without
-  it a leaf can be made to collide with an interior node, and an attacker who
-  controls leaf content presents a subtree as a leaf.
-* **The log position always advances; it is never a count of what survives.** A
-  count reuses a deleted run's index, so a removed run can be silently replaced
-  at the same position — and even the log size looks unchanged. redb keeps a
-  monotonic counter, Postgres a sequence; both hand out a position that has
-  never been issued before.
+* **The log position is never a count of what survives.** A count reuses a
+  deleted run's index, so a removed run can be silently replaced at the same
+  position — and even the log size looks unchanged. The store never deletes a
+  seal; a newest seal removed behind its back has its position reissued, which
+  is what a witnessed checkpoint's consistency proof refuses.
 * **The proof does not authenticate its own parameters.** An inclusion proof is
   checked against `(leaf, index, size, root)`, all supplied by whoever offers it;
   the size and root come from a *signed checkpoint*. Expecting the fold to
@@ -304,14 +299,14 @@ Rust struct.
   HTTP status codes, and every guarantee resting on *an independent party
   observed this log* would be a guarantee about string formatting.
 
-Both backends maintain the log, and both keep their gaps. redb advances a
-counter row inside the sealing transaction; Postgres uses a **sequence**, because
-several instances seal concurrently there — that is the topology it exists for —
-and a position derived from the current maximum by two transactions at once hands
-both the same slot.
+Both backends maintain the log. redb advances a counter row inside the sealing
+transaction. Postgres allocates the next position under a per-tenant
+transaction lock, because several instances seal concurrently there, and a
+position must follow **commit** order: a position taken by a transaction that
+commits after a later one was checkpointed would land a leaf inside that
+checkpoint, and a witness would see a fork.
 
-Positions therefore have holes once a run is removed, deliberately: a freed slot
-must never be reissued. The *tree* is built by walking the log in key order,
+Positions have holes once a run is removed, deliberately. The *tree* is built by walking the log in key order,
 which yields dense positions with no holes — so the position a proof uses is the
 run's rank in that walk, not its stored index. Handing back the stored index
 makes every run after a deleted one fail to prove an inclusion that is perfectly
@@ -330,15 +325,12 @@ the chain is over history as written.
 
 ### Schema evolution
 
-The journal is forever, so record shapes must evolve without rewriting history.
+Until the [format freeze](@/docs/status.md#format-freeze) a shape change is a
+[hard cut](@/docs/upgrading.md#hard-cuts). The freeze commits the journal to
+evolving without rewriting history:
 
-1. Records carry `(kind, v)`.
-2. **Backward compatibility is permanent.** New code must read every shape ever
-   written. There is no "we migrated past that".
-3. Upcast on read; never rewrite.
-4. **Upcasters are pure and total.** Same input, same output, in this process
+1. Records carry `(kind, v)`, and a shape change bumps `v`.
+2. **Every shape ever written stays readable.** Upcast on read; never rewrite.
+3. **Upcasters are pure and total.** Same input, same output, in this process
    and in one started a year from now.
-5. Hash the wire bytes (above).
-
-A golden corpus of historical fixtures belongs in CI: a schema change that
-cannot read it should fail the build.
+4. Hash the wire bytes (above).

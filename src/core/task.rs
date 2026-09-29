@@ -55,6 +55,15 @@ pub enum ClaimError {
     #[error("task {task} is not held by '{actor}'")]
     NotHeld { task: TaskId, actor: String },
 
+    /// The run already consumed a different answer to this task.
+    ///
+    /// A decision races the expiry sweep, and the run takes whichever answer
+    /// reached it first. The loser is refused rather than recorded: the
+    /// worklist saying *completed by alice* while the journal holds the
+    /// expiry policy's answer is a contradiction nobody can resolve later.
+    #[error("task {task} was already answered; the run consumed another decision")]
+    AlreadyAnswered { task: TaskId },
+
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -103,8 +112,15 @@ impl TaskId {
         self.0.to_hex()
     }
 
+    /// Read a task id in either written form: the bare hex, or the `task_<hex>`
+    /// that [`Display`](std::fmt::Display) prints — so an id copied from any
+    /// listing parses, as a [`RunId`] does.
+    ///
+    /// # Errors
+    ///
+    /// If what follows the optional prefix is not a 64-character hex digest.
     pub fn parse(s: &str) -> Result<Self, hex::FromHexError> {
-        Digest::from_hex(s).map(Self)
+        Digest::from_hex(s.strip_prefix("task_").unwrap_or(s)).map(Self)
     }
 }
 
@@ -129,6 +145,9 @@ pub enum TaskState {
     Expired,
     /// Passed to a wider or higher audience.
     Escalated,
+    /// Its run concluded closed before anybody answered, so there is nothing
+    /// left to decide.
+    Withdrawn,
 }
 
 impl TaskState {
@@ -140,6 +159,7 @@ impl TaskState {
             Self::Completed => "completed",
             Self::Expired => "expired",
             Self::Escalated => "escalated",
+            Self::Withdrawn => "withdrawn",
         }
     }
 
@@ -153,12 +173,13 @@ impl TaskState {
     }
 
     /// Every state a task can be in.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Open,
         Self::Claimed,
         Self::Completed,
         Self::Expired,
         Self::Escalated,
+        Self::Withdrawn,
     ];
 
     /// Whether the task is still somebody's to act on.
@@ -171,7 +192,7 @@ impl TaskState {
     pub const fn is_pending(self) -> bool {
         match self {
             Self::Open | Self::Claimed | Self::Escalated => true,
-            Self::Completed | Self::Expired => false,
+            Self::Completed | Self::Expired | Self::Withdrawn => false,
         }
     }
 
@@ -183,7 +204,7 @@ impl TaskState {
     pub const fn is_queued(self) -> bool {
         match self {
             Self::Open | Self::Escalated => true,
-            Self::Claimed | Self::Completed | Self::Expired => false,
+            Self::Claimed | Self::Completed | Self::Expired | Self::Withdrawn => false,
         }
     }
 
@@ -198,7 +219,7 @@ impl TaskState {
     pub const fn awaits_expiry(self) -> bool {
         match self {
             Self::Open | Self::Claimed => true,
-            Self::Completed | Self::Expired | Self::Escalated => false,
+            Self::Completed | Self::Expired | Self::Escalated | Self::Withdrawn => false,
         }
     }
 }
@@ -254,29 +275,79 @@ impl Priority {
     }
 }
 
-/// What happens when nobody answers in time.
+/// What happens when nobody answers in time, as a stored task records it.
 ///
 /// **Declared up front, never defaulted.** "The human did not answer, so we did
 /// it anyway" must be a decision somebody signed before the fact — deciding it
 /// in the moment, under time pressure, is how an unattended queue turns into an
 /// unattended action.
+///
+/// This is the vocabulary a [`Task`] row carries beside its
+/// [`escalate_to`](Task::escalate_to). A skill declares the policy with
+/// [`Expiry`], which carries what each answer needs inside the answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OnExpiry {
     /// Refuse the proposed action. The safe default.
     Deny,
     /// Widen the audience and keep waiting.
-    ///
-    /// Requires [`TaskSpec::escalate_to`] to name who is added: a promise to
-    /// widen an audience with nobody to widen it to is a state flag wearing a
-    /// control's name.
     Escalate,
     /// Proceed unattended.
-    ///
-    /// Requires [`TaskSpec::allow_unattended`], which exists so that choosing
-    /// this is an explicit, greppable act rather than an enum variant someone
-    /// picked because it was in the list.
     Proceed,
+}
+
+/// What a skill declares should happen when nobody answers its task in time.
+///
+/// Each answer carries what it needs, so the ones that mean nothing cannot be
+/// written: an escalation names who is added — a promise to widen an audience
+/// with nobody to widen it to is a state flag wearing a control's name — and
+/// acting without a human is spelled [`ProceedUnattended`](Self::ProceedUnattended),
+/// so it is an explicit, greppable act rather than a variant somebody picked
+/// off a list.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Expiry {
+    /// Refuse the proposed action. The safe default.
+    #[default]
+    Deny,
+    /// Widen the audience by these roles and keep waiting.
+    ///
+    /// The task is then answered by a person or never. Needs at least one role
+    /// and a bounded initial audience, both refused at the task otherwise.
+    Escalate {
+        /// Roles added to the audience when the window closes.
+        to: Vec<String>,
+    },
+    /// Act without a human when the window closes.
+    ProceedUnattended,
+}
+
+impl Expiry {
+    /// Escalate to these roles.
+    #[must_use]
+    pub fn escalate_to<R: Into<String>>(roles: impl IntoIterator<Item = R>) -> Self {
+        Self::Escalate {
+            to: roles.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// The stored policy this declaration becomes.
+    #[must_use]
+    pub const fn policy(&self) -> OnExpiry {
+        match self {
+            Self::Deny => OnExpiry::Deny,
+            Self::Escalate { .. } => OnExpiry::Escalate,
+            Self::ProceedUnattended => OnExpiry::Proceed,
+        }
+    }
+
+    /// The roles an escalation adds; empty for every other answer.
+    #[must_use]
+    pub fn escalate_roles(&self) -> &[String] {
+        match self {
+            Self::Escalate { to } => to,
+            Self::Deny | Self::ProceedUnattended => &[],
+        }
+    }
 }
 
 impl OnExpiry {
@@ -354,6 +425,20 @@ pub struct Justification {
 }
 
 impl Justification {
+    /// The digest of exactly what a reviewer is shown.
+    ///
+    /// An approval names this, so a task edited in the store between the run
+    /// proposing it and a person deciding it is an approval of something the
+    /// run never proposed — and is refused where the run reads the answer.
+    #[must_use]
+    pub fn digest(&self) -> Digest {
+        let value = serde_json::to_value(self)
+            .expect("a justification holds only infallibly serializable fields");
+        let mut framed = b"agentplane.task.justification.v1\0".to_vec();
+        framed.extend_from_slice(&crate::core::canon::value_bytes(&value));
+        Digest::of(&framed)
+    }
+
     /// A proposal, with the sentence that heads it and where it came from.
     ///
     /// `Tainted::trusted(..)` for the run's own words — a manifest summary, a
@@ -404,7 +489,7 @@ impl Justification {
 }
 
 /// A request for a human decision.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TaskSpec {
     pub kind: String,
     pub justification: Justification,
@@ -413,21 +498,13 @@ pub struct TaskSpec {
     pub priority: Priority,
     /// The obligation that bounds this wait, by name.
     pub deadline: String,
-    pub on_expiry: OnExpiry,
-    /// Roles added to the audience when the task escalates.
-    ///
-    /// Required by [`OnExpiry::Escalate`] and refused beside anything else:
-    /// escalation's one enforceable meaning is *these people can now see it*,
-    /// so the declaration must say who they are, and naming them under a
-    /// policy that never escalates is a declaration nothing reads.
-    pub escalate_to: Vec<String>,
+    /// What happens when nobody answers in time.
+    pub on_expiry: Expiry,
     /// Actors who may **not** decide this — the four-eyes control.
     ///
     /// Whoever proposed an action does not get to approve it. Without this,
     /// dual control is a naming convention rather than a check.
     pub excluded_actors: Vec<String>,
-    /// Explicit consent to act unattended on expiry.
-    pub allow_unattended: bool,
 }
 
 impl TaskSpec {
@@ -442,10 +519,8 @@ impl TaskSpec {
             candidate_roles: Vec::new(),
             priority: Priority::Normal,
             deadline: deadline.into(),
-            on_expiry: OnExpiry::Deny,
-            escalate_to: Vec::new(),
+            on_expiry: Expiry::Deny,
             excluded_actors: Vec::new(),
-            allow_unattended: false,
         }
     }
 
@@ -468,27 +543,10 @@ impl TaskSpec {
         self
     }
 
+    /// What happens when nobody answers in time. [`Expiry::Deny`] unless said.
     #[must_use]
-    pub fn on_expiry(mut self, e: OnExpiry) -> Self {
+    pub fn on_expiry(mut self, e: Expiry) -> Self {
         self.on_expiry = e;
-        self
-    }
-
-    /// Name a role added to the audience when the task escalates.
-    #[must_use]
-    pub fn escalate_to(mut self, r: impl Into<String>) -> Self {
-        self.escalate_to.push(r.into());
-        self
-    }
-
-    /// Consent to acting unattended when the window passes.
-    ///
-    /// Separate from `on_expiry` on purpose: `OnExpiry::Proceed` without this is
-    /// refused, so choosing to act without a human is a deliberate, greppable
-    /// act rather than a variant someone picked off a list.
-    #[must_use]
-    pub fn allow_unattended(mut self) -> Self {
-        self.allow_unattended = true;
         self
     }
 }
@@ -518,9 +576,204 @@ pub struct Task {
     /// so the reviewer's deadline and the case's are the same fact.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub due_at: Option<Timestamp>,
+    /// Why this task's proposal cannot be shown, when it cannot.
+    ///
+    /// Set by whoever sealed or opened the row — never inferred from what the
+    /// proposal looks like. A proposal whose clear arguments happen to be
+    /// spelled `{"$sealed": "…"}` is a proposal like any other, and reading
+    /// the shape instead let untrusted input make a task unapprovable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<Withheld>,
+}
+
+/// Why a task's proposal cannot be shown.
+///
+/// The reason is carried out of band, by the store decorator that sealed the
+/// row and the one that tried to open it, so an argument value can never
+/// spell it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Withheld {
+    /// Sealed at rest, and whoever read the row holds no key ring to open it.
+    /// This is what the stored row says; a plane holding the ring replaces it.
+    Sealed,
+    /// The key it was sealed under was destroyed: the matter was erased.
+    Erased,
+    /// The key opened the envelope and what came out does not decode as the
+    /// value it replaced — damage, not an erasure.
+    Undecodable,
+}
+
+impl Withheld {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sealed => "sealed",
+            Self::Erased => "erased",
+            Self::Undecodable => "undecodable",
+        }
+    }
+
+    /// The inverse of [`as_str`](Self::as_str), written over
+    /// [`ALL`](Self::ALL) for the reason [`CaseStatus::parse`] is.
+    ///
+    /// [`CaseStatus::parse`]: crate::core::CaseStatus::parse
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|c| c.as_str() == s)
+    }
+
+    pub const ALL: [Self; 3] = [Self::Sealed, Self::Erased, Self::Undecodable];
+}
+
+impl std::fmt::Display for Withheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Sealed => "it is sealed, and this plane holds no key ring to open it",
+            Self::Erased => "it was erased: the key it was sealed under is destroyed",
+            Self::Undecodable => "its sealed bytes opened and do not decode",
+        })
+    }
+}
+
+/// What every surface shows a person for one task: the one rendering.
+///
+/// A pure function of the stored task, so what a reviewer reads and what
+/// [`Justification::digest`] binds are read from the same value. Every string
+/// has its hidden code points escaped in place (see [`escaped`](Self::escaped));
+/// every word mixing scripts is listed in [`mixed_script`](Self::mixed_script)
+/// and left as written. Nothing is cut: a value is shown whole.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct Rendering {
+    /// Why the proposal cannot be shown, when it cannot — and then
+    /// `proposed_action` is null and `evidence` empty rather than an envelope
+    /// a client might display as a value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<Withheld>,
+    pub summary: String,
+    pub proposed_action: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    /// Whether any text above had a code point escaped because it renders as
+    /// nothing or reorders what surrounds it.
+    pub escaped: bool,
+    /// Words that mix alphabets, where they occur.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mixed_script: Vec<MixedScript>,
+}
+
+/// One word mixing alphabets, flagged beside the text it appears in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct MixedScript {
+    /// Where: `summary`, `cost`, `evidence/<n>`, or `proposed_action` and the
+    /// path to the string inside it.
+    pub at: String,
+    /// The word, escaped like the text around it.
+    pub word: String,
+    pub scripts: Vec<&'static str>,
+}
+
+/// The rendering being assembled: escaping and flagging as one walk.
+struct Renderer {
+    escaped: bool,
+    mixed_script: Vec<MixedScript>,
+}
+
+impl Renderer {
+    fn text(&mut self, at: &str, text: &str) -> String {
+        for word in text.split_whitespace() {
+            if let Some(scripts) = crate::core::visible::mixed_scripts(word) {
+                self.mixed_script.push(MixedScript {
+                    at: at.to_owned(),
+                    word: crate::core::visible::escape(word).0,
+                    scripts,
+                });
+            }
+        }
+        let (shown, escaped) = crate::core::visible::escape(text);
+        self.escaped |= escaped;
+        shown
+    }
+
+    fn value(&mut self, at: &str, value: &Value) -> Value {
+        match value {
+            Value::String(s) => Value::String(self.text(at, s)),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| self.value(&format!("{at}/{i}"), v))
+                    .collect(),
+            ),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(k, v)| {
+                        let key = self.text(&format!("{at} (a key)"), k);
+                        let inner = self.value(&format!("{at}/{k}"), v);
+                        (key, inner)
+                    })
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
 }
 
 impl Task {
+    /// The one rendering every surface shows for this task.
+    #[must_use]
+    pub fn rendering(&self) -> Rendering {
+        let j = &self.justification;
+        let mut r = Renderer {
+            escaped: false,
+            mixed_script: Vec::new(),
+        };
+        let summary = r.text("summary", j.summary.peek());
+        let cost = j.cost.as_ref().map(|c| r.text("cost", c.peek()));
+        let (proposed_action, evidence) = if self.withheld.is_some() {
+            (Value::Null, Vec::new())
+        } else {
+            (
+                r.value("proposed_action", &j.proposed_action),
+                j.evidence
+                    .iter()
+                    .enumerate()
+                    .map(|(i, line)| r.text(&format!("evidence/{i}"), line.peek()))
+                    .collect(),
+            )
+        };
+        Rendering {
+            withheld: self.withheld,
+            summary,
+            proposed_action,
+            cost,
+            evidence,
+            escaped: r.escaped,
+            mixed_script: r.mixed_script,
+        }
+    }
+
+    /// The stored justification with nothing withheld served as a value.
+    ///
+    /// A withheld proposal and its evidence are replaced by null and nothing,
+    /// so a client that renders the structured form cannot display an
+    /// envelope as if it were the arguments. [`withheld`](Self::withheld) says
+    /// why beside it.
+    #[must_use]
+    pub fn shown_justification(&self) -> Justification {
+        let mut shown = self.justification.clone();
+        if self.withheld.is_some() {
+            shown.proposed_action = Value::Null;
+            shown.evidence.clear();
+        }
+        shown
+    }
+
     /// Whether `actor` is permitted to decide this.
     ///
     /// Two checks: the four-eyes exclusion, then role eligibility.
@@ -632,6 +885,14 @@ pub struct Decision {
     /// reviewer's own trusted value. On a rejection it is recorded advice.
     #[serde(default)]
     pub amendment: Value,
+    /// What the decider was shown: [`Justification::digest`] of the task as
+    /// the store held it when the decision was recorded.
+    ///
+    /// Stamped by the runtime, never by the caller. A person's approval binds
+    /// to it, and the run refuses one whose digest is not that of the task it
+    /// proposed — the arguments reviewed are the arguments dispatched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed: Option<Digest>,
 }
 
 impl Decision {
@@ -647,6 +908,7 @@ impl Decision {
             decided: Decided::By(by),
             reason: reason.into(),
             amendment: Value::Null,
+            reviewed: None,
         }
     }
 
@@ -657,6 +919,7 @@ impl Decision {
             decided: Decided::By(by),
             reason: reason.into(),
             amendment: Value::Null,
+            reviewed: None,
         }
     }
 
@@ -679,6 +942,7 @@ impl Decision {
                 OnExpiry::Deny | OnExpiry::Escalate => "no answer within the window".to_owned(),
             },
             amendment: Value::Null,
+            reviewed: None,
         }
     }
 }
@@ -713,5 +977,21 @@ mod tests {
         // A rejection may be amended too — "no, and here is what would pass".
         let rejected = Decision::reject(rita(), "over her limit").amend(json!({"cap": 5000}));
         assert!(!rejected.approved, "amending must not approve");
+    }
+
+    /// A task id parses back from the form it prints.
+    ///
+    /// An operator copies the id out of whatever listed it, and a listing
+    /// prints `Display`; a parser that took only the bare hex refused the one
+    /// spelling a person was most likely to paste.
+    #[test]
+    fn a_task_id_parses_from_its_own_display_form() {
+        let id = TaskId::derive(
+            crate::core::RunId::generate(),
+            crate::core::EffectKey::from_hex(&format!("{:064x}", 7)).expect("hex key"),
+        );
+        assert_eq!(TaskId::parse(&id.to_string()).expect("display form"), id);
+        assert_eq!(TaskId::parse(&id.to_hex()).expect("bare hex"), id);
+        assert!(TaskId::parse("run_0123").is_err());
     }
 }

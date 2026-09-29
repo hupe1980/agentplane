@@ -250,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("OPENAI_API_KEY is not set — this example calls real models.");
         eprintln!(
             "For a version that needs no key: \
-             cargo run --example planned_run --features redb,testkit,manifest"
+             cargo run --example planned_run --features redb,fake-model,manifest"
         );
         return Ok(());
     };

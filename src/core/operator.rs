@@ -153,6 +153,7 @@ pub struct Operator {
 
 /// The wire shape, carrying no invariant.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OperatorWire {
     actor: String,
     basis: Basis,

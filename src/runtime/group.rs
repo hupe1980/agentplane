@@ -940,7 +940,7 @@ impl StepCtx<'_> {
                         refusal @ (crate::journal::EffectReplay::Refused { .. }
                         | crate::journal::EffectReplay::Denied { .. }),
                     ) => {
-                        self.replayed_refusal(key, refusal, 0).await?;
+                        self.replayed_refusal(key, &descriptor, refusal, 0).await?;
                     }
                     // An atomic member's records commit with its transaction,
                     // so the only things history can hold under its key are
@@ -988,7 +988,8 @@ impl StepCtx<'_> {
             // than an omission: a member is a write to a co-located database in
             // the transaction that commits this run's own records. That ceiling
             // bounds what left the deployment, and nothing here did.
-            self.gate(key, &descriptor, true, None, None, 0).await?;
+            self.gate(key, key, &descriptor, true, None, None, 0)
+                .await?;
             keyed.push((key, member));
         }
         if keyed.is_empty() {

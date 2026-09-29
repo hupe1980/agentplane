@@ -131,7 +131,7 @@ pub enum WitnessError {
     Unavailable(String),
 }
 
-/// A witness's attestation that it saw a log at this size and root.
+/// A witness's signature that it saw a log at this size and root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cosignature {
     /// Who cosigned. An auditor decides whether it trusts this identity; the
@@ -180,6 +180,10 @@ pub(crate) fn cosignature_message(timestamp: u64, note_text: &str) -> String {
 /// verify it over a message the witness did not sign, and reading a longer one
 /// from the front would silently discard trailing bytes a verifier is being
 /// asked to vouch for.
+///
+/// A timestamp above 2^63 − 1 is `None` too: `tlog-cosignature` bounds it
+/// there, so eight bytes that read higher are not a cosignature this format
+/// can carry, whatever they sign.
 // Gated on the feature that consumes it — the HTTP client is the only reader
 // of foreign payloads; producers in this file only build them.
 #[cfg(feature = "witness-http")]
@@ -190,6 +194,9 @@ pub(crate) fn cosignature_payload(blob: &[u8]) -> Option<(u64, &[u8])> {
     }
     let (stamp, signature) = blob.split_at(8);
     let timestamp = u64::from_be_bytes(stamp.try_into().expect("eight bytes"));
+    if timestamp > i64::MAX.cast_unsigned() {
+        return None;
+    }
     Some((timestamp, signature))
 }
 

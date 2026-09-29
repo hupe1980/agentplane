@@ -80,8 +80,7 @@ pub(crate) enum Reach {
 /// from two places on purpose: here, at connect time, where it is what the
 /// socket obeys; and from a caller's pre-flight, where it is what an operator
 /// gets told. A second spelling of it would agree everywhere except the
-/// boundary nobody probed, which is how this crate has already shipped one
-/// ceiling that was right in one backend and wrong in the other.
+/// boundary nobody probed.
 ///
 /// # Errors
 ///

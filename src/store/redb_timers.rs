@@ -1,12 +1,14 @@
 //! Durable timers on redb.
 
+use std::ops::Bound;
+
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::case::TimerStore;
 use crate::core::{CaseId, EffectKey, Phase, RunId, StoreError, Timer, Timestamp};
 
-use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
+use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded, is_sealed};
 
 fn phase_from(s: &str) -> Result<Phase, StoreError> {
     decoded("step phase", s, Phase::parse(s))
@@ -83,6 +85,26 @@ fn build(
     })
 }
 
+/// Remove one timer and its due-index entry, in the caller's transaction, so a
+/// retired timer cannot be left findable by the sweep.
+fn retire(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run: &str,
+    effect: &str,
+) -> Result<(), StoreError> {
+    let mut t = w.open_table(TIMERS).map_err(|e| be(&e))?;
+    if let Some(v) = t.remove((tenant, run, effect)).map_err(|e| be(&e))? {
+        let fire_at = v.value().4;
+        drop(v);
+        w.open_table(TIMERS_DUE)
+            .map_err(|e| be(&e))?
+            .remove((tenant, fire_at, run, effect))
+            .map_err(|e| be(&e))?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl TimerStore for RedbStore {
     fn tenant(&self) -> &str {
@@ -133,62 +155,92 @@ impl TimerStore for RedbStore {
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let out = {
+                // `limit` bounds the claims, not the candidates. Capping the
+                // candidates would let a page of timers held under another
+                // sweeper's live claim fill the page, and the due timers
+                // behind them would never be looked at. Read in chunks, so a
+                // backlog is walked only as far as it takes to fill the page.
+                //
                 // Selected and claimed in one transaction: a second sweeper
                 // reading concurrently finds nothing rather than a second copy
                 // of the same wake-up.
-                let due = w.open_table(TIMERS_DUE).map_err(|e| be(&e))?;
-                let mut candidates = Vec::new();
-                for e in due
-                    .range(
-                        (tenant.as_str(), i64::MIN, "", "")
-                            ..=(tenant.as_str(), cutoff, MAX_STR, MAX_STR),
-                    )
-                    .map_err(|e| be(&e))?
-                {
-                    if candidates.len() >= limit {
-                        break;
-                    }
-                    let (k, _) = e.map_err(|e| be(&e))?;
-                    let (_, _, run, effect) = k.value();
-                    candidates.push((run.to_owned(), effect.to_owned()));
-                }
-                drop(due);
-
-                let mut timers = w.open_table(TIMERS).map_err(|e| be(&e))?;
+                let chunk = limit.max(64);
+                let mut after: Option<(i64, String, String)> = None;
                 let mut out = Vec::new();
-                for (run, effect) in candidates {
-                    let Some(row) = timers
-                        .get((tenant.as_str(), run.as_str(), effect.as_str()))
-                        .map_err(|e| be(&e))?
-                        .map(|v| {
-                            let (c, hc, st, ph, fa, ca, hca) = v.value();
-                            (c.to_owned(), hc, st, ph.to_owned(), fa, ca, hca)
-                        })
-                    else {
-                        continue;
+                'scan: loop {
+                    let candidates: Vec<(i64, String, String)> = {
+                        let due = w.open_table(TIMERS_DUE).map_err(|e| be(&e))?;
+                        let end = Bound::Included((tenant.as_str(), cutoff, MAX_STR, MAX_STR));
+                        let start = match &after {
+                            Some((at, run, effect)) => Bound::Excluded((
+                                tenant.as_str(),
+                                *at,
+                                run.as_str(),
+                                effect.as_str(),
+                            )),
+                            None => Bound::Included((tenant.as_str(), i64::MIN, "", "")),
+                        };
+                        due.range::<(&str, i64, &str, &str)>((start, end))
+                            .map_err(|e| be(&e))?
+                            .take(chunk)
+                            .map(|e| {
+                                e.map(|(k, _)| {
+                                    let (_, at, run, effect) = k.value();
+                                    (at, run.to_owned(), effect.to_owned())
+                                })
+                                .map_err(|e| be(&e))
+                            })
+                            .collect::<Result<_, _>>()?
                     };
-                    let (case, has_case, step, phase, fire_at, claimed_at, has_claim) = row;
-                    // An unexpired claim belongs to another sweeper.
-                    if has_claim == 1 && claimed_at > cutoff - CLAIM_LEASE {
-                        continue;
+                    let Some(last) = candidates.last().cloned() else {
+                        break;
+                    };
+                    after = Some(last);
+                    for (_, run, effect) in candidates {
+                        if out.len() >= limit {
+                            break 'scan;
+                        }
+                        // A sealed run can record no wake. Its timer is
+                        // retired here rather than returned, or it is claimed
+                        // and fails once per lease period for ever.
+                        if is_sealed(&w, &tenant, &run)? {
+                            retire(&w, &tenant, &run, &effect)?;
+                            continue;
+                        }
+                        let mut timers = w.open_table(TIMERS).map_err(|e| be(&e))?;
+                        let Some(row) = timers
+                            .get((tenant.as_str(), run.as_str(), effect.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map(|v| {
+                                let (c, hc, st, ph, fa, ca, hca) = v.value();
+                                (c.to_owned(), hc, st, ph.to_owned(), fa, ca, hca)
+                            })
+                        else {
+                            continue;
+                        };
+                        let (case, has_case, step, phase, fire_at, claimed_at, has_claim) = row;
+                        // An unexpired claim belongs to another sweeper.
+                        if has_claim == 1 && claimed_at > cutoff - CLAIM_LEASE {
+                            continue;
+                        }
+                        timers
+                            .insert(
+                                (tenant.as_str(), run.as_str(), effect.as_str()),
+                                (
+                                    case.as_str(),
+                                    has_case,
+                                    step,
+                                    phase.as_str(),
+                                    fire_at,
+                                    cutoff,
+                                    1,
+                                ),
+                            )
+                            .map_err(|e| be(&e))?;
+                        out.push(build(
+                            &run, &effect, &case, has_case, step, &phase, fire_at,
+                        )?);
                     }
-                    timers
-                        .insert(
-                            (tenant.as_str(), run.as_str(), effect.as_str()),
-                            (
-                                case.as_str(),
-                                has_case,
-                                step,
-                                phase.as_str(),
-                                fire_at,
-                                cutoff,
-                                1,
-                            ),
-                        )
-                        .map_err(|e| be(&e))?;
-                    out.push(build(
-                        &run, &effect, &case, has_case, step, &phase, fire_at,
-                    )?);
                 }
                 out
             };
@@ -226,57 +278,32 @@ impl TimerStore for RedbStore {
         let (run, effect) = (run.to_string(), effect.to_hex());
         self.with_db(move |db| {
             let w = begin_write(db)?;
-            {
-                let mut t = w.open_table(TIMERS).map_err(|e| be(&e))?;
-                if let Some(v) = t
-                    .remove((tenant.as_str(), run.as_str(), effect.as_str()))
-                    .map_err(|e| be(&e))?
-                {
-                    let fire_at = v.value().4;
-                    drop(v);
-                    // The index entry goes in the same transaction, so a
-                    // disarmed timer cannot be left findable by the sweep.
-                    w.open_table(TIMERS_DUE)
-                        .map_err(|e| be(&e))?
-                        .remove((tenant.as_str(), fire_at, run.as_str(), effect.as_str()))
-                        .map_err(|e| be(&e))?;
-                }
-            }
+            retire(&w, &tenant, &run, &effect)?;
             w.commit().map_err(|e| be(&e))?;
             Ok(())
         })
         .await
     }
 
-    async fn pending(&self, limit: usize) -> Result<Vec<Timer>, StoreError> {
+    async fn disarm_run(&self, run: RunId) -> Result<usize, StoreError> {
         let tenant = self.tenant_name();
+        let run = run.to_string();
         self.with_db(move |db| {
-            let r = db.begin_read().map_err(|e| be(&e))?;
-            let due = r.open_table(TIMERS_DUE).map_err(|e| be(&e))?;
-            let timers = r.open_table(TIMERS).map_err(|e| be(&e))?;
-            let mut out = Vec::new();
-            // This tenant's range, not the whole table.
-            for e in due
-                .range(
-                    (tenant.as_str(), i64::MIN, "", "")
-                        ..=(tenant.as_str(), i64::MAX, MAX_STR, MAX_STR),
+            let w = begin_write(db)?;
+            let effects: Vec<String> = {
+                let t = w.open_table(TIMERS).map_err(|e| be(&e))?;
+                t.range(
+                    (tenant.as_str(), run.as_str(), "")..=(tenant.as_str(), run.as_str(), MAX_STR),
                 )
                 .map_err(|e| be(&e))?
-            {
-                if out.len() >= limit {
-                    break;
-                }
-                let (k, _) = e.map_err(|e| be(&e))?;
-                let (_, _, run, effect) = k.value();
-                if let Some(v) = timers
-                    .get((tenant.as_str(), run, effect))
-                    .map_err(|e| be(&e))?
-                {
-                    let (c, hc, st, ph, fa, _, _) = v.value();
-                    out.push(build(run, effect, c, hc, st, ph, fa)?);
-                }
+                .map(|e| e.map(|(k, _)| k.value().2.to_owned()).map_err(|e| be(&e)))
+                .collect::<Result<_, _>>()?
+            };
+            for effect in &effects {
+                retire(&w, &tenant, &run, effect)?;
             }
-            Ok(out)
+            w.commit().map_err(|e| be(&e))?;
+            Ok(effects.len())
         })
         .await
     }
@@ -285,24 +312,38 @@ impl TimerStore for RedbStore {
 impl RedbStore {
     /// How many armed timers a run still has.
     ///
-    /// For tests and operator tooling; the sweep uses `claim_due`.
+    /// For tests; the sweep uses `claim_due`, and an operator asking what a
+    /// run waits for reads `waiting_runs`.
     ///
     /// # Errors
     ///
     /// If the count cannot be read.
     pub async fn armed_timers(&self, run: RunId) -> Result<usize, StoreError> {
+        Ok(self.armed_timer_rows(run).await?.len())
+    }
+
+    /// The timers a run still has armed, as the rows the sweep would claim.
+    ///
+    /// For tests, like [`armed_timers`](Self::armed_timers).
+    ///
+    /// # Errors
+    ///
+    /// If the rows cannot be read or decoded.
+    pub async fn armed_timer_rows(&self, run: RunId) -> Result<Vec<Timer>, StoreError> {
         let tenant = self.tenant_name();
         let run = run.to_string();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(TIMERS).map_err(|e| be(&e))?;
-            let n = t
-                .range(
-                    (tenant.as_str(), run.as_str(), "")..=(tenant.as_str(), run.as_str(), MAX_STR),
-                )
+            t.range((tenant.as_str(), run.as_str(), "")..=(tenant.as_str(), run.as_str(), MAX_STR))
                 .map_err(|e| be(&e))?
-                .count();
-            Ok(n)
+                .map(|e| {
+                    let (k, v) = e.map_err(|e| be(&e))?;
+                    let (_, run, effect) = k.value();
+                    let (case, has_case, step, phase, fire_at, _, _) = v.value();
+                    build(run, effect, case, has_case, step, phase, fire_at)
+                })
+                .collect()
         })
         .await
     }

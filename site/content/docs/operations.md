@@ -39,8 +39,8 @@ other resume has an event-shaped driver — an inbound message, a fired timer, a
 operator — so a run crashed mid-step with none of those pending would have no
 driver at all, appear in no backlog (it concluded nothing, and its wake was
 already consumed), and wait forever while looking exactly like work in progress.
-The sweep's recovery pass is what closes that:
-an expired lease that still names an owner is precisely "an instance died
+The sweep's recovery pass is what closes that: an expired lease that still
+names an owner is precisely "an instance died
 holding this run", because every clean exit — sealed, failed, suspended —
 releases. See [the sweeper](#the-sweeper).
 
@@ -111,7 +111,8 @@ and nothing in the journal can say whether that call reached the world. The
 effect's declared recovery then decides — perform it again, or wait for a
 person — which is the right answer to an accident and an expensive one to
 schedule on every deploy. Draining is the difference between a stop somebody
-chose and a crash.
+chose and a crash. Moving a plane to a new build starts with one →
+[upgrading](@/docs/upgrading.md#procedure).
 
 `agentplane serve` drains on `SIGTERM` and `SIGINT`. The signal does two things
 at once and then waits for four:
@@ -220,11 +221,9 @@ frees a key without touching the run it named, and that an unkeyed admission
 claims nothing — the direction that would otherwise break every plane never using
 the feature.
 
-Writing it immediately caught a misreading in the battery itself: a *live* lease
-is correctly not stealable — `LeaseHeld`, deliberately distinct from `Fenced`,
-because the two call for opposite responses. A fenced writer must drop the run; a
-writer refused a live lease is not stale and should wait. That distinction is
-one of the checks.
+It also checks that a *live* lease is not stealable: `LeaseHeld`, distinct from
+`Fenced`, because a fenced writer must drop the run and a writer refused a live
+lease should wait.
 
 ### The case layer
 
@@ -243,8 +242,9 @@ container tag is pinned in the test rather than inherited: the
 `testcontainers-modules` default is `postgres:11-alpine`, which has been end of
 life since November 2023, so the default would certify this backend against a
 release nobody should be running.
-Postgres settles several more cleanly than the embedded store: `UPDATE … RETURNING` collapses
-a read-then-write into one statement, so there is no window to reason about
+
+Postgres settles several more cleanly than the embedded store: `UPDATE …
+RETURNING` collapses a read-then-write into one statement, so there is no window to reason about
 because there is no second statement.
 
 #### A paged read is part of the contract
@@ -286,16 +286,13 @@ A store that serialises internally — redb admits one writer at a time — pass
 trivially and correctly, having no race to lose. That is not a reason to skip it:
 the check exists for the backend where the race is real.
 
-The lesson was paid for once. The PostgreSQL run ceiling shipped with a comment
-claiming its count-and-insert serialised "inside the row lock the write takes" —
-no such lock exists for inserts of different rows, and racing it put eight runs
-through a ceiling of four while every sequential test stayed green. So the
-guards suite **races every store-side concurrency claim against a real
-PostgreSQL**: quota admission (sixteen racers, four slots), authority draws
-(sixteen racers, a mandate affording three), task claims (sixteen reviewers,
-one holder), timer sweeps (two sweepers partitioning twelve due wake-ups), case
-correlation and case-state writes. A claim about concurrency that has only been
-read is a claim; raced, it is evidence.
+A comment claiming a count-and-insert serialises "inside the row lock the write
+takes" reads as sound, and no such lock exists for inserts of different rows. So
+the guards suite **races every store-side concurrency claim against a real
+PostgreSQL**: quota admission, a tool's rate ceiling across two planes,
+authority draws, task claims, timer sweeps, case correlation and case-state
+writes. A claim about concurrency that has only been read is a claim; raced, it
+is evidence.
 
 ### Postgres
 
@@ -310,16 +307,13 @@ Three traps, each a plausible way to be nearly right:
   are non-transactional and leave gaps; a gap is indistinguishable from a deleted
   record during verification.
 
-Each was confirmed falsifiable by weakening the store and checking the battery
-named the right invariant — including one mutation that moved the writes outside
-the transaction, which the atomicity check caught with "a rejected batch left 1
-record(s) behind".
+Each is held by a mutation that weakens the store and requires the battery to
+name the right invariant.
 
 ## What the gate costs
 
 The first question a runtime built on *"the journal is the plan of record"*
-invites, and one this project could not answer until it had a way to produce a
-number. `just perf` produces it; these figures are from an Apple-silicon laptop
+invites. `just perf` answers it; these figures are from an Apple-silicon laptop
 and are quoted with the command precisely because they are hardware-specific.
 
 Each control is measured on its own store and reported by its best of three
@@ -363,8 +357,8 @@ against a deployment's own bundle rather than against this loop.
 
 **Two fsyncs per effect.** An effect crosses the protocol twice — `EffectStarted`
 before dispatch, its terminal record after — and both are durable commits at
-`Durability::Immediate`, because intent precedes action: the announcement must survive the
-process *before* anything reaches the world. The ~8.5 ms is that guarantee's
+`Durability::Immediate`, because intent precedes action: the announcement must
+survive the process *before* anything reaches the world. The ~8.5 ms is that guarantee's
 price, not an inefficiency waiting to be tuned away. Batching the two would
 break the only thing standing between a crash and an unrecorded payment.
 
@@ -401,7 +395,7 @@ Until something runs on a clock, a deadline is a number in a table and an
 unclaimed event is a row nobody reads. That is the failure this runtime is built
 against — not a crash, but a silence.
 
-One tick, eight findings — not all of them alarms, and the first two routine
+One tick, several findings — not all of them alarms, and the first two routine
 healing that still means something died. Recovery runs first, because an
 abandoned run may be one step from meeting a deadline the passes below would
 otherwise breach; then deadlines, task windows, event redelivery and
@@ -412,7 +406,7 @@ dead-lettering, and finally timers:
 | An instance died holding a run | The run is taken over at `epoch + 1` and resumed |
 | A claimed event's delivery died | The delivery is finished; reported as `events_redelivered` |
 | An obligation is approaching | `DeadlineTransition` → `Warned` |
-| An obligation passed unmet | `DeadlineTransition` → `Breached`; the **case** is escalated |
+| An obligation passed unmet | `DeadlineTransition` → `Breached`; the **case** is escalated — unless a run met the obligation since the sweep read it, which wins |
 | A task's window closed | The declared `on_expiry` is applied |
 | An event nobody claimed aged out | Dead-lettered with a reason |
 | A sleeping run's instant arrived | The run is woken; reported as `timers_fired` |
@@ -452,8 +446,8 @@ the operator running the plane.
 `needs_attention()` is the alerting predicate, and it enumerates exactly what a
 human should see: `breached`, `tasks_expired` or `dead_lettered` above zero, any
 saturated pass, `recovery_failures` or `wake_failures` above zero,
-`evidence_lost`, `census_unavailable`, and either witness count above zero. Recoveries that *succeeded* stay off
-that list — they are the plane healing, findable in the report and in the
+`evidence_lost`, `census_unavailable`, and either witness count above zero.
+Recoveries that *succeeded* stay off that list — they are the plane healing, findable in the report and in the
 sweep's own run. `is_quiet()` is the broader predicate: a healthy plane sweeps
 silently, so a non-silent sweep means something happened, even when it was only
 the system working.
@@ -481,7 +475,12 @@ Three details are worth knowing at 3 a.m.:
   is retried every tick, so a persistent count is the same run failing
   repeatedly — and nothing else will unstick it. The reason is in the log line
   of the failing tick. This is the one recovery number `needs_attention()`
-  fires on.
+  fires on. A recovery refused by the journal itself — a record this build
+  cannot decode, a chain that does not verify, a canonicalization it does not
+  implement, a recorded chain it cannot rehydrate — would be refused the same
+  way on every tick, so it is not retried: the run is **quarantined** with the
+  refusal named, and lands on the quarantine backlog for a person to reopen or
+  abandon. Everything else, a plane-dependent refusal included, is retried.
 - **The batch is small (32) on purpose.** Recovering a run replays its journal
   and then executes live from the frontier — which may dispatch a model call —
   so a mass failure drains over several ticks with `saturated.recovery` up
@@ -506,9 +505,15 @@ The claimed-event window is covered by its own pass. A delivery can die
 between an event's claim and the resume that consumes it — a crash in that
 window, or an owner that outlives the delivery's bounded retry — and the
 message then belongs to nobody: claimed, so no longer waiting; undelivered, so
-no run holds it. The sweep finishes those deliveries and reports each under
-`events_redelivered`. The redelivery is the system healing; a persistent count
-means deliveries keep dying, which is worth asking why.
+no run holds it. The delivery parks the pair, and the sweep walks the parked
+pairs — never every registered wait, whose long legitimate members would fill
+its page first — finishes those deliveries and reports each under
+`events_redelivered`. A parked wait already holds its message, so no second
+message is matched to it while it waits for redelivery; a parked wait whose run
+has since been sealed is retired rather than tried, as is every wait a run held
+when a resume repairs the seal a crash left missing. The redelivery is the
+system healing; a persistent count means deliveries keep dying, which is worth
+asking why.
 
 ### A finding has to be findable
 
@@ -592,9 +597,9 @@ a sweep with nothing to do.
 **Grant the read verbs explicitly.** `api:run.list`, `api:run.live`,
 `api:case.list`, `api:obligation.list`, `api:deadletter.list`, `api:push.list`
 and `api:halt.list` are what an on-call person needs, plus
-`api:obligation.acknowledge` for whoever answers a breach — separate from reading the list, because the party allowed to see what a
-deployment missed is not automatically the party allowed to declare it
-answered. An allowlist built
+`api:obligation.acknowledge` for whoever answers a breach — separate from
+reading the list, because the party allowed to see what a deployment missed is
+not automatically the party allowed to declare it answered. An allowlist built
 from route names alone will miss them; under a default-deny engine an ungranted
 verb means the backlog is refused to everybody. Enumerate `action::ALL` when
 writing rules rather than reading the route table. `api:obligation.list` is
@@ -612,6 +617,12 @@ announced, the process died or the provider went quiet, and whether the call
 reached the world is unanswerable from the journal — so nothing unwinds,
 because compensating around an unknown outcome is a refund for money nobody
 took.
+
+A run is also quarantined when a resume is refused because the declaration or
+policy bundle this plane holds is not the one the run was admitted under; its
+reason names both digests, and it is answered by bringing back the recorded
+revision and reopening, or by abandoning. Either way the run stays listed by
+`attention` until somebody answers it.
 
 That is the one conclusion a resume cannot clear, and the only backlog whose
 level moves because a *person* moved it. Three verbs, and they are deliberately
@@ -738,6 +749,7 @@ agentplane export --store ./journal.redb > history.jsonl
 agentplane audit  --store ./journal.redb > report.json
 agentplane verify history.jsonl --checkpoint cp.note   # check a copy, offline
 agentplane restore history.jsonl --store ./rebuilt.redb
+agentplane policy check --bundle ./policy --from history.jsonl   # re-derive the verdicts
 ```
 
 `--checkpoint` is the deletion check, and without it there is none. The Merkle
@@ -774,14 +786,14 @@ envelope when a ring is wired — then re-hashed (`get`, never `has` — presenc
 without integrity passes over altered bytes), and sealed state proven to open
 with the plaintext dropped on the spot. Reading any other way would hold the
 references against a store the deployment does not use: on a sealed plane,
-every intact envelope would report as corrupt, the one verdict that pages. The report's verdict has
-four answers, and the second is the one worth trusting the tooling for:
+every intact envelope would report as corrupt, the one verdict that pages. The
+report's verdict has four answers, and the second is the one worth trusting the
+tooling for:
 **intact**; **erased by design** — a tombstone or a destroyed key is retention
 reporting itself, counted and never a finding; **lost**, which pages; and **the
 bytes are gone and their tombstone does not read**, which pages too — the
 erasure may well have run, and nothing left in the store can say so. A drill
-that alarmed on erasure
-would teach you its findings are noise, and that is how a real loss gets ignored
+that alarmed on erasure would teach you its findings are noise, and that is how a real loss gets ignored
 six months later.
 
 The same rehearsal has a CLI verb for deployments that never write Rust:
@@ -827,10 +839,122 @@ legitimately unsigned. `--prior` is the deletion check: the report's own
 since then is a finding. The loop is deliberate — each audit prints the
 checkpoint the next one checks against.
 
-Both verbs default to every sealed outcome. `--outcome` narrows, `--limit`
-bounds, and reaching the limit prints a warning on **stderr** — so it survives
-`> out.jsonl` and an operator piping the export somewhere still learns the view
-was partial.
+Both verbs default to every sealed outcome. `--outcome` narrows and `--limit`
+bounds, and reaching the limit is never a pass. An **audit** records it in the
+report's `truncated` field — `{"limit": …, "reached": [outcomes]}`, so it
+survives `> report.json` — and exits `5` when nothing it read was wrong. An
+**export** that reached it is refused before a byte is written, because a
+truncated file is framed exactly like a complete one: raise `--limit`, narrow
+`--outcome`, or pass `--allow-partial` to write it anyway, which still exits
+`5`. See [exit statuses](#exit-statuses).
+
+### Re-deriving the policy verdicts {#policy-check}
+
+`policy check` reads an export and a policy bundle — the same `--bundle` loader
+`serve --policy` uses: one `.cedar` file, or a directory holding `policy.cedar`
+and optionally `schema.json` and `entities.json`, and nothing else — and
+evaluates every gated request the records support, offline. It opens no store
+and writes nothing. It needs the `cedar` feature (the `:full` image has it).
+
+```sh
+agentplane policy check --bundle ./policy --from history.jsonl --tenant acme
+agentplane policy check --bundle ./policy --candidate ./policy-next --from history.jsonl --json
+```
+
+Each run is **recorded** (the bundle's identity is the one its admission
+names, so it was evaluated), a **mismatch** (another bundle governed it; not
+evaluated), or **ungoverned**. A finding is a recorded permit the bundle
+refuses. `--candidate` adds, per run, the recorded permits the candidate would
+newly deny or cannot evaluate — measured against what happened, so a
+mismatched run is measured too. The report lists what it could not rebuild and
+why (sealed, erased, a refusal's request, a gate the record cannot show was
+passed); [security](@/docs/security.md#a-decision-somebody-else-can-check) has
+the list. `--tenant` is needed on a multi-tenant plane: every request carries
+the tenant and no record does, so the report says whether it was supplied.
+
+It exits `1` on a finding, a mismatch or a non-empty candidate diff, `5` when
+it evaluated nothing, and `0` otherwise. It checks agreement between a bundle
+and the record, not the record's integrity: `verify` the file first.
+
+### Replaying an edited declaration {#strict-replay}
+
+`replay --strict` re-executes a recorded run under the manifest it is handed
+and serves every model completion, tool result and peer reply from the
+journal. Handed an *edited* manifest, it answers the question an author has in
+review: would this change have made last week's runs do anything differently,
+and where?
+
+```sh
+agentplane replay run_01M3… --manifest edited.yaml --strict --store runs.redb
+agentplane replay --manifest edited.yaml --strict --from monday.jsonl --from tuesday.jsonl
+```
+
+```
+run run_01M3… — diverged
+  recorded: summariser 1.0.0 420d054e…
+  candidate: summariser 1.0.0 9623cd59…
+  (different digest)
+  first divergence: step s0, forward phase, `model.complete` — history ek:024c…, this build ek:3dff…
+```
+
+Each run gets one verdict, and every verdict names both revisions — the
+declaration digest the run was admitted under and the one in hand:
+
+| Verdict | Means |
+|---|---|
+| **verified** | Every recorded effect was asked for again, in order, and the run reached the ending it recorded — a recorded failure included: the recorded ending is what is verified. Under a different digest it reads *no divergence on this run*, which says nothing about the next input |
+| **diverged** | The first effect this build asked for differently, or beyond the record, or never asked for — with its step, phase and both keys. Or every effect matched and the run ended differently |
+| **cannot replay** | A reason that is not the edit, named: *erased* (sealed to a destroyed key), *key absent* (sealed, and this plane holds no key ring — nothing is known to be erased), *canonicalization changed*, *entry point removed* (the file no longer provides the capability the run executed), *not concluded*, or *ended by an act* (a cancellation, abandonment or sweep its steps did not decide) |
+
+It writes nothing — no lease, no conclusion, no index moves — and it reaches
+nothing: every provider, tool server and peer the manifest names is answered
+by a stand-in that refuses any call, so **no provider credential is read** and
+`--mcp` and `--peer` are refused rather than ignored. A model call's identity
+includes its driver's request profile (endpoint, schema mode, streaming), which
+is deployment wiring, so the stand-in takes it from the record: the verdict is
+about the declaration, not about this machine's provider setup.
+
+`--from` reads an export instead of a store: each file is rebuilt in memory,
+checked against its own checkpoint, and every run in it is replayed unless a
+run id names one. A corpus exits with its worst verdict — `4` if a run could
+not be read, then `1` if any diverged, then `5` if any could not be replayed,
+else `0` — so a CI job holding exports and a pull request's manifest reads one
+status.
+
+What it cannot see: a **policy bundle** edit (a strict replay replays recorded
+decisions and never asks the engine, which is what keeps a relaxed rule from
+re-judging old runs), and anything the declaration contributes outside the
+effects a run made — a raised ceiling diverges only on runs the old one
+stopped. A replay that serves some boundaries from the record and runs others
+live is refused, not offered: a live answer grafted onto old history is an
+observation the journal never recorded, and a model call made to explore an
+edit is a fresh `run`. A *resume* under a different declaration is still
+quarantined before anything replays.
+
+### The command line's exit statuses {#exit-statuses}
+
+One table for every verb, printed at the foot of `agentplane --help`, because a
+scheduler reads the status and nothing else:
+
+| Status | Means |
+|---|---|
+| `0` | Done, and the answer is yes. |
+| `1` | A finding or a negative answer: a failed run, an audit, verify or `policy check` finding, a strict replay that diverged, `attention` finding something, a `halt --lift` / `hold --lift` / `rearm` that found nothing standing, a `decide` approval of a proposal the terminal cannot show, an invalid manifest under `validate`. |
+| `2` | Usage: the command as typed cannot be carried out — a flag, argument or input this binary refuses. `clap`'s own parse errors use it too. |
+| `3` | A `run` or a resuming `replay` stopped to wait, for a person, a timer or an event. A strict replay of a waiting run that reproduces the wait is verified, `0`. |
+| `4` | Operational: a store, a witness, the network or a file could not be used. |
+| `5` | Partial: `--limit` truncated what was read, `policy check` could evaluate nothing, or a strict replay met a run it could not replay (and none diverged). |
+
+A finding and an outage are different pages, which is the reason for the split.
+
+**Output.** The verbs whose answer is a report — `audit`, `verify`, `export`,
+`attention`, `tasks`, `waiting`, `drill` and the other operator verbs — print
+JSON on stdout, always. The verbs whose answer is a sentence — `halt`, `init`,
+`validate`, `digest` — print text for a person, and one JSON document on stdout
+with `--json`; so does `policy check`, whose report is long enough that a
+person reads the summary and a pipeline reads the JSON. Everything else goes to
+stderr. `serve --log-format json` (`AGENTPLANE_LOG_FORMAT`) writes one JSON object per log line for a collector,
+and `agentplane --version` names the features the binary was built with.
 
 ### What no audit can answer: the runs that never started
 
@@ -930,11 +1054,18 @@ a request for exactly those conclusions.
 
 It rebuilds the case layer beside the journal: every matter is queryable again
 — `case`, correlation, the status worklist, the deadline sweep, the blob links
-erasure walks — and the conformance battery holds the import to every one of
-those read paths on both backends, because an import that rebuilds five
-indexes out of six reads perfectly until somebody queries the sixth. A store
+erasure walks, and the legal holds that stop a retention pass from erasing a
+matter — and the conformance battery holds the import to every one of
+those read paths on both backends. A store
 that already holds a case refuses it: a restore rebuilds a case layer, it does
 not merge one.
+
+Before anything is written, each record line must be replayable as written:
+its `hash` must cover its `raw` bytes and the chain before it, and its `v`
+must be the version this build writes. A file failing either is refused whole,
+with the store untouched — `append` re-derives every hash from what it is
+handed and stamps this build's version, so replaying such a line would rebuild
+a history the export never committed to.
 
 It replays the ordinary `append` path rather than writing rows, and that is the
 safety argument: `append` maintains six derived indexes — case, exactly-once,
@@ -1118,6 +1249,20 @@ if let Some(run) = report.record {
 
 **A quiet tick writes nothing.** A healthy plane sweeps constantly, and a Merkle
 log filling with evidence of inactivity is where the somethings hide.
+
+**A breach is applied first and noted after; a warning or an expiry is noted
+first and corrected if it lost.** A breach is conditional: a run that met the
+obligation after the sweep read it wins, and the store refuses the stale breach
+— so a refused breach writes nothing. An applied one is marked in the same write
+as owing its account, and the `deadline_breached` and `case_escalated` notes
+retire the mark. A crash between the breach and its notes leaves the mark, and
+the next tick notes every owed breach before it reads `due` — once. A warning,
+and a task expiry that meets an answer somebody already gave, are noted before
+they act; when the act does not apply the sweep appends `not_applied` for the
+same subject, so the last word about each subject is what happened to it. Read
+a subject's `deadline_warned` or `task_expired` as withdrawn when a
+`not_applied` follows it. An expiry that meets a person's answer also settles
+the task to that answer, so the next tick does not meet it again.
 
 Two things are deliberately *not* in it, and both are worth knowing. Dead-lettered
 events are counted rather than named, because the event store reports how many
@@ -1314,11 +1459,27 @@ provider that answered them. And `server.address`, because a driver's endpoint i
 deployment configuration, identical for every call it makes: that belongs on the
 OTel *resource* your exporter sets, not repeated on every span.
 
+The same rule reaches the **loud events**. A run's failure reason, a
+quarantine's, an undecidable effect's detail and a compensation's error are free
+text a provider, a peer or a skill wrote, and it quotes the request it refused —
+the caller's data. The journal seals those fields under a key ring and an
+erasure destroys them; a log line carrying the same words would outlive both. So
+each of those events carries the run, the class of fault as `error_type`
+(`undecidable`, `timeout`, `failed`, …) and `reason_digest` — `sha256:` and the
+first sixteen hex digits of SHA-256 over the text — and never the text. Read the
+words through the operator API (`GET /runs/{run}`), which honours erasure; the
+digest is what joins the two.
+
+Transport failures follow the same line one layer down: a webhook's, a peer's or
+a media source's URL routinely carries a bearer secret, so an outbound error is
+rendered with the **host** it failed at and never the URL — in a parked push
+registration, a log line and an effect's failure alike.
+
 The conventions are still pre-1.0, so the revision targeted is pinned in
 `telemetry::SEMCONV_VERSION` rather than tracked. An upstream change becomes a
 deliberate migration instead of a silent shift in what your dashboards mean.
 
-Three further decisions worth knowing:
+Further decisions worth knowing:
 
 - **One span per effect *attempt*.** A retried call shows as several spans rather
   than one long one, which is what makes "how often does this driver need a
@@ -1331,12 +1492,13 @@ Three further decisions worth knowing:
   bound to the current thread; held across an `.await` it stays entered while the
   future is suspended, so whatever runs next is attributed to it. With concurrent
   siblings that silently reparents their work. `Instrument` is the only form that
-  survives a suspension, and `tests/guards/layering.rs` bans the guard in async code.
+  survives a suspension, and `tests/guards/layering.rs` bans the guard in async
+  code.
 - **The vocabulary lives in `runtime::telemetry`.** A span name typed inline at
   twelve call sites is twelve chances to drift, and telemetry drift is invisible:
   the dashboard stops matching and nobody is told.
 
-Every failure P7 exists to surface has its own event target:
+Every failure that must not pass silently has its own event target:
 
 | Event | Fires when |
 |---|---|
@@ -1346,7 +1508,7 @@ Every failure P7 exists to surface has its own event target:
 | `agentplane.run.unreproducible` | A pinned read came back as different content — the durable record is not trustworthy |
 | `agentplane.run.recovered` | The sweep took over a run whose owner died holding it |
 | `agentplane.run.replanned` | A run changed its plan, and the successor names its parent |
-| `agentplane.run.failed` | A run concluded `failed`, with the reason it gives an operator — an ordinary conclusion rather than an incident, and findable under `GET /runs?outcome=failed` |
+| `agentplane.run.failed` | A run concluded `failed` — an ordinary conclusion rather than an incident, findable under `GET /runs?outcome=failed`; the event carries the reason's digest, and the API the reason |
 | `agentplane.effect.undecidable` | An outcome could not be determined and guessing was forbidden |
 | `agentplane.effect.reconciled` | A probe was asked whether a call landed |
 | `agentplane.budget.refused` | A limit refused an operation |
@@ -1364,8 +1526,8 @@ page does not name, because a table headed *every* is an alerting checklist and
 a short one is read as a complete one.
 
 `tests/guards/layering.rs` fails the build if any of those has no emitter, and
-`tests/process/telemetry.rs` asserts on what a subscriber actually received rather than
-on what the source contains — an instrumentation test that greps is checking the
+`tests/process/telemetry.rs` asserts on what a subscriber actually received
+rather than on what the source contains — an instrumentation test that greps is checking the
 author's intent, not the runtime's behaviour.
 
 ### The last mile: instrumented is not monitored
@@ -1419,20 +1581,53 @@ On the embedded backend that division is load-bearing, because redb admits one
 writer process: a verb that opens the store is a verb that runs while the
 plane is down — which is exactly when somebody is reaching for it.
 
-So every remedy `agentplane attention` names is a verb the CLI has.
+So every remedy `agentplane attention` names is a verb the CLI has, and every
+remedy `GET /attention` names is a route the API has — or, where the API has
+none (resuming a run, re-running a drill), the `agentplane` verb that does it.
+A remedy with nothing to run says `no verb:` and why. Each condition also lists
+its **subjects** — the run, task, `<case>/<obligation>`, message or
+`<run>/<registration>` the remedy's verb takes, at most ten, newest first for
+run conclusions and most overdue first for waits and tasks, with `unlisted`
+counting the rest — so the next command can be typed from the answer alone:
+
+```sh
+agentplane attention --store ./journal.redb
+# { "condition": "run.quarantined", "found": 1, "subjects": ["run_01JD…"],
+#   "unlisted": 0, "remedy": "establish an undecided effect with `reconcile`, …" }
+```
+
+A failed run is listed only when it stands on landed work nothing undid —
+`run.failed_with_landed_work`, whose remedy is `replay` to finish the work or
+`cancel` to unwind it. Any other failed run is one a resume may clear, and is
+not a condition.
+
 `reconcile` establishes an effect the runtime could not decide; `quarantine`
-reopens or abandons the run afterwards; `decide` answers a task on the
-worklist; `acknowledge` accounts for a breached obligation; `cancel` stops a
-run the ceiling or the halt will not release; `rearm` revives a parked push
-registration. Each takes `--actor`, recorded as **asserted** — nothing at a
-terminal verified the name, and the record says so, where the same act through
+reopens or abandons the run afterwards; `tasks` lists the worklist and
+`decide <task> approve|reject` answers one; `acknowledge` accounts for a
+breached obligation; `cancel` stops a run the ceiling or the halt will not
+release; `rearm` revives a parked push registration. Each takes `--actor`,
+recorded as **asserted** — nothing at a terminal verified the name, and the record says so, where the same act through
 the API records `authenticated`.
 
 Two of them cannot finish the job from a terminal, and say so rather than
 pretending. `quarantine` records the decision and reports `"applied": false`:
 a terminal holds the journal and not the agent, so the next resume applies it.
-`decide` records the decision durably and reports what the delivery did; a run
-waiting on it resumes when something can run it.
+`decide` records the decision durably, completes the task and reports what the
+delivery did — `Buffered`, from a terminal that holds no agent — and prints the
+`agentplane replay <run> --manifest … --store …` that continues the run.
+`cancel` from a terminal records the stop and leaves it to the plane that holds
+the agent, which observes it on its next resume.
+
+**Only a plane that can drive a run judges it.** A terminal holds no policy
+engine and no declaration, and a governed run was admitted under both; a
+terminal that compared its own empty policy with the run's would quarantine
+every governed run it answered a task for. So a resume first asks whether this
+plane provides every capability the run's plans name, and a plane that does not
+stops there — `NoProvider`, reported as `Buffered` by a delivery and as a
+recorded, undriven request by a cancel. A plane that does hold the agent under
+a different policy bundle or an edited declaration still quarantines the run:
+that is a real mismatch, and the one a rollout across a mixed fleet has to
+plan for.
 
 ### Serving it
 
@@ -1450,13 +1645,14 @@ verb does the same wiring from flags, hosting exactly one manifest per process.
 | `--addr` | `127.0.0.1:8080` | The peer surface. Loopback until you say otherwise. | `AGENTPLANE_ADDR` |
 | `--operator-addr` | off | The worklist, task decisions and `GET /runs?outcome=quarantined`, on their own listener. | `AGENTPLANE_OPERATOR_ADDR` |
 | `--policy` | **no default** | The Cedar policy set. No default, because a permissive engine and no engine are the same behaviour and only one of them looks governed. | `AGENTPLANE_POLICY` |
-| `--tokens` | none | The bearer tokens this plane accepts, each optionally carrying the `scope` and `not_after` of the chain that caller's runs act under. | `AGENTPLANE_TOKENS` |
+| `--tokens` | **no default** | The bearer tokens this plane accepts, each optionally carrying the `scope` and `not_after` of the chain that caller's runs act under. A token under 32 bytes, or one published in this project's examples, is refused at load. | `AGENTPLANE_TOKENS` |
+| `--log-format` | `text` | `json` writes one JSON object per log line. | `AGENTPLANE_LOG_FORMAT` |
 | `--url` | none | Where callers reach this plane. Goes on the Agent Card, so it is the public URL rather than what you bind. | `AGENTPLANE_URL` |
 | `--sweep-every` | 30s | How often deadlines, task expiry, dead letters and due timers are swept. `0` runs the sweep from your own scheduler instead. | `AGENTPLANE_SWEEP_EVERY` |
 | `--drill-every` | off | How often the recovery rehearsal runs — see [disaster recovery](#disaster-recovery). | `AGENTPLANE_DRILL_EVERY` |
 | `--drain-secs` | 25s | Bounds the stop — see [stopping an instance](#stopping-an-instance). | `AGENTPLANE_DRAIN_SECS` |
 | `--mcp NAME=COMMAND` | none | An MCP server to run and wire under `NAME`. Repeatable. | — |
-| `--peer NAME=URL` | none | An A2A peer the manifest grants under `tool://NAME/…`; its token comes from `AGENTPLANE_PEER_TOKEN_<NAME>` rather than the command line. Needs the `a2a` feature. | — |
+| `--peer NAME=URL` | none | An A2A peer the manifest grants under `tool://NAME/…`; its token comes from `AGENTPLANE_PEER_TOKEN_<NAME>` (upper-cased, `.` and `-` as `_`) rather than the command line. Two names that meet in one variable — `a.b` and `a-b` — are refused at boot. Needs the `a2a` feature. | — |
 | `--push-host` | none | Permits A2A push notifications to that exact host. Repeatable. Without one, push is not wired and the Agent Card advertises it as absent rather than claiming a capability nothing serves. | — |
 
 The three repeatable flags take no environment variable; everything else does,
@@ -1612,20 +1808,49 @@ tenant waiting on a hundred approvals could start nothing. It follows that a
 resume is not gated: that work was admitted already, and refusing it would
 strand a run waiting on something that has now happened.
 
-**Spend** bounds a period and is checked at admission, against what has been
-*accrued*. One live execution pass is assigned to the period in which it starts:
-admission checks that key and settlement charges the pass to the same key even
-when midnight or month-end passes before it finishes. A later resume is a new
-pass in its resume period. Recomputing at completion would authorize against one
-ledger and debit another.
+**Spend** bounds a period by **reserving** each run's worst case at
+admission. A run can spend its own ceiling and end one call past it per step it
+has in flight — a call's cost is known only when it returns — so admission
+holds `ceiling + width × one call` against the period, in the same store
+transaction that checks the ceiling and takes the slot, and refuses when settled
+spend plus every outstanding hold plus this one would pass the ceiling. The
+width is `max_parallel_steps`, or the admitted plan's node count, and the run is
+dispatched no wider. What one call can cost comes from the declaration: each
+model role's `max_input_tokens` plus its output ceiling, at its price (see
+[the manifest reference](@/docs/manifest.md#per-call-bound)); a Rust deployment
+states it on its `Budget` as `max_call_tokens` / `max_call_minor_units`.
+`agentplane validate` prints the figure per agent.
 
-**Size for what it leaves unbounded.** The period ceiling bounds what a tenant
-may *start*. Work already admitted finishes, resumes are not refused, and each
-is held only to its own budget — so a tenant with a thousand runs awaiting
-approval can carry a thousand per-run budgets past a crossed ceiling. Only the
-period ceiling and the per-run budget together bound a period. A halt does not
-close it: the workload scopes stop admission, and only a `subject:` halt reaches
-work already running.
+Under a spend ceiling, a run whose budget leaves that unit unbounded — no run
+ceiling, or no per-call bound — is refused with `QuotaError::Unbounded` naming
+the field. Admitted, it would hold nothing against a period it can spend
+without limit.
+
+Every pass settlement moves that pass's spend out of the run's hold and into the
+settled total, and the pass that concludes the run releases the rest. A
+suspended run keeps what it holds, and a resume is never refused for spend. One
+live execution pass belongs to the period in which it starts: settlement charges
+it there even when midnight or month-end passes before it finishes. A resume in
+a later period moves what the run still holds into that period — released from
+the old one, held in the new one, unconditionally.
+
+**What this bounds.** A period's settled total stays within its ceiling through
+the work admitted in it, however many runs suspend, run concurrently, or admit
+from several instances at once. What still reaches past it: holds carried in by
+resumes from an earlier period (new admissions are refused until they settle);
+a model call that reports more input than its role declares, which fails but is
+billed as reported; an embedder's own effects, bounded only as exactly as the
+per-call figure it declares for them; and compensating calls, which no ceiling
+gates. A commissioned run reserves and settles its own spend; the commissioning
+run's own ceiling still counts it, and the period is charged once.
+
+A `QuotaError::SpentOut` refusal names settled and reserved spend apart:
+settled spend resets with the period, reserved spend is held by open runs.
+`Runtime::reservations(limit)` lists the holders, and `agentplane attention`
+names the ones stopped waiting on a person — quarantined, exhausted, withheld or
+failed — since what they hold comes back only when somebody concludes them. A
+halt does not release a hold: the workload scopes stop admission, and only a
+`subject:` halt reaches work already running.
 
 Wiring a quota store records every active run even when all ceilings are
 `None`. That keeps `running()` truthful for operators and means adding a limit
@@ -1635,7 +1860,8 @@ by the previous unlimited configuration.
 Settlement is crash-safe rather than best-effort. Before a pass can dispatch an
 effect, `QuotaPassStarted` records its period and whether it owns the admission
 slot. At the end, `QuotaStore::settle` writes an exact `(run, epoch)` receipt,
-accrues that pass's spend, and releases its slot in one store transaction. A
+accrues that pass's spend, reduces the run's hold by it (releasing the rest when
+the pass concludes the run), and releases its slot in one store transaction. A
 lost acknowledgement repeats the same receipt and charges nothing twice; a
 changed retry is corruption. The run is physically sealed and its lease is
 released only after settlement succeeds. If settlement is unavailable, the
@@ -1649,17 +1875,16 @@ either side of the call and converges after a transient outage. It cannot make
 progress through a permanent partition or survive independent destructive loss
 of one backend while claiming the other is complete.
 
-Both of those are yours to set, and the second one has a default worth knowing:
-`RuntimeBuilder` starts at `Budget::unlimited()`. A deployment that sets a tenant
-ceiling and no per-run budget has bounded *nothing* — the product has an
-unbounded factor in it. A declarative agent cannot make that mistake, because a
-manifest without `budgets` fails validation rather than defaulting; a Rust
-deployment has to decide the same thing deliberately.
+`RuntimeBuilder` starts at `Budget::unlimited()`, so a Rust deployment that sets
+a tenant spend ceiling has to give its runs a ceiling and a per-call bound too —
+otherwise every run is refused as unbounded rather than admitted past the
+ceiling. A manifest without `budgets` already fails validation.
 
 A refusal is `RuntimeError::QuotaExceeded`, deliberately not a policy denial: a
 denial means *you may not* and retrying is pointless; a ceiling means *not right
-now*. Over A2A it comes back as `-32004` rather than an internal error, so a
-peer backs off instead of retrying a "fault" immediately.
+now*. Over A2A it comes back as `-32029` with the `ErrorInfo` reason
+`QUOTA_EXHAUSTED` rather than an internal error, so a peer backs off instead of
+retrying a "fault" immediately.
 
 Two failure choices worth knowing. An unreachable quota store **refuses** rather
 than admits — a ceiling that yields when its accounting is down is one an
@@ -1682,6 +1907,25 @@ let stranded = journal.abandoned_runs(100).await?;
 The listing empties as runs settle, which is what makes it a queue rather than a
 record of everything that ever ran.
 
+### A tool's rate ceiling {#rate-ceiling}
+
+A grant's [`rate_limit`](@/docs/manifest.md#rate-limit) is counted in the same
+quota store, per tenant per tool, so it needs one wired: a plane whose
+declarations state a ceiling and whose builder wired no quota store is refused
+at build. Each dispatch of a ceilinged tool costs one store transaction; an
+unceilinged tool pays nothing. An unreachable store refuses the call, as it
+refuses admission.
+
+A run stopped by one concludes `exhausted`, and `agentplane attention` lists it
+with the other exhausted runs. The remedy is time, not a raise: wait for the
+window to pass, then `agentplane replay` the run. A replay inside a window that
+is still full stops it again on the refusal already recorded; after the window
+it records a re-admission beside the refusal and carries on. Changing a ceiling
+means publishing a declaration; a new revision does not reset the count.
+
+The reservations are operational state, like delivery cursors: they are not in
+the export, and they age out with the widest window stated for their tool.
+
 ### The emergency stop {#the-emergency-stop}
 
 Beside the ceilings sits a switch that is deliberately not one:
@@ -1696,10 +1940,9 @@ stop.
 #### It names what it stops
 
 A tenant-wide switch is the right answer when the plane is the incident and the
-wrong one at three in the morning when agent 12 of 28 is misbehaving — and
-hosting several agents is exactly what a multi-document manifest and
-`A2aServer::hosting` are for. Against a tenant-only switch the options were stop
-all 28 or ship a policy change; neither is an emergency stop.
+wrong one when one agent of many on the plane is misbehaving — and hosting
+several agents is exactly what a multi-document manifest and
+`A2aServer::hosting` are for.
 
 | Scope | Stops | Reach for it when |
 |---|---|---|
@@ -1715,7 +1958,7 @@ asked for and leaves everyone else's alone.
 
 **It is the only scope that reaches work already running, and it pauses.** A run
 under a withdrawn credential stops at its next step boundary as `withheld`; its
-completed work stands, and lifting the halt lets it continue. It is not unwound —
+completed work stands, and after the lift a `replay` continues it. It is not unwound —
 reversing correct work because a credential lapsed is a second incident. To
 reverse it, cancel it.
 
@@ -1726,13 +1969,13 @@ last word.
 ```sh
 agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' \
                  --reason "incident 42: looping" --actor ops-carol
-agentplane halts --store ./journal.redb          # what is stopped right now
+agentplane halt list --store ./journal.redb      # what is stopped right now
 agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --lift
 ```
 
 `--scope` takes `tenant`, `agent:<metadata.name>`, `revision:<manifest digest>`
-or `subject:<delegation subject>` — the four forms `HaltScope::parse` accepts,
-and the refusal you get for a typo lists them.
+or `subject:<delegation subject>` — the forms `HaltScope::parse` accepts, and
+the refusal you get for a typo lists them.
 
 **`--actor` is required to throw one, and the row says it was *asserted*.** The
 runtime cannot check an emergency stop: there is no verdict to re-derive and no
@@ -1826,8 +2069,8 @@ is the clearest statement of the difference.
 **The `subject:` scope is the exception, and it is the one an incident most
 often needs.** It names an authority rather than a workload, so it *does* reach
 runs already executing — each pauses at its next step boundary as `withheld`,
-completed work standing, and lifting the halt continues it. The response to
-`POST /halts` says which of the two you got, derived from the scope, because an
+completed work standing, and after the lift a `replay` continues it. The
+response to `POST /halts` says which of the two you got, derived from the scope, because an
 operator who withdrew a credential and reads *cancel to reach work in flight*
 will unwind a week of correct work that the withdrawal had deliberately
 preserved.
@@ -1835,7 +2078,7 @@ preserved.
 ### One surface, many tenants
 
 `Api::new` takes `Planes`, a registry keyed by tenant, so one process can serve
-several — a single-tenant deployment passes its runtime and reads as before.
+several — a single-tenant deployment passes its one runtime.
 Which plane answers comes from the caller's tenant, which the `Authenticator`
 derives from the credential exactly as it derives `actor` and `roles`.
 
@@ -1855,7 +2098,7 @@ whether a run id exists by comparing a `400` against a `404`.
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
 | `GET /runs/live` | What is executing **right now**, and under whose authority? `stranded` marks a lapsed lease → [the emergency stop](#the-emergency-stop) |
 | `GET /drill` | **When did this plane last rehearse recovery, and did it pass?** `{"drilled": false}` for a plane that never has is a finding, not a clean answer → [recovery drill](#recovery-drill) |
-| `GET /attention` | **Does anything here need a person, and which thing?** One roll-up over every backlog below, each condition with its remedy. `agentplane attention` exits non-zero when something does |
+| `GET /attention` | **Does anything here need a person, and which thing?** One roll-up over every backlog below, each condition with its subjects and a remedy in this API's routes. `agentplane attention` exits non-zero when something does |
 | `GET /runs/waiting` | What is this plane **waiting on**, and until when? Soonest due first, so what should have moved already sorts to the front → [the recovery runbook](#recovery-drill) |
 | `GET /runs/{run}` | What is this run doing — **why is it not finishing**, or why did it end, and on whose decision? |
 | `GET /runs/{run}/history` | What did it actually *do*? The journal, record by record, from `?from=<seq>` |
@@ -1903,6 +2146,12 @@ event's id, so a gateway relaying two counterparties that both number their
 messages from one still delivers two events rather than swallowing the second as
 a retry.
 
+**The `agentplane.` kind namespace is the plane's own.** A human task's answer
+reaches its run as an event of such a kind, so any kind in it is a `403` here,
+and an A2A message addressed to a run waiting on a task is refused the same way.
+A task is decided with `POST /tasks/{task}/decide`, where the claim, eligibility
+and four-eyes run.
+
 One CloudEvents attribute correlates: `subject`, the standard's own "what
 this event is about", becomes the key `("subject", value)` — a run that
 expects to be woken by a bus correlates on the subject its counterparty will
@@ -1934,6 +2183,18 @@ the case and made up their mind. The flag calls `Task::may_decide`, the same
 predicate the store enforces, rather than re-implementing it: a second copy of an
 authorization rule drifts, and the copy that drifts is the one people read.
 
+**Each item carries the text a person should read, beside the value a program
+reads.** `justification` is the structured value; `rendering` is the same task
+with every invisible or direction-changing code point escaped in place
+(`\u{202E}`), `escaped` saying whether any was, and every word that mixes
+scripts listed in `mixed_script` with where it occurs. `agentplane tasks`
+prints the same rendering. A proposal the plane cannot open carries
+`withheld` — `sealed` (no key ring here), `erased` or `undecodable` — and then
+neither `justification` nor `rendering` carries a proposal or evidence at all,
+never the envelope. Approving it is refused with `422` and the reason, before
+anything is claimed or recorded; rejecting it still records
+→ [what a reviewer is shown](@/docs/security.md#what-a-reviewer-is-shown).
+
 ### No authenticator is shipped
 
 Same reasoning as the policy engine and the tracing exporter. `Authenticator` is
@@ -1960,14 +2221,12 @@ in the same transaction that reserves, so an ineligible reviewer is refused
 
 #### Eligibility outranks availability
 
-Writing the handler forced a question the in-process API never had to answer:
-what status code does a refused claim get? `403` and `409` ask different things
-of the reader — *this will never be yours* versus *try again, or ask Bob* — and
-that made the store's ordering visible. Both backends checked availability first,
-so a barred reviewer asking for a held task was told "held by Bob". They wait for
-Bob to release it, ask again, and are refused for a reason nobody has yet
-mentioned; and meanwhile they have learnt who is reviewing what, from a queue
-they have no standing in.
+A refused claim is a `403` or a `409`, and they ask different things of the
+reader — *this will never be yours* versus *try again, or ask Bob*. Checked
+availability first, a barred reviewer asking for a held task would be told
+"held by Bob", wait for Bob to release it, and then be refused for a reason
+nobody had mentioned — having learnt meanwhile who is reviewing what, from a
+queue they have no standing in.
 
 The order is part of the `TaskStore` contract, and the conformance battery
 holds both backends to it:
@@ -1986,14 +2245,11 @@ reader somebody else got there first; answered to a typo it sends an operator
 hunting for an interventionist who does not exist, and answered to an outage
 it teaches a client that a retryable failure is permanent.
 
-The same battery run then caught a second defect, in Postgres only: `release`
-had the right `WHERE` clause and **discarded the row count**, so a release by
-somebody who did not hold the task returned `Ok(())`. The caller is told the task
-is free; the holder still has it. That is the exact failure mode the shared
-contract exists to catch — a second backend gets whatever tests its author
-remembered to write, and those are the ones they were already thinking about.
-A release by somebody else reports `ClaimError::NotHeld`, which is deliberately not
-`NotFound`: "the id is wrong" and "it is not yours" call for different responses.
+A release by somebody who does not hold the task reports `ClaimError::NotHeld`
+rather than succeeding — otherwise the caller is told the task is free while the
+holder still has it — and deliberately not `NotFound`: "the id is wrong" and "it
+is not yours" call for different responses. The battery holds both backends to
+it.
 
 ### Escalation widens the audience — and then leaves the expiry scan
 
@@ -2034,10 +2290,10 @@ correlation key inherits that, being derived from the id.
 A full-fidelity journal is simultaneously an asset and a GDPR liability. The
 **window** is yours to choose — a retention period is a legal decision and a
 crate that picked one would be choosing somebody else's — but running it is not:
-`Runtime::retain` walks it, `agentplane retain --dry-run` lists what a walk
+`Runtime::retain` walks it, `agentplane retention plan` lists what a walk
 would erase, and [erasure](@/docs/erasure.md) is the full account.
 
-What exists today:
+What exists:
 
 - **The journal keeps everything, indefinitely.** It is append-only and
   hash-chained: nothing in it can be edited or removed without invalidating
@@ -2096,14 +2352,13 @@ the content.
 `Runtime::retain(older_than, at, reason)`, or:
 
 ```sh
-agentplane retain --store ./journal.redb \
-  --older-than-days 2555 --reason "retention: 7 years from opening" --dry-run
+agentplane retention plan --store ./journal.redb --older-than-days 2555
 ```
 
-The CLI form lists and refuses to erase — the binary wires no store that can
-— so the pass itself is the library call. It erases **closed** cases only, and
-measures the window from `opened_at`: a
-case still open is a matter still running, and erasing underneath a live run
+The CLI form lists — the binary wires no store that can erase, so it has no
+verb that claims to — and the pass itself is the library call. It erases
+**closed** cases only, and measures the window from `opened_at`: a case still
+open is a matter still running, and erasing underneath a live run
 turns a retention pass into an outage. Every pass returns `not_erasable` beside
 its count, and that list is the half that matters — a number with no coverage
 statement beside it is how a deployment comes to believe an obligation is
@@ -2258,8 +2513,8 @@ resume everything `awaiting` names, then open the gates.
 
 ### Evidence {#recovery-evidence}
 
-The drill is a test, not a procedure somebody remembers. `postgres_restores_a_plane_that_then_serves`
-runs the whole sequence against a real `PostgreSQL` server, restoring into a
+The drill is a test, not a procedure somebody remembers.
+`postgres_restores_a_plane_that_then_serves` runs the whole sequence against a real `PostgreSQL` server, restoring into a
 tenant of a database another tenant is already using, and asserts each claim
 above: equal roots at equal size, records hash-for-hash, the matter and its
 obligation and its artifact, isolation in both directions, a lease past the
@@ -2277,5 +2532,5 @@ be saying it about bytes nobody had put back yet.
 | A run seems stuck | It is almost certainly suspended on an event, a timer, or a human. `GET /runs/{id}` reports *why* rather than only *that* |
 | An event was dead-lettered | Nothing was waiting for it, and the grace window elapsed. `GET /dead-letters` names it and the keys it was filed under — the mismatch is usually visible by reading them next to what the run subscribed to |
 | A webhook receiver stopped answering | Its registration is *parked*, not deleted: the cursor survives so nothing is lost. `GET /push` says which and what it answered last; `POST /push/rearm` resumes at the first record it never acknowledged |
-| Budget exhausted | A ceiling doing its job, not a fault. The status carries the limit **and** where consumption actually reached, so it says what to raise it to |
+| Budget exhausted | A ceiling doing its job, not a fault. The status carries the limit **and** where consumption actually reached, so it says what to raise it to. A tool's full rate window reads the same way, and its remedy is time → [a tool's rate ceiling](#rate-ceiling) |
 | `LeaseHeld` vs `Fenced` | Opposite responses. `LeaseHeld` means another instance is alive and you should wait; `Fenced` means this writer is stale and must drop the run, never retry |

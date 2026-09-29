@@ -152,12 +152,32 @@ echo "── a declarative tool loop, with tools from an MCP server ──"
 # the host rather than in the container, because a distroless image has no
 # interpreter to run a scripted MCP server with.
 MCPBIN=(cargo run -q --features cli,mcp-stdio --bin agentplane --)
+tdir="$(mktemp -d -t agentplane-tools-XXXX)"
 out="$("${MCPBIN[@]}" run "$ROOT/examples/tool-calling.yaml" \
-        --input '{"ticket":"T-1"}' \
+        --input '{"ticket":"T-1"}' --store "$tdir/t.redb" \
         --mcp "tickets=python3 $ROOT/examples/mcp-server.py" 2>&1)" || {
     echo "FAIL: the tool loop did not run: $out"; exit 1; }
 grep -q 'Succeeded' <<<"$out" || { echo "FAIL: the tool loop did not succeed: $out"; exit 1; }
-echo "ok: started the server, derived the catalogue, completed the run"
+# Success alone is not evidence the server was reached: a loop whose model never
+# asks for a tool succeeds too. The server's answer is in the journal only if
+# the call went out and came back.
+"${MCPBIN[@]}" export --store "$tdir/t.redb" 2>/dev/null | grep -q 'printer on fire' || {
+    echo "FAIL: the run succeeded and the MCP server's answer is not in its journal"; exit 1; }
+rm -rf "$tdir"
+echo "ok: started the server, derived the catalogue, called the tool, completed the run"
+
+echo "── a tool loop with no transport names the flag that wires one ──"
+# The library's refusal names the Rust call that fixes it; a YAML author holds
+# this binary, so the refusal they see names the flag.
+if out="$("${BIN[@]}" run "$ROOT/examples/tool-calling.yaml" --input '{}' 2>&1 >/dev/null)"; then
+    echo "FAIL: a tool loop with no transport ran"; exit 1
+fi
+grep -q -- '--mcp tickets=' <<<"$out" || {
+    echo "FAIL: the refusal does not name --mcp: $out"; exit 1; }
+if grep -q 'RuntimeBuilder' <<<"$out"; then
+    echo "FAIL: the refusal tells a YAML author to write Rust: $out"; exit 1
+fi
+echo "ok: refused, naming --mcp"
 
 echo "── a grant whose server nobody wired refuses the build ──"
 # The wiring is load-bearing, not decorative: naming the wrong server must fail
@@ -217,7 +237,7 @@ echo "── a connection string in a build without the backend names the featur
 # `cli` does not pull in `postgres`, so this smoke test runs the exact build a
 # reader meets the flag in. "No such file or directory" would send them to look
 # at their path for a mistake that is in their feature list.
-if out="$("${BIN[@]}" halts --store 'postgres://localhost/nope' 2>&1 >/dev/null)"; then
+if out="$("${BIN[@]}" halt list --store 'postgres://localhost/nope' 2>&1 >/dev/null)"; then
     echo "FAIL: a build without postgres opened a connection string"; exit 1
 fi
 grep -q 'postgres' <<<"$out" || {
@@ -292,6 +312,47 @@ echo "ok: the rebuilt store reports the same checkpoint"
     echo "FAIL: a restored store exported something that does not verify"; exit 1; }
 echo "ok: and what it exports verifies"
 
+echo "── policy check re-derives an export's verdicts, and says what it could not ──"
+# The slim build names the feature rather than letting the parser say the verb
+# does not exist.
+if out="$("${BIN[@]}" policy check --bundle "$jdir" --from "$jdir/history.jsonl" 2>&1 >/dev/null)"; then
+    echo "FAIL: a build without cedar checked policy"; exit 1
+fi
+grep -q 'cedar' <<<"$out" || {
+    echo "FAIL: the refusal does not name the missing feature: $out"; exit 1; }
+POLBIN=(cargo run -q --features cli,cedar --bin agentplane --)
+mkdir -p "$jdir/policy"
+printf 'permit(principal, action, resource);\n' >"$jdir/policy/policy.cedar"
+# `run` wires no engine, so no gate ran and there is no verdict to re-derive.
+# That is a partial answer, never a clean one.
+status=0
+"${POLBIN[@]}" policy check --bundle "$jdir/policy" --from "$jdir/history.jsonl" --json \
+    >"$jdir/policy.json" 2>"$jdir/policy.err" || status=$?
+[ "$status" = "5" ] || {
+    echo "FAIL: an export with nothing to re-derive exited $status, not 5:"
+    sed 's/^/    /' "$jdir/policy.err"; exit 1; }
+python3 - "$jdir/policy.json" <<'PY' || { echo "FAIL: the report does not say what it could not judge"; exit 1; }
+import json,sys
+r = json.load(open(sys.argv[1]))
+assert r["runs"] and all(run["mode"] == "ungoverned" for run in r["runs"]), r["runs"]
+assert r["tenant"]["source"] == "default", r["tenant"]
+assert "refused admission" in r["outside_export"], r["outside_export"]
+PY
+# A rules file the loader would not read is refused, not read around.
+printf 'forbid(principal, action, resource);\n' >"$jdir/policy/extra.cedar"
+status=0
+"${POLBIN[@]}" policy check --bundle "$jdir/policy" --from "$jdir/history.jsonl" \
+    >/dev/null 2>&1 || status=$?
+[ "$status" = "2" ] || {
+    echo "FAIL: a bundle with a stray rules file exited $status, not 2"; exit 1; }
+rm "$jdir/policy/extra.cedar"
+status=0
+"${POLBIN[@]}" policy check --bundle "$jdir/policy" --from "$jdir/policy/policy.cedar" \
+    >/dev/null 2>&1 || status=$?
+[ "$status" = "2" ] || {
+    echo "FAIL: a file that is not an export exited $status, not 2"; exit 1; }
+echo "ok: ungoverned history is partial, and a bundle or file it cannot read is refused"
+
 echo "── a flag belonging to another verb does not parse ──"
 # The defect the parser rewrite removed: one flag table for every verb meant
 # `run` silently accepted `--push-host`, `--url`, `--tokens` and friends and did
@@ -320,13 +381,13 @@ fi
 echo "ok: the audit verbs' evidence flags belong to the audit verbs"
 echo "ok: each verb takes only its own flags"
 
-echo "── --strict without --replay does not parse ──"
+echo "── --strict belongs to replay, not run ──"
 # It used to be accepted and ignored, so a reader asking for a *verification*
 # replay got an ordinary one and no hint of the difference.
 if "${BIN[@]}" run "$YAML" --input '{}' --strict >/dev/null 2>&1; then
-    echo "FAIL: --strict was accepted without --replay"; exit 1
+    echo "FAIL: \`run\` accepted --strict, which only \`replay\` performs"; exit 1
 fi
-echo "ok: --strict requires --replay"
+echo "ok: --strict is a replay flag"
 
 echo "── the two input flags are mutually exclusive ──"
 if "${BIN[@]}" run "$YAML" --input '{}' --input-file /dev/null >/dev/null 2>&1; then
@@ -352,7 +413,7 @@ echo "── every remedy verb names itself, and each refuses a nameless actor �
 # this holds the parser to them. An operator act a terminal records is
 # `asserted`, so the name beside it is the whole of its evidence — a verb that
 # took it as optional would write an act attributed to nobody.
-for verb in reconcile quarantine decide acknowledge cancel; do
+for verb in reconcile quarantine tasks decide acknowledge cancel; do
     "${BIN[@]}" "$verb" --help >/dev/null 2>&1 || {
         echo "FAIL: \`$verb\` is named in an \`attention\` remedy and does not exist"; exit 1; }
 done
@@ -373,6 +434,255 @@ if "${BIN[@]}" reconcile some-run --store "$jdir/j.redb" --actor a --note n \
     echo "FAIL: \`reconcile\` accepted a result for an effect that did not happen"; exit 1
 fi
 echo "ok: each refuses the argument it cannot honestly record"
+
+echo "── a manifest with oversight runs, waits for a person, and finishes ──"
+# `run` opens a case for every run, so a declared approval can open its task.
+# Without one, the first oversight step failed with "this run has no case" and
+# no manifest with `spec.oversight` could run from a terminal at all.
+odir="$(mktemp -d -t agentplane-oversight-XXXX)"
+APPROVAL="$ROOT/examples/approval.yaml"
+set +e
+"${BIN[@]}" run "$APPROVAL" --input '{"ticket":"T-1"}' --store "$odir/o.redb" \
+    >"$odir/run.out" 2>"$odir/run.err"
+code=$?
+set -e
+[ "$code" = "3" ] || {
+    echo "FAIL: a run waiting for a person exited $code, not 3:"; sed 's/^/    /' "$odir/run.err"; exit 1; }
+grep -q 'is waiting for a person to decide task_' "$odir/run.err" || {
+    echo "FAIL: a suspended run did not say what it waits for:"; sed 's/^/    /' "$odir/run.err"; exit 1; }
+grep -q 'agentplane decide task_' "$odir/run.err" || {
+    echo "FAIL: a suspended run did not print the command that answers it"; exit 1; }
+if grep -q 'Suspended(' "$odir/run.err"; then
+    echo "FAIL: a suspended run printed its Debug form"; exit 1
+fi
+run_id="$(grep -o 'run_[0-9A-Z]*' "$odir/run.err" | head -1)"
+task="$("${BIN[@]}" tasks --store "$odir/o.redb" | python3 -c 'import json,sys
+t = json.load(sys.stdin)["tasks"]
+assert len(t) == 1, t
+print(t[0]["task"])')"
+"${BIN[@]}" tasks --store "$odir/o.redb" --show "$task" | grep -q '"proposed_action"' || {
+    echo "FAIL: tasks --show did not show what is being approved"; exit 1; }
+"${BIN[@]}" decide "$task" approve --reason "checked" --actor ada --store "$odir/o.redb" \
+    >/dev/null 2>"$odir/decide.err" || {
+    echo "FAIL: deciding from a terminal failed:"; sed 's/^/    /' "$odir/decide.err"; exit 1; }
+[ "$("${BIN[@]}" tasks --store "$odir/o.redb" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tasks"]))')" = "0" ] || {
+    echo "FAIL: a decided task is still on the worklist"; exit 1; }
+out="$("${BIN[@]}" replay "$run_id" --manifest "$APPROVAL" --store "$odir/o.redb" 2>&1)" || {
+    echo "FAIL: the approved run did not finish: $out"; exit 1; }
+grep -q 'Succeeded' <<<"$out" || { echo "FAIL: the approved run did not succeed: $out"; exit 1; }
+rm -rf "$odir"
+echo "ok: suspended, listed, decided, resumed, succeeded"
+
+echo "── a strict replay of a waiting run verifies the wait ──"
+# A run that recorded a suspension and replays to the same suspension is the
+# record reproduced — `0`, not the `3` a resume that stops to wait exits.
+wdir="$(mktemp -d -t agentplane-wait-XXXX)"
+set +e
+"${BIN[@]}" run "$APPROVAL" --input '{"ticket":"T-2"}' --store "$wdir/w.redb" \
+    >/dev/null 2>"$wdir/run.err"
+set -e
+wait_run="$(grep -o 'run_[0-9A-Z]*' "$wdir/run.err" | head -1)"
+"${BIN[@]}" tasks --store "$wdir/w.redb" | grep -q '"escaped"' || {
+    echo "FAIL: the worklist does not say whether it escaped anything"; exit 1; }
+"${BIN[@]}" replay "$wait_run" --manifest "$APPROVAL" --strict --store "$wdir/w.redb" \
+    >/dev/null 2>"$wdir/replay.err" || {
+    echo "FAIL: a strict replay of a faithfully waiting run did not exit 0:"
+    sed 's/^/    /' "$wdir/replay.err"; exit 1; }
+grep -q 'verified' "$wdir/replay.err" || {
+    echo "FAIL: no verdict:"; sed 's/^/    /' "$wdir/replay.err"; exit 1; }
+rm -rf "$wdir"
+echo "ok: a reproduced wait is verified"
+
+echo "── a strict replay under an edited manifest names the edit, and calls nobody ──"
+rdir="$(mktemp -d -t agentplane-verify-XXXX)"
+"${BIN[@]}" run "$YAML" --input '{"ticket":"T-3"}' --store "$rdir/r.redb" \
+    >/dev/null 2>"$rdir/run.err"
+vrun="$(grep -o 'run_[0-9A-Z]*' "$rdir/run.err" | head -1)"
+sed 's/One sentence\./Two sentences./' "$YAML" >"$rdir/edited.yaml"
+# The same edit, now naming a real provider — with its credential unset, so a
+# strict path that built live drivers would refuse before replaying anything.
+sed 's/provider: fake/provider: anthropic/' "$rdir/edited.yaml" >"$rdir/anthropic.yaml"
+sed 's/support\.summarise/support.digest/' "$YAML" >"$rdir/renamed.yaml"
+cmp -s "$YAML" "$rdir/edited.yaml" && { echo "FAIL: the fixture edit changed nothing"; exit 1; }
+
+"${BIN[@]}" replay "$vrun" --manifest "$YAML" --strict --store "$rdir/r.redb" \
+    >/dev/null 2>"$rdir/same.err" || {
+    echo "FAIL: a strict replay under the recording manifest did not verify:"
+    sed 's/^/    /' "$rdir/same.err"; exit 1; }
+grep -q '(same digest)' "$rdir/same.err" || {
+    echo "FAIL: a verified replay did not name its revision:"; sed 's/^/    /' "$rdir/same.err"; exit 1; }
+
+set +e
+env -u ANTHROPIC_API_KEY "${BIN[@]}" replay "$vrun" --manifest "$rdir/anthropic.yaml" \
+    --strict --store "$rdir/r.redb" >/dev/null 2>"$rdir/edit.err"
+code=$?
+set -e
+[ "$code" = "1" ] || {
+    echo "FAIL: a diverging strict replay exited $code, not 1:"; sed 's/^/    /' "$rdir/edit.err"; exit 1; }
+grep -q 'first divergence: step s0' "$rdir/edit.err" && grep -q '(different digest)' "$rdir/edit.err" || {
+    echo "FAIL: the divergence named no step or no second digest:"; sed 's/^/    /' "$rdir/edit.err"; exit 1; }
+if grep -q 'ANTHROPIC_API_KEY' "$rdir/edit.err"; then
+    echo "FAIL: a strict replay asked for a provider credential"; exit 1
+fi
+
+set +e
+"${BIN[@]}" replay "$vrun" --manifest "$rdir/renamed.yaml" --strict --store "$rdir/r.redb" \
+    >/dev/null 2>"$rdir/gone.err"
+code=$?
+set -e
+[ "$code" = "5" ] && grep -q 'cannot replay: entry point removed' "$rdir/gone.err" || {
+    echo "FAIL: a replay the plane cannot make exited $code, or was not named:"
+    sed 's/^/    /' "$rdir/gone.err"; exit 1; }
+
+if "${BIN[@]}" replay "$vrun" --manifest "$YAML" --strict --store "$rdir/r.redb" \
+        --mcp tickets=true >/dev/null 2>&1; then
+    echo "FAIL: --strict accepted --mcp, which could only start a server"; exit 1
+fi
+
+edir="$(mktemp -d -t agentplane-corpus-XXXX)"
+"${BIN[@]}" export --store "$rdir/r.redb" >"$edir/runs.jsonl" 2>/dev/null
+set +e
+env -u ANTHROPIC_API_KEY "${BIN[@]}" replay --manifest "$rdir/anthropic.yaml" --strict \
+    --from "$edir/runs.jsonl" >/dev/null 2>"$rdir/export.err"
+code=$?
+set -e
+[ "$code" = "1" ] && grep -q "run $vrun — diverged" "$rdir/export.err" || {
+    echo "FAIL: a corpus replay from an export exited $code:"; sed 's/^/    /' "$rdir/export.err"; exit 1; }
+[ "$(ls "$edir")" = "runs.jsonl" ] || {
+    echo "FAIL: replaying an export wrote a store beside it: $(ls "$edir")"; exit 1; }
+rm -rf "$rdir" "$edir"
+echo "ok: verified 0, diverged 1 with both digests, cannot replay 5, from an export, no credential"
+
+echo "── init writes a manifest that validates ──"
+idir="$(mktemp -d -t agentplane-init-XXXX)"
+"${BIN[@]}" init "$idir/agent.yaml" >/dev/null 2>&1 || { echo "FAIL: init failed"; exit 1; }
+"${BIN[@]}" validate "$idir/agent.yaml" >/dev/null || {
+    echo "FAIL: the starter manifest does not validate"; exit 1; }
+grep -q 'yaml-language-server: \$schema=' "$idir/agent.yaml" || {
+    echo "FAIL: the starter carries no schema modeline"; exit 1; }
+grep -q 'budgets:' "$idir/agent.yaml" || { echo "FAIL: the starter states no budget"; exit 1; }
+"${BIN[@]}" init "$idir/tools.yaml" --tools --name desk >/dev/null 2>&1
+"${BIN[@]}" validate "$idir/tools.yaml" >/dev/null || {
+    echo "FAIL: the tool-calling starter does not validate"; exit 1; }
+if "${BIN[@]}" init "$idir/agent.yaml" >/dev/null 2>&1; then
+    echo "FAIL: init overwrote an existing file"; exit 1
+fi
+rm -rf "$idir"
+echo "ok: both starters validate, and neither overwrites a file"
+
+echo "── the listings are subcommands of the verbs they list ──"
+"${BIN[@]}" halt list --store "$jdir/j.redb" --json | grep -q '"halts"' || {
+    echo "FAIL: halt list --json did not list"; exit 1; }
+"${BIN[@]}" halt list --store "$jdir/j.redb" | grep -q 'no halts standing' || {
+    echo "FAIL: halt list did not answer in text"; exit 1; }
+"${BIN[@]}" hold list --store "$jdir/j.redb" | grep -q '"holds"' || {
+    echo "FAIL: hold list did not list"; exit 1; }
+"${BIN[@]}" retention plan --store "$jdir/j.redb" --older-than-days 30 | grep -q '"would_erase"' || {
+    echo "FAIL: retention plan did not say what a pass would erase"; exit 1; }
+if "${BIN[@]}" hold --store "$jdir/j.redb" >/dev/null 2>&1; then
+    echo "FAIL: hold with no --case did something"; exit 1
+fi
+echo "ok: halt list, hold list, retention plan"
+
+echo "── a peer is reached, on somebody's behalf ──"
+# A peer call needs a chain. Without --acting-as the call was refused inside the
+# run, reported to the model as a tool failure, and the run exited zero with the
+# peer never asked — so the flag is required, and a stub peer must see the call.
+PEERBIN=(cargo run -q --features cli,a2a,testkit --bin agentplane --)
+pdir="$(mktemp -d -t agentplane-peer-XXXX)"
+cat >"$pdir/desk.yaml" <<'YAML'
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: desk, version: "1.0.0" }
+spec:
+  execution: { kind: tool-calling, max_turns: 3 }
+  identity: { role: "Ask the reviewer to check an invoice", constraints: "One sentence." }
+  topology: { mode: collaborative, role: orchestrator, reason: distinct-authority }
+  security: { max_delegation_depth: 1, max_sensitivity_egress: internal }
+  model: { provider: fake, model: m-1 }
+  tools:
+    - ref: tool://reviewer/audit.check
+      mutates: false
+      max_sensitivity: internal
+      description: Ask the reviewer to check an invoice.
+      arguments:
+        type: object
+        additionalProperties: false
+        required: [invoice]
+        properties: { invoice: { type: string } }
+  budgets: { max_tokens: 1000 }
+YAML
+cat >"$pdir/peer.py" <<'PY'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class Peer(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with open(sys.argv[1], "a") as f:
+            f.write(json.dumps(body) + "\n")
+        raw = json.dumps({"jsonrpc": "2.0", "id": body.get("id"), "result": {"message": {
+            "role": "ROLE_AGENT", "messageId": "reply-1",
+            "parts": [{"data": {"verdict": "ok"}, "mediaType": "application/json"}]}}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+    def log_message(self, *_):
+        pass
+server = HTTPServer(("127.0.0.1", 0), Peer)
+print(server.server_address[1], flush=True)
+server.serve_forever()
+PY
+python3 "$pdir/peer.py" "$pdir/asked.log" >"$pdir/port" &
+peer_pid=$!
+for _ in $(seq 50); do [ -s "$pdir/port" ] && break; sleep 0.1; done
+port="$(cat "$pdir/port")"
+if "${PEERBIN[@]}" run "$pdir/desk.yaml" --input '{"invoice":"INV-9"}' \
+        --peer "reviewer=http://127.0.0.1:$port/" >/dev/null 2>&1; then
+    kill "$peer_pid"; echo "FAIL: --peer ran with no chain to call it under"; exit 1
+fi
+"${PEERBIN[@]}" run "$pdir/desk.yaml" --input '{"invoice":"INV-9"}' \
+    --peer "reviewer=http://127.0.0.1:$port/" --acting-as alice >/dev/null 2>"$pdir/run.err" || {
+    kill "$peer_pid"; echo "FAIL: the peer run failed:"; sed 's/^/    /' "$pdir/run.err"; exit 1; }
+kill "$peer_pid"
+grep -q '"SendMessage"' "$pdir/asked.log" 2>/dev/null || {
+    echo "FAIL: the run succeeded and the peer was never asked"; exit 1; }
+rm -rf "$pdir"
+echo "ok: refused without a chain; with one, the peer saw the request"
+
+echo "── one table of exit statuses ──"
+# A scheduler reads the status and nothing else: a finding, a refused command,
+# an outage and a partial answer each have their own number, and `--help` says
+# which is which.
+status() { set +e; "$@" >/dev/null 2>&1; echo $?; set -e; }
+"${BIN[@]}" --help | grep -q '5  partial' || { echo "FAIL: --help prints no exit table"; exit 1; }
+"${BIN[@]}" --version | grep -q '^features: .*cli' || {
+    echo "FAIL: --version does not name the compiled features"; exit 1; }
+[ "$(status "${BIN[@]}" validate "$YAML" --require-annotation example.com/nobody)" = "1" ] || {
+    echo "FAIL: a missing annotation is not a finding (1)"; exit 1; }
+[ "$(status "${BIN[@]}" quarantine some-run --store "$jdir/j.redb" --actor a --reason x --decision sideways)" = "2" ] || {
+    echo "FAIL: a refused argument is not a usage error (2)"; exit 1; }
+[ "$(status "${BIN[@]}" halt --lift --store "$jdir/j.redb")" = "1" ] || {
+    echo "FAIL: a lift that found nothing standing exited as a success"; exit 1; }
+[ "$(status "${BIN[@]}" export --store /nonexistent/agentplane/j.redb)" = "4" ] || {
+    echo "FAIL: a store that cannot be opened is not an operational error (4)"; exit 1; }
+set +e
+"${BIN[@]}" export --store "$jdir/j.redb" --limit 0 >"$jdir/partial.jsonl" 2>/dev/null
+code=$?
+set -e
+[ "$code" = "5" ] || { echo "FAIL: a truncated export exited $code, not 5"; exit 1; }
+[ ! -s "$jdir/partial.jsonl" ] || { echo "FAIL: a refused partial export wrote a file"; exit 1; }
+[ "$(status "${BIN[@]}" export --store "$jdir/j.redb" --limit 0 --allow-partial)" = "5" ] || {
+    echo "FAIL: an allowed partial export does not say it is partial"; exit 1; }
+set +e
+"${BIN[@]}" audit --store "$jdir/j.redb" --limit 0 >"$jdir/partial.json" 2>/dev/null
+code=$?
+set -e
+[ "$code" = "5" ] || { echo "FAIL: an audit over a truncated list exited $code, not 5"; exit 1; }
+python3 -c 'import json,sys; t = json.load(open(sys.argv[1]))["truncated"]; assert t["reached"], t' \
+    "$jdir/partial.json" || { echo "FAIL: the audit report does not say it was truncated"; exit 1; }
+echo "ok: finding 1, usage 2, operational 4, partial 5 — and a partial export is refused"
 
 echo
 echo "the CLI runs an agent that is only a file"

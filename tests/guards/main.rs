@@ -28,6 +28,7 @@ mod outbox;
 mod postgres;
 mod push;
 mod quota;
+mod rate;
 #[cfg(feature = "manifest")]
 mod schema;
 mod store_contracts;

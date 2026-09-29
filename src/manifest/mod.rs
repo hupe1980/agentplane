@@ -260,6 +260,14 @@ pub struct Spec {
     /// silence that costs money, not the silence that costs nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub models: Option<Models>,
+    /// Shorthand for `models: { privileged: … }`, the single-model case.
+    ///
+    /// Resolved into [`models`](Self::models) before anything reads the
+    /// document, so the digest is over the longhand: the two spellings of one
+    /// declaration have one identity. Refused beside `models`, which would be
+    /// two answers to one question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<ModelRef>,
     /// The shape of what this agent takes.
     ///
     /// Optional, because a caller writing Rust against a skill it also wrote
@@ -623,7 +631,7 @@ pub enum Approval {
     Required,
     /// Only the tool calls that ask for it wait; the answer returns unattended.
     ///
-    /// The shape most deployments actually want, and the one that was missing.
+    /// The shape most deployments actually want.
     /// Gating the *answer* of a tool-calling agent is a review that arrives
     /// after the agent has already moved the money — the tool ran several turns
     /// ago, and a reviewer refusing now is refusing a summary of something that
@@ -927,9 +935,64 @@ pub struct ModelRef {
     /// A per-call output ceiling, if this role needs one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// A per-call input ceiling: the most tokens one call may send, cached
+    /// ones included.
+    ///
+    /// Output is bounded before the call, because `max_tokens` is sent to the
+    /// provider; input is not — it grows with the conversation — so this is
+    /// checked against what the provider reports, and a call that sent more
+    /// fails. With `max_tokens` and `pricing` it states what one call can
+    /// cost, which is what a tenant's spend quota reserves beside the run's
+    /// ceiling: under a quota a role without it leaves that figure unbounded
+    /// and the run is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<u32>,
     /// Explicit reasoning depth. Omitted uses the selected model's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<crate::model::ReasoningEffort>,
+    /// What this model's tokens cost, in minor units per million tokens.
+    ///
+    /// Required on every declared role when `budgets.max_minor_units` is set:
+    /// an unpriced call reports no money, and a money ceiling beside one is a
+    /// control that never binds. There is no built-in price table — rates
+    /// change, and the deployment is the party that knows its contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<crate::model::Pricing>,
+}
+
+impl ModelRef {
+    /// The most one call through this role can report, when the declaration
+    /// bounds it: `max_input_tokens` plus the output ceiling in tokens, and
+    /// those tokens at the declared price in money.
+    ///
+    /// The output ceiling is `max_tokens`, or the default every call is sent
+    /// with when the role names none — either way the figure the provider is
+    /// told. Input is priced at the dearest of the input, cache-read and
+    /// cache-write rates, because which of them a call's input lands in is the
+    /// provider's decision, not the declaration's. An unpriced role reports no
+    /// money, so its money figure is zero.
+    ///
+    /// `None` when `max_input_tokens` is absent: input grows with the
+    /// conversation, and nothing else bounds it.
+    #[must_use]
+    pub fn call_bound(&self) -> Option<crate::core::Spend> {
+        let input = u64::from(self.max_input_tokens?);
+        let output = u64::from(
+            self.max_tokens
+                .unwrap_or(crate::model::ModelCall::DEFAULT_MAX_OUTPUT_TOKENS),
+        );
+        let minor_units = self.pricing.map_or(0, |p| {
+            let rate = p.input.max(p.cache_read).max(p.cache_write);
+            let micro = u128::from(input)
+                .saturating_mul(u128::from(rate))
+                .saturating_add(u128::from(output).saturating_mul(u128::from(p.output)));
+            u64::try_from(micro.div_ceil(1_000_000)).unwrap_or(u64::MAX)
+        });
+        Some(crate::core::Spend {
+            tokens: input.saturating_add(output),
+            minor_units,
+        })
+    }
 }
 
 /// A declared [`ModelRef`] in the model layer's vocabulary.
@@ -937,7 +1000,9 @@ fn role(r: &ModelRef) -> crate::model::ModelRole {
     crate::model::ModelRole {
         model: crate::model::ModelId::new(&r.provider, &r.model),
         max_output_tokens: r.max_tokens,
+        max_input_tokens: r.max_input_tokens,
         reasoning_effort: r.reasoning_effort,
+        pricing: r.pricing,
     }
 }
 
@@ -1084,7 +1149,8 @@ pub struct Budgets {
     ///
     /// Gates **every** effect, exactly like [`max_tokens`](Self::max_tokens),
     /// and `0` is refused for the same reason: a free tool call still has to
-    /// pass the ceiling.
+    /// pass the ceiling. Refused beside a declared model role with no
+    /// [`pricing`](ModelRef::pricing): that role's calls report no money.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_minor_units: Option<u64>,
     /// How many times the run may change its plan.
@@ -1121,9 +1187,9 @@ pub struct Budgets {
     /// and every other ceiling here bounds work rather than disclosure — an
     /// extraction sized just under an effect count passes all of them.
     ///
-    /// Counted as the canonical size of each effect's outbound value: a tool
-    /// call's arguments, a model call's prompt, a peer call's payload. Reads
-    /// cost nothing.
+    /// Counted as the canonical size of what each effect sends: a tool call's
+    /// arguments, a peer call's payload, a model call's whole request — tool
+    /// results, declarations and granted media included. Reads cost nothing.
     ///
     /// `0` is meaningful and accepted, like the two ceilings above: it says
     /// this agent may read and may not send.
@@ -1175,7 +1241,8 @@ pub struct ToolGrant {
     /// picks, with no version and nothing connecting it to the runs whose
     /// behaviour changed.
     ///
-    /// Only a `tool-calling` agent uses it; a skill knows what it is calling.
+    /// A `tool-calling` or `planned` agent requires it; a skill knows what it is
+    /// calling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// Whether a person approves each call, before it happens.
@@ -1239,6 +1306,47 @@ pub struct ToolGrant {
     /// [`protected_fields`](Self::protected_fields).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arguments: Option<serde_json::Value>,
+    /// At most `count` calls to this tool in any `window_seconds`, across every
+    /// run of the tenant.
+    ///
+    /// ```yaml
+    /// - ref: "tool://payments/refund"
+    ///   rate_limit: { count: 20, window_seconds: 3600 }   # twenty an hour
+    /// ```
+    ///
+    /// Counted per tenant per tool reference in the quota store, so instances
+    /// sharing a store share the count, and every ceiling the plane's
+    /// declarations state for one tool binds every agent calling it. The
+    /// window slides. A call past the ceiling is refused before it is announced
+    /// and the run stops `exhausted`, like a budget: resume it once the window
+    /// has room. A retry of one call spends once; an undo is counted and never
+    /// refused.
+    ///
+    /// Refused at parse: a zero count, a zero window or one longer than the
+    /// calendar, and a ceiling on an agent grant, which dispatches through
+    /// `commission` where no rate is counted. Refused at build: a plane with no
+    /// quota store to count in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
+}
+
+/// A cross-run ceiling on one tool: see [`ToolGrant::rate_limit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimit {
+    /// Calls admitted per window. At least one.
+    pub count: u32,
+    /// The window, in seconds. At least one.
+    pub window_seconds: u64,
+}
+
+impl From<RateLimit> for crate::quota::RateCeiling {
+    fn from(r: RateLimit) -> Self {
+        Self {
+            count: r.count,
+            window_seconds: r.window_seconds,
+        }
+    }
 }
 
 const fn yes() -> bool {
@@ -1524,7 +1632,26 @@ impl Manifest {
         Ok(out)
     }
 
+    /// Bring the document to its canonical form: the one the digest covers.
+    ///
+    /// Two defaults are resolved here rather than left implicit, so that a file
+    /// using them and one spelling them out are one declaration with one
+    /// digest: `model:` becomes `models.privileged`, and a declarative agent
+    /// that names no capability provides its own `metadata.name` — the rule a
+    /// skill that declares nothing already follows. Idempotent, because
+    /// [`digest`](Self::digest) runs it again on a copy.
     fn normalize(&mut self) {
+        if self.spec.models.is_none()
+            && let Some(model) = self.spec.model.take()
+        {
+            self.spec.models = Some(Models {
+                privileged: Some(model),
+                quarantined: None,
+            });
+        }
+        if self.spec.execution.is_some() && self.spec.capabilities.provides.is_empty() {
+            self.spec.capabilities.provides = vec![self.metadata.name.clone()];
+        }
         for grant in &mut self.spec.tools {
             grant
                 .protected_fields
@@ -1584,6 +1711,7 @@ impl Manifest {
         self.validate_tool_approval()?;
         self.validate_tool_previews()?;
         self.validate_tool_grants()?;
+        self.validate_rate_limits()?;
         self.validate_mutating_grants_can_fire()?;
         self.validate_agent_grants()?;
         self.validate_context_grants()?;
@@ -1629,7 +1757,46 @@ impl Manifest {
         if self.spec.budgets.is_none() {
             return Err(ManifestError::Unbounded);
         }
-        self.validate_budgets()
+        self.validate_budgets()?;
+        self.validate_money_ceiling()
+    }
+
+    /// A money ceiling needs every declared model priced.
+    ///
+    /// A model call reports money only from the price its role states, so an
+    /// unpriced role spends tokens and zero minor units — and a
+    /// `max_minor_units` beside it is a ceiling the agent's largest cost never
+    /// reaches. Refused rather than accepted with a warning: the reviewer who
+    /// approved the ceiling believes it binds.
+    fn validate_money_ceiling(&self) -> Result<(), ManifestError> {
+        if self
+            .spec
+            .budgets
+            .as_ref()
+            .and_then(|b| b.max_minor_units)
+            .is_none()
+        {
+            return Ok(());
+        }
+        let Some(models) = self.spec.models.as_ref() else {
+            return Ok(());
+        };
+        for (field, declared) in [
+            ("spec.models.privileged.pricing", &models.privileged),
+            ("spec.models.quarantined.pricing", &models.quarantined),
+        ] {
+            if declared.as_ref().is_some_and(|r| r.pricing.is_none()) {
+                return Err(ManifestError::Unenforceable {
+                    field,
+                    detail: "spec.budgets.max_minor_units is declared and this model \
+                             role states no price, so its calls report no money and the \
+                             ceiling never binds on them — declare the role's pricing \
+                             (minor units per million input, output, cache-read and \
+                             cache-write tokens), or remove the money ceiling",
+                });
+            }
+        }
+        Ok(())
     }
 
     /// A ceiling of zero is refused, because it does not do what the person who
@@ -1669,10 +1836,12 @@ impl Manifest {
              of any kind: a read-only tool call, a local lookup, an agent that declares \
              no models at all. Such an agent does not run once and stop, it fails \
              identically on every run it will ever make. Omit the field to mean 'no \
-             limit'. To stop a tenant doing work, use the operator's emergency stop \
-             (`QuotaStore::set_halt`), which refuses new runs with a reason attached — \
+             limit'. To stop an agent doing work, throw the operator's emergency stop \
+             — `agentplane halt --scope agent:{name}` from a terminal, \
+             `QuotaStore::set_halt` in Rust — which refuses new runs with a reason attached — \
              a halt says somebody is dealing with an incident, where a ceiling only \
-             says not right now"
+             says not right now",
+            name = self.metadata.name
         )))
     }
 
@@ -1784,6 +1953,34 @@ impl Manifest {
     ///
     /// Only for `tool-calling`. A skill knows what it is calling, so requiring
     /// prose there would be the decoration this format refuses.
+    /// A rate ceiling that admits nothing, or whose window has no end, is
+    /// refused where somebody is still holding the file.
+    fn validate_rate_limits(&self) -> Result<(), ManifestError> {
+        for grant in &self.spec.tools {
+            let Some(rate) = grant.rate_limit else {
+                continue;
+            };
+            if rate.count == 0 {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{}' declares a rate_limit of zero calls, which admits \
+                     nothing — remove the grant to forbid the tool",
+                    grant.reference
+                )));
+            }
+            if rate.window_seconds == 0 || rate.window_seconds > crate::core::MAX_WINDOW_SECONDS {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{}' declares a rate_limit window of {} seconds; a window \
+                     is at least one second and at most the {} seconds between the first \
+                     and last instant this runtime can name",
+                    grant.reference,
+                    rate.window_seconds,
+                    crate::core::MAX_WINDOW_SECONDS
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_tool_grants(&self) -> Result<(), ManifestError> {
         let Some(execution) = &self.spec.execution else {
             return Ok(());
@@ -1971,6 +2168,14 @@ impl Manifest {
                     detail: "an agent consultation dispatches through `commission`, not \
                              through the sink-binding gate — a protected-field rule here \
                              would be reviewed and never checked",
+                });
+            }
+            if grant.rate_limit.is_some() {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.tools[].rate_limit",
+                    detail: "an agent consultation dispatches through `commission`, not \
+                             through the dispatch gate that counts a rate ceiling — a \
+                             ceiling here would be reviewed and never counted",
                 });
             }
             if grant.max_sensitivity.is_some() {
@@ -2342,6 +2547,14 @@ impl Manifest {
 
     /// Model roles, and the one combination that removes a control.
     fn validate_models(&self) -> Result<(), ManifestError> {
+        // `normalize` folds `model` into `models` unless both were written.
+        if self.spec.model.is_some() {
+            return Err(ManifestError::Syntax(
+                "spec.model and spec.models are two answers to one question: `model` is \
+                 shorthand for `models: { privileged: … }`, so write one or the other"
+                    .to_owned(),
+            ));
+        }
         // A declarative agent's whole behaviour is a model call, and the model
         // is named rather than defaulted — the runtime will not fall back to
         // some other registered driver, because that would run the agent on a
@@ -2355,20 +2568,6 @@ impl Manifest {
         // and the builder is the backstop for that. What this adds is the
         // refusal arriving from `agentplane validate`, before a deploy, rather
         // than from whichever process first tried to assemble a plane.
-        // A declarative agent's capabilities are what the runtime registers its
-        // driver under, so an empty `provides` is a declaration the runtime
-        // reads as "register nothing": the model, the tools and the prompt are
-        // all named, and no run can ever reach them.
-        if self.spec.execution.is_some() && self.spec.capabilities.provides.is_empty() {
-            return Err(ManifestError::Unenforceable {
-                field: "spec.capabilities.provides",
-                detail: "this agent's behaviour is declared but it advertises no capability, \
-                         and a declarative agent's driver is registered once per capability \
-                         it provides — so nothing would be registered and no run could ever \
-                         reach the model, tools and prompt named here. Name what this agent \
-                         answers",
-            });
-        }
         if self.spec.execution.is_some()
             && self
                 .spec
@@ -2400,6 +2599,28 @@ impl Manifest {
                 && (m.provider.trim().is_empty() || m.model.trim().is_empty())
             {
                 return Err(ManifestError::Empty(field));
+            }
+        }
+
+        // Zero input admits no call at all — every prompt carries at least
+        // one token — so the role could never answer. Refused for the reason
+        // a zero budget ceiling is: it is a wiring mistake, not a limit.
+        for (field, m) in [
+            (
+                "spec.models.privileged.max_input_tokens",
+                &models.privileged,
+            ),
+            (
+                "spec.models.quarantined.max_input_tokens",
+                &models.quarantined,
+            ),
+        ] {
+            if m.as_ref().and_then(|m| m.max_input_tokens) == Some(0) {
+                return Err(ManifestError::Unenforceable {
+                    field,
+                    detail: "a per-call input ceiling of zero fails every call the role \
+                             makes, since no prompt is empty — raise it, or remove it",
+                });
             }
         }
 
@@ -2947,7 +3168,35 @@ impl Manifest {
             max_denials: b.max_denials,
             max_parallel_steps: b.max_parallel_steps,
             max_egress_bytes: b.max_egress_bytes,
+            max_call_tokens: self.call_bound().map(|c| c.tokens),
+            max_call_minor_units: self.call_bound().map(|c| c.minor_units),
         }
+    }
+
+    /// The most one operation of this agent's runs can report: the dearest
+    /// declared model role's [`ModelRef::call_bound`].
+    ///
+    /// `None` when any declared role leaves its call unbounded, or when no
+    /// role is declared — then nothing in the declaration says what one
+    /// operation can cost. A commission is not an operation of this run for
+    /// this purpose: the commissioned run holds and settles its own.
+    #[must_use]
+    pub fn call_bound(&self) -> Option<crate::core::Spend> {
+        let models = self.spec.models.as_ref()?;
+        let roles: Vec<&ModelRef> = [&models.privileged, &models.quarantined]
+            .into_iter()
+            .flatten()
+            .collect();
+        if roles.is_empty() {
+            return None;
+        }
+        roles.iter().try_fold(crate::core::Spend::ZERO, |most, r| {
+            let one = r.call_bound()?;
+            Some(crate::core::Spend {
+                tokens: most.tokens.max(one.tokens),
+                minor_units: most.minor_units.max(one.minor_units),
+            })
+        })
     }
 }
 

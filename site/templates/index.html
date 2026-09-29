@@ -87,8 +87,8 @@
       <h3>Authority that only narrows</h3>
       <p>Delegation is audience-, time- and depth-bounded, bound at admission
         and read back on replay. A peer's run executes under <em>its own</em>
-        chain, never the plane's, and no downstream card or tool annotation can
-        widen what it holds.</p>
+        chain, never the plane's authority, and no downstream card or tool
+        annotation can widen what it holds.</p>
     </article>
     <article>
       <h3>Evidence that is also the recovery mechanism</h3>
@@ -139,13 +139,12 @@
   <dl class="stats">
     <div><dt>8</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
     <div><dt>30</dt><dd>deliberately broken specs; each must trip its own invariant</dd></div>
-    <div><dt>802</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>1032</dt><dd>code mutations, each naming the one test that must fail</dd></div>
     <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
   </dl>
   <p class="fine">
-    This project shipped an unfalsifiable guarantee once: a refusal that was
-    implemented, tested and green, where deleting it would have failed no test.
-    It was found by accident. The sweep exists so the next one is not —
+    A guarantee can be implemented, tested and green while deleting it fails
+    no test. Only removing it shows that, so the sweep removes each one —
     <a href="{{ get_url(path='@/docs/assurance.md') }}">how this is proven</a>
     is the long answer.
   </p>

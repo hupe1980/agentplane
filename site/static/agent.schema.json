@@ -573,6 +573,15 @@
       "additionalProperties": false,
       "description": "One model, named the way a provider names it.",
       "properties": {
+        "max_input_tokens": {
+          "description": "A per-call input ceiling: the most tokens one call may send, cached ones included.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "max_tokens": {
           "description": "A per-call output ceiling, if this role needs one.",
           "format": "uint32",
@@ -585,6 +594,17 @@
         "model": {
           "description": "The provider's own model identifier, pinned exactly.",
           "type": "string"
+        },
+        "pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Pricing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this model's tokens cost, in minor units per million tokens."
         },
         "provider": {
           "description": "The driver: `anthropic`, `openai`, or whatever an embedder registered.",
@@ -736,6 +756,43 @@
       ],
       "type": "object"
     },
+    "Pricing": {
+      "additionalProperties": false,
+      "description": "What a model's tokens cost, as the deployment states it.",
+      "properties": {
+        "cache_read": {
+          "description": "Input tokens served from a cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_write": {
+          "description": "Input tokens written into a cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "input": {
+          "description": "Ordinary input tokens — neither written to nor read from a cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "description": "Generated tokens, reasoning included.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input",
+        "output",
+        "cache_read",
+        "cache_write"
+      ],
+      "type": "object"
+    },
     "ProtectedField": {
       "additionalProperties": false,
       "description": "A stricter information-flow rule for one JSON field sent to a sink.",
@@ -772,6 +829,29 @@
       },
       "required": [
         "path"
+      ],
+      "type": "object"
+    },
+    "RateLimit": {
+      "additionalProperties": false,
+      "description": "A cross-run ceiling on one tool: see `ToolGrant::rate_limit`.",
+      "properties": {
+        "count": {
+          "description": "Calls admitted per window. At least one.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "window_seconds": {
+          "description": "The window, in seconds. At least one.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count",
+        "window_seconds"
       ],
       "type": "object"
     },
@@ -933,6 +1013,17 @@
           ],
           "description": "What this agent reads from and writes to durable memory."
         },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Shorthand for `models: { privileged: … }`, the single-model case."
+        },
         "models": {
           "anyOf": [
             {
@@ -1039,6 +1130,17 @@
             "$ref": "#/definitions/ProtectedField"
           },
           "type": "array"
+        },
+        "rate_limit": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RateLimit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "At most `count` calls to this tool in any `window_seconds`, across every run of the tenant."
         },
         "ref": {
           "description": "Which tool, as `tool://server/name`.",

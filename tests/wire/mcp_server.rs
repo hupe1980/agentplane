@@ -85,9 +85,34 @@ impl Skill for Auditor {
     }
 }
 
+/// Permits everything: a served plane must be governed, and these tests are
+/// about the wire rather than the rules.
+#[derive(Debug)]
+struct Permit;
+
+impl agentplane::core::PolicyEngine for Permit {
+    fn authorize(
+        &self,
+        _request: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"mcp-permit"),
+            "agentplane-test/mcp-permit",
+        )
+    }
+}
+
 fn plane() -> Arc<Runtime> {
     let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn JournalStore>;
-    Runtime::builder(store).owner("mcp").skill(Auditor).build()
+    Runtime::builder(store)
+        .owner("mcp")
+        .policy(Arc::new(Permit))
+        .skill(Auditor)
+        .build()
 }
 
 /// A client that asks for the revision this plane implements.
@@ -248,6 +273,212 @@ async fn a_tool_call_runs_the_agent_and_returns_its_answer() {
     client.cancel().await.expect("shutdown");
 }
 
+/// **A plane with no policy engine is not served.**
+///
+/// A catalogue any connecting host may call, admitting runs under no rule at
+/// all, is a plane somebody believes is governed. Refused at build, as the
+/// operator API and the A2A server refuse it.
+#[test]
+fn a_plane_without_a_policy_engine_is_not_served() {
+    let manifest = Manifest::parse(AGENT).expect("a valid manifest");
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn JournalStore>;
+    let ungoverned = Runtime::builder(store).owner("mcp").skill(Auditor).build();
+    assert_eq!(
+        McpServer::new(ungoverned, &[manifest]).err(),
+        Some(ServeError::NoPolicy),
+        "an ungoverned plane was offered as a tool catalogue"
+    );
+}
+
+/// **A host's retry of one call is one run.**
+///
+/// The protocol has no idempotency key and a request id is unique only within
+/// a session, so a host that resends a call after losing the response would
+/// otherwise run the agent twice — twice the effects, twice the spend. A host
+/// that names the call in `_meta` gets the run it already admitted back.
+#[tokio::test]
+async fn a_retried_call_with_the_same_key_is_one_run() {
+    let manifest = Manifest::parse(AGENT).expect("a valid manifest");
+    let plane = plane();
+    let server = McpServer::new(Arc::clone(&plane), &[manifest]).expect("served");
+    let client = connect(server).await;
+
+    let call = || {
+        let mut meta = rmcp::model::MetaObject::new();
+        meta.insert(
+            agentplane::tools::serve::IDEMPOTENCY_META_KEY.to_owned(),
+            json!("host-call-7"),
+        );
+        let mut request = CallToolRequestParams::new("audit.anomaly-detection").with_arguments(
+            json!({ "ledger": "GL-2026" })
+                .as_object()
+                .cloned()
+                .expect("object"),
+        );
+        request.meta = Some(rmcp::model::RequestMetaObject(meta));
+        request
+    };
+    let first = client.call_tool(call()).await.expect("first call");
+    let second = client.call_tool(call()).await.expect("retried call");
+    assert_eq!(first.structured_content, second.structured_content);
+    let runs = plane.journal().recent_runs(None, 10).await.expect("index");
+    assert_eq!(
+        runs.len(),
+        1,
+        "a retried call admitted a second run: {runs:?}"
+    );
+
+    client.cancel().await.expect("shutdown");
+}
+
+/// **Two sessions are two callers, whatever their request ids and keys.**
+///
+/// A server is cloned once per session by an HTTP transport. A request id is
+/// unique only within its session, and a host's key is the host's own: two
+/// sessions sending the same id — or the same key — are two calls, and the
+/// second must not be handed the first one's run.
+#[tokio::test]
+async fn two_sessions_with_the_same_request_id_and_key_are_two_runs() {
+    let manifest = Manifest::parse(AGENT).expect("a valid manifest");
+    let plane = plane();
+    let server = McpServer::new(Arc::clone(&plane), &[manifest]).expect("served");
+    let call = |key: Option<&str>| {
+        let mut request = CallToolRequestParams::new("audit.anomaly-detection").with_arguments(
+            json!({ "ledger": "GL-2026" })
+                .as_object()
+                .cloned()
+                .expect("object"),
+        );
+        if let Some(key) = key {
+            let mut meta = rmcp::model::MetaObject::new();
+            meta.insert(
+                agentplane::tools::serve::IDEMPOTENCY_META_KEY.to_owned(),
+                json!(key),
+            );
+            request.meta = Some(rmcp::model::RequestMetaObject(meta));
+        }
+        request
+    };
+
+    for key in [None, Some("host-call-7")] {
+        let before = plane
+            .journal()
+            .recent_runs(None, 10)
+            .await
+            .expect("index")
+            .len();
+        let a = connect(server.clone()).await;
+        let b = connect(server.clone()).await;
+        // Each session's first call carries the same request id.
+        a.call_tool(call(key)).await.expect("session a");
+        b.call_tool(call(key)).await.expect("session b");
+        let runs = plane.journal().recent_runs(None, 10).await.expect("index");
+        assert_eq!(
+            runs.len() - before,
+            2,
+            "a second session was handed the first one's run (key {key:?}): {runs:?}"
+        );
+        a.cancel().await.expect("shutdown");
+        b.cancel().await.expect("shutdown");
+    }
+}
+
+/// **A task id is not a handle on whatever the plane is running.**
+///
+/// `tasks/get` and `tasks/cancel` act on runs this surface admitted. A run the
+/// embedder started, or a peer's A2A task, is not an MCP host's to read or
+/// stop, and answers as a task that does not exist.
+#[tokio::test]
+async fn a_run_this_surface_did_not_admit_is_no_task_of_its_own() {
+    use rmcp::model::{CancelTaskParams, GetTaskParams};
+
+    let manifest = Manifest::parse(AGENT).expect("a valid manifest");
+    let plane = waiting_plane();
+    let server = McpServer::new(Arc::clone(&plane), &[manifest]).expect("served");
+    let client = connect(server).await;
+
+    let embedded = plane
+        .spawn(
+            "audit.anomaly-detection",
+            Tainted::trusted(json!({ "ledger": "internal" })),
+        )
+        .await
+        .expect("an in-process run");
+    let task_id = embedded.to_string();
+
+    let read = client
+        .peer()
+        .get_task(GetTaskParams::new(task_id.clone()))
+        .await;
+    assert!(
+        read.is_err(),
+        "tasks/get read a run the host never started: {read:?}"
+    );
+    let cancelled = client
+        .peer()
+        .cancel_task(CancelTaskParams::new(task_id.clone()))
+        .await;
+    assert!(
+        cancelled.is_err(),
+        "tasks/cancel reached a run the host never started"
+    );
+    assert!(
+        plane
+            .cancellation(embedded)
+            .await
+            .expect("read the cancellation")
+            .is_none(),
+        "a host stopped the embedder's run"
+    );
+
+    client.cancel().await.expect("shutdown");
+}
+
+/// **A completed task hands back the call's result.**
+///
+/// The Tasks extension's completed payload is the original request's result.
+/// An empty object in its place is a host that suspended for an answer and
+/// was handed nothing when it came.
+#[tokio::test]
+async fn a_completed_task_returns_the_calls_result() {
+    use rmcp::model::{GetTaskParams, TaskPayload};
+
+    let manifest = Manifest::parse(AGENT).expect("a valid manifest");
+    let plane = plane();
+    let server = McpServer::new(Arc::clone(&plane), &[manifest]).expect("served");
+    let client = connect(server).await;
+    client
+        .call_tool(
+            CallToolRequestParams::new("audit.anomaly-detection").with_arguments(
+                json!({ "ledger": "GL-2026" })
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            ),
+        )
+        .await
+        .expect("tools/call");
+    let task_id = plane.journal().recent_runs(None, 1).await.expect("index")[0]
+        .0
+        .to_string();
+
+    let detailed = client
+        .peer()
+        .get_task(GetTaskParams::new(task_id))
+        .await
+        .expect("tasks/get");
+    let TaskPayload::Completed { result } = &detailed.task.payload else {
+        panic!("a finished call did not read as completed: {detailed:?}");
+    };
+    assert_eq!(
+        result.get("structuredContent"),
+        Some(&json!({ "audited": "GL-2026" })),
+        "the completed task lost the call's answer: {result:?}"
+    );
+
+    client.cancel().await.expect("shutdown");
+}
+
 /// An unknown capability is a protocol error rather than a run that fails.
 #[tokio::test]
 async fn a_call_to_an_unoffered_capability_is_refused_before_admission() {
@@ -371,6 +602,7 @@ fn waiting_plane() -> Arc<Runtime> {
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .owner("mcp")
+        .policy(Arc::new(Permit))
         .timers(store as Arc<dyn agentplane::case::TimerStore>)
         .skill(Waits)
         .build()
@@ -451,6 +683,20 @@ async fn a_suspended_run_is_a_task_that_reads_from_the_journal() {
             .is_some(),
         "cancelling the task recorded nothing in the journal, so a restart would \
          not honour it"
+    );
+
+    // And a cancelled run reads as cancelled — a status the protocol has — not
+    // as a failure the host would report as the agent breaking.
+    let detailed = client
+        .peer()
+        .get_task(GetTaskParams::new(task_id.clone()))
+        .await
+        .expect("tasks/get after cancel");
+    assert_eq!(
+        detailed.task.status(),
+        TaskStatus::Cancelled,
+        "a cancelled run read as {:?}",
+        detailed.task.status()
     );
 
     client.cancel().await.expect("shutdown");

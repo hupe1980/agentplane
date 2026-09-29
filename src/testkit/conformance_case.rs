@@ -61,6 +61,8 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     a_breached_obligation_is_listable_and_survives_closure(store, r).await;
     an_acknowledged_breach_leaves_the_listing(store, r).await;
     a_breach_cannot_be_transitioned_away(store, r).await;
+    a_breach_applies_only_to_what_is_still_owed(store, r).await;
+    an_applied_breach_is_owed_its_account_until_noted(store, r).await;
     an_obligation_cannot_be_registered_on_a_closed_case(store, r).await;
     a_reopened_case_correlates_again(store, r).await;
     a_cases_blob_list_holds_only_its_own(store, r).await;
@@ -326,7 +328,10 @@ async fn an_acknowledged_breach_leaves_the_listing(store: &Arc<dyn CaseStore>, r
     // An account before the breach would take an obligation off the listing
     // while it was still going to be missed.
     let note = crate::core::BreachNote {
-        by: "compliance@example.test".to_owned(),
+        // Asserted, so the battery proves the basis survives the store rather
+        // than defaulting to the one a reader might assume.
+        by: crate::core::Operator::asserted("compliance@example.test")
+            .expect("a well-formed actor"),
         note: "filed under Q3 exceptions".to_owned(),
         at: ts(9_500),
     };
@@ -441,7 +446,8 @@ async fn the_first_account_stands(
     r: &mut Report,
 ) {
     let later = crate::core::BreachNote {
-        by: "someone-else@example.test".to_owned(),
+        by: crate::core::Operator::authenticated("someone-else@example.test")
+            .expect("a well-formed actor"),
         note: "second".to_owned(),
         at: ts(9_900),
     };
@@ -555,6 +561,168 @@ async fn a_breach_cannot_be_transitioned_away(store: &Arc<dyn CaseStore>, r: &mu
                 ),
             ),
         }
+    }
+}
+
+/// **An applied breach is owed its account until the sweep notes it.**
+///
+/// The sweep breaches first and writes its notes after, so the mark that a
+/// breach still owes its account is what a crash between the two leaves for
+/// the next tick: written by the breach in its own transaction, cleared by
+/// `mark_breach_noted`, and never set by a breach that did not apply.
+async fn an_applied_breach_is_owed_its_account_until_noted(
+    store: &Arc<dyn CaseStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let Ok(case) = store
+        .correlate_or_open("matter", &keys("BREACH-OWED"), ts(1_000))
+        .await
+        .map(crate::case::Correlation::case_id)
+    else {
+        r.record("owed breach", "the fixture could not open its case");
+        return;
+    };
+    for (name, resolved) in [("owed", 2_000), ("not-yet", 9_000)] {
+        if store
+            .register_deadline(&crate::core::Deadline {
+                case,
+                name: name.into(),
+                resolved_at: ts(resolved),
+                calendar_digest: crate::core::Digest::of(b"cal"),
+                warn_at: None,
+                state: crate::core::DeadlineState::Pending,
+                acknowledged: None,
+            })
+            .await
+            .is_err()
+        {
+            r.record(
+                "owed breach",
+                "the fixture could not register its obligations",
+            );
+            return;
+        }
+    }
+    let owed = |store: Arc<dyn CaseStore>| async move {
+        store.breaches_to_note(1_000).await.map(|list| {
+            list.into_iter()
+                .filter(|d| d.case == case)
+                .map(|d| d.name)
+                .collect::<Vec<_>>()
+        })
+    };
+    let _ = store.breach_deadline(case, "owed", ts(3_000)).await;
+    let _ = store.breach_deadline(case, "not-yet", ts(3_000)).await;
+    match owed(Arc::clone(store)).await {
+        Ok(names) if names == ["owed"] => {}
+        other => {
+            r.record(
+                "owed breach",
+                format!(
+                    "an applied breach must be owed its account and a refused one must not: {other:?}"
+                ),
+            );
+            return;
+        }
+    }
+    if store.mark_breach_noted(case, "owed").await.is_err() {
+        r.record("owed breach", "marking a breach noted failed");
+        return;
+    }
+    if !matches!(owed(Arc::clone(store)).await, Ok(names) if names.is_empty()) {
+        r.record("owed breach", "a noted breach is still owed its account");
+    }
+}
+
+/// **A breach applies only to what is still owed and due, and escalates only
+/// an open matter.**
+///
+/// The sweep decides from a `due` read that is stale by the time it acts. A
+/// run that met the obligation and closed the case in between has settled it;
+/// a breach written anyway reopens a closed matter and misreports a met duty
+/// as missed. `breach_deadline` makes the check and both writes one decision.
+async fn a_breach_applies_only_to_what_is_still_owed(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let register = |label: &'static str, resolved: i64| {
+        let store = Arc::clone(store);
+        async move {
+            let case = store
+                .correlate_or_open("matter", &keys(label), ts(1_000))
+                .await
+                .ok()?
+                .case_id();
+            store
+                .register_deadline(&crate::core::Deadline {
+                    case,
+                    name: "owed".into(),
+                    resolved_at: ts(resolved),
+                    calendar_digest: crate::core::Digest::of(b"cal"),
+                    warn_at: None,
+                    state: crate::core::DeadlineState::Pending,
+                    acknowledged: None,
+                })
+                .await
+                .ok()?;
+            Some(case)
+        }
+    };
+    let (Some(due), Some(early), Some(met)) = (
+        register("BREACH-DUE", 2_000).await,
+        register("BREACH-EARLY", 9_000).await,
+        register("BREACH-MET", 2_000).await,
+    ) else {
+        r.record("breach", "the fixture could not register its obligations");
+        return;
+    };
+
+    match store.breach_deadline(due, "owed", ts(3_000)).await {
+        Ok(true) => {}
+        other => r.record(
+            "breach",
+            format!("a due, outstanding obligation was not breached: {other:?}"),
+        ),
+    }
+    let status = |case| {
+        let store = Arc::clone(store);
+        async move { store.case(case).await.ok().flatten().map(|c| c.status) }
+    };
+    if status(due).await != Some(crate::core::CaseStatus::Escalated) {
+        r.record("breach", "a breach did not escalate its open case");
+    }
+
+    if !matches!(
+        store.breach_deadline(early, "owed", ts(3_000)).await,
+        Ok(false)
+    ) {
+        r.record("breach", "an obligation not yet due was breached");
+    }
+
+    // The race the verb exists for: met and closed after the sweep read it.
+    let settled = store
+        .set_deadline_state(met, "owed", crate::core::DeadlineState::Met)
+        .await
+        .is_ok()
+        && store.close(met).await.is_ok();
+    if !settled {
+        r.record("breach", "the fixture could not meet and close its case");
+        return;
+    }
+    match store.breach_deadline(met, "owed", ts(3_000)).await {
+        Ok(false) => {}
+        other => r.record(
+            "breach",
+            format!(
+                "an obligation met since the sweep read it answered {other:?} — a met duty \
+                 is reported as missed"
+            ),
+        ),
+    }
+    if status(met).await != Some(crate::core::CaseStatus::Closed) {
+        r.record(
+            "breach",
+            "a closed matter was reopened by a breach of an obligation it had met",
+        );
     }
 }
 
@@ -1327,8 +1495,8 @@ async fn correlating_twice_yields_one_case(store: &Arc<dyn CaseStore>, r: &mut R
 /// time it is called one at a time. Only an actual race distinguishes an
 /// implementation that *is* atomic from one that looks it.
 ///
-/// Two racers were not enough — they serialised often enough that dropping the
-/// arbitrating unique index went unnoticed. So this runs a **fan-out over
+/// Two racers are not enough — they serialise often enough that dropping the
+/// arbitrating unique index goes unnoticed. So this runs a **fan-out over
 /// several keys**, which is both more likely to interleave and cheap.
 ///
 /// Being explicit about what this can and cannot do: a race test corroborates,
@@ -1586,9 +1754,140 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_claimed_event_is_never_retired(store, r).await;
     a_claimed_event_is_recoverable_by_its_own_run(store, r).await;
     a_satisfied_waiter_does_not_claim_a_second_event(store, r).await;
+    a_parked_wait_is_not_matched_again(store, r).await;
+    an_erased_claim_is_dead_lettered_and_its_wait_reopened(store, r).await;
     a_zero_grace_sweep_retires_an_event_received_this_second(store, r).await;
     a_dead_letter_carries_the_keys_it_was_routed_on(store, r).await;
     a_minted_event_keeps_the_operator_who_minted_it(store, r).await;
+    a_parked_wait_is_listed_ahead_of_idle_ones(store, r).await;
+    a_closed_runs_waits_are_retired_together(store, r).await;
+}
+
+/// **A parked wait is listed for redelivery ahead of every idle one.**
+///
+/// A plane holds many long, legitimate waits; a redelivery page drawn from
+/// those in registration order never reaches a pair parked after them. The
+/// parked listing holds only parked waits, and the mark goes with the wait.
+async fn a_parked_wait_is_listed_ahead_of_idle_ones(store: &Arc<dyn EventStore>, r: &mut Report) {
+    r.checked += 1;
+    let at = ts(1_000);
+    let wait = |n: u8| Subscription {
+        run: RunId::generate(),
+        case: None,
+        effect: effect(n),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "parked.probe".into(),
+        correlation: keys(&format!("PARKED-{n}")),
+    };
+    for n in 0..4u8 {
+        if store.subscribe(&wait(n), at).await.is_err() {
+            r.record("redelivery", "subscribe failed");
+            return;
+        }
+    }
+    let parked = wait(9);
+    if store.park_wait(&parked, ts(2_000)).await.is_err() {
+        r.record("redelivery", "park failed");
+        return;
+    }
+    match store.parked_waits(64).await {
+        Ok(listed) if listed.iter().any(|s| s.run == parked.run) => {
+            if listed
+                .iter()
+                .any(|s| s.kind == "parked.probe" && s.run != parked.run)
+            {
+                r.record("redelivery", "an idle wait was listed as parked");
+            }
+        }
+        other => {
+            r.record(
+                "redelivery",
+                format!("a parked wait was not listed for redelivery: {other:?}"),
+            );
+            return;
+        }
+    }
+    if store.unsubscribe(parked.run, parked.effect).await.is_err() {
+        r.record("redelivery", "unsubscribe failed");
+        return;
+    }
+    if store
+        .parked_waits(64)
+        .await
+        .is_ok_and(|listed| listed.iter().any(|s| s.run == parked.run))
+    {
+        r.record(
+            "redelivery",
+            "a wait that was unsubscribed is still listed as parked",
+        );
+    }
+}
+
+/// **A closed run's waits are retired in one verb.**
+///
+/// Left registered, a closed run's wait is the oldest waiter on its key: the
+/// next matching event is claimed for a run that will never consume it, and a
+/// live run waiting on the same key starves.
+async fn a_closed_runs_waits_are_retired_together(store: &Arc<dyn EventStore>, r: &mut Report) {
+    r.checked += 1;
+    let closed = RunId::generate();
+    for n in [30u8, 31] {
+        let sub = Subscription {
+            run: closed,
+            case: None,
+            effect: effect(n),
+            step: StepId(0),
+            phase: Phase::Forward,
+            kind: "retire.probe".into(),
+            correlation: keys("RETIRE-1"),
+        };
+        if store.subscribe(&sub, ts(1_000)).await.is_err() {
+            r.record("retirement", "subscribe failed");
+            return;
+        }
+    }
+    let live = Subscription {
+        run: RunId::generate(),
+        case: None,
+        effect: effect(32),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "retire.probe".into(),
+        correlation: keys("RETIRE-1"),
+    };
+    if store.subscribe(&live, ts(1_001)).await.is_err() {
+        r.record("retirement", "subscribe failed");
+        return;
+    }
+    match store.unsubscribe_run(closed).await {
+        Ok(2) => {}
+        other => r.record(
+            "retirement",
+            format!("retiring a run with two waits answered {other:?}"),
+        ),
+    }
+    let event = InboundEvent::new(
+        "urn:probe",
+        "retire-1",
+        "retire.probe",
+        serde_json::json!({}),
+    )
+    .correlate(CorrelationKey::new("doc", "RETIRE-1"));
+    if store.buffer(&event, ts(1_002)).await.is_err() {
+        r.record("retirement", "buffer failed");
+        return;
+    }
+    match store.match_waiter(&event, ts(1_002)).await {
+        Ok(Some(sub)) if sub.run == live.run => {}
+        other => r.record(
+            "retirement",
+            format!(
+                "the event for a key a retired run had waited on went to {other:?}, not the \
+                 live waiter"
+            ),
+        ),
+    }
 }
 
 /// **An event this plane minted comes back naming who minted it.**
@@ -1918,6 +2217,167 @@ async fn a_satisfied_waiter_does_not_claim_a_second_event(
             ),
         );
     }
+}
+
+/// **A parked wait already holds its event, so no second event matches it.**
+///
+/// A delivery that claimed an event and could not resume the run parks the
+/// pair for redelivery. The parked wait is listed for that pass and recovers
+/// its claimed event through `claim_for`, but it is not a waiter: a second
+/// matching event elected for it is claimed for a run whose wait the first
+/// already satisfied, and stays claimed forever — a claimed event never
+/// dead-letters. The second event must stay live for the next real waiter.
+async fn a_parked_wait_is_not_matched_again(store: &Arc<dyn EventStore>, r: &mut Report) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let sub = Subscription {
+        run,
+        case: None,
+        effect: effect(23),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "parked.ack".into(),
+        correlation: keys("E-PARKED"),
+    };
+    let event = |id: &str| InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: id.into(),
+        kind: "parked.ack".into(),
+        correlation: keys("E-PARKED"),
+        payload: serde_json::json!({ "id": id }),
+        by: None,
+    };
+    let (first, second) = (event("evt-parked-1"), event("evt-parked-2"));
+    if store.subscribe(&sub, ts(1_000)).await.is_err()
+        || store.buffer(&first, ts(1_001)).await.is_err()
+    {
+        r.record("parked wait", "setup failed");
+        return;
+    }
+    if !matches!(store.match_waiter(&first, ts(1_002)).await, Ok(Some(m)) if m.run == run) {
+        r.record("parked wait", "the first event did not match the waiter");
+        return;
+    }
+    if store.park_wait(&sub, ts(1_003)).await.is_err()
+        || store.buffer(&second, ts(1_004)).await.is_err()
+    {
+        r.record("parked wait", "park or buffer failed");
+        return;
+    }
+    if let Ok(Some(m)) = store.match_waiter(&second, ts(1_005)).await {
+        r.record(
+            "parked wait",
+            format!(
+                "a second event was claimed for {} through a wait parked with its first — it stays claimed forever",
+                m.run
+            ),
+        );
+        return;
+    }
+    if !store
+        .parked_waits(64)
+        .await
+        .is_ok_and(|listed| listed.iter().any(|s| s.run == run))
+    {
+        r.record("parked wait", "the parked wait left the redelivery listing");
+    }
+    // The second event is still live: the next real waiter claims it.
+    let other = Subscription {
+        run: RunId::generate(),
+        effect: effect(24),
+        ..sub.clone()
+    };
+    let _ = store.subscribe(&other, ts(1_006)).await;
+    match store.claim_for(&other, ts(1_007)).await {
+        Ok(Some(b)) if b.event.id == second.id => {}
+        got => r.record(
+            "parked wait",
+            format!("the second event was not left live for the next waiter: {got:?}"),
+        ),
+    }
+    let _ = store.unsubscribe(run, sub.effect).await;
+    let _ = store.unsubscribe(other.run, other.effect).await;
+}
+
+/// **A message erased between its claim and its delivery is not delivered.**
+///
+/// The claim is durable and the resume a separate step, so the recovery of a
+/// crashed delivery re-reads the claimed row — and once erased that row holds
+/// no payload, which handed over as a value is a `null` the counterparty never
+/// sent. The erased message is dead-lettered as erased, its claim released,
+/// and the wait it was parked with is a wait again: the next matching event
+/// is claimed for it.
+async fn an_erased_claim_is_dead_lettered_and_its_wait_reopened(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let sub = Subscription {
+        run,
+        case: None,
+        effect: effect(25),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "erased.ack".into(),
+        correlation: keys("E-ERASED-CLAIM"),
+    };
+    let event = |id: &str| InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: id.into(),
+        kind: "erased.ack".into(),
+        correlation: keys("E-ERASED-CLAIM"),
+        payload: serde_json::json!({ "secret": id }),
+        by: None,
+    };
+    let (first, second) = (event("evt-erased-1"), event("evt-erased-2"));
+    if store.subscribe(&sub, ts(1_000)).await.is_err()
+        || store.buffer(&first, ts(1_001)).await.is_err()
+        || !matches!(store.match_waiter(&first, ts(1_002)).await, Ok(Some(_)))
+        || store.park_wait(&sub, ts(1_003)).await.is_err()
+    {
+        r.record("erased claim", "setup failed");
+        return;
+    }
+    if !matches!(
+        store.erase_payload("urn:conformance", "evt-erased-1").await,
+        Ok(true)
+    ) {
+        r.record("erased claim", "the erasure did not find the claimed row");
+        return;
+    }
+    match store.claim_for(&sub, ts(1_004)).await {
+        Ok(None) => {}
+        got => r.record(
+            "erased claim",
+            format!("the claiming run's recovery was handed the erased row: {got:?}"),
+        ),
+    }
+    if !store.dead_letters(64).await.is_ok_and(|letters| {
+        letters
+            .iter()
+            .any(|d| d.event.id == first.id && d.reason == crate::case::ERASED_REASON)
+    }) {
+        r.record(
+            "erased claim",
+            "a claimed message erased before delivery is not on the dead-letter list",
+        );
+    }
+    if store.buffer(&second, ts(1_005)).await.is_err() {
+        r.record("erased claim", "buffer failed");
+        return;
+    }
+    match store.match_waiter(&second, ts(1_006)).await {
+        Ok(Some(m)) if m.run == run => {}
+        got => r.record(
+            "erased claim",
+            format!(
+                "the wait parked with the erased message was not reopened — the next \
+                 event was matched to {got:?}"
+            ),
+        ),
+    }
+    let _ = store.unsubscribe(run, sub.effect).await;
 }
 
 /// **The crash between the claim and the resume must not lose the message.**
@@ -2340,6 +2800,12 @@ pub async fn check_waiting_tenancy(
 
 /// Check a [`TimerStore`].
 pub async fn check_timers(store: &Arc<dyn TimerStore>, r: &mut Report) {
+    a_timer_fires_once(store, r).await;
+    a_held_timer_does_not_hide_a_due_one(store, r).await;
+    a_closed_runs_timers_are_retired_together(store, r).await;
+}
+
+async fn a_timer_fires_once(store: &Arc<dyn TimerStore>, r: &mut Report) {
     r.checked += 1;
     let timer = crate::core::Timer {
         run: RunId::generate(),
@@ -2384,6 +2850,255 @@ pub async fn check_timers(store: &Arc<dyn TimerStore>, r: &mut Report) {
     }
 }
 
+/// **A timer held under another sweeper's claim does not hide the due ones
+/// behind it.**
+///
+/// `claim_due`'s limit bounds what it returns. A backend that takes `limit`
+/// candidates and *then* skips the held ones answers a page of nothing while
+/// due timers wait behind the held head — silently, because a short page looks
+/// like a quiet plane. Runs after [`a_timer_fires_once`], whose timer is held
+/// at the head of the due order.
+async fn a_held_timer_does_not_hide_a_due_one(store: &Arc<dyn TimerStore>, r: &mut Report) {
+    r.checked += 1;
+    for (n, at) in [(21u8, 1_100), (22, 1_200)] {
+        let timer = crate::core::Timer {
+            run: RunId::generate(),
+            case: None,
+            effect: effect(n),
+            step: StepId(0),
+            phase: Phase::Forward,
+            fire_at: ts(at),
+        };
+        if store.arm(&timer).await.is_err() {
+            r.record("timers", "arm failed");
+            return;
+        }
+    }
+    for round in 0..2 {
+        match store.claim_due(ts(2_000), 1).await {
+            Ok(page) if page.len() == 1 => {}
+            Ok(page) => {
+                r.record(
+                    "timers",
+                    format!(
+                        "claim {round} with a limit of one returned {} timers while due ones \
+                         were armed — a timer held by another sweeper filled the page and \
+                         hid the due timers behind it",
+                        page.len()
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                r.record("timers", format!("claim_due failed: {e}"));
+                return;
+            }
+        }
+    }
+}
+
+/// **A closed run's timers are retired in one verb.**
+///
+/// A sealed run can record no wake, so a timer it leaves armed is claimed and
+/// fails once per lease period for as long as the store exists. Another run's
+/// timer is untouched.
+async fn a_closed_runs_timers_are_retired_together(store: &Arc<dyn TimerStore>, r: &mut Report) {
+    r.checked += 1;
+    let (closed, other) = (RunId::generate(), RunId::generate());
+    for (run, n) in [(closed, 23u8), (closed, 24), (other, 25)] {
+        let timer = crate::core::Timer {
+            run,
+            case: None,
+            effect: effect(n),
+            step: StepId(0),
+            phase: Phase::Forward,
+            fire_at: ts(5_000_000),
+        };
+        if store.arm(&timer).await.is_err() {
+            r.record("timers", "arm failed");
+            return;
+        }
+    }
+    match store.disarm_run(closed).await {
+        Ok(2) => {}
+        Ok(n) => r.record(
+            "timers",
+            format!("disarm_run retired {n} timers of a run that had two armed"),
+        ),
+        Err(e) => {
+            r.record("timers", format!("disarm_run failed: {e}"));
+            return;
+        }
+    }
+    let Ok(due) = store.claim_due(ts(6_000_000), 64).await else {
+        r.record("timers", "claim_due failed");
+        return;
+    };
+    if due.iter().any(|t| t.run == closed) {
+        r.record(
+            "timers",
+            "a retired run's timer was still claimable — it would be claimed and fail \
+             once per lease period for ever",
+        );
+    }
+    if !due.iter().any(|t| t.run == other) {
+        r.record(
+            "timers",
+            "retiring one run's timers retired another run's too",
+        );
+    }
+}
+
+// ── Sealed runs ─────────────────────────────────────────────────────────────
+
+/// A parked wait is the redelivery pass's work; a sealed run can record no
+/// delivery, so its parked pair is retired rather than listed — or the pass
+/// tries it, fails and finds it again every tick. `false` when the fixture
+/// could not be set up.
+async fn a_sealed_runs_parked_wait_is_retired(
+    events: &Arc<dyn EventStore>,
+    sealed: RunId,
+    r: &mut Report,
+) -> bool {
+    let parked = Subscription {
+        run: sealed,
+        case: None,
+        effect: effect(42),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "sealed.parked".into(),
+        correlation: keys("SEALED-PARKED"),
+    };
+    if events.park_wait(&parked, ts(1_000)).await.is_err() {
+        r.record("sealed waits", "park failed");
+        return false;
+    }
+    for pass in ["first", "second"] {
+        match events.parked_waits(64).await {
+            Ok(listed) if listed.iter().any(|s| s.run == sealed) => r.record(
+                "sealed waits",
+                format!(
+                    "the {pass} redelivery page listed a sealed run's parked wait — it can \
+                     record no delivery and is tried again every tick"
+                ),
+            ),
+            Ok(_) => {}
+            Err(e) => r.record("sealed waits", format!("parked_waits failed: {e}")),
+        }
+    }
+    true
+}
+
+/// Check that the wait tables pass over a sealed run.
+///
+/// The three handles are one backend: the liveness check is the wait tables
+/// consulting the journal's seal in the same database. The runtime retires a
+/// closed run's timers and waits as it seals it; this covers what outlives
+/// that — a crash between the seal and the retirement.
+pub async fn check_sealed_runs_waits(
+    journal: &Arc<dyn crate::journal::JournalStore>,
+    timers: &Arc<dyn TimerStore>,
+    events: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let sealed = RunId::generate();
+    let Ok(lease) = journal
+        .acquire(sealed, "conformance", std::time::Duration::from_secs(60))
+        .await
+    else {
+        r.record("sealed waits", "acquire failed");
+        return;
+    };
+    let admitted = crate::journal::Append::new(
+        sealed,
+        crate::journal::RecordKind::RunAdmitted {
+            capability: "conformance".into(),
+            governed_by: None,
+            input_label: crate::core::Label::trusted(),
+            input: serde_json::Value::Null,
+            policy_bundle: None,
+            canon: crate::core::canon::VERSION,
+            idempotency_key: None,
+            admitted_by: None,
+            served_unchained: false,
+        },
+    );
+    if journal.append(lease.epoch, vec![admitted]).await.is_err()
+        || journal
+            .seal(sealed, lease.epoch, "cancelled")
+            .await
+            .is_err()
+    {
+        r.record("sealed waits", "the fixture could not seal its run");
+        return;
+    }
+
+    let timer = crate::core::Timer {
+        run: sealed,
+        case: None,
+        effect: effect(40),
+        step: StepId(0),
+        phase: Phase::Forward,
+        fire_at: ts(7_000_000),
+    };
+    if timers.arm(&timer).await.is_err() {
+        r.record("sealed waits", "arm failed");
+        return;
+    }
+    match timers.claim_due(ts(7_000_001), 64).await {
+        Ok(due) if due.iter().any(|t| t.run == sealed) => r.record(
+            "sealed waits",
+            "a sealed run's timer was claimed — it fails to record a wake and is \
+             claimed again every lease period",
+        ),
+        Ok(_) => {}
+        Err(e) => r.record("sealed waits", format!("claim_due failed: {e}")),
+    }
+
+    if !a_sealed_runs_parked_wait_is_retired(events, sealed, r).await {
+        return;
+    }
+
+    let wait = |run| Subscription {
+        run,
+        case: None,
+        effect: effect(41),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "sealed.probe".into(),
+        correlation: keys("SEALED-1"),
+    };
+    let live = RunId::generate();
+    if events.subscribe(&wait(sealed), ts(1_000)).await.is_err()
+        || events.subscribe(&wait(live), ts(1_001)).await.is_err()
+    {
+        r.record("sealed waits", "subscribe failed");
+        return;
+    }
+    let event = InboundEvent::new(
+        "urn:probe",
+        "sealed-1",
+        "sealed.probe",
+        serde_json::json!({}),
+    )
+    .correlate(CorrelationKey::new("doc", "SEALED-1"));
+    if events.buffer(&event, ts(1_002)).await.is_err() {
+        r.record("sealed waits", "buffer failed");
+        return;
+    }
+    match events.match_waiter(&event, ts(1_002)).await {
+        Ok(Some(sub)) if sub.run == live => {}
+        other => r.record(
+            "sealed waits",
+            format!(
+                "an event went to {other:?} while the oldest waiter on its key was a \
+                 sealed run and a live run waited behind it"
+            ),
+        ),
+    }
+}
+
 // ── Tasks ───────────────────────────────────────────────────────────────────
 
 /// Check a [`TaskStore`].
@@ -2401,6 +3116,8 @@ pub async fn check_tasks(store: &Arc<dyn TaskStore>, r: &mut Report) {
     an_escalated_task_leaves_the_overdue_scan(store, r).await;
     a_decided_task_is_not_resurrected_by_escalation(store, r).await;
     a_role_name_is_stored_verbatim(store, r).await;
+    a_settled_task_is_not_settled_again(store, r).await;
+    a_closed_runs_pending_tasks_are_withdrawn(store, r).await;
 }
 
 /// **A claim racing an expiry cannot resurrect the task.**
@@ -2484,7 +3201,7 @@ async fn a_state_write_to_a_missing_task_is_not_found(store: &Arc<dyn TaskStore>
     let ghost = task(63, None);
     match store.set_state(ghost.id, TaskState::Completed).await {
         Err(StoreError::NotFound(_)) => {}
-        Ok(()) => r.record(
+        Ok(_) => r.record(
             "missing rows",
             "set_state on a task that does not exist reported success — the \
              caller now believes a decision was recorded that no store holds",
@@ -2500,7 +3217,7 @@ async fn a_state_write_to_a_missing_task_is_not_found(store: &Arc<dyn TaskStore>
 /// names, and eligibility does not thin because the previous reviewer left.**
 ///
 /// Only the holder may release, so a task claimed by a reviewer who is not
-/// coming back was parked until its deadline breached. `take_over` is the
+/// coming back would stay parked until its deadline breached. `take_over` is the
 /// answer, and its two guards are what this pins. The `from` argument is a
 /// compare-and-swap: a take-over decided from a stale queue view must fail
 /// rather than displace whoever holds the task *now*. And a take-over is a
@@ -2672,6 +3389,114 @@ async fn a_claimed_task_is_offered_to_nobody_else(store: &Arc<dyn TaskStore>, r:
     }
 }
 
+/// **A settled task is not settled again.**
+///
+/// The expiry sweep and a reviewer's decision race to settle one task, and the
+/// run consumes whichever answer reached it first. `set_state` is the
+/// compare-and-set that keeps the worklist agreeing with that answer: the
+/// loser's write reports `false` and leaves the winner's state standing.
+async fn a_settled_task_is_not_settled_again(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let t = task(70, None);
+    if store.open(&t).await.is_err() {
+        r.record("settlement", "open failed");
+        return;
+    }
+    match store.set_state(t.id, TaskState::Completed).await {
+        Ok(true) => {}
+        other => {
+            r.record(
+                "settlement",
+                format!("settling an open task answered {other:?}, not that it settled"),
+            );
+            return;
+        }
+    }
+    match store.set_state(t.id, TaskState::Expired).await {
+        Ok(false) => {}
+        other => r.record(
+            "settlement",
+            format!("a second settlement of a decided task answered {other:?}, not `false`"),
+        ),
+    }
+    match store.task(t.id).await {
+        Ok(Some(after)) if after.state == TaskState::Completed => {}
+        other => r.record(
+            "settlement",
+            format!(
+                "the expiry that lost the race overwrote the decision that won it: {other:?} — \
+                 the worklist now contradicts the answer the run consumed"
+            ),
+        ),
+    }
+}
+
+/// **A closed run's awaited tasks are withdrawn; nothing else is.**
+///
+/// Nobody can answer a task whose run is sealed. Left pending it stays in the
+/// queue and the backlog, and its expiry is applied to a run that cannot
+/// consume it. A task the run did not name — opened beside an answer, already
+/// decided, or another run's — stands.
+async fn a_closed_runs_pending_tasks_are_withdrawn(store: &Arc<dyn TaskStore>, r: &mut Report) {
+    r.checked += 1;
+    let awaited = task(71, None);
+    let mut decided = task(72, None);
+    decided.run = awaited.run;
+    decided.id = TaskId::derive(awaited.run, effect(72));
+    let mut beside = task(74, None);
+    beside.run = awaited.run;
+    beside.id = TaskId::derive(awaited.run, effect(74));
+    let unrelated = task(73, None);
+    for t in [&awaited, &decided, &beside, &unrelated] {
+        if store.open(t).await.is_err() {
+            r.record("withdrawal", "open failed");
+            return;
+        }
+    }
+    if store
+        .set_state(decided.id, TaskState::Completed)
+        .await
+        .is_err()
+    {
+        r.record("withdrawal", "the fixture could not decide its task");
+        return;
+    }
+    let named = [awaited.id, decided.id, unrelated.id];
+    match store.withdraw_run(awaited.run, &named).await {
+        Ok(1) => {}
+        other => r.record(
+            "withdrawal",
+            format!("withdrawing a run with one pending awaited task answered {other:?}"),
+        ),
+    }
+    let state = |id| {
+        let store = Arc::clone(store);
+        async move { store.task(id).await.ok().flatten().map(|t| t.state) }
+    };
+    if state(awaited.id).await != Some(TaskState::Withdrawn) {
+        r.record(
+            "withdrawal",
+            "a closed run's awaited task is still pending — offered for a decision no \
+             answer can reach",
+        );
+    }
+    if state(decided.id).await != Some(TaskState::Completed) {
+        r.record(
+            "withdrawal",
+            "withdrawal rewrote a task that was already decided",
+        );
+    }
+    if state(beside.id).await != Some(TaskState::Open) {
+        r.record("withdrawal", "withdrawal took a task the run did not name");
+    }
+    if state(unrelated.id).await != Some(TaskState::Open) {
+        r.record(
+            "withdrawal",
+            "withdrawing one run's tasks withdrew another run's",
+        );
+    }
+}
+
 fn task(id: u8, excluded: Option<&str>) -> Task {
     let run = RunId::generate();
     Task {
@@ -2692,6 +3517,7 @@ fn task(id: u8, excluded: Option<&str>) -> Task {
         excluded_actors: excluded.map(|a| vec![a.to_owned()]).unwrap_or_default(),
         created_at: ts(1_000),
         due_at: None,
+        withheld: None,
     }
 }
 
@@ -2977,11 +3803,8 @@ async fn an_excluded_actor_cannot_claim(store: &Arc<dyn TaskStore>, r: &mut Repo
 /// state the row is in. Then a barred reviewer asking for a held task is told
 /// "held by Bob" — so they wait for Bob to release it, ask again, and are
 /// refused for a reason nobody has yet mentioned. It also hands queue state to
-/// somebody with no standing in that queue.
-///
-/// Both backends got this wrong, and it was found by writing an HTTP handler
-/// that had to choose a status code: `403` and `409` ask different things of
-/// the person reading them.
+/// somebody with no standing in that queue. `403` and `409` ask different
+/// things of the person reading them.
 async fn ineligibility_outranks_contention(store: &Arc<dyn TaskStore>, r: &mut Report) {
     r.checked += 1;
     let t = task(32, Some("alice"));

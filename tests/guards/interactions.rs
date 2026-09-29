@@ -178,7 +178,7 @@ impl Replanner for KeepsDone {
         // Keep every completed step exactly as it ran, and add a finisher.
         let mut nodes: Vec<PlanNode> = done
             .iter()
-            .map(|(id, cap)| PlanNode::new(id.0, cap.clone()).arg("input", ArgSource::run_input()))
+            .filter_map(|(id, _)| cur.node(*id).cloned())
             .collect();
         let mut z = PlanNode::new(9, "z")
             .arg("input", ArgSource::run_input())

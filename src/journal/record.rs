@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::{
-    AttestError, Attestation, CaseId, Compensation, DeadlineState, Digest, Disposition,
-    EffectDescriptor, EffectKey, Epoch, Label, Phase, PolicyBundleIdentity, Principal, Recovery,
-    RunId, Seq, Signer, Spend, StepId, StoreError, Timestamp, Verifier, canon,
+    CaseId, Compensation, DeadlineState, Digest, Disposition, EffectDescriptor, EffectKey, Epoch,
+    KeySignature, Label, Phase, PolicyBundleIdentity, Principal, Recovery, RunId, Seq,
+    SignatureError, Signer, Spend, StepId, StoreError, Timestamp, Verifier, canon,
 };
 
 /// Which declaration governed a run.
@@ -30,6 +30,7 @@ use crate::core::{
 /// recorded rather than a reference that has to be resolved against a registry
 /// that may no longer hold that version — or may be the compromised party.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentIdentity {
     /// `metadata.name` from the manifest.
     pub name: String,
@@ -132,6 +133,24 @@ pub enum RecordKind {
         /// see [`InboundEvent::dedup_key`](crate::core::InboundEvent::dedup_key).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         idempotency_key: Option<String>,
+        /// Who asked for this run, when a served surface or an embedder named
+        /// them — the authenticated caller, never a value the request body
+        /// supplied.
+        ///
+        /// `None` means nobody was named: a run the plane started itself, or
+        /// one an embedder admitted without saying for whom. Every task the
+        /// run opens bars this actor from deciding it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        admitted_by: Option<String>,
+        /// Admitted for a served caller that presented no delegation chain.
+        ///
+        /// Such a run acts under no chain and is not the plane: it holds no
+        /// standing authority, the tenant's included. Recorded rather than
+        /// inferred because a run the plane started for itself with no chain
+        /// looks the same in every other record, and a resume must draw as the
+        /// same holder the live run did.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        served_unchained: bool,
     },
 
     /// A live execution pass began under this record body's fencing epoch.
@@ -248,6 +267,13 @@ pub enum RecordKind {
     EffectStarted {
         descriptor: EffectDescriptor,
         recovery: Recovery,
+        /// Whether the gate treated this call as mutating: the effect's own
+        /// claim, widened by a reviewed grant that declares the tool mutating.
+        ///
+        /// The value the policy request carried, so a verdict re-derived from
+        /// the record is asked the question the gate was — an effect a grant
+        /// widened reads `true` here even where its catalogue entry says it
+        /// only reads.
         mutates: bool,
         /// Which attempt this is, 1-based.
         ///
@@ -263,10 +289,16 @@ pub enum RecordKind {
         ///
         /// Recorded because **authorization consults it**, and a decision whose
         /// inputs are not on the record cannot be re-derived by anyone who was
-        /// not there. Policy is total and side-effect free, so an auditor
-        /// holding the bundle identity, the descriptor and this can reach the
-        /// same verdict offline — and without it they must take the runtime's
-        /// word that the right label was presented.
+        /// not there. `agentplane policy check` rebuilds the effect gate's
+        /// request from this, the descriptor, `mutates`, the admission and
+        /// identity records and a tenant it is told, and evaluates it against
+        /// the bundle `RunAdmitted.policy_bundle` names. It cannot rebuild a
+        /// call whose arguments are sealed without a key or erased, a step
+        /// running a skill other than the admitted one (its declaration is not
+        /// recorded), a member of a group that did not commit (a reversal
+        /// skipped the gate and is not marked), a durable wait, or a refusal
+        /// (`PolicyDenied` records no arguments) — it reports those as not
+        /// evaluable rather than as agreeing.
         ///
         /// Absent for `cx.effect`, which binds no value and presents none, so
         /// the ordinary case costs no bytes and hashes identically.
@@ -897,9 +929,9 @@ pub(crate) fn unreadable(raw: &[u8], parse: serde_json::Error) -> StoreError {
 
 /// The hashed portion of a record.
 ///
-/// Field order here *is* the wire order (serde preserves struct declaration
-/// order), and object keys inside `payload` are sorted by `serde_json`. Both are
-/// required for the bytes to be canonical.
+/// Field order here is **not** the wire order: [`canon::to_bytes`](crate::core::canon::to_bytes) sorts every
+/// object's keys by their UTF-16 code units, at every depth, so the bytes are
+/// canonical whatever order the struct declares or `serde_json` would emit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecordBody {
     pub seq: Seq,
@@ -940,16 +972,16 @@ pub struct Record {
     /// given a [`Signer`](crate::core::Signer) writes unsigned records, and
     /// history written before signing was configured stays unsigned forever.
     /// What must never happen is a *verifier* silently accepting that; see
-    /// [`Record::verify_attested`].
-    pub attestation: Option<Attestation>,
+    /// [`Record::verify_signed`].
+    pub signature: Option<KeySignature>,
     raw: Vec<u8>,
 }
 
-/// What a record attestation is taken over: the chain hash under the record
+/// What a record signature is taken over: the chain hash under the record
 /// domain.
 ///
 /// A free function rather than two call sites, because signing and verifying
-/// must agree byte for byte and the two live 130 lines apart. Signing a labelled
+/// must agree byte for byte and the two live far apart. Signing a labelled
 /// digest and verifying a bare one rejects every genuine signature, which is
 /// loud; doing it the other way round accepts a signature made for something
 /// else, which is not.
@@ -1004,33 +1036,29 @@ impl Record {
             body,
             prev_hash,
             hash,
-            attestation: signer.map(|s| s.attest(&record_signing_input(hash))),
+            signature: signer.map(|s| s.signature_over(&record_signing_input(hash))),
             raw,
         })
     }
 
-    /// Reconstruct from storage, verifying the link before trusting the content.
+    /// Reconstruct from storage, verifying the link before trusting the
+    /// content, and carrying whatever signature the store kept.
     ///
     /// The body is decoded from `raw`; the hash is recomputed from `raw`. A
     /// record whose stored hash disagrees is rejected rather than returned with
     /// a warning — a journal you cannot trust is worse than no journal, because
     /// it produces an audit trail that is quietly a lie.
-    pub fn from_stored(raw: Vec<u8>, prev_hash: Digest, hash: Digest) -> Result<Self, StoreError> {
-        Self::from_stored_attested(raw, prev_hash, hash, None)
-    }
-
-    /// Reconstruct, carrying whatever signature the store kept.
     ///
     /// Reads under the [`Identity`](super::Identity) upcaster — this build's
     /// shapes and no others. A store that carries a real upcaster calls
     /// [`from_stored_with`](Self::from_stored_with) instead.
-    pub fn from_stored_attested(
+    pub fn from_stored_signed(
         raw: Vec<u8>,
         prev_hash: Digest,
         hash: Digest,
-        attestation: Option<Attestation>,
+        signature: Option<KeySignature>,
     ) -> Result<Self, StoreError> {
-        Self::from_stored_with(&super::Identity, raw, prev_hash, hash, attestation)
+        Self::from_stored_with(&super::Identity, raw, prev_hash, hash, signature)
     }
 
     /// Reconstruct, lifting the record forward if it was written at an older
@@ -1068,7 +1096,7 @@ impl Record {
         raw: Vec<u8>,
         prev_hash: Digest,
         hash: Digest,
-        attestation: Option<Attestation>,
+        signature: Option<KeySignature>,
     ) -> Result<Self, StoreError> {
         let recomputed = Digest::chain(prev_hash, &raw);
         if recomputed != hash {
@@ -1107,7 +1135,7 @@ impl Record {
             body,
             prev_hash,
             hash,
-            attestation,
+            signature,
             raw,
         })
     }
@@ -1131,6 +1159,25 @@ impl Record {
     #[must_use]
     pub fn effect_key(&self) -> Option<EffectKey> {
         self.body.effect_key
+    }
+
+    /// The producer whose [`origin_key`](crate::core::origin_key) admitted
+    /// this run — the key's `source` half — when this is the admission record
+    /// and its key was built that way.
+    ///
+    /// What a served surface asks before it reads or acts on a run it is
+    /// addressed by id: the source is the authenticated sender the surface
+    /// keyed the admission with, so it answers "whose run is this" from a
+    /// field the run already carries.
+    #[must_use]
+    pub fn admission_source(&self) -> Option<&str> {
+        match self.kind() {
+            RecordKind::RunAdmitted {
+                idempotency_key: Some(key),
+                ..
+            } => crate::core::origin_source(key),
+            _ => None,
+        }
     }
 
     /// The same record with its payload opened — a **read-time view**.
@@ -1196,9 +1243,9 @@ impl Record {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Corrupt`] if the chain is broken, or [`AttestError`] as a
+    /// [`StoreError::Corrupt`] if the chain is broken, or [`SignatureError`] as a
     /// corrupt-record detail if a signature is missing or wrong.
-    pub fn verify_attested(
+    pub fn verify_signed(
         records: &[Self],
         from: Digest,
         verifier: &dyn Verifier,
@@ -1206,7 +1253,7 @@ impl Record {
     ) -> Result<Digest, StoreError> {
         let head = Self::verify_chain(records, from)?;
         for r in records {
-            match &r.attestation {
+            match &r.signature {
                 // Under the same domain `seal_signed` signed it. Verifying the
                 // bare chain hash here while signing a labelled one there would
                 // reject every genuine signature — and getting it backwards, so
@@ -1218,7 +1265,7 @@ impl Record {
                 Some(a) => {
                     return Err(StoreError::Corrupt {
                         seq: r.seq(),
-                        detail: AttestError::BadSignature {
+                        detail: SignatureError::BadSignature {
                             seq: r.seq(),
                             key_id: a.key_id.clone(),
                         }
@@ -1228,7 +1275,7 @@ impl Record {
                 None if require_signature => {
                     return Err(StoreError::Corrupt {
                         seq: r.seq(),
-                        detail: AttestError::Unsigned { seq: r.seq() }.to_string(),
+                        detail: SignatureError::Unsigned { seq: r.seq() }.to_string(),
                     });
                 }
                 None => {}
@@ -1371,6 +1418,8 @@ mod tests {
                     policy_bundle: None,
                     canon: crate::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             ),
             Digest::ZERO,
@@ -1406,6 +1455,8 @@ mod tests {
                     policy_bundle: None,
                     canon: crate::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             ),
             Digest::ZERO,
@@ -1490,14 +1541,15 @@ mod tests {
     #[test]
     fn from_stored_rejects_a_hash_that_does_not_cover_the_bytes() {
         let r = chain_of(1).pop().unwrap();
-        let err = Record::from_stored(b"{\"seq\":1}".to_vec(), Digest::ZERO, r.hash).unwrap_err();
+        let err = Record::from_stored_signed(b"{\"seq\":1}".to_vec(), Digest::ZERO, r.hash, None)
+            .unwrap_err();
         assert!(matches!(err, StoreError::Corrupt { .. }));
     }
 
     #[test]
     fn from_stored_roundtrips_a_genuine_record() {
         let r = chain_of(1).pop().unwrap();
-        let back = Record::from_stored(r.raw().to_vec(), r.prev_hash, r.hash).unwrap();
+        let back = Record::from_stored_signed(r.raw().to_vec(), r.prev_hash, r.hash, None).unwrap();
         assert_eq!(back.body, r.body);
     }
 

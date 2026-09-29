@@ -38,7 +38,7 @@ it must fail.
 | `tests/trust/identity.rs` | Scope containment, attenuation, depth, and the chain surviving replay |
 | `tests/trust/boundary.rs` | Effect output is labelled at the source, propagates, gates sinks, and survives replay |
 | `tests/wire/api.rs` | That the HTTP surface cannot be told who is acting, that both gates run on every route, and that four-eyes survives the hop |
-| `tests/trust/attestation.rs` | That a *valid* chain rewritten by somebody who could hash but not sign is still caught |
+| `tests/trust/signature.rs` | That a *valid* chain rewritten by somebody who could hash but not sign is still caught |
 | `tests/engine/cancellation.rs` | That a stop unwinds what the run did, refuses to unwind around an unknown outcome, and names who asked |
 | `tests/engine/quarantine.rs` | That a person can answer a doubt and the runtime still decides the run — and that giving up leaves the doubt reportable |
 | `tests/wire/drivers.rs` | The two wire drivers' failure mappings — whether a peer acted, and whether a model call was billed |
@@ -47,9 +47,10 @@ it must fail.
 | `tests/guards/postgres.rs` | The shared-store backend against a real PostgreSQL server: tenant isolation with a *valid* identifier from the other tenant, concurrency under a lock, the case layer's contracts |
 | `tests/wire/a2a_interop.rs` | This crate's A2A **client** against the reference SDK's server — the one interoperability gap the conformance kit cannot close, since the kit validates servers |
 | `tests/guards/vault.rs` | The key-ring contract against a real Vault — where the status codes an in-process ring cannot get wrong actually live |
-| `tla/` | TLA+ models of the effect protocol, retry safety, sagas, and fencing, plus the mutants that prove those models constrain anything |
+| `tla/` | TLA+ models — `Authorization`, `Delegation`, `EffectGroup`, `EffectProtocol`, `Equivocation`, `Fencing`, `RetrySafety`, `Saga` — plus the mutants that prove those models constrain anything |
 
-Those three need a Docker daemon or a foreign implementation, and are skipped
+`postgres.rs`, `a2a_interop.rs` and `vault.rs` need a Docker daemon or a
+foreign implementation, and are skipped
 rather than failed without one — so they stay compiled and exercised by
 `just test` on every machine, between the rarer runs that have both.
 
@@ -132,9 +133,8 @@ witness's `409` does, so the in-process model stays a faithful stand-in rather
 than a friendlier one — including the cosignature timestamp, which is non-zero
 because the specification forbids the value that would say *no clock of record*.
 
-This shipped as a real defect and survived its first test, because that test used
-a four-entry log with a two-hash proof — the one size where the wrong arithmetic
-gives the right answer. The regression test uses fifty and a hundred.
+A four-entry log with a two-hash proof is the one size where the wrong
+arithmetic gives the right answer, so the test uses fifty and a hundred.
 
 ### The fake witness performs the check the specification makes mandatory
 
@@ -156,11 +156,6 @@ Model checking proves a spec's invariants hold *of the spec*. It says nothing
 about whether those invariants constrain anything, and the difference is not
 visible by reading.
 
-Writing `tla/RetrySafety.tla` also paid for itself immediately: TLC deadlocked
-on an effect that was *safe* to repeat, failing in doubt on its final attempt,
-with no rule to apply. The implementation handled it; the rules as first written
-did not.
-
 `tla/EffectProtocol.tla` models "act" and "record" as **separate** steps. As one
 atomic step TLC explores it exhaustively and finds no errors — but the one state
 the protocol exists to survive, *the action landed and the process died before
@@ -170,6 +165,8 @@ worthless.
 So `tla/verify.sh` runs two passes. The first checks the specs. The second
 checks the check: each spec is re-run against deliberately broken copies of
 itself, and each mutant must be caught by the specific invariant written for it.
+A selection — the full table, one entry per mutant, is `tla/mutations.py`
+(`python3 tla/mutations.py --list`):
 
 | Mutation | Spec | Must be caught by |
 |---|---|---|
@@ -217,9 +214,6 @@ entirely and the world *still* contains no duplicate, because the re-announcemen
 is rejected one layer down. The sweep goes green over a runtime that has stopped
 replaying at all.
 
-This is not hypothetical. The sweep was written with exactly that assertion, and
-a mutation removing the whole read-back survived it.
-
 So the load-bearing assertion is: **replay must never reach the constraint.** A
 resume may refuse, but only for a reason the design names — a crash before
 `PlanFrozen`, or an undecidable outcome under a recovery mode that forbids
@@ -247,10 +241,9 @@ the code moved and the mutation is silently testing nothing. A mutation that
 fails to compile broke the file instead of removing the guarantee — it proves
 nothing either way.
 
-This exists because a guarantee can be implemented, tested, and unfalsifiable,
-and this codebase shipped one: see *The hole this closed* above. Running the
-sweep the first time immediately found a second, smaller instance — a test whose
-name claimed a property its body could not exercise.
+It exists because a guarantee can be implemented, tested, and unfalsifiable: a
+test whose name claims a property its body cannot exercise passes forever, and
+only removing the guarantee shows it.
 
 `tests/guards/layering.rs` checks that every test the table names actually
 exists — an invented name otherwise costs a full rebuild to discover.
@@ -275,22 +268,18 @@ creeping into `core`, an invariant nobody wired up, a telemetry event nobody
 emits, **a public enum variant nothing constructs**, **a pair of features nothing
 exercises together**.
 
-That last one exists because the same bug happened five times: a variant, a
-recovery mode, an error, a record kind declared and never built, each reading as
-a capability the system had. `#[from]` variants are exempt (`?` builds them), and
+A variant, a recovery mode, an error or a record kind declared and never built
+reads as a capability the system has. `#[from]` variants are exempt (`?` builds them), and
 a variant meant for callers counts only if a *test* constructs it.
 
-The interaction matrix exists because replanning shipped with its own gates
-tested and broke the saga: a successor reusing a completed step's id made the
-unwind compensate work that never ran. The model↔code guard maps each invariant
-to one test, and no test combined a replan with an unwind. Adding a feature
-widens where an invariant applies, so the widening is what gets checked — every
+The model↔code guard maps each invariant to one test, so two features each
+tested on its own can still break each other — a replan whose successor reuses a
+completed step's id makes an unwind compensate work that never ran. Adding a
+feature widens where an invariant applies, so the widening is what gets checked — every
 pair of the feature axes must be exercised together, or declared independent
 with the reason.
 
-**A guard that reads source must exclude the source that is the guard.** Both
-source-reading guards have been blinded by themselves: the dead-variant check by
-its own doc comment naming the canonical example, and the interaction matrix by
-its own list of detection literals, which made one file look like a test
-exercising every feature. So they strip comments, and the matrix skips
-`layering.rs`.
+**A guard that reads source must exclude the source that is the guard.** A
+dead-variant check reads its own doc comment naming an example, and an
+interaction matrix reads its own detection literals as a test exercising every
+feature. So they strip comments, and the matrix skips `layering.rs`.

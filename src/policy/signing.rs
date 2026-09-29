@@ -12,7 +12,7 @@
 //! signing is fast enough to sit on the journal's write path, and verification
 //! needs only the public key.
 //!
-//! The [`Attestation`](crate::core::Attestation) deliberately carries no
+//! The [`KeySignature`](crate::core::KeySignature) deliberately carries no
 //! algorithm field. Self-described algorithms are how a verifier gets talked
 //! into checking a signature with something weaker than the one that made it;
 //! here the verifier decides what it will accept, and a record it cannot check

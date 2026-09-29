@@ -49,10 +49,11 @@
 //! A chain is **per request, never per plane.** The plane's own chain
 //! (`RuntimeBuilder::acting_as`) is the identity a run acts under when the
 //! embedder starts it in-process; a served surface admits each run under the
-//! chain its authenticated caller presented (`RunTerms::acting_as`), because a
-//! plane that bound its own chain to every peer's run would be an ambient
-//! credential — every caller acting as the owner, and "on whose behalf"
-//! answered with the same name for all of them.
+//! chain its authenticated caller presented, or under none when it presented
+//! none (`RunTerms::served`), because a plane that bound its own chain to
+//! every peer's run would be an ambient credential — every caller acting as
+//! the owner, and "on whose behalf" answered with the same name for all of
+//! them.
 //!
 //! # Verified once, then journaled
 //!
@@ -201,6 +202,7 @@ fn covers(a: &str, b: &str) -> bool {
 /// optional bounds are **absent, never null**, on the wire — a chain written
 /// before they existed reads back as one that declares neither.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Principal {
     /// Workload or human identity. A SPIFFE ID in practice, but opaque here —
     /// the runtime depends on attenuation, not on a naming scheme.

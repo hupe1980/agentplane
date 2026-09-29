@@ -4,7 +4,7 @@ mod events;
 mod tasks;
 mod timers;
 
-pub use events::{BufferedEvent, EventStore, TargetedDelivery};
+pub use events::{BufferedEvent, ERASED_REASON, EventStore, Minter, TargetedDelivery};
 pub use tasks::{ClaimError, TaskStore};
 pub use timers::TimerStore;
 
@@ -261,6 +261,47 @@ pub trait CaseStore: Send + Sync + Debug {
         name: &str,
         state: DeadlineState,
     ) -> Result<(), StoreError>;
+
+    /// Breach an obligation and escalate its case, in one transaction, if it
+    /// is still outstanding and due at `now`. Returns whether it applied.
+    ///
+    /// One verb because the sweep decides from a read that is already stale
+    /// when it acts: a run can meet the obligation and close the case in
+    /// between. Spelled as separate writes, the sweep then escalates a closed
+    /// case — reopening it and re-claiming its correlation keys — and breaches
+    /// an obligation that was met. Here the check and both writes are one
+    /// decision, and `false` means somebody got there first.
+    ///
+    /// The case is escalated only while it is not
+    /// [`Closed`](CaseStatus::Closed).
+    ///
+    /// An applied breach is also marked as **owing its account**, in the same
+    /// transaction: the sweep acts first and writes its notes after, so a
+    /// crash between the two leaves a breach [`due`](Self::due) no longer
+    /// lists. [`breaches_to_note`](Self::breaches_to_note) is where the next
+    /// tick finds it, and [`mark_breach_noted`](Self::mark_breach_noted) is
+    /// what the notes landing retires.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the case or the obligation does not exist.
+    async fn breach_deadline(
+        &self,
+        case: CaseId,
+        name: &str,
+        now: Timestamp,
+    ) -> Result<bool, StoreError>;
+
+    /// Breaches [`breach_deadline`](Self::breach_deadline) applied whose
+    /// account the sweep has not yet written, longest-overdue first.
+    async fn breaches_to_note(&self, limit: usize) -> Result<Vec<Deadline>, StoreError>;
+
+    /// Record that a breach's account is on the journal. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the obligation does not exist.
+    async fn mark_breach_noted(&self, case: CaseId, name: &str) -> Result<(), StoreError>;
 
     /// Obligations that are due or approaching, oldest first.
     ///

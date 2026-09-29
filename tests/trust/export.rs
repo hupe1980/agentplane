@@ -84,6 +84,8 @@ async fn an_open_runs_tail_is_reported_as_unpinned() {
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             )],
         )
@@ -390,7 +392,7 @@ async fn an_export_carries_what_a_reader_needs_to_check_it_without_us() {
         assert!(r["prev_hash"].is_string(), "a record without a link: {r}");
         assert!(r["seq"].is_number(), "a record without its position: {r}");
         assert!(
-            r.get("attestation").is_some(),
+            r.get("signature").is_some(),
             "the signature field is absent rather than null, so a reader cannot \
              tell unsigned history from a field this export forgot: {r}"
         );
@@ -1393,6 +1395,14 @@ impl JournalStore for StaleCheckpoint {
     ) -> Result<Vec<(RunId, u64)>, StoreError> {
         self.inner.recent_runs(after, limit).await
     }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs_from(source, after, limit).await
+    }
     async fn case_history(&self, case: CaseId, limit: usize) -> Result<Vec<Record>, StoreError> {
         self.inner.case_history(case, limit).await
     }
@@ -1693,6 +1703,81 @@ async fn the_case_layer_survives_export_and_restore() {
             .expect("blobs")
             .contains(&Digest::of(b"artifact")),
         "erasure can no longer find the artifact from the case that names it"
+    );
+}
+
+/// **A legal hold survives a disaster recovery.**
+///
+/// A hold is the one thing that makes an erasure fail. A restore that brought
+/// the matter back without it would hand the next retention pass a closed, old,
+/// unheld case — and the pass would erase exactly the matter somebody was
+/// ordered to preserve.
+#[tokio::test]
+async fn a_legal_hold_survives_export_and_restore() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{Case, CaseStatus, CaseVersion, LegalHold, Operator, RunId, Timestamp};
+
+    let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let cases: Arc<dyn CaseStore> = Arc::clone(&origin) as Arc<dyn CaseStore>;
+    let store: Arc<dyn JournalStore> = origin;
+    let opened = Timestamp::from_unix_timestamp(1_600_000_000).expect("instant");
+    let case = agentplane::core::CaseId::generate();
+    cases
+        .import_case(
+            &Case {
+                id: case,
+                kind: "matter".into(),
+                status: CaseStatus::Closed,
+                correlation: Vec::new(),
+                state: json!({}),
+                version: CaseVersion::INITIAL,
+                opened_at: opened,
+                runs: Vec::<RunId>::new(),
+            },
+            &[],
+            &[],
+        )
+        .await
+        .expect("import");
+    let hold = LegalHold {
+        placed_at: Timestamp::from_unix_timestamp(1_700_000_000).expect("instant"),
+        reason: "litigation L-12".into(),
+        by: Operator::authenticated("counsel@example").expect("operator"),
+    };
+    assert!(cases.place_hold(case, &hold).await.expect("hold"));
+
+    let mut bytes = Vec::new();
+    agentplane::export::to_jsonl(&store, Some(&cases), &[], &mut bytes)
+        .await
+        .expect("export");
+    let verified =
+        agentplane::export::verify(std::io::Cursor::new(&bytes), None, &[]).expect("verify");
+    assert!(verified.is_sound(), "{:#?}", verified.findings);
+
+    let fresh = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let fresh_journal: Arc<dyn JournalStore> = Arc::clone(&fresh) as Arc<dyn JournalStore>;
+    let fresh_cases: Arc<dyn CaseStore> = fresh as Arc<dyn CaseStore>;
+    agentplane::export::from_jsonl(
+        &fresh_journal,
+        Some(&fresh_cases),
+        std::io::Cursor::new(&bytes),
+    )
+    .await
+    .expect("restore");
+
+    let now = Timestamp::from_unix_timestamp(1_900_000_000).expect("instant");
+    let plan = agentplane::retention::plan(fresh_cases.as_ref(), now)
+        .await
+        .expect("plan");
+    assert_eq!(
+        plan.held,
+        vec![case],
+        "the restored plane would erase a matter under a preservation order: {plan:?}"
+    );
+    assert_eq!(
+        fresh_cases.hold(case).await.expect("hold"),
+        Some(hold),
+        "the hold came back with a different instant, reason or operator"
     );
 }
 
@@ -2116,6 +2201,8 @@ async fn a_sealing_record_claiming_a_foreign_head_is_caught_offline() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 ),
                 Append::new(
@@ -2461,4 +2548,316 @@ fn deleted_tail(text: &str, victim: &str, genuine: &agentplane::journal::Checkpo
         &serde_json::to_string(&truncated).expect("json"),
     );
     kept.join("\n")
+}
+
+/// Re-link every record in an export after `edit` has rewritten some of them,
+/// so the file is exactly as internally consistent as its writer's own output:
+/// each hash over its own bytes and its predecessor, each sealing record's
+/// `chain_head`, each run block's seal and the header's root. What is left
+/// wrong with the file is only what `edit` did.
+fn relinked(text: &str, mut edit: impl FnMut(&mut Value)) -> String {
+    let mut lines: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("every export line is JSON"))
+        .collect();
+    let mut prev = agentplane::core::Digest::ZERO;
+    let mut block: Option<usize> = None;
+    for at in 0..lines.len() {
+        if lines[at]["kind"] == json!("agentplane.export.run") {
+            prev = agentplane::core::Digest::ZERO;
+            block = Some(at);
+            continue;
+        }
+        if lines[at].get("kind").is_some() {
+            continue;
+        }
+        let value = &mut lines[at];
+        let mut wire: Value =
+            serde_json::from_str(value["raw"].as_str().expect("wire bytes")).expect("json");
+        edit(&mut wire);
+        if wire["kind"] == json!("RunConcluded") {
+            wire["chain_head"] = json!(prev);
+        }
+        let raw = serde_json::to_string(&wire).expect("serialises");
+        let hash = agentplane::core::Digest::chain(prev, raw.as_bytes());
+        value["body"] = wire;
+        value["prev_hash"] = json!(prev);
+        value["hash"] = json!(hash);
+        value["raw"] = json!(raw);
+        prev = hash;
+        if let Some(b) = block
+            && lines[b].get("seal").is_some()
+        {
+            lines[b]["seal"] = json!(hash);
+        }
+    }
+    let mut seals: Vec<(u64, agentplane::core::Digest)> = lines
+        .iter()
+        .filter(|v| v["kind"] == json!("agentplane.export.run"))
+        .filter_map(|v| {
+            Some((
+                v.get("index")?.as_u64()?,
+                serde_json::from_value(v.get("seal")?.clone()).ok()?,
+            ))
+        })
+        .collect();
+    seals.sort_by_key(|(i, _)| *i);
+    let root = agentplane::core::merkle::root(
+        &seals
+            .iter()
+            .map(|(_, s)| agentplane::core::merkle::leaf_hash(s))
+            .collect::<Vec<_>>(),
+    );
+    lines[0]["checkpoint"]["root"] = json!(root);
+    lines
+        .iter()
+        .map(|l| serde_json::to_string(l).expect("serialises"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **A record at a version this build does not write never reaches the store.**
+///
+/// A restore replays each record through `append`, which stamps this build's
+/// own version. A record written at another version was therefore silently
+/// rewritten into one this build does write — a different body, a different
+/// hash — and the store was populated before anything compared the result
+/// with the export. The fixture re-links the chain around the edit, so the
+/// hashes agree with the bytes and only the version is wrong.
+#[tokio::test]
+async fn a_record_at_a_foreign_version_refuses_to_restore_before_any_write() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+    let text = String::from_utf8(out).expect("utf8");
+    let mut rewritten = 0usize;
+    let edited = relinked(&text, |wire| {
+        if wire["kind"] == json!("StepStarted") {
+            wire["v"] = json!(0);
+            rewritten += 1;
+        }
+    });
+    assert_eq!(rewritten, 1, "the fixture rewrote no record");
+
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let refused =
+        agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(edited.as_bytes())).await;
+    let Err(e) = refused else {
+        panic!("a record at version 0 was restored — rewritten at this build's version");
+    };
+    assert!(
+        e.to_string().contains("version"),
+        "the refusal does not name the version: {e}"
+    );
+    assert!(
+        fresh.read(run, 1).await.expect("read").is_empty()
+            && fresh.checkpoint().await.expect("checkpoint").size == 0,
+        "the refusal came after the store was populated"
+    );
+}
+
+/// **A restore refuses a record whose bytes its claimed hash does not cover.**
+///
+/// The restore replays the wire bytes; a line whose bytes were edited and
+/// whose hash was not rebuilds a history the chain never committed to, and
+/// the store was populated before the checkpoint comparison said so.
+#[tokio::test]
+async fn a_record_whose_hash_does_not_cover_its_bytes_refuses_to_restore() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+    let original = String::from_utf8(out).expect("utf8");
+    let text = original.replace("\\\"n\\\":1", "\\\"n\\\":9");
+    assert_ne!(original, text, "the fixture edited nothing");
+
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let refused =
+        agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(text.as_bytes())).await;
+    let Err(e) = refused else {
+        panic!("a record whose hash does not cover its bytes was restored");
+    };
+    assert!(
+        e.to_string().contains("hash"),
+        "the refusal does not name the hash: {e}"
+    );
+    assert!(
+        fresh.read(run, 1).await.expect("read").is_empty(),
+        "the refusal came after the store was populated"
+    );
+}
+
+/// **Bytes that do not hash to their claim are an edit, whatever they parse as.**
+///
+/// A body this build cannot parse is a build skew only when its hash holds —
+/// then the bytes are the ones written, and the parse failure is about the
+/// reader. Parsing first let any replacement that happened not to parse read
+/// as a newer writer rather than as tampering.
+#[tokio::test]
+async fn an_unparseable_record_that_fails_its_hash_is_an_edit_not_a_skew() {
+    let (store, run) = one_run().await;
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &[run], &mut out)
+        .await
+        .expect("export");
+    let text = String::from_utf8(out).expect("utf8");
+    let mut replaced = 0usize;
+    let edited: Vec<String> = text
+        .lines()
+        .map(|line| {
+            let mut value: Value = serde_json::from_str(line).expect("json");
+            if value.get("kind").is_none() && replaced == 0 && value["body"]["seq"] == json!(2) {
+                let raw = r#"{"kind":"EffectDone","v":1,"seq":2,"x":1}"#;
+                value["raw"] = json!(raw);
+                value["body"] = serde_json::from_str(raw).expect("json");
+                replaced += 1;
+            }
+            serde_json::to_string(&value).expect("json")
+        })
+        .collect();
+    assert_eq!(replaced, 1, "the fixture replaced no record");
+
+    let report = agentplane::export::verify(
+        std::io::Cursor::new(edited.join("\n").as_bytes()),
+        None,
+        &[],
+    )
+    .expect("verify");
+    let said = report.findings.join("\n");
+    assert!(
+        said.contains("edited after it was sealed"),
+        "a replaced record was not reported as edited: {said}"
+    );
+    assert!(
+        !said.contains("skew"),
+        "bytes that fail their hash were excused as a newer writer: {said}"
+    );
+}
+
+/// **A prefix anchor is checked against the prefix the file carries.**
+///
+/// An export holds every leaf from position 0, so an anchor smaller than the
+/// file names a tree the file can rebuild: its first `m` leaves. Filing that
+/// comparison as unanswerable let an editor drop an early run, renumber the
+/// rest and rewrite the header, and the file verified against a witness's
+/// checkpoint that the dropped run was part of.
+#[tokio::test]
+async fn a_run_dropped_below_a_prefix_anchor_is_a_finding() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Trivial)
+        .build();
+    let store: Arc<dyn JournalStore> = store;
+    let mut runs = Vec::new();
+    let mut earlier = None;
+    for n in 0..10 {
+        runs.push(
+            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .await
+                .expect("run")
+                .run_id,
+        );
+        if n == 4 {
+            earlier = Some(store.checkpoint().await.expect("checkpoint"));
+        }
+    }
+    let earlier = earlier.expect("a checkpoint at size 5");
+    assert_eq!(earlier.size, 5);
+
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&store, None, &runs, &mut out)
+        .await
+        .expect("export");
+    let text = String::from_utf8(out).expect("utf8");
+    let edited = dropped_and_renumbered(&text, 3);
+
+    let anchors = [agentplane::journal::Anchor::new(
+        earlier.clone(),
+        "witness example.org",
+    )];
+    let blind = agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &[])
+        .expect("verify");
+    assert!(
+        blind.findings.is_empty(),
+        "the edited file is internally consistent by construction: {:#?}",
+        blind.findings
+    );
+    let checked =
+        agentplane::export::verify(std::io::Cursor::new(edited.as_bytes()), None, &anchors)
+            .expect("verify");
+    assert!(
+        !checked.is_sound(),
+        "run 3 of 10 was dropped under a size-5 anchor, and the file verified against it: \
+         {checked:#?}"
+    );
+
+    // The honest file matches the same anchor on its prefix.
+    let honest = agentplane::export::verify(std::io::Cursor::new(text.as_bytes()), None, &anchors)
+        .expect("verify");
+    assert!(
+        honest.is_sound(),
+        "the unedited export failed against a prefix of its own log: {honest:#?}"
+    );
+}
+
+/// Drop the run at log position `victim`, renumber every later position down
+/// by one, and rewrite header and trailer to the shorter log — a file that is
+/// internally perfect.
+fn dropped_and_renumbered(text: &str, victim: u64) -> String {
+    let mut kept: Vec<Value> = Vec::new();
+    let mut skipping = false;
+    let mut dropped_records = 0u64;
+    for line in text.lines() {
+        let mut value: Value = serde_json::from_str(line).expect("json");
+        if value["kind"] == json!("agentplane.export.run") {
+            let index = value["index"].as_u64().expect("a sealed run");
+            skipping = index == victim;
+            if index > victim {
+                value["index"] = json!(index - 1);
+            }
+        } else if value.get("kind").is_some() {
+            skipping = false;
+        }
+        if skipping {
+            if value.get("kind").is_none() {
+                dropped_records += 1;
+            }
+            continue;
+        }
+        kept.push(value);
+    }
+    assert!(dropped_records > 0, "the fixture removed no records");
+    let mut seals: Vec<(u64, agentplane::core::Digest)> = kept
+        .iter()
+        .filter(|v| v["kind"] == json!("agentplane.export.run"))
+        .map(|v| {
+            (
+                v["index"].as_u64().expect("index"),
+                serde_json::from_value(v["seal"].clone()).expect("seal"),
+            )
+        })
+        .collect();
+    seals.sort_by_key(|(i, _)| *i);
+    let leaves: Vec<_> = seals
+        .iter()
+        .map(|(_, s)| agentplane::core::merkle::leaf_hash(s))
+        .collect();
+    kept[0]["checkpoint"]["size"] = json!(leaves.len());
+    kept[0]["checkpoint"]["root"] = json!(agentplane::core::merkle::root(&leaves));
+    let last = kept.len() - 1;
+    for (field, by) in [
+        ("runs_requested", 1),
+        ("runs_exported", 1),
+        ("records", dropped_records),
+    ] {
+        let n = kept[last][field].as_u64().expect("a trailer count");
+        kept[last][field] = json!(n - by);
+    }
+    kept.iter()
+        .map(|v| serde_json::to_string(v).expect("json"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

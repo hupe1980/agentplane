@@ -1,7 +1,7 @@
 //! Live tokens for a human, one journaled answer for the machine.
 //!
 //! ```sh
-//! cargo run --example streaming_run --features redb,testkit
+//! cargo run --example streaming_run --features redb,fake-model
 //! ```
 //!
 //! No API key, no network.

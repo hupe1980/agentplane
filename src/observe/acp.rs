@@ -172,6 +172,13 @@ pub fn step_of(update: &Update) -> Mapped {
                 // recording it.
                 return unrecorded();
             };
+            // An update carries only the fields that changed. One with no
+            // status left the call's status where it was, and recording it as
+            // `Pending` would put a regression on the record that the agent
+            // never reported — the last status recorded is still the true one.
+            if update.session_update == "tool_call_update" && update.status.is_none() {
+                return unrecorded();
+            }
             Mapped::Step {
                 step: ObservedStep::ToolCall {
                     call,

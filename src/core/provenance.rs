@@ -21,7 +21,7 @@
 //! # What the signature covers, and why it is more than the fields
 //!
 //! Signing the identifiers alone would be worse than useless — it would be
-//! *convincing* and wrong. An attestation over `{run, case, effect, agent}` is
+//! *convincing* and wrong. A signature over `{run, case, effect, agent}` is
 //! valid for those identifiers no matter what request it rides on, so anybody
 //! who observes one legitimate call can lift the block and attach it to a
 //! different one. The provenance would verify perfectly on a request the run
@@ -34,7 +34,7 @@
 //!
 //! # What it is still not
 //!
-//! Not authorization. A verified attestation says *who is calling and what they
+//! Not authorization. A verified signature says *who is calling and what they
 //! asked for*; whether they may is the callee's decision, made against its own
 //! policy and the delegation chain. Provenance that authorizes by
 //! existing is a bearer token with extra steps.
@@ -42,7 +42,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::core::{Attestation, CaseId, Digest, EffectKey, RunId, Signer, Verifier, canon};
+use crate::core::{CaseId, Digest, EffectKey, KeySignature, RunId, Signer, Verifier, canon};
 
 /// The `_meta` key prefix this crate writes under.
 ///
@@ -98,7 +98,7 @@ pub struct Provenance {
     /// prove nothing — the same reasoning that keeps unsigned journal records
     /// unsigned rather than self-signed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attestation: Option<Attestation>,
+    pub signature: Option<KeySignature>,
 }
 
 impl Provenance {
@@ -110,7 +110,7 @@ impl Provenance {
             effect,
             dispatch: None,
             agent: agent.into(),
-            attestation: None,
+            signature: None,
         }
     }
 
@@ -147,7 +147,7 @@ impl Provenance {
     /// ordering, for the reason recorded against `core::canon`: map order is not
     /// something to inherit from a dependency's feature flags.
     ///
-    /// `target` and `arguments` are what bind the attestation to *this call*.
+    /// `target` and `arguments` are what bind the signature to *this call*.
     #[must_use]
     pub fn payload(&self, target: &str, arguments: &Value) -> Digest {
         let claim = json!({
@@ -183,7 +183,7 @@ impl Provenance {
     /// Sign this block for one specific call.
     #[must_use]
     pub fn seal(mut self, signer: &dyn Signer, target: &str, arguments: &Value) -> Self {
-        self.attestation = Some(signer.attest(&self.signing_input(target, arguments)));
+        self.signature = Some(signer.signature_over(&self.signing_input(target, arguments)));
         self
     }
 
@@ -194,7 +194,7 @@ impl Provenance {
     /// answer to the only question being asked, which is *may I act on this*.
     #[must_use]
     pub fn verify(&self, verifier: &dyn Verifier, target: &str, arguments: &Value) -> bool {
-        let Some(a) = &self.attestation else {
+        let Some(a) = &self.signature else {
             return false;
         };
         verifier.verify(
@@ -214,9 +214,9 @@ impl Provenance {
         }
         m.insert(format!("{NS}effect_key"), json!(self.effect.to_string()));
         m.insert(format!("{NS}agent"), json!(self.agent));
-        if let Some(a) = &self.attestation {
+        if let Some(a) = &self.signature {
             m.insert(
-                format!("{NS}attestation"),
+                format!("{NS}signature"),
                 serde_json::to_value(a).unwrap_or(Value::Null),
             );
         }
@@ -248,8 +248,8 @@ impl Provenance {
                 EffectKey::from_hex(raw.strip_prefix("ek:").unwrap_or(&raw)).ok()?
             },
             agent: s("agent")?,
-            attestation: meta
-                .get(&format!("{NS}attestation"))
+            signature: meta
+                .get(&format!("{NS}signature"))
                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
         })
     }
@@ -297,11 +297,11 @@ mod tests {
 
     /// **The property the whole design turns on.**
     ///
-    /// An attestation over the identifiers alone would be valid on any request,
+    /// A signature over the identifiers alone would be valid on any request,
     /// so anybody observing one legitimate call could lift the block onto a
     /// different tool. Binding the target is what stops that.
     #[test]
-    fn an_attestation_cannot_be_lifted_onto_another_tool() {
+    fn a_signature_cannot_be_lifted_onto_another_tool() {
         let args = json!({ "amount": 1 });
         let p = block().seal(&Stub, "reports.read", &args);
         assert!(
@@ -313,11 +313,11 @@ mod tests {
 
     /// And the arguments, for the same reason one step further in.
     #[test]
-    fn an_attestation_cannot_be_lifted_onto_other_arguments() {
+    fn a_signature_cannot_be_lifted_onto_other_arguments() {
         let p = block().seal(&Stub, "billing.transfer", &json!({ "amount": 1 }));
         assert!(
             !p.verify(&Stub, "billing.transfer", &json!({ "amount": 1_000_000 })),
-            "the amount changed and the attestation still verified"
+            "the amount changed and the signature still verified"
         );
     }
 
@@ -337,7 +337,7 @@ mod tests {
         let one = block().seal(&Stub, "t", &args);
         let two =
             Provenance::new(RunId::generate(), key(0), "auditor@2.0.0").seal(&Stub, "t", &args);
-        assert_ne!(one.attestation, two.attestation);
+        assert_ne!(one.signature, two.signature);
     }
 
     #[test]
@@ -380,13 +380,13 @@ mod tests {
 
     /// A block whose signature was stripped in transit must not read as absent.
     #[test]
-    fn a_stripped_attestation_does_not_verify() {
+    fn a_stripped_signature_does_not_verify() {
         let args = json!({});
         let p = block().seal(&Stub, "t", &args);
         let mut meta = p.to_meta();
-        meta.remove("io.github.hupe1980.agentplane/attestation");
+        meta.remove("io.github.hupe1980.agentplane/signature");
         let back = Provenance::from_meta(&meta).expect("still parses");
-        assert!(back.attestation.is_none());
+        assert!(back.signature.is_none());
         assert!(!back.verify(&Stub, "t", &args));
     }
 }

@@ -1230,6 +1230,103 @@ async fn a_zero_egress_ceiling_still_permits_a_read() {
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
+/// A provider that counts that it was asked, and answers.
+#[derive(Debug)]
+struct CountingModel(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl agentplane::model::ModelProvider for CountingModel {
+    async fn complete(
+        &self,
+        request: agentplane::model::Request<'_>,
+    ) -> Result<agentplane::model::Completion, agentplane::model::ModelError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let _ = request;
+        Ok(agentplane::model::Completion {
+            text: "ok".to_owned(),
+            model: None,
+            tool_calls: Vec::new(),
+            usage: agentplane::model::Usage::default(),
+            stop_reason: Some("end_turn".to_owned()),
+            truncated: false,
+            structured: None,
+            continuation: None,
+        })
+    }
+}
+
+/// A two-byte prompt continuing a megabyte of tool output.
+#[derive(Debug)]
+struct Continues(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl Skill for Continues {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("continues").provides("demo.continue")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let exchange = agentplane::model::ToolExchange::ok(
+            agentplane::model::ToolCall {
+                id: "c1".to_owned(),
+                name: "export".to_owned(),
+                arguments: json!({}),
+            },
+            json!({ "rows": "r".repeat(1_000_000) }),
+        );
+        let provider: Arc<dyn agentplane::model::ModelProvider> =
+            Arc::new(CountingModel(Arc::clone(&self.0)));
+        cx.sink_with(&Tainted::trusted(json!("hi")), |prompt| {
+            agentplane::model::ModelCall::new(
+                provider,
+                agentplane::model::ModelId::new("custom", "m"),
+                prompt,
+            )
+            .continuing([exchange])
+        })
+        .await?;
+        Ok(Outcome::done(Tainted::trusted(json!({ "done": true }))))
+    }
+}
+
+/// **A model call is measured by what it sends, not by its prompt.**
+///
+/// The prompt is what the sink gate binds, and a tool-loop turn's prompt is
+/// two bytes while its request carries every earlier tool result. Measured by
+/// the prompt, a megabyte left the plane under a two-kilobyte ceiling.
+#[tokio::test]
+async fn a_model_calls_tool_results_count_against_the_egress_ceiling() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .budget(Budget::unlimited().egress_bytes(2_000))
+        .skill(Continues(Arc::clone(&calls)))
+        .build();
+
+    let out = rt
+        .run("demo.continue", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "a megabyte of tool output was sent under a two-kilobyte egress ceiling"
+    );
+    match &out.status {
+        RunStatus::Exhausted(agentplane::core::BudgetExceeded::Egress { attempted, .. }) => {
+            assert!(
+                *attempted > 1_000_000,
+                "the refusal must name what the request carries: {attempted}"
+            );
+        }
+        other => panic!("expected an egress exhaustion, got {other:?}"),
+    }
+}
+
 /// **A replayed run reaches the same egress tally as the original.**
 ///
 /// The figure is recomputed from the effect rather than read back from the

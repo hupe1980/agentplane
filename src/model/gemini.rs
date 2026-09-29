@@ -94,8 +94,10 @@
 //! What is
 //! specific here is the success envelope: a `finishReason` of `MAX_TOKENS` is a
 //! truncated answer reported through [`Completion::truncated`] rather than as a
-//! silently shortened string; `SAFETY`, `RECITATION` and `PROHIBITED_CONTENT`
-//! are **metered** declines, because deciding to stop cost whatever it cost;
+//! silently shortened string; `STOP` is the only other reason read as an answer,
+//! and every other one — `SAFETY`, `OTHER`, `MALFORMED_FUNCTION_CALL`, a reason
+//! not yet invented — is a **metered** decline, because deciding to stop cost
+//! whatever it cost;
 //! and a candidate with no parts at all is a loud `Unusable` rather than an
 //! empty answer.
 
@@ -193,7 +195,7 @@ impl HarmBlockThreshold {
 ///   one a `stream: true` deployment loses.
 ///
 /// Deliberately not a default. An empty set means *the provider's defaults*,
-/// which is what every deployment had before this existed, and inventing a
+/// which is what a deployment gets that configures none, and inventing a
 /// house policy here would be this crate deciding a question it has no standing
 /// to decide.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -746,23 +748,26 @@ impl Gemini {
             .get("finishReason")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        let truncated = finish.as_deref() == Some("MAX_TOKENS");
-
-        // It generated and then stopped for a reason that is not an answer.
-        // Metered, because deciding cost whatever it cost — the same rule the
-        // Anthropic driver applies to a `refusal` stop reason.
-        if let Some(reason) = finish.as_deref()
-            && matches!(
-                reason,
-                "SAFETY" | "RECITATION" | "PROHIBITED_CONTENT" | "BLOCKLIST" | "SPII"
-            )
-        {
-            return Err(ModelError::Unusable {
-                model: model.clone(),
-                usage,
-                detail: format!("generation stopped: {reason}"),
-            });
-        }
+        // An allowlist: `STOP` is an answer, `MAX_TOKENS` a typed truncation,
+        // and every other reason — a filter, `OTHER`, a malformed or
+        // unexpected tool call, a reason this driver has never heard of — is
+        // generation that ended without one. Metered, because deciding cost
+        // whatever it cost. A denylist here passes the next reason Google adds
+        // as a complete answer.
+        let truncated = match finish.as_deref() {
+            Some("STOP") => false,
+            Some("MAX_TOKENS") => true,
+            other => {
+                return Err(ModelError::Unusable {
+                    model: model.clone(),
+                    usage,
+                    detail: format!(
+                        "generation stopped: {}",
+                        other.unwrap_or("no finishReason, so completeness is unknown")
+                    ),
+                });
+            }
+        };
 
         let content = candidate.get("content").cloned().unwrap_or(Value::Null);
         let parts = content
@@ -848,7 +853,10 @@ impl Gemini {
         };
         Usage {
             input_tokens: count("promptTokenCount"),
-            output_tokens: count("candidatesTokenCount") + count("thoughtsTokenCount"),
+            // Saturating: both counts are whatever the response said, and a
+            // wrapped sum reads an astronomical bill as a free one.
+            output_tokens: count("candidatesTokenCount")
+                .saturating_add(count("thoughtsTokenCount")),
             cache_read_tokens: count("cachedContentTokenCount"),
             cache_write_tokens: 0,
             minor_units: 0,
@@ -909,7 +917,9 @@ impl Gemini {
         while let Some(chunk) = body.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
-                Err(e) => return Err(severed(model, &acc, &e.to_string())),
+                Err(e) => {
+                    return Err(severed(model, &acc, &crate::netguard::transport_text(&e)));
+                }
             };
             // Charged before the chunk is kept: what the ceiling bounds is
             // what this process holds, not what it has already held. The
@@ -1125,7 +1135,6 @@ impl ModelProvider for Gemini {
                 SchemaMode::Native => "native",
                 SchemaMode::ForcedTool => "forced-tool",
             },
-            "timeout_ms": u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
             // Identity, not decoration: loosening a threshold changes what
             // governed the call, so a replay of history written under the
             // stricter one reports divergence rather than answering under the

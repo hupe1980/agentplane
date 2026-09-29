@@ -152,7 +152,7 @@ src/
              the provider drivers, each with a streaming twin, sit behind
              features (`providers` for Anthropic, OpenAI, Gemini and
              Chat Completions; `bedrock` for Bedrock — both off by default)
-  testkit/   fault injection, a signer that mints its own attestations, store
+  testkit/   fault injection, a stub signer that proves nothing, store
              conformance batteries and shared assertions (feature `testkit`,
              off by default, and no shipped feature enables it) — for this
              crate's assurance layers and for embedders testing their own
@@ -201,15 +201,6 @@ The same hard boundary applies to authorization. Admission records a structured
 policy-bundle identity covering rules, schema, static entities, adapter
 configuration/extensions, and evaluator semantics. An open run may resume only
 under that exact bundle because resume can dispatch past the recorded prefix.
-
-**And to the declaration, on the same terms.** A declarative agent's behaviour
-*is* its manifest, so a resume under an edited one runs a different program over
-the first one's journal. The digest is recorded at admission, so the resume
-compares it and refuses by name — *the declaration for `x` changed: admitted
-under …, and this plane holds …* — rather than letting replay discover the same
-fact later as two differing effect keys. A coded skill has no such handle: its
-behaviour is the embedder's binary, which this crate cannot identify and does
-not claim to, and there divergence is the answer.
 Dynamic request facts are not bundle inputs; they stay in each policy request.
 An effect's request carries the run, step, tenant, whether it mutates, the
 arguments — and, when the call came through `sink`, the **label** of the value it
@@ -218,6 +209,20 @@ rather than only on what it is; without it, provenance and authorization would b
 two graphs that meet only in the checks this crate happens to have written.
 `Strict` performs nothing and therefore neither loads nor compares policy, which
 keeps offline verification independent of historical evaluator availability.
+
+**And to the declaration, on the same terms.** A declarative agent's behaviour
+*is* its manifest, so a resume under an edited one runs a different program over
+the first one's journal. The digest is recorded at admission, so the resume
+compares it and refuses by name — *the declaration for `x` changed under an open
+run: admitted under …, and this plane holds …* — rather than letting replay
+discover the same fact later as two differing effect keys. Either refusal is
+journaled as the run's **quarantine**, because the resumes that meet it are
+mostly unattended — a timer's wake, an event's delivery, the recovery sweep — and
+an error there reaches nobody. Quarantined, the run is listed and counted, and
+both answers work: reopen it on a plane holding the recorded revision, or
+abandon it. A coded skill has no such handle: its behaviour is the embedder's
+binary, which this crate cannot identify and does not claim to, and there
+divergence is the answer.
 
 **A succeeded run is closed to resume**, and so is a cancelled or abandoned one.
 Succeeded means nothing is outstanding, and re-executing would repeat work that
@@ -249,27 +254,21 @@ Every hash — record hashes, effect keys, plan digests — is taken over canoni
 bytes, and `core::canon` produces that form itself: object keys are sorted at
 serialization time.
 
-It did not always. It relied on `serde_json::Map` being a `BTreeMap`, with a
-comment in `Cargo.toml` saying `preserve_order` must never be enabled. That is
-unenforceable. Cargo unifies features across the entire dependency graph, so the
-flag is not this crate's to refuse — adding `cedar-policy`, which enables it,
-turned it on for everyone.
+It does not rely on `serde_json::Map` being a `BTreeMap`. Cargo unifies
+features across the entire dependency graph, so `serde_json/preserve_order` is
+not this crate's to refuse — `cedar-policy` enables it. With it on, an
+insertion-ordered form would give `{"b":1,"a":2}` and `{"a":2,"b":1}`
+**different effect keys**: two runs performing the same call would fail to
+recognise each other's work, and exactly-once would stop holding in the
+direction that issues a second payment. Output is byte-identical whether
+`preserve_order` is on or off — checked by deriving effect keys under both
+builds and diffing.
 
-The effect was measured, not theorised. Before the fix, with `cedar` enabled, the
-same object built as `{"b":1,"a":2}` and as `{"a":2,"b":1}` produced **different
-effect keys**. Two runs performing the same call would fail to recognise each
-other's work; exactly-once would stop holding, silently, in the direction that
-issues a second payment.
-
-Sorting explicitly costs nothing and removes the dependency on a flag a stranger
-controls. Output is byte-identical whether `preserve_order` is on or off —
-checked by deriving effect keys under both builds and diffing.
-
-Two consequences worth keeping:
+Two consequences:
 
 * **`tests/guards/layering.rs` does not look for `indexmap` in the lockfile.** That
   question is unanswerable once a legitimate dependency wants the feature. It
-  checks what would actually undo the fix: no code outside
+  checks what would actually break canonical order: no code outside
   `canon` may call `serde_json::to_vec`, because with `preserve_order` on such a
   call takes insertion order into a hash.
 * **CI runs the suite under default features *and* `--all-features`.** They are

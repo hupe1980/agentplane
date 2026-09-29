@@ -213,10 +213,15 @@ And an agent can be **hosted** from the same file — the A2A 1.0 server that
 passes the protocol project's own conformance kit, started without writing Rust:
 
 ```sh
+# `serve` refuses the shipped placeholders and any token under 32 bytes.
+sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+    -e "s/replace-me:ops-alice:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+    examples/serve-tokens.yaml > tokens.yaml
+
 agentplane serve examples/served.yaml \
   --url http://localhost:8080 \
   --policy examples/serve-policy.cedar \
-  --tokens examples/serve-tokens.yaml \
+  --tokens tokens.yaml \
   --store ./served.redb
 ```
 
@@ -224,15 +229,20 @@ agentplane serve examples/served.yaml \
 says whose plane — one flag apart, because on the shared store several instances
 coexist and so do an operator's verbs and a serving process.
 
+Every verb exits by one table — `0` ok, `1` a finding or a negative answer, `2`
+a command it refuses, `3` a run waiting, `4` a store or network it could not
+use, `5` a partial answer — printed at the foot of `agentplane --help`
+([exit statuses](https://hupe1980.github.io/agentplane/docs/operations/#exit-statuses)).
+
 Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too, on
 its **own** listener, off unless asked for, and separated from the peer surface
 by *policy* — the example bundle gives `peer` the A2A actions and `operator`
-the API ones it uses, not the whole vocabulary — rather than by the port. It is an HTTP API rather than a console: **anything holding a
-delegation that carries the verbs can drive it**, and who is acting comes from
-the authenticated identity, never from the request body — the decision type has
-no actor field to spoof. It serves the worklist and task
-decisions, plus the backlogs an on-call person asks for by question rather than
-by id: what is quarantined, what is
+the API ones it uses, not the whole vocabulary — rather than by the port. It is
+an HTTP API rather than a console: **anything holding a delegation that carries
+the verbs can drive it**, and who is acting comes from the authenticated
+identity, never from the request body — the decision type has no actor field to
+spoof. It serves the worklist and task decisions, plus the backlogs an on-call
+person asks for by question rather than by id: what is quarantined, what is
 escalated, which obligations were missed, which messages reached nobody, which
 webhook receivers stopped accepting, **what is executing right now** and **what
 is stopped**
@@ -265,7 +275,8 @@ same behaviour, and a server that authenticates nobody has no actor to record a
 decision against. A token may carry its caller's own `scope` and `not_after`;
 every run that caller starts is then admitted under a chain rooted at the
 caller — checked against the plan, refused once expired — and the journal
-names the caller, never the plane, as who the run acted for. Needs
+names the caller, never the plane, as who the run acted for. A token with
+neither is bounded by the plane's chain but holds none of its authority. Needs
 `--features cli,a2a-server,cedar`, or the `:full` image.
 
 New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/docs/getting-started/)**
@@ -279,14 +290,15 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🗂️ | **Cases, not long-lived workflows** — runs stay minutes, business processes span months, so a deploy never migrates an in-flight workflow. Admission claims an idempotency key in the transaction that writes the first record, so a redelivery is answered with the original run |
 | 🛡️ | **Policy before live dispatch** — a total, I/O-free gate; denials are journaled, strict replay never re-judges history, and plan authority is checked before step 1 |
 | 🏷️ | **Field-level information flow** — outbound arguments carry hierarchical provenance, so an authority-bearing field can require a trusted or named source while ordinary content stays untrusted. Volume is the axis a label lacks, so the size crossing each sink is journaled and `max_egress_bytes` bounds it |
-| 💸 | **Budgets and tenant quotas that bind** — a failed model call is billed for what it burned, because the provider bills for it too, and a replayed run reaches the same tally at the same point → [budgets](https://hupe1980.github.io/agentplane/docs/plans-cases/#budgets) |
+| 💸 | **Budgets and tenant quotas that bind** — a failed model call is billed for what it burned, because the provider bills for it too; a replayed run reaches the same tally at the same point; and a tenant's period reserves each run's worst case at admission, so suspended and concurrent runs cannot carry it past its ceiling → [budgets](https://hupe1980.github.io/agentplane/docs/plans-cases/#budgets) |
 | 🧬 | **Effects that take together, or not at all** — each reversible member records the concrete call that undoes it, built from what that call *actually returned*; an irreversible send is **deferred** to commit, so an aborted group never sends it → [effects](https://hupe1980.github.io/agentplane/docs/effects/) |
-| 👤 | **Human oversight on the *call*, not a summary of it** — a task carries the exact tool and arguments about to be dispatched, and a read-only `preview` puts *four thousand records* on the reviewer's screen instead of `older_than: "2024-01-01"` → [worklists](https://hupe1980.github.io/agentplane/docs/plans-cases/#human-tasks) |
+| 👤 | **Human oversight on the *call*, not a summary of it** — a task carries the exact tool and arguments about to be dispatched, and a read-only `preview` puts *four thousand records* on the reviewer's screen instead of `older_than: "2024-01-01"`. Characters that render as nothing are shown escaped, a word mixing alphabets is flagged, and a proposal the plane cannot open is withheld rather than approved → [what a reviewer is shown](https://hupe1980.github.io/agentplane/docs/security/#what-a-reviewer-is-shown) |
 | 🔑 | **Erasure that reaches the backups** — payload bytes are sealed under a per-case key the crate never holds, so erasing a case destroys the key and last hour's backup with it. The chain commits to the **ciphertext**, so an auditor with no keys still verifies the run — and a legal hold refuses the sweep for a matter you must preserve → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
-| 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety*, and the run is journaled and deterministically replayable |
+| 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety*, and the run is journaled and deterministically replayable — under an edited file too: `replay --strict` names the first effect the edit changes and both digests, from a store or an export, with no provider credential → [replaying an edited declaration](https://hupe1980.github.io/agentplane/docs/operations/#strict-replay) |
 
-Ten rows, not the inventory. The full surface — the export/audit/restore
-toolchain, a durable manifest registry with an enumerable inventory, typed
+A selection, not the inventory. The full surface — the export/audit/restore
+toolchain, `policy check` re-deriving an export's policy verdicts offline and
+measuring a candidate bundle against them, a durable manifest registry with an enumerable inventory, typed
 release, standing authorities, effect groups that commit with the journal,
 batch runs over 10⁵ items with per-item journals and an item-granular resume,
 the scoped emergency stop, the audited sweeper, a scheduled recovery drill, a
@@ -324,8 +336,8 @@ What is deliberately **not** built, and what will move →
 | ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability |
 | ⚖️ | [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) — EU AI Act obligation by obligation, and what is missing |
 | 📋 | [Status](https://hupe1980.github.io/agentplane/docs/status/) — what is pre-alpha, what to pin, what is deliberately absent |
-| ⬆️ | [Upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) — what breaks between pre-alpha releases, and the shortest correct fix |
-| 📜 | [Changelog](CHANGELOG.md) — what changed and when, including every mechanism's reasoning as it landed |
+| ⬆️ | [Upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) — what a hard cut means, and moving a plane to a new build |
+| 📜 | [Changelog](CHANGELOG.md) — what changed, when, and what to do about it |
 | 🤝 | [Contributing](CONTRIBUTING.md) — the assurance ladder, and how to run it |
 
 ## 🧪 Assurance
@@ -340,7 +352,7 @@ just ci-full      # the above, plus TLA+ specs and the full mutation sweep
 python3 tools/mutants.py <name> --verify   # break one guarantee, run its test
 ```
 
-Two are unusual enough to name:
+The unusual ones:
 
 **🔬 Formal specs.** TLA+ specifications are model-checked on every push — the
 effect protocol, effect groups, retry safety, sagas, fencing, authorization,
@@ -387,8 +399,8 @@ tree size with two different roots is a split view no single anchor exhibits.
 official [a2a-tck](https://github.com/a2aproject/a2a-tck) against this crate's
 A2A server on a live socket. Every other A2A test drives this server with this
 crate's own client, which proves symmetry, not conformance — a client and
-server written from the same misreading agree everywhere. The kit's first run
-found five defects no in-repo test could reach.
+server written from the same misreading agree everywhere; the kit is the
+reader that did not.
 
 **🌐 Tests against a real provider.** `just test-live` runs the OpenAI, Gemini
 and `OpenAI`-compatible drivers, plus the embedding wire, against the actual
@@ -409,13 +421,11 @@ reported **weak**, not passing — that usually means the guarantee has no test 
 its own and is being held up by one that could be rewritten without anyone
 noticing what it protected.
 
-This is not decoration. The project shipped an unfalsifiable guarantee once: the
-refusal to replan on untrusted data was implemented, tested, and green — and
-deleting it would have failed no test, because the fixtures laundered the taint
-before it reached the check. It was found by accident. The sweep is so the next
-one is not.
+A guarantee can be implemented, tested and green while deleting it fails no
+test — a fixture that launders a value before it reaches the check is enough.
+Only removing the guarantee shows that, so the sweep removes each one.
 
-It runs on **every push**, sharded ten ways. `MUTANTS_SHARD=k/n` takes a
+It runs on **every push**, sharded across a CI matrix. `MUTANTS_SHARD=k/n` takes a
 contiguous slice of a list grouped by the feature set each mutation builds
 under, cut on **measured seconds rather than count** — a mutation checked by a
 library unit test costs six times one checked in an integration binary, and a

@@ -81,15 +81,25 @@ fi
 # built in, the image has to prove it can actually host an agent.
 if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
   echo "==> the full image serves an A2A peer"
-  cid=$(docker run -d --rm -p 18080:8080 -p 19090:9090 -v "$ROOT/examples:/work:ro" "$IMAGE" \
+  # The shipped token file holds placeholders `serve` refuses, so the smoke
+  # test does what the file tells a reader to: generate the two tokens.
+  PEER_TOKEN="$(openssl rand -hex 32)"
+  OPS_TOKEN="$(openssl rand -hex 32)"
+  secrets="$(mktemp -d -t agentplane-tokens-XXXX)"
+  sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$PEER_TOKEN/" \
+      -e "s/replace-me:ops-alice:openssl-rand-hex-32/$OPS_TOKEN/" \
+      "$ROOT/examples/serve-tokens.yaml" >"$secrets/tokens.yaml"
+  chmod 0644 "$secrets/tokens.yaml"
+  cid=$(docker run -d --rm -p 18080:8080 -p 19090:9090 -v "$ROOT/examples:/work:ro" \
+          -v "$secrets:/secrets:ro" "$IMAGE" \
           serve /work/served.yaml --addr 0.0.0.0:8080 --url http://localhost:18080 \
-          --policy /work/serve-policy.cedar --tokens /work/serve-tokens.yaml \
+          --policy /work/serve-policy.cedar --tokens /secrets/tokens.yaml \
           --operator-addr 0.0.0.0:9090 --push-host hooks.example.com \
           --store /tmp/served.redb)
   # `--store` needs a writable path, so this one is deliberately *not*
   # `--read-only`: a served task's id is a promise it can be fetched again, and
   # the CLI refuses an in-memory journal for exactly that reason.
-  trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+  trap 'docker rm -f "$cid" >/dev/null 2>&1 || true; rm -rf "$secrets"' EXIT
   for _ in $(seq 1 60); do
     curl -sf -o /dev/null "http://127.0.0.1:18080/.well-known/agent-card.json" && break
     sleep 1
@@ -105,14 +115,14 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
   grep -q '"error"' <<<"$anon" || { echo "REFUSED: an unauthenticated call was accepted: $anon"; exit 1; }
 
   ok=$(curl -sf -X POST "http://127.0.0.1:18080/a2a" -H 'content-type: application/json' \
-         -H 'a2a-version: 1.0' -H 'authorization: Bearer a-long-random-string' -d "$rpc")
+         -H 'a2a-version: 1.0' -H "authorization: Bearer $PEER_TOKEN" -d "$rpc")
   grep -q 'TASK_STATE_COMPLETED' <<<"$ok" || {
     echo "REFUSED: the served run did not complete: $ok"; docker logs "$cid"; exit 1; }
   # I13 through a shipped binary: the conclusion is *queryable* by whoever has
   # to clear it, not merely emitted. Until `--operator-addr` there was no way to
   # ask a running plane what it had concluded without writing Rust.
   runs=$(curl -sf "http://127.0.0.1:19090/runs?outcome=succeeded" \
-           -H 'authorization: Bearer another-long-random-string') || {
+           -H "authorization: Bearer $OPS_TOKEN") || {
     echo "REFUSED: the operator surface did not answer"; docker logs "$cid"; exit 1; }
   grep -q 'run_' <<<"$runs" || { echo "REFUSED: the run it just completed is not listed: $runs"; exit 1; }
 
@@ -120,12 +130,12 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
   # token reaching the operator socket must still be refused, or the separation
   # is a firewall rule somebody can misconfigure rather than a rule.
   leak=$(curl -s "http://127.0.0.1:19090/runs?outcome=succeeded" \
-           -H 'authorization: Bearer a-long-random-string')
+           -H "authorization: Bearer $PEER_TOKEN")
   grep -q 'run_' <<<"$leak" && { echo "REFUSED: a peer token listed runs: $leak"; exit 1; }
 
   # The converse, so the separation is not one-directional.
   cross=$(curl -s -X POST "http://127.0.0.1:18080/a2a" -H 'content-type: application/json' \
-            -H 'a2a-version: 1.0' -H 'authorization: Bearer another-long-random-string' -d "$rpc")
+            -H 'a2a-version: 1.0' -H "authorization: Bearer $OPS_TOKEN" -d "$rpc")
   grep -q '"error"' <<<"$cross" || { echo "REFUSED: an operator token sent a message: $cross"; exit 1; }
 
   # Push: the card must *claim* it, and the grant must *bite*. Advertising a
@@ -137,11 +147,12 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
 
   reg='{"jsonrpc":"2.0","id":"9","method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"hi"}],"messageId":"push-1"},"configuration":{"taskPushNotificationConfig":{"url":"https://evil.example.net/hook"}}}}'
   refused=$(curl -s -X POST "http://127.0.0.1:18080/a2a" -H 'content-type: application/json' \
-              -H 'a2a-version: 1.0' -H 'authorization: Bearer a-long-random-string' -d "$reg")
+              -H 'a2a-version: 1.0' -H "authorization: Bearer $PEER_TOKEN" -d "$reg")
   grep -q 'does not permit webhooks' <<<"$refused" || {
     echo "REFUSED: a webhook to an ungranted host was accepted: $refused"; exit 1; }
 
   docker rm -f "$cid" >/dev/null 2>&1 || true
+  rm -rf "$secrets"
   trap - EXIT
   echo "    served a card, refused an anonymous call, completed an authorized one,"
   echo "    listed the conclusion to an operator, kept the two roles apart, and"

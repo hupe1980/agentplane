@@ -103,6 +103,21 @@ pub enum BlobError {
     /// reached, and what came back was unreadable.
     #[error("blob at {digest}: the bytes are gone and their tombstone does not read ({detail})")]
     UnreadableTombstone { digest: String, detail: String },
+
+    /// Sealed bytes are stored there and did not open, for a cause that is
+    /// neither an erasure nor damage.
+    ///
+    /// A retired wrapping-key version, an envelope written by a build that
+    /// reads another construction, or a header this build cannot parse. The
+    /// first two are reversible — lower the key service's version floor, run
+    /// the other build — and the third cannot be told apart from damage here,
+    /// which the detail says. Folded into [`Corrupt`](Self::Corrupt) it pages
+    /// somebody about tampering; folded into [`Backend`](Self::Backend) it
+    /// reads as an outage that retrying will clear.
+    #[error(
+        "blob at {digest}: the sealed bytes did not open, and no erasure explains it: {detail}"
+    )]
+    Unopened { digest: String, detail: String },
 }
 
 /// Why an erasure did not happen.
@@ -341,7 +356,9 @@ pub trait BlobStore: Send + Sync + Debug {
 ///
 /// # Errors
 ///
-/// If the case's blob list cannot be read, or a blob cannot be expired.
+/// [`EraseError::Store`] carrying [`StoreError::NotFound`](crate::core::StoreError::NotFound)
+/// if the case does not exist, and an error if the case's blob list cannot be
+/// read or a blob cannot be expired.
 pub async fn erase_case(
     blobs: Option<&dyn BlobStore>,
     cases: &dyn crate::case::CaseStore,
@@ -367,11 +384,17 @@ pub async fn erase_case(
     // already selects closed cases and documents why; stated only there, it
     // held for exactly as long as nothing else called this function — and the
     // Article 17 path does, naming a matter rather than a window.
-    if let Some(open) = cases
-        .case(case)
-        .await?
-        .filter(|c| c.status != crate::core::CaseStatus::Closed)
-    {
+    //
+    // A case this plane does not hold is refused: answering `Ok(0)` would read
+    // as a matter that stored nothing and was erased, closing a request whose
+    // real matter is untouched.
+    let found = cases.case(case).await?;
+    if found.is_none() {
+        return Err(EraseError::Store(crate::core::StoreError::NotFound(
+            case.to_string(),
+        )));
+    }
+    if let Some(open) = found.filter(|c| c.status != crate::core::CaseStatus::Closed) {
         return Err(EraseError::CaseStillOpen {
             case: case.to_string(),
             status: format!("{:?}", open.status).to_lowercase(),

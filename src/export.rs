@@ -123,10 +123,12 @@ pub struct ExportedRecord<'r> {
     pub body: crate::journal::RecordBody,
     pub prev_hash: &'r crate::core::Digest,
     pub hash: &'r crate::core::Digest,
-    /// Present only where the plane was configured to sign. `None` is an
-    /// ordinary state and is emitted as such rather than omitted, so a reader
-    /// can tell *unsigned* from *a field this export forgot*.
-    pub attestation: Option<&'r crate::core::Attestation>,
+    /// The plane's workload-key signature over this record's chain hash — who
+    /// wrote the record, not a hardware attestation of where. Present only
+    /// where the plane was configured to sign. `None` is an ordinary state
+    /// and is emitted as such rather than omitted, so a reader can tell
+    /// *unsigned* from *a field this export forgot*.
+    pub signature: Option<&'r crate::core::KeySignature>,
     /// The exact bytes [`hash`](Self::hash) covers, verbatim.
     ///
     /// This is the wire-bytes rule, applied to the export: the chain is over
@@ -155,7 +157,7 @@ impl<'r> ExportedRecord<'r> {
             body,
             prev_hash: &r.prev_hash,
             hash: &r.hash,
-            attestation: r.attestation.as_ref(),
+            signature: r.signature.as_ref(),
             raw: String::from_utf8_lossy(r.raw()),
         })
     }
@@ -201,6 +203,10 @@ pub struct RunBlock {
 /// `blobs` carries digests, never bytes. Presence and integrity of the bytes
 /// are a question about a live blob store, which an offline file cannot
 /// answer and honestly reports as unchecked.
+///
+/// `hold` is always written, `null` for a matter nobody ordered preserved. A
+/// restore that brought a held matter back without its hold would hand the
+/// next retention pass a closed, old, unheld case to erase.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CaseBlock {
     /// Always `"agentplane.export.case"`.
@@ -208,6 +214,8 @@ pub struct CaseBlock {
     pub case: crate::core::Case,
     pub deadlines: Vec<crate::core::Deadline>,
     pub blobs: Vec<crate::core::Digest>,
+    /// The legal hold on this matter: instant, reason and operator.
+    pub hold: Option<crate::core::LegalHold>,
 }
 
 /// The last line of an export: what it contains, and what it does not.
@@ -375,6 +383,7 @@ pub async fn to_jsonl<W: std::io::Write>(
             for case in page {
                 let deadlines = case_store.deadlines(case.id).await.map_err(|e| as_io(&e))?;
                 let blobs = case_store.blobs_of(case.id).await.map_err(|e| as_io(&e))?;
+                let hold = case_store.hold(case.id).await.map_err(|e| as_io(&e))?;
                 writeln!(
                     out,
                     "{}",
@@ -383,6 +392,7 @@ pub async fn to_jsonl<W: std::io::Write>(
                         case,
                         deadlines,
                         blobs,
+                        hold,
                     })?
                 )?;
                 case_count += 1;
@@ -629,10 +639,6 @@ pub fn verify<R: std::io::BufRead>(
         &empty_blocks,
     );
     settle_cases(&mut report, &stamped, &carried, blob_digests);
-    report.not_checked.push(
-        "worklist decisions no run has consumed — a decision recorded against a task and not          yet read back by the run it answers is a store row, not a record, so it does not          survive here. The task re-opens and is decided again under the same four-eyes and          expiry"
-            .to_owned(),
-    );
     Ok(report)
 }
 
@@ -832,6 +838,9 @@ fn read_case_block(
             .findings
             .push("a case block's deadlines are malformed".to_owned());
     }
+    if let Err(e) = case_hold(value) {
+        report.findings.push(e);
+    }
     *blob_digests += value
         .get("blobs")
         .and_then(Value::as_array)
@@ -996,14 +1005,15 @@ struct RunPass {
 /// Three answers, because the size relation decides which applies: an anchor
 /// *above* the file, or of another log, names a history the file cannot be part
 /// of; an anchor *at* the file's size either matches it or names a second
-/// history of that size; and an anchor *below* it might be a prefix — which a
-/// file cannot settle either way, since it carries no consistency proof.
-/// Collapsing the third into the other two is what would let an operator pick
-/// whichever observer their export happens to satisfy.
+/// history of that size; and an anchor *below* it is checked against the
+/// file's own first leaves, which the file carries — a mismatch is a finding,
+/// and a match anchors the prefix and leaves the rest to the header, which is
+/// said.
 fn compare_anchors(
     report: &mut VerifyReport,
     header_seen: bool,
     anchors: &[crate::journal::Anchor],
+    leaves: &[(u64, crate::core::merkle::LeafHash)],
 ) -> Option<Checkpoint> {
     let mut matched = None;
     if !header_seen {
@@ -1041,17 +1051,51 @@ fn compare_anchors(
                     given.root.to_hex(),
                 ));
             }
+        } else if prefix_root(leaves, given.size) != Some(given.root) {
+            report.findings.push(format!(
+                "the checkpoint held by {} commits to the first {} run(s) of log '{}' with \
+                 root {}, and this export's first {} run(s) do not rebuild to it — a run \
+                 inside that prefix was removed, replaced or moved",
+                anchor.obtained_from,
+                given.size,
+                given.origin,
+                given.root.to_hex(),
+                given.size,
+            ));
         } else {
             report.not_checked.push(format!(
-                "the checkpoint held by {} is at size {} and this export is at size {} — a \
-                 file carries no consistency proof, so whether the export extends it was \
-                 not established here. Run `audit` against the store with that checkpoint, \
-                 which can ask the log for the proof",
-                anchor.obtained_from, anchor.checkpoint.size, report.checkpoint.size
+                "the checkpoint held by {} is at size {} and matches this export's first {} \
+                 run(s); the {} after it are held only to the file's own header",
+                anchor.obtained_from,
+                given.size,
+                given.size,
+                report.checkpoint.size - given.size
             ));
         }
     }
     matched
+}
+
+/// The root of the tree of a file's first `size` leaves, when the file carries
+/// exactly the positions `0..size` among them.
+///
+/// An export holds every leaf from position 0, so a checkpoint smaller than
+/// the file is a tree the file can rebuild — no consistency proof is needed
+/// for a reader who holds the leaves themselves. `leaves` is sorted by
+/// position; a missing or duplicated position below `size` answers `None`.
+fn prefix_root(
+    leaves: &[(u64, crate::core::merkle::LeafHash)],
+    size: u64,
+) -> Option<crate::core::Digest> {
+    let size = usize::try_from(size).ok()?;
+    let prefix = leaves.get(..size)?;
+    prefix
+        .iter()
+        .enumerate()
+        .all(|(at, (index, _))| u64::try_from(at) == Ok(*index))
+        .then(|| {
+            crate::core::merkle::root(&prefix.iter().map(|(_, leaf)| *leaf).collect::<Vec<_>>())
+        })
 }
 
 /// The checks that can only be made once the whole file has been read.
@@ -1078,11 +1122,11 @@ fn settle(
     // **Every anchor is consulted, and what cannot be is said.** Three answers,
     // because the size relation decides which one applies: an anchor *above*
     // the file is a log that shrank, an anchor *at* the file's size either
-    // matches it or names a different history, and an anchor *below* it might
-    // be a prefix — which a file cannot prove either way, since it carries no
-    // consistency proof. Collapsing the third into the first two is what lets
-    // an operator pick whichever observer their export happens to satisfy.
-    let matched = compare_anchors(report, header_seen, anchors);
+    // matches it or names a different history, and an anchor *below* it is
+    // rebuilt from the file's own first leaves. Collapsing any of them is what
+    // lets an operator pick whichever observer their export happens to satisfy.
+    leaves.sort_by_key(|(index, _)| *index);
+    let matched = compare_anchors(report, header_seen, anchors, &leaves);
     let against = if let Some(checkpoint) = matched {
         checkpoint
     } else {
@@ -1108,7 +1152,6 @@ fn settle(
     // The tree, rebuilt in log order. This is what notices a whole run dropped
     // from the middle: every per-run chain above still verified, because a chain
     // links records within a run and knows nothing about its neighbours.
-    leaves.sort_by_key(|(index, _)| *index);
     let size = u64::try_from(leaves.len()).unwrap_or(u64::MAX);
     if size == against.size {
         // The positions are part of the claim, not bookkeeping: a checkpoint of
@@ -1235,6 +1278,12 @@ fn read_record(
         return;
     };
     let raw_bytes = raw.as_bytes();
+    // The hash first, then the parse. Bytes that do not hash to their claim
+    // were edited, whatever they parse as; only bytes that do can make a parse
+    // failure a statement about the reader rather than about the file.
+    if crate::core::Digest::chain(pass.prev, raw_bytes) != claimed {
+        return edited_record(raw_bytes, pass, report);
+    }
     // The body verification reads is parsed from the wire bytes — the one
     // source the hash actually covers.
     let body = match serde_json::from_slice::<crate::journal::RecordBody>(raw_bytes) {
@@ -1303,14 +1352,14 @@ fn read_record(
         pass.clean = false;
     }
 
-    let attestation = value
-        .get("attestation")
-        .and_then(|a| serde_json::from_value::<Option<crate::core::Attestation>>(a.clone()).ok())
+    let signature = value
+        .get("signature")
+        .and_then(|a| serde_json::from_value::<Option<crate::core::KeySignature>>(a.clone()).ok())
         .flatten();
     // **Why the failure is matched on rather than summarised.** Not every way
-    // this read fails is an incident. The hash is checked before the body is
-    // parsed, so a record whose bytes were edited fails as `Corrupt` and
-    // everything past that point has bytes the chain commits to — a version
+    // this read fails is an incident. The hash was checked before the body was
+    // parsed, at the top of this function, so every record reaching this point
+    // has bytes the chain commits to — a version
     // this build does not read is then a statement about the reader, not about
     // the file. Collapsing the two spends a tampering verdict on the one
     // artifact this project hands to somebody who does not run it, and an
@@ -1322,17 +1371,20 @@ fn read_record(
     // same struct, so a body this build cannot read has already returned
     // through `unparsed_record`. Only the version survives that gate, because
     // nothing above compares it.
-    match crate::journal::Record::from_stored_attested(
+    match crate::journal::Record::from_stored_signed(
         raw_bytes.to_vec(),
         pass.prev,
         claimed,
-        attestation,
+        signature,
     ) {
         Ok(record) => {
             pass.prev = record.hash;
             pass.resealed.push(record);
         }
-        Err(skew @ crate::core::StoreError::UnknownRecordVersion { .. }) => {
+        // The hash was verified and the body parsed above, so the version is
+        // the one question left unanswered: every failure here is a record at
+        // a version this build does not read.
+        Err(skew) => {
             report.findings.push(format!(
                 "run {current}: record {} is at a version this build does not read, and \
                  its bytes hash as written — this is a build skew rather than an edit: \
@@ -1340,18 +1392,6 @@ fn read_record(
                 pass.last_seq
             ));
             pass.clean = false;
-            pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
-        }
-        Err(_) => {
-            report.findings.push(format!(
-                "run {current}: record {} does not recompute to the hash it carries \
-                 — it was edited after it was sealed",
-                pass.last_seq
-            ));
-            pass.clean = false;
-            // The head walks forward over the bytes actually present, so the
-            // leaf comparison at the end of the block speaks about what this
-            // file carries rather than about the first mismatch.
             pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
         }
     }
@@ -1374,7 +1414,7 @@ fn note_unknown_members(kind: &str, value: &serde_json::Value, report: &mut Veri
     let known: &[&str] = match kind {
         "agentplane.export" => &["kind", "version", "checkpoint", "canon"],
         "agentplane.export.run" => &["kind", "run", "index", "seal"],
-        "agentplane.export.case" => &["kind", "case", "deadlines", "blobs"],
+        "agentplane.export.case" => &["kind", "case", "deadlines", "blobs", "hold"],
         "agentplane.export.end" => &[
             "kind",
             "runs_requested",
@@ -1402,6 +1442,29 @@ fn note_unknown_members(kind: &str, value: &serde_json::Value, report: &mut Veri
             unknown.join(", ")
         ));
     }
+}
+
+/// A record line whose bytes do not hash to the hash it carries.
+///
+/// Filed before any parse: whatever these bytes parse as, they are not the
+/// bytes the chain committed to, so a parse failure here says nothing about
+/// the reader's age.
+fn edited_record(raw_bytes: &[u8], pass: &mut RunPass, report: &mut VerifyReport) {
+    let seq = serde_json::from_slice::<serde_json::Value>(raw_bytes)
+        .ok()
+        .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64))
+        .unwrap_or(pass.last_seq + 1);
+    report.findings.push(format!(
+        "run {}: record {seq} does not recompute to the hash it carries — it was edited \
+         after it was sealed",
+        pass.run
+    ));
+    pass.clean = false;
+    // The head and the sequence walk forward over the bytes actually present,
+    // so the leaf comparison at the end of the block speaks about what this
+    // file carries rather than about the first mismatch.
+    pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
+    pass.last_seq = seq;
 }
 
 /// A record line this reader cannot parse, filed under what that means.
@@ -1491,7 +1554,7 @@ fn finish_run(
     // posture: an unsigned record inside a signed history is the one an
     // attacker who cannot sign would add.
     if let Some(v) = verifier
-        && let Err(e) = crate::journal::Record::verify_attested(
+        && let Err(e) = crate::journal::Record::verify_signed(
             &pass.resealed,
             crate::core::Digest::ZERO,
             v,
@@ -1789,9 +1852,58 @@ pub async fn from_jsonl<R: std::io::BufRead>(
     input: R,
 ) -> Result<RestoreReport, StoreError> {
     let parsed = parse(input).map_err(|e| StoreError::Backend(e.to_string()))?;
+    restore_parsed(store, cases, parsed).await
+}
 
-    // The one check `parse`'s no-checking rule does not cover, because it is
-    // not a soundness question: a format this build does not read cannot be
+/// An export, restored into a store that lives only as long as the process.
+///
+/// The source a strict replay reads when it is handed a file rather than a
+/// plane: every run the file holds, rebuilt through [`from_jsonl`] and so
+/// checked against the file's own checkpoint, with nothing written to disk.
+#[cfg(feature = "redb")]
+#[derive(Debug)]
+pub struct ReplaySource {
+    pub store: Arc<crate::store::RedbStore>,
+    /// The runs the file holds, in the order it lists them.
+    pub runs: Vec<RunId>,
+    pub report: RestoreReport,
+}
+
+/// Restore an export into memory for replay.
+///
+/// # Errors
+///
+/// If the file cannot be read or is refused by [`from_jsonl`], or if the
+/// rebuilt store does not commit to the history the file claims.
+#[cfg(feature = "redb")]
+pub async fn open_for_replay<R: std::io::BufRead>(input: R) -> Result<ReplaySource, StoreError> {
+    let parsed = parse(input).map_err(|e| StoreError::Backend(e.to_string()))?;
+    let runs = parsed.runs.iter().map(|r| r.run).collect();
+    let store = Arc::new(crate::store::RedbStore::open_in_memory()?);
+    let journal = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let cases = Arc::clone(&store) as Arc<dyn crate::case::CaseStore>;
+    let report = restore_parsed(&journal, Some(&cases), parsed).await?;
+    if !report.is_faithful() {
+        return Err(StoreError::Backend(format!(
+            "the export does not rebuild to its own checkpoint: it claims {} records under \
+             root {}, and restoring it produced {} under {}",
+            report.expected.size, report.expected.root, report.rebuilt.size, report.rebuilt.root
+        )));
+    }
+    Ok(ReplaySource {
+        store,
+        runs,
+        report,
+    })
+}
+
+async fn restore_parsed(
+    store: &Arc<dyn JournalStore>,
+    cases: Option<&Arc<dyn crate::case::CaseStore>>,
+    parsed: Parsed,
+) -> Result<RestoreReport, StoreError> {
+    // A check `parse` leaves to its caller, because it is not about any one
+    // line: a format this build does not read cannot be
     // *parsed* completely, and `parse` skips what it does not recognise — so
     // proceeding would restore whatever subset happened to look familiar and
     // report it as the whole file.
@@ -1869,6 +1981,9 @@ pub async fn from_jsonl<R: std::io::BufRead>(
                 case_store
                     .import_case(&block.case, &block.deadlines, &block.blobs)
                     .await?;
+                if let Some(hold) = &block.hold {
+                    case_store.place_hold(block.case.id, hold).await?;
+                }
                 imported += 1;
             }
             not_carried.push(
@@ -1920,6 +2035,45 @@ struct RestoredRun {
     index: Option<u64>,
     outcome: Option<String>,
     bodies: Vec<crate::journal::RecordBody>,
+    /// The chain head over the records read so far, which the next record's
+    /// hash must extend.
+    prev: crate::core::Digest,
+}
+
+/// One record line's body, once its bytes are known to be the ones the chain
+/// committed to and at the version this build writes.
+///
+/// Both are conditions of replay rather than verification. `append` re-derives
+/// each hash from what it is handed and stamps this build's version, so bytes
+/// the claimed hash does not cover would rebuild a history the file never
+/// committed to, and a record at another version would be silently rewritten
+/// at this one — either way into a populated store, before the checkpoint
+/// comparison could say so.
+fn replayable(
+    raw: &[u8],
+    prev: crate::core::Digest,
+    claimed: crate::core::Digest,
+) -> Result<crate::journal::RecordBody, std::io::Error> {
+    crate::journal::Record::from_stored_signed(raw.to_vec(), prev, claimed, None)
+        .map(|record| record.body)
+        .map_err(|e| {
+            std::io::Error::other(match e {
+                StoreError::Corrupt { .. } => format!(
+                    "a record's claimed hash does not cover its wire bytes and the chain \
+                     before it ({e}) — replaying it would rebuild a history the export never \
+                     committed to, so the file is refused before anything is written"
+                ),
+                StoreError::UnknownRecordVersion { .. } => format!(
+                    "a record is at a version this build does not restore ({e}) — `append` \
+                     would rewrite it at this build's version, so the file is refused before \
+                     anything is written"
+                ),
+                other => format!(
+                    "a record line's wire bytes do not parse ({other}) — the record cannot be \
+                     replayed as written, and its display copy is not a substitute"
+                ),
+            })
+        })
 }
 
 struct Parsed {
@@ -1941,21 +2095,78 @@ struct RestoredCase {
     case: crate::core::Case,
     deadlines: Vec<crate::core::Deadline>,
     blobs: Vec<crate::core::Digest>,
+    hold: Option<crate::core::LegalHold>,
+}
+
+/// A case block's hold: `null` for none, a [`LegalHold`](crate::core::LegalHold)
+/// otherwise, and an error when the member is missing or unreadable.
+///
+/// Shared by the verifier and the restore so the two cannot disagree about
+/// what a readable hold is.
+fn case_hold(value: &serde_json::Value) -> Result<Option<crate::core::LegalHold>, String> {
+    let Some(hold) = value.get("hold") else {
+        return Err(
+            "a case block carries no `hold` member, so whether the matter is under \
+                    a legal hold is unknown"
+                .to_owned(),
+        );
+    };
+    serde_json::from_value::<Option<crate::core::LegalHold>>(hold.clone())
+        .map_err(|e| format!("a case block's legal hold is malformed: {e}"))
+}
+
+/// One case block as a restore replays it, or `None` for a malformed block.
+///
+/// Malformed blocks are skipped and found by `verify`, per [`parse`]'s
+/// no-checking rule — except an unreadable hold, which refuses the file.
+fn restored_case(value: &serde_json::Value) -> Result<Option<RestoredCase>, std::io::Error> {
+    use serde_json::Value;
+
+    // A restore that refused the file would refuse the healthy cases too.
+    let (Ok(case), Some(deadlines), Some(blobs)) = (
+        serde_json::from_value::<crate::core::Case>(
+            value.get("case").cloned().unwrap_or(Value::Null),
+        ),
+        value
+            .get("deadlines")
+            .and_then(|d| serde_json::from_value::<Vec<crate::core::Deadline>>(d.clone()).ok()),
+        value
+            .get("blobs")
+            .and_then(|b| serde_json::from_value::<Vec<crate::core::Digest>>(b.clone()).ok()),
+    ) else {
+        return Ok(None);
+    };
+    // Refused before anything is written.
+    let hold = case_hold(value).map_err(|e| {
+        std::io::Error::other(format!(
+            "case {}: {e} — restoring the matter without it would let retention \
+                         erase it, so the file is refused",
+            case.id
+        ))
+    })?;
+    Ok(Some(RestoredCase {
+        case,
+        deadlines,
+        blobs,
+        hold,
+    }))
 }
 
 /// Read an export into the shape a restore replays.
 ///
-/// Deliberately does no *soundness* checking: [`verify`] answers *is this
+/// Checks what replay needs and nothing wider: [`verify`] answers *is this
 /// sound* and this answers *what does it say*. Folding them would make a
 /// restore refuse the very history an operator is trying to recover, at the
 /// moment they most need it — and the right order is restore, then verify the
 /// result against its own checkpoint, which [`from_jsonl`] reports.
 ///
-/// One class of line is a hard error rather than a skip, and it is not a
-/// soundness question: a record line whose wire bytes are missing or do not
-/// parse cannot be *replayed*, only guessed at, and the one available guess —
-/// the editable display copy — is exactly the value the wire-bytes rule
-/// exists to keep out of the rebuilt history.
+/// One class of line is a hard error rather than a skip: a record line that
+/// cannot be *replayed as written*. Its wire bytes must be present and parse —
+/// the one available guess otherwise, the editable display copy, is exactly
+/// the value the wire-bytes rule exists to keep out of the rebuilt history —
+/// and they must be the bytes its hash covers, at the version this build
+/// writes; see [`replayable`]. All of it is decided here, before
+/// [`from_jsonl`] writes anything.
 fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
     use serde_json::Value;
 
@@ -1999,31 +2210,14 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                         index: value.get("index").and_then(Value::as_u64),
                         outcome: None,
                         bodies: Vec::new(),
+                        prev: crate::core::Digest::ZERO,
                     });
                 }
             }
             Some("agentplane.export.case") => {
-                // Malformed blocks are skipped here and found by `verify`,
-                // per this function's no-checking rule: a restore that
-                // refused the file would refuse the healthy cases in it too.
-                let (Ok(case), Some(deadlines), Some(blobs)) = (
-                    serde_json::from_value::<crate::core::Case>(
-                        value.get("case").cloned().unwrap_or(Value::Null),
-                    ),
-                    value.get("deadlines").and_then(|d| {
-                        serde_json::from_value::<Vec<crate::core::Deadline>>(d.clone()).ok()
-                    }),
-                    value.get("blobs").and_then(|b| {
-                        serde_json::from_value::<Vec<crate::core::Digest>>(b.clone()).ok()
-                    }),
-                ) else {
-                    continue;
-                };
-                parsed.cases.push(RestoredCase {
-                    case,
-                    deadlines,
-                    blobs,
-                });
+                if let Some(case) = restored_case(&value)? {
+                    parsed.cases.push(case);
+                }
             }
             Some("agentplane.export.end") => parsed.complete = true,
             // A line carrying a `kind` this build does not recognise is not a
@@ -2032,7 +2226,7 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
             // a record's obligations.
             Some(_) => {}
             _ => {
-                if value.get("attestation").is_some_and(|a| !a.is_null()) {
+                if value.get("signature").is_some_and(|a| !a.is_null()) {
                     parsed.signed += 1;
                 }
                 // The wire bytes are the source of truth, exactly as they are
@@ -2052,19 +2246,24 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                          what the chain hashed, so the file is refused instead of guessed at",
                     ));
                 };
-                let body = serde_json::from_slice::<crate::journal::RecordBody>(raw.as_bytes())
-                    .map_err(|e| {
-                        std::io::Error::other(format!(
-                            "a record line's wire bytes do not parse ({e}) — the record cannot \
-                             be replayed as written, and its display copy is not a substitute"
-                        ))
-                    })?;
-                if let Some(current) = parsed.runs.last_mut() {
-                    if let crate::journal::RecordKind::RunConcluded { outcome, .. } = &body.kind {
-                        current.outcome = Some(outcome.clone());
-                    }
-                    current.bodies.push(body);
+                let Some(claimed) = value
+                    .get("hash")
+                    .and_then(|h| serde_json::from_value::<crate::core::Digest>(h.clone()).ok())
+                else {
+                    return Err(std::io::Error::other(
+                        "a record line carries no hash — nothing ties its bytes to the chain, \
+                         so the file is refused instead of replayed",
+                    ));
+                };
+                let Some(current) = parsed.runs.last_mut() else {
+                    continue;
+                };
+                let body = replayable(raw.as_bytes(), current.prev, claimed)?;
+                current.prev = claimed;
+                if let crate::journal::RecordKind::RunConcluded { outcome, .. } = &body.kind {
+                    current.outcome = Some(outcome.clone());
                 }
+                current.bodies.push(body);
             }
         }
     }

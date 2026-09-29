@@ -679,13 +679,13 @@ fn classify_transport(peer: &PeerId, e: &reqwest::Error) -> PeerError {
     if e.is_connect() {
         return PeerError::Unreachable {
             peer: peer.clone(),
-            detail: format!("could not connect: {e}"),
+            detail: format!("could not connect: {}", crate::netguard::transport_text(e)),
         };
     }
     if e.is_timeout() {
         return PeerError::TimedOut {
             peer: peer.clone(),
-            detail: format!("timed out: {e}"),
+            detail: format!("timed out: {}", crate::netguard::transport_text(e)),
         };
     }
     if e.is_body() || e.is_decode() {
@@ -694,7 +694,10 @@ fn classify_transport(peer: &PeerId, e: &reqwest::Error) -> PeerError {
         // this a timeout would misdirect whoever debugs it.
         return PeerError::InDoubt {
             peer: peer.clone(),
-            detail: format!("the peer answered, and the response could not be read: {e}"),
+            detail: format!(
+                "the peer answered, and the response could not be read: {}",
+                crate::netguard::transport_text(e)
+            ),
         };
     }
     if e.is_request() {
@@ -702,12 +705,15 @@ fn classify_transport(peer: &PeerId, e: &reqwest::Error) -> PeerError {
         // is indistinguishable from none, so this is not `Unreachable`.
         return PeerError::InDoubt {
             peer: peer.clone(),
-            detail: format!("the request failed in flight: {e}"),
+            detail: format!(
+                "the request failed in flight: {}",
+                crate::netguard::transport_text(e)
+            ),
         };
     }
     PeerError::InDoubt {
         peer: peer.clone(),
-        detail: e.to_string(),
+        detail: crate::netguard::transport_text(e),
     }
 }
 
@@ -835,16 +841,12 @@ impl PeerClient for A2aClient {
 
 /// Add `tenant` only when the interface declares one.
 ///
-/// One implementation, because it was written twice as `"tenant": tenant` in a
-/// `json!` — where `None` renders as **`null`**, not as an absent field. A
-/// comment above one of them said "omitted entirely when the interface declares
-/// none", which is what the code was meant to do and not what it did.
-///
-/// `ProtoJSON` omits a field at its default value, and the reference server parses
-/// accordingly: a `null` where a string belongs is a type error, not an absence.
-/// This crate's *own* server accepted it — `serde` reads `null` into an
-/// `Option` as `None` — so every in-repo test agreed with the bug. Only a server
-/// nobody here wrote could find it, which is the whole argument for rung 8.
+/// One implementation, because `"tenant": tenant` in a `json!` renders `None`
+/// as **`null`**, not as an absent field. `ProtoJSON` omits a field at its
+/// default value, and the reference server parses accordingly: a `null` where a
+/// string belongs is a type error, not an absence. This crate's own server
+/// reads `null` into an `Option` as `None`, so only a server nobody here wrote
+/// tells the two apart.
 fn insert_tenant(params: &mut serde_json::Map<String, Value>, tenant: Option<&str>) {
     if let Some(tenant) = tenant {
         params.insert("tenant".into(), json!(tenant));

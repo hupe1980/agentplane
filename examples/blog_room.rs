@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example blog_room --features redb,testkit,manifest
+//! cargo run --example blog_room --features redb,fake-model,manifest
 //! ```
 //!
 //! No API key, no network.

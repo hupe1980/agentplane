@@ -63,7 +63,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::{BatchId, RunId, Spend, StoreError};
+use crate::core::{BatchId, Label, RunId, Spend, StoreError};
 
 /// One unit of work in a batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,14 +78,45 @@ pub struct BatchItem {
     pub key: String,
     /// What the plan receives as run input for this item.
     pub input: Value,
+    /// The input's label, when the source vouches for one.
+    ///
+    /// `None` — the default — admits the item **untrusted**, from the source
+    /// `batch:<batch id>`. A source reading a paged API, a file or somebody
+    /// else's database is the normal case, and an item it produced is data
+    /// from outside the plane: trusted input would reach every mutating sink
+    /// and every protected field with no release on the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<Label>,
 }
 
 impl BatchItem {
+    /// An item admitted untrusted, from the source `batch:<batch id>`.
     pub fn new(key: impl Into<String>, input: Value) -> Self {
         Self {
             key: key.into(),
             input,
+            label: None,
         }
+    }
+
+    /// Admit this item under `label` instead.
+    ///
+    /// The operator's statement about where the source's data came from,
+    /// journaled as the run's input label. `Label::trusted()` is the one to
+    /// think about: it says the plane's own operator produced this input, and
+    /// every taint gate downstream takes that at its word.
+    #[must_use]
+    pub fn labelled(mut self, label: Label) -> Self {
+        self.label = Some(label);
+        self
+    }
+
+    /// The label this item's run is admitted under, in batch `batch`.
+    #[must_use]
+    pub fn admission_label(&self, batch: BatchId) -> Label {
+        self.label.clone().unwrap_or_else(|| {
+            Label::untrusted(crate::core::SourceId::new(format!("batch:{batch}")))
+        })
     }
 }
 
@@ -111,7 +142,13 @@ impl SourceError {
 /// materialised.
 #[async_trait]
 pub trait ItemSource: Send + Sync + Debug {
-    /// The next page of items strictly after `after`, in key order.
+    /// The next page of items strictly after `after`, in strictly increasing
+    /// byte order of [`BatchItem::key`].
+    ///
+    /// Byte order, not a collation or a numeric sort: the resume cursor is the
+    /// greatest finished key compared as bytes, so a page in any other order
+    /// resumes past items that never ran. The driver refuses a page whose keys
+    /// do not strictly increase past `after`. Zero-pad numeric keys.
     ///
     /// Returning fewer than `limit` items does **not** mean the source is
     /// exhausted; returning zero does. The distinction matters for sources that
@@ -147,6 +184,11 @@ pub enum ItemOutcome {
     /// a fault teaches the reader to re-run work that is standing. The string
     /// names the ceiling that was hit.
     Exhausted(String),
+    /// Paused because an authority the item acts under was withdrawn. Not
+    /// terminal, and not `Exhausted`: the work stands as it does at a ceiling,
+    /// but the move is lifting the halt on that subject rather than raising a
+    /// budget. The string names the subject and why it was withdrawn.
+    Withheld(String),
 }
 
 impl ItemOutcome {
@@ -158,6 +200,7 @@ impl ItemOutcome {
             Self::Quarantined(_) => "quarantined",
             Self::Suspended(_) => "suspended",
             Self::Exhausted(_) => "exhausted",
+            Self::Withheld(_) => "withheld",
         }
     }
 
@@ -167,13 +210,14 @@ impl ItemOutcome {
     /// derives its terminal set from — so a query asking *what is still open*
     /// answers from the type rather than from a list of strings beside it.
     #[must_use]
-    pub fn all(detail: String) -> [Self; 5] {
+    pub fn all(detail: String) -> [Self; 6] {
         [
             Self::Succeeded,
             Self::Failed(detail.clone()),
             Self::Quarantined(detail.clone()),
             Self::Suspended(detail.clone()),
-            Self::Exhausted(detail),
+            Self::Exhausted(detail.clone()),
+            Self::Withheld(detail),
         ]
     }
 
@@ -192,7 +236,10 @@ impl ItemOutcome {
 
     #[must_use]
     pub const fn is_terminal(&self) -> bool {
-        !matches!(self, Self::Suspended(_) | Self::Exhausted(_))
+        !matches!(
+            self,
+            Self::Suspended(_) | Self::Exhausted(_) | Self::Withheld(_)
+        )
     }
 
     /// The stored spellings of every outcome that ends an item.
@@ -220,9 +267,11 @@ impl ItemOutcome {
     pub const fn is_settled(&self) -> bool {
         match self {
             Self::Succeeded => true,
-            Self::Failed(_) | Self::Quarantined(_) | Self::Suspended(_) | Self::Exhausted(_) => {
-                false
-            }
+            Self::Failed(_)
+            | Self::Quarantined(_)
+            | Self::Suspended(_)
+            | Self::Exhausted(_)
+            | Self::Withheld(_) => false,
         }
     }
 
@@ -310,6 +359,9 @@ pub struct BatchReport {
     /// [`Running`](BatchStatus::Running), and so does a deliberate `max_items`
     /// window — only the counts tell those apart.
     pub exhausted: u64,
+    /// Items paused because an authority they act under was withdrawn —
+    /// resumable once the halt on that subject is lifted.
+    pub withheld: u64,
     /// The whole batch's consumption, summed from its items.
     pub spend: Spend,
     /// The key processing stopped after, for a resume.
@@ -333,7 +385,10 @@ impl BatchReport {
     /// [`BatchSpec::max_items`]: crate::runtime::BatchSpec::max_items
     #[must_use]
     pub const fn needs_attention(&self) -> bool {
-        self.in_flight > 0 || self.exhausted > 0 || self.failed_or_quarantined() > 0
+        self.in_flight > 0
+            || self.exhausted > 0
+            || self.withheld > 0
+            || self.failed_or_quarantined() > 0
     }
 
     /// The terminal items that did not settle.
@@ -487,6 +542,8 @@ pub struct BatchCensus {
     pub suspended: u64,
     /// Paused at a ceiling — resumable once somebody raises it.
     pub exhausted: u64,
+    /// Paused under a withdrawn authority — resumable once the halt lifts.
+    pub withheld: u64,
     /// Reserved with no outcome recorded — an item interrupted mid-flight.
     pub in_flight: u64,
     pub spend: Spend,

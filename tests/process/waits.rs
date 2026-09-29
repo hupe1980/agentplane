@@ -330,7 +330,7 @@ async fn unclaimed_events_are_dead_lettered_by_the_sweep_not_on_arrival() {
 /// The cap is judged on what the pass *examined*, not on what it finished —
 /// a tick whose whole batch is still live-owned has seen as little of the
 /// backlog as one that finished every delivery in it, which is why the fixture
-/// registers waits nothing is buffering for.
+/// parks waits nothing is buffering for.
 #[tokio::test]
 async fn a_capped_redelivery_pass_says_so() {
     use agentplane::core::{EffectDescriptor, EffectKey, Phase, RunId, StepId, Subscription};
@@ -342,7 +342,7 @@ async fn a_capped_redelivery_pass_says_so() {
     for i in 0..=128u32 {
         let run = RunId::generate();
         f.store
-            .subscribe(
+            .park_wait(
                 &Subscription {
                     run,
                     case: None,
@@ -379,9 +379,9 @@ async fn a_capped_redelivery_pass_says_so() {
         "a saturated sweep is exactly when a human should look"
     );
 
-    // And a plane with a handful of waits is not flagged, so the signal means
+    // And a plane with no parked waits is not flagged, so the signal means
     // something. A second sweep here would still be saturated — nothing
-    // consumes a subscription nobody is delivering to — so the negative half
+    // consumes a parked wait nobody is delivering to — so the negative half
     // needs its own plane.
     let quiet = fixture("D-6d");
     let ordinary = quiet
@@ -1018,5 +1018,393 @@ async fn a_delivery_racing_a_live_owner_is_finished_by_the_sweep() {
         f.sends.load(Ordering::SeqCst),
         1,
         "the request went out once"
+    );
+}
+
+// ── A closed run waits for nothing ──────────────────────────────────────────
+
+fn ops() -> agentplane::core::Operator {
+    agentplane::core::Operator::asserted("ops").expect("a fixture names its operator")
+}
+
+/// Waits for a reply and does nothing else, so a cancellation has nothing to
+/// unwind and concludes the run `cancelled`.
+#[derive(Debug)]
+struct JustWaits(&'static str);
+
+#[async_trait::async_trait]
+impl Skill for JustWaits {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("just-waits").provides("demo.wait")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.deadline("reply", &DeadlineSpec::days(5), None).await?;
+        let reply = cx
+            .await_event(&AwaitSpec::new("reply.received", "reply").correlate(key(self.0)))
+            .await?;
+        Ok(Outcome::done(reply))
+    }
+}
+
+fn waiting_fixture(doc: &'static str) -> Fixture {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .skill(JustWaits(doc))
+        .build();
+    Fixture {
+        store,
+        rt,
+        sends: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+/// **A cancelled run's wait does not take the event a live run is waiting
+/// for.**
+///
+/// Two runs wait on one key and the older is cancelled. Left registered, the
+/// cancelled run's wait is the oldest waiter: the event is claimed for a run
+/// that can never consume it, every retry of it deduplicates against that
+/// claim, and the live run behind it waits until its deadline breaches.
+#[tokio::test]
+async fn a_cancelled_runs_wait_is_retired_and_the_live_waiter_gets_the_event() {
+    let f = waiting_fixture("D-K");
+    let a =
+        f.rt.run_correlated(
+            "demo.wait",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-K")],
+        )
+        .await
+        .unwrap();
+    assert!(a.status.is_suspended(), "{:?}", a.status);
+    f.rt.request_cancel(a.run_id, &ops(), "withdrawn by the requester")
+        .await
+        .unwrap();
+    let concluded = f.rt.recorded_outcome(a.run_id).await.unwrap();
+    assert!(
+        concluded.as_ref().is_some_and(|o| o.status.is_cancelled()),
+        "the fixture did not conclude the run cancelled: {concluded:?}"
+    );
+    assert!(
+        f.store
+            .waiting(64)
+            .await
+            .unwrap()
+            .iter()
+            .all(|w| w.run != a.run_id),
+        "a cancelled run is still registered as waiting — the next event on its \
+         key is claimed for a run that will never consume it"
+    );
+
+    let b =
+        f.rt.run_correlated(
+            "demo.wait",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-K")],
+        )
+        .await
+        .unwrap();
+    assert!(b.status.is_suspended(), "{:?}", b.status);
+    let delivery =
+        f.rt.deliver(&reply("EV-K", "D-K", json!({ "status": "accepted" })))
+            .await
+            .unwrap();
+    assert_eq!(delivery, Delivery::Resumed { run: b.run_id });
+}
+
+/// **A sealed run's leftover wait is passed over by the match.**
+///
+/// The runtime retires a closed run's waits as it seals it; this is the store
+/// half, for a wait that outlived that — a crash between the seal and the
+/// retirement. The oldest waiter on the key is the sealed run, and the event
+/// must go to the live one behind it.
+#[tokio::test]
+async fn a_sealed_runs_leftover_wait_does_not_take_the_event() {
+    let f = waiting_fixture("D-L");
+    let a =
+        f.rt.run_correlated(
+            "demo.wait",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-L")],
+        )
+        .await
+        .unwrap();
+    assert!(a.status.is_suspended(), "{:?}", a.status);
+    let leftover = f.store.waiting(64).await.unwrap();
+    assert_eq!(leftover.len(), 1);
+    f.rt.request_cancel(a.run_id, &ops(), "withdrawn by the requester")
+        .await
+        .unwrap();
+
+    let b =
+        f.rt.run_correlated(
+            "demo.wait",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-L")],
+        )
+        .await
+        .unwrap();
+    // The crash's leftover, registered before the live wait.
+    let long_ago = Timestamp::from_unix_timestamp(1_000_000_000).unwrap();
+    f.store.subscribe(&leftover[0], long_ago).await.unwrap();
+
+    let delivery =
+        f.rt.deliver(&reply("EV-L", "D-L", json!({ "status": "accepted" })))
+            .await
+            .unwrap();
+    assert_eq!(
+        delivery,
+        Delivery::Resumed { run: b.run_id },
+        "the event went to the sealed run's leftover wait, not the live waiter"
+    );
+}
+
+/// **A parked delivery behind a page of long waits is still redelivered.**
+///
+/// A delivery that claims an event while the run's owner holds the lease past
+/// the retry window parks the pair for the sweep. The redelivery pass used to
+/// read every registered wait oldest first: a plane with a page of legitimate
+/// long waits registered earlier never reached the parked pair, and the
+/// message that arrived in time stayed claimed for a run nothing resumed.
+#[tokio::test]
+async fn a_parked_delivery_behind_a_page_of_long_waits_is_redelivered() {
+    use agentplane::core::{EffectDescriptor, EffectKey, Phase, RunId, StepId, Subscription};
+
+    let f = fixture("D-P");
+    let long_ago = Timestamp::from_unix_timestamp(1_000_000_000).unwrap();
+    // A full redelivery page of waits registered before the one that parks.
+    for i in 0..128u32 {
+        f.store
+            .subscribe(
+                &Subscription {
+                    run: RunId::generate(),
+                    case: None,
+                    effect: EffectKey::for_effect(
+                        StepId(0),
+                        Phase::Forward,
+                        0,
+                        1,
+                        &EffectDescriptor::new("event.await", json!({ "n": i })),
+                    ),
+                    step: StepId(0),
+                    phase: Phase::Forward,
+                    kind: "never.arrives".to_owned(),
+                    correlation: vec![key(&format!("LONG-{i}"))],
+                },
+                long_ago,
+            )
+            .await
+            .unwrap();
+    }
+
+    let out =
+        f.rt.run_correlated(
+            "demo.request",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-P")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended());
+
+    // Another owner holds the run through the delivery's whole retry window.
+    let held = f
+        .store
+        .acquire(
+            out.run_id,
+            "a-stalled-owner",
+            std::time::Duration::from_mins(5),
+        )
+        .await
+        .unwrap();
+    let delivery = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.rt.deliver(&reply("EV-P", "D-P", json!({ "status": "accepted" }))),
+    )
+    .await
+    .expect("the delivery's retry is bounded")
+    .unwrap();
+    assert_eq!(
+        delivery,
+        Delivery::Buffered,
+        "the delivery gave up and parked"
+    );
+    f.store.release_lease(out.run_id, held.epoch).await.unwrap();
+
+    let report =
+        f.rt.sweep(Timestamp::now_utc(), std::time::Duration::from_hours(8760))
+            .await
+            .unwrap();
+    assert_eq!(
+        report.events_redelivered, 1,
+        "the parked pair sat behind a page of long waits and was never reached: \
+         {report:?}"
+    );
+    assert!(!report.saturated.redeliveries, "{report:?}");
+    let records = f.store.read(out.run_id, 1).await.unwrap();
+    assert!(
+        records.iter().any(
+            |r| matches!(r.kind(), RecordKind::StepFinished { outcome } if outcome == "succeeded")
+        ),
+        "the redelivered run did not finish"
+    );
+}
+
+/// **A conclusion repaired on resume retires the run's waits too.**
+///
+/// A crash between a run's conclusion and its seal is repaired by the next
+/// resume, which seals the recorded conclusion. That seal is a conclusion like
+/// any other: a wait left registered behind it is the oldest waiter on its key,
+/// and takes the next matching event from a live run waiting behind it.
+#[tokio::test]
+async fn a_repaired_seal_retires_the_runs_waits() {
+    let f = fixture("D-REPAIR");
+    let out =
+        f.rt.run_correlated(
+            "demo.request",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-REPAIR")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+    assert_eq!(f.store.waiting(10).await.unwrap().len(), 1);
+
+    // The crash window: the conclusion landed, the seal did not.
+    let lease = f
+        .store
+        .acquire(
+            out.run_id,
+            "crashed-owner",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("the suspended run is claimable");
+    let head = f.store.head(out.run_id).await.unwrap();
+    f.store
+        .append(
+            lease.epoch,
+            vec![agentplane::journal::Append::new(
+                out.run_id,
+                RecordKind::RunConcluded {
+                    outcome: "succeeded".to_owned(),
+                    reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
+                    chain_head: head.hash,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    f.store
+        .release_lease(out.run_id, lease.epoch)
+        .await
+        .unwrap();
+
+    let repaired = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.rt.replay(out.run_id, Mode::Resume),
+    )
+    .await
+    .expect("the repair finishes")
+    .expect("resume");
+    assert_eq!(repaired.status, RunStatus::Succeeded);
+    assert!(
+        f.store.waiting(10).await.unwrap().is_empty(),
+        "a run whose seal was repaired on resume kept its wait registered"
+    );
+}
+
+/// **A message erased after its claim is not delivered as `null`.**
+///
+/// A delivery claims the message durably and resumes the run in a separate
+/// step. Erased between the two, the row the recovery re-reads holds no
+/// payload — and handed over as a value it journals `EffectDone` with a
+/// `null` the counterparty never sent. The erased message is dead-lettered
+/// instead, and the wait stays open for its deadline to bound.
+#[tokio::test]
+async fn a_message_erased_after_its_claim_is_not_delivered_as_null() {
+    let f = fixture("D-ERASED");
+    let out =
+        f.rt.run_correlated(
+            "demo.request",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-ERASED")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+
+    // The crashed delivery: buffered, claimed and parked, never resumed.
+    let event = reply("EV-ERASED", "D-ERASED", json!({ "status": "accepted" }));
+    let now = Timestamp::now_utc();
+    assert!(f.store.buffer(&event, now).await.unwrap());
+    let sub = f
+        .store
+        .match_waiter(&event, now)
+        .await
+        .unwrap()
+        .expect("the waiting run claims the message");
+    f.store.park_wait(&sub, now).await.unwrap();
+    assert!(
+        f.store
+            .erase_payload("urn:test:counterparty", "EV-ERASED")
+            .await
+            .unwrap()
+    );
+
+    // Every path that recovers a claimed message: the sweep's redelivery pass,
+    // and a resume of the run itself.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.rt.sweep(now, std::time::Duration::from_hours(8760)),
+    )
+    .await
+    .expect("the sweep finishes")
+    .unwrap();
+    let resumed = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.rt.replay(out.run_id, Mode::Resume),
+    )
+    .await
+    .expect("the resume finishes")
+    .unwrap();
+
+    let records = f.store.read(out.run_id, 1).await.unwrap();
+    assert!(
+        !records.iter().any(|r| matches!(
+            r.kind(),
+            RecordKind::EffectDone { output, .. } if output.is_null()
+        )),
+        "an erased message was delivered to the run as null"
+    );
+    assert!(
+        resumed.status.is_suspended(),
+        "the wait did not stay open: {:?}",
+        resumed.status
+    );
+    assert!(
+        f.store
+            .dead_letters(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.event.id == "EV-ERASED" && d.reason == agentplane::case::ERASED_REASON),
+        "the erased message is not on the dead-letter list"
     );
 }

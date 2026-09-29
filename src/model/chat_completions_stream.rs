@@ -55,9 +55,8 @@ struct PartialCall {
     /// compatibility endpoint puts its encrypted `thought_signature` in
     /// `extra_content` and rejects a follow-up turn without it, so an
     /// accumulator that rebuilt a call from the three fields it knows would
-    /// drop it — and would do so only on the **streaming** path, which is this
-    /// driver's default. That is the worst version of the bug: fixed where it
-    /// was looked for, live where it actually runs.
+    /// drop it — and only on the **streaming** path, which is this driver's
+    /// default.
     ///
     /// Whole values rather than concatenated fragments, because these are not
     /// deltas — a server sends an extension once, complete. Last writer wins, so
@@ -107,12 +106,20 @@ impl Accumulator {
         {
             let index = fragment.get("index").and_then(Value::as_u64).unwrap_or(0);
             let call = self.calls.entry(index).or_default();
-            if let Some(id) = fragment.get("id").and_then(Value::as_str) {
-                call.id.push_str(id);
+            // The id and name are whole values, set by the first fragment that
+            // carries them. Some servers repeat both on every chunk; appended,
+            // `call_1` would arrive as `call_1call_1call_1` and the tool's name
+            // would match no declaration.
+            if let Some(id) = fragment.get("id").and_then(Value::as_str)
+                && call.id.is_empty()
+            {
+                id.clone_into(&mut call.id);
             }
             if let Some(f) = fragment.get("function") {
-                if let Some(name) = f.get("name").and_then(Value::as_str) {
-                    call.name.push_str(name);
+                if let Some(name) = f.get("name").and_then(Value::as_str)
+                    && call.name.is_empty()
+                {
+                    name.clone_into(&mut call.name);
                 }
                 if let Some(arguments) = f.get("arguments").and_then(Value::as_str) {
                     call.arguments.push_str(arguments);
@@ -260,6 +267,26 @@ mod tests {
             acc.push(data);
         }
         assert!(acc.generated());
+        let out = acc.into_response();
+        let call = &out["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["function"]["name"], "lookup");
+        assert_eq!(call["function"]["arguments"], r#"{"id":"x"}"#);
+    }
+
+    /// A server that repeats the id and name on every fragment still names
+    /// one call once.
+    #[test]
+    fn a_repeated_id_and_name_are_kept_not_concatenated() {
+        let mut acc = Accumulator::new();
+        for data in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"id\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"lookup","arguments":"\"x\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ] {
+            acc.push(data);
+        }
         let out = acc.into_response();
         let call = &out["choices"][0]["message"]["tool_calls"][0];
         assert_eq!(call["id"], "call_1");

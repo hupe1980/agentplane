@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example media_run --features redb,testkit,media
+//! cargo run --example media_run --features redb,fake-model,media
 //! ```
 //!
 //! The network fetch boundary is intentionally not mocked here: a fake

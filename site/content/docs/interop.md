@@ -48,14 +48,6 @@ A refusal *before* generation — bad request, unknown model, rate limit — is
 where retrying is unambiguously safe, and the only one where the peer tells you
 *when* — see [when the peer names the window](@/docs/plans-cases.md#when-the-peer-names-the-window).
 
-### Why the budget fixture calls twice
-
-A fixture making exactly one call passes whether or not the failure is billed,
-because an interrupted stream is `Landed` and therefore never retried. The
-fixture does what a real skill would — swallow the failure and ask again with a
-reworded prompt — so the second call is refused by the ceiling the first call's
-tokens consumed.
-
 ## Calling other agents
 
 A peer hop is a tool call with two extra problems, and both are identity rather
@@ -165,7 +157,7 @@ whether the request reached the far side.
 
 ## Calling peers and models over the wire
 
-Two drivers ship, both off by default and both thin. What each carries is a
+The drivers are off by default and thin. What each carries is a
 **failure mapping**, and that is the entire design content — the JSON is
 commodity, the mapping decides whether a request may be sent again and whether
 the budget is telling the truth.
@@ -197,8 +189,8 @@ understands perfectly well: a dialect this host does not implement cannot be
 downgraded to, and the specification's instruction for an unsupported version is
 to disconnect.
 
-**A revision leaves in a release that says so**, in the changelog and on the
-[upgrading](@/docs/upgrading.md) page, and never while it is the specification's
+**A revision leaves in a release that says so** under **BREAKING** in the
+[changelog](https://github.com/hupe1980/agentplane/blob/main/CHANGELOG.md), and never while it is the specification's
 Current revision. There is no second deprecation clock here: a *feature* this
 plane depends on carries the specification's window, and a *revision* this plane
 serves is a promise about this crate's own releases.
@@ -232,7 +224,7 @@ For manifested agents, `spec.context` — prompts, resources, and `task_input`
 for answering a server's input requests — is the review artifact and
 `McpAccess::from_manifest` is the deployment catalogue; the gate refuses a
 dispatch whose wired ceilings disagree with the grant's, in either direction.
-Server discovery is still only a diff: an MCP server cannot grant itself a
+Server discovery is only a diff: an MCP server cannot grant itself a
 prompt, resource or tool, and `agentplane serve` prints each server's
 advertisement drift beside its negotiated version. Every call carries a
 whole-request deadline — the transport itself waits forever, and a wedged
@@ -351,8 +343,8 @@ card it would have alone — sharing a plane must not change the identity a
 consumer pins, which is the same rule that makes a document's digest inside a
 room file equal its digest by itself.
 
-Dispatch already spanned every agent, because they are all on the runtime; what
-was missing was only discovery. Two agents advertising **one skill id** is
+Dispatch spans every agent, because they are all on the runtime; the directory
+adds only discovery. Two agents advertising **one skill id** is
 refused at construction: A2A dispatch is named, never inferred, and a name
 resolving to two agents is a routing decision the caller did not make.
 
@@ -419,17 +411,33 @@ the invariant for the one route nobody would think to check.
 | `GetTask` | state, bounded input history, and replay-reconstructed terminal artifacts |
 | `CancelTask` | a durable stop request; the task stays `WORKING` |
 | `GetExtendedAgentCard` | the authenticated card |
-| `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused |
+| `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused; at most `streams_per_caller` (default 8) open per peer |
 | `ListTasks` | newest-first, cursor-paginated and per-task-authorized, with context/status/time filters, bounded history and optional artifacts — both bounded, see below |
 | the push-notification configs | durable create/get/list/delete when wired; the protocol-specific refusal otherwise |
 | anything else | `-32601`, method not found |
 
+**A task belongs to the peer that admitted it.** Every method that names a task
+— `GetTask`, `CancelTask`, `SubscribeToTask`, a continuation, every push-config
+method — answers `TaskNotFoundError` unless the authenticated caller is the peer
+whose message admitted it, before policy is asked; `ListTasks` lists and counts
+only the caller's own. A run the embedder started in-process is nobody's task.
+A `contextId` joins only a context the same peer opened. Policy is still asked
+for your own tasks, and a task action's context carries `owner`, so a rule set
+can say so in its own words. A fault on the plane's side answers `-32603` with
+one fixed sentence; the detail goes to the operator's log.
+
 **`ListTasks` bounds both of its expensive answers, and says when a bound
-bit.** A content filter is bounded by `filter_scan_budget` (default 1024
-candidate reads), because the spec's `totalSize` is the exact pre-pagination
-count and an unbounded filter would let one field buy a scan of every run the
-tenant ever wrote. Over budget is a refusal naming `statusTimestampAfter` as the
-lever that narrows from the index, never a quietly truncated total. Artifacts
+bit.** Every listing is bounded by `filter_scan_budget` (default 1024 of the
+caller's own tasks) because the spec's `totalSize` is the exact
+pre-pagination count and an unbounded listing would buy a scan of every task
+the caller ever opened. The candidates are read from an index of the runs each
+peer admitted, maintained by the journal in the write that records each
+admission, so another peer's runs and the embedder's cost a listing nothing —
+neither a read nor a charge against the budget — and the plane's other traffic
+does not refuse your listing. `statusTimestampAfter` ends the scan at the first
+older task, because the index is newest first. Over budget is a refusal naming
+`statusTimestampAfter` as the lever that narrows from the index, never a
+quietly truncated total. Artifacts
 are bounded too — reassembling them replays each task's run — so a page past the
 budget returns the remaining tasks without artifacts and marks each with
 `io.agentplane.a2a/artifactsOmitted` in `Task.metadata`. `GetTask` on a marked
@@ -730,9 +738,9 @@ for a week and holding a connection open for that is a leak with a spec
 reference. Reconnecting costs the client nothing, since the stream is rebuilt
 from history rather than resumed from memory.
 
-There is deliberately **no SSE keep-alive**. It was tried: with it the response
-body did not end when the stream did, so the connection outlived the task — the
-exact failure the design is shaped to avoid. An idle stream may be reaped by
+There is deliberately **no SSE keep-alive**: with one, the response body does
+not end when the stream does, so the connection outlives the task — the exact
+failure the design is shaped to avoid. An idle stream may be reaped by
 an intermediary, which is the better failure, because a client can recover from a
 closed connection and cannot recover from one that never ends.
 
@@ -752,7 +760,15 @@ when a model first calls it.
 `tasks/get` answers by reading the journal rather than a table beside it, and the
 handle still means something after a restart or from another instance.
 `tasks/cancel` is the runtime's own cancellation, recorded and honoured at the
-next step boundary. Revisions older than `2026-07-28` are refused at the
+next step boundary. Both act only on runs this surface admitted — any other run
+id answers as no such task — and a completed task hands back the call's own
+result, a cancelled one reads `cancelled`. `McpServer::new` refuses a plane with
+no policy engine, and a call runs under no delegation chain, never the plane's.
+A host that sets `io.agentplane/idempotencyKey` in a call's `_meta` gets one run
+for every retry of that call **within its session**: this surface authenticates
+no host, so the session is what says whose key it is, and a key honoured across
+sessions would hand one host another's run. Each session — each clone of the
+server a transport makes — keys its calls apart from every other's. Revisions older than `2026-07-28` are refused at the
 handshake: they carry no Tasks extension, so a suspension would have no way to
 say so — the reason [the promise is stated per extension](#protocol-revisions).
 
@@ -829,12 +845,12 @@ Details worth stating:
 * **Deferred tool search is not authority discovery.** Current OpenAI and
   Anthropic models can search thousands of deferred tools, which improves token
   cost. Letting that search load executable authority would bypass exact
-  manifest review. Applications should keep the initial surface small or expose
-  an aggregate/governed retrieval tool until a search effect journals the query,
-  loaded definitions and grant recheck.
+  manifest review, and no effect journals a tool search. Keep the initial
+  surface small, or expose an aggregate, governed retrieval tool.
 * **Provider configuration that changes the wire is effect identity.** Each
   driver publishes a non-secret request profile: endpoint, API/driver version,
-  per-model schema mode, streaming mode and timeout. Strict replay therefore
+  per-model schema mode and streaming mode. The timeout is not in it, so raising
+  one does not break replay of runs in flight. Strict replay therefore
   cannot reuse a completion produced under a different provider request shape.
   API keys are transport credentials and never enter the profile or journal.
 * **Every call is time-bounded.** All drivers apply a configurable whole-request
@@ -883,7 +899,7 @@ Details worth stating:
   usage, truncation, native JSON Schema and forced-tool fallback are supported.
   Document names are constant and neutral because Bedrock treats them as model
   input. `ConverseStream` is the default;
-  `.buffered()` opts out. Region, stream mode, timeout and schema mode enter the
+  `.buffered()` opts out. Region, stream mode and schema mode enter the
   provider profile. Access, validation and not-found errors are refusals;
   throttling and model-not-ready are retryable. Stream failures follow the three-rung ladder
   above, reaching `Interrupted` because `ConverseStream` reports usage in its

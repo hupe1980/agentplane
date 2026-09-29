@@ -1,9 +1,17 @@
 //! Cryptographically erasable governed memory for single-node deployments.
 //!
 //! Content is sealed before it reaches `MemoryStore`; metadata remains clear so
-//! subject/purpose indexes and policy remain usable. Every item gets a fresh
-//! data key wrapped under the subject's tenant-qualified key scope. Destroying
-//! that wrapping scope makes live rows, replicas and backups unreadable.
+//! subject/purpose indexes and policy remain usable. Every **version** of every
+//! item is sealed in the crate's one envelope under its own tenant-qualified
+//! key scope, `memory-item/<id>@<version>`, so each erasure verb destroys
+//! exactly the keys of what it erased: `forget` every version of one id,
+//! `forget_cascading` and `sweep_expired` every version of each id they erased
+//! whole, `erase_subject` every version of every id the subject holds — and a
+//! cascade that trims an id's superseded versions destroys exactly those
+//! versions' keys, leaving its current one readable. Destroying a scope makes
+//! the live rows, replicas and backups of that version unreadable at once. A
+//! subject is not a key scope, so erasing one does not stop it being written
+//! to again under new ids.
 //!
 //! Subject erasure is serialized with writes and legal-hold changes by this
 //! wrapper. That mutex is process-local, so this concrete adapter is for redb or
@@ -14,30 +22,26 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chacha20poly1305::aead::{Aead, Generate as _};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
-use crate::core::{Digest, StoreError, TenantId, Timestamp};
-use crate::memory::{MemoryItem, MemoryStore, Recall, Selected};
+use crate::core::{StoreError, TenantId, Timestamp};
+use crate::journal::payload;
+use crate::memory::{Cascade, MemoryItem, MemoryStore, Recall, Selected};
 
-use super::{DataKey, KeyError, KeyRing, WrappedKey};
+use super::{Erasure, KeyError, KeyRing};
 
+/// What the envelope seals: the content and the lineage it was derived from.
+///
+/// Integrity is the AEAD's: the envelope authenticates these bytes under the
+/// item's identity, so no digest of the plaintext is stored beside them.
 #[derive(Debug, Serialize, Deserialize)]
-struct Envelope {
-    wrapped: WrappedKey,
-    nonce: Vec<u8>,
-    ciphertext: Vec<u8>,
-    digest: Digest,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PlainMemory {
-    content: Value,
+    content: serde_json::Value,
     derived_from: Vec<Selected>,
 }
 
-/// A memory store whose content is unreadable after subject-key destruction.
+/// A memory store whose content is unreadable once its items' keys are destroyed.
 pub struct EncryptedMemoryStore {
     inner: Arc<dyn MemoryStore>,
     keys: Arc<dyn KeyRing>,
@@ -57,9 +61,8 @@ impl EncryptedMemoryStore {
     /// Seal this store's content, serialised by a **process-local** lifecycle
     /// lock.
     ///
-    /// It was called `new_single_node`, and that name stopped being true when
-    /// the lock became a seam: this is single-node *by default* now, not by
-    /// construction. An active-active plane calls
+    /// Single-node *by default*, not by construction: the lock is a seam. An
+    /// active-active plane calls
     /// [`coordinated_by`](Self::coordinated_by) with a coordinator that spans
     /// instances — and [`is_distributed`](Self::is_distributed) is how a caller
     /// checks which it got, rather than inferring it from a constructor name.
@@ -127,83 +130,81 @@ impl EncryptedMemoryStore {
         super::scope(&self.tenant, "memory-lifecycle")
     }
 
-    fn scope(&self, subject: &str) -> String {
-        super::scope(&self.tenant, &format!("memory/{subject}"))
+    /// The erasure scope of one version of one memory id.
+    ///
+    /// Per version rather than per id or per subject: `forget` and the expiry
+    /// sweep erase ids, and a cascade erases ids *and* trims superseded
+    /// versions of ids that stay current. Only a key that seals exactly one
+    /// version can be destroyed by the trim without taking the current version
+    /// along — a per-id key would survive the trim, and a backup would keep
+    /// opening the version it removed. An id belongs to one subject and is never
+    /// reused once erased, and versions only grow, so erasing an id destroys
+    /// the scopes of versions `1..=` its highest.
+    fn scope(&self, id: &str, version: u64) -> String {
+        super::scope(&self.tenant, &format!("memory-item/{id}@{version}"))
     }
 
-    fn cipher(key: &DataKey) -> chacha20poly1305::XChaCha20Poly1305 {
-        use chacha20poly1305::KeyInit as _;
-        chacha20poly1305::XChaCha20Poly1305::new(key.expose().into())
+    /// The identity one stored version is sealed to.
+    ///
+    /// A canonical JSON array, so no field's content can spell another's: an
+    /// envelope moved to another id, version, subject, purpose or tenant fails
+    /// to authenticate there rather than opening as that row's content.
+    fn aad(&self, item: &MemoryItem, version: u64) -> Result<Vec<u8>, StoreError> {
+        crate::core::canon::to_bytes(&(
+            "memory",
+            self.tenant.as_str(),
+            item.id.as_str(),
+            version,
+            item.subject.as_str(),
+            item.purpose.as_str(),
+        ))
+        .map_err(|error| StoreError::Backend(error.to_string()))
     }
 
-    async fn seal(&self, item: &MemoryItem) -> Result<Value, StoreError> {
+    async fn seal(&self, item: &MemoryItem, version: u64) -> Result<serde_json::Value, StoreError> {
         let plain = crate::core::canon::to_bytes(&PlainMemory {
             content: item.content.clone(),
             derived_from: item.derived_from.clone(),
         })
         .map_err(|error| StoreError::Backend(error.to_string()))?;
-        let digest = Digest::of(&plain);
-        let (key, wrapped) = self
-            .keys
-            .data_key(&self.scope(&item.subject))
-            .await
-            .map_err(key_error)?;
-        let nonce = chacha20poly1305::XNonce::generate();
-        let ciphertext = Self::cipher(&key)
-            .encrypt(
-                &nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: &plain,
-                    aad: digest.as_bytes(),
-                },
-            )
-            .map_err(|error| StoreError::Backend(format!("sealing memory failed: {error}")))?;
-        serde_json::to_value(Envelope {
-            wrapped,
-            nonce: nonce.to_vec(),
-            ciphertext,
-            digest,
-        })
-        .map_err(|error| StoreError::Backend(error.to_string()))
+        let envelope = super::envelope::seal(
+            self.keys.as_ref(),
+            &self.scope(&item.id, version),
+            &self.aad(item, version)?,
+            &plain,
+        )
+        .await
+        .map_err(|error| match error {
+            KeyError::Destroyed { .. } => StoreError::Backend(format!(
+                "memory id '{}' was erased and cannot be reused",
+                item.id
+            )),
+            other => key_error(other),
+        })?;
+        Ok(payload::wrap(&envelope))
     }
 
-    /// `Ok(None)` when the row's wrapping key was destroyed — a completed
-    /// erasure reporting itself, not a fault. Every other failure stays loud:
-    /// a row that is not an envelope, a wrong-length nonce, a ciphertext that
-    /// does not authenticate are all corruption someone must be paged about,
-    /// and folding them into the skip would make tampering read as erasure.
+    /// `Ok(None)` when the row's key was destroyed — a completed erasure
+    /// reporting itself, not a fault. Every other failure stays loud: a row
+    /// that is not an envelope, an envelope that does not authenticate under
+    /// this row's identity, a retired key version and an unreachable ring are
+    /// all things someone must be told about, and folding them into the skip
+    /// would make tampering read as erasure.
     async fn open_item(&self, mut item: MemoryItem) -> Result<Option<MemoryItem>, StoreError> {
-        let envelope: Envelope = serde_json::from_value(item.content).map_err(|_| {
-            StoreError::Backend("encrypted memory row does not contain a valid envelope".to_owned())
-        })?;
-        if envelope.nonce.len() != 24 {
-            return Err(StoreError::Backend(
-                "encrypted memory nonce has the wrong length".to_owned(),
-            ));
-        }
-        let key = match self.keys.open(&envelope.wrapped).await {
-            Ok(key) => key,
-            Err(KeyError::Destroyed { .. }) => return Ok(None),
-            Err(error) => return Err(key_error(error)),
-        };
-        let plain = Self::cipher(&key)
-            .decrypt(
-                super::xnonce(&envelope.nonce).ok_or_else(|| {
-                    StoreError::Backend("encrypted memory nonce has the wrong length".to_owned())
-                })?,
-                chacha20poly1305::aead::Payload {
-                    msg: &envelope.ciphertext,
-                    aad: envelope.digest.as_bytes(),
-                },
+        let envelope = payload::unwrap(&item.content).ok_or_else(|| {
+            StoreError::Backend(
+                "encrypted memory row does not contain a sealed envelope".to_owned(),
             )
-            .map_err(|_| StoreError::Backend("encrypted memory did not authenticate".to_owned()))?;
-        if Digest::of(&plain) != envelope.digest {
-            return Err(StoreError::Backend(
-                "encrypted memory plaintext digest changed".to_owned(),
-            ));
-        }
+        })?;
+        let aad = self.aad(&item, item.version)?;
+        let Some(plain) = super::envelope::open_or_erased(self.keys.as_ref(), &aad, &envelope)
+            .await
+            .map_err(key_error)?
+        else {
+            return Ok(None);
+        };
         let plain: PlainMemory = serde_json::from_slice(&plain)
-            .map_err(|error| StoreError::Backend(error.to_string()))?;
+            .map_err(|error| StoreError::Backend(format!("encrypted memory: {error}")))?;
         item.content = plain.content;
         item.derived_from = plain.derived_from;
         Ok(Some(item))
@@ -241,16 +242,87 @@ impl EncryptedMemoryStore {
         })
     }
 
-    /// Destroy a subject's wrapping scope, then clean unreadable ciphertext.
+    /// Destroy the keys of versions the inner store already erased: each
+    /// entry is an id and the versions of it that went.
+    ///
+    /// The rows are gone from the live store, so a failure here cannot be
+    /// retried through the verb that erased them; it names the version whose
+    /// backups still open, for an operator to destroy by scope.
+    async fn destroy_erased(
+        &self,
+        erased: &[(String, Vec<u64>)],
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        for (id, versions) in erased {
+            for version in versions {
+                let scope = self.scope(id, *version);
+                self.keys
+                    .destroy(&scope, at, reason)
+                    .await
+                    .map_err(|error| {
+                        StoreError::Backend(format!(
+                            "memory '{id}' version {version} was erased from the store, and \
+                             destroying its key failed ({error}) — its backups still open until \
+                             scope '{scope}' is destroyed"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every version of each id, up to the highest it held.
+    fn every_version(ids: impl IntoIterator<Item = (String, u64)>) -> Vec<(String, Vec<u64>)> {
+        ids.into_iter()
+            .map(|(id, highest)| (id, (1..=highest).collect()))
+            .collect()
+    }
+
+    /// Each of `ids` with the highest version the store holds for it, read
+    /// before an erasure removes the rows that say.
+    async fn highest_versions(&self, ids: &[String]) -> Result<Vec<(String, u64)>, StoreError> {
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(current) = self.inner.current(id, None).await? {
+                out.push((id.clone(), current.version));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Refuse when any of `ids` is under legal hold.
+    async fn refuse_held(&self, ids: &[String]) -> Result<(), StoreError> {
+        for id in ids {
+            if self.inner.legal_hold(id).await? {
+                return Err(StoreError::UnderLegalHold { id: id.clone() });
+            }
+        }
+        Ok(())
+    }
+
+    /// Destroy every item key of a subject, then clean unreadable ciphertext.
+    ///
+    /// Holds are checked first, and a held item refuses the whole erasure with
+    /// [`StoreError::UnderLegalHold`] before any key is touched. Then each of
+    /// the subject's ids has its key destroyed — the erasure, reaching every
+    /// copy — and only then are the live rows removed. A cleanup failure after
+    /// the keys are gone is reported in [`Erasure::cleanup_failed`], not as
+    /// success. The subject stays writable under new ids.
     ///
     /// `at` and `reason` come from the caller's audited lifecycle operation;
     /// this adapter never reads an ambient clock.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::UnderLegalHold`] naming a held item, or a failure to read
+    /// the subject or destroy a key.
     pub async fn erase_subject(
         &self,
         subject: &str,
         at: Timestamp,
         reason: &str,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<Erasure, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
             // The subject's ids, enumerated by the dedicated erasure-path
             // operation rather than by a recall with an enormous limit. A
@@ -259,24 +331,28 @@ impl EncryptedMemoryStore {
             // past BIGINT — so an erasure riding one either failed outright or
             // silently checked holds for a truncated page of the subject.
             let ids = self.inner.subject_ids(subject).await?;
-            for id in &ids {
-                if self.inner.legal_hold(id).await? {
-                    return Err(StoreError::Backend(format!(
-                        "memory '{id}' is under legal hold"
-                    )));
+            self.refuse_held(&ids).await?;
+            for (id, versions) in Self::every_version(self.highest_versions(&ids).await?) {
+                for version in versions {
+                    self.keys
+                        .destroy(&self.scope(&id, version), at, reason)
+                        .await
+                        .map_err(key_error)?;
                 }
             }
-            self.keys
-                .destroy(&self.scope(subject), at, reason)
-                .await
-                .map_err(key_error)?;
-            match self.inner.forget_subject(subject).await {
-                Ok(count) => Ok(count),
+            Ok(match self.inner.forget_subject(subject).await {
+                Ok(count) => Erasure {
+                    reached: count,
+                    cleanup_failed: None,
+                },
                 Err(error) => {
-                    tracing::warn!(%subject, %error, "memory key was destroyed but ciphertext cleanup failed");
-                    Ok(ids.len())
+                    tracing::warn!(%subject, %error, "memory keys were destroyed but ciphertext cleanup failed");
+                    Erasure {
+                        reached: ids.len(),
+                        cleanup_failed: Some(error.to_string()),
+                    }
                 }
-            }
+            })
         })
         .await
     }
@@ -285,6 +361,18 @@ impl EncryptedMemoryStore {
 #[allow(clippy::needless_pass_by_value)]
 fn key_error(error: KeyError) -> StoreError {
     StoreError::Backend(error.to_string())
+}
+
+/// The instant and reason a key destruction records for a verb that carries
+/// neither: the trait's erasure verbs are addressed by id alone.
+///
+/// A wall-clock read, because the instant is the key ring's own record of when
+/// the key went — descriptive metadata no run reads back and nothing replays.
+/// Erasures that carry their caller's instant (`erase_subject`, the sweep)
+/// record that instead.
+#[allow(clippy::disallowed_methods)]
+fn verb_erasure(verb: &str) -> (Timestamp, String) {
+    (Timestamp::now_utc(), format!("memory {verb}"))
 }
 
 #[async_trait]
@@ -301,37 +389,53 @@ impl MemoryStore for EncryptedMemoryStore {
 
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
+            // The version is part of what the envelope is sealed to, and the
+            // store assigns it: the next after the current one. Predicted here
+            // under the lifecycle lock every write takes, and checked against
+            // the store's answer, so a disagreement fails this write rather
+            // than leaving a row that will never authenticate.
+            let version = self
+                .inner
+                .current(&item.id, None)
+                .await?
+                .map_or(1, |current| current.version + 1);
             let mut sealed = item.clone();
-            sealed.content = self.seal(item).await?;
+            sealed.content = self.seal(item, version).await?;
             sealed.derived_from.clear();
             for source in &item.derived_from {
                 sealed
                     .derived_from
                     .push(self.backing_selection(source).await?);
             }
-            self.inner.remember(&sealed).await
+            let written = self.inner.remember(&sealed).await?;
+            if written != version {
+                return Err(StoreError::Backend(format!(
+                    "memory '{}' was sealed as version {version} and stored as {written}; \
+                     the row will not open, so the write is refused",
+                    item.id
+                )));
+            }
+            Ok(written)
         })
         .await
     }
 
     // The read paths follow the skip-sealed convention SealedJournal and
-    // SealedCases set: a row whose wrapping key was **destroyed** is a
-    // completed erasure, and a completed erasure must not turn every later
-    // query about the subject into a persistent error — which is exactly what
-    // happens when `erase_subject` destroys the key and the ciphertext
-    // cleanup then fails. Destroyed rows are silently absent from `recall`
-    // and `derivatives`, and `version` answers `None` as it does for any
-    // erased version. What the skip does **not** cover: rows that are not
-    // valid envelopes, wrong-length nonces, ciphertext that fails to
-    // authenticate, and an unreachable key ring all stay loud, because those
-    // are faults to page about rather than erasures reporting themselves.
+    // SealedCases set: a row whose key was **destroyed** is a completed
+    // erasure, and a completed erasure must not turn every later query about
+    // the subject into a persistent error — which is exactly what happens when
+    // an erasure destroys the keys and the ciphertext cleanup then fails.
+    // Destroyed rows are silently absent from `recall` and `derivatives`, and
+    // `version` answers `None` as it does for any erased version. What the
+    // skip does **not** cover: rows that are not envelopes, envelopes that do
+    // not authenticate under their row's identity, and an unreachable key ring
+    // all stay loud, because those are faults to page about rather than
+    // erasures reporting themselves.
     async fn recall(&self, query: &Recall) -> Result<Vec<MemoryItem>, StoreError> {
-        // Every row a recall can return belongs to one subject, and a subject
-        // is one key scope — so this page is all-or-nothing: either the scope
-        // is live and every row opens, or it was destroyed and none do. That is
-        // what makes dropping rows here safe beside a `limit` the inner store
-        // has already applied. A per-row skip under a limit would otherwise
-        // hand back a short page shaped exactly like a complete one.
+        // A destroyed row is one the inner store's cleanup has not removed
+        // yet, so a page can come back shorter than `limit` while more
+        // readable rows exist past it — an erasure mid-cleanup, not a complete
+        // answer, and it ends when the cleanup is retried.
         let items = self.inner.recall(query).await?;
         let mut opened = Vec::with_capacity(items.len());
         for item in items {
@@ -344,7 +448,7 @@ impl MemoryStore for EncryptedMemoryStore {
 
     async fn subject_ids(&self, subject: &str) -> Result<Vec<String>, StoreError> {
         // Ids are metadata and never sealed, so there is nothing to open —
-        // and erasure needs this to work *after* the subject's key is gone.
+        // and erasure needs this to work *after* the keys are gone.
         self.inner.subject_ids(subject).await
     }
 
@@ -366,16 +470,44 @@ impl MemoryStore for EncryptedMemoryStore {
         }
     }
 
+    /// Destroys the id's key, then removes its rows.
+    ///
+    /// The hold is checked first, so a held id loses nothing. A failure to
+    /// remove the rows after the key is gone is an error naming it; retrying
+    /// `forget` completes it.
     async fn forget(&self, id: &str) -> Result<(), StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
-            self.inner.forget(id).await
+            self.refuse_held(&[id.to_owned()]).await?;
+            let (at, reason) = verb_erasure("forget");
+            for (id, versions) in
+                Self::every_version(self.highest_versions(&[id.to_owned()]).await?)
+            {
+                for version in versions {
+                    self.keys
+                        .destroy(&self.scope(&id, version), at, &reason)
+                        .await
+                        .map_err(key_error)?;
+                }
+            }
+            self.inner.forget(id).await.map_err(|error| {
+                StoreError::Backend(format!(
+                    "memory '{id}': its key is destroyed, so no copy opens, and removing its \
+                     rows failed ({error}) — retry forget to remove them"
+                ))
+            })
         })
         .await
     }
 
     async fn forget_subject(&self, subject: &str) -> Result<usize, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
-            self.inner.forget_subject(subject).await
+            let ids = self.inner.subject_ids(subject).await?;
+            let highest = self.highest_versions(&ids).await?;
+            let count = self.inner.forget_subject(subject).await?;
+            let (at, reason) = verb_erasure("forget_subject");
+            self.destroy_erased(&Self::every_version(highest), at, &reason)
+                .await?;
+            Ok(count)
         })
         .await
     }
@@ -391,9 +523,19 @@ impl MemoryStore for EncryptedMemoryStore {
         Ok(opened)
     }
 
-    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
+    /// Destroys the key of every version of every id the cascade erased
+    /// whole, and of exactly the versions it trimmed from ids that stay
+    /// current — whose current version keeps its own key and stays readable,
+    /// while a backup taken before the cascade no longer opens what it
+    /// removed.
+    async fn forget_cascading(&self, id: &str) -> Result<Cascade, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
-            self.inner.forget_cascading(id).await
+            let cascade = self.inner.forget_cascading(id).await?;
+            let (at, reason) = verb_erasure("forget_cascading");
+            self.destroy_erased(&Self::every_version(cascade.erased.clone()), at, &reason)
+                .await?;
+            self.destroy_erased(&cascade.trimmed, at, &reason).await?;
+            Ok(cascade)
         })
         .await
     }
@@ -420,9 +562,17 @@ impl MemoryStore for EncryptedMemoryStore {
         self.inner.legal_hold(id).await
     }
 
-    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, StoreError> {
+    /// Destroys the key of every version of every id the sweep erased.
+    async fn sweep_expired(&self, at: Timestamp) -> Result<Vec<(String, u64)>, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
-            self.inner.sweep_expired(at).await
+            let swept = self.inner.sweep_expired(at).await?;
+            self.destroy_erased(
+                &Self::every_version(swept.clone()),
+                at,
+                "memory retention expired",
+            )
+            .await?;
+            Ok(swept)
         })
         .await
     }

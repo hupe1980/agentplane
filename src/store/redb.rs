@@ -119,6 +119,16 @@ const RUN_ACTIVITY: TableDefinition<(&str, u64, &str), ()> = TableDefinition::ne
 const RUN_LAST_ACTIVITY: TableDefinition<(&str, &str), u64> =
     TableDefinition::new("run_last_activity");
 
+/// `(tenant, run_key) -> source`: the producer that admitted a run, from its
+/// `RunAdmitted` admission key. Written once, in that record's transaction.
+const RUN_SOURCE: TableDefinition<(&str, &str), &str> = TableDefinition::new("run_source");
+
+/// `(tenant, source, updated_at, run_key) -> ()`: [`RUN_ACTIVITY`] narrowed to
+/// one producer's runs, moved with it on every append — what lets a served
+/// listing read only its caller's runs.
+const RUN_BY_SOURCE: TableDefinition<(&str, &str, u64, &str), ()> =
+    TableDefinition::new("run_by_source");
+
 /// `(tenant, until, run_key) -> reason`: the runs whose last record is a
 /// suspension, soonest-due first.
 ///
@@ -305,11 +315,10 @@ impl RedbStore {
 
     /// The storage key for a run, and the only place one is derived.
     ///
-    /// One derivation because the alternative is eleven, and eleven places
-    /// building the same string is how one of them ends up building a slightly
-    /// different one.
+    /// One derivation because many places building the same string is how one
+    /// of them ends up building a slightly different one.
     pub(super) fn run_key(&self, run: RunId) -> String {
-        format!("{}/{run}", self.tenant)
+        run_key_in(self.tenant.as_str(), &run.to_string())
     }
 
     /// This handle's tenant, for a key or a range bound.
@@ -366,8 +375,8 @@ impl RedbStore {
             .map_err(|e| StoreError::Backend(format!("blocking pool: {e}")))?
     }
 
-    /// The log's leaves, in seal order — already leaf-hashed, which the type
-    /// now says rather than the comment.
+    /// The log's leaves, in seal order — already leaf-hashed, as the type
+    /// says.
     async fn log_leaves(&self) -> Result<Vec<crate::core::merkle::LeafHash>, StoreError> {
         let tenant = self.tenant.clone();
         self.with_db(move |db| {
@@ -545,7 +554,13 @@ impl Row {
         let prev_hash: [u8; 32] = raw[0..32].try_into().map_err(|_| corrupt("prev_hash"))?;
         let hash: [u8; 32] = raw[32..64].try_into().map_err(|_| corrupt("hash"))?;
         let mut at = 64;
-        let attested = raw[at] == 1;
+        // A boolean byte, read as one: any other value is damage, and reading
+        // it as *unsigned* would strip the signature without a word.
+        let attested = match raw[at] {
+            0 => false,
+            1 => true,
+            _ => return Err(corrupt("the signature flag")),
+        };
         at += 1;
         let (key_id, signature) = if attested {
             let (k, n) = take_bytes(raw, at).ok_or_else(|| corrupt("key_id"))?;
@@ -559,7 +574,13 @@ impl Row {
         } else {
             (None, None)
         };
-        let (body, _) = take_bytes(raw, at).ok_or_else(|| corrupt("body"))?;
+        let (body, end) = take_bytes(raw, at).ok_or_else(|| corrupt("body"))?;
+        if end != raw.len() {
+            return Err(StoreError::Corrupt {
+                seq: 0,
+                detail: "journal row carries bytes after its body".to_owned(),
+            });
+        }
         Ok(Self {
             body,
             prev_hash,
@@ -570,15 +591,15 @@ impl Row {
     }
 
     fn into_record(self) -> Result<Record, StoreError> {
-        let attestation = self
+        let signature = self
             .key_id
             .zip(self.signature)
-            .map(|(key_id, signature)| crate::core::Attestation { key_id, signature });
-        Record::from_stored_attested(
+            .map(|(key_id, signature)| crate::core::KeySignature { key_id, signature });
+        Record::from_stored_signed(
             self.body,
             Digest::from_bytes(self.prev_hash),
             Digest::from_bytes(self.hash),
-            attestation,
+            signature,
         )
     }
 }
@@ -611,8 +632,7 @@ fn digest(bytes: &[u8]) -> Result<Digest, StoreError> {
 /// Begin a write transaction with its durability stated rather than inherited.
 ///
 /// redb already defaults to [`Durability::Immediate`] — a commit is persistent
-/// by the time it returns — which is exactly what the old backend spelled as
-/// `PRAGMA synchronous = FULL`. Stating it anyway, in one place every write path
+/// by the time it returns. Stating it anyway, in one place every write path
 /// goes through, because "a committed record survives the process" is this
 /// crate's central promise and a promise resting on a dependency's default can
 /// be weakened by an upgrade with nothing here changing.
@@ -625,6 +645,28 @@ pub(super) fn begin_write(db: &Database) -> Result<redb::WriteTransaction, Store
     w.set_durability(redb::Durability::Immediate)
         .map_err(|e| be(&e))?;
     Ok(w)
+}
+
+/// [`RedbStore::run_key`] for a tenant and a run already rendered as
+/// strings — the form the wait tables key their rows by.
+pub(super) fn run_key_in(tenant: &str, run: &str) -> String {
+    format!("{tenant}/{run}")
+}
+
+/// Whether `run` is sealed, read inside the caller's write transaction.
+///
+/// The liveness check the wait tables make before handing a run a timer or an
+/// event: a sealed run can record neither.
+pub(super) fn is_sealed(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run: &str,
+) -> Result<bool, StoreError> {
+    let seals = w.open_table(RUN_SEAL).map_err(|e| be(&e))?;
+    Ok(seals
+        .get(run_key_in(tenant, run).as_str())
+        .map_err(|e| be(&e))?
+        .is_some())
 }
 
 pub(super) fn be<E: std::fmt::Display>(e: &E) -> StoreError {
@@ -828,6 +870,7 @@ impl JournalStore for RedbStore {
                 // stopped waiting, and a listing an operator re-arms from must
                 // not still name it.
                 let mut waiting: Option<crate::core::SuspendReason> = None;
+                let mut admitted_from: Option<String> = None;
 
                 for append in batch {
                     let effect_key = append.effect_key.map(EffectKey::to_hex);
@@ -872,8 +915,8 @@ impl JournalStore for RedbStore {
                         body: record.raw().to_vec(),
                         prev_hash: *record.prev_hash.as_bytes(),
                         hash: *record.hash.as_bytes(),
-                        key_id: record.attestation.as_ref().map(|a| a.key_id.clone()),
-                        signature: record.attestation.as_ref().map(|a| a.signature.clone()),
+                        key_id: record.signature.as_ref().map(|a| a.key_id.clone()),
+                        signature: record.signature.as_ref().map(|a| a.signature.clone()),
                     };
                     journal
                         .insert((key.as_str(), seq), row.encode().as_slice())
@@ -898,6 +941,9 @@ impl JournalStore for RedbStore {
                     // carries it, so the claim and the run are one event. An
                     // existing entry is the refusal, never something to
                     // overwrite.
+                    if let Some(source) = record.admission_source() {
+                        admitted_from = Some(source.to_owned());
+                    }
                     if let Some(k) = claimed {
                         let mut admissions = w.open_table(RUN_ADMISSION).map_err(|e| be(&e))?;
                         if let Some(held) = admissions
@@ -989,11 +1035,11 @@ impl JournalStore for RedbStore {
                 let updated = now_secs();
                 let mut activity = w.open_table(RUN_ACTIVITY).map_err(|e| be(&e))?;
                 let mut last = w.open_table(RUN_LAST_ACTIVITY).map_err(|e| be(&e))?;
-                if let Some(previous) = last
+                let previous = last
                     .get((tenant.as_str(), key.as_str()))
                     .map_err(|e| be(&e))?
-                    .map(|value| value.value())
-                {
+                    .map(|value| value.value());
+                if let Some(previous) = previous {
                     activity
                         .remove((tenant.as_str(), previous, key.as_str()))
                         .map_err(|e| be(&e))?;
@@ -1003,6 +1049,31 @@ impl JournalStore for RedbStore {
                     .map_err(|e| be(&e))?;
                 last.insert((tenant.as_str(), key.as_str()), updated)
                     .map_err(|e| be(&e))?;
+                // The per-producer view of the same index, moved with it.
+                let mut sources = w.open_table(RUN_SOURCE).map_err(|e| be(&e))?;
+                if let Some(source) = &admitted_from {
+                    sources
+                        .insert((tenant.as_str(), key.as_str()), source.as_str())
+                        .map_err(|e| be(&e))?;
+                }
+                let source = sources
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|value| value.value().to_owned());
+                if let Some(source) = source {
+                    let mut by_source = w.open_table(RUN_BY_SOURCE).map_err(|e| be(&e))?;
+                    if let Some(previous) = previous {
+                        by_source
+                            .remove((tenant.as_str(), source.as_str(), previous, key.as_str()))
+                            .map_err(|e| be(&e))?;
+                    }
+                    by_source
+                        .insert(
+                            (tenant.as_str(), source.as_str(), updated, key.as_str()),
+                            (),
+                        )
+                        .map_err(|e| be(&e))?;
+                }
                 sealed
             };
             w.commit().map_err(|e| be(&e))?;
@@ -1597,6 +1668,50 @@ impl JournalStore for RedbStore {
         .await
     }
 
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        let tenant = self.tenant_name();
+        let source = source.to_owned();
+        let prefix = format!("{tenant}/");
+        let end = after.map(|(updated, run)| (updated, format!("{prefix}{run}")));
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let by_source = match r.open_table(RUN_BY_SOURCE) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+                Err(e) => return Err(be(&e)),
+            };
+            let (t, s) = (tenant.as_str(), source.as_str());
+            // Exclusive upper bound at the cursor, as `recent_runs` has it.
+            let rows = match &end {
+                Some((updated, key)) => by_source
+                    .range((t, s, 0, "")..(t, s, *updated, key.as_str()))
+                    .map_err(|e| be(&e))?,
+                None => by_source
+                    .range((t, s, 0, "")..=(t, s, u64::MAX, MAX_STR))
+                    .map_err(|e| be(&e))?,
+            };
+            rows.rev()
+                .filter_map(|entry| match entry {
+                    Ok((key, _)) => {
+                        let (_, _, updated, stored) = key.value();
+                        stored
+                            .strip_prefix(prefix.as_str())
+                            .and_then(|id| RunId::parse(id).ok())
+                            .map(|run| Ok((run, updated)))
+                    }
+                    Err(error) => Some(Err(be(&error))),
+                })
+                .take(limit)
+                .collect()
+        })
+        .await
+    }
+
     async fn checkpoint(&self) -> Result<crate::journal::Checkpoint, StoreError> {
         let leaves = self.log_leaves().await?;
         Ok(crate::journal::Checkpoint {
@@ -1697,6 +1812,47 @@ impl JournalStore for RedbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(signed: bool) -> Vec<u8> {
+        Row {
+            body: b"{}".to_vec(),
+            prev_hash: [1; 32],
+            hash: [2; 32],
+            key_id: signed.then(|| "k".to_owned()),
+            signature: signed.then(|| vec![3; 64]),
+        }
+        .encode()
+    }
+
+    /// The signature flag is a boolean byte: any other value is a damaged
+    /// row, not an unsigned record. Read as unsigned, a damaged flag strips
+    /// a signature silently — the record reads back as history written
+    /// before signing was configured.
+    ///
+    /// Flipped on an *unsigned* row, so the rest of the row still decodes
+    /// under either reading and only the flag rule can refuse it.
+    #[test]
+    fn a_signature_flag_other_than_zero_or_one_is_corrupt() {
+        let mut row = row(false);
+        assert!(Row::decode(&row).is_ok_and(|r| r.signature.is_none()));
+        row[64] = 2;
+        assert!(
+            matches!(Row::decode(&row), Err(StoreError::Corrupt { .. })),
+            "a flag byte of 2 decoded as an unsigned row"
+        );
+    }
+
+    /// Bytes past the body are a damaged row, not padding to ignore.
+    #[test]
+    fn trailing_bytes_after_a_journal_row_are_corrupt() {
+        let mut row = row(true);
+        assert!(Row::decode(&row).is_ok_and(|r| r.signature.is_some()));
+        row.push(0);
+        assert!(
+            matches!(Row::decode(&row), Err(StoreError::Corrupt { .. })),
+            "a row with bytes after its body decoded as whole"
+        );
+    }
 
     /// `origin` and `for_tenant` compose the same name whatever order they are
     /// called in, and calling either twice changes nothing.

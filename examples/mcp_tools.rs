@@ -1,7 +1,7 @@
 //! One agent, two tool transports: a real MCP server and a typed Rust tool.
 //!
 //! ```sh
-//! cargo run --example mcp_tools --features redb,testkit,manifest,mcp
+//! cargo run --example mcp_tools --features redb,fake-model,manifest,mcp
 //! ```
 //!
 //! A genuine `rmcp` server runs in this process over a duplex pipe, so this is a

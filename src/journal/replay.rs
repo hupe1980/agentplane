@@ -52,6 +52,12 @@ pub enum EffectReplay {
         /// had. Without it the two label the same value differently, and every
         /// taint gate downstream may reach a different verdict.
         source: Option<String>,
+        /// The operator this plane minted the awaited event for, when it did.
+        ///
+        /// Read back so a wait can hold an answer to the act it names — a
+        /// worklist decision's decider must be the operator the decision was
+        /// recorded under — on replay exactly as live.
+        by: Option<crate::core::Operator>,
         spend: crate::core::Spend,
         /// The trust and sensitivity the effect declared when it landed.
         ///
@@ -159,6 +165,79 @@ impl EffectReplay {
 pub struct StepCursor {
     effects: Vec<Journaled>,
     pos: usize,
+    /// Where this step parted from its record, once it has.
+    diverged: Option<Divergence>,
+}
+
+/// Where a strict replay first parted from the record.
+///
+/// The structure a quarantine message flattens: an author asking *which
+/// effect did my edit change* needs the step and both keys as values, not a
+/// sentence to parse. Exactly one of three shapes — both keys (this build
+/// asked for a different effect), only [`recomputed`](Self::recomputed) (it
+/// asked for more than the record holds), only [`recorded`](Self::recorded)
+/// (it never asked for an effect the record holds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Divergence {
+    pub step: StepId,
+    pub phase: Phase,
+    /// The effect history holds at this position.
+    pub recorded: Option<EffectKey>,
+    /// The effect this build asked for there.
+    pub recomputed: Option<EffectKey>,
+    /// What the effect is, where either side names it.
+    pub kind: Option<String>,
+    pub detail: String,
+}
+
+impl Divergence {
+    /// The divergence a step error describes, if it describes one.
+    ///
+    /// `None` for every other failure: a refusal, a budget stop or a tool
+    /// error is the run's own verdict, which a faithful replay reproduces.
+    #[must_use]
+    pub fn of(step: StepId, phase: Phase, error: &StepError, history: &StepCursor) -> Option<Self> {
+        match error {
+            StepError::NonDeterminism {
+                seq,
+                expected,
+                actual,
+                detail,
+            } => Some(Self {
+                step,
+                phase,
+                recorded: Some(*expected),
+                recomputed: Some(*actual),
+                kind: history.kind_at(*seq),
+                detail: detail.clone(),
+            }),
+            StepError::ReplayOverrun { actual, kind } => Some(Self {
+                step,
+                phase,
+                recorded: None,
+                recomputed: Some(*actual),
+                kind: Some(kind.clone()),
+                detail: format!(
+                    "this build asks for `{kind}`, past the end of the recorded history"
+                ),
+            }),
+            _ => None,
+        }
+    }
+
+    /// A journaled effect this build never asked for.
+    #[must_use]
+    pub fn unconsumed(step: StepId, phase: Phase, missing: &Unconsumed) -> Self {
+        Self {
+            step,
+            phase,
+            recorded: Some(missing.key),
+            recomputed: None,
+            kind: missing.kind.clone(),
+            detail: format!("the record holds {missing}, which this build never asks for"),
+        }
+    }
 }
 
 /// A journaled effect this build never asked for.
@@ -258,10 +337,7 @@ impl StepCursor {
             RecordKind::EffectDone {
                 output,
                 source,
-                // Replay rebuilds the value and its label; who minted the
-                // event is evidence about the act, read by an auditor rather
-                // than by the deterministic zone, so nothing here consumes it.
-                by: _,
+                by,
                 spend,
                 declared,
             } => {
@@ -270,6 +346,7 @@ impl StepCursor {
                     EffectReplay::Done {
                         output: output.clone(),
                         source: source.clone(),
+                        by: by.clone(),
                         spend: *spend,
                         declared: *declared,
                     },
@@ -374,6 +451,7 @@ impl StepCursor {
             (Disposition::Landed, Some(output)) => EffectReplay::Done {
                 output: output.clone(),
                 source: None,
+                by: None,
                 spend,
                 // A `Landed` verdict without a declaration is a record this
                 // runtime does not write. Reading it as trusted would be the
@@ -401,6 +479,7 @@ impl StepCursor {
             replay: EffectReplay::Done {
                 output: serde_json::Value::Null,
                 source: None,
+                by: None,
                 spend: crate::core::Spend::default(),
                 // A release records no value of its own to label: the released
                 // value belongs to the caller and its new label is in the
@@ -432,6 +511,20 @@ impl StepCursor {
             key: e.key,
             kind: e.what.as_ref().map(|w| w.kind.clone()),
         })
+    }
+
+    /// What the record says was attempted at `seq`, if anything was.
+    #[must_use]
+    pub fn kind_at(&self, seq: Seq) -> Option<String> {
+        self.effects
+            .iter()
+            .find(|e| e.seq == seq)
+            .and_then(|e| e.what.as_ref().map(|w| w.kind.clone()))
+    }
+
+    /// Record where this step parted from its history; the first one stands.
+    pub fn note_divergence(&mut self, divergence: Divergence) {
+        self.diverged.get_or_insert(divergence);
     }
 
     /// Whether the next journaled effect is `key`, without consuming it.
@@ -547,6 +640,8 @@ pub struct ReplayCursor {
     /// effect read the forward record and report non-determinism against
     /// history that is perfectly sound.
     by_step: BTreeMap<(StepId, Phase), StepCursor>,
+    /// A divergence the executor found between steps rather than inside one.
+    noted: Option<Divergence>,
 }
 
 impl ReplayCursor {
@@ -568,7 +663,10 @@ impl ReplayCursor {
                 .apply(key, r.seq(), r.kind());
         }
 
-        Self { by_step }
+        Self {
+            by_step,
+            noted: None,
+        }
     }
 
     /// Detach a step's history so the step can own it.
@@ -607,6 +705,22 @@ impl ReplayCursor {
         self.by_step.iter().find_map(|((step, phase), cursor)| {
             cursor.first_unconsumed().map(|u| (*step, *phase, u))
         })
+    }
+
+    /// Record a divergence found at a step boundary; the first one stands.
+    pub fn note_divergence(&mut self, divergence: Divergence) {
+        self.noted.get_or_insert(divergence);
+    }
+
+    /// Where this replay first parted from the record, if it did.
+    ///
+    /// One noted at a boundary wins, because that is the finding the run's
+    /// conclusion was written from; otherwise the lowest step's own.
+    #[must_use]
+    pub fn divergence(&self) -> Option<&Divergence> {
+        self.noted
+            .as_ref()
+            .or_else(|| self.by_step.values().find_map(|c| c.diverged.as_ref()))
     }
 
     /// The first unconsumed effect in one `(step, phase)` slice, if any.
@@ -842,6 +956,7 @@ mod tests {
                 declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!("recorded"),
                 source: None,
+                by: None,
                 spend: crate::core::Spend::default()
             })
         );
@@ -1025,6 +1140,7 @@ mod tests {
                 declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!("a"),
                 source: None,
+                by: None,
                 spend: crate::core::Spend::default()
             })
         );
@@ -1034,6 +1150,7 @@ mod tests {
                 declared: crate::core::DeclaredOutput::untrusted(),
                 output: json!("b"),
                 source: None,
+                by: None,
                 spend: crate::core::Spend::default()
             })
         );

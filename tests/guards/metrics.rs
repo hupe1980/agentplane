@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use agentplane::case::{CaseStore, TaskStore, TimerStore};
 use agentplane::core::{
-    CorrelationKey, DeadlineSpec, Effect, EffectDescriptor, EffectError, Justification, OnExpiry,
+    CorrelationKey, DeadlineSpec, Effect, EffectDescriptor, EffectError, Expiry, Justification,
     Outcome, Recovery, RetryPolicy, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec,
     Timestamp,
 };
@@ -209,7 +209,7 @@ impl Skill for NeedsApproval {
             "approval",
         )
         .role("ops")
-        .on_expiry(OnExpiry::Deny);
+        .on_expiry(Expiry::Deny);
         cx.task(&spec).await?;
         Ok(Outcome::done(Tainted::trusted(json!({}))))
     }

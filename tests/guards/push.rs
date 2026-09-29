@@ -269,6 +269,39 @@ async fn the_loopback_exception_lifts_two_refusals_and_no_others() {
     );
 }
 
+/// **A delivery failure names the host, never the URL.**
+///
+/// A webhook URL is the receiver's to choose, and receivers put a bearer
+/// secret in it. The text of an unreachable delivery is parked beside the
+/// registration, logged and served back by the operator API — so `reqwest`'s
+/// own rendering, which quotes the whole URL, must not reach it.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn an_unreachable_delivery_does_not_quote_its_url() {
+    use agentplane::push::{Delivered, PushSender, PushTransport};
+
+    let sender =
+        PushSender::new(PushPolicy::new().allow_host("localhost")).allow_plaintext_loopback();
+    let outcome = sender
+        .deliver(
+            &config("http://localhost:1/hook/CANARY-path?t=CANARY-query"),
+            &message(),
+            0,
+        )
+        .await;
+    let Ok(Delivered::Unreachable(text)) = outcome else {
+        panic!("nothing listens on port 1, so this is unreachable: {outcome:?}");
+    };
+    assert!(
+        !text.contains("CANARY"),
+        "the parked error quotes the webhook URL, and the secret in it: {text}"
+    );
+    assert!(
+        text.contains("localhost"),
+        "the parked error no longer says where delivery failed: {text}"
+    );
+}
+
 /// A bracketed IPv6 literal is judged by the address rule, not lost in DNS.
 ///
 /// `Url::host_str` keeps the brackets and the resolver refuses them, so before

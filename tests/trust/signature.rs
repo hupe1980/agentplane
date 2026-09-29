@@ -8,7 +8,7 @@
 //! So the test that matters here is not "a tampered record is caught" — the
 //! chain already did that. It is **a perfectly valid chain, rewritten by
 //! somebody who could recompute hashes but could not sign**. That case passes
-//! `verify_chain` and must fail `verify_attested`, and if it does not, the
+//! `verify_chain` and must fail `verify_signed`, and if it does not, the
 //! signatures are decoration.
 
 #![cfg(all(feature = "redb", feature = "signing"))]
@@ -81,7 +81,7 @@ async fn a_signed_run_says_who_wrote_it() {
 
     for r in &records {
         let a = r
-            .attestation
+            .signature
             .as_ref()
             .unwrap_or_else(|| panic!("record {} is unsigned", r.seq()));
         assert_eq!(a.key_id, "spiffe://example.org/plane-a");
@@ -94,7 +94,7 @@ async fn a_signed_run_says_who_wrote_it() {
             &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
         )
         .unwrap();
-    Record::verify_attested(&records, Digest::ZERO, &verifier, true)
+    Record::verify_signed(&records, Digest::ZERO, &verifier, true)
         .expect("a run this plane signed must verify against its own key");
 }
 
@@ -137,7 +137,7 @@ async fn a_rewritten_chain_verifies_and_is_still_caught() {
             &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
         )
         .unwrap();
-    let err = Record::verify_attested(&forged, Digest::ZERO, &verifier, true)
+    let err = Record::verify_signed(&forged, Digest::ZERO, &verifier, true)
         .expect_err("a rewritten history was accepted");
     assert!(
         err.to_string().contains("no signature"),
@@ -172,7 +172,7 @@ async fn a_signature_from_the_wrong_key_is_refused() {
             &Ed25519Signer::new("x", &PLANE_A).verifying_key(),
         )
         .unwrap();
-    let err = Record::verify_attested(&forged, Digest::ZERO, &verifier, true)
+    let err = Record::verify_signed(&forged, Digest::ZERO, &verifier, true)
         .expect_err("a history signed by the wrong key was accepted");
     assert!(
         err.to_string().contains("did not make"),
@@ -201,11 +201,11 @@ async fn a_signature_commits_to_everything_before_it() {
         } else {
             // Everything after keeps its original signature, over the hash it
             // originally had.
-            Record::from_stored_attested(
+            Record::from_stored_signed(
                 r.raw().to_vec(),
                 prev,
                 Digest::chain(prev, r.raw()),
-                r.attestation.clone(),
+                r.signature.clone(),
             )
             .unwrap()
         };
@@ -222,7 +222,7 @@ async fn a_signature_commits_to_everything_before_it() {
     // Record 0's body is unchanged here, so the point is the mechanism: if any
     // earlier byte differs, every later hash differs, and every later signature
     // — made over the old hash — stops verifying.
-    let tampered = Record::verify_attested(&forged, Digest::ZERO, &verifier, true);
+    let tampered = Record::verify_signed(&forged, Digest::ZERO, &verifier, true);
     assert!(
         tampered.is_ok(),
         "an unmodified rebuild must still verify: {tampered:?}"
@@ -256,12 +256,12 @@ async fn an_unsigned_plane_is_ordinary_not_broken() {
         .unwrap();
     // The count first. `all()` over an empty slice is true, so a `read` that
     // returned nothing — a real way for this to break — would satisfy the
-    // assertion below while proving nothing about attestation at all.
+    // assertion below while proving nothing about signature at all.
     assert!(
         !records.is_empty(),
-        "the run wrote no records; the attestation assertion below would pass vacuously"
+        "the run wrote no records; the signature assertion below would pass vacuously"
     );
-    assert!(records.iter().all(|r| r.attestation.is_none()));
+    assert!(records.iter().all(|r| r.signature.is_none()));
     // The chain still holds.
     (store as Arc<dyn JournalStore>)
         .verify(out.run_id)
@@ -281,7 +281,7 @@ async fn stripping_the_signatures_is_not_a_way_to_pass() {
 
     let stripped: Vec<Record> = records
         .iter()
-        .map(|r| Record::from_stored_attested(r.raw().to_vec(), r.prev_hash, r.hash, None).unwrap())
+        .map(|r| Record::from_stored_signed(r.raw().to_vec(), r.prev_hash, r.hash, None).unwrap())
         .collect();
 
     let verifier = Ed25519Verifier::new()
@@ -292,11 +292,11 @@ async fn stripping_the_signatures_is_not_a_way_to_pass() {
         .unwrap();
 
     // Lenient: fine, because the plane has no basis to reject its own history.
-    Record::verify_attested(&stripped, Digest::ZERO, &verifier, false)
+    Record::verify_signed(&stripped, Digest::ZERO, &verifier, false)
         .expect("a lenient verification tolerates unsigned records");
 
     // Strict: refused, because an auditor asked for proof and got none.
-    Record::verify_attested(&stripped, Digest::ZERO, &verifier, true)
+    Record::verify_signed(&stripped, Digest::ZERO, &verifier, true)
         .expect_err("signatures were stripped and the strict check passed anyway");
 }
 
@@ -312,7 +312,7 @@ async fn an_unknown_signer_is_not_trusted() {
             &Ed25519Signer::new("x", &PLANE_B).verifying_key(),
         )
         .unwrap();
-    Record::verify_attested(&records, Digest::ZERO, &verifier, true)
+    Record::verify_signed(&records, Digest::ZERO, &verifier, true)
         .expect_err("a record signed by an unknown workload was accepted");
 }
 
@@ -679,6 +679,14 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         ) -> Result<Vec<(RunId, u64)>, StoreError> {
             self.0.recent_runs(after, limit).await
         }
+        async fn recent_runs_from(
+            &self,
+            source: &str,
+            after: Option<(u64, RunId)>,
+            limit: usize,
+        ) -> Result<Vec<(RunId, u64)>, StoreError> {
+            self.0.recent_runs_from(source, after, limit).await
+        }
         async fn head(&self, run: RunId) -> Result<Head, StoreError> {
             self.0.head(run).await
         }
@@ -779,6 +787,8 @@ async fn a_sealing_record_claiming_a_foreign_head_is_a_finding() {
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             ),
             Append::new(
@@ -838,6 +848,8 @@ async fn run_holding(
             policy_bundle: None,
             canon: agentplane::core::canon::VERSION,
             idempotency_key: None,
+            admitted_by: None,
+            served_unchained: false,
         },
     )];
     records.extend(body.into_iter().map(|k| Append::new(run, k)));
@@ -1206,6 +1218,7 @@ async fn the_audit_reports_who_raised_a_label_and_on_what_evidence() {
 
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(std::sync::Arc::new(PermitsReleases))
         .skill(Releases)
         .build();
     let out = rt
@@ -1397,6 +1410,8 @@ async fn every_verified_run_is_warranted_or_reported_as_unadmitted() {
                 policy_bundle: None,
                 canon: agentplane::core::canon::VERSION,
                 idempotency_key: None,
+                admitted_by: None,
+                served_unchained: false,
             },
         )],
     )
@@ -1758,6 +1773,14 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         ) -> Result<Vec<(RunId, u64)>, StoreError> {
             self.inner.recent_runs(after, limit).await
         }
+        async fn recent_runs_from(
+            &self,
+            source: &str,
+            after: Option<(u64, RunId)>,
+            limit: usize,
+        ) -> Result<Vec<(RunId, u64)>, StoreError> {
+            self.inner.recent_runs_from(source, after, limit).await
+        }
         async fn case_history(
             &self,
             case: CaseId,
@@ -2041,4 +2064,25 @@ async fn a_fork_is_caught_by_the_shorter_anchor_the_highest_would_have_hidden() 
         "the report must name every observation it was held to, or a reader cannot \
          tell how strong the verdict is"
     );
+}
+
+/// Permits every request. A release is refused on a plane with no policy
+/// engine, and these tests are about what a permitted release does.
+#[derive(Debug)]
+struct PermitsReleases;
+
+impl agentplane::core::PolicyEngine for PermitsReleases {
+    fn authorize(
+        &self,
+        _: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"permits-releases"),
+            "test/permits-releases-v1",
+        )
+    }
 }

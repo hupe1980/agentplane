@@ -30,6 +30,17 @@ pub enum TargetedDelivery {
     NotWaiting,
 }
 
+/// Who minted a buffered event: an operator on this plane, or nobody.
+///
+/// Read back by [`EventStore::minter`]. `Nobody` is every message that
+/// arrived over a wire, and every one this plane minted in nobody's name — an
+/// expired approval window's answer is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Minter {
+    Nobody,
+    Operator(crate::core::Operator),
+}
+
 /// Durable inbound-event handling.
 ///
 /// The ordering rule that makes this correct, stated once:
@@ -39,6 +50,9 @@ pub enum TargetedDelivery {
 /// An event that arrives before its waiter must survive until the waiter
 /// appears. Matching first and discarding on a miss is the bug that makes a run
 /// wait forever for something that already happened.
+/// The dead-letter reason of an unclaimed event whose payload was erased.
+pub const ERASED_REASON: &str = "erased";
+
 #[async_trait]
 pub trait EventStore: Send + Sync + Debug {
     /// Whose rows this handle can reach.
@@ -95,6 +109,13 @@ pub trait EventStore: Send + Sync + Debug {
     /// The mirror of [`claim_for`](EventStore::claim_for): one looks for a
     /// waiter given an event, the other for an event given a waiter. Both
     /// directions are needed precisely because either can arrive first.
+    ///
+    /// A subscription whose run is sealed is passed over: the event goes to
+    /// the next live waiter, or stays buffered, rather than being claimed for
+    /// a run that will never consume it. So is a **parked** one
+    /// ([`park_wait`](Self::park_wait)): it already holds its claimed event,
+    /// and a second event elected for it would stay claimed for a satisfied
+    /// wait for ever.
     async fn match_waiter(
         &self,
         event: &InboundEvent,
@@ -135,6 +156,44 @@ pub trait EventStore: Send + Sync + Debug {
     /// [`erase_payload`](Self::erase_payload) instead.
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError>;
 
+    /// Drop every subscription a run holds, returning how many waits were
+    /// retired.
+    ///
+    /// Called when the run concludes closed. Left registered, a closed run's
+    /// wait is the oldest waiter on its key, and the next matching event is
+    /// claimed for a run that will never consume it — while a live run
+    /// waiting on the same key starves. Payloads the run holds claimed are
+    /// shed exactly as [`unsubscribe`](Self::unsubscribe) sheds them.
+    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError>;
+
+    /// Register a wait that already holds a claimed event, and mark it for
+    /// redelivery.
+    ///
+    /// The delivery that claimed an event and could not resume the run —
+    /// its owner held the lease past the retry window — parks the pair here,
+    /// and [`parked_waits`](Self::parked_waits) is what the sweep's redelivery pass
+    /// walks. A targeted delivery's claim is parked by
+    /// [`deliver_to`](Self::deliver_to) itself. The mark goes with the
+    /// subscription: [`unsubscribe`](Self::unsubscribe) and the claim that
+    /// retires a wait both clear it.
+    ///
+    /// A parked wait is listed for redelivery and recovers its own event
+    /// through [`claim_for`](Self::claim_for), but it is not matchable: no
+    /// other event is claimed for it.
+    async fn park_wait(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError>;
+
+    /// Waits holding a claimed event nothing has delivered yet.
+    ///
+    /// A separate listing from [`waiting`](Self::waiting) because that one
+    /// is every registered wait in registration order, and a plane is
+    /// expected to hold far more legitimately long waits than a redelivery
+    /// page: the parked pair registered after them would never be reached.
+    ///
+    /// A sealed run's parked waits are retired rather than listed — it can
+    /// record no delivery, so listing them has the pass fail on them every
+    /// tick — and the payloads it held claimed are shed with them.
+    async fn parked_waits(&self, limit: usize) -> Result<Vec<Subscription>, StoreError>;
+
     /// Remove one buffered event's payload while keeping its identity.
     ///
     /// The erasure verb the buffer was missing. The buffer keeps its copy of
@@ -150,11 +209,34 @@ pub trait EventStore: Send + Sync + Debug {
     /// keys and reason, because "what went unclaimed and why" is operational
     /// truth about the deployment, not the counterparty's content.
     ///
+    /// A row **nobody had claimed** also leaves the claimable set: it becomes a
+    /// dead letter whose reason is [`ERASED_REASON`], in the same write. Left
+    /// live, the next matching waiter would claim the emptied row and be
+    /// handed `null` as if the counterparty had sent it.
+    ///
+    /// So does a row **claimed and not yet delivered** — claimed, with its
+    /// payload not yet shed by the claimant's unsubscribe. The claim is
+    /// released and the claimant's wait that was parked holding it is
+    /// unparked, so the wait stays open for its deadline to bound; the
+    /// recovery that would have re-read the row finds nothing to hand over.
+    /// Every erased row is marked erased, and [`claim_for`](Self::claim_for)
+    /// never returns one, whatever its claim says.
+    ///
     /// What this does **not** cover: the journaled copy of a *delivered*
     /// payload, which lives under the run's case and is erased by that case's
     /// key; and the correlation keys, which are business identifiers the row
     /// is filed under, not content. Returns whether a row existed.
     async fn erase_payload(&self, source: &str, id: &str) -> Result<bool, StoreError>;
+
+    /// Who minted the buffered event `(source, id)`, or `None` when no such
+    /// event was ever buffered.
+    ///
+    /// Survives both payload erasure and the unsubscribe that sheds a
+    /// delivered payload, as the minter does on the row: who on this plane
+    /// minted a message is not the counterparty's content. It is how a
+    /// settler that meets a duplicate answer to a human task learns whose
+    /// answer is already on record.
+    async fn minter(&self, source: &str, id: &str) -> Result<Option<Minter>, StoreError>;
 
     /// Move events nobody claimed within the window to the dead-letter list.
     ///

@@ -1067,6 +1067,8 @@ async fn a_deleted_run_is_caught_by_the_anchor_a_witness_holds() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 )],
             )

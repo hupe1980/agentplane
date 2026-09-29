@@ -9,12 +9,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::config::Region;
-use aws_sdk_bedrockruntime::operation::converse::ConverseError;
 use aws_sdk_bedrockruntime::types::{
     ContentBlock, ConversationRole, DocumentBlock, DocumentFormat, DocumentSource, ImageBlock,
     ImageFormat, ImageSource, InferenceConfiguration, JsonSchemaDefinition, Message, OutputConfig,
     OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
-    ReasoningTextBlock, SpecificToolChoice, SystemContentBlock, Tool, ToolChoice,
+    ReasoningTextBlock, SpecificToolChoice, StopReason, SystemContentBlock, Tool, ToolChoice,
     ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
     ToolSpecification, ToolUseBlock,
 };
@@ -746,13 +745,16 @@ impl Bedrock {
                 detail: "Bedrock did not start the stream before the request deadline".to_owned(),
             })?
             .map_err(|error| {
-                error.as_service_error().map_or_else(
-                    || ModelError::Unreachable {
-                        model: model.clone(),
-                        detail: error.to_string(),
-                    },
-                    |service| classify_stream_start(model, service),
-                )
+                classify_sdk(model, &error, |service, detail| {
+                    classify_service(
+                        model,
+                        detail,
+                        service.is_throttling_exception() || service.is_model_not_ready_exception(),
+                        service.is_access_denied_exception()
+                            || service.is_resource_not_found_exception()
+                            || service.is_validation_exception(),
+                    )
+                })
             })?;
 
         let mut stream = output.stream;
@@ -897,28 +899,29 @@ impl Bedrock {
                 detail: "a Bedrock guardrail intervened on this call".to_owned(),
             });
         }
-        // The provider's own verdict that this turn is not usable output.
-        // Converse stops with these when the model emitted something it could
-        // not parse into its message shape — a tool call included — and what
-        // reaches the content blocks is whatever fragment survived. Passing
-        // that fragment through would hand a caller's tool loop a call the
-        // provider itself has disowned, plausible-looking arguments and all.
-        // Metered, because the tokens were generated and billed either way.
-        if matches!(
-            output.stop_reason(),
-            aws_sdk_bedrockruntime::types::StopReason::MalformedModelOutput
-                | aws_sdk_bedrockruntime::types::StopReason::MalformedToolUse
-        ) {
-            return Err(ModelError::Unusable {
-                model: model.clone(),
-                usage,
-                detail: format!(
-                    "Bedrock stopped with '{}': the provider could not parse what the \
-                     model emitted, so no fragment of it is a usable answer",
-                    output.stop_reason().as_str()
-                ),
-            });
-        }
+        // An allowlist. `end_turn`, `tool_use` and `stop_sequence` are an
+        // answer; `max_tokens` and a full context window are a typed
+        // truncation; everything else ended without one. The malformed stops
+        // are the provider disowning what reached the content blocks — a
+        // fragment passed through would hand a tool loop a call the provider
+        // itself could not parse — and `content_filtered` or a reason this SDK
+        // reports as unknown is no more an answer. Metered, because the tokens
+        // were generated and billed either way.
+        let truncated = match output.stop_reason() {
+            StopReason::EndTurn | StopReason::ToolUse | StopReason::StopSequence => false,
+            StopReason::MaxTokens | StopReason::ModelContextWindowExceeded => true,
+            other => {
+                return Err(ModelError::Unusable {
+                    model: model.clone(),
+                    usage,
+                    detail: format!(
+                        "Bedrock stopped with '{}', which is not an answer: no fragment of \
+                         what the model emitted is usable output",
+                        other.as_str()
+                    ),
+                });
+            }
+        };
         let message = output
             .output()
             .and_then(|value| value.as_message().ok())
@@ -997,11 +1000,6 @@ impl Bedrock {
             });
         }
         let stop_reason = output.stop_reason().as_str().to_owned();
-        let truncated = matches!(
-            output.stop_reason(),
-            aws_sdk_bedrockruntime::types::StopReason::MaxTokens
-                | aws_sdk_bedrockruntime::types::StopReason::ModelContextWindowExceeded
-        );
         let continuation = (!calls.is_empty()).then(|| {
             ProviderContinuation::new(
                 "bedrock",
@@ -1035,7 +1033,6 @@ impl ModelProvider for Bedrock {
                 SchemaMode::Native => "native",
                 SchemaMode::ForcedTool => "forced-tool",
             },
-            "timeout_ms": self.timeout.as_millis(),
             // Identity, not decoration: turning a guardrail on, off, or to
             // another version changes what governed the call, so a replay of
             // history written under the old configuration reports divergence
@@ -1126,14 +1123,16 @@ impl ModelProvider for Bedrock {
                 detail: format!("Bedrock did not complete within {:?}", self.timeout),
             })?;
         let output = result.map_err(|error| {
-            if let Some(service) = error.as_service_error() {
-                classify_service(model, service)
-            } else {
-                ModelError::Unreachable {
-                    model: model.clone(),
-                    detail: error.to_string(),
-                }
-            }
+            classify_sdk(model, &error, |service, detail| {
+                classify_service(
+                    model,
+                    detail,
+                    service.is_throttling_exception() || service.is_model_not_ready_exception(),
+                    service.is_access_denied_exception()
+                        || service.is_resource_not_found_exception()
+                        || service.is_validation_exception(),
+                )
+            })
         })?;
         let mut completion = Self::interpret(model, schema, self.schema_mode, &output)?;
         if let Some((observer, label)) = stream {
@@ -1211,58 +1210,55 @@ fn tool(
     Ok(Tool::ToolSpec(specification))
 }
 
-fn classify_service(model: &ModelId, error: &ConverseError) -> ModelError {
-    let detail = error.to_string();
-    if error.is_throttling_exception() || error.is_model_not_ready_exception() {
-        ModelError::RateLimited {
+/// Classify a failed SDK call by how far it got.
+///
+/// The detail is the whole source chain: the SDK's own `Display` says only
+/// "dispatch failure" or "service error", which sends an operator looking for
+/// a cause the message dropped. Only a request the SDK could not build is
+/// known never to have reached AWS; a dispatch failure may have been sent, and
+/// a timeout or an unreadable response certainly was, so each of those is
+/// `Unavailable` — reached, with nothing said about whether it generated.
+fn classify_sdk<E, R>(
+    model: &ModelId,
+    error: &aws_sdk_bedrockruntime::error::SdkError<E, R>,
+    service: impl FnOnce(&E, String) -> ModelError,
+) -> ModelError
+where
+    E: std::error::Error + 'static,
+    R: std::fmt::Debug,
+{
+    use aws_sdk_bedrockruntime::error::{DisplayErrorContext, SdkError};
+    let detail = DisplayErrorContext(error).to_string();
+    match error {
+        SdkError::ServiceError(context) => service(context.err(), detail),
+        SdkError::ConstructionFailure(_) => ModelError::Unreachable {
             model: model.clone(),
             detail,
-            // The SDK models a throttle as a typed error and does not surface
-            // the response headers at this seam, so there is no window to read.
-            // Nothing is lost that the caller could have used: the AWS client
-            // applies its own adaptive retry beneath this call, and a second
-            // schedule stacked on it would multiply rather than add.
-            retry_after: None,
-        }
-    } else if error.is_access_denied_exception()
-        || error.is_resource_not_found_exception()
-        || error.is_validation_exception()
-    {
-        ModelError::Refused {
+        },
+        _ => ModelError::Unavailable {
             model: model.clone(),
             detail,
-        }
-    } else {
-        // Buffered Converse does not expose partial usage for timeout, model,
-        // service, or unknown failures. It may have generated, so do not claim
-        // the request was free or definitely absent.
-        ModelError::Unavailable {
-            model: model.clone(),
-            detail,
-        }
+        },
     }
 }
 
-fn classify_stream_start(
-    model: &ModelId,
-    error: &aws_sdk_bedrockruntime::operation::converse_stream::ConverseStreamError,
-) -> ModelError {
-    let detail = error.to_string();
-    if error.is_throttling_exception() || error.is_model_not_ready_exception() {
+/// Classify a Converse service error, buffered or at stream start.
+///
+/// A throttle is `RateLimited` with no window: the SDK models it as a typed
+/// error and does not surface the response headers at this seam, and the AWS
+/// client applies its own adaptive retry beneath this call, so a second
+/// schedule stacked on it would multiply rather than add. Access, lookup and
+/// validation failures are refusals. Anything else — a timeout, a model or
+/// service fault — may have generated, and Converse exposes no partial usage
+/// for it, so it is `Unavailable` rather than free or absent.
+fn classify_service(model: &ModelId, detail: String, throttled: bool, refused: bool) -> ModelError {
+    if throttled {
         ModelError::RateLimited {
             model: model.clone(),
             detail,
-            // The SDK models a throttle as a typed error and does not surface
-            // the response headers at this seam, so there is no window to read.
-            // Nothing is lost that the caller could have used: the AWS client
-            // applies its own adaptive retry beneath this call, and a second
-            // schedule stacked on it would multiply rather than add.
             retry_after: None,
         }
-    } else if error.is_access_denied_exception()
-        || error.is_resource_not_found_exception()
-        || error.is_validation_exception()
-    {
+    } else if refused {
         ModelError::Refused {
             model: model.clone(),
             detail,
@@ -1671,6 +1667,49 @@ mod tests {
         }
     }
 
+    /// Completeness is an allowlist: a filtered stop, or one this SDK names
+    /// only as unknown, carries text that reads like an answer and is not one.
+    #[test]
+    fn a_filtered_or_unknown_stop_is_unusable_not_an_answer() {
+        let model = ModelId::new("bedrock", "test");
+        for reason in [
+            aws_sdk_bedrockruntime::types::StopReason::ContentFiltered,
+            aws_sdk_bedrockruntime::types::StopReason::from("a_reason_not_yet_invented"),
+        ] {
+            let message = Message::builder()
+                .role(ConversationRole::Assistant)
+                .content(ContentBlock::Text("looks whole".to_owned()))
+                .build()
+                .expect("message");
+            let output = aws_sdk_bedrockruntime::operation::converse::ConverseOutput::builder()
+                .output(aws_sdk_bedrockruntime::types::ConverseOutput::Message(
+                    message,
+                ))
+                .stop_reason(reason.clone())
+                .usage(
+                    aws_sdk_bedrockruntime::types::TokenUsage::builder()
+                        .input_tokens(7)
+                        .output_tokens(3)
+                        .total_tokens(10)
+                        .build()
+                        .expect("usage"),
+                )
+                .build()
+                .expect("converse output");
+            let error = Bedrock::interpret(&model, None, SchemaMode::Native, &output)
+                .expect_err(reason.as_str());
+            match error {
+                ModelError::Unusable { usage, .. } => {
+                    assert_eq!(usage.output_tokens, 3, "the generation was billed");
+                }
+                other => panic!(
+                    "{}: expected a metered Unusable, got {other:?}",
+                    reason.as_str()
+                ),
+            }
+        }
+    }
+
     #[test]
     fn smithy_documents_round_trip_json() {
         let value = json!({"s": "x", "n": -2, "u": 3, "f": 1.5, "a": [true, null]});
@@ -1821,13 +1860,22 @@ mod tests {
                 "region": "eu-west-1",
                 "stream": true,
                 "schema_mode": "native",
-                "timeout_ms": 300_000,
                 // Present and null when unguarded: an absent key and a null
                 // one are the same to a reader and different to a digest, so
                 // the profile states the answer rather than omitting it.
                 "guardrail": Value::Null,
                 "reasoning_dialect": Value::Null,
             })
+        );
+
+        assert_eq!(
+            driver.request_profile(&ModelId::new("bedrock", "m")),
+            driver
+                .clone()
+                .timeout(Duration::from_secs(7))
+                .request_profile(&ModelId::new("bedrock", "m")),
+            "a timeout is how long this plane waits, not what it asks — it must not \
+             enter the effect identity"
         );
 
         assert_ne!(

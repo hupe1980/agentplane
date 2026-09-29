@@ -395,6 +395,8 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 ),
                 Append::new(
@@ -478,6 +480,8 @@ async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 ),
                 Append::new(

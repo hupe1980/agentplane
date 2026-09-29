@@ -478,6 +478,8 @@ async fn sealed_store(n: usize) -> Arc<agentplane::store::RedbStore> {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 )],
             )
@@ -621,6 +623,8 @@ async fn a_stale_witness_is_healed_with_a_proof_from_its_cursor() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 )],
             )

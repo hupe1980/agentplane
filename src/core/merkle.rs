@@ -623,8 +623,8 @@ mod tests {
     /// binding only does work when the prefix straddles a split and the old root
     /// is rebuilt from proof hashes.
     ///
-    /// Found by mutation testing: deleting the old-root comparison changed
-    /// nothing, because every test then present used the left-aligned shape.
+    /// A suite that uses only the left-aligned shape survives deleting the
+    /// old-root comparison.
     #[test]
     fn a_forged_old_root_is_rejected() {
         let l = leaves(9);

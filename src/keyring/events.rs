@@ -66,13 +66,11 @@ impl SealedEvents {
         })
     }
 
-    /// One message, one scope. `(source, id)` is the pair `CloudEvents`
-    /// defines uniqueness by and the pair this buffer deduplicates on, so the
-    /// erasure unit is exactly the message an erasure request names. Derived
-    /// here and nowhere else: the seal path and [`erase_event`](Self::erase_event)
-    /// must agree byte-for-byte about which key seals a message.
+    /// One message, one scope — [`event_scope`](super::event_scope), so the
+    /// seal path and [`erase_event`](Self::erase_event) agree byte-for-byte
+    /// about which key seals a message.
     fn scope_for(&self, source: &str, id: &str) -> String {
-        super::scope(&self.tenant, &format!("event/{source}/{id}"))
+        super::event_scope(&self.tenant, source, id)
     }
 
     /// The ciphertext binds tenant, purpose label and event identity as
@@ -89,7 +87,7 @@ impl SealedEvents {
     /// derivations side by side and prove colliding identifiers never share
     /// an AAD.
     pub(super) fn aad(tenant: &TenantId, event: &InboundEvent) -> String {
-        format!("event:{tenant}:{}/{}", event.source, event.id)
+        format!("event:{tenant}:{}", event.dedup_key())
     }
 
     async fn sealed(&self, event: &InboundEvent) -> Result<InboundEvent, StoreError> {
@@ -119,19 +117,34 @@ impl SealedEvents {
     /// the first place. A ring that is merely unreachable is a different
     /// answer and gets one.
     async fn opened(&self, mut event: InboundEvent) -> Result<InboundEvent, StoreError> {
-        let Some(envelope) = payload::unwrap(&event.payload) else {
-            return Ok(event);
-        };
-        let aad = Self::aad(&self.tenant, &event);
-        if let Some(plain) =
-            super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
-                .await
-                .map_err(|e| StoreError::Backend(e.to_string()))?
-            && let Ok(value) = serde_json::from_slice(&plain)
-        {
+        if let Some(value) = self.payload(&event).await? {
             event.payload = value;
         }
         Ok(event)
+    }
+
+    /// The payload in the clear, or `None` when its key was destroyed.
+    ///
+    /// A payload that was never sealed comes back as stored. One whose
+    /// plaintext does not parse is an error rather than a sealed wrapper left
+    /// in place: nothing destroyed a key, so nothing explains it.
+    async fn payload(&self, event: &InboundEvent) -> Result<Option<serde_json::Value>, StoreError> {
+        let Some(envelope) = payload::unwrap(&event.payload) else {
+            return Ok(Some(event.payload.clone()));
+        };
+        let aad = Self::aad(&self.tenant, event);
+        let Some(plain) =
+            super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
+                .await
+                .map_err(|e| StoreError::Backend(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&plain).map(Some).map_err(|e| {
+            StoreError::Backend(format!(
+                "a buffered event's payload opened and does not parse: {e}"
+            ))
+        })
     }
 
     /// Cryptographically erase one buffered message, then shed its ciphertext.
@@ -140,15 +153,20 @@ impl SealedEvents {
     /// the scope this decorator sealed the message under is destroyed first,
     /// so every copy — replicas and backups included — stops opening at the
     /// same instant, and only then is the live ciphertext removed from the
-    /// buffer row. A ciphertext-cleanup failure after the destroy is logged
-    /// and reported as done, because the erasure already happened where it
-    /// counts: in the key.
+    /// buffer row. A cleanup failure after the destroy is reported in
+    /// [`Erasure::cleanup_failed`](super::Erasure::cleanup_failed): the erasure
+    /// happened where it counts, in the key, and the live row still holds
+    /// ciphertext until the same call is retried.
     ///
     /// `at` and `reason` come from the caller's audited lifecycle operation.
     /// What this does not cover: a payload buffered *before* the deployment
     /// configured sealing was stored in the clear, and destroying a key it was
     /// never sealed under erases nothing — the inner `erase_payload` is what
     /// removes those bytes.
+    ///
+    /// [`Erasure::reached`](super::Erasure::reached) is `1` when a buffered
+    /// row existed and `0` when none did; when the cleanup failed it is `1`,
+    /// the one message the destroyed scope names.
     ///
     /// # Errors
     ///
@@ -159,19 +177,25 @@ impl SealedEvents {
         id: &str,
         at: crate::core::Timestamp,
         reason: &str,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<super::Erasure, StoreError> {
         let scope = self.scope_for(source, id);
         self.keys
             .destroy(&scope, at, reason)
             .await
             .map_err(|e| StoreError::Backend(format!("erasing an event's key failed: {e}")))?;
-        match self.inner.erase_payload(source, id).await {
-            Ok(existed) => Ok(existed),
+        Ok(match self.inner.erase_payload(source, id).await {
+            Ok(existed) => super::Erasure {
+                reached: usize::from(existed),
+                cleanup_failed: None,
+            },
             Err(error) => {
                 tracing::warn!(%source, %id, %error, "event key was destroyed but ciphertext cleanup failed");
-                Ok(true)
+                super::Erasure {
+                    reached: 1,
+                    cleanup_failed: Some(error.to_string()),
+                }
             }
-        }
+        })
     }
 }
 
@@ -190,14 +214,17 @@ impl EventStore for SealedEvents {
         sub: &Subscription,
         at: Timestamp,
     ) -> Result<Option<BufferedEvent>, StoreError> {
-        let claimed = self.inner.claim_for(sub, at).await?;
-        Ok(match claimed {
-            Some(mut buffered) => {
-                buffered.event = self.opened(buffered.event).await?;
-                Some(buffered)
-            }
-            None => None,
-        })
+        // A claim never hands a run a sealed wrapper: a message whose key was
+        // destroyed is not delivered, because what the run would read is not
+        // what the counterparty sent.
+        let Some(mut buffered) = self.inner.claim_for(sub, at).await? else {
+            return Ok(None);
+        };
+        let Some(payload) = self.payload(&buffered.event).await? else {
+            return Ok(None);
+        };
+        buffered.event.payload = payload;
+        Ok(Some(buffered))
     }
 
     async fn match_waiter(
@@ -233,6 +260,18 @@ impl EventStore for SealedEvents {
         self.inner.unsubscribe(run, effect).await
     }
 
+    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
+        self.inner.unsubscribe_run(run).await
+    }
+
+    async fn park_wait(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
+        self.inner.park_wait(sub, at).await
+    }
+
+    async fn parked_waits(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
+        self.inner.parked_waits(limit).await
+    }
+
     async fn erase_payload(&self, source: &str, id: &str) -> Result<bool, StoreError> {
         // The plain verb removes the stored bytes — ciphertext here, which
         // also covers rows buffered before sealing was configured. Callers
@@ -240,6 +279,16 @@ impl EventStore for SealedEvents {
         // [`SealedEvents::erase_event`], which destroys the message's key
         // first and therefore reaches replicas and backups too.
         self.inner.erase_payload(source, id).await
+    }
+
+    async fn minter(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<crate::case::Minter>, StoreError> {
+        // The minter is never sealed: it is this plane's operator, not the
+        // counterparty's content.
+        self.inner.minter(source, id).await
     }
 
     async fn sweep_unclaimed(
@@ -399,18 +448,23 @@ mod aad_tests {
             serde_json::json!({"pii": "erase me"})
         );
 
-        assert!(
-            sealed
-                .erase_event("counterparty", "42", at(3_000), "erasure request")
-                .await
-                .expect("erase")
+        let erased = sealed
+            .erase_event("counterparty", "42", at(3_000), "erasure request")
+            .await
+            .expect("erase");
+        assert_eq!(
+            erased,
+            crate::keyring::Erasure {
+                reached: 1,
+                cleanup_failed: None
+            }
         );
         // The key is gone — the derivation pinned here must match the one the
         // seal path used, or the erasure destroyed a scope nothing was sealed
         // under.
         assert!(
             matches!(
-                ring.data_key(&crate::keyring::scope(&tenant, "event/counterparty/42"))
+                ring.data_key(&crate::keyring::event_scope(&tenant, "counterparty", "42"))
                     .await,
                 Err(crate::keyring::KeyError::Destroyed { .. })
             ),
@@ -425,5 +479,131 @@ mod aad_tests {
             "the buffer's ciphertext survived the erasure"
         );
         assert_eq!(letters[0].reason, "nobody came");
+    }
+
+    /// Delegates everything, and fails the ciphertext cleanup.
+    #[derive(Debug)]
+    struct FailsCleanup(std::sync::Arc<dyn EventStore>);
+
+    #[async_trait::async_trait]
+    impl EventStore for FailsCleanup {
+        fn tenant(&self) -> &str {
+            self.0.tenant()
+        }
+        async fn buffer(&self, e: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
+            self.0.buffer(e, at).await
+        }
+        async fn subscribe(&self, s: &Subscription, at: Timestamp) -> Result<(), StoreError> {
+            self.0.subscribe(s, at).await
+        }
+        async fn claim_for(
+            &self,
+            s: &Subscription,
+            at: Timestamp,
+        ) -> Result<Option<BufferedEvent>, StoreError> {
+            self.0.claim_for(s, at).await
+        }
+        async fn match_waiter(
+            &self,
+            e: &InboundEvent,
+            at: Timestamp,
+        ) -> Result<Option<Subscription>, StoreError> {
+            self.0.match_waiter(e, at).await
+        }
+        async fn deliver_to(
+            &self,
+            run: RunId,
+            e: &InboundEvent,
+            at: Timestamp,
+        ) -> Result<TargetedDelivery, StoreError> {
+            self.0.deliver_to(run, e, at).await
+        }
+        async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
+            self.0.unsubscribe(run, effect).await
+        }
+        async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
+            self.0.unsubscribe_run(run).await
+        }
+        async fn park_wait(&self, s: &Subscription, at: Timestamp) -> Result<(), StoreError> {
+            self.0.park_wait(s, at).await
+        }
+        async fn parked_waits(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
+            self.0.parked_waits(limit).await
+        }
+        async fn erase_payload(&self, _source: &str, _id: &str) -> Result<bool, StoreError> {
+            Err(StoreError::Backend("the buffer is read-only".to_owned()))
+        }
+        async fn minter(
+            &self,
+            source: &str,
+            id: &str,
+        ) -> Result<Option<crate::case::Minter>, StoreError> {
+            self.0.minter(source, id).await
+        }
+        async fn sweep_unclaimed(&self, older: Timestamp, why: &str) -> Result<usize, StoreError> {
+            self.0.sweep_unclaimed(older, why).await
+        }
+        async fn dead_letters(&self, limit: usize) -> Result<Vec<DeadLetter>, StoreError> {
+            self.0.dead_letters(limit).await
+        }
+        async fn waiting(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
+            self.0.waiting(limit).await
+        }
+    }
+
+    /// **An erasure whose cleanup failed says so, and its message is not
+    /// delivered.**
+    ///
+    /// The key is gone, so the erasure happened; the live row still holds
+    /// ciphertext. Reported as done, the request is closed over a row a retry
+    /// would have removed. And the row is still claimable: a waiter must not
+    /// be handed the sealed wrapper as if the counterparty had sent it.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn a_failed_cleanup_is_reported_and_the_erased_message_is_not_delivered() {
+        use crate::core::{CorrelationKey, Phase, StepId};
+        use std::sync::Arc;
+
+        let at = |seconds| Timestamp::from_unix_timestamp(seconds).expect("time");
+        let tenant = TenantId::new("event-cleanup").expect("tenant");
+        let inner = Arc::new(
+            crate::store::RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(tenant.clone()),
+        ) as Arc<dyn EventStore>;
+        let sealed = SealedEvents::wrap(
+            Arc::new(FailsCleanup(inner)),
+            Arc::new(MemoryKeyRing::new()),
+            tenant,
+        );
+        let mut message = event("counterparty", "7");
+        message.correlation = vec![CorrelationKey::new("order", "O-7")];
+        message.payload = serde_json::json!({"pii": "erase me"});
+        assert!(sealed.buffer(&message, at(1_000)).await.expect("buffer"));
+
+        let erasure = sealed
+            .erase_event("counterparty", "7", at(2_000), "erasure request")
+            .await
+            .expect("the key was destroyed");
+        assert!(
+            !erasure.is_complete(),
+            "a cleanup failure after the key's destruction was reported as a clean erasure"
+        );
+
+        let sub = Subscription {
+            run: RunId::generate(),
+            case: None,
+            effect: EffectKey::from_hex(&format!("{:064x}", 9)).expect("hex key"),
+            step: StepId(1),
+            phase: Phase::Forward,
+            kind: "reply".to_owned(),
+            correlation: vec![CorrelationKey::new("order", "O-7")],
+        };
+        sealed.subscribe(&sub, at(3_000)).await.expect("subscribe");
+        let claimed = sealed.claim_for(&sub, at(3_001)).await.expect("claim");
+        assert!(
+            claimed.is_none(),
+            "an erased message reached a waiter as data: {claimed:?}"
+        );
     }
 }

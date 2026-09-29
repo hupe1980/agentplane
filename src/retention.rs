@@ -321,4 +321,22 @@ fn finish(mut report: RetentionReport) -> RetentionReport {
             .to_owned(),
     );
     report
+        .not_erasable
+        .extend(OUTSIDE_THE_CASE.iter().map(|line| (*line).to_owned()));
+    report
 }
+
+/// Copies of a matter's data whose erasure unit is not the case, so no case
+/// walk reaches them.
+const OUTSIDE_THE_CASE: [&str; 4] = [
+    "governed memory is erased by item and by subject, never by case — including memory a \
+     declaration keyed to `$case` or `$correlation/<namespace>`, whose subject is the case id \
+     or a business key; erase those subjects with `EncryptedMemoryStore::erase_subject`",
+    "an inbound event is its own erasure unit: the event buffer's copy, and every backup of \
+     it, is erased by `SealedEvents::erase_event` for its `(source, id)`, not by the case the \
+     message was delivered into",
+    "media fetched under a named external retention policy belongs to that policy's unit, not \
+     the case, so this pass neither tombstones nor unseals it — its lifecycle controller does",
+    "semantic-index vectors are derived from memory content and live in the retriever's index; \
+     nothing here removes them — delete them where the index is kept",
+];

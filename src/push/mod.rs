@@ -924,7 +924,7 @@ impl PushSender {
                 status: response.status().as_u16(),
                 retry_after: retry_after_seconds(response.headers()),
             },
-            Err(e) => Delivered::Unreachable(e.to_string()),
+            Err(e) => Delivered::Unreachable(crate::netguard::transport_text(&e)),
         })
     }
 }

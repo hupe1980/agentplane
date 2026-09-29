@@ -187,13 +187,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     store.set_legal_hold("team-support-language", true).await?;
     let after_expiry = Timestamp::from_unix_timestamp(4_102_444_801)?;
-    let swept = store.sweep_expired(after_expiry).await?;
+    let swept = store.sweep_expired(after_expiry).await?.len();
     println!(
         "4. legal hold      → a sweep past the expiry date removed {swept} — a hold outranks the calendar"
     );
     assert_eq!(swept, 0);
     store.set_legal_hold("team-support-language", false).await?;
-    let swept = store.sweep_expired(after_expiry).await?;
+    let swept = store.sweep_expired(after_expiry).await?.len();
     println!(
         "   hold released  → the same sweep removed {swept} — expiry is enforced, not advisory"
     );

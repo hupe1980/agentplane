@@ -38,8 +38,7 @@
 //! # One surface, many tenants
 //!
 //! [`Api::new`] takes [`Planes`] — a registry keyed by tenant — so one process
-//! can serve several. A single-tenant deployment passes its runtime and reads
-//! exactly as before.
+//! can serve several. A single-tenant deployment passes its runtime.
 //!
 //! Which plane answers comes from [`Caller::tenant`], which the
 //! [`Authenticator`] derives from the credential like `actor` and `roles`. That
@@ -56,13 +55,15 @@
 //! an unregistered tenant into somebody else's data, and it would look like
 //! working software.
 //!
-//! # No authenticator is shipped
+//! # The authenticator is the deployment's
 //!
 //! Same reasoning as the policy engine and the tracing exporter: the deployment
 //! owns its identity system, and a bearer-token parser baked in here would be
 //! wrong for the mutual-TLS deployment and load-bearing for the other. What this
 //! crate owns is the shape — every route runs behind
-//! [`Authenticator::authenticate`], and there is no route that does not.
+//! [`Authenticator::authenticate`], and there is no route that does not. The
+//! one implementation shipped, [`tokens`], exists for the binary, which cannot
+//! ask its operator to write one.
 //!
 //! # What an operator actually needs
 //!
@@ -73,7 +74,7 @@
 //!   reports **what it is waiting for**, because "suspended" alone sends someone
 //!   into the journal.
 //! * *And what did it do?* — the journal itself, cursored, under its own verb.
-//!   The status view answers from six fields; this answers with the run's
+//!   The status view answers from a few fields; this answers with the run's
 //!   inputs, its model exchanges and every argument it sent, which is a
 //!   different grant to make.
 //! * *What is waiting for me?* — the worklist, filtered to the caller's roles,
@@ -168,8 +169,10 @@ pub struct Caller {
     /// this caller starts is admitted under it: checked against the plan,
     /// held to its audience and validity, journaled as the run's
     /// `IdentityBound`. `None` means the credential carried no chain, and
-    /// the run acts under the plane's own ([`RuntimeBuilder::acting_as`]) —
-    /// or under none.
+    /// the run acts under **none**: the plane's own chain
+    /// ([`RuntimeBuilder::acting_as`]) bounds what it may be admitted for and
+    /// lends it none of its authority, which would otherwise be an ambient
+    /// credential every peer holds.
     ///
     /// [`RuntimeBuilder::acting_as`]: crate::runtime::RuntimeBuilder::acting_as
     pub acting_as: Option<crate::core::Delegation>,
@@ -191,6 +194,12 @@ impl Caller {
     pub fn in_tenant(mut self, tenant: TenantId) -> Self {
         self.tenant = tenant;
         self
+    }
+
+    /// The policy context the operator API asks under: roles and tenant, and
+    /// nothing else — no chain, no label, no depth.
+    fn operator_context(&self) -> Value {
+        json!({ "roles": self.roles, "tenant": self.tenant.as_str() })
     }
 
     /// A caller whose credential carried a delegation chain.
@@ -275,6 +284,41 @@ pub enum ApiSetupError {
          and then refuse all of them; register at least one with `Planes::one`"
     )]
     NoPlanes,
+
+    /// A tenant's policy set cannot evaluate a request this surface asks.
+    ///
+    /// The operator API asks under `{roles, tenant}` alone. A rule reading
+    /// `context.delegation_depth` or `context.label` with no action scope and
+    /// no `has` guard is evaluated here too, errors, and refuses every route —
+    /// with a 500, during the incident somebody opened the API to handle.
+    #[error(
+        "tenant '{tenant}''s policy set cannot evaluate the operator API's requests: \
+         {problems} — they carry only `roles` and `tenant`; scope the rule to the \
+         actions it is about, or guard the read with `context has …`"
+    )]
+    PolicyUnevaluable { tenant: String, problems: String },
+}
+
+/// Whether `engine` can evaluate every request the operator API puts to it.
+///
+/// One probe per [`action::ALL`] verb, under the exact context a route sends.
+/// Each returned string is a request shape the rules could not evaluate; an
+/// empty answer says nothing about whether they are *right*. [`Api::new`]
+/// refuses a plane whose engine reports anything.
+#[must_use]
+pub fn policy_problems(engine: &dyn crate::core::PolicyEngine) -> Vec<String> {
+    let caller = Caller::new("preflight", vec!["preflight".to_owned()]);
+    let context = caller.operator_context();
+    let requests: Vec<PolicyRequest<'_>> = action::ALL
+        .iter()
+        .map(|action| PolicyRequest {
+            principal: &caller.actor,
+            action,
+            resource: "preflight.resource",
+            context: &context,
+        })
+        .collect();
+    engine.preflight(&requests)
 }
 
 /// What a stop request looks like on the wire.
@@ -360,6 +404,7 @@ pub struct AcknowledgeRequest {
 
 /// Placing a legal hold on one matter.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlaceHoldRequest {
     /// The matter to preserve.
     pub case: String,
@@ -373,6 +418,7 @@ pub struct PlaceHoldRequest {
 
 /// Lifting one.
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseHoldRequest {
     /// The matter to release.
     pub case: String,
@@ -609,6 +655,23 @@ pub struct TaskView {
     /// flag a UI must actively ignore is harder to miss than a field it must
     /// actively read.
     pub has_untrusted_prose: bool,
+    /// Why the proposal cannot be shown, when it cannot.
+    ///
+    /// Then `justification` carries no `proposed_action` and no evidence —
+    /// never the envelope, which a client could display as if it were the
+    /// arguments — and an approval is refused while a rejection records.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<crate::core::Withheld>,
+    /// The task as a person should read it: every hidden or
+    /// direction-changing code point escaped in place, every word mixing
+    /// scripts flagged beside it.
+    ///
+    /// `justification` is the structured value for a program; this is the
+    /// text for a reviewer, and it is the same rendering the terminal prints.
+    /// A client that shows `justification` to a person renders invisible
+    /// characters as nothing, which is how an approval covers what the
+    /// approver could not see.
+    pub rendering: crate::core::Rendering,
 }
 
 impl TaskView {
@@ -619,11 +682,13 @@ impl TaskView {
             // that drifts is the one people read.
             decidable_by_you: task.may_decide(&caller.actor, &caller.roles),
             has_untrusted_prose: task.justification.has_untrusted_prose(),
+            withheld: task.withheld,
+            rendering: task.rendering(),
+            justification: serde_json::to_value(task.shown_justification()).unwrap_or(Value::Null),
             assignee: task.assignee,
             id: task.id.to_hex(),
             run: task.run.to_string(),
             kind: task.kind,
-            justification: serde_json::to_value(&task.justification).unwrap_or(Value::Null),
             priority: task.priority.as_str().to_owned(),
             state: task.state.as_str().to_owned(),
             case: task.case.map(|c| c.to_string()),
@@ -885,8 +950,15 @@ impl Api {
             return Err(ApiSetupError::NoPlanes);
         }
         for plane in planes.by_tenant.values() {
-            if plane.policy().is_none() {
+            let Some(policy) = plane.policy() else {
                 return Err(ApiSetupError::NoPolicy);
+            };
+            let problems = policy_problems(policy.as_ref());
+            if !problems.is_empty() {
+                return Err(ApiSetupError::PolicyUnevaluable {
+                    tenant: plane.tenant().to_string(),
+                    problems: problems.join("; "),
+                });
             }
         }
         Ok(Self {
@@ -985,7 +1057,12 @@ impl Api {
         resource: &str,
     ) -> Result<Session, ApiError> {
         let caller = self.auth.authenticate(headers).await?;
+        self.authorize(caller, action, resource)
+    }
 
+    /// [`gate`](Self::gate) for a caller already authenticated, so a route
+    /// that needs the caller before it knows the resource authenticates once.
+    fn authorize(&self, caller: Caller, action: &str, resource: &str) -> Result<Session, ApiError> {
         // Refused, never defaulted. Falling back to a default plane would turn
         // an unregistered tenant into somebody else's data, and it would look
         // like working software.
@@ -1001,7 +1078,7 @@ impl Api {
 
         // Roles and tenant go in the context so a policy set can key on them
         // without this crate deciding what either means.
-        let context = json!({ "roles": caller.roles, "tenant": caller.tenant.as_str() });
+        let context = caller.operator_context();
         let decision = policy.authorize(&PolicyRequest {
             principal: &caller.actor,
             action,
@@ -1037,7 +1114,7 @@ pub mod action {
     ///
     /// Its own verb rather than a widened `run.read`, for the reason
     /// `obligation.list` is not a widened `case.list`: the status view answers
-    /// *what is this doing and why is it not finishing* from six fields, and
+    /// *what is this doing and why is it not finishing* from a few fields, and
     /// this answers it with the run's inputs, its model exchanges and every
     /// argument it sent. A deployment that grants an on-call rota the first has
     /// said nothing about the second.
@@ -1247,8 +1324,32 @@ impl From<AuthError> for ApiError {
     }
 }
 
+/// An identifier in the path or body that does not parse as one.
 fn bad(what: &str) -> ApiError {
     ApiError(StatusCode::BAD_REQUEST, format!("not a {what} id"))
+}
+
+/// A request whose content is wrong, in a sentence that says how.
+fn invalid(why: &str) -> ApiError {
+    ApiError(StatusCode::BAD_REQUEST, why.to_owned())
+}
+
+/// The authenticator handed back an actor no operator record can carry — an
+/// empty or oversized name.
+///
+/// A 500, not a 400: nothing in the request can fix it. The deployment's
+/// `Authenticator` produced a caller this plane cannot put a name to, and the
+/// operator is the one who has to hear about it.
+fn unusable_caller(error: &crate::core::OperatorError) -> ApiError {
+    tracing::error!(
+        target: "agentplane::api",
+        %error,
+        "the authenticator produced an actor no operator record can carry"
+    );
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the authenticated identity cannot be recorded".to_owned(),
+    )
 }
 
 fn unavailable(what: &str) -> ApiError {
@@ -1481,6 +1582,11 @@ async fn cancel_run(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let s = api.gate(&headers, action::RUN_CANCEL, &run).await?;
     let id = RunId::parse(&run).map_err(|_| bad("run"))?;
+    // The one field of the record the operator writes, and the one a later
+    // reader needs to understand why somebody stopped the work.
+    if body.reason.trim().is_empty() {
+        return Err(invalid("a non-empty 'reason' is required"));
+    }
 
     // The actor is the authenticated caller; `CancelRequest` has no field for
     // one. Same rule as deciding a task.
@@ -1495,7 +1601,7 @@ async fn cancel_run(
         .request_cancel(
             id,
             &crate::core::Operator::authenticated(s.caller.actor.clone())
-                .map_err(|_| bad("actor"))?,
+                .map_err(|e| unusable_caller(&e))?,
             &body.reason,
         )
         .await
@@ -1565,7 +1671,7 @@ async fn decide_quarantine(
         .decide_quarantine(
             id,
             &crate::core::Operator::authenticated(s.caller.actor.clone())
-                .map_err(|_| bad("actor"))?,
+                .map_err(|e| unusable_caller(&e))?,
             reason,
             decision,
         )
@@ -1608,15 +1714,21 @@ async fn reconcile_effect(
     let assertion = match (body.disposition.as_str(), body.output) {
         ("landed", Some(output)) => Assertion::Landed(output),
         ("landed", None) => {
-            return Err(bad(
-                "output: a landed verdict is the result the run reads back",
+            return Err(invalid(
+                "'landed' needs an 'output': a landed verdict is the result the run reads back",
             ));
         }
         ("did_not_happen", None) => Assertion::DidNotHappen,
         ("did_not_happen", Some(_)) => {
-            return Err(bad("output: a call that never took returned nothing"));
+            return Err(invalid(
+                "'did_not_happen' takes no 'output': a call that never took returned nothing",
+            ));
         }
-        _ => return Err(bad("disposition: expected 'landed' or 'did_not_happen'")),
+        _ => {
+            return Err(invalid(
+                "'disposition' must be 'landed' or 'did_not_happen'",
+            ));
+        }
     };
 
     s.plane
@@ -1625,7 +1737,7 @@ async fn reconcile_effect(
             effect,
             assertion,
             &crate::core::Operator::authenticated(s.caller.actor.clone())
-                .map_err(|_| bad("actor"))?,
+                .map_err(|e| unusable_caller(&e))?,
             &body.note,
         )
         .await
@@ -1716,11 +1828,17 @@ async fn live_runs(
     // under it*, which is the whole reason the listing carries a subject. It
     // narrows what the caller reads and never widens it — the gate above
     // answered for the listing, not for a subject.
+    //
+    // `truncated` is decided before the filter, because the bound is on the
+    // page read, not on the matches: a filter applied to a truncated page that
+    // then reported `false` would tell a responder nothing else is acting
+    // under a withdrawn authority when the runs past the page were never
+    // looked at.
+    let truncated = found.len() > api.limit;
+    found.truncate(api.limit);
     if let Some(subject) = q.subject.as_deref() {
         found.retain(|live| live.subject.as_deref() == Some(subject));
     }
-    let truncated = found.len() > api.limit;
-    found.truncate(api.limit);
 
     Ok(Json(json!({
         "runs": found
@@ -1801,7 +1919,11 @@ async fn attention(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Va
                 "condition": c.kind,
                 "found": c.found,
                 "at_least": c.at_least,
-                "remedy": c.remedy,
+                "subjects": c.subjects,
+                "unlisted": c.unlisted,
+                // In this API's routes: a remedy naming a terminal verb to a
+                // dashboard is a prescription its reader cannot fill here.
+                "remedy": c.remedy.http,
             }))
             .collect::<Vec<_>>(),
         "not_checked": found.not_checked,
@@ -2001,7 +2123,8 @@ fn claim_refused(e: &crate::case::ClaimError) -> ApiError {
         ClaimError::NotFound(_) => StatusCode::NOT_FOUND,
         ClaimError::AlreadyClaimed { .. }
         | ClaimError::NotPending { .. }
-        | ClaimError::NotHeld { .. } => StatusCode::CONFLICT,
+        | ClaimError::NotHeld { .. }
+        | ClaimError::AlreadyAnswered { .. } => StatusCode::CONFLICT,
         ClaimError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     // The store's own words: "you proposed this action" and "you hold the wrong
@@ -2037,6 +2160,8 @@ async fn decide(
         ),
         reason: body.reason,
         amendment: body.amendment,
+        // Stamped by `decide_task` from the stored task, never from the body.
+        reviewed: None,
     };
 
     // Roles likewise, and `decide_task` re-runs the four-eyes and eligibility
@@ -2059,6 +2184,13 @@ async fn decide(
             // a 409: a conflict tells the decider their verdict lost a race,
             // and this one was simply not written yet.
             crate::core::RuntimeError::Store(_) => store_failed(),
+            // Not a conflict: nobody else holds the task, and retrying the
+            // same approval here fails the same way. The body names the reason
+            // and the two ways on — a plane holding the key ring, or a
+            // rejection.
+            crate::core::RuntimeError::ProposalWithheld { .. } => {
+                ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+            }
             other => ApiError(StatusCode::CONFLICT, other.to_string()),
         })?;
 
@@ -2095,7 +2227,7 @@ async fn cases_by_status(
         .status
         .unwrap_or_else(|| CaseStatus::Escalated.as_str().to_owned());
     let s = api.gate(&headers, action::CASE_LIST, &asked).await?;
-    let status = CaseStatus::parse(&asked).ok_or_else(|| bad("status"))?;
+    let status = CaseStatus::parse(&asked).ok_or_else(|| invalid("not a case status"))?;
     let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
 
     // One more than the page — see the module doc on cursored lists.
@@ -2207,7 +2339,8 @@ async fn acknowledge_obligation(
     let case = crate::core::CaseId::parse(&body.case).map_err(|_| bad("case"))?;
 
     let note = crate::core::BreachNote {
-        by: s.caller.actor.clone(),
+        by: crate::core::Operator::authenticated(s.caller.actor.clone())
+            .map_err(|e| unusable_caller(&e))?,
         note: body.note,
         at: now_for_account(),
     };
@@ -2280,13 +2413,13 @@ async fn place_hold(
     let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
     let case = crate::core::CaseId::parse(&body.case).map_err(|_| bad("case"))?;
     if body.reason.trim().is_empty() {
-        return Err(bad("reason"));
+        return Err(invalid("a non-empty 'reason' is required"));
     }
 
     // The actor is the authenticated caller; `PlaceHoldRequest` has no field
     // for it, for the reason a cancellation's has none.
-    let by =
-        crate::core::Operator::authenticated(s.caller.actor.clone()).map_err(|_| bad("actor"))?;
+    let by = crate::core::Operator::authenticated(s.caller.actor.clone())
+        .map_err(|e| unusable_caller(&e))?;
     let placed = cases
         .place_hold(
             case,
@@ -2380,15 +2513,16 @@ async fn place_halt(
     Json(body): Json<PlaceHaltRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let s = api.gate(&headers, action::HALT_PLACE, &body.scope).await?;
-    let scope = crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| bad("scope"))?;
+    let scope =
+        crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| invalid("not a halt scope"))?;
     if body.reason.trim().is_empty() {
-        return Err(bad("reason"));
+        return Err(invalid("a non-empty 'reason' is required"));
     }
     // The actor is the authenticated caller; `PlaceHaltRequest` has no field
     // for it. The whole weight of a stop is the name beside it, and a name the
     // requester supplies is a name the requester chose.
-    let by =
-        crate::core::Operator::authenticated(s.caller.actor.clone()).map_err(|_| bad("actor"))?;
+    let by = crate::core::Operator::authenticated(s.caller.actor.clone())
+        .map_err(|e| unusable_caller(&e))?;
     s.plane
         .set_halt(&scope, &by, now_for_account(), &body.reason)
         .await
@@ -2423,7 +2557,8 @@ async fn lift_halt(
     Json(body): Json<LiftHaltRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let s = api.gate(&headers, action::HALT_LIFT, &body.scope).await?;
-    let scope = crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| bad("scope"))?;
+    let scope =
+        crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| invalid("not a halt scope"))?;
     let was_standing = s
         .plane
         .lift_halt(&scope)
@@ -2571,7 +2706,7 @@ async fn case_view(
     let mut history = s
         .plane
         .journal()
-        .case_history(id, api.history + 1)
+        .case_history(id, api.history.saturating_add(1))
         .await
         .map_err(|_| store_failed())?;
     let history_truncated = history.len() > api.history;
@@ -2596,13 +2731,24 @@ async fn case_view(
 /// the sender's name in provenance, so a body that set it would let one
 /// counterparty deduplicate against another's messages, or post under a name a
 /// policy trusts. It comes from the authenticated caller instead.
+///
+/// Any other field is refused: a misspelt `corelation` accepted silently is an
+/// event that correlates with nothing while its sender believes it did.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeliverBody {
     id: String,
     kind: String,
     #[serde(default)]
     correlation: Vec<crate::core::CorrelationKey>,
     payload: Value,
+    /// Accepted and never read. A caller that sends one is mistaken rather
+    /// than hostile — it is the field every event shape it knows carries — and
+    /// refusing it would only teach it to strip the field; reading it is what
+    /// would be wrong.
+    #[serde(default)]
+    #[allow(dead_code)]
+    source: Option<Value>,
 }
 
 /// The two shapes this route accepts, and what each becomes.
@@ -2721,15 +2867,17 @@ async fn deliver(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, ApiError> {
+    // Authenticated before the body is read: the parser's refusals describe
+    // the shapes this route accepts, and a caller with no identity is owed
+    // none of them. Authorization waits for the kind, which is in the body.
+    let caller = api.auth.authenticate(&headers).await?;
     let input = parse_delivery(&headers, &body)?;
 
     // Authorized on the event *kind*, so a policy set can let a counterparty
     // gateway post `acknowledgement.received` without also letting it post
     // whatever else the plane happens to wait on. A CloudEvent's `type` is that
     // kind — the same question, asked of whichever envelope arrived.
-    let s = api
-        .gate(&headers, action::EVENT_DELIVER, input.kind())
-        .await?;
+    let s = api.authorize(caller, action::EVENT_DELIVER, input.kind())?;
 
     // The source is who the transport says they are, never who the body claims.
     // A self-asserted source would make `(source, id)` a pair a caller controls
@@ -2741,9 +2889,18 @@ async fn deliver(
     // A store outage is the plane's problem, answered 503 so a conformant bus
     // retries; everything else is a statement about the request, and a 409 a
     // bus treats as permanent is the honest answer only for those.
+    // A kind this plane mints for itself is forbidden rather than conflicting:
+    // it is a statement about who may send it, and no retry changes that.
     let delivery = s.plane.deliver(&event).await.map_err(|e| match e {
         crate::core::RuntimeError::Store(_) => {
-            ApiError(StatusCode::SERVICE_UNAVAILABLE, e.to_string())
+            tracing::error!(target: "agentplane::api", error = %e, "an event could not be delivered");
+            ApiError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the store is unavailable; retry".to_owned(),
+            )
+        }
+        crate::core::RuntimeError::ReservedEventKind { .. } => {
+            ApiError(StatusCode::FORBIDDEN, e.to_string())
         }
         _ => ApiError(StatusCode::CONFLICT, e.to_string()),
     })?;

@@ -1,7 +1,7 @@
 //! Human oversight on the *call*, not a summary of it.
 //!
 //! ```sh
-//! cargo run --example approved_call --features redb,testkit,manifest
+//! cargo run --example approved_call --features redb,fake-model,manifest
 //! ```
 //!
 //! `requires_approval: true` on a tool grant opens a task carrying the **exact

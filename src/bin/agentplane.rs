@@ -14,10 +14,10 @@
 //! packaging convention — so a multi-agent room deploys as one file with no
 //! Rust anywhere. The file is packaging: each agent keeps its own digest.
 //!
-//! This binary is the last step of the declarative tier. A manifest with
-//! `spec.execution` already needs no skill, but it still needed a `main` to
-//! build a runtime and hand it a driver — and Rust is the thing the tier exists
-//! to remove. With this, a YAML file and an API key are the whole agent.
+//! This binary completes the declarative tier. A manifest with
+//! `spec.execution` needs no skill, and this is the `main` that builds a
+//! runtime and hands it a driver — Rust being the thing the tier exists to
+//! remove. A YAML file and an API key are the whole agent.
 //!
 //! That is also what makes the digest claim exact rather than nearly true:
 //! everything the agent does is in the file, so there is no accompanying program
@@ -69,20 +69,170 @@ use agentplane::store::RedbStore;
 ///
 /// `RUST_LOG` overrides the whole decision, so a one-shot run that *is* being
 /// measured stays reachable.
-fn install_tracing(metrics: bool) {
+///
+/// A strict replay's divergence is its report, printed as the verdict; the
+/// executor's own divergence and quarantine events would say the same thing
+/// twice, louder, and call a verification that wrote nothing a quarantine.
+fn install_tracing(metrics: bool, verifying: bool, format: LogFormat) {
     use tracing_subscriber::{EnvFilter, fmt};
-    let default = if metrics {
-        "warn,agentplane=info"
+    let mut default = if metrics {
+        "warn,agentplane=info".to_owned()
     } else {
-        "warn,agentplane=info,agentplane.metric=off"
+        "warn,agentplane=info,agentplane.metric=off".to_owned()
     };
+    if verifying {
+        for target in [
+            agentplane::runtime::telemetry::NONDETERMINISM,
+            agentplane::runtime::telemetry::QUARANTINED,
+        ] {
+            default.push(',');
+            default.push_str(target);
+            default.push_str("=off");
+        }
+    }
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
     // `try_init` rather than `init`: failing to install a subscriber must not
     // take down a run that would otherwise have worked.
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
+    let builder = fmt().with_env_filter(filter).with_writer(std::io::stderr);
+    let _ = match format {
+        LogFormat::Text => builder.try_init(),
+        // One JSON object per line, for a collector that would otherwise parse
+        // the human format with a regular expression.
+        LogFormat::Json => builder.json().try_init(),
+    };
+}
+
+/// How a log line is written.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum LogFormat {
+    /// For a person at a terminal.
+    #[default]
+    Text,
+    /// One JSON object per line, for a log collector.
+    Json,
+}
+
+/// The exit statuses, one table for every verb.
+///
+/// A scheduler reads the status and nothing else, so each number means one
+/// thing whichever verb returned it: a finding and an outage are different
+/// pages, and a partial answer is neither a pass nor a failure.
+mod exit {
+    /// The command did what it was asked, and the answer is yes.
+    pub const OK: u8 = 0;
+    /// A finding, or a negative answer: a run that failed, an audit finding,
+    /// something that needs attention, a lift that found nothing standing.
+    pub const FINDING: u8 = 1;
+    /// The command as typed cannot be carried out: a flag, an argument or an
+    /// input file this binary refuses. `clap`'s own parse errors use it too.
+    pub const USAGE: u8 = 2;
+    /// A run stopped to wait — for a person, a timer or an event.
+    pub const SUSPENDED: u8 = 3;
+    /// Something this command depends on failed: a store, a witness, the
+    /// network, the filesystem.
+    pub const OPERATIONAL: u8 = 4;
+    /// The answer is incomplete: a `--limit` truncated what was read, or a
+    /// strict replay met a run it could not replay.
+    pub const PARTIAL: u8 = 5;
+}
+
+/// The same table, as `--help` prints it.
+const EXIT_STATUS_HELP: &str = "Exit status:
+  0  ok
+  1  a finding or a negative answer (a failed run, an audit finding, needs attention)
+  2  usage: the command as typed cannot be carried out
+  3  a run is suspended, waiting for a person, a timer or an event
+  4  operational: a store, witness, network or file could not be used
+  5  partial: --limit truncated the answer, or a strict replay could not replay a run";
+
+/// Why a verb could not answer, which decides its exit status.
+///
+/// A plain `String` is an operational fault — most refusals arrive as one from
+/// a store or a file — so `?` on the library's errors lands there, and a
+/// refusal of the command line itself is said with [`usage`].
+#[derive(Debug)]
+enum Fault {
+    Usage(String),
+    Operational(String),
+}
+
+impl Fault {
+    const fn status(&self) -> u8 {
+        match self {
+            Self::Usage(_) => exit::USAGE,
+            Self::Operational(_) => exit::OPERATIONAL,
+        }
+    }
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Usage(m) | Self::Operational(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<String> for Fault {
+    fn from(message: String) -> Self {
+        Self::Operational(message)
+    }
+}
+
+/// A refusal of the command as typed.
+fn usage(message: impl Into<String>) -> Fault {
+    Fault::Usage(message.into())
+}
+
+/// What `--version` prints: the version and the features compiled in.
+///
+/// A binary's feature set decides which verbs, stores and drivers exist, and
+/// an operator debugging "this build cannot serve" needs it without a
+/// toolchain. Derived from the same `cfg`s the code is, so it cannot claim a
+/// feature the build lacks.
+fn build_description() -> &'static str {
+    static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TEXT.get_or_init(|| {
+        format!(
+            "{}\nfeatures: {}",
+            env!("CARGO_PKG_VERSION"),
+            compiled_features().join(", ")
+        )
+    })
+}
+
+/// Every feature this binary was built with, by its Cargo name.
+fn compiled_features() -> Vec<&'static str> {
+    let all = [
+        ("a2a", cfg!(feature = "a2a")),
+        ("a2a-server", cfg!(feature = "a2a-server")),
+        ("acp", cfg!(feature = "acp")),
+        ("bedrock", cfg!(feature = "bedrock")),
+        ("cedar", cfg!(feature = "cedar")),
+        ("cli", cfg!(feature = "cli")),
+        ("fake-model", cfg!(feature = "fake-model")),
+        ("http", cfg!(feature = "http")),
+        ("keyring", cfg!(feature = "keyring")),
+        ("keyring-vault", cfg!(feature = "keyring-vault")),
+        ("manifest", cfg!(feature = "manifest")),
+        ("mcp", cfg!(feature = "mcp")),
+        ("mcp-http", cfg!(feature = "mcp-http")),
+        ("mcp-server", cfg!(feature = "mcp-server")),
+        ("mcp-stdio", cfg!(feature = "mcp-stdio")),
+        ("media", cfg!(feature = "media")),
+        ("opendal", cfg!(feature = "opendal")),
+        ("postgres", cfg!(feature = "postgres")),
+        ("providers", cfg!(feature = "providers")),
+        ("push", cfg!(feature = "push")),
+        ("redb", cfg!(feature = "redb")),
+        ("signing", cfg!(feature = "signing")),
+        ("testkit", cfg!(feature = "testkit")),
+        ("witness-http", cfg!(feature = "witness-http")),
+    ];
+    all.iter()
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| *name)
+        .collect()
 }
 
 /// The command line.
@@ -95,6 +245,8 @@ fn install_tracing(metrics: bool) {
     name = "agentplane",
     version,
     about = "Run an agent that is only a file",
+    long_version = build_description(),
+    after_help = EXIT_STATUS_HELP,
     long_about = "Run, host and pin agents declared entirely in YAML.\n\n\
                   A file may hold several manifests separated by `---` (the \
                   Kubernetes convention), so a whole multi-agent room deploys as \
@@ -109,6 +261,8 @@ struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 enum Verb {
+    /// Write a starter manifest that validates and runs.
+    Init(InitArgs),
     /// Execute an agent once and print its answer.
     Run(RunArgs),
     /// Re-execute a recorded run: resume it, or verify it with --strict.
@@ -122,35 +276,37 @@ enum Verb {
     /// Print the manifest format as a JSON Schema, for editors and CI linters.
     Schema,
     /// Print the identity a registry pins.
-    Digest(FileArgs),
+    Digest(DigestArgs),
     /// Check a journal's history and print what could not be checked.
     Audit(AuditArgs),
     /// Write a journal's records out as JSON Lines.
-    Export(StoreArgs),
+    Export(ExportArgs),
     /// Recompute an export and check it against its own checkpoint.
     Verify(VerifyArgs),
+    /// Re-derive an export's policy verdicts, or measure a candidate bundle.
+    Policy(PolicyArgs),
     /// Rebuild a store from an export, and prove it by its own checkpoint.
     Restore(RestoreArgs),
     /// Walk the case layer and tell erasure from loss, against the live stores.
     Drill(DrillArgs),
     /// Retire admission keys older than a window you choose.
     ForgetAdmissions(ForgetArgs),
-    /// List the closed cases a retention pass would erase.
-    Retain(RetainArgs),
-    /// Throw or lift the emergency stop, and say what it covers.
+    /// Plan retention: list the closed cases a pass would erase.
+    Retention(RetentionArgs),
+    /// Throw or lift the emergency stop; `halt list` shows every one standing.
     Halt(HaltArgs),
-    /// List every emergency stop standing on a tenant.
-    Halts(HaltsArgs),
     /// List the runs that are waiting, and what each one waits for.
     Waiting(WaitingArgs),
     /// Ask whether anything on this plane needs a person right now.
     Attention(WaitingArgs),
-    /// Place, lift, or list the legal holds that stop a retention pass.
+    /// Place or lift a legal hold; `hold list` shows every one standing.
     Hold(HoldArgs),
     /// Establish what happened to an effect the runtime could not decide.
     Reconcile(ReconcileArgs),
     /// Answer a quarantine: hand the run back, or close it where it stands.
     Quarantine(QuarantineArgs),
+    /// List the open tasks on the worklist, or show one with --show.
+    Tasks(TasksArgs),
     /// Decide a task on the worklist, as the person named.
     Decide(DecideArgs),
     /// Account for a breached obligation so it leaves the backlog.
@@ -177,8 +333,8 @@ struct ActingAs {
 }
 
 impl ActingAs {
-    fn operator(&self) -> Result<agentplane::core::Operator, String> {
-        agentplane::core::Operator::asserted(&self.actor).map_err(|e| e.to_string())
+    fn operator(&self) -> Result<agentplane::core::Operator, Fault> {
+        agentplane::core::Operator::asserted(&self.actor).map_err(|e| usage(e.to_string()))
     }
 }
 
@@ -237,22 +393,50 @@ struct QuarantineArgs {
     who: ActingAs,
 }
 
-/// Decide a task on the worklist.
-#[derive(clap::Args, Debug)]
-struct DecideArgs {
-    /// The task, as `attention` and the worklist print it.
-    task_id: String,
+/// A verdict, said in so many words.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Let the proposed action happen.
+    Approve,
+    /// Refuse it.
+    Reject,
+}
 
+/// The worklist, as a verb.
+#[derive(clap::Args, Debug)]
+struct TasksArgs {
     #[command(flatten)]
     at: StoreRef,
 
-    /// Approve it. Without this the decision is a refusal.
-    #[arg(long, conflicts_with = "reject")]
-    approve: bool,
+    /// Show one task whole — its proposed action and evidence — instead of
+    /// listing. Takes the id as the listing prints it.
+    #[arg(long, value_name = "TASK")]
+    show: Option<String>,
 
-    /// Refuse it, recording why.
-    #[arg(long)]
-    reject: bool,
+    /// A role you hold. Repeatable. The listing is the worklist as these roles
+    /// see it — a task naming candidate roles is shown only to one of them,
+    /// exactly as `decide` would admit — and a task naming none is anyone's.
+    #[arg(long = "role")]
+    roles: Vec<String>,
+
+    /// How many to list, highest priority and oldest first.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+}
+
+/// Decide a task on the worklist.
+#[derive(clap::Args, Debug)]
+struct DecideArgs {
+    /// The task, as `tasks` and `attention` print it.
+    task_id: String,
+
+    /// `approve` or `reject`. No default: a decision with no verdict is not
+    /// one.
+    #[arg(value_enum)]
+    verdict: Verdict,
+
+    #[command(flatten)]
+    at: StoreRef,
 
     /// The words that go on the record beside the verdict. Required.
     #[arg(long)]
@@ -316,58 +500,78 @@ struct RearmArgs {
     #[command(flatten)]
     at: StoreRef,
 
-    /// The registration's id, as `attention` and the parked listing print it.
+    /// The registration's id — the part after the `/` in an `attention`
+    /// `push.parked` subject.
     #[arg(long)]
     id: String,
 }
 
 /// Retention, as a verb, for the tier that is a manifest and this binary.
 ///
+/// Only `plan` exists, and that is the honest shape: this binary wires **no
+/// blob store and no key ring**, so nothing here can make a byte unreadable.
+/// Erasing is `Runtime::retain` on a plane built with both.
+#[derive(clap::Args, Debug)]
+struct RetentionArgs {
+    #[command(subcommand)]
+    act: RetentionAct,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum RetentionAct {
+    /// List the closed cases a retention pass would erase.
+    Plan(RetentionPlanArgs),
+}
+
 /// `--older-than-days` is **required and has no default**, for the reason
 /// [`ForgetArgs`]'s window is: a retention period is a legal and business
 /// decision, and a crate that picked one would be choosing somebody else's.
-///
-/// `--reason` is required too. It lands on every tombstone and on each key
-/// destruction, so a later read says *expired, on this date, for this reason*
-/// rather than *missing* — which is the distinction the recovery drill's
-/// three-way verdict is built on.
 #[derive(clap::Args, Debug)]
-struct RetainArgs {
+struct RetentionPlanArgs {
     /// The store holding the case layer, and whose. Blob addresses and key
-    /// scopes derive from the tenant, so a pass under the wrong one erases
-    /// nothing and says it erased nothing.
+    /// scopes derive from the tenant, so a plan under the wrong one lists
+    /// nothing.
     #[command(flatten)]
     at: StoreRef,
 
-    /// Erase closed cases opened longer ago than this, in days. Required.
+    /// Closed cases opened longer ago than this, in days. Required.
     #[arg(long)]
     older_than_days: u32,
+}
 
-    /// Why, recorded on every tombstone. Required.
-    #[arg(long)]
-    reason: String,
+/// A listing, for the verbs whose default act changes something.
+#[derive(clap::Subcommand, Debug)]
+enum Listing {
+    /// List every one standing on this tenant.
+    List(ListArgs),
+}
 
-    /// List what a pass would erase. Required: this binary wires no blob
-    /// store and no key ring, so listing is the only half it can perform.
-    #[arg(long)]
-    dry_run: bool,
+#[derive(clap::Args, Debug)]
+struct ListArgs {
+    /// The store, and whose to read.
+    #[command(flatten)]
+    at: StoreRef,
 }
 
 /// Preservation, as a verb.
 ///
-/// The counterpart of `retain`: that verb says what a sweep would destroy, this
-/// one says what it may not. With no `--case`, it lists — because a hold that
-/// can only be read by somebody who already knows which matter to ask about
-/// delivers nothing to the person whose job is to find out what is still being
-/// preserved and why.
+/// The counterpart of `retention plan`: that verb says what a sweep would
+/// destroy, this one says what it may not. `hold list` reads every hold
+/// standing — a hold that can only be read by somebody who already knows
+/// which matter to ask about delivers nothing to the person whose job is to
+/// find out what is still being preserved and why.
 #[derive(clap::Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct HoldArgs {
+    #[command(subcommand)]
+    list: Option<Listing>,
+
     /// The store holding the case layer, and whose.
     #[command(flatten)]
-    at: StoreRef,
+    at: Option<StoreRef>,
 
-    /// The matter to place or lift a hold on. Omit to list every hold standing.
-    #[arg(long)]
+    /// The matter to place or lift a hold on.
+    #[arg(long, required = true)]
     case: Option<String>,
 
     /// Why this matter may not be destroyed. Required to place one: the person
@@ -397,10 +601,14 @@ struct HoldArgs {
 /// *why* and *who* are the whole question. A lift needs neither, because it
 /// restores the default and the row it clears is gone.
 #[derive(clap::Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct HaltArgs {
+    #[command(subcommand)]
+    list: Option<Listing>,
+
     /// The store holding the halt, and which tenant to stop.
     #[command(flatten)]
-    at: StoreRef,
+    at: Option<StoreRef>,
 
     /// What to stop: `tenant`, `agent:<metadata.name>`,
     /// `revision:<manifest digest>`, or `subject:<delegation subject>`.
@@ -432,14 +640,10 @@ struct HaltArgs {
     /// Lift this halt instead of setting it.
     #[arg(long, conflicts_with_all = ["reason", "actor"])]
     lift: bool,
-}
 
-/// What is stopped right now — the question a per-scope lookup cannot answer.
-#[derive(clap::Args, Debug)]
-struct HaltsArgs {
-    /// The store holding the halts, and whose to read.
-    #[command(flatten)]
-    at: StoreRef,
+    /// Print one JSON document on stdout instead of text — `halt list` too.
+    #[arg(long, global = true)]
+    json: bool,
 }
 
 /// The runs that are waiting, as a verb.
@@ -686,14 +890,27 @@ struct StoreArgs {
     limit: usize,
 }
 
+/// What `export` takes beyond the shared store arguments.
+#[derive(clap::Args, Debug)]
+struct ExportArgs {
+    #[command(flatten)]
+    store: StoreArgs,
+
+    /// Write the export even when `--limit` truncated it, and exit 5.
+    ///
+    /// Without it a truncated export is refused and nothing is written: a file
+    /// that stopped at the limit is framed exactly like a complete one, and
+    /// it is the artifact an auditor is handed.
+    #[arg(long)]
+    allow_partial: bool,
+}
+
 /// Where a plane's state is, and whose.
 ///
-/// One type rather than a `--store`/`--tenant` pair written out per verb. Four
-/// verbs had both, five had only the store, and the binary could serve only the
-/// unnamed tenant — so an operator who learnt `--tenant` from `halt` and reached
-/// for `export` got an artifact about a different plane, empty, well-formed and
-/// exit zero. A verb cannot now name a store without saying whose it is,
-/// because there is no other way to name one.
+/// One type rather than a `--store`/`--tenant` pair written out per verb, so no
+/// verb can name a store without taking whose it is. A verb missing `--tenant`
+/// would read the unnamed tenant and hand an operator an artifact about a
+/// different plane — empty, well-formed and exit zero.
 #[derive(clap::Args, Debug, Clone)]
 struct StoreRef {
     /// The plane's store: a redb file, or a `postgres://` connection string.
@@ -710,15 +927,16 @@ struct StoreRef {
 }
 
 impl StoreRef {
-    async fn open(&self) -> Result<Backend, String> {
+    async fn open(&self) -> Result<Backend, Fault> {
         Backend::open(&self.store, self.tenant.as_deref()).await
     }
 }
 
-/// [`StoreRef`] for the two verbs a store is genuinely optional for.
+/// [`StoreRef`] for the verbs a store is genuinely optional for.
 ///
-/// `run` may journal to memory because it exits with its answer; `serve` refuses
-/// without one and says why in its own words rather than clap's.
+/// `run` may journal to memory because it exits with its answer; `replay
+/// --strict` may read `--from` exports instead; `serve` refuses without one and
+/// says why in its own words rather than clap's.
 #[derive(clap::Args, Debug, Clone)]
 struct MaybeStoreRef {
     /// The plane's store: a redb file, or a `postgres://` connection string.
@@ -735,7 +953,7 @@ impl MaybeStoreRef {
     ///
     /// `Ok(None)` rather than a default, so each caller decides what an absent
     /// store means: `run` journals to memory and says so, `serve` refuses.
-    async fn open(&self) -> Result<Option<Backend>, String> {
+    async fn open(&self) -> Result<Option<Backend>, Fault> {
         match &self.store {
             Some(spec) => Backend::open(spec, self.tenant.as_deref()).await.map(Some),
             None => Ok(None),
@@ -770,10 +988,45 @@ fn verifier_from(keys: &[String]) -> Result<Option<agentplane::policy::Ed25519Ve
     Ok(Some(verifier))
 }
 
+/// A starter manifest, written where you say.
 #[derive(clap::Args, Debug)]
-struct FileArgs {
+struct InitArgs {
+    /// Where to write it. Refused when the file exists.
+    #[arg(default_value = "agent.yaml")]
+    path: String,
+
+    /// Start from a tool-calling agent that reads from an MCP server, rather
+    /// than a single completion.
+    #[arg(long)]
+    tools: bool,
+
+    /// The agent's `metadata.name`, and the capability it provides.
+    #[arg(long, default_value = "my-agent")]
+    name: String,
+
+    #[command(flatten)]
+    out: JsonFlag,
+}
+
+/// Machine-readable output, for the verbs whose answer is a sentence.
+///
+/// One convention: those verbs print text for a person, and with `--json` one
+/// JSON document on stdout instead. The verbs whose answer is a report —
+/// `audit`, `verify`, `attention`, `tasks` and the rest — print JSON always.
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct JsonFlag {
+    /// Print one JSON document on stdout instead of text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args, Debug)]
+struct DigestArgs {
     /// The manifest, or a `---`-separated file of them.
     manifest: String,
+
+    #[command(flatten)]
+    out: JsonFlag,
 }
 
 #[derive(clap::Args, Debug)]
@@ -793,6 +1046,10 @@ struct ValidateArgs {
     /// yours, the enforcement is a job you run.
     #[arg(long = "require-annotation", value_name = "KEY")]
     require_annotation: Vec<String>,
+
+    /// Print one JSON document on stdout instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(clap::Args, Debug)]
@@ -830,9 +1087,29 @@ struct RunArgs {
     /// Repeatable, one per peer. The manifest grants the capabilities; this
     /// says where the peer is. Its bearer token, when it needs one, comes from
     /// the environment as `AGENTPLANE_PEER_TOKEN_<NAME>` (upper-cased, `.`
-    /// and `-` as `_`), never from the command line. Needs the `a2a` feature.
-    #[arg(long, value_name = "NAME=URL")]
+    /// and `-` as `_`), never from the command line. Needs the `a2a` feature,
+    /// and `--acting-as`: a peer call is made on somebody's behalf.
+    #[arg(long, value_name = "NAME=URL", requires = "acting_as")]
     peer: Vec<String>,
+
+    /// Who this run acts on behalf of: the owner of its delegation chain.
+    ///
+    /// The chain is rooted at this subject and scoped to exactly what the
+    /// file declares — the capabilities its agents provide and the ones they
+    /// grant under a peer's name — so a peer receives the chain plus one link
+    /// naming it, and nothing wider. Required by `--peer`.
+    #[arg(long, value_name = "SUBJECT")]
+    acting_as: Option<String>,
+
+    /// A correlation key for the run's case, as `NAMESPACE=VALUE`. Repeatable.
+    ///
+    /// Every run opens or joins a case, because oversight, obligations and
+    /// `$correlation/<namespace>` memory subjects all live on one. Without this
+    /// the run gets a case of its own, keyed `invocation=<fresh id>`; name a
+    /// key (`--correlate customer=C-7`) to join the open case that key already
+    /// belongs to, or to resolve a `$correlation/customer` subject.
+    #[arg(long, value_name = "NAMESPACE=VALUE")]
+    correlate: Vec<String>,
 }
 
 /// Re-execute a recorded run.
@@ -841,41 +1118,61 @@ struct RunArgs {
 /// almost nothing: a replay has no input, no capability choice and no default
 /// store — the journal *is* the subject — and a flag table where half the
 /// flags are meaningless under another flag is the silently-accepted-option
-/// defect this parser was adopted to remove.
+/// defect this parser exists to remove.
 #[derive(clap::Args, Debug)]
+#[command(after_help = REPLAY_EXIT_HELP)]
 struct ReplayArgs {
-    /// The run to re-execute.
-    run_id: String,
+    /// The run to re-execute. With `--strict --from`, leave it out to replay
+    /// every run the exports hold.
+    run_id: Option<String>,
 
-    /// The journal holding it, and whose. Required: there is nothing to replay
-    /// in a memory store this process did not itself write.
+    /// The journal holding the run, and whose. Required unless `--strict`
+    /// reads `--from` an export: there is nothing to replay in a memory store
+    /// this process did not itself write.
     #[command(flatten)]
-    at: StoreRef,
+    at: MaybeStoreRef,
 
-    /// The manifest (or `---`-separated room) the run executed under.
+    /// Replay from an export file instead of a store. Repeatable; `--strict`
+    /// only. Each file is rebuilt in memory and checked against its own
+    /// checkpoint — nothing is written to disk.
+    #[arg(long, value_name = "EXPORT", requires = "strict")]
+    from: Vec<String>,
+
+    /// The manifest (or `---`-separated room) to replay under.
     ///
-    /// Required, because a replay re-executes the deterministic zone and a
-    /// declarative agent's manifest *is* that code. Hand it the same document;
-    /// a journal written by a different declaration is divergence, and the
-    /// run is quarantined rather than continued — which is the desired
-    /// outcome, not a limitation.
+    /// A resume under a different declaration than the run was admitted
+    /// under is refused before anything replays, and the run is quarantined
+    /// with both digests named. A strict verification runs under whatever it
+    /// is handed — that is how an edited manifest is checked against the runs
+    /// it would have made — and its report names both digests.
     #[arg(long)]
     manifest: String,
 
-    /// Verify rather than resume: read every effect back and fail if this
-    /// build would do more, less, or different work than the record.
+    /// Verify rather than resume: read every effect back and report whether
+    /// this build does the same work, different work, or cannot be compared.
+    ///
+    /// Calls no model, starts no tool server, dials no peer and writes
+    /// nothing, so it needs no provider credential.
     #[arg(long)]
     strict: bool,
 
     /// Run an MCP server as a child process, as `run` takes it. A resume that
     /// continues past its recorded history dispatches live and may need one.
+    /// Refused with `--strict`, which dispatches nothing.
     #[arg(long, value_name = "NAME=COMMAND")]
     mcp: Vec<String>,
 
-    /// Reach an A2A peer, as `run` takes it.
+    /// Reach an A2A peer, as `run` takes it. Refused with `--strict`.
     #[arg(long, value_name = "NAME=URL")]
     peer: Vec<String>,
 }
+
+/// What `replay --strict` exits with, beside the table every verb shares.
+const REPLAY_EXIT_HELP: &str = "Exit status of `--strict`:
+  0  every run replayed was verified
+  1  a run diverged from its record
+  4  a store, file or journal could not be used
+  5  partial: a run could not be replayed (named in the report), and none diverged";
 
 /// Print the Agent Card a served manifest would advertise.
 #[derive(clap::Args, Debug)]
@@ -887,6 +1184,53 @@ struct CardArgs {
     /// handed, without serving anything.
     #[arg(long, env = "AGENTPLANE_URL")]
     url: String,
+}
+
+/// Policy over recorded history.
+#[derive(clap::Args, Debug)]
+struct PolicyArgs {
+    #[command(subcommand)]
+    act: PolicyAct,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum PolicyAct {
+    /// Rebuild every gated request an export records and evaluate it offline.
+    Check(PolicyCheckArgs),
+}
+
+/// Re-derive recorded verdicts from an export.
+///
+/// Reads one file, opens no store, writes nothing and calls no network. It
+/// checks agreement between a bundle and the record, not the record's
+/// integrity — run `verify` on the same file for that.
+#[derive(clap::Args, Debug)]
+#[cfg_attr(not(feature = "cedar"), allow(dead_code))]
+struct PolicyCheckArgs {
+    /// The bundle the runs recorded: a `.cedar` file, or a directory holding
+    /// `policy.cedar` and optionally `schema.json` and `entities.json`. Read
+    /// by the loader `serve --policy` uses, so its digest is the one a served
+    /// plane records. A run that recorded another bundle is a mismatch and is
+    /// not evaluated.
+    #[arg(long)]
+    bundle: String,
+
+    /// The export to read. `-` reads standard input.
+    #[arg(long)]
+    from: String,
+
+    /// A bundle to measure against what happened: every recorded permit it
+    /// would refuse, per run.
+    #[arg(long)]
+    candidate: Option<String>,
+
+    /// The tenant the runs belong to. Every request carries it and no record
+    /// does, so the report says whether it was supplied or assumed.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
+
+    #[command(flatten)]
+    out: JsonFlag,
 }
 
 #[derive(clap::Args, Debug)]
@@ -903,8 +1247,11 @@ struct ServeArgs {
     #[arg(long, env = "AGENTPLANE_ADDR", default_value = "127.0.0.1:8080")]
     addr: String,
 
-    /// A Cedar policy set. No default: a permissive engine and no engine are the
-    /// same behaviour, and only one of them looks governed.
+    /// A Cedar policy bundle: one `.cedar` file, or a directory holding
+    /// `policy.cedar` and optionally `schema.json` and `entities.json` — the
+    /// same loader `policy check --bundle` reads. No default: a permissive
+    /// engine and no engine are the same behaviour, and only one of them
+    /// looks governed.
     #[arg(long, env = "AGENTPLANE_POLICY")]
     policy: Option<String>,
 
@@ -983,6 +1330,15 @@ struct ServeArgs {
         default_value_t = 25
     )]
     drain_secs: u64,
+
+    /// How the server logs: `text` for a terminal, `json` for a collector.
+    #[arg(
+        long,
+        value_enum,
+        env = "AGENTPLANE_LOG_FORMAT",
+        default_value_t = LogFormat::Text
+    )]
+    log_format: LogFormat,
 }
 
 /// The anchoring checkpoint an audit was given, and **how it was obtained**.
@@ -1045,8 +1401,28 @@ struct Anchor {
 #[derive(serde::Serialize)]
 struct AuditDocument<'a> {
     anchor: &'a Anchor,
+    /// Which run lists `--limit` cut short. Travels in the report, because a
+    /// warning on stderr is gone the moment somebody writes `> report.json`,
+    /// and a clean report over a truncated list reads as a clean plane.
+    truncated: &'a Truncation,
     #[serde(flatten)]
     report: &'a agentplane::audit::AuditReport,
+}
+
+/// Where a journal verb's run list stopped short of the store.
+#[derive(Debug, Default, serde::Serialize)]
+struct Truncation {
+    /// The `--limit` in force.
+    limit: usize,
+    /// The outcomes, and `in-flight runs`, whose list reached it — so runs
+    /// past it were not read.
+    reached: Vec<String>,
+}
+
+impl Truncation {
+    const fn is_partial(&self) -> bool {
+        !self.reached.is_empty()
+    }
 }
 
 /// What `verify` prints: the file's report, and the anchor it was held to.
@@ -1098,9 +1474,10 @@ fn witness_keys(keys: &[String]) -> Result<Vec<agentplane::journal::TrustedWitne
 /// The **anchor** an auditor needs is one checkpoint from outside the store.
 /// Naming several witnesses buys something a single one cannot: a split view
 /// is exactly two witnesses holding one size with different roots, and no
-/// single anchor exhibits it. So this returns the highest checkpoint any of
-/// them cosigned, and reports a disagreement on stderr as what it is — the
-/// event witnessing exists to detect, found by the party it exists to protect.
+/// single anchor exhibits it. So this returns every checkpoint the witnesses
+/// cosigned — each one an anchor the audit is held to — and reports a
+/// disagreement on stderr as what it is: the event witnessing exists to
+/// detect, found by the party it exists to protect.
 ///
 /// `Ok(None)` when no witness was named. A named witness that has never seen
 /// this log is said out loud and is not an anchor: an auditor holding a clean
@@ -1202,20 +1579,23 @@ async fn audit_report(
     store: &Arc<dyn JournalStore>,
     runs: &[agentplane::RunId],
     audit: &AuditArgs,
-) -> Result<ExitCode, String> {
+    truncated: &Truncation,
+) -> Result<ExitCode, Fault> {
     // An audit with no prior checkpoint and no key still checks every
     // chain, and reports the two things it could not do. That is the
     // honest default for somebody who has just been handed a database —
     // and the flags are how they narrow it on the second pass, with the
     // key the operator published and the checkpoint the first pass printed.
-    let verifier = verifier_from(&audit.key)?;
+    let verifier = verifier_from(&audit.key).map_err(usage)?;
     // The store's own origin, unless the auditor named one — which they do
     // exactly when the store's answer is the thing under suspicion.
     let origin = match &audit.origin {
         Some(o) => o.clone(),
         None => store.checkpoint().await.map_err(|e| e.to_string())?.origin,
     };
-    let fetched = anchor_from_witnesses(&audit.witness, &audit.witness_key, &origin).await?;
+    let fetched = anchor_from_witnesses(&audit.witness, &audit.witness_key, &origin)
+        .await
+        .map_err(usage)?;
     let prior: Option<agentplane::journal::Checkpoint> = match &audit.prior {
         Some(path) => Some(
             std::fs::read_to_string(path)
@@ -1268,6 +1648,7 @@ async fn audit_report(
         "{}",
         serde_json::to_string_pretty(&AuditDocument {
             anchor: &anchor,
+            truncated,
             report: &report,
         })
         .map_err(|e| e.to_string())?
@@ -1280,14 +1661,83 @@ async fn audit_report(
     // witnesses holding one size with two different roots is the event
     // witnessing exists to detect, and only this command — which asked more
     // than one witness — is in a position to see it.
-    Ok(if report.is_sound() && anchor.split_view.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    //
+    // A sound audit over a truncated run list is a partial answer, not a pass:
+    // the runs past `--limit` were never read.
+    Ok(ExitCode::from(audit_status(
+        report.is_sound() && anchor.split_view.is_empty(),
+        truncated,
+    )))
 }
 
-fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode, String> {
+/// Whether an export stops before writing: truncated, and nobody said a partial
+/// file is what they want.
+const fn refuses_partial_export(truncated: &Truncation, allow_partial: bool) -> bool {
+    truncated.is_partial() && !allow_partial
+}
+
+/// How an audit exits: a finding outranks a partial view, and a partial view
+/// is never a pass.
+const fn audit_status(sound: bool, truncated: &Truncation) -> u8 {
+    if !sound {
+        exit::FINDING
+    } else if truncated.is_partial() {
+        exit::PARTIAL
+    } else {
+        exit::OK
+    }
+}
+
+/// The export half of `journal_verb`: write the runs out, or refuse a partial
+/// file nobody asked for.
+async fn export_runs(
+    store: &Arc<dyn JournalStore>,
+    cases: &Arc<dyn agentplane::case::CaseStore>,
+    runs: &[agentplane::RunId],
+    truncation: &Truncation,
+    allow_partial: bool,
+) -> Result<ExitCode, Fault> {
+    // Refused before a byte is written: a truncated export is framed
+    // exactly like a complete one, so the only place the difference
+    // can live is the decision to write it at all.
+    if refuses_partial_export(truncation, allow_partial) {
+        eprintln!(
+            "agentplane: refusing a partial export; raise --limit, narrow \
+             --outcome, or pass --allow-partial to write it anyway"
+        );
+        return Ok(ExitCode::from(exit::PARTIAL));
+    }
+    let stdout = std::io::stdout();
+    let trailer = agentplane::export::to_jsonl(
+        store,
+        Some(cases),
+        runs,
+        std::io::BufWriter::new(stdout.lock()),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    eprintln!(
+        "exported {} record(s) from {}/{} run(s) and {} case(s)",
+        trailer.records, trailer.runs_exported, trailer.runs_requested, trailer.cases
+    );
+    if !trailer.unreadable.is_empty() {
+        for u in &trailer.unreadable {
+            eprintln!("unreadable: {} — {}", u.run, u.reason);
+        }
+        return Ok(ExitCode::from(exit::FINDING));
+    }
+    Ok(ExitCode::from(if truncation.is_partial() {
+        exit::PARTIAL
+    } else {
+        exit::OK
+    }))
+}
+
+fn journal_verb(
+    opts: &StoreArgs,
+    audit: Option<&AuditArgs>,
+    allow_partial: bool,
+) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1368,29 +1818,23 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
         }
 
         let Some(audit) = audit else {
-            let stdout = std::io::stdout();
-            let trailer = agentplane::export::to_jsonl(
-                &store,
-                Some(&cases),
-                &runs,
-                std::io::BufWriter::new(stdout.lock()),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-            eprintln!(
-                "exported {} record(s) from {}/{} run(s) and {} case(s)",
-                trailer.records, trailer.runs_exported, trailer.runs_requested, trailer.cases
-            );
-            if !trailer.unreadable.is_empty() {
-                for u in &trailer.unreadable {
-                    eprintln!("unreadable: {} — {}", u.run, u.reason);
-                }
-                return Ok(ExitCode::FAILURE);
-            }
-            return Ok(ExitCode::SUCCESS);
+            let truncation = Truncation {
+                limit: opts.limit,
+                reached: truncated,
+            };
+            return export_runs(&store, &cases, &runs, &truncation, allow_partial).await;
         };
 
-        audit_report(&store, &runs, audit).await
+        audit_report(
+            &store,
+            &runs,
+            audit,
+            &Truncation {
+                limit: opts.limit,
+                reached: truncated,
+            },
+        )
+        .await
     })
 }
 
@@ -1403,7 +1847,7 @@ fn journal_verb(opts: &StoreArgs, audit: Option<&AuditArgs>) -> Result<ExitCode,
 /// A drill whose exit code could not tell the two apart would teach whoever
 /// scripts it to ignore the nonzero that means bytes are missing with no
 /// tombstone to explain them.
-fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
+fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1424,7 +1868,7 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
                 // exactly what a missing CI log cannot tell from a rotated
                 // one — so it exits non-zero and says which it is.
                 println!("{}", serde_json::json!({ "drilled": false }));
-                return Ok(ExitCode::FAILURE);
+                return Ok(ExitCode::from(exit::FINDING));
             };
             let sound = record.sound;
             println!(
@@ -1446,18 +1890,19 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
             return Ok(if sound {
                 ExitCode::SUCCESS
             } else {
-                ExitCode::FAILURE
+                ExitCode::from(exit::FINDING)
             });
         }
         // The tenant scopes blob addresses and key scopes. This verb wires
         // neither store, so it reaches neither — but the value is the one the
-        // operator named, so a future flag that wires blobs inherits the right
-        // scope rather than a default that was never a decision.
+        // operator named, not a default nobody chose.
         let tenant = opts
             .at
             .tenant
             .as_deref()
-            .map(|name| agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}")))
+            .map(|name| {
+                agentplane::core::TenantId::new(name).map_err(|e| usage(format!("--tenant: {e}")))
+            })
             .transpose()?
             .unwrap_or_default();
         let stores = agentplane::drill::Stores {
@@ -1505,7 +1950,7 @@ fn drill_verb(opts: &DrillArgs) -> Result<ExitCode, String> {
         Ok(if report.is_sound() {
             ExitCode::SUCCESS
         } else {
-            ExitCode::FAILURE
+            ExitCode::from(exit::FINDING)
         })
     })
 }
@@ -1535,7 +1980,7 @@ fn cutoff_before(
 /// Prints the count, because a retention pass that says nothing is
 /// indistinguishable from one that found nothing — and the two call for
 /// different responses when the index keeps growing.
-fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, String> {
+fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1548,7 +1993,7 @@ fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, String> {
         // observation of a run.
         #[allow(clippy::disallowed_methods)]
         let now = time::OffsetDateTime::now_utc();
-        let cutoff = cutoff_before(now, opts.older_than_days)?;
+        let cutoff = cutoff_before(now, opts.older_than_days).map_err(usage)?;
         let retired = store
             .forget_admissions(cutoff)
             .await
@@ -1565,24 +2010,15 @@ fn forget_admissions_verb(opts: &ForgetArgs) -> Result<ExitCode, String> {
     })
 }
 
-/// Plan a retention pass, and refuse to pretend to run one.
+/// Plan a retention pass.
 ///
 /// This binary wires **no blob store and no key ring** — a redb file is a
 /// journal and a case layer, not a bucket and not a KMS — so nothing here can
 /// make a byte unreadable. A verb that walked the cases, erased nothing, and
-/// printed `erased: 0` beside a clean exit code would be the shape this project
-/// refuses hardest: a control that reads as having run. So the verb answers the
-/// half it can — *what a pass would erase* — through the same selection rule
-/// `Runtime::retain` uses, and refuses the other half by name.
-fn retain_verb(opts: &RetainArgs) -> Result<ExitCode, String> {
-    if !opts.dry_run {
-        return Err(concat!(
-            "this binary wires no blob store and no key ring, so it cannot erase anything; ",
-            "it can only say what a pass would erase. Run again with --dry-run, or call ",
-            "`Runtime::retain` from a plane built with `.blobs(..)` and `.keyring(..)`"
-        )
-        .to_owned());
-    }
+/// printed `erased: 0` beside a clean exit code would be a control that reads
+/// as having run. So the verb is named for the half it performs — *what a pass
+/// would erase* — through the same selection rule `Runtime::retain` uses.
+fn retention_plan_verb(opts: &RetentionPlanArgs) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1596,15 +2032,13 @@ fn retain_verb(opts: &RetainArgs) -> Result<ExitCode, String> {
         // observation of a run.
         #[allow(clippy::disallowed_methods)]
         let now = time::OffsetDateTime::now_utc();
-        let cutoff = cutoff_before(now, opts.older_than_days)?;
+        let cutoff = cutoff_before(now, opts.older_than_days).map_err(usage)?;
         let plan = agentplane::retention::plan(cases.as_ref(), cutoff)
             .await
             .map_err(|e| e.to_string())?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "dry_run": true,
-                "reason": opts.reason,
                 "cutoff": cutoff.unix_timestamp(),
                 "scanned": plan.scanned,
                 "would_erase": plan.due,
@@ -1615,54 +2049,75 @@ fn retain_verb(opts: &RetainArgs) -> Result<ExitCode, String> {
     })
 }
 
-/// Place, lift, or list legal holds.
+/// What a verb whose store is optional in the parser says when none was named.
+///
+/// `halt` and `hold` take a `list` subcommand, and clap cannot make `--store`
+/// required on the verb and optional on its subcommand at once — so the one
+/// requirement it would have enforced is enforced here, in its words.
+fn missing_store() -> String {
+    "--store is required (or set AGENTPLANE_STORE): the plane's store, a redb file or a \
+     `postgres://` connection string"
+        .to_owned()
+}
+
+/// Every standing legal hold.
+fn holds_verb(at: &StoreRef) -> Result<ExitCode, Fault> {
+    blocking(async {
+        let cases = at.open().await?.cases();
+        let mut standing = Vec::new();
+        let mut after = None;
+        loop {
+            let page = cases.holds(after, 256).await.map_err(|e| e.to_string())?;
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|(c, _)| *c);
+            for (id, hold) in page {
+                standing.push(serde_json::json!({
+                    "case": id.to_string(),
+                    "placed_at": hold.placed_at.unix_timestamp(),
+                    "reason": hold.reason,
+                    "by": hold.by.actor(),
+                    "basis": hold.by.basis().as_str(),
+                }));
+            }
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "holds": standing }))
+                .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Place or lift a legal hold.
 ///
 /// Prints what it did for the reason `halt` does: an operator who cannot see
 /// the control move has not been told whether they moved it.
-fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
-    if opts.case.is_none() && (opts.lift || opts.reason.is_some()) {
-        return Err(
-            "--lift and --reason act on one matter: name it with --case, or pass \
-             neither to list every hold standing"
-                .to_owned(),
-        );
-    }
+fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, Fault> {
+    let (at, case) = match (&opts.list, &opts.at, &opts.case) {
+        (Some(Listing::List(list)), ..) => return holds_verb(&list.at),
+        (None, Some(at), Some(case)) => (at, case.as_str()),
+        (None, None, _) => return Err(usage(missing_store())),
+        (None, Some(_), None) => {
+            return Err(usage(
+                "name the matter with --case, or run `hold list` to list every \
+                        hold standing"
+                    .to_owned(),
+            ));
+        }
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let cases = opts.at.open().await?.cases();
+        let cases = at.open().await?.cases();
 
-        let Some(case) = opts.case.as_deref() else {
-            let mut standing = Vec::new();
-            let mut after = None;
-            loop {
-                let page = cases.holds(after, 256).await.map_err(|e| e.to_string())?;
-                if page.is_empty() {
-                    break;
-                }
-                after = page.last().map(|(c, _)| *c);
-                for (id, hold) in page {
-                    standing.push(serde_json::json!({
-                        "case": id.to_string(),
-                        "placed_at": hold.placed_at.unix_timestamp(),
-                        "reason": hold.reason,
-                        "by": hold.by.actor(),
-                        "basis": hold.by.basis().as_str(),
-                    }));
-                }
-            }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({ "holds": standing }))
-                    .map_err(|e| e.to_string())?
-            );
-            return Ok(ExitCode::SUCCESS);
-        };
-
-        let case = agentplane::core::CaseId::parse(case).map_err(|e| format!("--case: {e}"))?;
+        let case =
+            agentplane::core::CaseId::parse(case).map_err(|e| usage(format!("--case: {e}")))?;
         if opts.lift {
             let lifted = cases.release_hold(case).await.map_err(|e| e.to_string())?;
             println!(
@@ -1673,27 +2128,31 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
                 }))
                 .map_err(|e| e.to_string())?
             );
-            return Ok(ExitCode::SUCCESS);
+            return Ok(lift_status(lifted));
         }
 
         let Some(reason) = opts.reason.as_deref() else {
-            return Err(concat!(
-                "--reason is required to place a hold: a preservation nobody can account for ",
-                "is indistinguishable from a sweep that quietly stopped working. ",
-                "Use --lift to release one"
-            )
-            .to_owned());
+            return Err(usage(
+                concat!(
+                    "--reason is required to place a hold: a preservation nobody can account for ",
+                    "is indistinguishable from a sweep that quietly stopped working. ",
+                    "Use --lift to release one"
+                )
+                .to_owned(),
+            ));
         };
         let Some(actor) = opts.actor.as_deref() else {
-            return Err(concat!(
-                "--actor is required to place a hold: a preservation order the runtime ",
-                "cannot check is worth the name beside it, and the row records that this ",
-                "one was asserted rather than authenticated"
-            )
-            .to_owned());
+            return Err(usage(
+                concat!(
+                    "--actor is required to place a hold: a preservation order the runtime ",
+                    "cannot check is worth the name beside it, and the row records that this ",
+                    "one was asserted rather than authenticated"
+                )
+                .to_owned(),
+            ));
         };
-        let by = agentplane::core::Operator::asserted(actor).map_err(|e| e.to_string())?;
-        // Wall clock by design, like `retain`'s cutoff: when a hold was placed
+        let by = agentplane::core::Operator::asserted(actor).map_err(|e| usage(e.to_string()))?;
+        // Wall clock by design, like the retention cutoff: when a hold was placed
         // is a fact about the outside world, not a journaled observation.
         #[allow(clippy::disallowed_methods)]
         let now = time::OffsetDateTime::now_utc();
@@ -1734,28 +2193,37 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, String> {
 ///
 /// Prints what it did, because an operator who cannot see the switch move has
 /// not been told whether they threw it.
-fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
+fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, Fault> {
+    let at = match (&opts.list, &opts.at) {
+        (Some(Listing::List(list)), _) => return halts_verb(&list.at, opts.json),
+        (None, Some(at)) => at,
+        (None, None) => return Err(usage(missing_store())),
+    };
     let scope = agentplane::quota::HaltScope::parse(&opts.scope).ok_or_else(|| {
-        format!(
+        usage(format!(
             "'{}' is not a scope: use {}",
             opts.scope,
             agentplane::quota::HaltScope::forms()
-        )
+        ))
     })?;
     let thrown = if opts.lift {
         None
     } else {
-        let reason = opts.reason.as_deref().ok_or(concat!(
-            "--reason is required to halt: the next person to look will be somebody else, ",
-            "possibly at three in the morning, and why is the whole question. ",
-            "Use --lift to clear a halt"
-        ))?;
-        let actor = opts.actor.as_deref().ok_or(concat!(
-            "--actor is required to halt: the runtime cannot check an emergency stop, ",
-            "so the name beside it is the whole of its evidence. It is recorded as ",
-            "asserted — nothing here verified it"
-        ))?;
-        let by = agentplane::core::Operator::asserted(actor).map_err(|e| e.to_string())?;
+        let reason = opts.reason.as_deref().ok_or_else(|| {
+            usage(concat!(
+                "--reason is required to halt: the next person to look will be somebody else, ",
+                "possibly at three in the morning, and why is the whole question. ",
+                "Use --lift to clear a halt"
+            ))
+        })?;
+        let actor = opts.actor.as_deref().ok_or_else(|| {
+            usage(concat!(
+                "--actor is required to halt: the runtime cannot check an emergency stop, ",
+                "so the name beside it is the whole of its evidence. It is recorded as ",
+                "asserted — nothing here verified it"
+            ))
+        })?;
+        let by = agentplane::core::Operator::asserted(actor).map_err(|e| usage(e.to_string()))?;
         Some((by, reason))
     };
 
@@ -1765,10 +2233,10 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let quotas = opts.at.open().await?.quotas();
+        let quotas = at.open().await?.quotas();
         let printed = if let Some((by, reason)) = &thrown {
             {
-                // Wall clock by design, like `retain`'s cutoff and a hold's
+                // Wall clock by design, like the retention cutoff and a hold's
                 // instant: when a person threw a stop is a fact about the
                 // outside world, not a journaled observation.
                 #[allow(clippy::disallowed_methods)]
@@ -1777,6 +2245,15 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
                     .set_halt(&scope, by, now, reason)
                     .await
                     .map_err(|e| e.to_string())?;
+                if !opts.json {
+                    println!(
+                        "halted {}: {reason} (by {}, {})",
+                        scope.key(),
+                        by.actor(),
+                        by.basis().as_str()
+                    );
+                    return Ok(ExitCode::SUCCESS);
+                }
                 serde_json::json!({
                     "scope": scope.key(),
                     "halted": true,
@@ -1790,12 +2267,23 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
                 let was_standing = quotas.lift_halt(&scope).await.map_err(|e| e.to_string())?;
                 // Whether one was standing is the answer to *did I clear the
                 // right scope*, which is the question during an incident. A lift
-                // that found nothing must not read as success.
-                serde_json::json!({
-                    "scope": scope.key(),
-                    "halted": false,
-                    "was_standing": was_standing,
-                })
+                // that found nothing must not read as success, so it exits as a
+                // negative answer.
+                if opts.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "scope": scope.key(),
+                            "halted": false,
+                            "was_standing": was_standing,
+                        })
+                    );
+                } else if was_standing {
+                    println!("lifted {}", scope.key());
+                } else {
+                    println!("no halt was standing on {}; nothing lifted", scope.key());
+                }
+                return Ok(lift_status(was_standing));
             }
         };
         println!("{printed}");
@@ -1803,15 +2291,24 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// How a lift exits: a lift that found nothing standing is a negative answer.
+fn lift_status(was_standing: bool) -> ExitCode {
+    ExitCode::from(if was_standing {
+        exit::OK
+    } else {
+        exit::FINDING
+    })
+}
+
 /// Every standing halt, so an operator can see what an incident left behind.
-fn halts_verb(opts: &HaltsArgs) -> Result<ExitCode, String> {
+fn halts_verb(at: &StoreRef, json: bool) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let quotas = opts.at.open().await?.quotas();
+        let quotas = at.open().await?.quotas();
         let halts = quotas.halts().await.map_err(|e| e.to_string())?;
         let rows: Vec<serde_json::Value> = halts
             .iter()
@@ -1825,17 +2322,32 @@ fn halts_verb(opts: &HaltsArgs) -> Result<ExitCode, String> {
                 })
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "halts": rows }))
-                .map_err(|e| e.to_string())?
-        );
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "halts": rows }))
+                    .map_err(|e| e.to_string())?
+            );
+        } else if halts.is_empty() {
+            println!("no halts standing");
+        } else {
+            for h in &halts {
+                println!(
+                    "{}\tthrown {} by {} ({}): {}",
+                    h.scope.key(),
+                    h.at.unix_timestamp(),
+                    h.by.actor(),
+                    h.by.basis().as_str(),
+                    h.reason
+                );
+            }
+        }
         Ok(ExitCode::SUCCESS)
     })
 }
 
 /// List the runs whose last record is a suspension.
-fn waiting_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
+fn waiting_verb(opts: &WaitingArgs) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1876,11 +2388,13 @@ fn waiting_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
 /// same reason `drill` and `verify` report through their status rather than
 /// only on stdout.
 /// One async runtime, for the verbs that only touch stores.
-fn blocking<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
+fn blocking<T, E: From<String>>(
+    f: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|e| format!("could not start the async runtime: {e}"))?
+        .map_err(|e| E::from(format!("could not start the async runtime: {e}")))?
         .block_on(f)
 }
 
@@ -1889,33 +2403,35 @@ fn blocking<T>(f: impl std::future::Future<Output = Result<T, String>>) -> Resul
 /// The first of the remedies `attention` names for a quarantine, and the one
 /// that has to come first: reopening a run whose doubt is unanswered
 /// quarantines it again, correctly, on the same effect.
-fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, String> {
+fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, Fault> {
     let assertion = match opts.outcome.as_str() {
         "landed" => {
             let raw = opts.output.as_deref().unwrap_or("null");
             agentplane::core::Assertion::Landed(
-                serde_json::from_str(raw).map_err(|e| format!("--output is not JSON: {e}"))?,
+                serde_json::from_str(raw)
+                    .map_err(|e| usage(format!("--output is not JSON: {e}")))?,
             )
         }
         "did-not-happen" => {
             if opts.output.is_some() {
-                return Err(
+                return Err(usage(
                     "--output belongs to `--outcome landed`: an effect that did not happen \
                      produced no result to read back"
                         .to_owned(),
-                );
+                ));
             }
             agentplane::core::Assertion::DidNotHappen
         }
         other => {
-            return Err(format!(
+            return Err(usage(format!(
                 "'{other}' is not an outcome: use `landed` or `did-not-happen`"
-            ));
+            )));
         }
     };
     let by = opts.who.operator()?;
-    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
-    let effect = agentplane::core::EffectKey::from_hex(&opts.effect).map_err(|e| e.to_string())?;
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| usage(e.to_string()))?;
+    let effect =
+        agentplane::core::EffectKey::from_hex(&opts.effect).map_err(|e| usage(e.to_string()))?;
 
     blocking(async move {
         let backend = opts.at.open().await?;
@@ -1947,20 +2463,20 @@ fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, String> {
 /// was not handed — so the decision is recorded and the next resume applies
 /// it. Reporting the run as moved would be the one dishonest thing available
 /// here.
-fn quarantine_verb(opts: &QuarantineArgs) -> Result<ExitCode, String> {
+fn quarantine_verb(opts: &QuarantineArgs) -> Result<ExitCode, Fault> {
     use agentplane::core::QuarantineDecision;
 
     let decision = match opts.decision.as_str() {
         "reopen" => QuarantineDecision::Reopen,
         "abandon" => QuarantineDecision::Abandon,
         other => {
-            return Err(format!(
+            return Err(usage(format!(
                 "'{other}' is not a decision: use `reopen` or `abandon`"
-            ));
+            )));
         }
     };
     let by = opts.who.operator()?;
-    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| usage(e.to_string()))?;
 
     blocking(async move {
         let backend = opts.at.open().await?;
@@ -1988,25 +2504,104 @@ fn quarantine_verb(opts: &QuarantineArgs) -> Result<ExitCode, String> {
     })
 }
 
+/// One task, as a terminal shows it.
+///
+/// The rendering every surface shows ([`Task::rendering`]): hidden and
+/// direction-changing code points escaped in place, words mixing scripts
+/// listed beside the text, and a proposal this binary cannot open — it holds
+/// no key ring — shown as withheld, with the reason, rather than as an
+/// envelope a person might read as the arguments.
+///
+/// [`Task::rendering`]: agentplane::core::Task::rendering
+fn task_json(task: &agentplane::core::Task, whole: bool) -> serde_json::Value {
+    let j = &task.justification;
+    let shown = task.rendering();
+    let mut out = serde_json::json!({
+        "task": task.id.to_string(),
+        "run": task.run.to_string(),
+        "case": task.case.map(|c| c.to_string()),
+        "kind": task.kind,
+        "state": task.state.as_str(),
+        "priority": task.priority.as_str(),
+        "summary": shown.summary,
+        "proposed_action": shown.proposed_action,
+        "withheld": shown.withheld.map(|w| format!("{} — {w}", w.as_str())),
+        "candidate_roles": task.candidate_roles,
+        "assignee": task.assignee,
+        "due_at": task.due_at.map(|d| d.to_string()),
+        // Whether a sentence above was written by something the run does not
+        // trust — the distinction a reviewer must be shown, not left to infer.
+        "has_untrusted_prose": j.has_untrusted_prose(),
+        // Whether anything above had a code point escaped that would have
+        // rendered as nothing or reordered the text around it.
+        "escaped": shown.escaped,
+        "mixed_script": shown.mixed_script,
+    });
+    if whole {
+        out["confidence"] = serde_json::json!(j.confidence);
+        out["cost"] = serde_json::json!(shown.cost);
+        out["evidence"] = serde_json::json!(shown.evidence);
+        out["excluded_actors"] = serde_json::json!(task.excluded_actors);
+        out["on_expiry"] = serde_json::json!(task.on_expiry.as_str());
+        out["escalate_to"] = serde_json::json!(task.escalate_to);
+    }
+    out
+}
+
+/// The worklist, or one task on it.
+///
+/// Read through [`TaskStore::queue`](agentplane::case::TaskStore::queue) with
+/// the roles named, which is the listing the HTTP worklist serves a caller —
+/// so a terminal shows the same tasks `decide` would admit, and no others.
+fn tasks_verb(opts: &TasksArgs) -> Result<ExitCode, Fault> {
+    blocking(async move {
+        let tasks = opts.at.open().await?.tasks();
+        if let Some(show) = &opts.show {
+            let id = agentplane::core::TaskId::parse(show)
+                .map_err(|e| usage(format!("`{show}` is not a task id: {e}")))?;
+            let task = tasks
+                .task(id)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("no task {id} on this plane"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&task_json(&task, true)).map_err(|e| e.to_string())?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        let mut queued = tasks
+            .queue(&opts.roles, opts.limit.saturating_add(1))
+            .await
+            .map_err(|e| e.to_string())?;
+        // One past the page, so *there is more* is a fact rather than an
+        // inference from a full page.
+        let truncated = queued.len() > opts.limit;
+        queued.truncate(opts.limit);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "tasks": queued.iter().map(|t| task_json(t, false)).collect::<Vec<_>>(),
+                "truncated": truncated,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
 /// Decide a task on the worklist.
 ///
 /// The claim, the eligibility check and four-eyes all run in the task store,
 /// which is why `--role` is taken: the exclusion this enforces is the reason
 /// an approval is worth anything, and a terminal that skipped it would be a
 /// second door into the control the HTTP route goes through.
-fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, String> {
-    // The verdict first: it is an argument error, answerable without a store
-    // or a well-formed id, and an operator who forgot it should be told that
-    // rather than shown a parse failure for something else.
-    if !opts.approve && !opts.reject {
-        return Err(
-            "say which: `--approve` or `--reject`. A decision with no verdict is not one"
-                .to_owned(),
-        );
-    }
+fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, Fault> {
     let by = opts.who.operator()?;
-    let id = agentplane::core::TaskId::parse(&opts.task_id).map_err(|e| e.to_string())?;
-    let decision = if opts.approve {
+    let id = agentplane::core::TaskId::parse(&opts.task_id)
+        .map_err(|e| usage(format!("`{}` is not a task id: {e}", opts.task_id)))?;
+    let approved = opts.verdict == Verdict::Approve;
+    let decision = if approved {
         agentplane::core::Decision::approve(by.clone(), opts.reason.clone())
     } else {
         agentplane::core::Decision::reject(by.clone(), opts.reason.clone())
@@ -2014,18 +2609,28 @@ fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, String> {
 
     blocking(async move {
         let backend = opts.at.open().await?;
+        // The shortest lease the store can renew: this plane holds no agent,
+        // so a resume after the decision keeps its lease for recovery to find
+        // the run, and the operator's `replay` should not wait long for it.
         let plane = Runtime::builder_with(backend.stores())
             .tenant(backend.tenant())
+            .lease_ttl(std::time::Duration::from_secs(2))
             .build();
-        let delivery = plane
-            .decide_task(id, &decision, &opts.roles)
-            .await
-            .map_err(|e| e.to_string())?;
+        let delivery = match plane.decide_task(id, &decision, &opts.roles).await {
+            Ok(delivery) => delivery,
+            // A refusal, not an outage: nothing was recorded and the task is
+            // still open, and the person at this terminal is owed the way on.
+            Err(agentplane::core::RuntimeError::ProposalWithheld { reason, .. }) => {
+                eprintln!("{}", withheld_refusal(id, reason));
+                return Ok(ExitCode::from(exit::FINDING));
+            }
+            Err(e) => return Err(e.to_string().into()),
+        };
         println!(
             "{}",
             serde_json::json!({
-                "task": opts.task_id,
-                "approved": opts.approve,
+                "task": id.to_string(),
+                "approved": approved,
                 "by": by.actor(),
                 "basis": by.basis().as_str(),
                 // Buffered rather than resumed is the ordinary answer here: a
@@ -2034,14 +2639,47 @@ fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, String> {
                 "delivery": format!("{delivery:?}"),
             })
         );
+        if delivery.resumed_run().is_none()
+            && let Some(task) = backend.tasks().task(id).await.map_err(|e| e.to_string())?
+        {
+            eprintln!(
+                "recorded. Run {} reads it when it resumes:\n  agentplane replay {} \
+                 --manifest <file>{}",
+                task.run,
+                task.run,
+                where_flags(Some(&opts.at.store), opts.at.tenant.as_deref())
+            );
+        }
         Ok(ExitCode::SUCCESS)
     })
 }
 
+/// Why this terminal will not record an approval, in words its operator can
+/// act on.
+fn withheld_refusal(id: agentplane::core::TaskId, reason: agentplane::core::Withheld) -> String {
+    use agentplane::core::Withheld;
+    let why = match reason {
+        Withheld::Sealed => {
+            "its proposal is sealed at rest and this terminal holds no key ring, so it \
+             cannot show you what you would be approving. Approve it on the plane that \
+             holds the key ring, or reject it here — a rejection needs no proposal"
+        }
+        Withheld::Erased => {
+            "its proposal was erased — the key it was sealed under is destroyed — so \
+             nobody can be shown what an approval would approve. Reject it"
+        }
+        Withheld::Undecodable => {
+            "its sealed proposal opened and does not decode, so what it holds cannot be \
+             shown. Reject it, or restore the row from a backup and decide it then"
+        }
+    };
+    format!("task {id} was not approved: {why}. Nothing was recorded; the task is still open.")
+}
+
 /// Account for a breached obligation so it leaves the backlog.
-fn acknowledge_verb(opts: &AcknowledgeArgs) -> Result<ExitCode, String> {
+fn acknowledge_verb(opts: &AcknowledgeArgs) -> Result<ExitCode, Fault> {
     let by = opts.who.operator()?;
-    let case = agentplane::core::CaseId::parse(&opts.case_id).map_err(|e| e.to_string())?;
+    let case = agentplane::core::CaseId::parse(&opts.case_id).map_err(|e| usage(e.to_string()))?;
 
     blocking(async move {
         let backend = opts.at.open().await?;
@@ -2050,7 +2688,7 @@ fn acknowledge_verb(opts: &AcknowledgeArgs) -> Result<ExitCode, String> {
         #[allow(clippy::disallowed_methods)]
         let at = agentplane::core::Timestamp::now_utc();
         let note = agentplane::core::BreachNote {
-            by: by.actor().to_owned(),
+            by: by.clone(),
             note: opts.note.clone(),
             at,
         };
@@ -2085,9 +2723,9 @@ fn acknowledge_verb(opts: &AcknowledgeArgs) -> Result<ExitCode, String> {
 /// A request, not an interruption: the run reads it at its next step
 /// boundary, so an effect between announcing and recording is never cut in
 /// half.
-fn cancel_verb(opts: &CancelArgs) -> Result<ExitCode, String> {
+fn cancel_verb(opts: &CancelArgs) -> Result<ExitCode, Fault> {
     let by = opts.who.operator()?;
-    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| usage(e.to_string()))?;
     blocking(async move {
         let backend = opts.at.open().await?;
         let plane = Runtime::builder_with(backend.stores())
@@ -2114,8 +2752,8 @@ fn cancel_verb(opts: &CancelArgs) -> Result<ExitCode, String> {
 
 /// Re-arm a parked push registration.
 #[cfg(feature = "push")]
-fn rearm_verb(opts: &RearmArgs) -> Result<ExitCode, String> {
-    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| e.to_string())?;
+fn rearm_verb(opts: &RearmArgs) -> Result<ExitCode, Fault> {
+    let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| usage(e.to_string()))?;
     blocking(async move {
         let backend = opts.at.open().await?;
         let plane = Runtime::builder_with(backend.stores())
@@ -2137,11 +2775,11 @@ fn rearm_verb(opts: &RearmArgs) -> Result<ExitCode, String> {
                 "rearmed": rearmed,
             })
         );
-        Ok(ExitCode::SUCCESS)
+        Ok(lift_status(rearmed))
     })
 }
 
-fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
+fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -2149,8 +2787,12 @@ fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
 
     rt.block_on(async {
         let backend = opts.at.open().await?;
+        // The quota store is wired for its reservations only: which stopped
+        // runs hold the tenant's period is a condition, and no ceiling this
+        // verb could state is consulted.
         let plane = Runtime::builder_with(backend.stores())
             .tenant(backend.tenant())
+            .quota(backend.quotas(), agentplane::quota::TenantQuota::default())
             .build();
         // The clock is this verb's, which is what makes the runtime's own
         // escapes stay at three: a binary reading the wall clock to ask "what
@@ -2172,7 +2814,11 @@ fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
                         "condition": c.kind,
                         "found": c.found,
                         "at_least": c.at_least,
-                        "remedy": c.remedy,
+                        // The ids the remedy's verb takes, so the next command
+                        // can be typed from this output alone.
+                        "subjects": c.subjects,
+                        "unlisted": c.unlisted,
+                        "remedy": c.remedy.cli,
                     }))
                     .collect::<Vec<_>>(),
                 "not_checked": found.not_checked,
@@ -2180,7 +2826,7 @@ fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, String> {
             .map_err(|e| e.to_string())?
         );
         Ok(if found.any() {
-            ExitCode::FAILURE
+            ExitCode::from(exit::FINDING)
         } else {
             ExitCode::SUCCESS
         })
@@ -2220,25 +2866,27 @@ impl Backend {
     // a network call, opening a file is not. One signature so no caller has to
     // know which feature set it was built with.
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
-    async fn open(spec: &str, tenant: Option<&str>) -> Result<Self, String> {
+    async fn open(spec: &str, tenant: Option<&str>) -> Result<Self, Fault> {
         let tenant = tenant
-            .map(|name| agentplane::core::TenantId::new(name).map_err(|e| format!("--tenant: {e}")))
+            .map(|name| {
+                agentplane::core::TenantId::new(name).map_err(|e| usage(format!("--tenant: {e}")))
+            })
             .transpose()?;
         if is_connection_string(spec) {
             // The refusal names the flag rather than saying "not a file": the
             // feature exists, it is one rebuild away, and "no such file or
             // directory" would send somebody to look at their path.
             #[cfg(not(feature = "postgres"))]
-            return Err(
+            return Err(usage(
                 "--store names a PostgreSQL database and this build cannot open one. \
                  Reinstall with `--features cli,postgres`, or use the `:full` container \
-                 image, which is built with it"
-                    .to_owned(),
-            );
+                 image, which is built with it",
+            ));
             #[cfg(feature = "postgres")]
             return Self::shared(spec, tenant).await;
         }
-        let store = RedbStore::open(spec).map_err(|e| held_by_a_plane(&e.to_string()))?;
+        let store =
+            RedbStore::open(spec).map_err(|e| Fault::from(held_by_a_plane(&e.to_string())))?;
         let tenant = tenant.unwrap_or_default();
         Ok(Self::Embedded(
             Arc::new(store.for_tenant(tenant.clone())),
@@ -2247,7 +2895,7 @@ impl Backend {
     }
 
     #[cfg(feature = "postgres")]
-    async fn shared(url: &str, tenant: Option<agentplane::core::TenantId>) -> Result<Self, String> {
+    async fn shared(url: &str, tenant: Option<agentplane::core::TenantId>) -> Result<Self, Fault> {
         let store = agentplane::store::PostgresStore::connect(url)
             .await
             .map_err(|e| e.to_string())?;
@@ -2258,7 +2906,7 @@ impl Backend {
         ))
     }
 
-    /// The six stores a plane runs on.
+    /// The stores a plane runs on.
     fn stores(&self) -> agentplane::runtime::Stores {
         match self {
             Self::Embedded(s, _) => agentplane::runtime::Stores::on(Arc::clone(s)),
@@ -2276,6 +2924,14 @@ impl Backend {
     }
 
     fn cases(&self) -> Arc<dyn agentplane::case::CaseStore> {
+        match self {
+            Self::Embedded(s, _) => Arc::clone(s) as _,
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => Arc::clone(s) as _,
+        }
+    }
+
+    fn tasks(&self) -> Arc<dyn agentplane::case::TaskStore> {
         match self {
             Self::Embedded(s, _) => Arc::clone(s) as _,
             #[cfg(feature = "postgres")]
@@ -2366,7 +3022,41 @@ fn manifests_at(path: &str) -> Result<Vec<Manifest>, String> {
     Manifest::parse_all(&text).map_err(|e| e.to_string())
 }
 
-fn dispatch(cli: Cli) -> Result<ExitCode, String> {
+/// Print the identity a registry pins, per agent.
+fn digest_verb(a: &DigestArgs) -> Result<ExitCode, Fault> {
+    let manifests = manifests_at(&a.manifest).map_err(usage)?;
+    // One document prints the bare digest, so scripts that pin a single
+    // agent keep working; a room prints one line per agent, because a
+    // bundle digest would make one agent's edit move its neighbours'
+    // identities.
+    if a.out.json {
+        let rows = manifests
+            .iter()
+            .map(|m| {
+                Ok(serde_json::json!({
+                    "name": m.metadata.name,
+                    "version": m.metadata.version,
+                    "digest": m.digest().map_err(|e| e.to_string())?.to_hex(),
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        println!("{}", serde_json::json!({ "digests": rows }));
+    } else if let [only] = manifests.as_slice() {
+        println!("{}", only.digest().map_err(|e| e.to_string())?.to_hex());
+    } else {
+        for m in &manifests {
+            println!(
+                "{}  {} {}",
+                m.digest().map_err(|e| e.to_string())?.to_hex(),
+                m.metadata.name,
+                m.metadata.version
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn dispatch(cli: Cli) -> Result<ExitCode, Fault> {
     match cli.verb {
         Verb::Validate(a) => validate(&a),
         Verb::Schema => {
@@ -2381,41 +3071,25 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
             );
             Ok(ExitCode::SUCCESS)
         }
-        Verb::Digest(a) => {
-            let manifests = manifests_at(&a.manifest)?;
-            // One document prints the bare digest, so scripts that pin a single
-            // agent keep working; a room prints one line per agent, because a
-            // bundle digest would make one agent's edit move its neighbours'
-            // identities.
-            if let [only] = manifests.as_slice() {
-                println!("{}", only.digest().map_err(|e| e.to_string())?.to_hex());
-            } else {
-                for m in &manifests {
-                    println!(
-                        "{}  {} {}",
-                        m.digest().map_err(|e| e.to_string())?.to_hex(),
-                        m.metadata.name,
-                        m.metadata.version
-                    );
-                }
-            }
-            Ok(ExitCode::SUCCESS)
-        }
-        Verb::Audit(a) => journal_verb(&a.store, Some(&a)),
-        Verb::Export(a) => journal_verb(&a, None),
+        Verb::Digest(a) => digest_verb(&a),
+        Verb::Audit(a) => journal_verb(&a.store, Some(&a), false),
+        Verb::Export(a) => journal_verb(&a.store, None, a.allow_partial),
         Verb::Drill(a) => drill_verb(&a),
         Verb::ForgetAdmissions(a) => forget_admissions_verb(&a),
-        Verb::Retain(a) => retain_verb(&a),
+        Verb::Retention(RetentionArgs {
+            act: RetentionAct::Plan(a),
+        }) => retention_plan_verb(&a),
         Verb::Halt(a) => halt_verb(&a),
         Verb::Hold(a) => hold_verb(&a),
         Verb::Reconcile(a) => reconcile_verb(&a),
         Verb::Quarantine(a) => quarantine_verb(&a),
+        Verb::Tasks(a) => tasks_verb(&a),
         Verb::Decide(a) => decide_verb(&a),
+        Verb::Init(a) => init_verb(&a),
         Verb::Acknowledge(a) => acknowledge_verb(&a),
         #[cfg(feature = "push")]
         Verb::Rearm(a) => rearm_verb(&a),
         Verb::Cancel(a) => cancel_verb(&a),
-        Verb::Halts(a) => halts_verb(&a),
         Verb::Waiting(a) => waiting_verb(&a),
         Verb::Attention(a) => attention_verb(&a),
         Verb::Restore(a) => {
@@ -2446,25 +3120,133 @@ fn dispatch(cli: Cli) -> Result<ExitCode, String> {
                 Ok(if report.is_faithful() {
                     ExitCode::SUCCESS
                 } else {
-                    ExitCode::FAILURE
+                    ExitCode::from(exit::FINDING)
                 })
             })
         }
         Verb::Verify(a) => verify_verb(&a),
+        Verb::Policy(PolicyArgs {
+            act: PolicyAct::Check(a),
+        }) => policy_check_verb(&a),
         Verb::Run(a) => {
-            let manifests = manifests_at(&a.manifest)?;
+            let manifests = manifests_at(&a.manifest).map_err(usage)?;
             execute(&manifests, &a)
         }
         Verb::Replay(a) => {
-            let manifests = manifests_at(&a.manifest)?;
+            let manifests = manifests_at(&a.manifest).map_err(usage)?;
             replay(&manifests, &a)
         }
         Verb::Card(a) => card(&a),
         Verb::Serve(a) => {
-            let manifests = manifests_at(&a.manifest)?;
+            let manifests = manifests_at(&a.manifest).map_err(usage)?;
             serve(&manifests, &a)
         }
     }
+}
+
+/// The starter a single-completion agent begins from.
+///
+/// Every line is one the parser accepts and the schema describes, and the
+/// budget is stated: the format refuses a document that leaves spend unbounded
+/// by omission, so a starter without one would fail the first `validate`.
+const STARTER: &str = r#"# yaml-language-server: $schema=https://hupe1980.github.io/agentplane/agent.schema.json
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: NAME, version: "0.1.0" }
+spec:
+  execution: { kind: completion }
+  identity:
+    role: "Summarise the input in one sentence"
+    constraints: "No speculation."
+  capabilities: { provides: [NAME] }
+  models:
+    # No key yet? `provider: fake` answers with a value of the output schema.
+    privileged: { provider: anthropic, model: claude-sonnet-5 }
+  output:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [summary]
+      properties: { summary: { type: string } }
+  budgets: { max_tokens: 20000, max_steps: 4 }
+"#;
+
+/// The starter a tool-calling agent begins from.
+///
+/// The grant names a server; which process serves it is `--mcp` on the command
+/// line, so moving the agent between machines does not change its digest.
+const STARTER_TOOLS: &str = r#"# yaml-language-server: $schema=https://hupe1980.github.io/agentplane/agent.schema.json
+#
+#   agentplane run FILE --input '{"ticket": "T-1"}' \
+#     --mcp "tickets=python3 examples/mcp-server.py"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: NAME, version: "0.1.0" }
+spec:
+  execution: { kind: tool-calling, max_turns: 4 }
+  identity:
+    role: "Answer a support question using the ticket tool"
+    constraints: "One sentence. Cite the ticket id."
+  capabilities: { provides: [NAME] }
+  models:
+    # No key yet? `provider: fake` answers with a value of the output schema.
+    privileged: { provider: anthropic, model: claude-sonnet-5 }
+  tools:
+    - ref: "tool://tickets/read"
+      mutates: false
+      description: "Read a ticket by id"
+      arguments:
+        type: object
+        additionalProperties: false
+        required: [id]
+        properties: { id: { type: string } }
+  budgets: { max_tokens: 20000, max_steps: 8 }
+"#;
+
+/// Write a starter manifest, and prove it parses before saying so.
+///
+/// Refuses to overwrite: a starter is a first file, and replacing a reviewed
+/// one with it is the kind of mistake nothing downstream would notice.
+fn init_verb(opts: &InitArgs) -> Result<ExitCode, Fault> {
+    let template = if opts.tools { STARTER_TOOLS } else { STARTER };
+    let text = template
+        .replace("NAME", &opts.name)
+        .replace("FILE", &opts.path);
+    // Parsed before it is written, so a name the format refuses is a message
+    // here rather than a file that fails its first `validate`.
+    let parsed =
+        Manifest::parse_all(&text).map_err(|e| usage(format!("--name {}: {e}", opts.name)))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&opts.path)
+        .map_err(|e| format!("writing {}: {e}", opts.path))?;
+    std::io::Write::write_all(&mut file, text.as_bytes())
+        .map_err(|e| format!("writing {}: {e}", opts.path))?;
+    let digest = parsed
+        .first()
+        .map(|m| m.digest().map(agentplane::Digest::to_hex))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    if opts.out.json {
+        println!(
+            "{}",
+            serde_json::json!({ "wrote": opts.path, "digest": digest })
+        );
+    } else {
+        println!("wrote {} ({digest})", opts.path);
+    }
+    eprintln!(
+        "next:\n  agentplane validate {path}\n  agentplane run {path} --input '{{}}'{mcp}",
+        path = opts.path,
+        mcp = if opts.tools {
+            " --mcp \"tickets=<command>\""
+        } else {
+            ""
+        }
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Read a checkpoint an auditor was handed, in either form they hold it in.
@@ -2498,10 +3280,219 @@ fn read_checkpoint(path: &str) -> Result<agentplane::journal::Checkpoint, String
 
 /// `verify`: recompute an export from its own bytes, against a checkpoint from
 /// somewhere else.
-fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, String> {
-    let verifier = verifier_from(&opts.key)?;
+/// The files a policy bundle directory holds, and nothing else.
+#[cfg(feature = "cedar")]
+const BUNDLE_FILES: [&str; 3] = ["policy.cedar", "schema.json", "entities.json"];
+
+/// Load a Cedar policy bundle: one rules file, or a directory of rules,
+/// schema and static entities.
+///
+/// The one loader, for `serve --policy` and `policy check --bundle` alike, so a
+/// checked bundle is byte for byte the served one and its digest is the one a
+/// served run records. A directory holding any other file is refused rather
+/// than read around: a rule in a file the loader skipped is a rule the bundle
+/// identity does not cover, and an author would believe it checked.
+#[cfg(feature = "cedar")]
+fn load_policy_bundle(path: &str) -> Result<agentplane::policy::CedarEngine, Fault> {
+    let at = std::path::Path::new(path);
+    let meta =
+        std::fs::metadata(at).map_err(|e| format!("reading the policy bundle {path}: {e}"))?;
+    let read = |file: &std::path::Path| {
+        std::fs::read_to_string(file).map_err(|e| format!("reading {}: {e}", file.display()))
+    };
+    let (rules, schema, entities) = if meta.is_dir() {
+        let entries = std::fs::read_dir(at).map_err(|e| format!("reading {path}: {e}"))?;
+        for entry in entries {
+            let name = entry
+                .map_err(|e| format!("reading {path}: {e}"))?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if !name.starts_with('.') && !BUNDLE_FILES.contains(&name.as_str()) {
+                return Err(usage(format!(
+                    "the policy bundle {path} holds `{name}`, which no bundle reads: a bundle \
+                     directory holds {} and nothing else, so a rule cannot sit in a file \
+                     the bundle's identity does not cover",
+                    BUNDLE_FILES.join(", ")
+                )));
+            }
+        }
+        let rules = at.join(BUNDLE_FILES[0]);
+        if !rules.is_file() {
+            return Err(usage(format!(
+                "the policy bundle {path} has no {}",
+                BUNDLE_FILES[0]
+            )));
+        }
+        let optional = |name: &str| {
+            let file = at.join(name);
+            if file.is_file() {
+                read(&file).map(Some)
+            } else {
+                Ok(None)
+            }
+        };
+        (
+            read(&rules)?,
+            optional(BUNDLE_FILES[1])?,
+            optional(BUNDLE_FILES[2])?,
+        )
+    } else {
+        (read(at)?, None, None)
+    };
+    agentplane::policy::CedarEngine::from_bundle(&rules, schema.as_deref(), entities.as_deref())
+        .map_err(|e| usage(format!("the policy bundle {path} was refused: {e}")))
+}
+
+/// `policy check`: an export's gated requests, rebuilt and evaluated offline.
+#[cfg(feature = "cedar")]
+fn policy_check_verb(opts: &PolicyCheckArgs) -> Result<ExitCode, Fault> {
+    use agentplane::policy::check::{Check, CheckError, TenantSource, Verdict};
+
+    let bundle = load_policy_bundle(&opts.bundle)?;
+    let candidate = opts
+        .candidate
+        .as_deref()
+        .map(load_policy_bundle)
+        .transpose()?;
+    let (tenant, source) = match &opts.tenant {
+        Some(name) => (
+            agentplane::core::TenantId::new(name).map_err(|e| usage(format!("--tenant: {e}")))?,
+            TenantSource::Supplied,
+        ),
+        None => (agentplane::core::TenantId::default(), TenantSource::Default),
+    };
+    let check = Check::new(tenant.as_str(), source);
+    let candidate = candidate
+        .as_ref()
+        .map(|c| c as &dyn agentplane::core::PolicyEngine);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    let report = if opts.from == "-" {
+        rt.block_on(check.run(std::io::stdin().lock(), &bundle, candidate))
+    } else {
+        let file =
+            std::fs::File::open(&opts.from).map_err(|e| format!("reading {}: {e}", opts.from))?;
+        rt.block_on(check.run(std::io::BufReader::new(file), &bundle, candidate))
+    }
+    .map_err(|e| match e {
+        CheckError::NotAnExport(_) => usage(format!("{}: {e}", opts.from)),
+        CheckError::Io(_) | CheckError::Keys(_) => Fault::Operational(e.to_string()),
+    })?;
+
+    if opts.out.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{}", policy_report_text(&report));
+    }
+    Ok(match report.verdict() {
+        Verdict::Clean => ExitCode::SUCCESS,
+        Verdict::Findings => ExitCode::from(exit::FINDING),
+        Verdict::Partial => ExitCode::from(exit::PARTIAL),
+    })
+}
+
+/// The report, for a person.
+#[cfg(feature = "cedar")]
+fn policy_report_text(report: &agentplane::policy::check::Report) -> String {
+    use agentplane::policy::check::{Finding, Mode};
+    use std::fmt::Write as _;
+
+    let line = |f: &Finding| {
+        let mut at = String::new();
+        if let Some(step) = f.step {
+            let _ = write!(at, "step {step} ");
+        }
+        if let Some(key) = f.effect_key {
+            let _ = write!(at, "effect {} ", key.to_hex());
+        }
+        format!("{at}{} on {}: {}", f.action, f.resource, f.reason)
+    };
+    let mut out = String::new();
+    let _ = write!(out, "bundle {}", report.bundle.to_hex());
+    if let Some(candidate) = report.candidate {
+        let _ = write!(out, ", candidate {}", candidate.to_hex());
+    }
+    let _ = writeln!(
+        out,
+        "; tenant {} ({})",
+        report.tenant.value,
+        match report.tenant.source {
+            agentplane::policy::check::TenantSource::Supplied => "supplied",
+            agentplane::policy::check::TenantSource::Default => "assumed: none was supplied",
+        }
+    );
+    for run in &report.runs {
+        match run.mode {
+            Mode::Recorded => {
+                let _ = writeln!(
+                    out,
+                    "run {}: {} evaluated, {} finding(s)",
+                    run.run,
+                    run.evaluated,
+                    run.findings.len()
+                );
+            }
+            Mode::Mismatch => {
+                let _ = writeln!(
+                    out,
+                    "run {}: recorded bundle {} is not the one supplied — not evaluated",
+                    run.run,
+                    run.recorded_bundle
+                        .map(agentplane::core::Digest::to_hex)
+                        .unwrap_or_default()
+                );
+            }
+            Mode::Ungoverned => {
+                let _ = writeln!(
+                    out,
+                    "run {}: ungoverned — no bundle is on its record, so no gate ran",
+                    run.run
+                );
+            }
+        }
+        for f in &run.findings {
+            let _ = writeln!(out, "  finding: {}", line(f));
+        }
+        if let Some(diff) = &run.diff {
+            for f in &diff.newly_denied {
+                let _ = writeln!(out, "  newly denied: {}", line(f));
+            }
+            for f in &diff.malformed_under_candidate {
+                let _ = writeln!(out, "  malformed under candidate: {}", line(f));
+            }
+        }
+        let mut reasons = std::collections::BTreeMap::new();
+        for n in &run.not_evaluable {
+            *reasons.entry(n.reason).or_insert(0usize) += 1;
+        }
+        for (reason, count) in reasons {
+            let _ = writeln!(
+                out,
+                "  not evaluable: {count} {}",
+                serde_json::to_value(reason)
+                    .ok()
+                    .and_then(|v| v.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_default()
+            );
+        }
+    }
+    for run in &report.unreadable {
+        let _ = writeln!(out, "run {run}: the export could not read it");
+    }
+    let _ = writeln!(out, "not in any export: {}", report.outside_export);
+    out
+}
+
+fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, Fault> {
+    let verifier = verifier_from(&opts.key).map_err(usage)?;
     let saved = match &opts.checkpoint {
-        Some(path) => Some(read_checkpoint(path)?),
+        Some(path) => Some(read_checkpoint(path).map_err(usage)?),
         None => None,
     };
     // The origin an export is *supposed* to be of. Read from the file would
@@ -2519,23 +3510,24 @@ fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, String> {
                 &opts.witness,
                 &opts.witness_key,
                 origin,
-            ))?
+            ))
+            .map_err(usage)?
         }
         (None, false) => {
-            return Err(
+            return Err(usage(
                 "--witness needs --origin: the log's name cannot come from the file being \
                  checked, because that header is written by whoever wrote the file"
                     .to_owned(),
-            );
+            ));
         }
         // No witness named. The key check still has to happen, so a
         // `--witness-key` with nothing to use it against is a refusal rather
         // than a flag that did nothing.
         (_, true) => {
             if !opts.witness_key.is_empty() {
-                return Err(
+                return Err(usage(
                     "--witness-key was given with no --witness to use it against".to_owned(),
-                );
+                ));
             }
             Anchor::default()
         }
@@ -2581,22 +3573,22 @@ fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, String> {
     Ok(if report.is_sound() && anchor.split_view.is_empty() {
         ExitCode::SUCCESS
     } else {
-        ExitCode::FAILURE
+        ExitCode::from(exit::FINDING)
     })
 }
 
 /// Print the Agent Card a served manifest would advertise.
-fn card(opts: &CardArgs) -> Result<ExitCode, String> {
+fn card(opts: &CardArgs) -> Result<ExitCode, Fault> {
     // One card, one agent — the same rule `serve` applies, because this verb
     // prints exactly what `serve` would advertise.
-    let manifests = manifests_at(&opts.manifest)?;
+    let manifests = manifests_at(&opts.manifest).map_err(usage)?;
     let [manifest] = manifests.as_slice() else {
-        return Err(format!(
+        return Err(usage(format!(
             "`card` describes one agent and this file holds {}. A2A's card \
              path is well-known and singular — split the file, or point this \
              at the document you would serve",
             manifests.len()
-        ));
+        )));
     };
     let card =
         agentplane::peers::AgentCard::derive(manifest, &opts.url).map_err(|e| e.to_string())?;
@@ -2612,12 +3604,17 @@ fn main() -> ExitCode {
     // this binary's own vocabulary. Parsed before the subscriber is installed
     // because which verb this is decides what belongs in the output.
     let cli = <Cli as clap::Parser>::parse();
-    install_tracing(matches!(cli.verb, Verb::Serve(_)));
+    let (metrics, format) = match &cli.verb {
+        Verb::Serve(serve) => (true, serve.log_format),
+        _ => (false, LogFormat::Text),
+    };
+    let verifying = matches!(&cli.verb, Verb::Replay(replay) if replay.strict);
+    install_tracing(metrics, verifying, format);
     match dispatch(cli) {
         Ok(code) => code,
-        Err(e) => {
-            eprintln!("agentplane: {e}");
-            ExitCode::FAILURE
+        Err(fault) => {
+            eprintln!("agentplane: {fault}");
+            ExitCode::from(fault.status())
         }
     }
 }
@@ -2679,7 +3676,7 @@ const DEFAULT_SWEEP_SECONDS: u32 = 30;
 /// refuses a runtime with no policy engine and no case layer; this wires both
 /// rather than working around either.
 #[cfg(all(feature = "a2a-server", feature = "cedar"))]
-fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
+fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
     use agentplane::api::a2a::A2aServer;
     use agentplane::api::tokens::TokenAuthenticator;
 
@@ -2687,35 +3684,38 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
     // card path is singular, so serving a bundle would have to pick one and
     // silently not serve the others.
     let [manifest] = manifests else {
-        return Err(format!(
+        return Err(usage(format!(
             "`serve` hosts one agent and this file holds {}. A2A's card path is \
              well-known and singular, so a room would have to advertise one \
              document and quietly not serve the rest — split the file, or run \
              one process per agent",
             manifests.len()
-        ));
+        )));
     };
 
-    let url = opts.url.as_deref().ok_or(
-        "`serve` needs --url: the address callers reach this plane on. It goes on the \
+    let url = opts.url.as_deref().ok_or_else(|| {
+        usage(
+            "`serve` needs --url: the address callers reach this plane on. It goes on the \
          Agent Card, so it is the public URL rather than what you bind — an agent's \
          declaration must not change when its address does",
-    )?;
-    let policy_path = opts.policy.as_deref().ok_or(
-        "`serve` needs --policy: a Cedar policy set. There is deliberately no default — \
+        )
+    })?;
+    let policy_path = opts.policy.as_deref().ok_or_else(|| {
+        usage(
+            "`serve` needs --policy: a Cedar policy set. There is deliberately no default — \
          a permissive engine and no engine are the same behaviour, and only one of them \
          looks governed",
-    )?;
-    let tokens_path = opts.tokens.as_deref().ok_or(
-        "`serve` needs --tokens: bearer tokens naming the callers this plane accepts. \
+        )
+    })?;
+    let tokens_path = opts.tokens.as_deref().ok_or_else(|| {
+        usage(
+            "`serve` needs --tokens: bearer tokens naming the callers this plane accepts. \
          There is deliberately no default — a server that authenticates nobody has no \
          actor to record a decision against",
-    )?;
+        )
+    })?;
 
-    let policy_src = std::fs::read_to_string(policy_path)
-        .map_err(|e| format!("reading the policy set {policy_path}: {e}"))?;
-    let policy = agentplane::policy::CedarEngine::new(&policy_src)
-        .map_err(|e| format!("the policy set {policy_path} was refused: {e}"))?;
+    let policy = load_policy_bundle(policy_path)?;
     let tokens_src = std::fs::read_to_string(tokens_path)
         .map_err(|e| format!("reading the token file {tokens_path}: {e}"))?;
     // One `Arc`, two surfaces: the same accepted credentials govern both, so a
@@ -2739,11 +3739,13 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         // A journal in memory would make every served task disappear on
         // restart, which is the opposite of what a peer promises when it hands
         // back a task id. Refused rather than defaulted.
-        let backend = opts.at.open().await?.ok_or(
-            "`serve` needs --store: a served task's id is a promise that it can be \
+        let backend = opts.at.open().await?.ok_or_else(|| {
+            usage(
+                "`serve` needs --store: a served task's id is a promise that it can be \
              fetched again, and an in-memory journal breaks that promise at the next \
              restart. `run` may journal to memory because it exits with its answer",
-        )?;
+            )
+        })?;
 
         // **The whole plane, not a corner of it.** One store backs every store
         // this runtime has, and a server that wired only the journal and the
@@ -2759,7 +3761,8 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, String> {
         {
             builder = builder.tool_server(name, client);
         }
-        if let Some((registry, client)) = connect_peers(&opts.peer, std::slice::from_ref(manifest))?
+        if let Some((registry, client)) =
+            connect_peers(&opts.peer, std::slice::from_ref(manifest)).map_err(usage)?
         {
             builder = builder.peers(registry, client);
         }
@@ -3207,6 +4210,7 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
     if specs.is_empty() {
         return Ok(None);
     }
+    refuse_ambiguous_peers(specs)?;
     let mut registry = PeerRegistry::new();
     let mut router = PeerRouter::new();
     for spec in specs {
@@ -3220,13 +4224,16 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
         if name.trim().is_empty() || url.trim().is_empty() {
             return Err(format!("--peer `{spec}` names no peer or no URL"));
         }
-        let granted: Vec<String> = manifests
+        let grants: Vec<(String, bool)> = manifests
             .iter()
             .flat_map(|m| &m.spec.tools)
-            .filter_map(|g| agentplane::tools::ToolId::parse(&g.reference))
-            .filter(|id| id.server == name)
-            .map(|id| id.tool)
+            .filter_map(|g| {
+                agentplane::tools::ToolId::parse(&g.reference).map(|id| (id, g.mutates))
+            })
+            .filter(|(id, _)| id.server == name)
+            .map(|(id, mutates)| (id.tool, mutates))
             .collect();
+        let granted: Vec<String> = grants.iter().map(|(tool, _)| tool.clone()).collect();
         if granted.is_empty() {
             return Err(format!(
                 "--peer `{name}` is wired but no manifest grants a `tool://{name}/…` \
@@ -3235,10 +4242,14 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
         }
         let peer = PeerId::new(name);
         let mut grant = PeerGrant::new(Scope::of(granted.iter().cloned()));
-        let token_var = format!(
-            "AGENTPLANE_PEER_TOKEN_{}",
-            name.to_ascii_uppercase().replace(['.', '-'], "_")
-        );
+        // Read-only when every grant naming this peer says `mutates: false`,
+        // for the reason the scope is the grants': the reviewed documents say
+        // what a call to this peer does. One mutating grant keeps the whole
+        // registration mutating, which is the cautious reading.
+        if grants.iter().all(|(_, mutates)| !mutates) {
+            grant = grant.read_only();
+        }
+        let token_var = peer_token_var(name);
         if let Ok(token) = std::env::var(&token_var)
             && !token.is_empty()
         {
@@ -3254,7 +4265,11 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
         // is `testkit`, which the released binary does not carry — see the `cli`
         // feature — and reaching a local peer from a development build means
         // `--features cli,a2a,testkit`.
-        if !url.starts_with("https://") {
+        let local = cfg!(feature = "testkit")
+            && ["http://localhost:", "http://127.0.0.1:", "http://[::1]:"]
+                .iter()
+                .any(|prefix| url.starts_with(prefix));
+        if !url.starts_with("https://") && !local {
             return Err(format!(
                 "--peer `{name}` is `{url}`, and a peer is reached over HTTPS. A card or a \
                  peer answer steers the calls that follow it, so a plaintext hop would let \
@@ -3264,6 +4279,12 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
         }
         let client = A2aClient::new(Endpoint::new(url))
             .map_err(|e| format!("could not build a client for peer `{name}`: {e}"))?;
+        #[cfg(feature = "testkit")]
+        let client = if local {
+            client.allow_loopback()
+        } else {
+            client
+        };
         router = router.peer(
             peer,
             Arc::new(client) as Arc<dyn agentplane::peers::PeerClient>,
@@ -3276,21 +4297,72 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
     )))
 }
 
+/// The environment variable a peer's bearer token is read from.
+///
+/// Upper-cased, with `.` and `-` as `_`, because a shell variable name admits
+/// neither — which is also why two names can meet here.
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+fn peer_token_var(name: &str) -> String {
+    format!(
+        "AGENTPLANE_PEER_TOKEN_{}",
+        name.to_ascii_uppercase().replace(['.', '-'], "_")
+    )
+}
+
+/// Refuse `--peer` names that would read one token variable.
+///
+/// `a.b`, `a-b`, `a_b` and `A_B` all become `AGENTPLANE_PEER_TOKEN_A_B`, so two
+/// of them wired together would each present the other's credential — the
+/// token meant for one peer sent to another. Refused at boot, naming both, and
+/// a name given twice is refused with them.
+#[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+fn refuse_ambiguous_peers(specs: &[String]) -> Result<(), String> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for spec in specs {
+        let name = spec.split_once('=').map_or(spec.as_str(), |(name, _)| name);
+        let var = peer_token_var(name);
+        if let Some(earlier) = seen.insert(var.clone(), name) {
+            return Err(format!(
+                "--peer `{earlier}` and --peer `{name}` both read their token from {var}, \
+                 so one would present the other's credential — rename one of them"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse every manifest in the file, and hold each to the annotations a
 /// deployment requires.
 ///
-/// The runtime never reads `metadata.annotations` — that is what makes them safe
-/// to carry, and it is why nothing in a running plane can notice an agent that
-/// shipped without an owner. This does not change that: the keys stay the
-/// deployment's vocabulary, no interpretation crosses the trust boundary, and
-/// the enforcement is a job somebody runs in review.
+/// Why this lives in review rather than in the runtime is on
+/// `ValidateArgs::require_annotation`.
 ///
 /// # Errors
 ///
 /// If a manifest will not parse, or a required annotation is absent.
-fn validate(a: &ValidateArgs) -> Result<ExitCode, String> {
+fn validate(a: &ValidateArgs) -> Result<ExitCode, Fault> {
+    let text = std::fs::read_to_string(&a.manifest)
+        .map_err(|e| usage(format!("reading {}: {e}", a.manifest)))?;
+    // A document the parser refuses is this verb's negative answer, not a
+    // fault of the command: `validate` was asked *is this valid*, and no is an
+    // answer a CI job acts on.
+    let manifests = match Manifest::parse_all(&text) {
+        Ok(manifests) => manifests,
+        Err(e) => {
+            if a.json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "valid": false, "error": e.to_string() })
+                );
+            } else {
+                eprintln!("invalid: {e}");
+            }
+            return Ok(ExitCode::from(exit::FINDING));
+        }
+    };
+    let mut documents = Vec::new();
     let mut missing = Vec::new();
-    for m in &manifests_at(&a.manifest)? {
+    for m in &manifests {
         // Checked per agent, because a file may hold a room and "one of them
         // has an owner" is not the rule anybody meant.
         //
@@ -3302,23 +4374,202 @@ fn validate(a: &ValidateArgs) -> Result<ExitCode, String> {
             .iter()
             .filter(|key| !m.metadata.annotations.contains_key(*key))
             .collect();
-        if absent.is_empty() {
-            println!("ok: {} {}", m.metadata.name, m.metadata.version);
-        } else {
-            for key in absent {
+        let bound = declared_bound(m);
+        if !a.json {
+            if absent.is_empty() {
+                println!("ok: {} {}", m.metadata.name, m.metadata.version);
+            }
+            for key in &absent {
                 println!("MISSING: {} — annotation '{key}'", m.metadata.name);
-                missing.push(format!("{}: {key}", m.metadata.name));
+            }
+            for line in &bound.lines {
+                println!("  {line}");
             }
         }
+        missing.extend(
+            absent
+                .iter()
+                .map(|key| format!("{}: {key}", m.metadata.name)),
+        );
+        documents.push(serde_json::json!({
+            "name": m.metadata.name,
+            "version": m.metadata.version,
+            "missing_annotations": absent,
+            "bound": bound.json,
+        }));
     }
-    if missing.is_empty() {
-        return Ok(ExitCode::SUCCESS);
+    if a.json {
+        println!(
+            "{}",
+            serde_json::json!({ "valid": missing.is_empty(), "documents": documents })
+        );
+    } else if !missing.is_empty() {
+        eprintln!(
+            "{} required annotation(s) absent: {}",
+            missing.len(),
+            missing.join(", ")
+        );
     }
-    Err(format!(
-        "{} required annotation(s) absent: {}",
-        missing.len(),
-        missing.join(", ")
-    ))
+    Ok(ExitCode::from(if missing.is_empty() {
+        exit::OK
+    } else {
+        exit::FINDING
+    }))
+}
+
+/// What one agent's declaration says its runs can cost, and nothing else.
+struct DeclaredBound {
+    lines: Vec<String>,
+    json: serde_json::Value,
+}
+
+/// The worst case a declaration implies, per unit: the run ceiling plus one
+/// call past it per step in flight — the figure a tenant's spend quota
+/// reserves at admission.
+///
+/// **Derived, never forecast.** Every number is read off the manifest: the
+/// ceilings, each model role's `max_input_tokens` and output ceiling at its
+/// declared price, `max_parallel_steps`, `max_turns`. A term the manifest
+/// leaves unbounded is named, and no total is printed beside it — a figure
+/// that assumed a value for it would be a guess wearing a bound's name.
+///
+/// Width is `max_parallel_steps`, or one: a run started by name is one step,
+/// and a multi-step plan is held to its own width, which no manifest states.
+#[allow(clippy::too_many_lines)]
+fn declared_bound(m: &Manifest) -> DeclaredBound {
+    let budget = m.budget();
+    let width = budget.max_parallel_steps.unwrap_or(1) as u64;
+    let mut lines = Vec::new();
+
+    let roles: Vec<(&str, &agentplane::manifest::ModelRef)> = m
+        .spec
+        .models
+        .as_ref()
+        .map(|models| {
+            [
+                ("privileged", models.privileged.as_ref()),
+                ("quarantined", models.quarantined.as_ref()),
+            ]
+            .into_iter()
+            .filter_map(|(name, r)| r.map(|r| (name, r)))
+            .collect()
+        })
+        .unwrap_or_default();
+    let mut role_json = Vec::new();
+    for (name, r) in &roles {
+        let line = match r.call_bound() {
+            Some(call) => format!(
+                "one call, {name} {}/{}: {} tokens, {} minor units",
+                r.provider, r.model, call.tokens, call.minor_units
+            ),
+            None => format!(
+                "one call, {name} {}/{}: unbounded — spec.models.{name}.max_input_tokens is \
+                 not declared",
+                r.provider, r.model
+            ),
+        };
+        lines.push(line);
+        role_json.push(serde_json::json!({
+            "role": name,
+            "call": r.call_bound().map(|c| serde_json::json!({
+                "tokens": c.tokens,
+                "minor_units": c.minor_units,
+            })),
+        }));
+    }
+    let call = m.call_bound();
+    // The fields that leave the per-call term unbounded, by name.
+    let call_gaps: Vec<String> = if roles.is_empty() {
+        vec!["spec.models (no model role states what one call can cost)".to_owned()]
+    } else {
+        roles
+            .iter()
+            .filter(|(_, r)| r.call_bound().is_none())
+            .map(|(name, _)| format!("spec.models.{name}.max_input_tokens"))
+            .collect()
+    };
+
+    let mut units = serde_json::Map::new();
+    for (unit, ceiling, field, per_call) in [
+        (
+            "tokens",
+            budget.max_tokens,
+            "spec.budgets.max_tokens",
+            call.map(|c| c.tokens),
+        ),
+        (
+            "minor units",
+            budget.max_minor_units,
+            "spec.budgets.max_minor_units",
+            call.map(|c| c.minor_units),
+        ),
+    ] {
+        let mut unbounded: Vec<String> = Vec::new();
+        if ceiling.is_none() {
+            unbounded.push(field.to_owned());
+        }
+        if per_call.is_none() {
+            unbounded.extend(call_gaps.iter().cloned());
+        }
+        let total = match (ceiling, per_call) {
+            (Some(c), Some(p)) => Some(c.saturating_add(width.saturating_mul(p))),
+            _ => None,
+        };
+        let shown = |v: Option<u64>| v.map_or_else(|| "?".to_owned(), |v| v.to_string());
+        lines.push(match total {
+            Some(total) => format!(
+                "worst case, {unit}: {total} = ceiling {} + width {width} × one call {}",
+                shown(ceiling),
+                shown(per_call)
+            ),
+            None => format!(
+                "worst case, {unit}: no total — unbounded: {}",
+                unbounded.join(", ")
+            ),
+        });
+        units.insert(
+            unit.replace(' ', "_"),
+            serde_json::json!({
+                "ceiling": ceiling,
+                "per_call": per_call,
+                "width": width,
+                "total": total,
+                "unbounded": unbounded,
+            }),
+        );
+    }
+
+    // A tool-calling agent's model calls are also bounded by its turns: a
+    // second figure, independent of the ceiling, and only as bounded as one
+    // call is.
+    let turns = m
+        .spec
+        .execution
+        .as_ref()
+        .filter(|e| e.kind == agentplane::manifest::ExecutionKind::ToolCalling)
+        .map(|e| e.max_turns);
+    if let Some(turns) = turns {
+        lines.push(match call {
+            Some(c) => format!(
+                "model calls: at most {turns} turns × one call = {} tokens, {} minor units",
+                u64::from(turns).saturating_mul(c.tokens),
+                u64::from(turns).saturating_mul(c.minor_units)
+            ),
+            None => format!(
+                "model calls: at most {turns} turns, no total — unbounded: {}",
+                call_gaps.join(", ")
+            ),
+        });
+    }
+
+    DeclaredBound {
+        lines,
+        json: serde_json::json!({
+            "roles": role_json,
+            "units": units,
+            "turns": turns,
+        }),
+    }
 }
 
 /// Naming the feature rather than ignoring the flag, as `--mcp` does.
@@ -3562,13 +4813,26 @@ fn spawn_push_worker(
 /// reason the provider list is derived from the build rather than written out.
 #[cfg(not(all(feature = "a2a-server", feature = "cedar")))]
 #[allow(clippy::unnecessary_wraps)]
-fn serve(_manifests: &[Manifest], _opts: &ServeArgs) -> Result<ExitCode, String> {
-    Err(
+fn serve(_manifests: &[Manifest], _opts: &ServeArgs) -> Result<ExitCode, Fault> {
+    Err(usage(
         "this build cannot serve: `serve` needs the `a2a-server` and `cedar` features. \
          Reinstall with `--features cli,a2a-server,cedar`, or use the `:full` \
-         container image, which is built with them"
-            .to_owned(),
-    )
+         container image, which is built with them",
+    ))
+}
+
+/// `policy check` in a build without the evaluator it would run.
+///
+/// Said in words rather than left to the parser, so a reader is told the verb
+/// exists and which feature it needs rather than that it does not exist.
+#[cfg(not(feature = "cedar"))]
+#[allow(clippy::unnecessary_wraps)]
+fn policy_check_verb(_opts: &PolicyCheckArgs) -> Result<ExitCode, Fault> {
+    Err(usage(
+        "this build cannot check policy: `policy check` evaluates a Cedar bundle and needs \
+         the `cedar` feature. Reinstall with `--features cli,cedar`, or use the `:full` \
+         container image",
+    ))
 }
 
 /// Refuse a file whose behaviour is not in the file.
@@ -3586,8 +4850,94 @@ fn require_declarative(manifests: &[Manifest]) -> Result<(), String> {
     Ok(())
 }
 
+/// Where the run was, so the next command a person types can be printed whole.
+struct Resume<'a> {
+    manifest: &'a str,
+    store: Option<&'a str>,
+    /// Whose plane: a printed command that dropped it would resume against the
+    /// unnamed default, find nothing, and say so as if the run were gone.
+    tenant: Option<&'a str>,
+}
+
+/// Quote a word for a POSIX shell, so a printed command pastes back as the
+/// same arguments.
+fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:@%+=,".contains(c));
+    if safe {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// A connection string with its password taken out, for printing.
+///
+/// Both places libpq accepts one: the userinfo of the URL, and a `password=`
+/// parameter. What is left still names the database; libpq finds the password
+/// in `PGPASSWORD` or `~/.pgpass`, which is where one belongs.
+fn without_password(spec: &str) -> String {
+    let Some((scheme, rest)) = spec.split_once("://") else {
+        return spec.to_owned();
+    };
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rsplit_once('@') {
+        Some((userinfo, host)) => {
+            let user = userinfo.split_once(':').map_or(userinfo, |(user, _)| user);
+            format!("{user}@{host}")
+        }
+        None => authority.to_owned(),
+    };
+    let tail = match tail.split_once('?') {
+        Some((path, query)) => {
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|pair| !pair.to_ascii_lowercase().starts_with("password="))
+                .collect();
+            if kept.is_empty() {
+                path.to_owned()
+            } else {
+                format!("{path}?{}", kept.join("&"))
+            }
+        }
+        None => tail.to_owned(),
+    };
+    format!("{scheme}://{authority}{tail}")
+}
+
+/// The `--store` and `--tenant` a printed next step carries.
+///
+/// A store named by `AGENTPLANE_STORE` is printed as that variable, and a
+/// connection string named on the command line loses its password: stderr is
+/// pasted into tickets and scrollback is shared, and a hint is not the place a
+/// database credential should travel.
+fn where_flags(store: Option<&str>, tenant: Option<&str>) -> String {
+    let from_env = std::env::var("AGENTPLANE_STORE").ok();
+    let store = match store {
+        None => " --store <file>".to_owned(),
+        Some(s) if from_env.as_deref() == Some(s) => r#" --store "$AGENTPLANE_STORE""#.to_owned(),
+        Some(s) if is_connection_string(s) => {
+            format!(" --store {}", shell_quote(&without_password(s)))
+        }
+        Some(s) => format!(" --store {}", shell_quote(s)),
+    };
+    match tenant {
+        Some(t) => format!("{store} --tenant {}", shell_quote(t)),
+        None => store,
+    }
+}
+
 /// The verbs' shared tail: report the run, print the answer, exit honestly.
-fn conclude(outcome: &agentplane::runtime::RunOutcome) -> ExitCode {
+fn conclude(outcome: &agentplane::runtime::RunOutcome, resume: &Resume<'_>) -> ExitCode {
+    if let RunStatus::Suspended(reason) = &outcome.status {
+        suspended(outcome.run_id, reason, resume);
+        // Not a failure and not an answer: the run is durable and waiting,
+        // and a script needs to tell that apart from both.
+        return ExitCode::from(exit::SUSPENDED);
+    }
     eprintln!("run {} — {:?}", outcome.run_id, outcome.status);
     if let Some(output) = &outcome.output {
         // The answer on stdout and everything else on stderr, so this
@@ -3599,12 +4949,182 @@ fn conclude(outcome: &agentplane::runtime::RunOutcome) -> ExitCode {
     if matches!(outcome.status, RunStatus::Succeeded) {
         ExitCode::SUCCESS
     } else {
-        ExitCode::FAILURE
+        ExitCode::from(exit::FINDING)
     }
 }
 
-fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
-    require_declarative(manifests)?;
+/// Say what a suspended run waits for, and the commands that move it on.
+fn suspended(
+    run: agentplane::core::RunId,
+    reason: &agentplane::core::SuspendReason,
+    at: &Resume<'_>,
+) {
+    use agentplane::core::SuspendReason;
+
+    let store = where_flags(at.store, at.tenant);
+    let replay = format!(
+        "agentplane replay {run} --manifest {}{store}",
+        shell_quote(at.manifest)
+    );
+    match reason {
+        SuspendReason::AwaitingEvent {
+            kind, correlation, ..
+        } => {
+            let task = correlation
+                .iter()
+                .find(|k| k.namespace == "task")
+                .and_then(|k| agentplane::core::TaskId::parse(&k.value).ok());
+            if let Some(task) = task {
+                eprintln!("run {run} is waiting for a person to decide {task}");
+                eprintln!("next:");
+                eprintln!("  agentplane tasks --show {task}{store}");
+                eprintln!("  agentplane decide {task} approve --reason '…' --actor <you>{store}");
+                eprintln!("  {replay}");
+            } else {
+                eprintln!("run {run} is waiting for a `{kind}` event ({reason})");
+                eprintln!("next: deliver it, then\n  {replay}");
+            }
+        }
+        SuspendReason::AwaitingTime { until } => {
+            eprintln!("run {run} is waiting until {until}");
+            eprintln!("next, once that instant has passed:\n  {replay}");
+        }
+        other => {
+            eprintln!("run {run} is waiting: {other}");
+            eprintln!("next:\n  {replay}");
+        }
+    }
+    if at.store.is_none() {
+        eprintln!(
+            "note: this run journaled to memory and ended with the process — run it \
+             again with --store to keep it"
+        );
+    }
+}
+
+/// Parse `--correlate NAMESPACE=VALUE` flags, or mint the run a case of its
+/// own.
+///
+/// A fresh key rather than no case: oversight, obligations and case-bound
+/// memory are declarative features, and a run without a case refuses each of
+/// them at the first step that needs one.
+fn correlation(flags: &[String]) -> Result<Vec<agentplane::core::CorrelationKey>, String> {
+    if flags.is_empty() {
+        return Ok(vec![agentplane::core::CorrelationKey::new(
+            "invocation",
+            agentplane::core::RunId::generate().to_string(),
+        )]);
+    }
+    flags
+        .iter()
+        .map(|flag| {
+            let (namespace, value) = flag
+                .split_once('=')
+                .filter(|(n, v)| !n.trim().is_empty() && !v.trim().is_empty())
+                .ok_or_else(|| {
+                    format!(
+                        "--correlate wants `<namespace>=<value>`, got `{flag}` — a \
+                         `$correlation/customer` subject needs `--correlate customer=C-7`"
+                    )
+                })?;
+            Ok(agentplane::core::CorrelationKey::new(namespace, value))
+        })
+        .collect()
+}
+
+/// The chain `--acting-as` names: rooted at that subject, scoped to what the
+/// file declares.
+///
+/// Exactly the file's own reach — the capabilities its agents provide, and the
+/// ones they grant under a peer's name — because the chain is what a peer
+/// receives, and a root wider than the declaration would hand a peer
+/// authority no reviewer saw.
+fn chain_for(
+    subject: &str,
+    manifests: &[Manifest],
+    peers: &[String],
+) -> Result<agentplane::core::Delegation, String> {
+    let peer_names: Vec<&str> = peers
+        .iter()
+        .filter_map(|p| p.split_once('=').map(|(n, _)| n))
+        .collect();
+    let mut scope: Vec<String> = manifests
+        .iter()
+        .flat_map(|m| m.spec.capabilities.provides.iter().cloned())
+        .collect();
+    scope.extend(
+        manifests
+            .iter()
+            .flat_map(|m| &m.spec.tools)
+            .filter_map(|g| agentplane::tools::ToolId::parse(&g.reference))
+            .filter(|id| peer_names.contains(&id.server.as_str()))
+            .map(|id| id.tool),
+    );
+    if subject.trim().is_empty() {
+        return Err("--acting-as names nobody".to_owned());
+    }
+    Ok(agentplane::core::Delegation::root(
+        agentplane::core::Principal::new(subject, agentplane::core::Scope::of(scope)),
+    ))
+}
+
+/// Say a build refusal in this binary's vocabulary.
+///
+/// The library's messages name the Rust call that fixes a wiring mistake,
+/// which is right for an embedder and useless to somebody holding a YAML file
+/// and this binary. The refusals a command line can reach are rewritten to
+/// name the flag that fixes them; the rest pass through.
+fn in_cli_terms(error: &agentplane::runtime::BuildError, manifests: &[Manifest]) -> String {
+    use agentplane::runtime::BuildError;
+    match error {
+        BuildError::DeclarativeToolsUnreachable { agent, kind, .. } => {
+            let servers: Vec<String> = manifests
+                .iter()
+                .filter(|m| &m.metadata.name == agent)
+                .flat_map(|m| &m.spec.tools)
+                .filter_map(|g| agentplane::tools::ToolId::parse(&g.reference))
+                .map(|id| id.server)
+                .filter(|s| s != "agent")
+                .fold(Vec::new(), |mut acc, s| {
+                    if !acc.contains(&s) {
+                        acc.push(s);
+                    }
+                    acc
+                });
+            format!(
+                "agent '{agent}' declares `execution.kind: {kind}` and grants tools on {}, \
+                 but nothing reaches them. Name the process that serves each one: \
+                 `--mcp {}=<command>` for an MCP server, or `--peer <name>=<url>` for an \
+                 A2A peer",
+                servers.join(", "),
+                servers.first().map_or("<server>", String::as_str),
+            )
+        }
+        BuildError::PeerIsAlsoAToolServer { server } => format!(
+            "'{server}' is named by both --mcp and --peer; a grant `tool://{server}/…` \
+             cannot mean both a tool call and a delegating hop — drop one of the two flags"
+        ),
+        BuildError::UnknownProvider { agent, provider } => format!(
+            "agent '{agent}' names provider '{provider}', and this binary ships {}",
+            shipped_providers().join(", ")
+        ),
+        other => other.to_string(),
+    }
+}
+
+fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
+    require_declarative(manifests).map_err(usage)?;
+    // Before anything is started: a peer call is made on somebody's behalf,
+    // and a run with no chain would reach the model, offer it the peer, and
+    // refuse the call as a tool failure the run then answers around — exit
+    // zero, and the peer never asked.
+    let chain = opts
+        .acting_as
+        .as_deref()
+        .map(|subject| chain_for(subject, manifests, &opts.peer))
+        .transpose()
+        .map_err(usage)?;
+    let keys = correlation(&opts.correlate).map_err(usage)?;
 
     // Current-thread on purpose. A CLI runs one agent and exits, so a work
     // stealing pool buys nothing and would mean pulling `rt-multi-thread` into
@@ -3636,8 +5156,11 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
         for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
-        if let Some((registry, client)) = connect_peers(&opts.peer, manifests)? {
+        if let Some((registry, client)) = connect_peers(&opts.peer, manifests).map_err(usage)? {
             builder = builder.peers(registry, client);
+        }
+        if let Some(chain) = chain {
+            builder = builder.acting_as(chain);
         }
         for manifest in manifests {
             builder = builder.agent(agentplane::runtime::Agent::new(manifest));
@@ -3645,15 +5168,31 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
         // `try_build`, because everything on this plane arrived as input: a
         // wiring mistake in a file somebody handed us is a refusal with a
         // sentence, not a programmer error worth a crash.
-        let agent = builder.try_build().map_err(|e| e.to_string())?;
+        let agent = builder
+            .try_build()
+            .map_err(|e| in_cli_terms(&e, manifests))?;
 
-        let capability = entry_capability(manifests, opts.capability.as_deref())?;
+        let capability = entry_capability(manifests, opts.capability.as_deref()).map_err(usage)?;
+        // The case kind is the capability: a case is a matter, and the matter
+        // a terminal run belongs to is the thing it was asked to do.
         let outcome = agent
-            .run(&capability, Tainted::trusted(opts.read_input()?))
+            .run_correlated(
+                &capability,
+                Tainted::trusted(opts.read_input().map_err(usage)?),
+                &capability,
+                &keys,
+            )
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(conclude(&outcome))
+        Ok(conclude(
+            &outcome,
+            &Resume {
+                manifest: &opts.manifest,
+                store: opts.at.store.as_deref(),
+                tenant: opts.at.tenant.as_deref(),
+            },
+        ))
     })
 }
 
@@ -3662,18 +5201,22 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, String> {
 /// The plane is rebuilt exactly as `run` builds it — same providers, same MCP
 /// wiring, same agents — plus the whole case layer, because a **resume** may
 /// continue past its recorded history and dispatch live: a run that suspended
-/// on a task or a timer needs the stores those live in. `--strict` never
-/// dispatches; it reads the history back and fails if this build diverges.
-fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, String> {
-    require_declarative(manifests)?;
-
-    let run = agentplane::core::RunId::parse(&opts.run_id)
-        .map_err(|e| format!("`{}` is not a run id: {e}", opts.run_id))?;
-    let mode = if opts.strict {
-        Mode::Strict
-    } else {
-        Mode::Resume
-    };
+/// on a task or a timer needs the stores those live in. `--strict` is
+/// [`verify_replay`]: it dispatches nothing and reports a verdict.
+fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, Fault> {
+    require_declarative(manifests).map_err(usage)?;
+    if opts.strict {
+        return verify_replay(manifests, opts);
+    }
+    let run_id = opts.run_id.as_deref().ok_or_else(|| {
+        usage("a resume needs the run to resume: `agentplane replay <run> --manifest …`")
+    })?;
+    let store = opts.at.store.as_deref().ok_or_else(|| {
+        usage("a resume needs the store the run lives in: --store <file|postgres://…>")
+    })?;
+    let run = agentplane::core::RunId::parse(run_id)
+        .map_err(|e| usage(format!("`{run_id}` is not a run id: {e}")))?;
+    let mode = Mode::Resume;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3681,7 +5224,7 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, String>
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let backend = opts.at.open().await?;
+        let backend = Backend::open(store, opts.at.tenant.as_deref()).await?;
         let mut builder = with_providers(
             Runtime::builder_with(backend.stores()).tenant(backend.tenant()),
             manifests,
@@ -3690,17 +5233,199 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, String>
         for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
-        if let Some((registry, client)) = connect_peers(&opts.peer, manifests)? {
+        if let Some((registry, client)) = connect_peers(&opts.peer, manifests).map_err(usage)? {
             builder = builder.peers(registry, client);
         }
         for manifest in manifests {
             builder = builder.agent(agentplane::runtime::Agent::new(manifest));
         }
-        let agent = builder.try_build().map_err(|e| e.to_string())?;
+        let agent = builder
+            .try_build()
+            .map_err(|e| in_cli_terms(&e, manifests))?;
 
-        let outcome = agent.replay(run, mode).await.map_err(|e| e.to_string())?;
-        Ok(conclude(&outcome))
+        let outcome = match agent.replay(run, mode).await {
+            // A terminal that recorded a decision and could not run the agent
+            // keeps its short lease, so the run stays findable. The replay the
+            // operator runs next waits that lease out rather than failing on it;
+            // a longer hold is somebody else's live work and is reported.
+            Err(agentplane::core::RuntimeError::LeaseHeld { remaining_secs, .. })
+                if remaining_secs <= 5 =>
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(remaining_secs + 1)).await;
+                agent.replay(run, mode).await
+            }
+            other => other,
+        }
+        .map_err(|e| e.to_string())?;
+        Ok(conclude(
+            &outcome,
+            &Resume {
+                manifest: &opts.manifest,
+                store: Some(store),
+                tenant: opts.at.tenant.as_deref(),
+            },
+        ))
     })
+}
+
+/// What one replayed run contributes to the process's exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Replayed {
+    Verified,
+    CannotReplay,
+    Diverged,
+    Unreadable,
+}
+
+impl Replayed {
+    fn of(verdict: &agentplane::runtime::Verdict) -> Self {
+        use agentplane::runtime::Finding;
+        match verdict.finding {
+            Finding::Verified { .. } => Self::Verified,
+            Finding::CannotReplay(_) => Self::CannotReplay,
+            _ => Self::Diverged,
+        }
+    }
+}
+
+/// The exit a strict replay of several runs owes, from the worst of them.
+///
+/// Worst is an outage (the answer is unreliable), then a divergence (the
+/// finding the verb exists for), then a run that could not be replayed (a
+/// partial answer), then verified. A corpus with one diverged run fails as
+/// diverged whatever else it holds, so CI reads one status.
+fn replay_exit(runs: &[Replayed]) -> u8 {
+    match runs.iter().max() {
+        None | Some(Replayed::Verified) => exit::OK,
+        Some(Replayed::CannotReplay) => exit::PARTIAL,
+        Some(Replayed::Diverged) => exit::FINDING,
+        Some(Replayed::Unreadable) => exit::OPERATIONAL,
+    }
+}
+
+/// `replay --strict`: replay recorded runs under the manifest in hand and
+/// report a verdict per run.
+///
+/// Every driver is replay-only: a provider that answers with the recorded
+/// request profile and refuses to complete, a tool transport and a peer
+/// transport that refuse every call. A strict replay serves every call from
+/// the record, so none of them is reached, and none needs a credential or a
+/// process. `--mcp` and `--peer` are refused rather than ignored: under
+/// `--strict` one could only start a server and the other only dial one.
+fn verify_replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, Fault> {
+    if !opts.mcp.is_empty() || !opts.peer.is_empty() {
+        return Err(usage(
+            "--strict dispatches nothing, so --mcp could only start a server and --peer only \
+             dial one; drop them — every tool result and peer reply is read from the record",
+        ));
+    }
+    if !opts.from.is_empty() && opts.at.store.is_some() {
+        return Err(usage(
+            "--from and --store name two sources; replay one of them (AGENTPLANE_STORE counts \
+             as --store)",
+        ));
+    }
+    let wanted = opts
+        .run_id
+        .as_deref()
+        .map(|id| {
+            agentplane::core::RunId::parse(id)
+                .map_err(|e| usage(format!("`{id}` is not a run id: {e}")))
+        })
+        .transpose()?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+
+    rt.block_on(async {
+        // Each source is a set of stores and the runs to replay from it.
+        let mut sources: Vec<(
+            agentplane::runtime::Stores,
+            agentplane::core::TenantId,
+            Vec<agentplane::core::RunId>,
+        )> = Vec::new();
+        if opts.from.is_empty() {
+            let store = opts.at.store.as_deref().ok_or_else(|| {
+                usage("--strict needs a source: --store <file|postgres://…> or --from <export>")
+            })?;
+            let run = wanted.ok_or_else(|| {
+                usage("a strict replay of a store names its run; replay every run of an export with --from")
+            })?;
+            let backend = Backend::open(store, opts.at.tenant.as_deref()).await?;
+            sources.push((backend.stores(), backend.tenant(), vec![run]));
+        } else {
+            for path in &opts.from {
+                let file = std::fs::File::open(path)
+                    .map_err(|e| format!("could not read the export {path}: {e}"))?;
+                let source =
+                    agentplane::export::open_for_replay(std::io::BufReader::new(file))
+                        .await
+                        .map_err(|e| format!("{path}: {e}"))?;
+                let runs = match wanted {
+                    Some(run) if source.runs.contains(&run) => vec![run],
+                    Some(_) => continue,
+                    None => source.runs.clone(),
+                };
+                sources.push((
+                    agentplane::runtime::Stores::on(source.store),
+                    agentplane::core::TenantId::default(),
+                    runs,
+                ));
+            }
+            if let Some(run) = wanted
+                && sources.is_empty()
+            {
+                return Err(format!("no export named holds run {run}").into());
+            }
+        }
+
+        let mut results = Vec::new();
+        for (stores, tenant, runs) in sources {
+            for run in runs {
+                results.push(verify_one(manifests, &stores, &tenant, run).await?);
+            }
+        }
+        Ok(ExitCode::from(replay_exit(&results)))
+    })
+}
+
+/// Replay one run strictly and print its verdict.
+async fn verify_one(
+    manifests: &[Manifest],
+    stores: &agentplane::runtime::Stores,
+    tenant: &agentplane::core::TenantId,
+    run: agentplane::core::RunId,
+) -> Result<Replayed, Fault> {
+    let history = match stores.journal.read(run, 1).await {
+        Ok(history) => history,
+        Err(e) => {
+            eprintln!("run {run} — cannot be read: {e}");
+            return Ok(Replayed::Unreadable);
+        }
+    };
+    let mut builder = agentplane::runtime::replay_only::wire(
+        Runtime::builder_with(stores.clone()).tenant(tenant.clone()),
+        manifests,
+        &history,
+    );
+    for manifest in manifests {
+        builder = builder.agent(agentplane::runtime::Agent::new(manifest));
+    }
+    let plane = builder
+        .try_build()
+        .map_err(|e| usage(in_cli_terms(&e, manifests)))?;
+    match plane.verify(run).await {
+        Ok(verdict) => {
+            eprint!("{verdict}");
+            Ok(Replayed::of(&verdict))
+        }
+        Err(e) => {
+            eprintln!("run {run} — cannot be read: {e}");
+            Ok(Replayed::Unreadable)
+        }
+    }
 }
 
 /// Register a driver for each provider the manifest names — and only those.
@@ -3879,7 +5604,300 @@ fn key(var: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::cutoff_before;
+    use super::{
+        EXIT_STATUS_HELP, Fault, Truncation, audit_status, cutoff_before, declared_bound, exit,
+        lift_status, refuse_ambiguous_peers, refuses_partial_export, shell_quote, where_flags,
+        without_password,
+    };
+
+    /// A fresh directory under the system temp dir, unique to this test.
+    #[cfg(feature = "cedar")]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-bundle-{name}-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// **A bundle directory and the rules file it holds are one bundle.**
+    ///
+    /// `serve --policy` and `policy check --bundle` read through one loader, so
+    /// a served file and the directory an auditor is handed name the same
+    /// identity — the one `RunAdmitted.policy_bundle` records and the check
+    /// compares against. With a schema beside the rules, it is another bundle.
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn a_bundle_directory_and_its_rules_file_have_one_identity() {
+        use agentplane::core::PolicyEngine as _;
+
+        let rules = "permit(principal, action, resource);";
+        let dir = scratch("same");
+        std::fs::write(dir.join("policy.cedar"), rules).unwrap();
+        let single = scratch("single").join("served.cedar");
+        std::fs::write(&single, rules).unwrap();
+
+        let from_dir = super::load_policy_bundle(dir.to_str().unwrap()).expect("dir");
+        let from_file = super::load_policy_bundle(single.to_str().unwrap()).expect("file");
+        assert_eq!(from_dir.bundle(), from_file.bundle());
+        assert_eq!(
+            from_dir.bundle(),
+            agentplane::policy::CedarEngine::new(rules)
+                .unwrap()
+                .bundle(),
+            "the loader is not the engine `serve` used to build"
+        );
+
+        std::fs::write(dir.join("entities.json"), "[]").unwrap();
+        let with_entities = super::load_policy_bundle(dir.to_str().unwrap()).expect("dir");
+        assert_ne!(
+            with_entities.bundle(),
+            from_file.bundle(),
+            "the entities beside the rules did not reach the bundle identity"
+        );
+    }
+
+    /// **A file the loader would skip is refused**, so no rule sits where the
+    /// bundle's identity does not reach.
+    #[cfg(feature = "cedar")]
+    #[test]
+    fn a_bundle_directory_holding_another_file_is_refused() {
+        let dir = scratch("stray");
+        std::fs::write(
+            dir.join("policy.cedar"),
+            "permit(principal, action, resource);",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("extra.cedar"),
+            "forbid(principal, action, resource);",
+        )
+        .unwrap();
+        match super::load_policy_bundle(dir.to_str().unwrap()) {
+            Err(Fault::Usage(why)) => assert!(why.contains("extra.cedar"), "{why}"),
+            Err(other) => panic!("refused as the wrong kind of fault: {other}"),
+            Ok(_) => panic!("a rule in a file the bundle does not read was accepted"),
+        }
+    }
+
+    fn agent(models: &str, budgets: &str) -> agentplane::manifest::Manifest {
+        agentplane::manifest::Manifest::parse(&format!(
+            "apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: bounded, version: \"1.0.0\" }}
+spec:
+  execution: {{ kind: tool-calling, max_turns: 4 }}
+  capabilities: {{ provides: [bounded.answer] }}
+  models:
+{models}
+  budgets: {budgets}
+"
+        ))
+        .expect("the fixture parses")
+    }
+
+    const PRICE: &str =
+        "pricing: { input: 1000000, output: 2000000, cache_read: 100000, cache_write: 1250000 }";
+
+    /// Every term bounded: the figure is the formula, from the declaration.
+    #[test]
+    fn validate_derives_the_worst_case_from_the_declaration() {
+        let m = agent(
+            &format!(
+                "    privileged: {{ provider: fake, model: m, max_tokens: 100, max_input_tokens: 900, {PRICE} }}"
+            ),
+            "{ max_tokens: 10000, max_minor_units: 50000, max_parallel_steps: 2 }",
+        );
+        let bound = declared_bound(&m);
+        let tokens = &bound.json["units"]["tokens"];
+        // 1000 per call; 10000 + 2 × 1000.
+        assert_eq!(tokens["per_call"], 1000);
+        assert_eq!(tokens["total"], 12_000);
+        // 900 input at the dearest input rate (1.25/token) + 100 output at 2.
+        let money = &bound.json["units"]["minor_units"];
+        assert_eq!(money["per_call"], 1325);
+        assert_eq!(money["total"], 50_000 + 2 * 1325);
+        assert_eq!(bound.json["turns"], 4);
+        assert!(
+            bound
+                .lines
+                .iter()
+                .any(|l| l.contains("12000 = ceiling 10000 + width 2 × one call 1000")),
+            "{:?}",
+            bound.lines
+        );
+    }
+
+    /// An unbounded term is named, and no total stands beside it.
+    #[test]
+    fn validate_names_every_unbounded_term() {
+        let m = agent(
+            &format!("    privileged: {{ provider: fake, model: m, max_tokens: 100, {PRICE} }}"),
+            "{ max_tokens: 10000 }",
+        );
+        let bound = declared_bound(&m);
+        for unit in ["tokens", "minor_units"] {
+            assert!(
+                bound.json["units"][unit]["total"].is_null(),
+                "a total was printed for {unit} although a term is unbounded: {}",
+                bound.json
+            );
+        }
+        let tokens: Vec<String> =
+            serde_json::from_value(bound.json["units"]["tokens"]["unbounded"].clone())
+                .expect("names");
+        assert_eq!(tokens, vec!["spec.models.privileged.max_input_tokens"]);
+        let money: Vec<String> =
+            serde_json::from_value(bound.json["units"]["minor_units"]["unbounded"].clone())
+                .expect("names");
+        assert_eq!(
+            money,
+            vec![
+                "spec.budgets.max_minor_units",
+                "spec.models.privileged.max_input_tokens"
+            ]
+        );
+        assert!(
+            bound.lines.iter().any(|l| l.contains("no total")),
+            "{:?}",
+            bound.lines
+        );
+    }
+    use std::process::ExitCode;
+
+    fn truncation(reached: &[&str]) -> Truncation {
+        Truncation {
+            limit: 10,
+            reached: reached.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    /// **One table of exit statuses, and `--help` prints the same one.**
+    ///
+    /// A scheduler reads the status and nothing else, so a finding and an
+    /// outage must not share a number, and a partial answer must be neither a
+    /// pass nor a failure.
+    #[test]
+    fn the_exit_statuses_are_one_table() {
+        use clap::CommandFactory as _;
+
+        assert_eq!(usage_status(), exit::USAGE);
+        assert_eq!(
+            Fault::from("store down".to_owned()).status(),
+            exit::OPERATIONAL
+        );
+        assert_ne!(exit::FINDING, exit::OPERATIONAL);
+
+        // An audit: a finding outranks a partial view; a partial view is not a pass.
+        assert_eq!(audit_status(true, &truncation(&[])), exit::OK);
+        assert_eq!(
+            audit_status(true, &truncation(&["succeeded"])),
+            exit::PARTIAL
+        );
+        assert_eq!(
+            audit_status(false, &truncation(&["succeeded"])),
+            exit::FINDING
+        );
+
+        // A lift that found nothing standing is a negative answer.
+        assert_eq!(lift_status(true), ExitCode::SUCCESS);
+        assert_eq!(lift_status(false), ExitCode::from(exit::FINDING));
+
+        for (code, word) in [
+            (exit::OK, "ok"),
+            (exit::FINDING, "finding"),
+            (exit::USAGE, "usage"),
+            (exit::SUSPENDED, "suspended"),
+            (exit::OPERATIONAL, "operational"),
+            (exit::PARTIAL, "partial"),
+        ] {
+            assert!(
+                EXIT_STATUS_HELP
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("{code}  ")) && l.contains(word)),
+                "--help does not say that {code} means {word}: {EXIT_STATUS_HELP}"
+            );
+        }
+        let help = super::Cli::command()
+            .get_after_help()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert_eq!(help, EXIT_STATUS_HELP, "--help prints another table");
+    }
+
+    fn usage_status() -> u8 {
+        super::usage("bad flag").status()
+    }
+
+    /// **A truncated export is refused unless a partial file was asked for.**
+    #[test]
+    fn a_truncated_export_is_refused_without_allow_partial() {
+        assert!(refuses_partial_export(
+            &truncation(&["in-flight runs"]),
+            false
+        ));
+        assert!(!refuses_partial_export(
+            &truncation(&["in-flight runs"]),
+            true
+        ));
+        assert!(!refuses_partial_export(&truncation(&[]), false));
+    }
+
+    /// **A printed next step names the tenant and carries no password.**
+    ///
+    /// The hint `run` and `replay` print is pasted into tickets: `--store`
+    /// verbatim would carry a `postgres://` password, and a hint with no
+    /// `--tenant` resumes against the default tenant and finds nothing.
+    #[test]
+    fn a_printed_next_step_carries_the_tenant_and_no_password() {
+        let flags = where_flags(
+            Some("postgres://ada:s3cret@db.internal:5432/plane?password=hunter2&sslmode=require"),
+            Some("acme corp"),
+        );
+        assert!(
+            !flags.contains("s3cret"),
+            "the URL's password was printed: {flags}"
+        );
+        assert!(
+            !flags.contains("hunter2"),
+            "the password parameter was printed: {flags}"
+        );
+        assert!(flags.contains("ada@db.internal:5432/plane"), "{flags}");
+        assert!(flags.contains("sslmode=require"), "{flags}");
+        assert!(
+            flags.ends_with(" --tenant 'acme corp'"),
+            "the tenant is missing or unquoted: {flags}"
+        );
+        assert_eq!(
+            without_password("postgres://db/plane"),
+            "postgres://db/plane",
+            "a URL with no password is printed as it is"
+        );
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(where_flags(Some("runs.redb"), None), " --store runs.redb");
+    }
+
+    /// **Two `--peer` names that read one token variable are refused.**
+    ///
+    /// `a.b`, `a-b` and `a_b` all read `AGENTPLANE_PEER_TOKEN_A_B`, so wiring
+    /// two of them would send one peer's bearer token to the other.
+    #[test]
+    fn ambiguous_peer_names_are_refused_at_boot() {
+        let specs = |names: &[&str]| -> Vec<String> {
+            names
+                .iter()
+                .map(|n| format!("{n}=https://peer.example"))
+                .collect()
+        };
+        let err = refuse_ambiguous_peers(&specs(&["billing.eu", "billing-eu"]))
+            .expect_err("both read AGENTPLANE_PEER_TOKEN_BILLING_EU");
+        assert!(
+            err.contains("billing.eu") && err.contains("billing-eu"),
+            "{err}"
+        );
+        assert!(refuse_ambiguous_peers(&specs(&["billing", "reviewer"])).is_ok());
+    }
 
     /// A window a person could type is answered; one that reaches past the
     /// calendar is a message rather than an abort.
@@ -3893,5 +5911,181 @@ mod tests {
         assert!(cutoff_before(now, 90).is_ok());
         let err = cutoff_before(now, u32::MAX).expect_err("a window of 11m years");
         assert!(err.contains("--older-than-days"), "{err}");
+    }
+
+    /// **A corpus exits with its worst verdict, and each verdict has one
+    /// status.**
+    ///
+    /// A CI job reads the status and nothing else: a divergence anywhere fails
+    /// the job as a finding whatever else the corpus holds, a run that could
+    /// not be replayed is a partial answer rather than a pass, and an outage
+    /// outranks both because it leaves the answer unknown.
+    #[test]
+    fn a_corpus_exits_with_its_worst_verdict() {
+        use super::{Replayed, replay_exit};
+
+        assert_eq!(replay_exit(&[]), exit::OK);
+        assert_eq!(replay_exit(&[Replayed::Verified]), exit::OK);
+        assert_eq!(
+            replay_exit(&[Replayed::Verified, Replayed::CannotReplay]),
+            exit::PARTIAL
+        );
+        assert_eq!(
+            replay_exit(&[
+                Replayed::CannotReplay,
+                Replayed::Diverged,
+                Replayed::Verified
+            ]),
+            exit::FINDING
+        );
+        assert_eq!(
+            replay_exit(&[Replayed::Diverged, Replayed::Unreadable]),
+            exit::OPERATIONAL
+        );
+    }
+
+    /// **A strict replay needs no provider this binary could build.**
+    ///
+    /// The run was recorded under a provider name no driver here answers to —
+    /// the shape of a CI job holding no credential for the provider its
+    /// manifest names. Every call is served from the record, so the verdict
+    /// must still come back; a strict path that registered the manifest's
+    /// live drivers would refuse before replaying anything.
+    #[test]
+    fn strict_replay_wires_only_replay_only_drivers() {
+        use agentplane::journal::JournalStore;
+
+        const ACME: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summariser, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise a support ticket" }
+  capabilities: { provides: [support.summarise] }
+  models:
+    privileged: { provider: acme, model: sum-1 }
+  budgets: { max_tokens: 10000 }
+"#;
+        let manifests = vec![agentplane::manifest::Manifest::parse(ACME).expect("parses")];
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let store = std::sync::Arc::new(
+                    agentplane::store::RedbStore::open_in_memory().expect("store"),
+                );
+                let recorded = agentplane::runtime::Runtime::builder(
+                    std::sync::Arc::clone(&store) as std::sync::Arc<dyn JournalStore>
+                )
+                .provider("acme", agentplane::model::fake::FakeProvider::new())
+                .agent(agentplane::runtime::Agent::new(&manifests[0]))
+                .build()
+                .run(
+                    "support.summarise",
+                    agentplane::core::Tainted::trusted(serde_json::json!({ "t": 1 })),
+                )
+                .await
+                .expect("recorded");
+
+                let replayed = super::verify_one(
+                    &manifests,
+                    &agentplane::runtime::Stores::on(store),
+                    &agentplane::core::TenantId::default(),
+                    recorded.run_id,
+                )
+                .await
+                .expect("a strict replay needs no driver this binary can build");
+                assert_eq!(replayed, super::Replayed::Verified);
+            });
+    }
+
+    /// A task for the terminal tests, proposing `proposed` under `summary`.
+    fn listed(
+        summary: &str,
+        proposed: serde_json::Value,
+        withheld: Option<agentplane::core::Withheld>,
+    ) -> agentplane::core::Task {
+        use agentplane::core::{
+            EffectDescriptor, EffectKey, Justification, OnExpiry, Phase, Priority, RunId, StepId,
+            Tainted, Task, TaskId, TaskState,
+        };
+        let run = RunId::generate();
+        Task {
+            id: TaskId::derive(
+                run,
+                EffectKey::for_effect(
+                    StepId(0),
+                    Phase::Forward,
+                    0,
+                    1,
+                    &EffectDescriptor::new("approval", serde_json::json!({})),
+                ),
+            ),
+            run,
+            case: None,
+            kind: "approval".into(),
+            justification: Justification::new(Tainted::trusted(summary.to_owned()), proposed),
+            candidate_roles: Vec::new(),
+            escalate_to: Vec::new(),
+            assignee: None,
+            priority: Priority::Normal,
+            state: TaskState::Open,
+            on_expiry: OnExpiry::Deny,
+            excluded_actors: Vec::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            due_at: None,
+            withheld,
+        }
+    }
+
+    /// **The terminal shows a withheld proposal as withheld.**
+    ///
+    /// This binary holds no key ring, so on a sealed plane every proposal it
+    /// reads is an envelope. Printing that as `proposed_action` hands the
+    /// person at the terminal a value that is not the arguments; the reason
+    /// is printed instead.
+    #[test]
+    fn the_terminal_shows_a_withheld_proposal_as_withheld() {
+        let task = listed(
+            "Refund the invoice",
+            serde_json::json!({ "$sealed": "AAECAwQFBgc=" }),
+            Some(agentplane::core::Withheld::Sealed),
+        );
+        let shown = super::task_json(&task, true);
+        assert_eq!(shown["proposed_action"], serde_json::Value::Null, "{shown}");
+        assert!(
+            shown["withheld"]
+                .as_str()
+                .is_some_and(|w| w.starts_with("sealed") && w.contains("no key ring")),
+            "{shown}"
+        );
+        assert!(!shown.to_string().contains("$sealed"), "{shown}");
+    }
+
+    /// **The terminal escapes what a reviewer cannot see.**
+    ///
+    /// A JSON printer passes a right-to-left override through verbatim, and
+    /// the terminal then reverses the digits after it. The terminal prints
+    /// the same rendering the HTTP worklist serves.
+    #[test]
+    fn the_terminal_escapes_what_a_reviewer_cannot_see() {
+        let task = listed(
+            "Pay\u{200B} the vendor",
+            serde_json::json!({ "amount": "\u{202E}0001" }),
+            None,
+        );
+        let shown = super::task_json(&task, false);
+        assert_eq!(shown["escaped"], true, "{shown}");
+        assert_eq!(
+            shown["proposed_action"]["amount"], "\\u{202E}0001",
+            "{shown}"
+        );
+        let printed = shown.to_string();
+        assert!(
+            !printed.contains('\u{202E}') && !printed.contains('\u{200B}'),
+            "{printed}"
+        );
     }
 }

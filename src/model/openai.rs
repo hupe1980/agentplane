@@ -25,8 +25,9 @@
 //! | Response | Meaning | Metered |
 //! |---|---|---|
 //! | `status: "completed"` | it answered | yes |
-//! | `status: "incomplete"` | it answered and was cut off | **yes**, and [`Completion::truncated`] |
+//! | `status: "incomplete"`, `max_output_tokens` | it answered and was cut off | **yes**, and [`Completion::truncated`] |
 //! | `status: "failed"` | it started and gave up | **yes** |
+//! | any other status or incomplete reason | it stopped without an answer | **yes** |
 //! | a `refusal` content part | it generated, and declined | **yes** |
 //!
 //! The middle row is the one worth being careful about. A truncated answer is
@@ -656,6 +657,17 @@ impl OpenAi {
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
         if let Some(effort) = reasoning_effort {
+            // Responses names `none` through `xhigh`. `max` has no counterpart,
+            // and sending it would be a 400 at best and a silently clamped
+            // level at worst — refused here, as every other driver refuses a
+            // level its provider does not name.
+            if effort == super::ReasoningEffort::Max {
+                return Err(ModelError::Refused {
+                    model: model.clone(),
+                    detail: "OpenAI Responses has no reasoning effort 'max' — it names none,                              minimal, low, medium, high and xhigh"
+                        .to_owned(),
+                });
+            }
             body["reasoning"] = json!({ "effort": effort.as_str() });
         }
         if let Some(system) = instructions(prompt) {
@@ -767,7 +779,29 @@ impl OpenAi {
         }
 
         let text = parsed.text();
-        let truncated = parsed.status == "incomplete";
+        // Completeness is an allowlist. `completed` is an answer, and an
+        // `incomplete` cut off by the output budget is a typed truncation.
+        // Incomplete for any other reason — a content filter — or a status
+        // this driver does not recognise ended without an answer, and is
+        // metered because deciding cost what it cost.
+        let incomplete_reason = parsed
+            .incomplete_details
+            .as_ref()
+            .map(|i| i.reason.as_str());
+        let truncated = match (parsed.status.as_str(), incomplete_reason) {
+            ("completed", _) => false,
+            ("incomplete", Some("max_output_tokens")) => true,
+            (status, reason) => {
+                return Err(ModelError::Unusable {
+                    model: model.clone(),
+                    usage,
+                    detail: format!(
+                        "generation stopped with status '{status}'{}, which is not an answer",
+                        reason.map(|r| format!(" ({r})")).unwrap_or_default()
+                    ),
+                });
+            }
+        };
 
         // Empty *and* not truncated is an answer with nothing in it — unusable,
         // and billed. Empty *because* it was cut off is reported through
@@ -896,7 +930,9 @@ impl OpenAi {
         while let Some(chunk) = body.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
-                Err(e) => return Err(severed(model, &acc, &e.to_string())),
+                Err(e) => {
+                    return Err(severed(model, &acc, &crate::netguard::transport_text(&e)));
+                }
             };
             // Charged before the chunk is kept: what the ceiling bounds is
             // what this process holds, not what it has already held. The
@@ -1003,7 +1039,6 @@ impl ModelProvider for OpenAi {
             "store": self.retain_responses,
             "schema_mode": schema_mode,
             "stream": self.stream,
-            "timeout_ms": self.timeout.as_millis(),
         })
     }
 

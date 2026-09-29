@@ -3,9 +3,9 @@
 Notable changes per release, on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 **Written for somebody who already depends on a version.** Each entry says what
-changed and what to do about it. Anything needing more than a line or two is in
-[upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/); why a design
-was chosen is not here.
+changed and what to do about it. Moving a deployment between builds is the
+[upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) procedure;
+why a design was chosen is not here.
 
 **Two categories are ours.** `Assurance` is a change to what the project can
 *prove* — a guarantee that gained a test, a surface walked adversarially.
@@ -16,7 +16,212 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.44.0] — unreleased
+## [0.45.0] — 2026-09-29
+
+### Security
+
+- **Nobody but the worklist can answer a human task.** An event whose kind is
+  in the `agentplane.` namespace is refused at every intake — `POST /events`
+  (403), A2A, `deliver`, `deliver_to` — and a task accepts only an answer from
+  its own worklist under the decider it names. Before, anyone allowed to post
+  events could approve any task under any name.
+- **An approval binds to what the reviewer was shown.** A decision names the
+  digest of the task its decider saw, and a run refuses an approval of a task
+  edited between proposal and decision. A proposal the plane cannot open — a
+  terminal with no key ring — is marked withheld and cannot be approved
+  (`ProposalWithheld`, 422); a rejection is buffered for the plane that holds
+  the agent.
+- **BREAKING: the caller who started a run cannot approve it.**
+  `RunAdmitted.admitted_by` records the initiator, and every task the run
+  opens excludes them.
+- **BREAKING: a served caller without a delegation chain acts under none.** It
+  no longer inherits the plane's chain — which made the operator's authority an
+  ambient credential — but is still bounded by it (scope, admissibility,
+  depth). Authority holders are typed (`Holder`); A2A and MCP refuse at startup
+  a policy set that cannot evaluate that request shape.
+- **BREAKING: A2A tasks belong to the peer that admitted them.** Reads, writes,
+  streams, push configurations and `contextId` joins on another peer's task
+  answer `TASK_NOT_FOUND`; `ListTasks` lists only your own and stops at
+  `statusTimestampAfter`; a policy rule can name the owner as `context.owner`.
+- **BREAKING: the MCP server needs a policy engine and answers only for its own
+  runs.** `tasks/get` and `tasks/cancel` refuse a run this surface did not
+  admit; a completed task carries its result; a host retry is the same run.
+  Idempotency keys and request ids are scoped to a session.
+- **BREAKING: a standing authority is drawn only by its holder, and only with
+  an id the run's own code chose.** An id from model or peer text is refused.
+- **BREAKING: batch items are admitted untrusted** unless the source vouches
+  with `BatchItem::labelled`.
+- **BREAKING: a plane with no policy engine refuses every `release`.** A
+  release is the one call that lowers a label.
+- **Telemetry never carries a failure's words.** Loud events name the run, the
+  error class and a digest of the reason; the text stays in the journal, where
+  erasure reaches it. **BREAKING** for log consumers.
+- **Transport errors name the host, never the URL**, and a peer or client is
+  never shown a store's error text, so webhook and peer secrets no longer reach
+  parked registrations or logs.
+- **Vault transit keys are derived from the scope** (`ap-` + SHA-256), so no
+  scope can share a key or escape the URL path. Re-provision keys. **BREAKING**
+- **Token files refuse tokens under 32 bytes and the published example
+  values.** **BREAKING**
+- **Erasing one event no longer destroys another's key.** The event key scope
+  is length-prefixed like the dedup key, so `("bus/x", "1")` and
+  `("bus", "x/1")` no longer share one.
+
+### Fixed
+
+- **A task is settled once.** Expiry and decision race through a
+  compare-and-set; the loser is refused (`ClaimError::AlreadyAnswered`, 409),
+  and an expiry that meets an answer already on record settles to that answer.
+- **A decision or stop from a plane that cannot drive the run** — an
+  operator's terminal — no longer quarantines a governed run: it is buffered
+  for the plane that holds the agent. A sealed run there is reported as
+  key-absent (`PayloadsSealed`), not erased.
+- **A run that concludes closed retires its timers, event subscriptions and
+  parked waits and withdraws the tasks it waited on**, so a dead run no longer
+  swallows another run's event or fires forever. A parked wait is never matched
+  to a second message. **BREAKING** for store implementors.
+- **Deadline sweeps:** a breach is one conditional transaction that never
+  reopens a closed case, applied first and noted after (a crash between is
+  noted by the next tick, once); a lost race is recorded as `not_applied`; warned
+  obligations and held timers no longer starve due ones.
+- **A run refused on resume is listed, not lost.** A resume refused because
+  the declaration or policy bundle changed quarantines the run, naming both
+  digests, instead of returning `DeclarationChanged`/`PolicyBundleChanged`.
+  **BREAKING** for callers matching those errors.
+- **A resume that fails after a wake, a delivery or a recovery keeps its
+  lease**, so the recovery sweep retries it; a recovery the journal itself
+  refuses quarantines the run instead of retrying every lease period. A lost
+  recovery race is not counted as a failure.
+- **A failure unwinds interrupted siblings' landed work**, and `attention`
+  lists failed runs still standing on landed work.
+- **Unwinding after a replan undoes what ran**, as the skill its `StepStarted`
+  names; a successor must carry completed steps over unchanged; an aborted
+  effect group no longer quarantines or double-compensates its step.
+  **BREAKING** for replanners that redeclared completed steps.
+- **A tool that ran and failed is retried only if it declares
+  `retry_landed`.**
+- **Erasure reaches memory backups**: every memory version has its own key,
+  and an erased subject can be written again. An erased buffered event is
+  dead-lettered and its wait reopened, never delivered as `null`. Blob and
+  memory payloads use the versioned envelope, bound to their row;
+  `StepCompensated.outcome` is sealed. **BREAKING**
+- **Exports carry legal holds and restore places them**, so a recovered plane
+  never erases a preserved matter. **BREAKING** export format.
+- **The Postgres Merkle log stays append-only under concurrent seals.** Seal
+  positions are allocated under a per-tenant lock in commit order; before, a
+  witness could see an honest history as a fork.
+- **`export::verify` checks an anchor older than the export** against the
+  file's own leaves, and a record's hash before parsing it, so an edited line
+  is reported as edited rather than as build skew. **Restore refuses before
+  writing** a line whose hash or version does not hold.
+- **`audit` reports truncation and exits 5; `export` refuses a truncated
+  export** unless `--allow-partial`. **BREAKING**
+- **BREAKING: `max_minor_units` binds.** A model role declares `pricing`
+  (minor units per million input, output, cache-read and cache-write tokens);
+  a money ceiling over an unpriced role is refused at load. A commission's
+  spend is settled into the tenant's period once.
+- **`max_egress_bytes` counts everything a model call sends** — tool results,
+  the conversation so far, tool declarations and attached media — not only the
+  prompt.
+- **`EffectStarted.mutates` records the value the policy gate was asked with**
+  (the grant-widened claim). **BREAKING** record meaning.
+- **A tool's error text carries the tool's label**, so a confidential failure
+  cannot reach a model cleared below it.
+- **A filtered or cut-off model answer is never read as complete.** Stop
+  reasons are allowlisted per provider.
+- **A model stream that fails partway is retried under its policy.** A call
+  with no world effect is billed and asked again.
+- **A driver's timeout is no longer part of a model call's identity**, so
+  raising it does not break replay of runs already in flight.
+- **Cancelling a run that has finished answers 409**; a failed or exhausted
+  run can still be stopped.
+- **A batch item withheld under a withdrawn authority is counted as withheld**,
+  not as exhausted.
+- **A breach acknowledgement records who and on what basis**, like every other
+  operator act.
+- **`/runs/live?subject=` reports truncation from the page it read**, so a
+  filtered answer never claims nothing is running when it did not look.
+- **Suspended-run hints carry `--tenant`, are shell-quoted, and never print a
+  Postgres password**; ambiguous `--peer` names are refused.
+- **Several published Cedar examples were refused by `preflight` or failed on
+  every call.** Each now guards what it reads, and the build probes a mutating
+  call, a labelled call, every resource a rule names and the served actions.
+
+### Changed
+
+- **BREAKING: store traits.** `EventStore::minter`,
+  `CaseStore::breaches_to_note`/`mark_breach_noted`,
+  `JournalStore::recent_runs_from`; `TaskStore::set_state` returns whether it
+  applied; `MemoryStore::forget_cascading` returns `Cascade`; `sweep_expired`
+  returns the swept ids; memory `Cascade`/`sweep_expired` carry versions;
+  `TimerStore::pending` is removed (use `waiting_runs`).
+- **BREAKING: effect keys are domain-separated** at the hash, so every key
+  changes; recreate stores written by an earlier build.
+- **BREAKING: nested record payloads refuse unknown members**, as the top level
+  already did.
+- **BREAKING: a record signature is named a signature**, not an attestation —
+  it is a workload-key signature, not a hardware attestation.
+  `ExportedRecord::attestation` is `signature` on the wire; `Attestation` is
+  `KeySignature`, `AttestError` is `SignatureError`, `Record::attestation` and
+  `Provenance::attestation` are `signature`, `Signer::attest` is
+  `signature_over`, `verify_attested` is `verify_signed`, and the provenance
+  metadata key is `io.github.hupe1980.agentplane/signature`.
+- **BREAKING: one CLI exit-code table** — 0 ok, 1 finding, 2 usage,
+  3 suspended, 4 operational, 5 partial — printed in `--help`. `halt` prints
+  text unless `--json` (also on `init`, `validate`, `digest`).
+- **BREAKING: CLI.** `retain` is `retention plan`; `halt list` and `hold list`
+  list what stands; a decision is `decide <task> approve|reject`; escalation
+  names its audience in the type (`Expiry::escalate_to(..)`).
+- **`serve --policy` takes a bundle file or directory**, through the same
+  loader as `policy check`.
+- **`capabilities.provides` defaults to the agent's name** for a declarative
+  agent.
+- **BREAKING (testkit): the fake provider calls the first offered tool on a
+  tool loop's first turn**, so a fake-driven run proves its transport was
+  reached; a test expecting a plain answer on turn one must offer no tools.
+
+### Added
+
+- **A tenant spend quota reserves each run's worst case at admission** — its
+  ceiling plus one call per step in flight, from declared per-call maxima
+  (`max_input_tokens`, output ceilings, price) — in the transaction that checks
+  the ceiling, so a period's spend is bounded. Under a spend quota an unbounded
+  run is refused; `validate` prints the worst case. **BREAKING**: recreate
+  stores; `QuotaStore::reserve` takes a `SpendHold`.
+- **`spec.tools[].rate_limit: { count, window_seconds }`** caps calls to one tool
+  across every run of a tenant in a sliding window. A full window pauses the run
+  like a budget (`BudgetExceeded::Rate`); a retry spends once; an undo is never
+  refused. **BREAKING**: `QuotaStore` gains `reserve_rate` and `rate_room`.
+- **`agentplane policy check --bundle … --from export.jsonl
+  [--candidate …]`** re-derives every gated request an export records, through
+  the gates' own builders, and reports what the bundle would deny, what a
+  candidate would newly deny, and what it could not evaluate.
+- **`agentplane replay --strict` answers whether an edited declaration
+  diverges** — verified, diverged (the first effect, with both digests) or
+  cannot replay — from a store or `--from` export files, with no provider
+  credential. **BREAKING**: it no longer prints the run's output or exits 3.
+- **Every task surface shows invisible and bidirectional characters visibly**
+  and flags words mixing scripts. **BREAKING**: new `tasks.withheld` column.
+- **`agentplane run` handles every declarative feature.** Runs correlate by
+  default (`--correlate k=v` joins an existing case) and `--acting-as` gives
+  peer calls a chain.
+- **`agentplane tasks`** lists open approvals, and **`agentplane init`** writes
+  a valid starter manifest.
+- **`attention` names the runs, tasks and cases behind each condition**, and
+  its remedies name the verb on the surface serving them.
+- **`serve --log-format json`**, and `--version` lists the compiled features.
+- **`schemars` is re-exported**, so a tool author derives `JsonSchema` without
+  matching versions.
+- **`agentplane replay` waits out a terminal's short lease** after `decide`, so
+  approve-then-resume works in one sitting.
+
+### Assurance
+
+- **Nothing published may cite a feature specification.** The docs guard
+  refuses a path into the specification tree or a bare requirement identifier,
+  and `just package` refuses them in the tarball.
+
+## [0.44.0] — 2026-09-21
 
 ### Security
 

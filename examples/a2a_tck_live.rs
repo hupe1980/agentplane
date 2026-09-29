@@ -1,7 +1,7 @@
 //! Serve this plane's A2A surface for the official conformance kit.
 //!
 //! ```sh
-//! cargo run --example a2a_tck_live --features redb,a2a-server,manifest
+//! cargo run --example a2a_tck_live --features redb,a2a-server,manifest,testkit
 //! ```
 //!
 //! Then, from a checkout of <https://github.com/a2aproject/a2a-tck>:
@@ -20,10 +20,7 @@
 //! written from the same misreading agree with each other everywhere,
 //! including where both are wrong — only an outside authority
 //! breaks the tie. The TCK is the outside authority: pytest conformance
-//! written by the protocol's own project, exercised against a live socket. Its
-//! first run found a real interoperability defect — the JSON-RPC endpoint
-//! 404ing the trailing-slash URL every httpx-based client produces — plus
-//! four protocol-mapping defects no in-repo test could have caught.
+//! written by the protocol's own project, exercised against a live socket.
 //!
 //! # Why it is `_live`
 //!

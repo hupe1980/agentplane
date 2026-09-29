@@ -374,7 +374,7 @@ impl Declarative {
                             exchanges
                                 .push(crate::model::ToolExchange::ok(asked, answer.peek().clone()));
                         }
-                        Err(e) => match model_facing(&e) {
+                        Err(e) => match relayed_failure(cx, &mut conversation_label, &e) {
                             Some(detail) => {
                                 exchanges.push(crate::model::ToolExchange::failed(asked, detail));
                             }
@@ -400,7 +400,7 @@ impl Declarative {
                             exchanges
                                 .push(crate::model::ToolExchange::ok(asked, answer.peek().clone()));
                         }
-                        Err(e) => match model_facing(&e) {
+                        Err(e) => match relayed_failure(cx, &mut conversation_label, &e) {
                             Some(detail) => {
                                 exchanges.push(crate::model::ToolExchange::failed(asked, detail));
                             }
@@ -433,7 +433,7 @@ impl Declarative {
                         exchanges
                             .push(crate::model::ToolExchange::ok(asked, result.peek().clone()));
                     }
-                    Err(e) => match model_facing(&e) {
+                    Err(e) => match relayed_failure(cx, &mut conversation_label, &e) {
                         Some(detail) => {
                             exchanges.push(crate::model::ToolExchange::failed(asked, detail));
                         }
@@ -560,15 +560,12 @@ impl Declarative {
             // `StepCtx::open_task` refuses it. Escalation stays available
             // because widening the audience of an unanswered row is a real
             // thing to want.
-            spec.on_expiry = match oversight.on_expiry {
-                crate::core::OnExpiry::Escalate => {
-                    // The oversight-level escalation audience, applied to the
-                    // triage row too: the parser has already held every triage
-                    // audience to be bounded when escalation is declared.
-                    spec.escalate_to.clone_from(&oversight.escalate_to);
-                    crate::core::OnExpiry::Escalate
-                }
-                _ => crate::core::OnExpiry::Deny,
+            spec.on_expiry = match &oversight.on_expiry {
+                // The oversight-level escalation audience, applied to the
+                // triage row too: the parser has already held every triage
+                // audience to be bounded when escalation is declared.
+                escalate @ crate::core::Expiry::Escalate { .. } => escalate.clone(),
+                _ => crate::core::Expiry::Deny,
             };
             cx.open_task(&spec).await?;
         }
@@ -1245,9 +1242,7 @@ struct Proposal {
     approval: crate::manifest::Approval,
     approvers: Vec<String>,
     deadline: crate::manifest::OversightDeadline,
-    on_expiry: crate::core::OnExpiry,
-    escalate_to: Vec<String>,
-    allow_unattended: bool,
+    on_expiry: crate::core::Expiry,
     /// Rules that open a task *beside* the answer rather than in front of it.
     triage: Vec<crate::manifest::TriageRule>,
 }
@@ -1260,12 +1255,13 @@ impl Proposal {
             approvers: o.approvers.clone(),
             deadline: o.deadline.clone(),
             on_expiry: match o.on_expiry {
-                Expiry::Deny => crate::core::OnExpiry::Deny,
-                Expiry::Escalate => crate::core::OnExpiry::Escalate,
-                Expiry::Proceed => crate::core::OnExpiry::Proceed,
+                Expiry::Escalate => crate::core::Expiry::escalate_to(o.escalate_to.iter().cloned()),
+                Expiry::Proceed if o.allow_unattended => crate::core::Expiry::ProceedUnattended,
+                // The parser refuses `proceed` without `allow_unattended`, so
+                // the consent is always there; were it not, the safe answer is
+                // the one that does not act.
+                Expiry::Deny | Expiry::Proceed => crate::core::Expiry::Deny,
             },
-            escalate_to: o.escalate_to.clone(),
-            allow_unattended: o.allow_unattended,
             triage: o.triage.clone(),
         }
     }
@@ -1305,9 +1301,7 @@ impl Proposal {
             self.deadline.name.clone(),
         );
         spec.candidate_roles.clone_from(&self.approvers);
-        spec.on_expiry = self.on_expiry;
-        spec.escalate_to.clone_from(&self.escalate_to);
-        spec.allow_unattended = self.allow_unattended;
+        spec.on_expiry = self.on_expiry.clone();
         spec
     }
 }
@@ -1966,9 +1960,8 @@ fn privileged(m: &Manifest) -> Option<ModelRole> {
 /// without any of it crossing the boundary.
 ///
 /// So a refusal is [`REFUSED`](crate::core::REFUSED) and nothing else. The
-/// journal still keeps the full reason. `PolicyError::for_model` has said this
-/// since it was written; until now nothing called it, and the one path that
-/// feeds a refusal to a model used `Display`.
+/// journal still keeps the full reason. `PolicyError::for_model` is the one
+/// rendering a model sees; `Display` is for the journal and the operator.
 ///
 /// # An unknown outcome is not a failed call
 ///
@@ -1989,7 +1982,8 @@ fn privileged(m: &Manifest) -> Option<ModelRole> {
 /// The far side's own answer, and only that. A tool that was unreachable,
 /// declined the request, or ran and reported failure is information the model
 /// needs in order to try something else — and it is text the far side already
-/// controls, so withholding it protects nothing.
+/// controls, so withholding it protects nothing from the far side. It is not
+/// unlabelled, though: see [`relayed_failure`].
 fn model_facing(e: &crate::core::StepError) -> Option<String> {
     match e {
         crate::core::StepError::Policy(p) => Some(p.for_model().to_owned()),
@@ -2006,6 +2000,29 @@ fn model_facing(e: &crate::core::StepError) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// What a failed call tells the model, with the failure's label joined into
+/// the conversation's.
+///
+/// A far side's error text is its output as much as its answer is — an MCP
+/// tool's `isError` content is rendered straight into it — so it carries the
+/// label an answer from that effect would have carried. Joined here exactly as
+/// a success's label is joined, so the next turn's sink gate judges the
+/// conversation the model will actually read: a confidential tool cannot reach
+/// a model with a lower ceiling by failing instead of answering.
+fn relayed_failure(
+    cx: &mut StepCtx<'_>,
+    conversation_label: &mut crate::core::Label,
+    e: &crate::core::StepError,
+) -> Option<String> {
+    let detail = model_facing(e)?;
+    if matches!(e, crate::core::StepError::Effect(_))
+        && let Some(failed) = cx.take_failed_output_label()
+    {
+        *conversation_label = conversation_label.join(&failed);
+    }
+    Some(detail)
 }
 
 #[cfg(all(test, feature = "providers"))]

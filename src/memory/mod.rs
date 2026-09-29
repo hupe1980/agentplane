@@ -300,8 +300,9 @@ pub struct Recall {
     pub purpose: Option<String>,
     /// At most this many, newest first.
     pub limit: usize,
-    /// Deterministic lifecycle cutoff. Set by [`StepCtx::recall`] from its
-    /// journaled clock; direct store callers may choose one explicitly.
+    /// Deterministic lifecycle cutoff. [`StepCtx::recall`] uses the later of
+    /// this and its journaled clock, so a step cannot read a memory back from
+    /// past its expiry; direct store callers may choose one explicitly.
     ///
     /// [`StepCtx::recall`]: crate::runtime::StepCtx::recall
     #[serde(
@@ -737,6 +738,31 @@ pub struct Selected {
     pub digest: Digest,
 }
 
+/// What a cascading erasure removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Cascade {
+    /// Ids erased whole — every version, and the id reserved from reuse —
+    /// each with the highest version it held.
+    pub erased: Vec<(String, u64)>,
+    /// Ids that stay current, each with exactly the superseded versions it
+    /// lost because they absorbed an erased source.
+    pub trimmed: Vec<(String, Vec<u64>)>,
+}
+
+impl Cascade {
+    /// How many ids lost state, each counted once.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.erased.len() + self.trimmed.len()
+    }
+
+    /// Whether the cascade removed nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.erased.is_empty() && self.trimmed.is_empty()
+    }
+}
+
 /// Why a memory operation could not be completed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MemoryError {
@@ -779,10 +805,11 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// the handle is actually scoped to.
     ///
     /// This exists so a mismatch with the plane's tenant is a **startup
-    /// refusal**. When a key ring is wired, `build()` seals this state under
-    /// the plane's tenant while the store writes rows under its own; the two
-    /// disagreeing is not a leak — the scopes simply differ — but it seals the
-    /// state under a scope erasure will never destroy. That is an erasure that
+    /// refusal**. A `keyring::EncryptedMemoryStore`
+    /// seals this state under the tenant it was constructed with while the
+    /// store writes rows under its own; the two disagreeing is not a leak — the
+    /// scopes simply differ — but it seals the state under a scope erasure
+    /// will never destroy. That is an erasure that
     /// reports success and misses, which is the one failure a deletion
     /// guarantee cannot have.
     fn tenant(&self) -> &str {
@@ -941,17 +968,24 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// and remained readable through [`version`](Self::version), would outlive
     /// the erasure that claimed to reach everything derived.
     ///
-    /// Returns the number of ids whose state this call actually removed — an
-    /// id that lost only superseded versions counts once; a tombstone passed
-    /// through is routed, not counted.
+    /// Returns the ids whose state this call actually removed, split into ids
+    /// erased whole and ids that lost only superseded versions; a tombstone
+    /// passed through is routed, not named. Named, with their versions, rather
+    /// than counted because a sealing wrapper seals every version under a key
+    /// of its own and destroys exactly the keys of what this removed: every
+    /// version of an id erased whole, and only the trimmed versions of one
+    /// that stays.
     ///
     /// # Errors
     ///
-    /// If the store cannot be reached.
-    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError>;
+    /// If the store cannot be reached, or
+    /// [`StoreError::UnderLegalHold`] naming a held id the traversal reached —
+    /// in which case nothing was removed.
+    async fn forget_cascading(&self, id: &str) -> Result<Cascade, StoreError>;
 
     /// Place or release a legal hold. A held id cannot be forgotten, swept, or
-    /// removed as part of subject/cascading erasure.
+    /// removed as part of subject/cascading erasure: those refuse with
+    /// [`StoreError::UnderLegalHold`], and the sweep passes over it.
     async fn set_legal_hold(&self, id: &str, held: bool) -> Result<(), StoreError>;
 
     /// Whether an id is currently protected by legal hold.
@@ -975,14 +1009,15 @@ pub trait MemoryStore: Send + Sync + Debug {
     ) -> Result<Vec<String>, StoreError>;
 
     /// Atomically erase current memories whose effective expiry has passed,
-    /// unless held. Returns the number of memory ids erased.
+    /// unless held. Returns the ids erased, each with the highest version it
+    /// held — what a sealing wrapper needs to destroy every version's key.
     ///
     /// The effective expiry is `min(expires_at, access window)` — the hard
     /// ceiling wins, and a lapsed sliding window collects an item its ceiling
     /// would still have kept. The cutoff is inclusive (`<= at`), and the sweep
     /// keeps derivation edges in both directions exactly as `forget` does, so
     /// a later cascading erasure still routes through the tombstone.
-    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, StoreError>;
+    async fn sweep_expired(&self, at: Timestamp) -> Result<Vec<(String, u64)>, StoreError>;
 
     /// Refresh sliding access retention for current ids at a journaled instant.
     ///

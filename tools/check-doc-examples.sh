@@ -8,24 +8,22 @@
 # not compile is the worst first impression a crate can make, and it is exactly
 # the kind of rot that sets in silently after an API change.
 #
-# Which blocks are checked, stated as what the code below actually does rather
-# than as a rule it does not implement. This comment used to claim "a block
-# qualifies when it carries its own `use` lines", and nothing enforced that: the
-# assembler picked exactly two blocks by searching for `impl Skill` and
-# `Runtime::builder`. The tool-call block carries `use` lines, was therefore
-# believed covered, and was not — it shipped for a while with `ToolCall::prepare(..)?`
-# in a function returning `SkillError`, which does not compile. A checker whose
-# comment overstates its own reach is worse than a narrower one, because it is
-# the reason nobody looks again.
+# Which blocks are checked, stated as what the code below actually does. A
+# checker whose comment overstates its own reach is worse than a narrower one,
+# because it is the reason nobody looks again.
 #
-# Three blocks are checked, each named by a marker unique to it:
+# Five blocks are checked, each named by a marker unique to it:
 #
-#   * the skill        (`impl Skill`)      — self-contained
-#   * the wiring       (`Runtime::builder`) — self-contained
-#   * the tool call    (`ToolCall::prepare`) — a *fragment*, compiled inside a
-#     function that supplies its three free names. That coupling is deliberate
-#     and narrow: the harness states the contract in one place, and a page that
-#     renames one of them fails here rather than in a reader's editor.
+#   * the skill        (`impl Skill`)          — self-contained
+#   * the wiring       (`Runtime::builder`)    — self-contained
+#   * the typed tool   (`impl Tool for`)       — self-contained, in its own module
+#   * the tool call    (`.call_tool(ToolId`)   — a *fragment*
+#   * the human task   (`cx.task(`)            — a *fragment*
+#
+# A fragment is compiled verbatim inside a function that supplies its free
+# names (`cx`, `model_written_memo`; `cx`, `justification`). That coupling is
+# deliberate and narrow: the harness states the contract in one place, and a
+# page that renames one of them fails here rather than in a reader's editor.
 #
 # Anything else on the page is prose-adjacent illustration and is not compiled.
 # Adding a block does not silently add coverage — say so here, or it has none.
@@ -150,6 +148,7 @@ edition = "2024"
 # heredoc: it is unquoted, so they would run as commands.)
 agentplane = { path = "$ROOT", features = ["redb", "testkit", "manifest"] }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 EOF
@@ -177,7 +176,9 @@ def one(marker):
 
 skill = one("impl Skill")
 wiring = one("Runtime::builder")
-tool_call = one("ToolCall::prepare")
+typed_tool = one("impl Tool for")
+tool_call = one(".call_tool(ToolId")
+task = one("cx.task(")
 
 
 def split_uses(block):
@@ -186,52 +187,74 @@ def split_uses(block):
     return uses, body
 
 
+def indent(text, n):
+    return "\n".join(" " * n + l if l else l for l in text.splitlines())
+
+
 wiring_uses, wiring_body = split_uses(wiring)
 tool_uses, tool_body = split_uses(tool_call)
+task_uses, task_body = split_uses(task)
 
-# The fragment's three free names are supplied as parameters so the block itself
-# is compiled **verbatim**. Rewriting it to fit would check a different program
+# A fragment's free names are supplied as parameters so the block itself is
+# compiled **verbatim**. Rewriting it to fit would check a different program
 # from the one the page publishes, which is the failure mode a snippet harness
 # exists to prevent.
 #
-# The fragment lives in its own module so its `use` lines are compiled as the
-# page writes them without colliding with the skill block's — two snippets on
+# Each fragment lives in its own module so its `use` lines are compiled as the
+# page writes them without colliding with another block's — two snippets on
 # one page legitimately import the same name, and rewriting either to avoid that
 # would check a program the page does not publish.
-tool_fn = "\n".join("        " + l for l in tool_body.splitlines())
-tool_mod_uses = "\n".join("    " + l for l in tool_uses.splitlines())
-main_fn = "\n".join("    " + l for l in wiring_body.splitlines())
-
 (work / "src/main.rs").write_text(f"""{skill}
 
 {wiring_uses}
 
-/// The tool-call fragment, verbatim, with the three names the page leaves to the reader.
+/// The typed tool, verbatim.
+#[allow(dead_code)]
+mod typed_tool {{
+{indent(typed_tool, 4)}
+}}
+
+/// The tool-call fragment, verbatim, with the names the page leaves to the reader.
 #[allow(dead_code, unused_variables, unused_imports)]
 mod governed_tool_call {{
-{tool_mod_uses}
+    use agentplane::prelude::*;
     use serde_json::json;
+{indent(tool_uses, 4)}
 
     pub async fn call(
-        cx: &mut agentplane::runtime::StepCtx<'_>,
-        client: std::sync::Arc<dyn agentplane::tools::ToolClient>,
-        model_written_memo: agentplane::core::Tainted<serde_json::Value>,
-    ) -> Result<(), agentplane::core::SkillError> {{
-{tool_fn}
+        cx: &mut StepCtx<'_>,
+        model_written_memo: Tainted<serde_json::Value>,
+    ) -> Result<(), SkillError> {{
+{indent(tool_body, 8)}
         let _ = result;
+        Ok(())
+    }}
+}}
+
+/// The human-task fragment, verbatim.
+#[allow(dead_code, unused_variables, unused_imports)]
+mod human_task {{
+    use agentplane::prelude::*;
+{indent(task_uses, 4)}
+
+    pub async fn ask(
+        cx: &mut StepCtx<'_>,
+        justification: agentplane::core::Justification,
+    ) -> Result<(), SkillError> {{
+{indent(task_body, 8)}
+        let _ = decision;
         Ok(())
     }}
 }}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {{
-{main_fn}
+{indent(wiring_body, 4)}
     Ok(())
 }}
 """)
-print("assembled the getting-started skill + wiring + tool call")
+print("assembled the getting-started skill, wiring, typed tool, tool call and task")
 PY
-
 cd "$WORK"
 cargo run --quiet
 echo "ok: the first example a reader copies compiles and runs"

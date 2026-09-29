@@ -42,6 +42,55 @@ pub async fn check(ring: &dyn KeyRing, scope: &str) -> Report {
     report
 }
 
+/// Two scopes are two erasure units: destroying one leaves the other readable.
+///
+/// Run it with scopes shaped like the ones the crate produces — a
+/// tenant-qualified case scope and event scopes carrying a counterparty's
+/// `?`, `#` and `..` — because a ring that maps a scope onto its backend
+/// badly fails here and nowhere else: two scopes truncated onto one key erase
+/// each other. Both scopes must be unused, and `scope` is destroyed.
+pub async fn check_isolated(ring: &dyn KeyRing, scope: &str, sibling: &str) -> Report {
+    let mut report = Report::default();
+    let at =
+        crate::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("a valid test instant");
+    report.checked += 1;
+    let (doomed, kept) = match (ring.data_key(scope).await, ring.data_key(sibling).await) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => {
+            report.record("data_key mints under a realistic scope", format!("{e}"));
+            return report;
+        }
+    };
+    if let Err(e) = ring.destroy(scope, at, "conformance battery").await {
+        report.record("destroy erases a realistic scope", format!("{e}"));
+        return report;
+    }
+    report.checked += 1;
+    if !matches!(ring.open(&doomed.1).await, Err(KeyError::Destroyed { .. })) {
+        report.record(
+            "destroy erases a realistic scope",
+            format!("a key wrapped under '{scope}' still opens after its scope was destroyed"),
+        );
+    }
+    report.checked += 1;
+    match ring.open(&kept.1).await {
+        Ok(opened) if opened.expose() == kept.0.expose() => {}
+        Ok(_) => report.record(
+            "a sibling scope survives an erasure",
+            "the sibling's wrapped key opened to different material",
+        ),
+        Err(e) => report.record(
+            "a sibling scope survives an erasure",
+            format!(
+                "destroying '{scope}' made '{sibling}' unopenable ({e}) — the two \
+                 scopes share one key in the backend, so erasing one message erases \
+                 another"
+            ),
+        ),
+    }
+    report
+}
+
 /// A data key is fresh per call, and its wrapped form opens back to it.
 async fn mint(
     ring: &dyn KeyRing,

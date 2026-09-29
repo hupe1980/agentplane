@@ -1,7 +1,7 @@
 //! A signer that is not cryptography.
 //!
 //! Exists so the store conformance battery can check that a backend **keeps**
-//! the attestation it was given. That is a persistence question, not a
+//! the signature it was given. That is a persistence question, not a
 //! cryptographic one, and pulling a real signature scheme into the battery would
 //! make every backend author install a crypto dependency to prove their `INSERT`
 //! has the right number of columns.

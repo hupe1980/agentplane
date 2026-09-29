@@ -29,8 +29,8 @@ use std::sync::Arc;
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{
     AwaitSpec, Calendar, CalendarError, CaseStatus, CorrelationKey, DeadlineSpec, DeadlineState,
-    Decision, Delivery, Digest, InboundEvent, Justification, OnExpiry, Operator, Priority,
-    TaskSpec, Timestamp,
+    Decision, Delivery, Digest, Expiry, InboundEvent, Justification, Operator, Priority, TaskSpec,
+    Timestamp,
 };
 use agentplane::journal::RecordKind;
 use agentplane::prelude::*;
@@ -175,13 +175,12 @@ impl Skill for SendRequest {
                     )
                     .role("mako-operator")
                     .priority(Priority::High)
-                    // Four eyes: whoever proposed this does not approve it.
-                    .excluding("agent:switch-bot")
-                    // Escalation must say who it widens to; a bare `Escalate`
-                    // is refused, because widening is its one enforceable
+                    // Four eyes needs no line here: the operator who asked for
+                    // this run is barred from every task it opens.
+                    // Escalation says who it widens to — the roles are part
+                    // of the variant, because widening is its one enforceable
                     // meaning.
-                    .on_expiry(OnExpiry::Escalate)
-                    .escalate_to("mako-team-lead"),
+                    .on_expiry(Expiry::escalate_to(["mako-team-lead"])),
                 )
                 .await?;
 
@@ -227,14 +226,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys = [CorrelationKey::new("document", "DOC-4711")];
 
     // ── Day 0: the request goes out ────────────────────────────────────────
-    let sent = rt
-        .run_correlated(
+    // Rita asks for it, and the run records that she did.
+    let agentplane::runtime::Admission::Fresh(sent) = rt
+        .run_under(
             "switch.request",
             Tainted::trusted(json!({ "document": "DOC-4711", "meter": "51238696781" })),
-            "supplier-switch",
-            &keys,
+            agentplane::runtime::RunTerms::default()
+                .correlated("supplier-switch", &keys)
+                .admitted_by("rita"),
         )
-        .await?;
+        .await?
+    else {
+        unreachable!("an unkeyed admission is always fresh");
+    };
     println!("day 0  request   → {}", sent.status.as_str());
     if let RunStatus::Suspended(reason) = &sent.status {
         println!("       waiting   → {reason}");
@@ -303,11 +307,11 @@ async fn handle_rejection(
     println!("       confidence→ {:?}", task.justification.confidence);
     println!("       cost      → {:?}", task.justification.cost);
 
-    // Four eyes: the proposer may not approve their own proposal.
+    // Four eyes: the operator who asked for the switch may not approve it.
     let self_approval = rt
         .decide_task(
             task.id,
-            &Decision::approve(Operator::asserted("agent:switch-bot")?, "I am sure"),
+            &Decision::approve(Operator::asserted("rita")?, "I am sure"),
             &["mako-operator".to_owned()],
         )
         .await;

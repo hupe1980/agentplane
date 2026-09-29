@@ -123,6 +123,14 @@ impl JournalStore for SharedJournal {
     ) -> Result<Vec<(RunId, u64)>, StoreError> {
         self.inner.recent_runs(after, limit).await
     }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs_from(source, after, limit).await
+    }
 
     async fn case_history(
         &self,

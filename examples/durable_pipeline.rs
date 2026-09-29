@@ -11,8 +11,8 @@
 //! 1. A run performs three externally visible stages and journals each one.
 //! 2. Strict replay re-executes the logic and performs **nothing** — every
 //!    effect is read back from the journal.
-//! 3. A run interrupted after stage 1 resumes at stage 2, so stage 1 happens
-//!    exactly once across both attempts.
+//! 3. A run interrupted after its first stage resumes at the second, so the
+//!    first happens exactly once across both attempts.
 //! 4. Changing the code makes replay diverge, and the run is quarantined
 //!    instead of quietly rewriting history.
 

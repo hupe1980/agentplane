@@ -42,7 +42,9 @@
 //! common to every HTTP driver. What is
 //! specific here is the success envelope: `choices[0].finish_reason` is
 //! `"length"` for a truncated answer (reported through
-//! [`Completion::truncated`], never as a silently shortened string), a
+//! [`Completion::truncated`], never as a silently shortened string), `stop`
+//! and `tool_calls` are the only reasons read as an answer — `content_filter`
+//! and anything unrecognised are a **metered** `Unusable` — a
 //! `message.refusal` is a **metered** decline, and tool-call arguments arrive
 //! as JSON strings that must parse — a malformed one is a loud, metered
 //! [`ModelError::Unusable`], not a dropped call.
@@ -566,6 +568,7 @@ impl ChatCompletions {
 
     /// Turn a response envelope into a [`Completion`] — one interpretation
     /// shared exactly by the buffered and streaming paths.
+    #[allow(clippy::too_many_lines)]
     fn interpret(
         &self,
         parsed: &ApiResponse,
@@ -592,7 +595,24 @@ impl ChatCompletions {
         }
 
         let text = choice.message.content.clone().unwrap_or_default();
-        let truncated = choice.finish_reason.as_deref() == Some("length");
+        // An allowlist. `stop` and `tool_calls` (and the older `function_call`
+        // spelling) are an answer, `length` a typed truncation; anything else —
+        // `content_filter`, a server's own reason, no reason at all — ended
+        // without one, and is metered because deciding cost what it cost.
+        let truncated = match choice.finish_reason.as_deref() {
+            Some("stop" | "tool_calls" | "function_call") => false,
+            Some("length") => true,
+            other => {
+                return Err(ModelError::Unusable {
+                    model: model.clone(),
+                    usage,
+                    detail: format!(
+                        "generation stopped: {}",
+                        other.unwrap_or("no finish_reason, so completeness is unknown")
+                    ),
+                });
+            }
+        };
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
 
         // Arguments are JSON strings and must parse. A malformed call is a
@@ -742,7 +762,9 @@ impl ChatCompletions {
         while let Some(chunk) = body.next().await {
             let chunk = match chunk {
                 Ok(chunk) => chunk,
-                Err(e) => return Err(severed(model, &acc, &e.to_string())),
+                Err(e) => {
+                    return Err(severed(model, &acc, &crate::netguard::transport_text(&e)));
+                }
             };
             // Charged before the chunk is kept: what the ceiling bounds is
             // what this process holds, not what it has already held. The
@@ -853,7 +875,6 @@ impl ModelProvider for ChatCompletions {
             "base": self.base,
             "schema_mode": schema_mode,
             "stream": self.stream,
-            "timeout_ms": self.timeout.as_millis(),
         })
     }
 

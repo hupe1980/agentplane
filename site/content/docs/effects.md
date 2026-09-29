@@ -9,8 +9,9 @@ group = "How it works"
 
 Every outward call — a model completion, a tool call, a clock read, a payment —
 crosses one protocol. This page is that protocol, the saga rules built on it, the
-transactional group that sits between an effect and a step, and what an operator
-stopping a run does to work already done.
+transactional group that sits between an effect and a step, how case state and
+run ownership stay inside it, what an operator stopping a run does to work
+already done, and how memory is governed by the same rules.
 
 ## The effect protocol
 
@@ -104,7 +105,13 @@ one of them provably never reached the peer. So every `EffectError` declares a
 |---|---|---|
 | `DidNotHappen` | Refused before dispatch, or rejected with the request intact | Always — even for a mutation |
 | `InDoubt` | Timed out, or the connection died mid-flight | Only if `Recovery` says so |
-| `Landed` | It took effect and the response would not decode | Never |
+| `Landed` | It took effect and failed, or its response would not decode | Never for a mutation; see below |
+
+A `Landed` read or model completion changed nothing, so it is repeated when the
+retry policy permits — the failed attempt's spend is billed first — unless the
+failure is permanent: a tool that ran and reported failure has given its answer,
+and is not asked again unless its `ToolSafety::retry_landed` says its failures
+are transient.
 
 The vocabulary is borrowed from distributed transactions, where a participant
 whose outcome is unknown after a failure has been called **in-doubt** since the
@@ -321,7 +328,7 @@ of the schedule.
     ended, severity decides, not the order they happened to be scheduled in.
     Quarantined outranks Failed, which outranks Exhausted, which outranks
     Suspended. Cancelled ranks with Failed; Replanning ranks with Suspended.
-    Only Quarantined refuses to unwind.</desc>
+    Failed unwinds; Quarantined must not; Exhausted and Suspended pause.</desc>
 
   <rect class="box" x="14"  y="58" width="132" height="52" rx="9"/>
   <rect class="box" x="176" y="58" width="132" height="52" rx="9"/>
@@ -333,7 +340,7 @@ of the schedule.
   <text class="lbl" x="242" y="80"  text-anchor="middle">Failed</text>
   <text class="sub" x="242" y="97"  text-anchor="middle">unwinds</text>
   <text class="lbl" x="404" y="80"  text-anchor="middle">Exhausted</text>
-  <text class="sub" x="404" y="97"  text-anchor="middle">unwinds</text>
+  <text class="sub" x="404" y="97"  text-anchor="middle">pauses</text>
   <text class="lbl" x="563" y="80"  text-anchor="middle">Suspended</text>
   <text class="sub" x="563" y="97"  text-anchor="middle">still working</text>
 
@@ -503,6 +510,13 @@ no resume can repair — a **sealed** conclusion over an unsettled group — is 
 `agentplane audit` finding, because nothing may resume a sealed run and
 whether its members were taken or taken back is then permanently undecided.
 
+A group settled `Aborted` leaves its step with **nothing to undo**. The run's
+unwind judges each step by the mutating effects it journaled, and it discounts
+the members and reversals of an aborted group: that settlement is written only
+once every landed member was taken back. So a checkout whose invariant failed
+does not quarantine a step that declares no compensation, and a step that does
+declare one is not undone a second time.
+
 ### The model, and what it proves
 
 The frontier is specified in TLA+ and model-checked, because "several calls take
@@ -518,11 +532,9 @@ written for it, and every invariant is mapped to a test that checks the same
 property against the code. A model verifying a protocol the runtime does not
 implement is a green job that says nothing, so that mapping is itself enforced.
 
-One invariant had to be weakened before it verified, and the weakening is the
-interesting part: "a gated member runs only for a **committed** group" is false,
-because a member is legitimately released while the group is still open — commit
-is what *follows* the last release. Stated over the frontier instead, it holds.
-The model rejected the sentence a person would have written.
+The gating invariant is stated over the frontier, not over a committed group:
+a member is legitimately released while the group is still open, because commit
+is what *follows* the last release.
 
 ### The strongest class: committing *with* the journal
 
@@ -576,7 +588,7 @@ transaction is an externalisation with no reversal registered and none
 possible. Settling `Aborted` there would put *taken back whole* in the journal
 over a ledger row that stands, which is precisely the claim the quarantine
 outcome exists to refuse. The TLA+ model's `AbortIsComplete` invariant carries
-the same conjunct, and a mutant restoring the old behaviour is caught by it.
+the same conjunct, and a mutant that settles `Aborted` there is caught by it.
 
 ### What a group is not
 
@@ -601,6 +613,57 @@ A suspension is not an abandonment. The frame is persisted and the step re-runs
 from the top, rebuilding the group from the journal as it replays the members, so
 a group may legitimately span a durable wait.
 
+## Case state and ownership
+
+### Every case mutation is an effect
+
+A case's status and its obligations are shared mutable state that outlives the
+run: several runs and an operator all write them over months. Both changes go
+through the effect protocol, and the two reasons are separate.
+
+**A write outside the journal is performed again on every replay.** Replaying
+last quarter's history to answer a question would close a case that has since
+been reopened — a replay reads history, it does not rewrite the world that
+history happened in.
+
+**And it leaves nothing to attribute.** *Who closed this case, and when* is
+exactly what the journal is for, and a status that changed without a record is a
+change nobody can answer for.
+
+The deadline transition also reads the state it moved *from* inside the effect
+rather than before it. Reading first would put a store lookup in the
+deterministic zone, and a replay would report whatever the deadline says now as
+the state it moved from.
+
+### A lease answers "is the owner dead?", and nothing else
+
+Ownership is a lease with a TTL, and the epoch it carries is what fences a
+displaced writer. The trap is that expiry answers a second question nobody
+asked: **a healthy run that outlives its TTL looks exactly like a crashed one**.
+Agent runs routinely outlive a lease, because a single model call can. Another
+instance then acquires the run, bumps the epoch, and the original is fenced on
+its next append — killed mid-flight, having already done real work, for being
+slow.
+
+So the runtime **renews while it executes**, on a task that is aborted the moment
+execution returns by any path. The TTL then bounds how long a *crashed* owner
+strands its runs, which is what it is for, and stops bounding how long a run may
+take, which it should never have bounded. Strict verification renews nothing,
+because it never writes and holds no lease.
+
+Renewal runs at a third of the TTL, so two renewals can be lost to a slow store
+before the lease lapses. Renewing *at* the TTL would make any hesitation fatal,
+and a lapsed lease is one anybody may take — including, per `acquire`'s own
+rule, the caller that let it lapse, which would fence a run with its own
+heartbeat.
+
+`RuntimeBuilder::lease_ttl` sets it, and **refuses anything under two seconds**.
+Both stores keep expiry in whole seconds and lapse on `expires_at <= now`, so a
+one-second lease is expired for part of every second it exists and no renewal
+frequency saves it. A plane configured that way would have runs taken from it
+under load and nowhere else — so it is refused at build rather than left to be
+discovered.
+
 ## Stopping a run
 
 Article 14 is not "a human can approve things". It is oversight, and the half
@@ -614,6 +677,69 @@ interrupting between "announced" and "recorded" manufactures exactly the
 in-doubt case the effect protocol exists to avoid. A suspended run has no thread
 to notice anything, so `request_cancel` resumes it itself; a run executing
 elsewhere sees the request at its own next boundary.
+
+### The request lives beside the chain, not in it
+
+Every other write to a run requires the fencing lease, because two writers on one
+chain is the corruption fencing prevents. A stop request is the opposite case:
+whoever is asking is **not** the owner, holds no epoch, and is usually asking
+because the owner is busy doing the thing they want stopped. Requiring the lease
+would mean the only party who can stop a running agent is the process running it.
+
+So the request goes to a side table — unfenced, idempotent, first-asker-wins —
+and the *owner* journals `RunCancelled` when it acts on the request. That puts
+"who asked, and why" inside the hash chain without letting an unfenced writer
+append to it. A second asker is told `recorded: false` rather than silently
+replacing the first, because an upsert would reassign the intervention to
+whoever asked last and make "who stopped this run?" answer wrongly six weeks
+later.
+
+### A stop unwinds, including the step it interrupted
+
+Compensation walks *completed* steps, which is right for a failure: the step that
+failed ended on its own terms. A stop arrives from outside while a step is
+typically **suspended** — waiting for a human, holding effects it already
+performed, and never completing. Unwinding only completed steps would leave
+exactly the work the operator was trying to stop.
+
+So for a cancellation the list is extended from journal evidence: any step with a
+recorded mutating effect that is neither complete nor already compensated. The
+interrupted step goes last, so the reverse walk undoes it first.
+
+A failure interrupts its concurrent siblings the same way: one step fails while
+a sibling sits suspended holding a landed mutation. Whether a failure unwinds at
+all is asked of the completed steps **and** those interrupted siblings — a
+sibling that mutated, never completed and did not itself fail — so a failure with
+nothing completed to compensate still unwinds the sibling's landed work. The
+failing step is not asked: a failure whose only landed work is its own stays
+resumable, and `agentplane attention` lists it as `run.failed_with_landed_work`
+until somebody finishes it with `replay` or unwinds it with `cancel`.
+
+### And it refuses to unwind around doubt
+
+A run holding an effect that may or may not have landed is quarantined, not
+unwound — compensating everything except the one thing nobody can account for is
+how a saga refunds money nobody took. Cancellation opened a second door into the
+unwind, and it is shut the same way.
+
+That check is scoped to cancellation deliberately. An ordinary failure that
+leaves an orphan is not stuck: the announcement is journaled, the effect declared
+a `Recovery`, and resuming resolves it. Quarantining there would turn every
+recoverable orphan into a permanent operator obligation.
+
+### The replay cursor is keyed by phase, not only by step
+
+A step's forward pass and its compensation share a step id, so a cursor keyed by
+step alone would be shared between them. That holds only while compensation
+cannot start before the forward pass has consumed its own history — and
+cancelling a *suspended* run reaches compensation without re-running the forward
+pass, at which point the compensating effect reads the forward record and
+reports non-determinism against history that is sound.
+
+So the cursor is keyed by `(step, phase)`, which is what the effect key already
+says the identity is.
+
+## Memory
 
 ### Four state lifetimes, not one “memory” switch
 
@@ -641,10 +767,10 @@ that can silently rewrite the system prompt. A single mutable user “profile”
 also not a special primitive: use narrow versioned items unless the application
 owns a typed profile/patch contract and its conflict policy.
 
-Formation is currently **hot-path and synchronous**, making latency and failure
-part of the run. Background formation can be built as an explicit scheduled
-skill over journal/case inputs; it is not a hidden hook, because another run and
-effect history must own that mutation.
+Formation is **hot-path and synchronous**, so its latency and failure are part
+of the run. Background formation is an explicit scheduled skill over journal or
+case inputs, never a hidden hook, because another run and effect history must
+own that mutation.
 
 An application chooses durable sharing with `subject`: use an agent-qualified
 subject for private memory or a team-qualified subject for several agents in one
@@ -796,8 +922,8 @@ with it. `forget_cascading` is what an **erasure** needs: the memory and
 everything transitively derived from it. A correction retains outgoing lineage,
 so deciding later that the request was really an erasure can still reach every
 summary. Cascading erasure is a required backend operation, not a default loop
-over `derivatives` and `forget`: that loop had a gap in which another writer
-could add a summary after traversal. redb uses one write transaction;
+over `derivatives` and `forget`: that loop would leave a gap in which another
+writer could add a summary after traversal. redb uses one write transaction;
 PostgreSQL excludes derivative creation for the complete traversal and deletion.
 
 Formation is explicit despite being automatic: a digest-covered manifest field
@@ -808,104 +934,3 @@ so destroying it makes backup ciphertext unreadable. Its concrete lifecycle
 coordinator is single-node; active-active deployments still need a distributed
 database/KMS ceremony. Provider conversations and compaction remain projections,
 never durable memory truth.
-
-### Every case mutation is an effect
-
-A case's status and its obligations are shared mutable state that outlives the
-run: several runs and an operator all write them over months. Both changes go
-through the effect protocol, and the two reasons are separate.
-
-**A write outside the journal is performed again on every replay.** Replaying
-last quarter's history to answer a question would close a case that has since
-been reopened — a replay reads history, it does not rewrite the world that
-history happened in.
-
-**And it leaves nothing to attribute.** *Who closed this case, and when* is
-exactly what the journal is for, and a status that changed without a record is a
-change nobody can answer for.
-
-The deadline transition also reads the state it moved *from* inside the effect
-rather than before it. Reading first would put a store lookup in the
-deterministic zone, and a replay would report whatever the deadline says now as
-the state it moved from.
-
-### A lease answers "is the owner dead?", and nothing else
-
-Ownership is a lease with a TTL, and the epoch it carries is what fences a
-displaced writer. The trap is that expiry answers a second question nobody
-asked: **a healthy run that outlives its TTL looks exactly like a crashed one**.
-Agent runs routinely outlive a lease, because a single model call can. Another
-instance then acquires the run, bumps the epoch, and the original is fenced on
-its next append — killed mid-flight, having already done real work, for being
-slow.
-
-So the runtime **renews while it executes**, on a task that is aborted the moment
-execution returns by any path. The TTL then bounds how long a *crashed* owner
-strands its runs, which is what it is for, and stops bounding how long a run may
-take, which it should never have bounded. Strict verification renews nothing,
-because it never writes and holds no lease.
-
-Renewal runs at a third of the TTL, so two renewals can be lost to a slow store
-before the lease lapses. Renewing *at* the TTL would make any hesitation fatal,
-and a lapsed lease is one anybody may take — including, per `acquire`'s own
-rule, the caller that let it lapse, which would fence a run with its own
-heartbeat.
-
-`RuntimeBuilder::lease_ttl` sets it, and **refuses anything under two seconds**.
-Both stores keep expiry in whole seconds and lapse on `expires_at <= now`, so a
-one-second lease is expired for part of every second it exists and no renewal
-frequency saves it. A plane configured that way would have runs taken from it
-under load and nowhere else — so it is refused at build rather than left to be
-discovered.
-
-### The request lives beside the chain, not in it
-
-Every other write to a run requires the fencing lease, because two writers on one
-chain is the corruption fencing prevents. A stop request is the opposite case:
-whoever is asking is **not** the owner, holds no epoch, and is usually asking
-because the owner is busy doing the thing they want stopped. Requiring the lease
-would mean the only party who can stop a running agent is the process running it.
-
-So the request goes to a side table — unfenced, idempotent, first-asker-wins —
-and the *owner* journals `RunCancelled` when it acts on the request. That puts
-"who asked, and why" inside the hash chain without letting an unfenced writer
-append to it. A second asker is told `recorded: false` rather than silently
-replacing the first, because an upsert would reassign the intervention to
-whoever asked last and make "who stopped this run?" answer wrongly six weeks
-later.
-
-### A stop unwinds, including the step it interrupted
-
-Compensation walks *completed* steps, which is right for a failure: the step that
-failed ended on its own terms. A stop arrives from outside while a step is
-typically **suspended** — waiting for a human, holding effects it already
-performed, and never completing. Unwinding only completed steps would leave
-exactly the work the operator was trying to stop.
-
-So for a cancellation the list is extended from journal evidence: any step with a
-recorded mutating effect that is neither complete nor already compensated. The
-interrupted step goes last, so the reverse walk undoes it first.
-
-### And it refuses to unwind around doubt
-
-A run holding an effect that may or may not have landed is quarantined, not
-unwound — compensating everything except the one thing nobody can account for is
-how a saga refunds money nobody took. Cancellation opened a second door into the
-unwind, and it is shut the same way.
-
-That check is scoped to cancellation deliberately. An ordinary failure that
-leaves an orphan is not stuck: the announcement is journaled, the effect declared
-a `Recovery`, and resuming resolves it. Quarantining there would turn every
-recoverable orphan into a permanent operator obligation.
-
-### The replay cursor is keyed by phase, not only by step
-
-A step's forward pass and its compensation share a step id, so a cursor keyed by
-step alone would be shared between them. That holds only while compensation
-cannot start before the forward pass has consumed its own history — and
-cancelling a *suspended* run reaches compensation without re-running the forward
-pass, at which point the compensating effect reads the forward record and
-reports non-determinism against history that is sound.
-
-So the cursor is keyed by `(step, phase)`, which is what the effect key already
-says the identity is.

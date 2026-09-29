@@ -100,6 +100,10 @@ impl ScopedBlobs {
                 digest: digest.to_hex(),
                 detail,
             },
+            BlobError::Unopened { detail, .. } => BlobError::Unopened {
+                digest: digest.to_hex(),
+                detail,
+            },
             e @ (BlobError::Backend(_) | BlobError::Corrupt { .. }) => e,
         }
     }

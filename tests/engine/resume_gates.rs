@@ -16,10 +16,22 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(any(feature = "manifest", feature = "testkit"))]
+use std::time::Duration;
 
+#[cfg(feature = "manifest")]
+use agentplane::case::TimerStore;
+#[cfg(any(feature = "manifest", feature = "testkit"))]
+use agentplane::case::{CaseStore, EventStore};
 use agentplane::core::{
     ArgSource, Budget, Compensation, Effect, EffectDescriptor, EffectError, Outcome, PlanIR,
     PlanNode, Recovery, RetryPolicy, RunId, Skill, SkillDescriptor, SkillError, StepId, Tainted,
+};
+#[cfg(any(feature = "manifest", feature = "testkit"))]
+use agentplane::core::{AwaitSpec, CorrelationKey, DeadlineSpec, InboundEvent, Timestamp};
+#[cfg(feature = "manifest")]
+use agentplane::core::{
+    Delivery, Digest, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
 };
 use agentplane::journal::{Append, JournalStore, RecordKind};
 use agentplane::runtime::effects::Recorded;
@@ -158,17 +170,19 @@ async fn an_edited_declaration_is_refused_before_the_resume_replays() {
     assert_ne!(edited, LEAKY, "the fixture edited nothing");
     crash.store(false, Ordering::SeqCst);
 
-    let err = plane(&edited, &crash)
+    let refused = plane(&edited, &crash)
         .replay(crashed.run_id, Mode::Resume)
         .await
-        .expect_err("a resume under an edited declaration must be refused");
-    let msg = err.to_string();
+        .expect("a refused resume is journaled as the run's quarantine, not raised");
+    let RunStatus::Quarantined(msg) = &refused.status else {
+        panic!("a resume under an edited declaration must be refused: {refused:?}");
+    };
     assert!(
         msg.contains("declaration for `leaky` changed"),
         "the refusal has to name the agent whose declaration moved: {msg}"
     );
     assert!(
-        msg.contains("resume under the revision that wrote the journal"),
+        msg.contains("under the revision that wrote the journal"),
         "and hand over the remedy, since the recorded digest is the argument \
          for it: {msg}"
     );
@@ -178,10 +192,15 @@ async fn an_edited_declaration_is_refused_before_the_resume_replays() {
         "the refused resume dispatched the very effect the edit would have allowed"
     );
 
-    // And the unedited plane still resumes, or this test would pass against a
-    // gate that refuses every resume.
+    // And the unedited plane still resumes once the quarantine is answered, or
+    // this test would pass against a gate that refuses every resume.
     let same = plane(LEAKY, &crash)
-        .replay(crashed.run_id, Mode::Resume)
+        .decide_quarantine(
+            crashed.run_id,
+            &operator("oncall"),
+            "back on the admitted revision",
+            agentplane::core::QuarantineDecision::Reopen,
+        )
         .await
         .expect("an unchanged declaration resumes");
     assert!(matches!(same.status, RunStatus::Failed(_)), "{same:?}");
@@ -483,6 +502,67 @@ async fn the_delegation_ceiling_holds_on_the_live_tail_of_a_resume() {
     assert_eq!(staged.load(Ordering::SeqCst), 1);
 }
 
+/// A run acting under no chain starts from the plane's depth.
+///
+/// A served caller that presented no chain acts under none, and is bounded by
+/// the plane's chain; counting its hand-offs from the owner rather than from
+/// the plane would let it delegate further than the plane itself may.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_chainless_run_delegates_from_the_planes_depth() {
+    const DEPTH_ONE: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: chief, version: "1.0.0" }
+spec:
+  capabilities: { provides: [demo.chief] }
+  security: { max_delegation_depth: 1 }
+  budgets: {}
+"#;
+    let manifest = agentplane::manifest::Manifest::parse(DEPTH_ONE).expect("parse");
+    let store = store();
+    let helped = Arc::new(AtomicUsize::new(0));
+    let plane = agentplane::core::Delegation::root(agentplane::core::Principal::new(
+        "user:operator",
+        agentplane::core::Scope::root(),
+    ))
+    .delegate(agentplane::core::Principal::new(
+        "svc:plane",
+        agentplane::core::Scope::root(),
+    ))
+    .expect("delegate");
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .acting_as(plane)
+        .agent(
+            agentplane::runtime::Agent::new(&manifest).skill(ChiefAfterCrash {
+                crash: Arc::new(AtomicBool::new(false)),
+                staged: Arc::new(AtomicUsize::new(0)),
+            }),
+        )
+        .skill(Helper {
+            calls: Arc::clone(&helped),
+        })
+        .build();
+
+    let admitted = rt
+        .run_under(
+            "demo.chief",
+            Tainted::trusted(json!({})),
+            agentplane::runtime::RunTerms::default().served(None),
+        )
+        .await
+        .expect("admitted");
+    let agentplane::runtime::Admission::Fresh(out) = admitted else {
+        panic!("a fresh admission");
+    };
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "a chainless run delegated past the plane's depth: {:?}",
+        out.status
+    );
+    assert_eq!(helped.load(Ordering::SeqCst), 0);
+}
+
 // ── A final InDoubt on a mutating effect is an operator's question ──────────
 
 #[derive(Debug)]
@@ -677,6 +757,8 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         policy_bundle: None,
                         canon: canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 ),
                 Append::new(
@@ -1561,4 +1643,449 @@ async fn a_repeated_conclusion_is_not_re_sealed_but_a_new_one_is() {
          history still says it failed"
     );
     store.verify(out.run_id).await.unwrap();
+}
+
+// ── A refused resume stays findable ─────────────────────────────────────────
+//
+// Most resumes are unattended. A timer's wake and an event's delivery record
+// the awaited result and then resume under the lease they recorded it with; the
+// recovery sweep resumes a run its owner died holding. When the resume is
+// refused because the plane no longer holds what the run was admitted under,
+// nobody is there to read the error — and the recorded wake has already taken
+// the run off the waiting listing. Unless the refusal is journaled, the run
+// sits on no listing at all: not waiting, not concluded, not abandoned.
+
+/// Waits once — on a timer or on a message — and then finishes.
+#[cfg(any(feature = "manifest", feature = "testkit"))]
+#[derive(Debug)]
+struct WaitsOnce {
+    on_event: bool,
+}
+
+#[cfg(any(feature = "manifest", feature = "testkit"))]
+#[async_trait::async_trait]
+impl Skill for WaitsOnce {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("waiter").provides("demo.wait")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        if self.on_event {
+            cx.deadline("window", &DeadlineSpec::days(1), None).await?;
+            cx.await_event(
+                &AwaitSpec::new("go.ahead", "window")
+                    .correlate(CorrelationKey::new("matter", "M-1")),
+            )
+            .await?;
+        } else {
+            cx.sleep(Duration::from_secs(2)).await?;
+        }
+        Ok(Outcome::done(Tainted::trusted(json!({ "woke": true }))))
+    }
+}
+
+#[cfg(feature = "manifest")]
+const WAITER: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: waiter, version: "1.0.0" }
+spec:
+  capabilities: { provides: [demo.wait] }
+  security: { max_sensitivity_egress: internal }
+  budgets: {}
+"#;
+
+/// Permits everything, under a bundle identity the test names.
+#[cfg(feature = "manifest")]
+#[derive(Debug)]
+struct PermitsAll(&'static str);
+
+#[cfg(feature = "manifest")]
+impl PolicyEngine for PermitsAll {
+    fn authorize(&self, _request: &PolicyRequest<'_>) -> PolicyDecision {
+        PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(
+            Digest::of(self.0.as_bytes()),
+            "agentplane-test/resume-gates",
+        )
+    }
+}
+
+/// Which admitted fact the second plane no longer holds.
+#[cfg(feature = "manifest")]
+#[derive(Debug, Clone, Copy)]
+enum Moved {
+    Declaration,
+    Bundle,
+}
+
+#[cfg(feature = "manifest")]
+fn edited_waiter() -> String {
+    let edited = WAITER.replace(
+        "max_sensitivity_egress: internal",
+        "max_sensitivity_egress: confidential",
+    );
+    assert_ne!(edited, WAITER, "the fixture edited nothing");
+    edited
+}
+
+/// A plane over the shared stores: the one the run was admitted on, or one
+/// holding a different revision of whatever `moved` names.
+#[cfg(feature = "manifest")]
+fn waiter_plane(store: &Arc<RedbStore>, on_event: bool, moved: Option<Moved>) -> Arc<Runtime> {
+    let yaml = match moved {
+        Some(Moved::Declaration) => edited_waiter(),
+        _ => WAITER.to_owned(),
+    };
+    let bundle = match moved {
+        Some(Moved::Bundle) => "bundle-b",
+        _ => "bundle-a",
+    };
+    let manifest = agentplane::manifest::Manifest::parse(&yaml).expect("parse");
+    Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .timers(store.clone() as Arc<dyn TimerStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .policy(Arc::new(PermitsAll(bundle)) as Arc<dyn PolicyEngine>)
+        .agent(agentplane::runtime::Agent::new(&manifest).skill(WaitsOnce { on_event }))
+        .build()
+}
+
+/// Admit a run on the original plane and let it suspend on its wait.
+#[cfg(feature = "manifest")]
+async fn suspended_waiter(store: &Arc<RedbStore>, on_event: bool) -> RunId {
+    let out = waiter_plane(store, on_event, None)
+        .run_correlated(
+            "demo.wait",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[CorrelationKey::new("matter", "M-1")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+    out.run_id
+}
+
+#[cfg(any(feature = "manifest", feature = "testkit"))]
+#[allow(clippy::disallowed_methods)]
+fn later(secs: i64) -> Timestamp {
+    Timestamp::now_utc()
+        .checked_add(time::Duration::seconds(secs))
+        .unwrap()
+}
+
+/// The refused run is quarantined, names what moved, is counted where a
+/// person looks — and the remedy it names works.
+#[cfg(feature = "manifest")]
+async fn assert_findable_and_answerable(
+    store: &Arc<RedbStore>,
+    run: RunId,
+    on_event: bool,
+    moved: Moved,
+) {
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    assert!(
+        journal
+            .runs_by_outcome("quarantined", 10)
+            .await
+            .unwrap()
+            .contains(&run),
+        "the refused resume left the run on no listing: not waiting, not \
+         concluded, not abandoned"
+    );
+
+    let reason = journal
+        .read(run, 1)
+        .await
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|r| match r.kind() {
+            RecordKind::RunConcluded { reason, .. } => reason.clone(),
+            _ => None,
+        })
+        .expect("the quarantine says why");
+    let (recorded, held) = match moved {
+        Moved::Declaration => (
+            agentplane::manifest::Manifest::parse(WAITER)
+                .unwrap()
+                .digest()
+                .unwrap(),
+            agentplane::manifest::Manifest::parse(&edited_waiter())
+                .unwrap()
+                .digest()
+                .unwrap(),
+        ),
+        Moved::Bundle => (
+            PermitsAll("bundle-a").bundle().digest(),
+            PermitsAll("bundle-b").bundle().digest(),
+        ),
+    };
+    for named in [recorded.to_string(), held.to_string()] {
+        assert!(
+            reason.contains(&named),
+            "the quarantine must name both revisions, and {named} is missing: {reason}"
+        );
+    }
+    if matches!(moved, Moved::Declaration) {
+        assert!(reason.contains("`waiter`"), "and the agent: {reason}");
+    }
+
+    let attention = waiter_plane(store, on_event, None)
+        .attention(later(0), 10)
+        .await
+        .unwrap();
+    assert!(
+        attention
+            .conditions
+            .iter()
+            .any(|c| c.kind == "run.quarantined"),
+        "the refused run needs a person and the roll-up did not say so: {attention:?}"
+    );
+
+    // The remedy the reason names: reopen it on a plane holding the revision
+    // it was admitted under, which resumes it past the recorded wait.
+    let reopened = waiter_plane(store, on_event, None)
+        .decide_quarantine(
+            run,
+            &operator("oncall"),
+            "rolled back to the admitted revision",
+            agentplane::core::QuarantineDecision::Reopen,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(reopened.status, RunStatus::Succeeded),
+        "a reopen under the admitted revision did not finish the run: {:?}",
+        reopened.status
+    );
+}
+
+#[cfg(feature = "manifest")]
+async fn a_refused_wake_stays_findable(moved: Moved) {
+    let store = store();
+    let run = suspended_waiter(&store, false).await;
+
+    let woken = waiter_plane(&store, false, Some(moved))
+        .fire_timers(later(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        (woken.fired, woken.failed),
+        (1, 0),
+        "the wake happened and was recorded; its refused resume is the run's \
+         quarantine, not a failure of the wake"
+    );
+    assert_findable_and_answerable(&store, run, false, moved).await;
+}
+
+#[cfg(feature = "manifest")]
+async fn a_refused_delivery_stays_findable(moved: Moved) {
+    let store = store();
+    let run = suspended_waiter(&store, true).await;
+
+    let delivery = waiter_plane(&store, true, Some(moved))
+        .deliver(
+            &InboundEvent::new(
+                "urn:test:approver",
+                "EV-1",
+                "go.ahead",
+                json!({ "ok": true }),
+            )
+            .correlate(CorrelationKey::new("matter", "M-1")),
+        )
+        .await
+        .expect("the event was delivered; the run's refusal is the run's");
+    assert_eq!(delivery, Delivery::Resumed { run });
+    assert_findable_and_answerable(&store, run, true, moved).await;
+}
+
+/// The owner recorded the wake and died before resuming — the state a crash
+/// in the handover leaves — and a plane on the other revision recovers it.
+#[cfg(feature = "manifest")]
+async fn a_refused_recovery_stays_findable(moved: Moved) {
+    let store = store();
+    let run = suspended_waiter(&store, false).await;
+
+    let timers = store.clone() as Arc<dyn TimerStore>;
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    let timer = timers
+        .claim_due(later(3600), 10)
+        .await
+        .unwrap()
+        .pop()
+        .expect("the sleep armed a timer");
+    let lease = journal
+        .acquire(run, "dead-instance", Duration::from_secs(2))
+        .await
+        .unwrap();
+    let mut wake = Append::new(
+        run,
+        RecordKind::EffectDone {
+            output: json!({ "fired_at": timer.fire_at.unix_timestamp() }),
+            source: None,
+            by: None,
+            spend: agentplane::core::Spend::default(),
+            declared: agentplane::core::DeclaredOutput::trusted(),
+        },
+    )
+    .effect(timer.effect)
+    .step(timer.step)
+    .phase(timer.phase);
+    if let Some(case) = timer.case {
+        wake = wake.case(case);
+    }
+    journal.append(lease.epoch, vec![wake]).await.unwrap();
+    timers.disarm(run, timer.effect).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(journal.abandoned_runs(10).await.unwrap(), vec![run]);
+
+    let report = waiter_plane(&store, false, Some(moved))
+        .sweep(later(0), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        (report.runs_recovered, report.recovery_failures),
+        (1, 0),
+        "the recovery reached a decision about the run — its quarantine"
+    );
+    assert!(
+        journal.abandoned_runs(10).await.unwrap().is_empty(),
+        "a quarantined run is listed as quarantined, not recovered every tick"
+    );
+    assert_findable_and_answerable(&store, run, false, moved).await;
+}
+
+/// **A wake refused by an edited declaration leaves the run findable.**
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_wake_refused_by_an_edited_declaration_stays_findable() {
+    a_refused_wake_stays_findable(Moved::Declaration).await;
+}
+
+/// **A wake refused by a changed policy bundle leaves the run findable.**
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_wake_refused_by_a_changed_policy_bundle_stays_findable() {
+    a_refused_wake_stays_findable(Moved::Bundle).await;
+}
+
+/// **An event whose resume an edited declaration refuses still delivered, and
+/// the run stays findable.**
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn an_event_refused_by_an_edited_declaration_stays_findable() {
+    a_refused_delivery_stays_findable(Moved::Declaration).await;
+}
+
+/// The bundle twin of the delivery above.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn an_event_refused_by_a_changed_policy_bundle_stays_findable() {
+    a_refused_delivery_stays_findable(Moved::Bundle).await;
+}
+
+/// **A run recovered onto a plane with an edited declaration — a rolling
+/// deploy — stays findable, and is not retried into the same refusal.**
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_recovered_run_refused_by_an_edited_declaration_stays_findable() {
+    a_refused_recovery_stays_findable(Moved::Declaration).await;
+}
+
+/// The bundle twin of the recovery above.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_recovered_run_refused_by_a_changed_policy_bundle_stays_findable() {
+    a_refused_recovery_stays_findable(Moved::Bundle).await;
+}
+
+/// **A resume that fails mid-flight leaves the run to recovery.**
+///
+/// The delivery recorded the event, so the run is off the waiting listing; the
+/// resume then hit a store failure writing its conclusion. Releasing the lease
+/// there would leave the run on no listing at all — not waiting, not
+/// concluded, and invisible to the abandonment sweep, which lists only leases
+/// that lapse while still naming an owner. Kept, the lease lapses and the
+/// sweep finishes the run.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_resume_that_fails_mid_flight_is_left_for_recovery() {
+    use agentplane::testkit::{Fault, Faulty, Schedule};
+
+    let inner = store();
+    let faulty = Arc::new(Faulty::new(
+        inner.clone() as Arc<dyn JournalStore>,
+        Schedule::healthy().on_kind("RunConcluded", Fault::FailedClean),
+    ));
+    let plane = |journal: Arc<dyn JournalStore>| {
+        Runtime::builder(journal)
+            .cases(inner.clone() as Arc<dyn CaseStore>)
+            .events(inner.clone() as Arc<dyn EventStore>)
+            .lease_ttl(Duration::from_secs(2))
+            .skill(WaitsOnce { on_event: true })
+            .build()
+    };
+    let flaky = plane(faulty.clone() as Arc<dyn JournalStore>);
+
+    let out = flaky
+        .run_correlated(
+            "demo.wait",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[CorrelationKey::new("matter", "M-1")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+
+    let delivered = flaky
+        .deliver(
+            &InboundEvent::new(
+                "urn:test:approver",
+                "EV-1",
+                "go.ahead",
+                json!({ "ok": true }),
+            )
+            .correlate(CorrelationKey::new("matter", "M-1")),
+        )
+        .await;
+    assert!(
+        delivered.is_err(),
+        "the resume's store failure: {delivered:?}"
+    );
+    assert!(
+        !faulty.injected().is_empty(),
+        "no fault was injected, so nothing here was tested"
+    );
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let journal = inner.clone() as Arc<dyn JournalStore>;
+    assert_eq!(
+        journal.abandoned_runs(10).await.unwrap(),
+        vec![out.run_id],
+        "the failed resume released its lease over a run nothing else lists"
+    );
+
+    let report = plane(journal.clone())
+        .sweep(later(0), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!((report.runs_recovered, report.recovery_failures), (1, 0));
+    assert!(
+        journal
+            .runs_by_outcome("succeeded", 10)
+            .await
+            .unwrap()
+            .contains(&out.run_id),
+        "recovery finished the run the failed resume left behind"
+    );
 }

@@ -26,10 +26,16 @@ spec:
     # laxer than this grant refuses the build.
     - ref: "tool://tickets/read"
       mutates: false
+      # What the model asks for is untrusted and at least `internal`, so a tool
+      # that may be shown only `public` data refuses every call a model makes.
+      max_sensitivity: internal
       description: "Read a ticket by id"
       arguments:
         type: object
         additionalProperties: false
         required: [id]
         properties: { id: { type: string } }
+  # A tool's answer is `internal` too, and it goes back to the model on the
+  # next turn: without this, the model sink's `public` default refuses it.
+  security: { max_sensitivity_egress: internal }
   budgets: { max_tokens: 1000 }

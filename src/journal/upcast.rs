@@ -13,7 +13,7 @@
 //!    effect, but harder to find because it only manifests on old records.
 //! 5. **Hash the wire bytes, not the upcast form.** Rehashing after an upcast
 //!    would destroy tamper evidence for all history the first time a schema
-//!    changed. See [`Record::from_stored`](super::Record::from_stored), which
+//!    changed. See [`Record::from_stored_with`](super::Record::from_stored_with), which
 //!    verifies against the stored bytes and never re-serializes.
 
 use serde_json::Value;

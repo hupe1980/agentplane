@@ -55,7 +55,7 @@
 //!
 //! So the rule is the other half of the choice, stated rather than discovered:
 //! **sealed payload bytes never change, and the erasure scope is the rotation
-//! unit.** A scope is already narrow — one case, one run, one memory subject —
+//! unit.** A scope is already narrow — one case, one run, one memory version —
 //! so a compromised wrapping key exposes that unit and nothing else, which is
 //! the blast radius rotation is bought for. Adding a key version is safe and
 //! needs nothing from this crate: envelopes sealed before a rotation keep
@@ -328,6 +328,23 @@ pub fn scope(tenant: &crate::core::TenantId, unit: &str) -> String {
     crate::core::erasure_scope(tenant, unit)
 }
 
+/// The erasure scope of one buffered event, named by its `(source, id)` pair.
+///
+/// `(source, id)` is the pair `CloudEvents` defines uniqueness by and the pair
+/// the buffer deduplicates on, so the erasure unit is exactly the message an
+/// erasure request names. The pair is joined by
+/// [`origin_key`](crate::core::origin_key), which puts the length of `source`
+/// in front: a `source` is a URI and routinely contains `/`, so a plain join
+/// would let `("bus/x", "1")` and `("bus", "x/1")` share one key, and erasing
+/// either would destroy the other's.
+#[must_use]
+pub fn event_scope(tenant: &crate::core::TenantId, source: &str, id: &str) -> String {
+    scope(
+        tenant,
+        &format!("event/{}", crate::core::origin_key(source, id)),
+    )
+}
+
 /// Refuse a sealing scope that is not the scope the wrapped store writes under.
 ///
 /// Every wrapper here takes the store it seals and the tenant to seal for. Those
@@ -383,6 +400,33 @@ mod envelope;
 /// elsewhere, because sealed bytes cannot be rewritten into the new shape.
 pub const ENVELOPE_FORMAT_VERSION: u8 = envelope::FORMAT_VERSION;
 
+/// What a cryptographic erasure did: the key, then the live ciphertext.
+///
+/// The key's destruction is the erasure — every copy, backups included, stops
+/// opening at that instant — so a failure *after* it is not a failed erasure
+/// and must not be reported as one. It is not a clean one either: the live
+/// store still holds ciphertext for the rows it names, which a retry of the
+/// same call removes. Returned rather than logged so the caller answering an
+/// erasure request can say which of the two it got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct Erasure {
+    /// How many stored units the erasure reached: rows the cleanup removed, or
+    /// — when the cleanup failed — the units enumerated before the key went.
+    pub reached: usize,
+    /// Why removing the live ciphertext failed after the key was destroyed,
+    /// or `None` when it was removed.
+    pub cleanup_failed: Option<String>,
+}
+
+impl Erasure {
+    /// Whether the key is destroyed **and** the live ciphertext is gone.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.cleanup_failed.is_none()
+    }
+}
+
 mod cases;
 pub use cases::{SealedCases, probe_sealed_case_state};
 
@@ -394,6 +438,7 @@ pub use tasks::SealedTasks;
 
 mod journal;
 pub use journal::SealedJournal;
+pub(crate) use journal::open_payloads;
 
 #[cfg(feature = "push")]
 mod push;

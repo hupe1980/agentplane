@@ -15,7 +15,7 @@
 //! The client here is the real SDK over an in-process pipe, so what it sees is
 //! what a desktop host would see.
 //!
-//! Run with: `cargo run --example serve_mcp --features mcp-server,redb,testkit`
+//! Run with: `cargo run --example serve_mcp --features redb,mcp-server`
 //!
 //! [`mcp_tools`]: https://github.com/hupe1980/agentplane/blob/main/examples/mcp_tools.rs
 
@@ -79,6 +79,28 @@ impl Skill for Checker {
     }
 }
 
+/// The rules this demo runs under: everything is permitted. A served plane
+/// must be governed — `McpServer::new` refuses one with no engine — and a real
+/// deployment writes its rules here.
+#[derive(Debug)]
+struct PermitAll;
+
+impl agentplane::core::PolicyEngine for PermitAll {
+    fn authorize(
+        &self,
+        _request: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"example.permit"),
+            "example/permit-v1",
+        )
+    }
+}
+
 /// A client with nothing special about it: the SDK's own, declaring the Tasks
 /// extension because a governed run may suspend for a person.
 #[derive(Debug, Clone)]
@@ -103,7 +125,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let digest = manifest.digest()?.to_hex();
     let store =
         Arc::new(RedbStore::open_in_memory()?) as Arc<dyn agentplane::journal::JournalStore>;
-    let plane = Runtime::builder(store).owner("desk").skill(Checker).build();
+    let plane = Runtime::builder(store)
+        .owner("desk")
+        .policy(Arc::new(PermitAll))
+        .skill(Checker)
+        .build();
     let server = McpServer::new(plane, std::slice::from_ref(&manifest))?;
 
     // In-process, so the example needs no second process — but it is the real

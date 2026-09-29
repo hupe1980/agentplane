@@ -15,17 +15,26 @@
 //!
 //! | This crate | Transit |
 //! |---|---|
-//! | erasure scope | a named key, `transit/keys/<scope>` |
-//! | mint a data key | `POST transit/datakey/plaintext/<scope>` |
-//! | open a data key | `POST transit/decrypt/<scope>` |
-//! | erase | `DELETE transit/keys/<scope>` |
+//! | erasure scope | a named key, `transit/keys/<name>` |
+//! | mint a data key | `POST transit/datakey/plaintext/<name>` |
+//! | open a data key | `POST transit/decrypt/<name>` |
+//! | erase | `DELETE transit/keys/<name>` |
+//!
+//! `<name>` is [`VaultTransit::key_name`] of the scope: `ap-` and the hex
+//! SHA-256 of the scope's bytes. A scope is not a legal path segment — a
+//! tenant-qualified scope contains `/`, and an event scope carries the
+//! counterparty's own `source` and `id`, which may hold `?`, `#` or `..` — so
+//! written into the URL raw it would truncate two scopes onto one key or walk
+//! the plane's token to another path. The hash is injective for every scope
+//! the crate can produce and spells only `[a-z0-9-]`. The logical scope stays
+//! in the [`WrappedKey`], which is what erasure and error reports name.
 //!
 //! Three endpoints Vault offers are deliberately not in that table.
-//! `transit/keys/<scope>/rotate` is the operator's decision — on their
+//! `transit/keys/<name>/rotate` is the operator's decision — on their
 //! schedule, under their audit, with their approvals — and a runtime that
 //! rotated somebody's key ring because it happened to be running would be
 //! taking a decision that is not its own. `transit/rewrap` and
-//! `transit/keys/<scope>/config` follow from the rule stated in the [module
+//! `transit/keys/<name>/config` follow from the rule stated in the [module
 //! documentation](crate::keyring): sealed bytes are rotation-immutable, so
 //! there is nothing to rewrap, and the version floor that would make rewrapping
 //! necessary is the one setting this crate must never move on an operator's
@@ -47,7 +56,7 @@
 //! before promising anyone that erasure works:
 //!
 //! ```text
-//! vault write transit/keys/<scope>/config deletion_allowed=true
+//! vault write transit/keys/<name>/config deletion_allowed=true
 //! ```
 //!
 //! [Transit HTTP API]: https://developer.hashicorp.com/vault/api-docs/secret/transit
@@ -137,6 +146,21 @@ impl VaultTransit {
         format!("{}/v1/{}/{tail}", self.address, self.mount)
     }
 
+    /// The endpoint `op` on the transit key that holds `scope`, the one place
+    /// a scope becomes part of a URL.
+    fn key_url(&self, op: &str, scope: &str) -> String {
+        self.url(&format!("{op}/{}", Self::key_name(scope)))
+    }
+
+    /// The transit key that holds `scope`: `ap-` and the hex SHA-256 of it.
+    ///
+    /// Public so an operator provisioning keys — `deletion_allowed` is set
+    /// per key — can name the one a scope maps to.
+    #[must_use]
+    pub fn key_name(scope: &str) -> String {
+        format!("ap-{}", crate::core::Digest::of(scope.as_bytes()).to_hex())
+    }
+
     /// One request, with the status codes that mean something mapped.
     async fn call(
         &self,
@@ -155,7 +179,7 @@ impl VaultTransit {
         let response = req
             .send()
             .await
-            .map_err(|e| KeyError::Unavailable(format!("{url}: {e}")))?;
+            .map_err(|e| KeyError::Unavailable(crate::netguard::transport_text(&e)))?;
 
         let status = response.status().as_u16();
         // A wrapped key or an error message, both small. The key service is
@@ -278,7 +302,7 @@ fn to_key(b64: &str, what: &str) -> Result<DataKey, KeyError> {
 #[async_trait]
 impl KeyRing for VaultTransit {
     async fn data_key(&self, scope: &str) -> Result<(DataKey, WrappedKey), KeyError> {
-        let url = self.url(&format!("datakey/plaintext/{scope}"));
+        let url = self.key_url("datakey/plaintext", scope);
         let body = self
             .call(
                 reqwest::Method::POST,
@@ -311,7 +335,7 @@ impl KeyRing for VaultTransit {
     async fn open(&self, wrapped: &WrappedKey) -> Result<DataKey, KeyError> {
         let ciphertext = String::from_utf8(wrapped.sealed.clone())
             .map_err(|_| KeyError::Refused("a transit ciphertext must be text".to_owned()))?;
-        let url = self.url(&format!("decrypt/{}", wrapped.scope));
+        let url = self.key_url("decrypt", &wrapped.scope);
         let body = self
             .call(
                 reqwest::Method::POST,
@@ -332,7 +356,7 @@ impl KeyRing for VaultTransit {
         // `deletion_allowed=true`, and that refusal is surfaced rather than
         // swallowed: an erasure that quietly did not happen is worse than one
         // that failed.
-        let url = self.url(&format!("keys/{scope}"));
+        let url = self.key_url("keys", scope);
         match self.call(reqwest::Method::DELETE, &url, None, scope).await {
             // `Destroyed` here means the key was already gone, and erasure is
             // idempotent: the caller's own record is the authority on when it
@@ -347,6 +371,45 @@ impl KeyRing for VaultTransit {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scope reaches Vault as one legal segment, and never as another scope's.
+    ///
+    /// Scopes the crate really produces: tenant-qualified with `/`, and an
+    /// event scope built from a counterparty's own `source` and `id`. Written
+    /// raw, `?` and `#` truncate the path — two messages on one key, so
+    /// erasing one erases the other — and `..` walks the token elsewhere.
+    #[test]
+    fn a_scope_maps_to_one_legal_transit_key_name() {
+        let tenant = crate::core::TenantId::new("acme").expect("tenant");
+        let scopes = [
+            super::super::scope(&tenant, "case_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            super::super::event_scope(&tenant, "bus/x?y#z/../..", "1"),
+            super::super::event_scope(&tenant, "bus/x?y#z/../..", "2"),
+            super::super::event_scope(&tenant, "bus/x", "?y#z/../..1"),
+            "acme/../sys/policy".to_owned(),
+        ];
+        let ring = VaultTransit::new("http://vault.internal:8200", "transit", "t").expect("ring");
+        let names: std::collections::BTreeSet<String> = scopes
+            .iter()
+            .map(|s| {
+                let url = ring.key_url("decrypt", s);
+                url.strip_prefix("http://vault.internal:8200/v1/transit/decrypt/")
+                    .unwrap_or_else(|| panic!("{url} left the decrypt endpoint"))
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names.len(), scopes.len(), "two scopes share a transit key");
+        for name in &names {
+            assert!(
+                name.starts_with("ap-")
+                    && name[3..].len() == 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
+                "{name} is not a legal single transit key segment"
+            );
+        }
+    }
 
     /// A retired ciphertext version is reclassified; a real refusal is not.
     ///

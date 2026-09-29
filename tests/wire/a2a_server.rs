@@ -1323,6 +1323,398 @@ async fn a_served_run_acts_as_its_caller_not_as_the_plane() {
     );
 }
 
+/// **A caller that presented no chain is still bounded by the plane's.**
+///
+/// It does not act under the plane's chain — that would make the operator's
+/// authority ambient — but the plane's chain is the most this plane may do for
+/// anybody, so a chainless caller asking for a skill outside it is declined,
+/// and one inside it is admitted bound to nobody.
+#[tokio::test]
+async fn a_chainless_caller_is_bounded_by_the_planes_chain() {
+    let f = fixture();
+    let router_under = |scope: &str| {
+        let rt = Runtime::builder(Arc::clone(&f.store) as Arc<dyn JournalStore>)
+            .cases(Arc::clone(&f.store) as Arc<dyn CaseStore>)
+            .policy(f.policy.clone() as Arc<dyn PolicyEngine>)
+            .acting_as(Delegation::root(Principal::new(
+                "user:operator",
+                Scope::of([scope]),
+            )))
+            .skill(Echoes {
+                capability: "settlement.check",
+                seen: f.seen.clone(),
+            })
+            .build();
+        A2aServer::new(
+            rt,
+            Arc::new(HeaderAuth),
+            &card_security(),
+            &f.manifest,
+            "https://plane.internal/a2a",
+        )
+        .expect("policy wired")
+        .router()
+    };
+    let message = |id: &str| {
+        let mut message = text("please settle INV-9");
+        message["messageId"] = json!(id);
+        rpc(
+            "SendMessage",
+            &json!({"message": message}),
+            Some("acme-peer"),
+        )
+    };
+
+    // Outside the plane's chain: declined, though the caller named no scope.
+    let (_, body) = send(&router_under("billing.*"), message("m-outside")).await;
+    assert_eq!(
+        body["result"]["message"]["parts"][0]["text"], "this agent declined the request",
+        "a chainless caller escaped the plane's ceiling: {body:#}"
+    );
+    assert!(f.seen.lock().unwrap().is_empty(), "nothing ran");
+
+    // Inside it: admitted, and bound to nobody — not to the plane's operator.
+    let (_, body) = send(&router_under("settlement.*"), message("m-inside")).await;
+    let task = RunId::parse(
+        body["result"]["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a caller inside the ceiling is admitted: {body:#}")),
+    )
+    .unwrap();
+    let records = f.store.read(task, 1).await.expect("journal");
+    assert!(
+        !records
+            .iter()
+            .any(|r| matches!(r.kind(), RecordKind::IdentityBound { .. })),
+        "a chainless caller acted under the plane's chain"
+    );
+}
+
+/// Permits everything, keeping every context it was asked under.
+#[derive(Debug, Default)]
+struct Contexts(Mutex<Vec<(String, Value)>>);
+
+impl PolicyEngine for Contexts {
+    fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+        self.0
+            .lock()
+            .unwrap()
+            .push((request.action.to_owned(), request.context.clone()));
+        PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(Digest::of(b"a2a-contexts"), "agentplane-test/contexts")
+    }
+}
+
+/// **A caller whose credential carried no chain acts under none.**
+///
+/// The plane holds a chain rooted at its operator, for the runs its embedder
+/// starts. A peer that authenticated with a bare token presented no chain, and
+/// admitting its run under the operator's would hand every authenticated peer
+/// the operator's authority: the journal would say the run acted for alice,
+/// and an admission rule keyed on `owner` would see alice.
+#[tokio::test]
+async fn a_caller_without_a_chain_does_not_act_under_the_planes() {
+    let f = fixture();
+    let policy = Arc::new(Contexts::default());
+    let rt = Runtime::builder(Arc::clone(&f.store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&f.store) as Arc<dyn CaseStore>)
+        .policy(policy.clone() as Arc<dyn PolicyEngine>)
+        .acting_as(Delegation::root(Principal::new("alice", Scope::root())))
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: f.seen.clone(),
+        })
+        .build();
+    let router = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("policy wired")
+    .router();
+
+    let (_, body) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("please settle INV-9")}),
+            Some("bare-peer"),
+        ),
+    )
+    .await;
+    let task = RunId::parse(
+        body["result"]["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a bare-token peer is admitted: {body:#}")),
+    )
+    .unwrap();
+    let records = f.store.read(task, 1).await.expect("journal");
+    let bound: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::IdentityBound { chain } => Some(chain.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        bound.is_empty(),
+        "a peer that presented no chain was admitted under the plane's own: {bound:?}"
+    );
+    let admit = policy
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(action, _)| action == agentplane::core::ACTION_ADMIT)
+        .map(|(_, context)| context.clone())
+        .expect("admission asked the policy engine");
+    assert!(
+        admit.get("owner").is_none(),
+        "the admission rule saw the plane's owner for a peer's run: {admit:#}"
+    );
+}
+
+/// **A task belongs to the peer that admitted it.**
+///
+/// Two peers in one tenant, and a policy that permits everything: authorization
+/// is the deployment's, and a permit-all rule set is a legitimate one. What is
+/// not the deployment's to forget is whose task a task id names. Peer B,
+/// holding peer A's task id, must learn nothing about it — not its state, not
+/// its history, not that it exists — and must not be able to cancel it,
+/// continue it, join its context, subscribe to it, or point its webhook
+/// somewhere else. A run the embedder started in-process is nobody's A2A task.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn a_task_belongs_to_the_peer_that_admitted_it() {
+    let f = fixture();
+    let policy = Arc::new(Contexts::default());
+    let rt = Runtime::builder(Arc::clone(&f.store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&f.store) as Arc<dyn CaseStore>)
+        .policy(policy.clone() as Arc<dyn PolicyEngine>)
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: f.seen.clone(),
+        })
+        .build();
+    let transport = Arc::new(RecordingPush::default());
+    let router = A2aServer::new(
+        rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("policy wired")
+    .with_push(
+        Arc::clone(&f.store) as Arc<dyn agentplane::push::PushStore>,
+        Arc::clone(&transport) as Arc<dyn PushTransport>,
+    )
+    .expect("push before signing")
+    .router();
+
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("settle INV-1")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = sent["result"]["task"]["id"].as_str().unwrap().to_owned();
+    let context = sent["result"]["task"]["contextId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hook = json!({"taskId": task, "url": "https://client.example/a-hook"});
+    let (_, created) = send(
+        &router,
+        rpc("CreateTaskPushNotificationConfig", &hook, Some("peer-a")),
+    )
+    .await;
+    let config_id = created["result"]["id"].as_str().unwrap().to_owned();
+
+    // Peer A reads its own task, and the rule it was read under names A.
+    let (_, own) = send(
+        &router,
+        rpc("GetTask", &json!({"id": task}), Some("peer-a")),
+    )
+    .await;
+    assert_eq!(own["result"]["id"], task.as_str(), "{own:#}");
+    let read_context = policy
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(action, _)| action == action::TASK_READ)
+        .map(|(_, context)| context.clone())
+        .expect("GetTask asked the policy engine");
+    assert_eq!(
+        read_context["owner"], "peer-a",
+        "a task rule cannot name whose task it is: {read_context:#}"
+    );
+
+    // Peer B, holding the id, finds nothing.
+    for (method, params) in [
+        ("GetTask", json!({"id": task})),
+        ("CancelTask", json!({"id": task})),
+        ("SubscribeToTask", json!({"id": task})),
+        (
+            "GetTaskPushNotificationConfig",
+            json!({"taskId": task, "id": config_id}),
+        ),
+        ("ListTaskPushNotificationConfigs", json!({"taskId": task})),
+        (
+            "CreateTaskPushNotificationConfig",
+            json!({"taskId": task, "url": "https://client.example/b-hook"}),
+        ),
+        (
+            "DeleteTaskPushNotificationConfig",
+            json!({"taskId": task, "id": config_id}),
+        ),
+        (
+            "SendMessage",
+            json!({"message": {
+                "messageId": "b-continue", "role": "ROLE_USER",
+                "taskId": task, "parts": [{"text": "more"}]
+            }}),
+        ),
+        (
+            "SendMessage",
+            json!({"message": {
+                "messageId": "b-join", "role": "ROLE_USER",
+                "contextId": context, "parts": [{"text": "join"}]
+            }}),
+        ),
+    ] {
+        let (_, body) = send(&router, rpc(method, &params, Some("peer-b"))).await;
+        assert_eq!(
+            err_code(&body),
+            i64::from(code::TASK_NOT_FOUND),
+            "{method} reached another peer's task: {body:#}"
+        );
+        assert!(
+            !body.to_string().contains("settle INV-1"),
+            "{method} disclosed another peer's input: {body:#}"
+        );
+    }
+    let (_, listed) = send(&router, rpc("ListTasks", &json!({}), Some("peer-b"))).await;
+    assert_eq!(
+        listed["result"]["totalSize"], 0,
+        "ListTasks counted another peer's task: {listed:#}"
+    );
+
+    // A's webhook is still A's, pointing where A pointed it.
+    let (_, still) = send(
+        &router,
+        rpc(
+            "GetTaskPushNotificationConfig",
+            &json!({"taskId": task, "id": config_id}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(still["result"]["url"], "https://client.example/a-hook");
+
+    // A run the embedder started is nobody's task, including A's.
+    let embedded = rt
+        .run(
+            "settlement.check",
+            Tainted::trusted(json!({"text": "internal"})),
+        )
+        .await
+        .expect("in-process run");
+    let (_, hidden) = send(
+        &router,
+        rpc(
+            "GetTask",
+            &json!({"id": embedded.run_id.to_string()}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&hidden), i64::from(code::TASK_NOT_FOUND));
+    let (_, mine) = send(&router, rpc("ListTasks", &json!({}), Some("peer-a"))).await;
+    assert_eq!(
+        mine["result"]["totalSize"], 1,
+        "ListTasks listed a run nobody admitted over A2A: {mine:#}"
+    );
+}
+
+/// **A fault on this plane's side is one fixed sentence to a peer.**
+///
+/// A store's error names its connection, a host, a table. Relayed as the
+/// JSON-RPC message it tells an external counterparty how this deployment is
+/// built — and a read that failed is not a task that does not exist, so it
+/// must not answer as one either: a client told "not found" stops asking about
+/// a task that is merely unreadable for a moment.
+#[tokio::test]
+async fn an_internal_fault_names_nothing_about_the_plane() {
+    use agentplane::testkit::faults::{Fault, Faulty, Schedule};
+
+    let f = fixture();
+    let (_, sent) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("settle")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = RunId::parse(sent["result"]["task"]["id"].as_str().unwrap()).unwrap();
+
+    let faulty = Arc::new(Faulty::new(
+        Arc::clone(&f.store) as Arc<dyn JournalStore>,
+        Schedule::healthy()
+            .every(1, Fault::FailedClean)
+            .unreadable(task)
+            .detail("dsn=secret"),
+    ));
+    let rt = Runtime::builder(faulty as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&f.store) as Arc<dyn CaseStore>)
+        .policy(f.policy.clone() as Arc<dyn PolicyEngine>)
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: f.seen.clone(),
+        })
+        .build();
+    let router = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("policy wired")
+    .router();
+
+    let mut fresh = text("settle again");
+    fresh["messageId"] = json!("m-fault");
+    for (method, params) in [
+        ("SendMessage", json!({"message": fresh})),
+        ("GetTask", json!({"id": task.to_string()})),
+        ("SubscribeToTask", json!({"id": task.to_string()})),
+    ] {
+        let (_, body) = send(&router, rpc(method, &params, Some("peer-a"))).await;
+        assert_eq!(
+            err_code(&body),
+            i64::from(code::INTERNAL_ERROR),
+            "{method} answered a store fault as something else: {body:#}"
+        );
+        assert!(
+            !body.to_string().contains("dsn=secret"),
+            "{method} relayed the store's own error to a peer: {body:#}"
+        );
+    }
+}
+
 /// The sender cannot pick the capability by writing text.
 ///
 /// With several skills advertised and none named, the call is refused rather
@@ -1551,19 +1943,20 @@ async fn context_id_groups_new_immutable_tasks_across_turns() {
     assert_eq!(err_code(&refused), i64::from(code::UNSUPPORTED_OPERATION));
 }
 
-/// **A content filter's cost has a ceiling, and crossing it is a refusal —
-/// not a truncated total, and not a scan the caller sizes.**
+/// **A listing's cost has a ceiling, and crossing it is a refusal — not a
+/// truncated total, and not a scan the caller sizes.**
 ///
-/// `status` and `contextId` can only be evaluated by reading each candidate's
-/// journal, and the spec's `totalSize` is the exact pre-pagination count — so
-/// an unbounded implementation hands any authenticated peer a scan of every
-/// run the tenant ever wrote, per request, by adding one field. The bound
-/// refuses over-budget filters and names `statusTimestampAfter` as the lever,
-/// because that one is answered from the index and narrows for free. A
-/// truncated count instead would be a lie shaped like an answer: a smaller
-/// tenant, not a bounded scan.
+/// Whether a run counts toward `totalSize` takes a read: `status` and
+/// `contextId` are in its journal, and whose task it is sits in its admission
+/// record, so even an unfiltered listing reads one record per candidate. The
+/// spec's `totalSize` is the exact pre-pagination count, so an unbounded
+/// implementation hands any authenticated peer a scan of every run the tenant
+/// ever wrote, per request. The bound refuses over-budget listings — filtered
+/// or not — and names `statusTimestampAfter` as the lever, because that one is
+/// answered from the index and narrows for free. A truncated count instead
+/// would be a lie shaped like an answer: a smaller tenant, not a bounded scan.
 #[tokio::test]
-async fn a_filter_past_its_scan_budget_is_refused_naming_the_lever() {
+async fn a_listing_past_its_scan_budget_is_refused_naming_the_lever() {
     let f = fixture();
     for n in 0..2 {
         let msg = json!({"message": {
@@ -1597,20 +1990,67 @@ async fn a_filter_past_its_scan_budget_is_refused_naming_the_lever() {
         "the refusal must name the filter that narrows without reading: {refused}"
     );
 
-    // The positive halves. An unfiltered listing over the same store is
-    // index-only and unaffected by the budget; and the same filter under the
-    // default budget answers exactly.
+    // Unfiltered is no exemption: counting still reads each candidate.
     let unfiltered = json!({"pageSize": 1});
-    let (_, listed) = send(&tight, rpc("ListTasks", &unfiltered, Some("peer-a"))).await;
+    let (_, refused) = send(&tight, rpc("ListTasks", &unfiltered, Some("peer-a"))).await;
     assert_eq!(
-        listed["result"]["totalSize"], 2,
-        "an unfiltered listing reads no journals beyond its page and owes no \
-         budget: {listed}"
+        err_code(&refused),
+        i64::from(code::INVALID_PARAMS),
+        "an unfiltered listing scanned past its ceiling to count: {refused}"
     );
+
+    // The positive halves. The lever narrows the same listing under the same
+    // ceiling, and the default budget answers exactly.
+    let narrowed = json!({"pageSize": 1, "statusTimestampAfter": "2999-01-01T00:00:00Z"});
+    let (_, listed) = send(&tight, rpc("ListTasks", &narrowed, Some("peer-a"))).await;
+    assert_eq!(listed["result"]["totalSize"], 0, "{listed}");
+    let (_, all) = send(&f.router(), rpc("ListTasks", &unfiltered, Some("peer-a"))).await;
+    assert_eq!(all["result"]["totalSize"], 2, "{all}");
     let (_, roomy) = send(&f.router(), rpc("ListTasks", &list, Some("peer-a"))).await;
     assert!(
         roomy["result"]["totalSize"].is_u64(),
         "the same filter under the default budget answers exactly: {roomy}"
+    );
+}
+
+/// The ceiling is charged for the caller's own tasks, not for the tenant's.
+///
+/// A plane whose embedder ran more work than the budget would otherwise
+/// refuse every peer's unfiltered listing — a peer's cost would be set by
+/// runs it cannot see and did not start.
+#[tokio::test]
+async fn a_peers_listing_is_not_charged_for_runs_it_did_not_admit() {
+    let f = fixture();
+    for _ in 0..3 {
+        f.rt.run("settlement.check", Tainted::trusted(json!({})))
+            .await
+            .expect("an embedder's run");
+    }
+    let msg = json!({"message": {
+        "messageId": "own-turn",
+        "role": "ROLE_USER",
+        "parts": [{"text": "hello"}]
+    }});
+    send(&f.router(), rpc("SendMessage", &msg, Some("peer-a"))).await;
+    let tight = A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("the fixture wires a policy engine")
+    .filter_scan_budget(1)
+    .router();
+
+    let (_, listed) = send(
+        &tight,
+        rpc("ListTasks", &json!({"pageSize": 1}), Some("peer-a")),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["totalSize"], 1,
+        "the embedder's runs were charged to the peer's listing: {listed}"
     );
 }
 
@@ -2395,6 +2835,118 @@ async fn a_plane_without_a_policy_engine_is_not_served() {
     );
 }
 
+/// A policy set that cannot evaluate this surface's requests is not served.
+///
+/// A2A asks under `{roles, peer, tenant}`. An unscoped depth cap is correct on
+/// a plane whose runs all carry a chain, and declines every peer here — with a
+/// decline that tells the peer nothing about why.
+#[cfg(feature = "cedar")]
+#[tokio::test]
+async fn a_policy_set_this_surface_cannot_evaluate_is_not_served() {
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let policy = agentplane::policy::CedarEngine::new(
+        r"
+        permit(principal, action, resource);
+        forbid(principal, action, resource) when { context.delegation_depth >= 3 };
+        ",
+    )
+    .expect("it compiles");
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(policy))
+        .acting_as(Delegation::root(Principal::new("user:hupe", Scope::root())))
+        .cases(Arc::new(RedbStore::open_in_memory().unwrap()))
+        .build();
+
+    let built = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &manifest,
+        "https://plane.internal/a2a",
+    );
+    assert!(
+        matches!(built, Err(ServerSetupError::PolicyUnevaluable { .. })),
+        "a surface whose every request would be refused as malformed was served"
+    );
+}
+
+/// A task action is probed with the owner it always carries.
+///
+/// A rule reading `context.owner` on a cancel is evaluable on every cancel
+/// this surface sends. Probing without it refused a sound rule set at startup.
+#[cfg(feature = "cedar")]
+#[tokio::test]
+async fn a_rule_reading_the_owner_of_a_task_action_is_served() {
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let policy = agentplane::policy::CedarEngine::new(
+        r#"
+        permit(principal, action, resource);
+        forbid(principal, action == Action::"a2a:task.cancel", resource)
+            unless { context.owner like "*" };
+        "#,
+    )
+    .expect("it compiles");
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(policy))
+        .cases(Arc::new(RedbStore::open_in_memory().unwrap()))
+        .build();
+
+    let built = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &manifest,
+        "https://plane.internal/a2a",
+    );
+    assert!(
+        built.is_ok(),
+        "a rule every cancel can evaluate was refused: {:?}",
+        built.err()
+    );
+}
+
+/// The runtime's own requests are probed in the shape a chainless peer's run
+/// takes, not only in the plane's.
+///
+/// A depth cap on admissions is evaluable on every run this plane starts for
+/// itself, because each carries the plane's chain. A peer that presented no
+/// chain acts under none, and its admission carries no depth — so the cap
+/// would decline it as malformed, and the surface must not start.
+#[cfg(feature = "cedar")]
+#[tokio::test]
+async fn a_rule_a_chainless_peers_run_cannot_evaluate_is_not_served() {
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let policy = agentplane::policy::CedarEngine::new(
+        r#"
+        permit(principal, action, resource);
+        forbid(principal, action == Action::"run:admit", resource)
+            when { context.delegation_depth >= 3 };
+        "#,
+    )
+    .expect("it compiles");
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(policy))
+        .acting_as(Delegation::root(Principal::new("user:hupe", Scope::root())))
+        .cases(Arc::new(RedbStore::open_in_memory().unwrap()))
+        .try_build()
+        .expect("every run this plane starts for itself carries its depth");
+
+    let built = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &manifest,
+        "https://plane.internal/a2a",
+    );
+    assert!(
+        matches!(built, Err(ServerSetupError::PolicyUnevaluable { .. })),
+        "a surface whose chainless peers would be refused as malformed was served"
+    );
+}
+
 /// A declined request is the agent saying no, not the agent breaking.
 ///
 /// Reported as `-32603 Internal error` this reads to a caller as "the far side
@@ -3173,6 +3725,69 @@ async fn subscribing_to_a_finished_task_is_unsupported() {
         err_code(&body),
         i64::from(code::UNSUPPORTED_OPERATION),
         "a terminal task incorrectly opened a subscription: {body:#}"
+    );
+}
+
+/// **How many streams one peer holds open is a bound this surface states.**
+///
+/// A stream is a connection kept for as long as the run lives and a journal
+/// read per poll interval. Unbounded, any authenticated peer chooses what that
+/// costs the plane. Past the ceiling a new stream is back-pressure, and a
+/// stream that ends — here, a client that went away — gives its slot back.
+#[tokio::test]
+async fn open_streams_per_caller_are_bounded_and_given_back() {
+    let f = continuation_fixture();
+    let router = A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("policy wired")
+    .streams_per_caller(1)
+    .router();
+    let (_, first) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("begin")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = first["result"]["task"]["id"].as_str().unwrap().to_owned();
+    let subscribe = || rpc("SubscribeToTask", &json!({"id": task}), Some("peer-a"));
+
+    let held = router.clone().oneshot(subscribe()).await.unwrap();
+    assert!(
+        held.headers()
+            .get("content-type")
+            .is_some_and(|v| v.to_str().unwrap_or("").starts_with("text/event-stream")),
+        "the first stream opens"
+    );
+    // Bounded: a refusal is a short JSON body, and a stream that opened would
+    // never finish reading — which is the failure this asserts, not a hang.
+    let (_, refused) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send(&router, subscribe()),
+    )
+    .await
+    .expect("a second stream past a ceiling of one was opened and is still streaming");
+    assert_eq!(
+        err_code(&refused),
+        i64::from(code::QUOTA_EXHAUSTED),
+        "a second stream past a ceiling of one was opened: {refused:#}"
+    );
+
+    drop(held);
+    let reopened = router.clone().oneshot(subscribe()).await.unwrap();
+    assert!(
+        reopened
+            .headers()
+            .get("content-type")
+            .is_some_and(|v| v.to_str().unwrap_or("").starts_with("text/event-stream")),
+        "a stream whose client went away kept its slot"
     );
 }
 
@@ -4732,5 +5347,289 @@ async fn the_push_token_rides_the_delivery_as_its_own_header() {
         seen.as_slice(),
         [Some("opaque-task-token".to_owned()), None],
         "the token must ride exactly when the registration carries one"
+    );
+}
+
+// ── What a listing reads ────────────────────────────────────────────────────
+
+/// A journal that records which runs were read and how many index pages were
+/// fetched. Everything else passes through.
+#[derive(Debug)]
+struct CountsReads {
+    inner: Arc<dyn JournalStore>,
+    read: Mutex<Vec<RunId>>,
+    index_pages: std::sync::atomic::AtomicUsize,
+}
+
+impl CountsReads {
+    fn reset(&self) {
+        self.read.lock().unwrap().clear();
+        self.index_pages
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl JournalStore for CountsReads {
+    fn is_shared(&self) -> bool {
+        self.inner.is_shared()
+    }
+    fn atomic(&self) -> Option<&dyn agentplane::journal::AtomicJournal> {
+        self.inner.atomic()
+    }
+    fn tenant(&self) -> &str {
+        self.inner.tenant()
+    }
+    async fn append(
+        &self,
+        epoch: agentplane::core::Epoch,
+        batch: Vec<agentplane::journal::Append>,
+    ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
+        self.inner.append(epoch, batch).await
+    }
+    async fn read(
+        &self,
+        run: RunId,
+        from: agentplane::core::Seq,
+    ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
+        self.read.lock().unwrap().push(run);
+        self.inner.read(run, from).await
+    }
+    async fn read_page(
+        &self,
+        run: RunId,
+        from: agentplane::core::Seq,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
+        self.read.lock().unwrap().push(run);
+        self.inner.read_page(run, from, limit).await
+    }
+    async fn runs_by_outcome(
+        &self,
+        outcome: &str,
+        limit: usize,
+    ) -> Result<Vec<RunId>, agentplane::core::StoreError> {
+        self.inner.runs_by_outcome(outcome, limit).await
+    }
+    async fn count_by_outcome(&self, outcome: &str) -> Result<u64, agentplane::core::StoreError> {
+        self.inner.count_by_outcome(outcome).await
+    }
+    async fn admitted_as(&self, key: &str) -> Result<Option<RunId>, agentplane::core::StoreError> {
+        self.inner.admitted_as(key).await
+    }
+    async fn forget_admissions(
+        &self,
+        older_than: agentplane::core::Timestamp,
+    ) -> Result<usize, agentplane::core::StoreError> {
+        self.inner.forget_admissions(older_than).await
+    }
+    async fn recent_runs(
+        &self,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, agentplane::core::StoreError> {
+        self.index_pages
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.recent_runs(after, limit).await
+    }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, agentplane::core::StoreError> {
+        self.index_pages
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.recent_runs_from(source, after, limit).await
+    }
+    async fn case_history(
+        &self,
+        case: agentplane::core::CaseId,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
+        self.inner.case_history(case, limit).await
+    }
+    async fn head(
+        &self,
+        run: RunId,
+    ) -> Result<agentplane::journal::Head, agentplane::core::StoreError> {
+        self.inner.head(run).await
+    }
+    async fn acquire(
+        &self,
+        run: RunId,
+        owner: &str,
+        ttl: std::time::Duration,
+    ) -> Result<agentplane::journal::Lease, agentplane::core::StoreError> {
+        self.inner.acquire(run, owner, ttl).await
+    }
+    async fn renew(
+        &self,
+        run: RunId,
+        owner: &str,
+        epoch: agentplane::core::Epoch,
+        ttl: std::time::Duration,
+    ) -> Result<agentplane::journal::Lease, agentplane::core::StoreError> {
+        self.inner.renew(run, owner, epoch, ttl).await
+    }
+    async fn release_lease(
+        &self,
+        run: RunId,
+        epoch: agentplane::core::Epoch,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.release_lease(run, epoch).await
+    }
+    async fn abandoned_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<RunId>, agentplane::core::StoreError> {
+        self.inner.abandoned_runs(limit).await
+    }
+    async fn waiting_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::journal::WaitingRun>, agentplane::core::StoreError> {
+        self.inner.waiting_runs(limit).await
+    }
+    async fn seal(
+        &self,
+        run: RunId,
+        epoch: agentplane::core::Epoch,
+        outcome: &str,
+    ) -> Result<Digest, agentplane::core::StoreError> {
+        self.inner.seal(run, epoch, outcome).await
+    }
+    async fn checkpoint(
+        &self,
+    ) -> Result<agentplane::journal::Checkpoint, agentplane::core::StoreError> {
+        self.inner.checkpoint().await
+    }
+    async fn consistency_proof(
+        &self,
+        old_size: u64,
+    ) -> Result<Vec<Digest>, agentplane::core::StoreError> {
+        self.inner.consistency_proof(old_size).await
+    }
+    async fn inclusion_proof(
+        &self,
+        run: RunId,
+    ) -> Result<Option<agentplane::journal::Inclusion>, agentplane::core::StoreError> {
+        self.inner.inclusion_proof(run).await
+    }
+    async fn request_cancel(
+        &self,
+        run: RunId,
+        actor: &agentplane::core::Operator,
+        reason: &str,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.request_cancel(run, actor, reason).await
+    }
+    async fn cancellation(
+        &self,
+        run: RunId,
+    ) -> Result<Option<agentplane::journal::Cancellation>, agentplane::core::StoreError> {
+        self.inner.cancellation(run).await
+    }
+}
+
+/// A plane whose journal counts what a listing reads.
+fn counted_fixture() -> (Fixture, Arc<CountsReads>) {
+    let f = fixture();
+    let counted = Arc::new(CountsReads {
+        inner: Arc::clone(&f.store) as Arc<dyn JournalStore>,
+        read: Mutex::new(Vec::new()),
+        index_pages: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let rt = Runtime::builder(Arc::clone(&counted) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&f.store) as Arc<dyn CaseStore>)
+        .policy(f.policy.clone() as Arc<dyn PolicyEngine>)
+        .skill(Echoes {
+            capability: "settlement.check",
+            seen: f.seen.clone(),
+        })
+        .build();
+    (Fixture { rt, ..f }, counted)
+}
+
+fn counted_router(f: &Fixture) -> axum::Router {
+    A2aServer::new(
+        f.rt.clone(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &f.manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("the fixture wires a policy engine")
+    .router()
+}
+
+/// **A peer's listing reads its own runs, and nobody else's.**
+///
+/// Whose task a run is lives in its admission, and finding the caller's runs
+/// by reading every run's admission record made one peer's `ListTasks` cost
+/// every other peer's traffic and every run the embedder started. The listing
+/// reads the per-producer index instead, so the other runs cost it no reads.
+#[tokio::test]
+async fn a_listing_reads_only_the_callers_runs() {
+    let (f, counted) = counted_fixture();
+    let router = counted_router(&f);
+    for _ in 0..3 {
+        f.rt.run("settlement.check", Tainted::trusted(json!({})))
+            .await
+            .expect("an embedder's run");
+    }
+    for n in 0..2 {
+        let msg = json!({"message": {
+            "messageId": format!("other-{n}"),
+            "role": "ROLE_USER",
+            "parts": [{"text": "hello"}]
+        }});
+        send(&router, rpc("SendMessage", &msg, Some("peer-b"))).await;
+    }
+    let msg = json!({"message": {
+        "messageId": "mine",
+        "role": "ROLE_USER",
+        "parts": [{"text": "hello"}]
+    }});
+    let (_, sent) = send(&router, rpc("SendMessage", &msg, Some("peer-a"))).await;
+    let mine =
+        RunId::parse(sent["result"]["task"]["id"].as_str().expect("a task id")).expect("a run id");
+
+    counted.reset();
+    let (_, listed) = send(&router, rpc("ListTasks", &json!({}), Some("peer-a"))).await;
+    assert_eq!(listed["result"]["totalSize"], 1, "{listed}");
+    let read = counted.read.lock().unwrap().clone();
+    assert!(
+        read.iter().all(|run| *run == mine),
+        "peer-a's listing read runs it did not admit: {read:?}"
+    );
+}
+
+/// **`statusTimestampAfter` ends the scan at the cutoff.**
+///
+/// The index is newest first, so the first run older than the cutoff means
+/// every run after it is older too. Skipping it and reading on walks the
+/// caller's whole history to find nothing.
+#[tokio::test]
+async fn a_timestamp_cutoff_ends_the_listing_scan() {
+    let (f, counted) = counted_fixture();
+    let router = counted_router(&f);
+    let msg = json!({"message": {
+        "messageId": "old",
+        "role": "ROLE_USER",
+        "parts": [{"text": "hello"}]
+    }});
+    send(&router, rpc("SendMessage", &msg, Some("peer-a"))).await;
+
+    counted.reset();
+    let later = json!({"statusTimestampAfter": "2999-01-01T00:00:00Z"});
+    let (_, listed) = send(&router, rpc("ListTasks", &later, Some("peer-a"))).await;
+    assert_eq!(listed["result"]["totalSize"], 0, "{listed}");
+    assert_eq!(
+        counted
+            .index_pages
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the listing kept paging the index past a cutoff every later row is older than"
     );
 }

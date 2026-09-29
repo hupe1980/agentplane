@@ -644,6 +644,99 @@ mod unwinding {
         }
     }
 
+    /// Lands a charge, then asks for a new plan: a step that changed the world
+    /// and never completed.
+    #[derive(Debug)]
+    struct Charges {
+        log: Log,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Charges {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("charge").provides("charge")
+        }
+        fn compensation(&self) -> Compensation {
+            Compensation::Compensatable
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.effect(M("do:charge".into(), Arc::clone(&self.log), false))
+                .await?;
+            Ok(Outcome::Replan {
+                reason: "the charge needs a different route".into(),
+            })
+        }
+        async fn compensate(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _o: &Tainted<Value>,
+        ) -> Result<(), SkillError> {
+            cx.effect(M("undo:charge".into(), Arc::clone(&self.log), false))
+                .await?;
+            Ok(())
+        }
+    }
+
+    /// Successor that drops the step which charged and asked to replan.
+    #[derive(Debug)]
+    struct DropsCharge;
+    #[async_trait::async_trait]
+    impl Replanner for DropsCharge {
+        async fn replan(
+            &self,
+            current: &PlanIR,
+            reason: &str,
+            _c: &[(StepId, Capability)],
+        ) -> Result<PlanIR, ReplanError> {
+            Ok(current.succeed_with(
+                vec![
+                    PlanNode::new(0, "alpha").arg("input", ArgSource::run_input()),
+                    PlanNode::new(2, "boom")
+                        .arg("x", ArgSource::node(StepId(0)))
+                        .terminal(),
+                ],
+                reason,
+            ))
+        }
+    }
+
+    /// Successor that puts other work at the id of the step which charged.
+    #[derive(Debug)]
+    struct ReusesCharge;
+    #[async_trait::async_trait]
+    impl Replanner for ReusesCharge {
+        async fn replan(
+            &self,
+            current: &PlanIR,
+            reason: &str,
+            _c: &[(StepId, Capability)],
+        ) -> Result<PlanIR, ReplanError> {
+            Ok(current.succeed_with(
+                vec![
+                    PlanNode::new(0, "alpha").arg("input", ArgSource::run_input()),
+                    PlanNode::new(1, "gamma").arg("x", ArgSource::node(StepId(0))),
+                    PlanNode::new(2, "boom")
+                        .arg("x", ArgSource::node(StepId(1)))
+                        .terminal(),
+                ],
+                reason,
+            ))
+        }
+    }
+
+    fn charging() -> PlanIR {
+        PlanIR::new(vec![
+            PlanNode::new(0, "alpha").arg("input", ArgSource::run_input()),
+            PlanNode::new(1, "charge")
+                .arg("x", ArgSource::node(StepId(0)))
+                .terminal(),
+        ])
+    }
+
     fn runtime(planner: Arc<dyn Replanner>, log: &Log) -> Arc<Runtime> {
         let store = Arc::new(RedbStore::open_in_memory().unwrap());
         Runtime::builder(store as Arc<dyn JournalStore>)
@@ -656,6 +749,9 @@ mod unwinding {
                 fails: false,
             })
             .skill(Asks)
+            .skill(Charges {
+                log: Arc::clone(log),
+            })
             .skill(Undoable {
                 name: "gamma",
                 log: Arc::clone(log),
@@ -772,6 +868,73 @@ mod unwinding {
             "dropping a step from the successor does not un-run it"
         );
     }
+
+    /// **A step that landed a mutation and asked to replan is undone as what
+    /// ran, even when the successor drops it.**
+    ///
+    /// The step never completed, so the unwind reaches it as an interrupted
+    /// step — and the capability it ran is on the record in its
+    /// `StepStarted`. Resolving it from the plan in force found nothing at
+    /// step 1 and left the charge standing.
+    #[tokio::test]
+    async fn a_charge_that_asked_to_replan_is_undone_when_the_successor_drops_it() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let rt = runtime(Arc::new(DropsCharge), &log);
+
+        let out = rt
+            .run_plan(charging(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+        assert!(
+            matches!(out.status, RunStatus::Failed(_)),
+            "got {:?}",
+            out.status
+        );
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(
+            entries,
+            vec![
+                "do:alpha",
+                "do:charge",
+                "do:boom",
+                "undo:charge",
+                "undo:alpha"
+            ],
+            "the landed charge was not undone by the skill that made it"
+        );
+    }
+
+    /// **A successor may not put other work at the id of a step that started.**
+    ///
+    /// The reuse rule covers every step the journal says started, not only
+    /// the completed ones: effect keys derive from the step id, and a step
+    /// that charged before asking to replan holds keys the new work would
+    /// collide with. Refused, the run unwinds the charge as `charge` — never
+    /// as `gamma`, which did not run.
+    #[tokio::test]
+    async fn a_successor_may_not_reuse_the_id_of_a_step_that_started() {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let rt = runtime(Arc::new(ReusesCharge), &log);
+
+        let out = rt
+            .run_plan(charging(), Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+        match &out.status {
+            RunStatus::Failed(m) => {
+                assert!(m.contains("reuses step s1"), "got: {m}");
+            }
+            other => panic!("expected the successor refused, got {other:?}"),
+        }
+
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(
+            entries,
+            vec!["do:alpha", "do:charge", "undo:charge", "undo:alpha"],
+            "the successor's work ran at a used id, or the charge was not undone"
+        );
+    }
 }
 
 // ── The contract binds the successor too ────────────────────────────────────
@@ -821,5 +984,73 @@ async fn a_required_verifier_binds_the_successor_a_replanner_proposes() {
             "the successor was refused for some other reason: {why}"
         ),
         other => panic!("a successor with nothing checking the work ran: {other:?}"),
+    }
+}
+
+// ── A carried-over step is the same step ────────────────────────────────────
+
+/// Keeps step 1's capability but moves it behind new work and makes it the
+/// terminal verifier.
+#[derive(Debug)]
+struct Reorders;
+
+#[async_trait::async_trait]
+impl Replanner for Reorders {
+    async fn replan(
+        &self,
+        current: &PlanIR,
+        reason: &str,
+        _completed: &[(StepId, agentplane::core::Capability)],
+    ) -> Result<PlanIR, ReplanError> {
+        Ok(current.succeed_with(
+            vec![
+                PlanNode::new(3, "fetch").arg("input", ArgSource::run_input()),
+                PlanNode::new(1, "lookup")
+                    .arg("subject", ArgSource::node(StepId(3)))
+                    .verifies()
+                    .terminal(),
+            ],
+            reason,
+        ))
+    }
+}
+
+/// **A successor's terminal is not satisfied by work done under another node.**
+///
+/// Step 1 ran under v1 with no dependencies. v2 declares a *different* step 1 —
+/// after 3, verifying it, terminal — and a completed step counts as done by id,
+/// so carrying it over would finish the run the moment 3 did: a verifier that
+/// never saw what it verifies, reported as the plan's completion. A completed
+/// step carries over only as the node it ran as; anything else is refused.
+#[tokio::test]
+async fn a_successor_may_not_redeclare_a_completed_step() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .budget(Budget::default().replans(2))
+        .replanner(Arc::new(Reorders))
+        .skill(Plain("lookup"))
+        .skill(Plain("fetch"))
+        .skill(AsksToReplan {
+            name: "asks",
+            untrusted: false,
+        })
+        .build();
+
+    let v1 = PlanIR::new(vec![
+        PlanNode::new(1, "lookup").arg("input", ArgSource::run_input()),
+        PlanNode::new(2, "asks")
+            .arg("x", ArgSource::node(StepId(1)))
+            .terminal(),
+    ]);
+    let out = rt.run_plan(v1, Tainted::trusted(json!({}))).await.unwrap();
+    match &out.status {
+        RunStatus::Failed(m) => assert!(
+            m.contains("step s1") && m.contains("redeclares"),
+            "the refusal does not name the redeclared step: {m}"
+        ),
+        other => panic!(
+            "a terminal verifier that never ran after what it verifies completed the run: {other:?}"
+        ),
     }
 }

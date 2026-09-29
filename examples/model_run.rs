@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example model_run --features redb,testkit
+//! cargo run --example model_run --features redb,fake-model
 //! ```
 //!
 //! No API key, no network. `model::fake::FakeProvider` stands in for the provider,

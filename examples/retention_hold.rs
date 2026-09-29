@@ -10,7 +10,7 @@
 //! is reported as held rather than as a failure, because a control doing its
 //! job must not read as a malfunction.
 //!
-//! Run with: `cargo run --example retention_hold --features redb,testkit`
+//! Run with: `cargo run --example retention_hold`
 
 use std::sync::Arc;
 

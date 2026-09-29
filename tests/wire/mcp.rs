@@ -818,7 +818,7 @@ async fn a_tool_call_carries_signed_provenance() {
         "the server received no provenance: {meta:?}"
     );
     assert!(
-        meta.contains_key("io.github.hupe1980.agentplane/attestation"),
+        meta.contains_key("io.github.hupe1980.agentplane/signature"),
         "the block arrived unsigned, which is a claim rather than evidence: {meta:?}"
     );
 
@@ -871,7 +871,7 @@ async fn an_unsigned_block_still_correlates_but_does_not_attest() {
     let meta = seen.0.lock().unwrap().clone().expect("_meta");
     assert!(meta.contains_key("io.github.hupe1980.agentplane/run_id"));
     assert!(
-        !meta.contains_key("io.github.hupe1980.agentplane/attestation"),
+        !meta.contains_key("io.github.hupe1980.agentplane/signature"),
         "a plane with no identity must not emit something that looks attested"
     );
 }

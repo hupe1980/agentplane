@@ -11,9 +11,8 @@
 //!
 //! `model_run` is the same story against `FakeProvider`: no key, no
 //! network, runnable by anyone. Read that one first. This exists to show the
-//! claim holding against a provider that can genuinely disagree — which is not
-//! a hypothetical, because writing it found two bugs in the `OpenAI` driver that
-//! every stubbed test had passed.
+//! claim holding against a provider that can genuinely disagree, which a stub
+//! never does.
 //!
 //! What it shows:
 //!
@@ -108,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Ok(key) = std::env::var("OPENAI_API_KEY") else {
         eprintln!("OPENAI_API_KEY is not set — this example calls a real model.");
         eprintln!(
-            "For a version that needs no key: cargo run --example model_run --features redb,testkit"
+            "For a version that needs no key: cargo run --example model_run --features redb,fake-model"
         );
         return Ok(());
     };

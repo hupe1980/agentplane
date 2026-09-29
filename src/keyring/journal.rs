@@ -110,12 +110,7 @@ impl SealedJournal {
         kind: &crate::journal::RecordKind,
         effect: Option<crate::core::EffectKey>,
     ) -> String {
-        format!(
-            "journal:{}:{run}:{}:{}",
-            self.tenant,
-            kind.kind_str(),
-            effect.map_or_else(|| "-".to_owned(), crate::core::EffectKey::to_hex),
-        )
+        journal_aad(self.tenant.as_str(), run, kind, effect)
     }
 }
 
@@ -279,6 +274,14 @@ impl JournalStore for SealedJournal {
     ) -> Result<Vec<(RunId, u64)>, StoreError> {
         self.inner.recent_runs(after, limit).await
     }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs_from(source, after, limit).await
+    }
 
     async fn head(&self, run: RunId) -> Result<Head, StoreError> {
         self.inner.head(run).await
@@ -337,48 +340,16 @@ impl SealedJournal {
     async fn open_all(&self, records: Vec<Record>) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::with_capacity(records.len());
         for record in records {
-            let run = record.body.run;
-            let aad = self.aad(run, record.kind(), record.effect_key());
             let mut kind = record.kind().clone();
-            let mut changed = false;
-            for field in payload::payloads(&mut kind) {
-                match field {
-                    payload::SealedField::Value(field) => {
-                        let Some(envelope) = payload::unwrap(field) else {
-                            continue;
-                        };
-                        if let Some(plain) = super::envelope::open_or_erased(
-                            self.keys.as_ref(),
-                            aad.as_bytes(),
-                            &envelope,
-                        )
-                        .await
-                        .map_err(|e| StoreError::Backend(e.to_string()))?
-                        {
-                            *field = serde_json::from_slice(&plain)?;
-                            changed = true;
-                        }
-                    }
-                    payload::SealedField::Text(field) => {
-                        let Some(envelope) = payload::unwrap_text(field) else {
-                            continue;
-                        };
-                        if let Some(plain) = super::envelope::open_or_erased(
-                            self.keys.as_ref(),
-                            aad.as_bytes(),
-                            &envelope,
-                        )
-                        .await
-                        .map_err(|e| StoreError::Backend(e.to_string()))?
-                            && let Ok(text) = String::from_utf8(plain)
-                        {
-                            *field = text;
-                            changed = true;
-                        }
-                    }
-                }
-            }
-            out.push(if changed {
+            let opened = open_payloads(
+                self.keys.as_ref(),
+                self.tenant.as_str(),
+                record.body.run,
+                record.effect_key(),
+                &mut kind,
+            )
+            .await?;
+            out.push(if opened.opened > 0 {
                 record.with_opened_kind(kind)
             } else {
                 record
@@ -386,4 +357,94 @@ impl SealedJournal {
         }
         Ok(out)
     }
+}
+
+/// The associated data a journal payload authenticates under.
+///
+/// The ciphertext binds **tenant, record identity and purpose** — see
+/// [`SealedJournal`]'s own `aad` for what each component closes. A free
+/// function because an offline reader of an export opens the same payloads
+/// under the same binding without a store.
+pub(crate) fn journal_aad(
+    tenant: &str,
+    run: RunId,
+    kind: &crate::journal::RecordKind,
+    effect: Option<crate::core::EffectKey>,
+) -> String {
+    format!(
+        "journal:{tenant}:{run}:{}:{}",
+        kind.kind_str(),
+        effect.map_or_else(|| "-".to_owned(), crate::core::EffectKey::to_hex),
+    )
+}
+
+/// What opening one record's sealed payloads found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Opened {
+    /// Payloads this call turned back into their plaintext.
+    pub(crate) opened: usize,
+    /// Payloads whose key has been **destroyed**: erased, for good.
+    pub(crate) erased: usize,
+}
+
+/// Open every sealed payload `kind` carries, in place.
+///
+/// The one opener: [`SealedJournal`] reads through it, and so does
+/// `policy check` over an export, so the two cannot disagree about which
+/// payload is erased and which merely sealed. A payload whose key was
+/// destroyed stays sealed and is counted in [`Opened::erased`] — erasure is a
+/// completed operation, not an outage. Every other key failure is an error: a
+/// ring that cannot be reached reported as an erasure is indistinguishable
+/// from one, and the two call for opposite actions.
+///
+/// # Errors
+///
+/// Whatever the ring said, for every cause but a destroyed key; or opened
+/// bytes that do not parse as the field they replace.
+pub(crate) async fn open_payloads(
+    keys: &dyn KeyRing,
+    tenant: &str,
+    run: RunId,
+    effect: Option<crate::core::EffectKey>,
+    kind: &mut crate::journal::RecordKind,
+) -> Result<Opened, StoreError> {
+    let aad = journal_aad(tenant, run, kind, effect);
+    let mut found = Opened::default();
+    for field in payload::payloads(kind) {
+        match field {
+            payload::SealedField::Value(field) => {
+                let Some(envelope) = payload::unwrap(field) else {
+                    continue;
+                };
+                match super::envelope::open_or_erased(keys, aad.as_bytes(), &envelope)
+                    .await
+                    .map_err(|e| StoreError::Backend(e.to_string()))?
+                {
+                    Some(plain) => {
+                        *field = serde_json::from_slice(&plain)?;
+                        found.opened += 1;
+                    }
+                    None => found.erased += 1,
+                }
+            }
+            payload::SealedField::Text(field) => {
+                let Some(envelope) = payload::unwrap_text(field) else {
+                    continue;
+                };
+                match super::envelope::open_or_erased(keys, aad.as_bytes(), &envelope)
+                    .await
+                    .map_err(|e| StoreError::Backend(e.to_string()))?
+                {
+                    Some(plain) => {
+                        if let Ok(text) = String::from_utf8(plain) {
+                            *field = text;
+                            found.opened += 1;
+                        }
+                    }
+                    None => found.erased += 1,
+                }
+            }
+        }
+    }
+    Ok(found)
 }

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Spend, Tainted, TenantId};
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::quota::{Period, QuotaError, QuotaSettlement, QuotaStore, TenantQuota};
+use agentplane::quota::{Period, QuotaError, QuotaSettlement, QuotaStore, SpendHold, TenantQuota};
 use agentplane::runtime::{RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
@@ -85,14 +85,34 @@ impl QuotaStore for FailsFirstSettlement {
     async fn reserve(
         &self,
         run: agentplane::RunId,
-        limit: Option<u32>,
+        quota: &TenantQuota,
+        hold: Option<&SpendHold>,
         at: agentplane::core::Timestamp,
     ) -> Result<(), QuotaError> {
-        self.inner.reserve(run, limit, at).await
+        self.inner.reserve(run, quota, hold, at).await
     }
 
     async fn release(&self, run: agentplane::RunId) -> Result<(), agentplane::core::StoreError> {
         self.inner.release(run).await
+    }
+
+    async fn carry(
+        &self,
+        run: agentplane::RunId,
+        period: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.carry(run, period).await
+    }
+
+    async fn reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::quota::Held>, agentplane::core::StoreError> {
+        self.inner.reservations(limit).await
+    }
+
+    async fn reserved(&self, period: &str) -> Result<Spend, agentplane::core::StoreError> {
+        self.inner.reserved(period).await
     }
 
     async fn set_halt(
@@ -142,6 +162,22 @@ impl QuotaStore for FailsFirstSettlement {
     ) -> Result<Vec<agentplane::RunId>, agentplane::core::StoreError> {
         self.inner.running_runs(limit).await
     }
+
+    async fn reserve_rate(
+        &self,
+        reservation: &agentplane::quota::RateReservation,
+    ) -> Result<(), QuotaError> {
+        self.inner.reserve_rate(reservation).await
+    }
+
+    async fn rate_room(
+        &self,
+        grant: &str,
+        ceilings: &[agentplane::quota::RateCeiling],
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), QuotaError> {
+        self.inner.rate_room(grant, ceilings, at).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -157,6 +193,22 @@ impl Skill for BlockingWork {
         self.entered.wait().await;
         self.release.wait().await;
         Ok(Outcome::done(input))
+    }
+}
+
+/// A run budget a tenant's spend quota can reserve: a ceiling, and what one
+/// operation of these fixtures reports at most.
+fn bounded() -> agentplane::core::Budget {
+    agentplane::core::Budget::unlimited()
+        .tokens(1_000)
+        .call_tokens(100)
+}
+
+/// A quota with only a concurrency ceiling.
+fn slots(n: u32) -> TenantQuota {
+    TenantQuota {
+        max_concurrent_runs: Some(n),
+        ..TenantQuota::default()
     }
 }
 
@@ -216,11 +268,11 @@ async fn a_tenant_at_its_ceiling_is_refused() {
     let second = agentplane::core::RunId::generate();
 
     quotas
-        .reserve(first, Some(1), at)
+        .reserve(first, &slots(1), None, at)
         .await
         .expect("first fits");
 
-    let refused = quotas.reserve(second, Some(1), at).await;
+    let refused = quotas.reserve(second, &slots(1), None, at).await;
     assert!(
         matches!(refused, Err(QuotaError::TooManyRuns { running: 1, .. })),
         "a second run was admitted past a ceiling of one: {refused:?}"
@@ -230,7 +282,7 @@ async fn a_tenant_at_its_ceiling_is_refused() {
     // permanent refusal.
     quotas.release(first).await.expect("release");
     quotas
-        .reserve(second, Some(1), at)
+        .reserve(second, &slots(1), None, at)
         .await
         .expect("the slot freed by the first run was not reusable");
 }
@@ -247,9 +299,12 @@ async fn reserving_the_same_run_twice_takes_one_slot() {
     let at = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("instant");
     let run = agentplane::core::RunId::generate();
 
-    quotas.reserve(run, Some(1), at).await.expect("first");
     quotas
-        .reserve(run, Some(1), at)
+        .reserve(run, &slots(1), None, at)
+        .await
+        .expect("first");
+    quotas
+        .reserve(run, &slots(1), None, at)
         .await
         .expect("a retried admission was refused against its own slot");
     assert_eq!(
@@ -273,11 +328,11 @@ async fn one_tenants_ceiling_does_not_throttle_another() {
     let at = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("instant");
 
     // Acme fills its ceiling.
-    acme.reserve(agentplane::core::RunId::generate(), Some(1), at)
+    acme.reserve(agentplane::core::RunId::generate(), &slots(1), None, at)
         .await
         .expect("acme fits");
     assert!(
-        acme.reserve(agentplane::core::RunId::generate(), Some(1), at)
+        acme.reserve(agentplane::core::RunId::generate(), &slots(1), None, at)
             .await
             .is_err(),
         "acme's own ceiling did not hold"
@@ -285,7 +340,7 @@ async fn one_tenants_ceiling_does_not_throttle_another() {
 
     // Globex is unaffected.
     globex
-        .reserve(agentplane::core::RunId::generate(), Some(1), at)
+        .reserve(agentplane::core::RunId::generate(), &slots(1), None, at)
         .await
         .expect("one tenant's runs consumed another tenant's ceiling");
     assert_eq!(globex.running().await.expect("count"), 1);
@@ -313,6 +368,7 @@ async fn a_tenant_that_has_spent_its_period_is_refused() {
                 period: Some("2026-08".to_owned()),
                 spend: Spend::tokens(tokens),
                 release_slot: false,
+                concludes: false,
             })
             .await
             .expect("settle");
@@ -326,7 +382,15 @@ async fn a_tenant_that_has_spent_its_period_is_refused() {
          incurred"
     );
     assert!(
-        agentplane::quota::check_spend("acme", "2026-08", &quota, spent).is_err(),
+        agentplane::quota::check_spend(
+            "acme",
+            "2026-08",
+            &quota,
+            spent,
+            Spend::ZERO,
+            Spend::tokens(1)
+        )
+        .is_err(),
         "a tenant at exactly its ceiling was allowed to start more work"
     );
 
@@ -334,7 +398,17 @@ async fn a_tenant_that_has_spent_its_period_is_refused() {
     // this is the behaviour a bill implies.
     let next = quotas.spent("2026-09").await.expect("read");
     assert_eq!(next.tokens, 0);
-    assert!(agentplane::quota::check_spend("acme", "2026-09", &quota, next).is_ok());
+    assert!(
+        agentplane::quota::check_spend(
+            "acme",
+            "2026-09",
+            &quota,
+            next,
+            Spend::ZERO,
+            Spend::tokens(1_000)
+        )
+        .is_ok()
+    );
 }
 
 /// A period key is derived from the instant, and orders lexicographically.
@@ -478,6 +552,22 @@ async fn redb_satisfies_the_quota_store_contract() {
     report.assert_conforms("RedbStore (quota)");
 }
 
+/// Two handles on one redb file, racing for the last units of a period.
+///
+/// redb has one writer, so this holds by construction there — which is what
+/// makes it the reference the shared backend's twin is compared with.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn concurrent_admissions_at_the_spend_ceiling_admit_only_what_fits() {
+    let store = RedbStore::open_in_memory().expect("store");
+    let first = store.clone().for_tenant(tenant("race"));
+    let second = store.for_tenant(tenant("race"));
+
+    let mut report = agentplane::testkit::conformance::Report::default();
+    agentplane::testkit::conformance_quota::check_race(&first, &second, &mut report).await;
+    report.assert_conforms("RedbStore (quota race)");
+}
+
 /// Replay never consults the quota, so a ceiling cannot rewrite the past.
 ///
 /// A quota is wall-clock, mutable state that lives outside the chain. If replay
@@ -513,7 +603,7 @@ async fn replay_does_not_consult_the_quota() {
     let scoped = Arc::new(store.for_tenant(tenant("acme"))) as Arc<dyn QuotaStore>;
     let at = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("instant");
     scoped
-        .reserve(agentplane::core::RunId::generate(), Some(1), at)
+        .reserve(agentplane::core::RunId::generate(), &slots(1), None, at)
         .await
         .expect("occupy the ceiling");
 
@@ -922,6 +1012,7 @@ async fn a_resumed_run_accrues_its_spend_once() {
         .tenant(tenant("acme"))
         .owner("t")
         .timers(scoped.clone() as Arc<dyn TimerStore>)
+        .budget(bounded())
         .quota(scoped.clone() as Arc<dyn QuotaStore>, quota)
         .skill(SpendThenSleep)
         .build();
@@ -975,6 +1066,7 @@ async fn a_strict_pass_accrues_no_spend() {
     let rt = Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
         .tenant(tenant("acme"))
         .owner("t")
+        .budget(bounded())
         .quota(scoped.clone() as Arc<dyn QuotaStore>, quota)
         .skill(SpendsOnce)
         .build();
@@ -1027,6 +1119,7 @@ async fn a_failed_quota_settlement_is_recovered_exactly_once() {
         .tenant(tenant("acme"))
         .owner("settlement-recovery")
         .lease_ttl(MIN_LEASE_TTL)
+        .budget(bounded())
         .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
         .skill(SpendsOnce)
         .build();
@@ -1081,6 +1174,11 @@ async fn a_failed_quota_settlement_is_recovered_exactly_once() {
     assert_eq!(quotas.running().await.expect("running"), 0);
     assert_eq!(quotas.spent(&period).await.expect("spent").tokens, 100);
     assert!(store.inclusion_proof(run).await.expect("proof").is_some());
+    assert!(
+        quotas.reserved(&period).await.expect("reserved").is_free(),
+        "recovery settled the concluding pass and left the run's reservation \
+         standing, so a run that finished holds the period forever"
+    );
 
     rt.replay(run, Mode::Resume)
         .await
@@ -1123,6 +1221,7 @@ async fn a_failed_recovery_keeps_the_run_in_the_retry_queue() {
         .tenant(tenant("acme"))
         .owner("settlement-recovery")
         .lease_ttl(MIN_LEASE_TTL)
+        .budget(bounded())
         .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
         .skill(SpendsOnce)
         .build();
@@ -1207,6 +1306,7 @@ async fn settlement_recovery_preserves_an_open_failure() {
         .tenant(tenant("acme"))
         .owner("failed-settlement-recovery")
         .lease_ttl(MIN_LEASE_TTL)
+        .budget(bounded())
         .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
         .skill(SpendsThenFails)
         .build();
@@ -1710,5 +1810,548 @@ impl Skill for Waits {
         )
         .await?;
         Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}
+
+/// Spends a fixed figure once, under a capability a commission names.
+#[derive(Debug)]
+struct Specialist;
+
+#[async_trait::async_trait]
+impl Skill for Specialist {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("specialist").provides("specialist")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.effect(Costs(100)).await?;
+        Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}
+
+/// Commissions the specialist and spends nothing of its own.
+#[derive(Debug)]
+struct Delegator;
+
+#[async_trait::async_trait]
+impl Skill for Delegator {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("delegator").provides("delegator")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let answer = cx
+            .commission("specialist", Tainted::trusted(json!({})))
+            .await?;
+        Ok(Outcome::done(answer))
+    }
+}
+
+/// A commission is billed to the tenant's period once, by the run that spent it.
+///
+/// The sub-run takes its own quota pass and settles its own spend; the
+/// commissioning run's ledger is billed the same figure so its own ceiling
+/// bounds the work it ordered. Settling that figure a second time from the
+/// parent's pass would charge the tenant twice for one call.
+#[tokio::test]
+async fn a_commission_accrues_to_the_tenant_period_once() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.clone().for_tenant(tenant("acme")));
+    let rt = Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("t")
+        .budget(
+            agentplane::core::Budget::unlimited()
+                .tokens(10_000)
+                .call_tokens(100),
+        )
+        .quota(scoped.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(Specialist)
+        .skill(Delegator)
+        .build();
+
+    let out = rt
+        .run("delegator", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded);
+    assert_eq!(
+        out.consumed.spend.tokens, 100,
+        "the commissioning run's own ceiling must still see what it ordered"
+    );
+    let spent = QuotaStore::spent(scoped.as_ref(), &this_period(&quota))
+        .await
+        .expect("read");
+    assert_eq!(
+        spent.tokens, 100,
+        "one hundred tokens were spent once and the period was charged {} — the \
+         commissioning run settled its sub-run's spend a second time",
+        spent.tokens
+    );
+}
+
+// ── Reservation ─────────────────────────────────────────────────────────────
+
+/// Sleeps first, then spends 100 at a time until its own budget stops it.
+#[derive(Debug)]
+struct SleepThenBurn;
+
+#[async_trait::async_trait]
+impl Skill for SleepThenBurn {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("burner").provides("burner")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.sleep(std::time::Duration::from_secs(60)).await?;
+        for _ in 0..100 {
+            cx.effect(Costs(100)).await?;
+        }
+        Ok(Outcome::done(Tainted::trusted(json!({"ok": true}))))
+    }
+}
+
+/// A plane over one tenant with a spend quota, a run budget and timers.
+fn reserving_plane(
+    scoped: &Arc<RedbStore>,
+    quota: TenantQuota,
+    budget: agentplane::core::Budget,
+) -> Arc<Runtime> {
+    use agentplane::case::TimerStore;
+    Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("t")
+        .timers(scoped.clone() as Arc<dyn TimerStore>)
+        .budget(budget)
+        .quota(scoped.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(SleepThenBurn)
+        .skill(SpendThenSleep)
+        .skill(SpendsOnce)
+        .skill(Work)
+        .build()
+}
+
+#[allow(clippy::disallowed_methods)]
+fn an_hour_from_now() -> agentplane::core::Timestamp {
+    agentplane::core::Timestamp::now_utc() + std::time::Duration::from_secs(3600)
+}
+
+/// **A period ceiling bounds admitted work, not only settled work.**
+///
+/// Every run here suspends before spending anything, so at every admission
+/// the period has settled nothing — a ceiling that counted settled spend alone
+/// would admit all five, and each then spends its whole budget and one call
+/// past it. Reserved, each holds `250 + 1 × 100`: two fit a 1000-token
+/// period, the third is refused naming what is reserved, and when every
+/// admitted run has resumed and exhausted its budget the settled total is
+/// inside the ceiling.
+#[tokio::test]
+async fn a_period_ceiling_bounds_suspended_runs() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let budget = agentplane::core::Budget::unlimited()
+        .tokens(250)
+        .call_tokens(100);
+    let rt = reserving_plane(&scoped, quota, budget);
+    let period = this_period(&quota);
+
+    let mut admitted = 0;
+    for attempt in 0..5 {
+        match rt.run("burner", Tainted::trusted(json!({}))).await {
+            Ok(out) => {
+                assert!(out.status.is_suspended(), "{:?}", out.status);
+                admitted += 1;
+            }
+            Err(agentplane::core::RuntimeError::QuotaExceeded(QuotaError::SpentOut {
+                settled,
+                reserved,
+                requested,
+                ..
+            })) => {
+                assert_eq!(
+                    (settled, reserved, requested),
+                    (0, 700, 350),
+                    "the refusal must name settled and reserved apart"
+                );
+            }
+            Err(other) => panic!("attempt {attempt} failed for another reason: {other}"),
+        }
+    }
+    assert_eq!(
+        admitted, 2,
+        "{admitted} runs each able to spend 350 were admitted into a 1000-token period \
+         — the ceiling counted settled spend and not what admitted runs can spend"
+    );
+
+    assert_eq!(
+        rt.fire_timers(an_hour_from_now())
+            .await
+            .expect("fire")
+            .fired,
+        2
+    );
+    let settled = QuotaStore::spent(scoped.as_ref(), &period)
+        .await
+        .expect("read")
+        .tokens;
+    assert_eq!(
+        settled, 600,
+        "each run spends to its ceiling of 250 and one 100-token call past it"
+    );
+    assert!(settled <= 1_000, "the period passed its ceiling: {settled}");
+}
+
+/// A run that concludes under its reservation gives the period the rest back.
+#[tokio::test]
+async fn a_settled_run_releases_its_unspent_reservation() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let budget = agentplane::core::Budget::unlimited()
+        .tokens(500)
+        .call_tokens(100);
+    let rt = reserving_plane(&scoped, quota, budget);
+    let period = this_period(&quota);
+
+    let out = rt
+        .run("spends-once", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded);
+    assert_eq!(
+        QuotaStore::spent(scoped.as_ref(), &period)
+            .await
+            .expect("spent")
+            .tokens,
+        100
+    );
+    assert!(
+        QuotaStore::reserved(scoped.as_ref(), &period)
+            .await
+            .expect("reserved")
+            .is_free(),
+        "a run that finished having spent 100 of the 600 it reserved still holds \
+         the rest, so the period fills with budget nobody will spend"
+    );
+    assert!(
+        QuotaStore::reservations(scoped.as_ref(), 10)
+            .await
+            .expect("listing")
+            .is_empty()
+    );
+
+    // Every resume settles the passes its history records again, and the
+    // receipt says the last one concluded the run: a resume of the finished
+    // run must read the conclusion the same way, or its own receipt refuses it.
+    rt.replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("a resume of a finished run disagreed with its own settlement receipt");
+}
+
+/// A suspended pass's spend leaves the reservation as it is settled.
+///
+/// Settlement happens at the end of every pass, a suspended one included, so a
+/// reservation held whole until conclusion would count this run's first 100
+/// tokens twice: once settled, once still reserved.
+#[tokio::test]
+async fn a_suspended_pass_is_not_charged_twice() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let budget = agentplane::core::Budget::unlimited()
+        .tokens(500)
+        .call_tokens(100);
+    let rt = reserving_plane(&scoped, quota, budget);
+    let period = this_period(&quota);
+
+    let out = rt
+        .run("spender", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(out.status.is_suspended());
+    let settled = QuotaStore::spent(scoped.as_ref(), &period)
+        .await
+        .expect("spent");
+    let held = QuotaStore::reserved(scoped.as_ref(), &period)
+        .await
+        .expect("reserved");
+    assert_eq!(
+        (settled.tokens, held.tokens),
+        (100, 500),
+        "the period counts {} settled and {} reserved for a run that holds 600 — \
+         its first pass is charged twice",
+        settled.tokens,
+        held.tokens
+    );
+}
+
+/// Under a money quota, a run with no money ceiling is refused, naming why.
+#[tokio::test]
+async fn a_run_with_no_money_ceiling_is_refused_under_a_money_quota() {
+    let quota = TenantQuota {
+        max_minor_units_per_period: Some(10_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    // Everything but the money ceiling: a per-call bound alone is not a bound
+    // on the run.
+    let budget = agentplane::core::Budget::unlimited().call_minor_units(10);
+    let rt = reserving_plane(&scoped, quota, budget);
+
+    match rt.run("spends-once", Tainted::trusted(json!({}))).await {
+        Err(agentplane::core::RuntimeError::QuotaExceeded(QuotaError::Unbounded {
+            field, ..
+        })) => assert_eq!(field, "max_minor_units"),
+        other => {
+            panic!("a run that can spend without limit entered a money-bounded period: {other:?}")
+        }
+    }
+    assert_eq!(
+        QuotaStore::running(scoped.as_ref()).await.expect("count"),
+        0,
+        "the refused run holds a slot"
+    );
+}
+
+/// With no spend quota, a run's budget is its own business.
+#[tokio::test]
+async fn a_run_with_no_ceiling_is_admitted_without_a_quota() {
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let rt = reserving_plane(&scoped, slots(4), agentplane::core::Budget::unlimited());
+    let out = rt
+        .run("spends-once", Tainted::trusted(json!({})))
+        .await
+        .expect("an unbudgeted run under a concurrency-only quota is admitted");
+    assert_eq!(out.status, RunStatus::Succeeded);
+}
+
+/// A resume is never refused for spend, however full the period is.
+#[tokio::test]
+async fn a_resume_past_the_ceiling_is_not_refused() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let budget = agentplane::core::Budget::unlimited()
+        .tokens(250)
+        .call_tokens(100);
+    let rt = reserving_plane(&scoped, quota, budget);
+    let period = this_period(&quota);
+
+    let out = rt
+        .run("burner", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(out.status.is_suspended());
+
+    // Somebody else's work settles the period far past its ceiling.
+    QuotaStore::settle(
+        scoped.as_ref(),
+        &QuotaSettlement {
+            run: agentplane::core::RunId::generate(),
+            epoch: 1,
+            period: Some(period.clone()),
+            spend: Spend::tokens(5_000),
+            release_slot: false,
+            concludes: true,
+        },
+    )
+    .await
+    .expect("settle");
+
+    assert_eq!(
+        rt.fire_timers(an_hour_from_now())
+            .await
+            .expect("fire")
+            .fired,
+        1
+    );
+    let records = scoped.read(out.run_id, 1).await.expect("read");
+    let concluded = records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::RunConcluded { outcome, .. } => Some(outcome.clone()),
+        _ => None,
+    });
+    assert_eq!(
+        concluded.as_deref(),
+        Some("exhausted"),
+        "the resume was refused for spend and the admitted run stranded mid-work"
+    );
+}
+
+/// A resume in a later period brings what the run still holds with it.
+///
+/// The old period is released and the new one holds the same remainder — the
+/// run spends where it resumes, so that is where its worst case belongs.
+#[tokio::test]
+async fn a_resume_across_a_period_boundary_follows_the_stated_rule() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let budget = agentplane::core::Budget::unlimited()
+        .tokens(250)
+        .call_tokens(100);
+    let rt = reserving_plane(&scoped, quota, budget);
+    let period = this_period(&quota);
+
+    let out = rt
+        .run("burner", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(out.status.is_suspended());
+    // Stand the run's hold in a period long past, as if it had been admitted
+    // then and is resuming now.
+    QuotaStore::carry(scoped.as_ref(), out.run_id, "2000-01")
+        .await
+        .expect("move");
+
+    assert_eq!(
+        rt.fire_timers(an_hour_from_now())
+            .await
+            .expect("fire")
+            .fired,
+        1
+    );
+    assert!(
+        QuotaStore::reserved(scoped.as_ref(), "2000-01")
+            .await
+            .expect("old")
+            .is_free(),
+        "the admission period still holds the run's remainder after it resumed elsewhere"
+    );
+    // Exhausted, not sealed: it still holds what it did not spend (350 − 300),
+    // and holds it in the period it resumed in.
+    let held = QuotaStore::reservations(scoped.as_ref(), 10)
+        .await
+        .expect("listing");
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].period, period);
+    assert_eq!(held[0].remaining, Spend::tokens(50));
+}
+
+/// A stopped run holding a reservation is named, with the verb that frees it.
+#[tokio::test]
+async fn a_full_period_names_the_runs_that_hold_it() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let budget = agentplane::core::Budget::unlimited()
+        .tokens(250)
+        .call_tokens(100);
+    let rt = reserving_plane(&scoped, quota, budget);
+
+    let out = rt
+        .run("burner", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(
+        rt.fire_timers(an_hour_from_now())
+            .await
+            .expect("fire")
+            .fired,
+        1
+    );
+
+    let found = rt
+        .attention(an_hour_from_now(), 50)
+        .await
+        .expect("attention");
+    let held = found
+        .conditions
+        .iter()
+        .find(|c| c.kind == "quota.held_by_stopped_run")
+        .unwrap_or_else(|| {
+            panic!(
+                "an exhausted run holding part of the period is not named: {:?}",
+                found.conditions
+            )
+        });
+    assert_eq!(held.subjects, vec![out.run_id.to_string()]);
+    assert!(held.remedy.cli.contains("cancel"), "{}", held.remedy.cli);
+}
+
+/// A reservation covers one overshooting call per step the run may have in
+/// flight, and no more than the run is then allowed to dispatch.
+///
+/// Each step in a ready set may hold a call the ledger admitted below the
+/// ceiling and has not billed, so a fan-out can end a call past its ceiling per
+/// branch, not one. With nothing declared the width is the admitted plan's
+/// node count — four here, three branches and the aggregator, an upper bound
+/// on any ready set it has; with `max_parallel_steps` it is that, and the run
+/// is held to it.
+#[tokio::test]
+async fn a_reservation_covers_every_step_in_flight() {
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(10_000),
+        ..TenantQuota::default()
+    };
+    for (budget, held) in [
+        (
+            agentplane::core::Budget::unlimited()
+                .tokens(250)
+                .call_tokens(100),
+            250 + 4 * 100,
+        ),
+        (
+            agentplane::core::Budget::unlimited()
+                .tokens(250)
+                .call_tokens(100)
+                .parallel_steps(1),
+            250 + 100,
+        ),
+    ] {
+        let store = RedbStore::open_in_memory().expect("store");
+        let scoped = Arc::new(store.for_tenant(tenant("acme")));
+        let rt = reserving_plane(&scoped, quota, budget);
+        let plan = agentplane::core::PlanIR::fan_out(["burner", "spender", "spends-once"], "work");
+        let out = rt
+            .run_plan(plan, Tainted::trusted(json!({})))
+            .await
+            .expect("admitted");
+        let holds = QuotaStore::reservations(scoped.as_ref(), 10)
+            .await
+            .expect("listing");
+        let run = holds
+            .iter()
+            .find(|h| h.run == out.run_id)
+            .expect("the run holds its reservation");
+        // What is left once the first pass settled what it spent.
+        assert_eq!(
+            run.remaining.tokens + out.consumed.spend.tokens,
+            held,
+            "the reservation was not sized for the steps this run may have in flight"
+        );
     }
 }

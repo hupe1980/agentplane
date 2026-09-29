@@ -144,6 +144,24 @@ pub enum RuntimeError {
     #[error(transparent)]
     TaskClaim(#[from] crate::core::ClaimError),
 
+    /// An approval was offered for a task whose proposal this plane cannot
+    /// show.
+    ///
+    /// Its own class, apart from a claim refusal and from
+    /// [`PlanContract`](Self::PlanContract), because a caller does something
+    /// different with it: decide from a plane that holds the key ring, or
+    /// reject — a rejection of the unseen is safe and still records. Nothing
+    /// was claimed or recorded, and the task stays open.
+    #[error(
+        "task {task} holds a proposal this plane cannot show — {reason} — so an approval \
+         would be of arguments nobody was shown; decide it where the key ring that sealed \
+         it is wired, or reject it"
+    )]
+    ProposalWithheld {
+        task: String,
+        reason: crate::core::Withheld,
+    },
+
     #[error("plan contract violation: {0}")]
     PlanContract(String),
 
@@ -158,10 +176,30 @@ pub enum RuntimeError {
     )]
     UnknownTenant(String),
 
+    /// An event from outside named a kind this plane mints for itself.
+    ///
+    /// A human task's answer travels as an event in the `agentplane.`
+    /// namespace, so accepting one from outside would let whoever may post an
+    /// event decide a task. Refused at every intake; the worklist is the one
+    /// door into the namespace.
+    #[error(
+        "event kind '{kind}' is in the `agentplane.` namespace, which only this plane mints — \
+         a task is decided on the worklist, never by posting its answer as an event"
+    )]
+    ReservedEventKind { kind: String },
+
     /// An open run would continue under policy semantics other than the bundle
     /// recorded at admission.
+    ///
+    /// Journaled as the run's quarantine reason rather than raised, so the
+    /// message is the one a person reads off the run, and it names the verbs
+    /// that answer it.
     #[error(
-        "policy bundle changed while resuming an open run: recorded {recorded:?}, configured {configured:?}"
+        "the policy bundle changed under an open run: admitted under {}, and this plane holds {} \
+         — the run is quarantined; reopen it with `quarantine` and `replay` it on a plane \
+         holding the recorded bundle, or abandon it with `quarantine`",
+        bundle_named(.recorded.as_ref()),
+        bundle_named(.configured.as_ref())
     )]
     PolicyBundleChanged {
         recorded: Option<crate::core::Digest>,
@@ -182,10 +220,14 @@ pub enum RuntimeError {
     /// behaviour is the embedder's binary, which this crate cannot identify and
     /// does not claim to; there, divergence is the answer, later and less
     /// precisely.
+    ///
+    /// Journaled as the run's quarantine reason rather than raised, as the
+    /// bundle refusal is.
     #[error(
-        "the declaration for `{agent}` changed while resuming an open run: admitted under \
-         {recorded}, and this plane holds {configured} — resume under the revision that \
-         wrote the journal, or abandon the run"
+        "the declaration for `{agent}` changed under an open run: admitted under {recorded}, \
+         and this plane holds {configured} — the run is quarantined; reopen it with \
+         `quarantine` and `replay` it under the revision that wrote the journal, or abandon \
+         it with `quarantine`"
     )]
     DeclarationChanged {
         agent: String,
@@ -238,6 +280,22 @@ pub enum RuntimeError {
          still verifies, and nothing is wrong with this build"
     )]
     PayloadsErased { run: String },
+
+    /// The run's history is sealed, and this plane holds no key ring to open
+    /// it.
+    ///
+    /// Not an erasure, and kept apart from [`PayloadsErased`](Self::PayloadsErased)
+    /// because the two send a reader opposite ways: *erased* says the data is
+    /// gone for good, this says it is intact and this plane cannot read it — an
+    /// operator's terminal, a restored export, a verifier handed no key. A ring
+    /// that is wired answers for itself: a destroyed key is an erasure, an
+    /// unreachable one fails the read.
+    #[error(
+        "run {run}'s recorded plan is sealed and this plane holds no key ring to open \
+         it: nothing is known to be erased — replay it where the key ring it was sealed \
+         under is wired"
+    )]
+    PayloadsSealed { run: String },
 
     /// Nothing on this plane answers to the name `run` was given.
     ///
@@ -363,6 +421,14 @@ pub enum RuntimeError {
          closes it without unwinding"
     )]
     CannotUnwind { run: String },
+
+    /// A cancellation was asked of a run that has already concluded.
+    ///
+    /// Refused rather than recorded: a sealed run is not reopened by anybody
+    /// changing their mind, and a stored request against it would answer the
+    /// operator "recorded" for a stop that can never happen.
+    #[error("run {run} already concluded as '{outcome}'; there is nothing left to stop")]
+    AlreadyConcluded { run: String, outcome: String },
 
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -801,8 +867,8 @@ pub enum StepError {
     /// are not. A digest pair says two calls differ and nothing about how; the
     /// party who has to act is whoever changed the code, and what they need is
     /// which call moved. It is composed from the fields that are *clear* on the
-    /// record — an effect's kind and its attempt — because this message is
-    /// journaled into the run's conclusion, which is not a sealed field.
+    /// record — an effect's kind and its attempt — so the conclusion that
+    /// carries it says which call moved without opening a sealed payload.
     #[error("non-determinism at seq {seq}: {detail} (history {expected}, this build {actual})")]
     NonDeterminism {
         seq: Seq,
@@ -877,6 +943,50 @@ pub enum StepError {
          this build performs more effects than the recorded one"
     )]
     ReplayOverrun { actual: EffectKey, kind: String },
+}
+
+impl SkillError {
+    /// The class of fault, as one low-cardinality word — what a loud event
+    /// reports as `error_type` in place of the message.
+    ///
+    /// Exhaustive for the reason [`EffectError::class`] is.
+    #[must_use]
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Input(_) => "input",
+            Self::Step(step) => step.class(),
+            Self::Tool(_) => "tool",
+            Self::Other(_) => "other",
+        }
+    }
+}
+
+impl StepError {
+    /// The class of fault, as one low-cardinality word.
+    ///
+    /// An effect's failure reports the effect's own class, so the word is the
+    /// one its span already carried as `error.type`.
+    #[must_use]
+    pub const fn class(&self) -> &'static str {
+        match self {
+            Self::Effect(e) => e.class(),
+            Self::Policy(_) => "policy",
+            Self::Store(_) => "store",
+            Self::Encoding(_) => "encoding",
+            Self::Tool(_) => "tool",
+            Self::Undecidable { .. } => "undecidable",
+            Self::Unrecorded { .. } => "unrecorded",
+            Self::Unreproducible { .. } => "unreproducible",
+            Self::NonDeterminism { .. } => "nondeterminism",
+            Self::Budget(_) => "budget",
+            Self::Suspended(_) => "suspended",
+            Self::Denied { .. } => "denied",
+            Self::GroupFootprint { .. } => "group_footprint",
+            Self::GroupAborted { .. } => "group_aborted",
+            Self::GroupUnsettled { .. } => "group_unsettled",
+            Self::ReplayOverrun { .. } => "replay_overrun",
+        }
+    }
 }
 
 /// Authorization failure.
@@ -1324,6 +1434,14 @@ pub enum StoreError {
     #[error("run {run} is sealed as '{outcome}'; a sealed journal accepts no appends")]
     RunSealed { run: String, outcome: String },
 
+    /// A memory item is under legal hold, so the erasure touched nothing.
+    ///
+    /// Typed rather than a [`Backend`](Self::Backend) string for the reason
+    /// every refusal here is: the store is healthy and retrying cannot help —
+    /// the hold has to be released by whoever placed it.
+    #[error("memory '{id}' is under legal hold, so nothing was erased")]
+    UnderLegalHold { id: String },
+
     /// Another instance holds a *live* lease. Distinct from being fenced: this
     /// writer is not stale, it is simply not the owner yet. The correct response
     /// is to wait for expiry (or for an operator to force a takeover), which is
@@ -1415,6 +1533,12 @@ pub enum StoreError {
     Encoding(#[from] serde_json::Error),
 }
 
+/// A policy bundle as a refusal names it: its digest, or the absence of an
+/// engine, which is a bundle of its own and not a blank.
+fn bundle_named(digest: Option<&crate::core::Digest>) -> String {
+    digest.map_or_else(|| "no policy engine".to_owned(), ToString::to_string)
+}
+
 impl RuntimeError {
     /// Lift a store error into the operator-facing taxonomy.
     ///
@@ -1445,32 +1569,17 @@ impl RuntimeError {
             other => Self::Store(other),
         }
     }
-
-    /// Whether this run should be abandoned by *this* instance rather than
-    /// retried. Both cases are terminal for the current owner: fencing means
-    /// someone else owns it, and a broken chain means the recorded history can
-    /// no longer be trusted to describe anything.
-    ///
-    /// Divergence is deliberately not here. It is not a `RuntimeError` at all —
-    /// a replay that recomputes a different key quarantines the *run*, through
-    /// [`StepError::NonDeterminism`], and a run status is not something an
-    /// owner abandons. A second spelling of it lived on this enum, unconstructed
-    /// and pointed at by the crate's own front page, until a guard noticed.
-    #[must_use]
-    pub fn is_terminal_for_owner(&self) -> bool {
-        matches!(self, Self::Fenced { .. } | Self::ChainBroken { .. })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Disposition, LISTED_CAPABILITIES, RuntimeError, SkillError, StepError};
 
-    /// Two embedder-facing predicates, each of which was public, documented,
-    /// and called by nothing — so a wrong `matches!` arm would have been
-    /// invisible. Neither claims to *be* a control, which is what separates
-    /// them from `PolicyError::for_model`; they are still decisions an embedder
-    /// makes recovery choices on.
+    /// An embedder-facing predicate the crate itself never calls, so a wrong
+    /// `matches!` arm would be invisible without this. It does not claim to
+    /// *be* a control, which is what separates it from
+    /// `PolicyError::for_model`; it is still a decision an embedder makes
+    /// recovery choices on.
     #[test]
     fn only_a_call_that_never_left_is_safe_to_repeat_on_its_own_terms() {
         assert!(Disposition::DidNotHappen.is_definitely_safe_to_repeat());
@@ -1478,31 +1587,6 @@ mod tests {
         // negation of `Landed`: a timed-out payment may well have been taken.
         assert!(!Disposition::InDoubt.is_definitely_safe_to_repeat());
         assert!(!Disposition::Landed.is_definitely_safe_to_repeat());
-    }
-
-    #[test]
-    fn an_owner_abandons_a_fenced_run_and_a_broken_chain_and_nothing_else() {
-        assert!(
-            RuntimeError::Fenced {
-                run: "run-1".into(),
-                held: 1,
-                current: 2,
-            }
-            .is_terminal_for_owner()
-        );
-        assert!(
-            RuntimeError::ChainBroken {
-                seq: 1,
-                detail: "hash mismatch".into(),
-            }
-            .is_terminal_for_owner()
-        );
-        // An ordinary store failure is retryable by this instance: nobody else
-        // owns the run and the history is still trustworthy.
-        assert!(
-            !RuntimeError::Store(crate::core::StoreError::Backend("timeout".into()))
-                .is_terminal_for_owner()
-        );
     }
 
     // ── How a failure reads ─────────────────────────────────────────────────
@@ -1579,3 +1663,27 @@ mod tests {
 }
 
 debug_is_display!(RuntimeError, SkillError, StepError);
+
+/// Log a fault on this plane's side, and return the one sentence a served
+/// surface tells its caller about it.
+///
+/// The detail goes to the operator's log and nowhere else. Rendered to the
+/// caller, a store's error names its DSN, a table, a host — facts about this
+/// deployment a counterparty or a calling model has no use for and a prober
+/// has every use for. One helper for every surface that serves strangers, so
+/// no surface words its own and one of them leaks.
+#[cfg(any(feature = "a2a-server", feature = "mcp-server"))]
+pub(crate) fn withheld_fault(
+    surface: &'static str,
+    doing: &str,
+    error: &dyn std::fmt::Display,
+) -> &'static str {
+    tracing::error!(
+        target: "agentplane::served",
+        surface,
+        doing,
+        %error,
+        "a served request failed internally"
+    );
+    "internal error"
+}

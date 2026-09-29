@@ -48,28 +48,36 @@ kind: Agent
 metadata: { name: triage, version: "0.1.0" }
 spec:
   execution: { kind: completion }
-  capabilities: { provides: [support.triage] }
-  models:
-    privileged: { provider: fake, model: triage-1 }
+  model: { provider: fake, model: triage-1 }
   budgets: { max_tokens: 20000 }
 ```
 
-That file is the smallest agent this format accepts, and each of its four
-`spec` entries is there because `agentplane validate` refuses its absence. Try
-deleting them one at a time and validating; the refusals arrive in this order,
-and each is a design decision stated at the moment it bites:
+(`agentplane init` writes a starter like this one, with the schema modeline
+already in it; `init --tools` writes a tool-calling one.)
 
-Without `capabilities`:
+That file is the smallest agent this format accepts. `model:` is shorthand for
+`models: { privileged: … }`, the single-model case, and the capability the agent
+answers defaults to its `metadata.name` — `triage` here — as a skill that
+declares none answers its own name. Both resolve before the digest is taken, so
+the file that spells them out is the same agent. Say
+`capabilities: { provides: [support.triage] }` when callers should ask for
+something other than the name.
+
+Each of the three `spec` entries is there because something refuses its
+absence. Try deleting them one at a time; each refusal is a design decision
+stated at the moment it bites.
+
+Without `execution`, the file still **validates** — it is then the declaration
+of an agent whose behaviour is Rust code you register yourself — but
+`agentplane run` refuses it, because there is nothing in the file for the
+binary to run:
 
 ```text
-agentplane: spec.capabilities.provides cannot be enforced here: this agent's
-behaviour is declared but it advertises no capability, and a declarative
-agent's driver is registered once per capability it provides — so nothing
-would be registered and no run could ever reach the model, tools and prompt
-named here. Name what this agent answers
+agentplane: manifest 'triage' declares no `spec.execution`, so its behaviour is
+a skill somebody wrote and there is nothing here for this binary to run …
 ```
 
-Without `models`:
+Without `model` (`agentplane validate` refuses this and the next one):
 
 ```text
 agentplane: spec.execution cannot be enforced here: this agent's behaviour is
@@ -89,12 +97,22 @@ that the decision is in the file rather than in its absence
 
 That last one is the format's whole posture in a sentence: an absent decision
 is not a default, it is a refusal — even *unbounded* has to be written down.
-With all four present:
+With all three present:
 
 ```sh
 $ agentplane validate triage.yaml
 ok: triage 0.1.0
+  one call, privileged fake/triage-1: unbounded — spec.models.privileged.max_input_tokens is not declared
+  worst case, tokens: no total — unbounded: spec.models.privileged.max_input_tokens
+  worst case, minor units: no total — unbounded: spec.budgets.max_minor_units, spec.models.privileged.max_input_tokens
 ```
+
+The indented lines are what the file says a run can cost, read off it and
+nothing else: its ceiling plus one call past it per step in flight. Each
+`unbounded` names the field that would bound it. That is fine for a first
+agent; under a tenant's spend quota it is what gets a run refused, because an
+unbounded run cannot be reserved — see
+[what one call can cost](@/docs/manifest.md#per-call-bound).
 
 ## 3. Run it
 
@@ -126,9 +144,7 @@ spec:
   identity:
     role: "Support ticket triage"
     constraints: "Classify severity. Never promise a refund."
-  capabilities: { provides: [support.triage] }
-  models:
-    privileged: { provider: fake, model: triage-1 }
+  model: { provider: fake, model: triage-1 }
   output:
     schema:
       type: object
@@ -156,8 +172,8 @@ Misspell a ceiling and the file is rejected —
 ```text
 agentplane: manifest is not well-formed: document 1: unknown field `max_tokns`,
 expected one of `max_steps`, `max_effects`, `max_tokens`, `max_minor_units`,
-`max_replans`, `max_wallclock_secs`, `max_denials`, `max_parallel_steps`,
-`max_egress_bytes`
+`max_replans`, `max_wallclock_secs`, `max_denials`, `max_egress_bytes`,
+`max_parallel_steps`
 ```
 
 — because in a tolerant parser `max_tokns: 100` does not mean "a ceiling with
@@ -179,16 +195,21 @@ run run_01M13H3XGTE0BHXA1S1YR575BY — Succeeded
 
 $ agentplane replay run_01M13H3XGTE0BHXA1S1YR575BY \
     --store runs.redb --manifest triage.yaml --strict
-run run_01M13H3XGTE0BHXA1S1YR575BY — Succeeded
-{"severity":"fake","summary":"fake"}
+run run_01M13H3XGTE0BHXA1S1YR575BY — verified — the recorded `succeeded` ending was reproduced
+  recorded: triage 0.1.0 8170f033…
+  candidate: triage 0.1.0 8170f033…
+  (same digest)
 ```
 
 The second command re-executed the run's logic and read every effect back from
-the journal — **the model was not called again**. That is the runtime's
-central claim, held by your agent on your disk: the completion is history, and
-`--strict` verifies the history reproduces byte for byte. Without `--strict`,
-`replay` *resumes* — the verb you reach for when a run crashed or suspended
-partway.
+the journal — **the model was not called again**, and no provider key is
+needed to do it. That is the runtime's central claim, held by your agent on
+your disk: the completion is history, and `--strict` verifies the history
+reproduces. Hand it an *edited* `triage.yaml` and it names the first effect
+the edit changes, under both digests — the check to run on a manifest change
+before it ships ([replaying an edited declaration](@/docs/operations.md#strict-replay)).
+Without `--strict`, `replay` *resumes* — the verb you reach for when a run
+crashed or suspended partway.
 
 ## 6. Give it a tool
 
@@ -233,7 +254,7 @@ identically …
 ```
 
 The wiring is one flag — `--mcp` names which command serves `tickets`
-(`examples/mcp-server.py` in the repository is a 40-line stdio MCP server to
+(`examples/mcp-server.py` in the repository is a minimal stdio MCP server to
 play with):
 
 ```sh
@@ -246,9 +267,9 @@ run run_01M13H94M4K11MZKYX4AE6THQX — Succeeded
 
 Honesty about what just happened: the wiring, the grant and the loop are all
 real, but the deterministic fake has no judgement, so it answered without
-choosing the tool. Watching a model actually *choose* — and watching the four
+choosing the tool. Watching a model actually *choose* — and watching the
 refusals that bound what it may choose — is
-`cargo run --example tool_loop --features redb,testkit,manifest` in the
+`cargo run --example tool_loop --features redb,fake-model,manifest` in the
 repository, or this same file against a live model (step 8).
 
 One posture rule is worth meeting now, because you will hit it the first time
@@ -269,7 +290,7 @@ A model may choose what to *read*; which fields of a *write* it may author is
 the operator's decision, written in the grant. The
 [manifest reference](@/docs/manifest.md#protected-fields) covers
 `protected_fields`, and `requires_approval: true` puts a person in front of
-each call — `cargo run --example approved_call --features redb,testkit,manifest`
+each call — `cargo run --example approved_call --features redb,fake-model,manifest`
 runs that whole shape.
 
 ## 7. Pin what you built
@@ -318,4 +339,4 @@ give you a multi-agent room with no Rust anywhere —
 **Drop to Rust when a decision is code.** A skill with an `if` in it beats a
 prompt asking a model to pretend to be one. The
 [getting-started](@/docs/getting-started.md#write-a-skill) page begins there,
-and `examples/` holds twenty-odd runnable answers to specific questions.
+and `examples/` holds runnable answers to specific questions.

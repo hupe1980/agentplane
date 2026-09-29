@@ -16,9 +16,12 @@
 //!
 //! # The envelope carries its own key
 //!
-//! ```text
-//! [u32 len][wrapped data key][24-byte nonce][ciphertext ‖ tag]
-//! ```
+//! Stored bytes are the crate's one sealed envelope — the versioned
+//! construction in [`envelope`](super::envelope) every other decorator writes
+//! — bound to `blob:{scope}:{digest}` as associated data. The scope is in it
+//! so an envelope copied to the same address under another erasure unit fails
+//! to authenticate there rather than opening as that unit's data; the digest
+//! is in it so ciphertext moved to another address fails the same way.
 //!
 //! The wrapped key travels with the payload rather than being looked up, which
 //! is what makes a **restore** work: a backup holds everything needed to bring
@@ -36,7 +39,7 @@ use async_trait::async_trait;
 use crate::blob::{BlobError, BlobStore};
 use crate::core::{Digest, Timestamp};
 
-use super::{DataKey, KeyError, KeyRing, WrappedKey};
+use super::{KeyError, KeyRing};
 
 /// A [`BlobStore`] that seals payloads under a scope's data key.
 ///
@@ -66,98 +69,63 @@ impl EncryptedBlobs {
         }
     }
 
-    fn cipher(key: &DataKey) -> chacha20poly1305::XChaCha20Poly1305 {
-        use chacha20poly1305::KeyInit as _;
-        chacha20poly1305::XChaCha20Poly1305::new(key.expose().into())
+    /// The identity an envelope at `digest` is sealed to: this erasure unit
+    /// and this address.
+    fn aad(&self, digest: Digest) -> String {
+        format!("blob:{}:{}", self.scope, digest.to_hex())
     }
 }
 
-/// A read that could not be trusted, with the reason in place of a hash.
-fn corrupt(digest: Digest, why: &str) -> BlobError {
-    BlobError::Corrupt {
-        expected: digest.to_hex(),
-        actual: why.to_owned(),
-    }
-}
-
-/// Split `[u32 len][wrapped][rest]`, refusing anything that does not fit.
+/// A key failure, in the vocabulary a blob reader acts on.
 ///
-/// Every length here is checked against the buffer rather than trusted: a
-/// truncated or hostile envelope must be a refusal, not a panic in a slice.
-fn split_envelope(digest: Digest, envelope: &[u8]) -> Result<(WrappedKey, &[u8]), BlobError> {
-    let Some(head) = envelope.get(..4) else {
-        return Err(corrupt(digest, "the envelope has no length prefix"));
-    };
-    let len = u32::from_be_bytes(head.try_into().expect("a four-byte slice")) as usize;
-    let Some(bytes) = envelope.get(4..4 + len) else {
-        return Err(corrupt(
-            digest,
-            "the envelope claims a wrapped key longer than itself",
-        ));
-    };
-    let wrapped = serde_json::from_slice(bytes)
-        .map_err(|_| corrupt(digest, "the envelope's wrapped key does not parse"))?;
-    Ok((wrapped, &envelope[4 + len..]))
-}
-
-/// An erased scope is not a missing blob and not a corrupt one.
-///
-/// Mapped here rather than at the call site so every backend reports a completed
-/// erasure the same way. `NotFound` would send somebody looking for lost data,
-/// and `Corrupt` would send them looking for a fault.
-fn erased(e: KeyError) -> BlobError {
+/// Mapped here rather than at the call site so every backend reports each cause
+/// the same way. A destroyed key is a completed erasure (`Expired`), never a
+/// missing blob or a corrupt one; a retired key version, an envelope another
+/// build wrote and a header this build cannot parse are intact bytes that did
+/// not open (`Unopened`); an unreachable ring is an outage (`Backend`); and a
+/// refusal — a payload that does not authenticate under this scope and
+/// address, a truncated envelope, a wrapped key the ring will not open — is
+/// bytes that are not what was written (`Corrupt`).
+fn classify(digest: Digest, e: KeyError) -> BlobError {
     match e {
         KeyError::Destroyed { scope, at, reason } => BlobError::Expired {
-            digest: String::new(),
+            digest: digest.to_hex(),
             at: at.unix_timestamp(),
             reason: format!("the data key for scope '{scope}' was destroyed: {reason}"),
         },
-        other => BlobError::Backend(other.to_string()),
+        e @ (KeyError::Retired { .. }
+        | KeyError::UnknownFormat { .. }
+        | KeyError::UnreadableHeader { .. }) => BlobError::Unopened {
+            digest: digest.to_hex(),
+            detail: e.to_string(),
+        },
+        KeyError::Unavailable(e) => BlobError::Backend(format!("the key ring is unavailable: {e}")),
+        KeyError::Refused(why) => BlobError::Corrupt {
+            expected: digest.to_hex(),
+            actual: why,
+        },
     }
 }
 
 #[async_trait]
 impl BlobStore for EncryptedBlobs {
     async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
-        use chacha20poly1305::aead::{Aead, Generate as _};
-
         // Addressed by the plaintext, so a digest already in a journal keeps
         // meaning what it meant.
         let digest = Digest::of(bytes);
-        let (key, wrapped) = self.keys.data_key(&self.scope).await.map_err(erased)?;
-        let cipher = Self::cipher(&key);
-        let nonce = chacha20poly1305::XNonce::generate();
-
-        // The digest is the associated data: the envelope is bound to the
-        // address it lives at, so ciphertext moved to another address fails to
-        // authenticate rather than decrypting into somebody else's payload.
-        let sealed = cipher
-            .encrypt(
-                &nonce,
-                chacha20poly1305::aead::Payload {
-                    msg: bytes,
-                    aad: digest.to_hex().as_bytes(),
-                },
-            )
-            .map_err(|e| BlobError::Backend(format!("sealing a payload failed: {e}")))?;
-
-        // The wrapped key goes in front, length-prefixed, so the envelope is
-        // self-describing and a restore needs nothing but itself.
-        // Canonical bytes, not `serde_json::to_vec`: this crate enables
-        // `preserve_order` transitively, so plain serialisation would order keys
-        // by insertion. Nothing hashes this header today, and writing it in a
-        // form that depends on field declaration order is how it would stop
-        // being true quietly.
-        let wrapped_bytes = crate::core::canon::to_bytes(&wrapped)
-            .map_err(|e| BlobError::Backend(format!("a wrapped key would not serialise: {e}")))?;
-        let len = u32::try_from(wrapped_bytes.len())
-            .map_err(|_| BlobError::Backend("the wrapped key is implausibly large".to_owned()))?;
-
-        let mut envelope = Vec::with_capacity(4 + wrapped_bytes.len() + 24 + sealed.len());
-        envelope.extend_from_slice(&len.to_be_bytes());
-        envelope.extend_from_slice(&wrapped_bytes);
-        envelope.extend_from_slice(&nonce);
-        envelope.extend_from_slice(&sealed);
+        let envelope = super::envelope::seal(
+            self.keys.as_ref(),
+            &self.scope,
+            self.aad(digest).as_bytes(),
+            bytes,
+        )
+        .await
+        .map_err(|e| match e {
+            // Sealing is a write: a destroyed scope refuses it as erased, and
+            // every other failure is the ring's, not the bytes'.
+            e @ KeyError::Destroyed { .. } => classify(digest, e),
+            other => BlobError::Backend(format!("sealing a payload failed: {other}")),
+        })?;
 
         // The inner store addresses by *its* bytes, so the envelope would land
         // at its own digest. Written through `put_at` so the plaintext address
@@ -167,29 +135,15 @@ impl BlobStore for EncryptedBlobs {
     }
 
     async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
-        use chacha20poly1305::aead::Aead;
-
         let envelope = self.inner.get_raw(digest).await?;
-        let (wrapped, rest) = split_envelope(digest, &envelope)?;
-        if rest.len() < 24 {
-            return Err(corrupt(digest, "the envelope is shorter than its nonce"));
-        }
-        let (nonce, sealed) = rest.split_at(24);
 
         // Opened through the service, which is where erasure is enforced: once
         // the scope's wrapping key is destroyed this fails for everyone holding
         // a copy, which is the whole guarantee.
-        let key = self.keys.open(&wrapped).await.map_err(erased)?;
-        let plain = Self::cipher(&key)
-            .decrypt(
-                super::xnonce(nonce)
-                    .ok_or_else(|| corrupt(digest, "the envelope's nonce is the wrong width"))?,
-                chacha20poly1305::aead::Payload {
-                    msg: sealed,
-                    aad: digest.to_hex().as_bytes(),
-                },
-            )
-            .map_err(|_| corrupt(digest, "the sealed payload did not authenticate"))?;
+        let plain =
+            super::envelope::open(self.keys.as_ref(), self.aad(digest).as_bytes(), &envelope)
+                .await
+                .map_err(|e| classify(digest, e))?;
 
         // Verified against the plaintext, so the claim is about the payload and
         // not about an envelope somebody could have swapped.
@@ -290,6 +244,53 @@ mod refusal_tests {
         assert_eq!(
             store.get(digest).await.expect("still sealed"),
             b"the payload"
+        );
+    }
+
+    /// **An envelope opens only where it was sealed.**
+    ///
+    /// Two erasure units over one backing store: the bytes one unit sealed,
+    /// read through the other unit's handle at the same address, must not
+    /// open — otherwise a blob outlives the erasure of the unit it belongs to
+    /// by being read as another's.
+    #[tokio::test]
+    async fn an_envelope_read_under_another_scope_does_not_open() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+        let ring: Arc<dyn KeyRing> = Arc::new(MemoryKeyRing::new());
+        let sealed_in = EncryptedBlobs::new(Arc::clone(&inner), Arc::clone(&ring), "acme/case-1");
+        let other = EncryptedBlobs::new(Arc::clone(&inner), Arc::clone(&ring), "acme/case-2");
+        let digest = sealed_in.put(b"case one's bytes").await.expect("put");
+        assert_eq!(
+            inner.get_raw(digest).await.expect("raw")[0],
+            super::super::envelope::FORMAT_VERSION,
+            "a stored blob is not the crate's versioned envelope"
+        );
+        assert!(
+            matches!(other.get(digest).await, Err(BlobError::Corrupt { .. })),
+            "an envelope sealed for one erasure unit opened under another"
+        );
+        assert_eq!(
+            sealed_in.get(digest).await.expect("get"),
+            b"case one's bytes"
+        );
+    }
+
+    /// **A retired key version is neither an erasure nor an outage.**
+    #[tokio::test]
+    async fn a_retired_key_version_reads_as_unopened() {
+        let ring = Arc::new(MemoryKeyRing::new());
+        let store = EncryptedBlobs::new(
+            Arc::new(MemoryBlobs::new()),
+            Arc::clone(&ring) as Arc<dyn KeyRing>,
+            "acme/case-1",
+        );
+        let digest = store.put(b"the payload").await.expect("put");
+        ring.rotate();
+        ring.retire_below(1);
+        let read = store.get(digest).await;
+        assert!(
+            matches!(read, Err(BlobError::Unopened { ref detail, .. }) if detail.contains("retired")),
+            "a retired wrapping-key version read as {read:?}"
         );
     }
 }

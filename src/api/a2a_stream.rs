@@ -41,14 +41,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::response::sse::{Event, Sse};
-use futures_util::stream::Stream;
+use futures_util::stream::{Stream, StreamExt as _};
 use serde_json::{Value, json};
 
 use crate::core::{RunId, Seq};
 use crate::journal::RecordKind;
 use crate::runtime::Runtime;
 
-use super::a2a::{A2aArtifact, A2aTask, TaskState, sealed_state, task_artifacts, task_of};
+use super::a2a::{
+    A2aArtifact, A2aTask, ArtifactCache, StreamSlot, TaskState, cached_artifacts, sealed_state,
+    task_artifacts,
+};
 
 /// How often a subscriber re-reads the journal.
 ///
@@ -168,31 +171,37 @@ pub(super) const fn closes(state: TaskState) -> bool {
 /// The first event is always the `Task` itself, which the spec requires: a
 /// subscriber must be able to learn the current state without having been
 /// present for the events that produced it.
-pub fn tail(
+///
+/// `slot` is held for as long as the stream lives, so the caller's count of
+/// open streams falls when it ends or when the client goes away.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn tail(
     runtime: Arc<Runtime>,
+    cache: Arc<std::sync::Mutex<ArtifactCache>>,
+    slot: StreamSlot,
     run: RunId,
     case: Option<String>,
     id: Value,
     first: A2aTask,
     from: Seq,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    Sse::new(frames(runtime, run, case, id, first, from))
+    Sse::new(
+        frames(runtime, cache, run, case, id, first, from).map(move |event| {
+            let _held = &slot;
+            event
+        }),
+    )
 }
 
 /// The event sequence behind [`tail`], before axum wraps it.
 ///
-/// Split out for one reason: `Sse` hands back no way to read what it will send,
-/// so the stream's own behaviour could not be tested — and the full mutation
-/// sweep proved that was not hypothetical. Deleting the `already_over` return
-/// below left **all forty-six** A2A tests passing, because the only path any of
-/// them takes to a terminal task is `SubscribeToTask`, which is refused before
-/// it ever reaches here. The guarantee looked verified and was verified by
-/// nothing.
-///
-/// A function returning the raw stream is testable, and the test that names this
-/// guarantee now actually drives it.
+/// Split out because `Sse` hands back no way to read what it will send. The
+/// request-level tests reach a terminal task only through `SubscribeToTask`,
+/// which refuses one before it gets here, so the `already_over` return below
+/// is pinned by a test that drives this function directly.
 fn frames(
     runtime: Arc<Runtime>,
+    cache: Arc<std::sync::Mutex<ArtifactCache>>,
     run: RunId,
     case: Option<String>,
     id: Value,
@@ -226,7 +235,7 @@ fn frames(
                 if let RecordKind::RunConcluded { outcome, .. } = record.kind() {
                     let state = sealed_state(outcome);
                     if state == TaskState::Completed {
-                        match task_artifacts(&runtime, run, state).await {
+                        match cached_artifacts(&runtime, &cache, run, state).await {
                             Ok(Some(artifacts)) => {
                                 for artifact in artifacts {
                                     yield Ok(stream_response(
@@ -285,23 +294,6 @@ fn frames(
     stream
 }
 
-/// The task a stream opens with, read from the journal as it stands now.
-pub async fn current(runtime: &Runtime, run: RunId) -> Option<(A2aTask, Option<String>, Seq)> {
-    let records = runtime.journal().read(run, 1).await.ok()?;
-    // The same reading `tasks/get` and `tasks/list` answer with. A stream is a
-    // view of the history rather than a second opinion about it, and a client
-    // that polled and subscribed must not be told two things about one run.
-    let (state, detail) = super::a2a::state_from_history(&records)?;
-    let last = records.last()?;
-    let case = records
-        .iter()
-        .find_map(|r| r.body.case.map(|c| c.to_string()));
-    let next = last.body.seq + 1;
-    let mut task = task_of(run, state, &detail, case.clone());
-    task.artifacts = task_artifacts(runtime, run, state).await.ok()?;
-    Some((task, case, next))
-}
-
 #[cfg(all(test, feature = "redb"))]
 mod tests {
     use super::{Event, RunId, TaskState, frames};
@@ -315,14 +307,10 @@ mod tests {
     /// polling a run whose closing record was written before this subscriber
     /// existed — a loop that would never see it and never end.
     ///
-    /// This test exists because the full mutation sweep found the guarantee
-    /// verified by **nothing**: deleting the early return left every one of the
-    /// forty-six A2A tests green. `SubscribeToTask` is refused on a terminal
-    /// task before it reaches the stream, so no test drove the one method that
-    /// does reach it — `SendStreamingMessage`, which has no such pre-check.
-    /// The mutation's named test was checking the *refusal*, one layer up, and
-    /// the sweep is what told the difference between "checked" and "looks
-    /// checked".
+    /// `SubscribeToTask` is refused on a terminal task before it reaches the
+    /// stream, so a test of that refusal says nothing about this path; the
+    /// method that does reach it is `SendStreamingMessage`, which has no such
+    /// pre-check.
     #[tokio::test]
     async fn a_stream_on_an_already_finished_task_ends() {
         let store = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"));
@@ -341,7 +329,7 @@ mod tests {
         // assertion. The deadline turns "never ends" into a sentence.
         let collected: Vec<Result<Event, std::convert::Infallible>> = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            frames(runtime, run, None, json!(1), finished, 1).collect(),
+            frames(runtime, Arc::default(), run, None, json!(1), finished, 1).collect(),
         )
         .await
         .expect(
@@ -385,7 +373,7 @@ mod tests {
 
         let collected: Vec<Result<Event, std::convert::Infallible>> = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            frames(runtime, run, None, json!(1), working, 1).collect(),
+            frames(runtime, Arc::default(), run, None, json!(1), working, 1).collect(),
         )
         .await
         .expect(

@@ -365,7 +365,7 @@ impl Witness for HttpWitness {
             .body(body.clone())
             .send()
             .await
-            .map_err(|e| WitnessError::Unavailable(format!("{url}: {e}")))?;
+            .map_err(|e| WitnessError::Unavailable(crate::netguard::transport_text(&e)))?;
 
         let status = response.status().as_u16();
         // A cosignature or a size line — small by construction, so the small
@@ -657,6 +657,24 @@ mod codec_tests {
         assert!(cosignature_payload(&[]).is_none());
         assert!(cosignature_payload(&[0u8; 72]).is_some());
     }
+
+    /// `tlog-cosignature` bounds the timestamp at 2^63 − 1: a payload whose
+    /// eight bytes read higher is not a cosignature, whatever it signs.
+    #[test]
+    fn a_timestamp_past_two_to_the_sixty_three_is_not_a_cosignature() {
+        let payload = |stamp: u64| {
+            let mut blob = stamp.to_be_bytes().to_vec();
+            blob.extend_from_slice(&[0u8; 64]);
+            blob
+        };
+        assert!(cosignature_payload(&payload(1 << 63)).is_none());
+        assert!(cosignature_payload(&payload(u64::MAX)).is_none());
+        assert_eq!(
+            cosignature_payload(&payload(i64::MAX.cast_unsigned())).map(|(t, _)| t),
+            Some(i64::MAX.cast_unsigned()),
+            "the largest timestamp the spec allows is still one"
+        );
+    }
 }
 
 /// What a witness holds about a log, read by somebody who is not the log.
@@ -741,7 +759,7 @@ impl WitnessReader {
             .get(&url)
             .send()
             .await
-            .map_err(|e| WitnessError::Unavailable(format!("{url}: {e}")))?;
+            .map_err(|e| WitnessError::Unavailable(crate::netguard::transport_text(&e)))?;
         let status = response.status().as_u16();
         let text = crate::netguard::intake::read_text(response, crate::netguard::intake::METADATA)
             .await

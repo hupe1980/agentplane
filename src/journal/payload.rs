@@ -32,7 +32,7 @@
 //! blobs already have, where the chain commits to a digest and the bytes stay
 //! erasable.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// The reserved key marking a sealed payload.
 ///
@@ -65,11 +65,13 @@ pub fn is_sealed_text(text: &str) -> bool {
 }
 
 /// Wrap an envelope as the JSON a record carries in place of its payload.
+#[cfg(feature = "keyring")]
 pub(crate) fn wrap(envelope: &[u8]) -> Value {
-    json!({ SEALED: crate::core::b64::encode(envelope) })
+    serde_json::json!({ SEALED: crate::core::b64::encode(envelope) })
 }
 
 /// The envelope inside a sealed payload, if this is one.
+#[cfg(feature = "keyring")]
 pub(crate) fn unwrap(value: &Value) -> Option<Vec<u8>> {
     if !is_sealed(value) {
         return None;
@@ -79,11 +81,13 @@ pub(crate) fn unwrap(value: &Value) -> Option<Vec<u8>> {
 }
 
 /// Wrap an envelope as the string a record carries in place of a text field.
+#[cfg(feature = "keyring")]
 pub(crate) fn wrap_text(envelope: &[u8]) -> String {
     format!("{SEALED}:{}", crate::core::b64::encode(envelope))
 }
 
 /// The envelope inside a sealed text field, if this is one.
+#[cfg(feature = "keyring")]
 pub(crate) fn unwrap_text(text: &str) -> Option<Vec<u8>> {
     let encoded = text.strip_prefix(SEALED)?.strip_prefix(':')?;
     crate::core::b64::decode(encoded)
@@ -139,6 +143,11 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             policy_bundle: _,
             canon: _,
             idempotency_key: _,
+            // Clear, like `EffectDone.by`: who asked is control-plane, and the
+            // four-eyes exclusion reads it on every task the run opens.
+            admitted_by: _,
+            // Clear: which holder a run draws as is control-plane.
+            served_unchained: _,
         } => vec![SealedField::Value(input)],
         // The frozen plan is sealed because it can *embed* the caller's data,
         // not merely reference it: a `planned` agent's planner reads the
@@ -163,7 +172,12 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             // stay answerable after *what left* is destroyed. Sealing it would
             // make the volume signal vanish with the payload it measures.
             outbound_bytes: _,
-        } => vec![SealedField::Value(&mut descriptor.args)],
+        } => {
+            // Named field by field, like the record around it: a field added
+            // to the descriptor must be decided here, not pass as clear.
+            let crate::core::EffectDescriptor { kind: _, args } = descriptor;
+            vec![SealedField::Value(args)]
+        }
         K::EffectDone {
             output,
             source: _,
@@ -216,6 +230,15 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         } => {
             detail.as_mut().map(SealedField::Text).into_iter().collect()
         }
+        // A compensation's outcome is its error text when it failed — a refund
+        // provider's refusal quoting the charge it was asked to reverse — and
+        // the fixed word "compensated" otherwise, sealed alike so the ciphertext
+        // does not say which. `compensation` is the declared class and stays
+        // clear: nothing about the caller is in it.
+        K::StepCompensated {
+            outcome,
+            compensation: _,
+        } => vec![SealedField::Text(outcome)],
         // The message is free text a provider or tool wrote — it quotes the
         // request it refused, which is the caller's data. `disposition` and
         // `permanent` MUST stay clear: retry and reconciliation route on them,
@@ -309,10 +332,6 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
         | K::GroupOpened {
             group: _,
             resources: _,
-        }
-        | K::StepCompensated {
-            compensation: _,
-            outcome: _,
         }
         // `value` is a **digest**, not the value: the record binds a release
         // decision to bytes it does not hold, and a digest is not the bytes.

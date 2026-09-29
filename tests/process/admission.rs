@@ -787,6 +787,14 @@ impl JournalStore for BlindToKeys {
     ) -> Result<Vec<(agentplane::RunId, u64)>, agentplane::core::StoreError> {
         self.0.recent_runs(after, limit).await
     }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, agentplane::RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(agentplane::RunId, u64)>, agentplane::core::StoreError> {
+        self.0.recent_runs_from(source, after, limit).await
+    }
     async fn case_history(
         &self,
         case: agentplane::core::CaseId,

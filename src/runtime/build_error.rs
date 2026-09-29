@@ -228,6 +228,17 @@ pub enum BuildError {
         declared: &'static str,
     },
 
+    /// A grant declares a rate ceiling on a plane with nothing to count it in.
+    ///
+    /// The count is across runs and instances, so it lives in the quota store;
+    /// without one the ceiling would be reviewed and never counted.
+    #[error(
+        "agent '{agent}' declares a rate_limit on '{grant}', which is counted across runs in \
+         the quota store — but this plane has none. Wire one with \
+         `RuntimeBuilder::quota(..)`, or drop the ceiling"
+    )]
+    RateLimitWithoutQuotaStore { agent: String, grant: String },
+
     /// The plane's embedder and its index speak different languages.
     ///
     /// The one wiring mistake in this list that would otherwise never fail —

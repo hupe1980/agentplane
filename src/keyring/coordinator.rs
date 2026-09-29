@@ -135,8 +135,8 @@ impl Lease {
 /// and a lease nobody ever drops is a scope held for as long as the caller
 /// holds it.
 ///
-/// The rule is the compiler's now, and this is what says so — widen the field
-/// back to public and this stops failing:
+/// The rule is the compiler's, and this pins it — widen the field to public
+/// and this stops failing:
 ///
 /// ```compile_fail
 /// use agentplane::keyring::{ErasureCoordinator, LocalCoordinator, UnderLock};

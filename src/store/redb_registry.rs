@@ -36,9 +36,9 @@
 use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::core::{Attestation, Digest, KeyId, Signer, StoreError, Verifier};
+use crate::core::{Digest, KeyId, KeySignature, Signer, StoreError, Verifier};
 use crate::manifest::registry::{
-    PublishVerdict, attest_manifest, check_attestation, decide_publish, reparse, to_yaml,
+    PublishVerdict, check_signature, decide_publish, reparse, sign_manifest, to_yaml,
 };
 use crate::manifest::{Manifest, Registry, RegistryError};
 
@@ -46,7 +46,7 @@ use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
 /// `(tenant, name, version) -> (digest hex, manifest YAML, key id, signature hex)`.
 ///
-/// The attestation is two columns rather than one serialized struct because the
+/// The signature is two columns rather than one serialized struct because the
 /// halves are read separately: the key id answers *who published this* for an
 /// operator, and the signature is only ever handed to a verifier.
 ///
@@ -60,12 +60,12 @@ type RegistryRow<'a> = (&'a str, &'a str, &'a str, &'a str);
 const MANIFESTS: TableDefinition<(&str, &str, &str), RegistryRow<'static>> =
     TableDefinition::new("registry_manifests");
 
-/// The stored attestation, if the row carries one.
-fn stored_attestation(key_id: &str, signature: &str) -> Option<Attestation> {
+/// The stored signature, if the row carries one.
+fn stored_signature(key_id: &str, signature: &str) -> Option<KeySignature> {
     if key_id.is_empty() {
         return None;
     }
-    Some(Attestation {
+    Some(KeySignature {
         key_id: key_id.to_owned(),
         // A signature that does not decode cannot verify, and an empty one
         // fails exactly as a wrong one does. Reporting corruption here would
@@ -76,7 +76,7 @@ fn stored_attestation(key_id: &str, signature: &str) -> Option<Attestation> {
 }
 
 /// What the store found under one key.
-type Stored = Option<(Digest, Option<Attestation>)>;
+type Stored = Option<(Digest, Option<KeySignature>)>;
 
 fn backend(e: &StoreError) -> RegistryError {
     RegistryError::Backend(e.to_string())
@@ -93,7 +93,7 @@ impl RedbStore {
     async fn publish_row(
         &self,
         manifest: &Manifest,
-        attestation: Option<Attestation>,
+        signature: Option<KeySignature>,
     ) -> Result<Digest, RegistryError> {
         let tenant = self.tenant_name();
         let name = manifest.metadata.name.clone();
@@ -104,7 +104,7 @@ impl RedbStore {
             source,
         })?;
         let yaml = to_yaml(manifest)?;
-        let signed = attestation
+        let signed = signature
             .as_ref()
             .map_or((String::new(), String::new()), |a| {
                 (a.key_id.clone(), hex::encode(&a.signature))
@@ -127,7 +127,7 @@ impl RedbStore {
                                          which is not a digest"
                                     ),
                                 })?;
-                            Some((digest, stored_attestation(key_id, signature)))
+                            Some((digest, stored_signature(key_id, signature)))
                         }
                         None => None,
                     };
@@ -135,7 +135,7 @@ impl RedbStore {
                         &name,
                         &version,
                         digest,
-                        attestation.as_ref(),
+                        signature.as_ref(),
                         stored.as_ref().map(|(d, a)| (*d, a.as_ref())),
                     );
                     match verdict {
@@ -143,7 +143,7 @@ impl RedbStore {
                         // content is identical by construction — that is what
                         // `decide_publish` established — so rewriting the row is
                         // rewriting it with itself plus a signature.
-                        Ok(PublishVerdict::Insert | PublishVerdict::AdoptAttestation) => {
+                        Ok(PublishVerdict::Insert | PublishVerdict::AdoptSignature) => {
                             table
                                 .insert(
                                     key,
@@ -177,7 +177,7 @@ impl RedbStore {
         &self,
         name: &str,
         version: &str,
-    ) -> Result<(String, Option<Attestation>), RegistryError> {
+    ) -> Result<(String, Option<KeySignature>), RegistryError> {
         let tenant = self.tenant_name();
         let (name, version) = (name.to_owned(), version.to_owned());
         let (asked_name, asked_version) = (name.clone(), version.clone());
@@ -196,10 +196,7 @@ impl RedbStore {
                     return Ok(None);
                 };
                 let (_, yaml, key_id, signature) = row.value();
-                Ok(Some((
-                    yaml.to_owned(),
-                    stored_attestation(key_id, signature),
-                )))
+                Ok(Some((yaml.to_owned(), stored_signature(key_id, signature))))
             })
             .await
             .map_err(|e| backend(&e))?;
@@ -221,8 +218,8 @@ impl Registry for RedbStore {
         manifest: &Manifest,
         signer: &dyn Signer,
     ) -> Result<Digest, RegistryError> {
-        let (_, attestation) = attest_manifest(manifest, signer)?;
-        self.publish_row(manifest, Some(attestation)).await
+        let (_, signature) = sign_manifest(manifest, signer)?;
+        self.publish_row(manifest, Some(signature)).await
     }
 
     async fn resolve(&self, name: &str, version: &str) -> Result<Manifest, RegistryError> {
@@ -236,9 +233,9 @@ impl Registry for RedbStore {
         version: &str,
         verifier: &dyn Verifier,
     ) -> Result<(Manifest, KeyId), RegistryError> {
-        let (yaml, attestation) = self.row(name, version).await?;
+        let (yaml, signature) = self.row(name, version).await?;
         let manifest = reparse(name, version, &yaml)?;
-        let key = check_attestation(name, version, &manifest, attestation.as_ref(), verifier)?;
+        let key = check_signature(name, version, &manifest, signature.as_ref(), verifier)?;
         Ok((manifest, key))
     }
 

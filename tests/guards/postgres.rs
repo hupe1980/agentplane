@@ -39,6 +39,26 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 /// and out of support.
 const PG: &str = "18-alpine";
 
+/// Connect to a freshly started container, retrying while it finishes coming up.
+///
+/// A container reports its port before Postgres accepts connections, and under
+/// many containers starting at once the gap is long enough that one connection
+/// attempt fails as often as not. The failure would be the harness's, not the
+/// store's, so it is retried rather than reported.
+async fn connect_retrying(url: &str) -> PostgresStore {
+    let mut last = None;
+    for attempt in 0..10u64 {
+        match PostgresStore::connect(url).await {
+            Ok(store) => return store,
+            Err(e) => {
+                last = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt + 1))).await;
+            }
+        }
+    }
+    panic!("connect: {:?}", last.expect("at least one attempt"));
+}
+
 #[tokio::test]
 async fn postgres_satisfies_the_journal_store_contract() {
     let Ok(container) = Postgres::default().with_tag(PG).start().await else {
@@ -95,7 +115,7 @@ async fn postgres_satisfies_the_authority_store_contract() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let tenant = agentplane::core::TenantId::new("authority-conformance").expect("tenant");
     let store = Arc::new(base.for_tenant(tenant)) as Arc<dyn AuthorityStore>;
 
@@ -113,7 +133,7 @@ async fn postgres_satisfies_the_memory_store_contract() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let tenant = agentplane::core::TenantId::new("memory-conformance").expect("tenant");
     let store = Arc::new(base.clone().for_tenant(tenant.clone())) as Arc<dyn MemoryStore>;
 
@@ -143,9 +163,8 @@ async fn postgres_persists_push_delivery_cursors() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = PostgresStore::connect(&url)
+    let store = connect_retrying(&url)
         .await
-        .expect("connect")
         .for_tenant(agentplane::core::TenantId::new("push-postgres").unwrap());
     let task = RunId::generate();
     let config = PushConfig {
@@ -202,9 +221,8 @@ async fn postgres_due_in_matches_the_paging_default() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = PostgresStore::connect(&url)
+    let store = connect_retrying(&url)
         .await
-        .expect("connect")
         .for_tenant(agentplane::core::TenantId::new("push-due-in").unwrap());
     agentplane::testkit::conformance_push::pin_due_in_against_the_default(
         Arc::new(store) as Arc<dyn PushStore>
@@ -375,7 +393,7 @@ async fn postgres_cryptographic_subject_erasure_completes() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let tenant = agentplane::core::TenantId::new("crypto-erase").expect("tenant");
     let inner = Arc::new(base.for_tenant(tenant.clone())) as Arc<dyn MemoryStore>;
     let encrypted = EncryptedMemoryStore::new(inner, Arc::new(MemoryKeyRing::new()), tenant);
@@ -397,7 +415,8 @@ async fn postgres_cryptographic_subject_erasure_completes() {
             .expect(
                 "subject erasure failed on Postgres — the enumeration must not \
                  ride a bounded recall this backend refuses"
-            ),
+            )
+            .reached,
         3
     );
     assert!(
@@ -426,9 +445,8 @@ async fn postgres_erasure_leaves_no_access_expiry_residue() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = PostgresStore::connect(&url)
+    let store = connect_retrying(&url)
         .await
-        .expect("connect")
         .for_tenant(agentplane::core::TenantId::new("residue").expect("tenant"));
 
     let with_window = |id: &str, subject: &str, window: u64| {
@@ -458,7 +476,8 @@ async fn postgres_erasure_leaves_no_access_expiry_residue() {
         store
             .forget_cascading("res-cascade")
             .await
-            .expect("cascade"),
+            .expect("cascade")
+            .len(),
         1
     );
     assert_eq!(
@@ -501,9 +520,8 @@ async fn postgres_event_buffer_erases_payloads() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = PostgresStore::connect(&url)
+    let store = connect_retrying(&url)
         .await
-        .expect("connect")
         .for_tenant(agentplane::core::TenantId::new("event-erasure").expect("tenant"));
     conformance::event_erasure(Arc::new(store) as Arc<dyn EventStore>).await;
 }
@@ -527,12 +545,16 @@ async fn postgres_issue_repairs_a_half_issued_authority() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = PostgresStore::connect(&url)
+    let store = connect_retrying(&url)
         .await
-        .expect("connect")
         .for_tenant(agentplane::core::TenantId::new("authority-atomic").expect("tenant"));
 
-    let authority = StandingAuthority::new("mandate-1", "ticket-4711", Spend::money(1_000));
+    let authority = StandingAuthority::new(
+        "mandate-1",
+        agentplane::authority::Holder::Tenant,
+        "ticket-4711",
+        Spend::money(1_000),
+    );
     store.issue(&authority).await.expect("issue");
 
     // Manufacture the legacy crash artifact: terms without balance.
@@ -607,7 +629,7 @@ async fn postgres_satisfies_the_registry_contract() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = PostgresStore::connect(&url).await.expect("connect");
+    let store = connect_retrying(&url).await;
 
     let signer = StubSigner::new("release-bot");
     let other = StubSigner::new("compromised-bot");
@@ -636,8 +658,8 @@ async fn postgres_refuses_the_loser_of_a_concurrent_publish() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let one = PostgresStore::connect(&url).await.expect("connect");
-    let two = PostgresStore::connect(&url).await.expect("connect");
+    let one = connect_retrying(&url).await;
+    let two = connect_retrying(&url).await;
 
     let manifest = |tokens: u64| {
         Manifest::parse(&format!(
@@ -701,7 +723,7 @@ async fn postgres_satisfies_the_case_layer_contracts() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = Arc::new(PostgresStore::connect(&url).await.expect("connect"));
+    let store = Arc::new(connect_retrying(&url).await);
 
     let mut report = agentplane::testkit::conformance::Report::default();
     agentplane::testkit::conformance_quota::check(store.as_ref(), &mut report).await;
@@ -710,6 +732,13 @@ async fn postgres_satisfies_the_case_layer_contracts() {
     cc::check_timers(&(Arc::clone(&store) as Arc<dyn TimerStore>), &mut report).await;
     cc::check_tasks(&(Arc::clone(&store) as Arc<dyn TaskStore>), &mut report).await;
     cc::check_batches(&(Arc::clone(&store) as Arc<dyn BatchStore>), &mut report).await;
+    cc::check_sealed_runs_waits(
+        &(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>),
+        &(Arc::clone(&store) as Arc<dyn TimerStore>),
+        &(Arc::clone(&store) as Arc<dyn EventStore>),
+        &mut report,
+    )
+    .await;
 
     // Two tenant handles onto the *same* server, because the tenancy check is
     // about one backend keeping two tenants apart.
@@ -747,7 +776,7 @@ async fn postgres_keeps_tenants_apart() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let acme = base
         .clone()
         .for_tenant(TenantId::new("acme").expect("valid"));
@@ -835,6 +864,8 @@ async fn journal_is_apart(acme: &PostgresStore, globex: &PostgresStore) {
                 policy_bundle: None,
                 canon: agentplane::core::canon::VERSION,
                 idempotency_key: None,
+                admitted_by: None,
+                served_unchained: false,
             },
         )],
     )
@@ -1264,7 +1295,7 @@ async fn every_parameter_type_binds_and_reads_back() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = Arc::new(PostgresStore::connect(&url).await.expect("connect"));
+    let store = Arc::new(connect_retrying(&url).await);
 
     let seen = StdArc::new(Mutex::new(serde_json::Value::Null));
     store
@@ -1316,7 +1347,7 @@ async fn an_unconvertible_column_is_refused_rather_than_nulled() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = Arc::new(PostgresStore::connect(&url).await.expect("connect"));
+    let store = Arc::new(connect_retrying(&url).await);
 
     let err = store
         .atomic()
@@ -1362,8 +1393,8 @@ async fn the_erasure_lock_excludes_a_second_instance() {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
 
-    let one = PostgresStore::connect(&url).await.expect("connect");
-    let two = PostgresStore::connect(&url).await.expect("connect");
+    let one = connect_retrying(&url).await;
+    let two = connect_retrying(&url).await;
     let a = one.erasure_coordinator();
     let b = two.erasure_coordinator();
     assert!(
@@ -1381,7 +1412,7 @@ async fn the_erasure_lock_excludes_a_second_instance() {
     // Probed with `pg_try_advisory_lock` on a third session, so this test asks
     // *is the scope held* without taking it. Cancelling a real `acquire` is the
     // subject of its own test below.
-    let probe = PostgresStore::connect(&url).await.expect("connect");
+    let probe = connect_retrying(&url).await;
     let held_by_someone: bool = probe
         .erasure_probe(scope)
         .await
@@ -1455,7 +1486,7 @@ async fn postgres_run_ceiling_holds_under_concurrent_admission() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let tenant = agentplane::core::TenantId::new("quota-race").expect("tenant");
     let store = Arc::new(base.for_tenant(tenant));
     let (limit, racers) = (4u32, 16usize);
@@ -1466,7 +1497,15 @@ async fn postgres_run_ceiling_holds_under_concurrent_admission() {
         let store = Arc::clone(&store);
         admissions.spawn(async move {
             store
-                .reserve(agentplane::core::RunId::generate(), Some(limit), at)
+                .reserve(
+                    agentplane::core::RunId::generate(),
+                    &agentplane::quota::TenantQuota {
+                        max_concurrent_runs: Some(limit),
+                        ..agentplane::quota::TenantQuota::default()
+                    },
+                    None,
+                    at,
+                )
                 .await
         });
     }
@@ -1493,6 +1532,382 @@ async fn postgres_run_ceiling_holds_under_concurrent_admission() {
     );
 }
 
+/// **A period's spend ceiling holds while two instances admit at its edge.**
+///
+/// Two connections, one tenant, twenty holds of 100 for a 1000-token period:
+/// the ceiling check and the hold's insert are one decision under the tenant's
+/// admission lock, or both instances read a period with room and both land.
+#[tokio::test]
+async fn postgres_spend_ceiling_holds_under_concurrent_admission() {
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let tenant = agentplane::core::TenantId::new("spend-race").expect("tenant");
+    let first = connect_retrying(&url).await.for_tenant(tenant.clone());
+    let second = connect_retrying(&url).await.for_tenant(tenant);
+
+    let mut report = agentplane::testkit::conformance::Report::default();
+    agentplane::testkit::conformance_quota::check_race(&first, &second, &mut report).await;
+    report.assert_conforms("PostgresStore (quota race)");
+}
+
+/// **A tool's rate ceiling holds while two instances dispatch at its edge.**
+///
+/// Forty reservations race for a ceiling of ten through two connections onto
+/// one tenant. The count and the insert are one decision under the grant's
+/// advisory lock, or both instances read a window with one place left and
+/// both land. The same battery also holds one tenant's count apart from
+/// another's.
+#[tokio::test]
+async fn postgres_rate_ceiling_holds_under_concurrent_dispatch() {
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let tenant = agentplane::core::TenantId::new("rate-race").expect("tenant");
+    let first = connect_retrying(&url).await.for_tenant(tenant.clone());
+    let second = connect_retrying(&url).await.for_tenant(tenant);
+    let other = connect_retrying(&url)
+        .await
+        .for_tenant(agentplane::core::TenantId::new("rate-other").expect("tenant"));
+
+    let mut report = agentplane::testkit::conformance::Report::default();
+    agentplane::testkit::conformance_quota::check_rate_race(&first, &second, &mut report).await;
+    agentplane::testkit::conformance_quota::check_rate_tenants(&first, &other, &mut report).await;
+    report.assert_conforms("PostgresStore (rate race)");
+}
+
+/// **Two planes on one store perform exactly the ceiling.**
+///
+/// The runtime-level half of the race above: two instances, one tenant, one
+/// declaration of five refunds an hour, sixteen runs dispatched at once. Five
+/// reach the payments server; the rest stop `exhausted` with the refusal on
+/// their record.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn two_planes_on_one_store_perform_exactly_the_ceiling() {
+    use agentplane::core::{BudgetExceeded, Outcome, Skill, SkillDescriptor, SkillError, Tainted};
+    use agentplane::quota::{QuotaStore, TenantQuota};
+    use agentplane::runtime::{Agent, RunStatus, Runtime, StepCtx};
+    use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId, ToolSafety};
+    use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct Payments(AtomicUsize);
+    #[async_trait::async_trait]
+    impl ToolClient for Payments {
+        async fn call(
+            &self,
+            _tool: &ToolId,
+            _arguments: &Value,
+            _provenance: Option<&agentplane::core::Provenance>,
+        ) -> Result<Value, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "refunded": true }))
+        }
+        fn destination(&self, _tool: &ToolId) -> agentplane::tools::Destination {
+            agentplane::tools::Destination::Local
+        }
+    }
+
+    #[derive(Debug)]
+    struct Refunds;
+    #[async_trait::async_trait]
+    impl Skill for Refunds {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("refunds").provides("refund")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::done(
+                cx.call_tool(ToolId::new("payments", "refund"), input)
+                    .await?,
+            ))
+        }
+    }
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let tenant = agentplane::core::TenantId::new("rate-planes").expect("tenant");
+    let manifest = agentplane::manifest::Manifest::parse(
+        "
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: refunder, version: '1.0.0' }
+spec:
+  capabilities: { provides: [refund] }
+  tools:
+    - ref: tool://payments/refund
+      mutates: false
+      rate_limit: { count: 5, window_seconds: 3600 }
+  budgets: {}
+",
+    )
+    .expect("a well-formed declaration");
+    let payments = Arc::new(Payments::default());
+    let mut planes = Vec::new();
+    for owner in ["instance-a", "instance-b"] {
+        let store = Arc::new(connect_retrying(&url).await.for_tenant(tenant.clone()));
+        planes.push(
+            Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+                .tenant(tenant.clone())
+                .owner(owner)
+                .quota(store as Arc<dyn QuotaStore>, TenantQuota::default())
+                .tools(
+                    Arc::new(
+                        ToolCatalog::new()
+                            .allow(ToolId::new("payments", "refund"), ToolSafety::read_only()),
+                    ),
+                    Arc::clone(&payments) as Arc<dyn ToolClient>,
+                )
+                .agent(Agent::new(&manifest).skill(Refunds))
+                .build(),
+        );
+    }
+
+    let mut runs = tokio::task::JoinSet::new();
+    for n in 0..16 {
+        let plane = Arc::clone(&planes[n % 2]);
+        runs.spawn(async move {
+            plane
+                .run("refund", Tainted::trusted(json!({ "order": n })))
+                .await
+                .expect("admitted")
+                .status
+        });
+    }
+    let (mut performed, mut refused) = (0, 0);
+    while let Some(status) = runs.join_next().await {
+        match status.expect("no run panicked") {
+            RunStatus::Succeeded => performed += 1,
+            RunStatus::Exhausted(BudgetExceeded::Rate { .. }) => refused += 1,
+            other => panic!("a run ended for a reason other than the ceiling: {other:?}"),
+        }
+    }
+    assert_eq!(
+        (performed, refused),
+        (5, 11),
+        "two instances sharing one store performed {performed} refunds under five an hour"
+    );
+    assert_eq!(payments.0.load(Ordering::SeqCst), 5);
+}
+
+/// **The Merkle log only grows at its end, even while two instances seal.**
+///
+/// A checkpoint is a promise that every later checkpoint extends it. That
+/// holds only if a leaf's position follows commit order: a seal that took its
+/// position, then committed after a later position had already been
+/// checkpointed, puts a leaf *before* the checkpoint's last one, and a witness
+/// holding that checkpoint sees a fork where there was none.
+///
+/// A trigger holds one seal open after its row is written — position taken,
+/// transaction uncommitted — while a second run seals. Whatever the second
+/// seal did meanwhile, the checkpoint taken then must be a prefix of the log
+/// once the first commits.
+#[tokio::test]
+async fn postgres_merkle_log_only_grows_at_its_end_under_concurrent_seals() {
+    use agentplane::core::RunId;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = Arc::new(
+        connect_retrying(&url)
+            .await
+            .for_tenant(agentplane::core::TenantId::new("seal-race").expect("tenant")),
+    );
+    // Each run carries a record, so every leaf is distinct: runs with empty
+    // chains share one leaf, and any order of them is consistent.
+    let admit = |store: Arc<PostgresStore>, run: RunId, owner: &'static str| async move {
+        admitted_run(&store, run, owner).await
+    };
+
+    let (raw, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    tokio::spawn(connection);
+
+    let (held, other) = (RunId::generate(), RunId::generate());
+    raw.batch_execute(&format!(
+        "CREATE FUNCTION hold_seal() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.run_id = '{held}' THEN PERFORM pg_advisory_xact_lock(4242); END IF;
+             RETURN NEW;
+         END $$ LANGUAGE plpgsql;
+         CREATE TRIGGER hold_seal AFTER INSERT ON run_seal
+             FOR EACH ROW EXECUTE FUNCTION hold_seal();
+         SELECT pg_advisory_lock(4242);"
+    ))
+    .await
+    .expect("install the pause");
+
+    // One run already in the log, so the prefix is not trivially empty.
+    let first = RunId::generate();
+    let l = admit(Arc::clone(&store), first, "a").await;
+    store.seal(first, l.epoch, "succeeded").await.expect("seal");
+
+    let l_held = admit(Arc::clone(&store), held, "a").await;
+    let l_other = admit(Arc::clone(&store), other, "b").await;
+    let sealing_held = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.seal(held, l_held.epoch, "succeeded").await })
+    };
+    // Wait until the held seal is parked in its trigger, its row written.
+    loop {
+        let waiting: i64 = raw
+            .query_one(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+                &[],
+            )
+            .await
+            .expect("pg_locks")
+            .get(0);
+        if waiting > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let sealing_other = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.seal(other, l_other.epoch, "succeeded").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let c1 = store
+        .checkpoint()
+        .await
+        .expect("checkpoint while one seal is open");
+
+    raw.batch_execute("SELECT pg_advisory_unlock(4242)")
+        .await
+        .expect("release the pause");
+    sealing_held.await.expect("task").expect("held seal");
+    sealing_other.await.expect("task").expect("other seal");
+    let c2 = store.checkpoint().await.expect("checkpoint");
+    assert_eq!(c2.size, 3, "all three runs are in the log");
+
+    let proof = store
+        .consistency_proof(c1.size)
+        .await
+        .expect("consistency proof");
+    assert!(
+        agentplane::core::merkle::verify_consistency(
+            usize::try_from(c1.size).expect("a size fits"),
+            &c1.root,
+            usize::try_from(c2.size).expect("a size fits"),
+            &c2.root,
+            &proof,
+        ),
+        "a checkpoint of size {} taken while a seal was open is not a prefix \
+         of the log after it committed — a leaf landed before the checkpoint's \
+         end, and a witness holding it would report a fork",
+        c1.size
+    );
+}
+
+/// Lease `run` and append its admission, handing back the lease.
+async fn admitted_run(
+    store: &PostgresStore,
+    run: agentplane::core::RunId,
+    owner: &str,
+) -> agentplane::journal::Lease {
+    use agentplane::journal::{Append, RecordKind};
+    let lease = store
+        .acquire(run, owner, std::time::Duration::from_mins(1))
+        .await
+        .expect("acquire");
+    store
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "admitted".into(),
+                    governed_by: None,
+                    input_label: agentplane::core::Label::trusted(),
+                    input: serde_json::Value::Null,
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+    lease
+}
+
+/// **Half a signature is a damaged row, not an unsigned record.**
+///
+/// A key id without its signature — or the reverse — read as *unsigned*
+/// strips the record's authorship silently: it reads back as history written
+/// before signing was configured. The schema refuses the half-written row,
+/// and a row that reached the table anyway (a table created before the
+/// constraint existed) reads as corrupt.
+#[tokio::test]
+async fn postgres_half_a_signature_is_refused_not_read_as_unsigned() {
+    use agentplane::core::RunId;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = connect_retrying(&url)
+        .await
+        .for_tenant(agentplane::core::TenantId::new("half-signed").expect("tenant"))
+        .signing_as(Arc::new(agentplane::testkit::StubSigner::default()));
+    let run = RunId::generate();
+    admitted_run(&store, run, "w").await;
+    assert!(
+        store.read(run, 1).await.expect("read")[0]
+            .signature
+            .is_some(),
+        "the fixture wrote no signature"
+    );
+
+    let (raw, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    tokio::spawn(connection);
+    let strip = "UPDATE journal SET signature = NULL WHERE tenant = 'half-signed'";
+    assert!(
+        raw.execute(strip, &[]).await.is_err(),
+        "the schema accepted a key id without its signature"
+    );
+
+    raw.batch_execute("ALTER TABLE journal DROP CONSTRAINT journal_signature_whole")
+        .await
+        .expect("drop the constraint, as a table created before it would lack it");
+    raw.execute(strip, &[]).await.expect("strip the signature");
+    assert!(
+        matches!(
+            store.read(run, 1).await,
+            Err(agentplane::core::StoreError::Corrupt { .. })
+        ),
+        "a row with half a signature read back as an unsigned record"
+    );
+}
+
 /// **Concurrent draws serialise on the balance row's lock — corroborated as a
 /// race, not assumed from the statement shape.**
 ///
@@ -1512,13 +1927,14 @@ async fn postgres_authority_draws_serialise_on_the_row_lock() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let tenant = agentplane::core::TenantId::new("authority-race").expect("tenant");
     let store = Arc::new(base.for_tenant(tenant));
 
     store
         .issue(&StandingAuthority::new(
             "mandate-race",
+            agentplane::authority::Holder::Tenant,
             "approval:RACE-1",
             Spend::money(100),
         ))
@@ -1627,6 +2043,7 @@ async fn postgres_task_claim_admits_exactly_one_reviewer() {
         excluded_actors: Vec::new(),
         created_at: agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
         due_at: None,
+        withheld: None,
     };
     store.open(&task).await.expect("open");
 
@@ -1666,7 +2083,7 @@ async fn postgres_two_sweepers_partition_the_due_timers() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let tenant = agentplane::core::TenantId::new("timer-race").expect("tenant");
     let store = Arc::new(base.for_tenant(tenant));
 
@@ -1960,7 +2377,7 @@ async fn postgres_restores_a_plane_that_then_serves() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let base = PostgresStore::connect(&url).await.expect("connect");
+    let base = connect_retrying(&url).await;
     let tenant = |name: &str| {
         Arc::new(
             base.clone()
@@ -2369,7 +2786,7 @@ async fn a_cancelled_acquire_leaves_neither_the_lock_nor_the_pool_wedged() {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
 
-    let one = PostgresStore::connect(&url).await.expect("connect");
+    let one = connect_retrying(&url).await;
     // **A pool of one, deliberately.** With a larger pool the second acquire
     // gets a *different* connection and the test passes whether or not the lock
     // session was detached — which it did, on the first version of this test.
@@ -2403,7 +2820,7 @@ async fn a_cancelled_acquire_leaves_neither_the_lock_nor_the_pool_wedged() {
     // Nothing holds the scope now. If the abandoned request were still queued
     // server-side it would have been granted the lock the moment `a` released —
     // to a session with no lease, which nothing can release.
-    let probe = PostgresStore::connect(&url).await.expect("connect");
+    let probe = connect_retrying(&url).await;
     assert!(
         !probe.erasure_probe(scope).await.expect("probe"),
         "the scope is held after the only lease was released — the cancelled \
@@ -2453,8 +2870,8 @@ async fn a_dropped_lease_frees_the_scope() {
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
 
-    let one = PostgresStore::connect(&url).await.expect("connect");
-    let probe = PostgresStore::connect(&url).await.expect("connect");
+    let one = connect_retrying(&url).await;
+    let probe = connect_retrying(&url).await;
     let a = one.erasure_coordinator();
     let scope = "acme/dropped-lease";
 
@@ -2521,7 +2938,7 @@ async fn the_sweep_reads_are_planned_as_index_scans() {
     };
     let port = container.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let store = PostgresStore::connect(&url).await.expect("connect");
+    let store = connect_retrying(&url).await;
 
     for (what, sql, index) in [
         (

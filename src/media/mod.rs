@@ -254,7 +254,6 @@ impl MediaPolicy {
             "max_redirects": self.max_redirects,
             "max_bytes": self.max_bytes,
             "max_header_bytes": self.max_header_bytes,
-            "timeout_ms": self.timeout.as_millis(),
             "retry": self.retry,
             "retention": self.retention,
             "max_url_sensitivity": self.max_url_sensitivity,
@@ -442,7 +441,10 @@ impl GovernedMedia {
             fetcher: self.clone(),
             blobs,
             arguments: json!({ "url": url }),
-            case_link,
+            // Linked only when the case is the erasure unit. Externally
+            // retained bytes live under the policy's unit, so a link would
+            // name a digest at an address the case never wrote.
+            case_link: case_link.filter(|_| self.requires_case()),
         }
     }
 
@@ -585,9 +587,9 @@ impl GovernedMedia {
                 if error.is_timeout() {
                     MediaError::TimedOut(self.policy.timeout)
                 } else if error.is_connect() {
-                    MediaError::Unavailable(error.to_string())
+                    MediaError::Unavailable(crate::netguard::transport_text(&error))
                 } else {
-                    MediaError::Interrupted(error.to_string())
+                    MediaError::Interrupted(crate::netguard::transport_text(&error))
                 }
             })?;
         Ok((
@@ -1312,6 +1314,79 @@ mod tests {
         assert_eq!(filed.digest, Digest::of(b"\x89PNG\r\n\x1a\nbody"));
     }
 
+    /// **Externally retained media is not linked to the case it was fetched in.**
+    ///
+    /// Its bytes live under the policy's erasure unit, not the case's. A link
+    /// would name a digest at an address the case never wrote: a drill reports
+    /// it lost, and `erase_case` tombstones an empty address and counts it.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn externally_retained_media_is_not_linked_to_the_case() {
+        use crate::blob::MemoryBlobs;
+        use crate::case::CaseStore;
+
+        let cases = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"));
+        let case = crate::core::CaseId::generate();
+        let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("instant");
+        cases
+            .import_case(
+                &crate::core::Case {
+                    id: case,
+                    kind: "matter".into(),
+                    status: crate::core::CaseStatus::Open,
+                    correlation: Vec::new(),
+                    state: json!({}),
+                    version: crate::core::CaseVersion::INITIAL,
+                    opened_at: at,
+                    runs: Vec::new(),
+                },
+                &[],
+                &[],
+            )
+            .await
+            .expect("case");
+        let link = || MediaCaseLink {
+            cases: Arc::clone(&cases) as Arc<dyn CaseStore>,
+            case,
+            at,
+        };
+        let fetched = || FetchBody {
+            source_url: "https://media.example/a.png".to_owned(),
+            final_url: "https://media.example/a.png".to_owned(),
+            media_type: "image/png".to_owned(),
+            bytes: b"\x89PNG\r\n\x1a\nbody".to_vec(),
+            redirects: 0,
+            validated_by: Vec::new(),
+            hops: Vec::new(),
+        };
+
+        GovernedMedia::new(policy().external_retention("test/v1"))
+            .effect(
+                Arc::new(MemoryBlobs::new()),
+                "https://media.example/a.png",
+                Some(link()),
+            )
+            .file(fetched())
+            .await
+            .expect("files");
+        assert!(
+            cases.blobs_of(case).await.expect("links").is_empty(),
+            "externally retained media was linked to the case it was fetched in"
+        );
+
+        // The positive half: case-linked retention links.
+        GovernedMedia::new(policy())
+            .effect(
+                Arc::new(MemoryBlobs::new()),
+                "https://media.example/a.png",
+                Some(link()),
+            )
+            .file(fetched())
+            .await
+            .expect("files");
+        assert_eq!(cases.blobs_of(case).await.expect("links").len(), 1);
+    }
+
     #[tokio::test]
     async fn an_exact_grant_cannot_make_a_metadata_ip_public() {
         let policy = MediaPolicy::new()
@@ -1449,6 +1524,17 @@ mod tests {
         assert_eq!(effect.trust(), Trust::Untrusted);
         assert_eq!(descriptor.args["validators"][0], "clamav:rules-42");
         assert_eq!(descriptor.args["policy"]["max_bytes"], DEFAULT_MAX_BYTES);
+
+        // How long this plane waits is not what it asks: a fetcher differing
+        // only in its timeout must replay the same history.
+        let hasty = GovernedMedia::new(policy().timeout(std::time::Duration::from_secs(3)))
+            .validator(Arc::new(Scanner("clamav:rules-42".to_owned())))
+            .effect(
+                Arc::new(crate::blob::MemoryBlobs::new()),
+                "https://media.example/a.png",
+                None,
+            );
+        assert_eq!(hasty.descriptor(), descriptor);
     }
 }
 

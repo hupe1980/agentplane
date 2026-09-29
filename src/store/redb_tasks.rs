@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::case::{ClaimError, TaskStore};
-use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, Timestamp};
+use crate::core::{CaseId, RunId, StoreError, Task, TaskId, TaskState, Timestamp};
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
@@ -111,6 +111,29 @@ fn reindex(
         }
     }
     Ok(())
+}
+
+/// Move a pending task to `state`, in the caller's transaction, returning
+/// whether it moved. A task that is no longer pending stays as it stands: the
+/// settlement that won the race is the one the run consumed.
+fn settle(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    key: &str,
+    task: &Task,
+    state: TaskState,
+) -> Result<bool, StoreError> {
+    if !task.state.is_pending() {
+        return Ok(false);
+    }
+    let mut updated = task.clone();
+    updated.state = state;
+    w.open_table(TASKS)
+        .map_err(|e| be(&e))?
+        .insert((tenant, key), serde_json::to_string(&updated)?.as_str())
+        .map_err(|e| be(&e))?;
+    reindex(w, tenant, key, task, state)?;
+    Ok(true)
 }
 
 /// Read a task back out of the store.
@@ -402,29 +425,45 @@ impl TaskStore for RedbStore {
         .await
     }
 
-    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
+    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<bool, StoreError> {
         let tenant = self.tenant_name();
         let key = id.to_hex();
         self.with_db(move |db| {
             let w = begin_write(db)?;
-            {
-                let mut tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
+            let applied = {
+                let tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
                 let Some(task) = load(&tasks, &tenant, &key)? else {
                     return Err(StoreError::NotFound(id.to_string()));
                 };
-                let mut updated = task.clone();
-                updated.state = state;
-                tasks
-                    .insert(
-                        (tenant.as_str(), key.as_str()),
-                        serde_json::to_string(&updated)?.as_str(),
-                    )
-                    .map_err(|e| be(&e))?;
                 drop(tasks);
-                reindex(&w, &tenant, &key, &task, state)?;
+                settle(&w, &tenant, &key, &task, state)?
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(applied)
+        })
+        .await
+    }
+
+    async fn withdraw_run(&self, run: RunId, awaited: &[TaskId]) -> Result<usize, StoreError> {
+        let tenant = self.tenant_name();
+        let keys: Vec<String> = awaited.iter().map(|id| id.to_hex()).collect();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let mut n = 0;
+            for key in keys {
+                let task = {
+                    let tasks = w.open_table(TASKS).map_err(|e| be(&e))?;
+                    load(&tasks, &tenant, &key)?
+                };
+                if let Some(task) = task
+                    && task.run == run
+                    && settle(&w, &tenant, &key, &task, TaskState::Withdrawn)?
+                {
+                    n += 1;
+                }
             }
             w.commit().map_err(|e| be(&e))?;
-            Ok(())
+            Ok(n)
         })
         .await
     }

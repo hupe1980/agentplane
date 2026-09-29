@@ -57,6 +57,7 @@ mod embedded {
             excluded_actors: Vec::new(),
             created_at: at(created),
             due_at: None,
+            withheld: None,
         }
     }
 
@@ -576,6 +577,7 @@ mod shared {
             excluded_actors: Vec::new(),
             created_at: at(created),
             due_at: None,
+            withheld: None,
         }
     }
 

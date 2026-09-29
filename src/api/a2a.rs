@@ -48,6 +48,12 @@
 //! storage and a retrying transport worker; without that wiring every push
 //! method uses `PushNotificationNotSupportedError` and the card advertises
 //! false.
+//!
+//! # A task belongs to the peer that admitted it
+//!
+//! Every read, write, stream, push configuration and `contextId` join is scoped
+//! to the admitting peer; another peer's task answers `TASK_NOT_FOUND`, never a
+//! refusal that confirms it exists.
 
 use std::sync::Arc;
 
@@ -178,6 +184,56 @@ pub mod action {
         CARD_EXTENDED,
         TASK_PUSH,
     ];
+}
+
+/// The policy context every A2A action is asked under: roles, the peer's own
+/// name, and tenant — no chain, no label, no depth. A task action adds the
+/// task's `owner` ([`A2aServer::context`]).
+fn peer_context(caller: &Caller) -> Value {
+    json!({
+        "roles": caller.roles,
+        "peer": caller.actor,
+        "tenant": caller.tenant.as_str(),
+    })
+}
+
+/// Whether `engine` can evaluate every request this surface puts to it.
+///
+/// Each [`action::ALL`] verb is probed in exactly the shapes it is asked in:
+/// with the task's `owner` where it acts on a task, and without it where it
+/// does not — sending, the extended card, the `tasks` listing, and an inline
+/// push registration for a task that does not exist yet. Probing a task action
+/// without its owner would refuse a rule set that reads `context.owner`, which
+/// every such request carries; probing the listing with one would miss a rule
+/// that breaks on the request that carries none. [`A2aServer::hosting`]
+/// refuses a runtime whose engine reports anything: a rule this surface
+/// cannot evaluate declines every peer, and the decline says nothing to the
+/// peer about why.
+#[must_use]
+pub fn policy_problems(engine: &dyn crate::core::PolicyEngine) -> Vec<String> {
+    let caller = Caller::new("preflight", vec!["preflight".to_owned()]);
+    let bare = peer_context(&caller);
+    let owned = A2aServer::context(&caller, Some(&caller.actor));
+    let shapes: &[(&str, &Value)] = &[
+        (action::MESSAGE_SEND, &bare),
+        (action::TASK_READ, &owned),
+        (action::TASK_READ, &bare),
+        (action::TASK_CONTINUE, &owned),
+        (action::TASK_CANCEL, &owned),
+        (action::CARD_EXTENDED, &bare),
+        (action::TASK_PUSH, &owned),
+        (action::TASK_PUSH, &bare),
+    ];
+    let requests: Vec<PolicyRequest<'_>> = shapes
+        .iter()
+        .map(|(action, context)| PolicyRequest {
+            principal: &caller.actor,
+            action,
+            resource: "preflight.resource",
+            context,
+        })
+        .collect();
+    engine.preflight(&requests)
 }
 
 /// The `A2A-Version` service parameter.
@@ -562,11 +618,11 @@ impl A2aReply {
     /// answer is a model's words, and an echoing skill returns a peer's own
     /// bytes. So the marker is honoured only from a **trusted** output.
     ///
-    /// This was not hypothetical. Before the check, a peer could put the
-    /// marker in its message, have an ordinary echoing skill return it, and
-    /// choose the envelope its own reply arrived in — a file URL of the
-    /// attacker's naming, presented as the agent's answer. Model output is a
-    /// proposal, never authority; so is a peer's message.
+    /// Otherwise a peer could put the marker in its message, have an ordinary
+    /// echoing skill return it, and choose the envelope its own reply arrived
+    /// in — a file URL of the attacker's naming, presented as the agent's
+    /// answer. Model output is a proposal, never authority; so is a peer's
+    /// message.
     ///
     /// An untrusted answer still reaches the caller — as the artifact content
     /// it is, rather than as an instruction about the envelope.
@@ -832,8 +888,8 @@ struct CommonParams {
     configuration: Option<SendConfiguration>,
     /// `SendMessageRequest.metadata`, accepted and not interpreted.
     ///
-    /// Modelled rather than ignored because the two are different answers now
-    /// that unknown fields are refused: the specification defines this field, so
+    /// Modelled rather than ignored because unknown fields are refused, and
+    /// the two are different answers: the specification defines this field, so
     /// a conforming client may send it and must not meet `-32602`. It is
     /// deliberately not read — opaque caller data has no governed meaning here,
     /// and inventing one would be a control nothing enforces. What the runtime
@@ -987,7 +1043,7 @@ pub struct A2aServer {
     /// The card's advertised skill ids — what a caller may ask for.
     skills: Vec<String>,
     push: Option<PushRuntime>,
-    /// How many candidate journals one content-filtered `ListTasks` may read.
+    /// How many of the caller's own tasks one `ListTasks` may examine.
     ///
     /// See [`Self::filter_scan_budget`] for why this is a ceiling and not a
     /// page size.
@@ -998,6 +1054,61 @@ pub struct A2aServer {
     /// Artifact projections of **sealed** runs, so a poll loop does not buy a
     /// strict replay per read. See [`ArtifactCache`].
     artifact_cache: Arc<std::sync::Mutex<ArtifactCache>>,
+    /// Open streams, per caller. See [`Self::streams_per_caller`].
+    streams: StreamSlots,
+}
+
+/// Default for [`A2aServer::streams_per_caller`].
+const STREAMS_PER_CALLER: usize = 8;
+
+/// How many streams each caller holds open on this server.
+#[derive(Debug, Clone)]
+struct StreamSlots {
+    limit: usize,
+    open: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+}
+
+impl StreamSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            open: Arc::default(),
+        }
+    }
+
+    /// One more stream for `actor`, or `None` at its ceiling.
+    fn claim(&self, actor: &str) -> Option<StreamSlot> {
+        let mut open = crate::core::poison::recover(&self.open);
+        let held = open.entry(actor.to_owned()).or_default();
+        if *held >= self.limit {
+            return None;
+        }
+        *held += 1;
+        Some(StreamSlot {
+            open: Arc::clone(&self.open),
+            actor: actor.to_owned(),
+        })
+    }
+}
+
+/// One open stream, given back when the stream is dropped — whether it ended
+/// or its client went away.
+#[derive(Debug)]
+pub(super) struct StreamSlot {
+    open: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    actor: String,
+}
+
+impl Drop for StreamSlot {
+    fn drop(&mut self) {
+        let mut open = crate::core::poison::recover(&self.open);
+        if let Some(held) = open.get_mut(&self.actor) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                open.remove(&self.actor);
+            }
+        }
+    }
 }
 
 /// A bounded in-process cache of sealed runs' artifact projections.
@@ -1011,7 +1122,7 @@ pub struct A2aServer {
 /// performance story; insertion order is enough where every entry is equally
 /// immutable.
 #[derive(Debug, Default)]
-struct ArtifactCache {
+pub(super) struct ArtifactCache {
     map: std::collections::HashMap<RunId, Option<Vec<A2aArtifact>>>,
     order: std::collections::VecDeque<RunId>,
 }
@@ -1068,7 +1179,7 @@ pub type A2aPushWorker = crate::push::DeliveryWorker;
 
 /// Outcome of one bounded push sweep.
 ///
-/// Re-exported from [`crate::push`], which owns the delivery loop now.
+/// Re-exported from [`crate::push`], which owns the delivery loop.
 pub use crate::push::PushSweepReport;
 
 /// `StreamResponse` payloads, for **caller-registered** webhooks only.
@@ -1144,6 +1255,16 @@ pub enum ServerSetupError {
          place that skips the gate"
     )]
     NoPolicy,
+    /// The policy set cannot evaluate a request this surface asks. A2A asks
+    /// under `{roles, peer, tenant}` alone, so an unscoped rule reading
+    /// `context.delegation_depth` or `context.label` unguarded declines every
+    /// peer.
+    #[error(
+        "the policy set cannot evaluate the A2A surface's requests: {problems} — \
+         they carry only `roles`, `peer` and `tenant`; scope the rule to the \
+         actions it is about, or guard the read with `context has …`"
+    )]
+    PolicyUnevaluable { problems: String },
     #[error(
         "the runtime has no case layer, so this server cannot mint the \
          contextId A2A 1.0 requires on every task — a generated contextId \
@@ -1218,6 +1339,15 @@ impl A2aServer {
         url: impl Into<String>,
     ) -> Result<Self, ServerSetupError> {
         let policy = runtime.policy().ok_or(ServerSetupError::NoPolicy)?.clone();
+        let mut problems = policy_problems(policy.as_ref());
+        // A peer with no chain of its own acts under none on this plane, so
+        // the runtime's requests for it take a shape the build did not probe.
+        problems.extend(runtime.served_policy_problems());
+        if !problems.is_empty() {
+            return Err(ServerSetupError::PolicyUnevaluable {
+                problems: problems.join("; "),
+            });
+        }
         if runtime.cases().is_none() {
             return Err(ServerSetupError::NoCases);
         }
@@ -1310,16 +1440,33 @@ impl A2aServer {
             filter_scan_budget: FILTER_SCAN_BUDGET,
             artifact_replay_budget: ARTIFACT_REPLAY_BUDGET,
             artifact_cache: Arc::new(std::sync::Mutex::new(ArtifactCache::default())),
+            streams: StreamSlots::new(STREAMS_PER_CALLER),
         })
     }
 
-    /// Bound what one content-filtered `ListTasks` may cost.
+    /// Bound how many streams one caller may hold open at once.
     ///
-    /// A `status` or `contextId` filter can only be evaluated by reading a
-    /// candidate task's journal, and the spec's `totalSize` is the exact total
-    /// — so a filtered listing over a large tenant is a request whose cost the
-    /// *caller* chooses. Unbounded, that is the same scan the paged index
-    /// removed, reachable by any authenticated peer who adds one field.
+    /// A `SendStreamingMessage` or `SubscribeToTask` is a connection held for
+    /// as long as the run lives and a journal read per poll interval — so an
+    /// unbounded count is a cost any authenticated peer chooses for this
+    /// plane. Past the ceiling a new stream is refused as back-pressure
+    /// ([`code::QUOTA_EXHAUSTED`]), before anything is admitted; one ending,
+    /// or its client going away, frees the slot.
+    #[must_use]
+    pub fn streams_per_caller(mut self, limit: usize) -> Self {
+        self.streams = StreamSlots::new(limit.max(1));
+        self
+    }
+
+    /// Bound what one `ListTasks` may cost.
+    ///
+    /// The spec's `totalSize` is the exact total, and a `status` or `contextId`
+    /// filter is decided only by reading each candidate's journal — so the
+    /// cost of a listing is one the *caller* chooses.
+    ///
+    /// The budget counts the caller's own tasks. The index a listing reads is
+    /// narrowed to them, so another caller's volume — or the embedder's — does
+    /// not refuse this one's listing.
     ///
     /// Over budget, the request is refused with the narrowing lever named —
     /// `statusTimestampAfter` is answered from the index, so tightening it
@@ -1509,6 +1656,57 @@ impl A2aServer {
         action: &str,
         resource: &str,
     ) -> Result<Caller, RpcError> {
+        let caller = self.authenticate(headers).await?;
+        self.authorize(&caller, action, resource, None)?;
+        Ok(caller)
+    }
+
+    /// Authenticate, find the task, and refuse it unless this caller admitted
+    /// it — then authorize, with the owner in the rule's context.
+    ///
+    /// A task id is a bearer of nothing. Policy decides what a caller may do
+    /// with *its* tasks; whose task an id names is decided here, before policy
+    /// is asked, and a task another peer admitted — or one nobody admitted over
+    /// this surface — answers exactly as a task that does not exist. Anything
+    /// else tells a peer holding a guessed or leaked id that it is real.
+    ///
+    /// Hands back the task's journal, read once, because every caller of this
+    /// was about to read it anyway.
+    async fn gate_task(
+        &self,
+        headers: &HeaderMap,
+        action: &str,
+        run: RunId,
+    ) -> Result<(Caller, Vec<crate::journal::Record>), RpcError> {
+        let caller = self.authenticate(headers).await?;
+        let records = self.authorized_task(&caller, action, run).await?;
+        Ok((caller, records))
+    }
+
+    /// [`gate_task`](Self::gate_task) for a caller already authenticated, so
+    /// a request that needs the caller earlier authenticates once.
+    async fn authorized_task(
+        &self,
+        caller: &Caller,
+        action: &str,
+        run: RunId,
+    ) -> Result<Vec<crate::journal::Record>, RpcError> {
+        let records = self
+            .runtime
+            .journal()
+            .read(run, 1)
+            .await
+            .map_err(|e| internal("reading a task's journal", &e))?;
+        let owner = task_owner(&records);
+        if owner != Some(caller.actor.as_str()) {
+            return Err(task_not_found(run));
+        }
+        self.authorize(caller, action, &run.to_string(), owner)?;
+        Ok(records)
+    }
+
+    /// Who is calling, from the credential — and only if it is this tenant.
+    async fn authenticate(&self, headers: &HeaderMap) -> Result<Caller, RpcError> {
         let caller = self.auth.authenticate(headers).await.map_err(|e| {
             // Refused, not "invalid request": a caller that cannot authenticate
             // must not be told its request was malformed and try again with a
@@ -1527,19 +1725,38 @@ impl A2aServer {
                 "this endpoint does not serve your tenant",
             ));
         }
+        Ok(caller)
+    }
 
-        let context = json!({
-            "roles": caller.roles,
-            "peer": caller.actor,
-            "tenant": caller.tenant.as_str(),
-        });
+    /// What a rule on this surface can key on.
+    ///
+    /// `owner` is present on a task action: the peer that admitted the task,
+    /// which by the time a rule is asked is always the caller — so a rule set
+    /// can say "a peer reads its own tasks" in its own words rather than trust
+    /// this surface to have said it.
+    fn context(caller: &Caller, owner: Option<&str>) -> Value {
+        let mut context = peer_context(caller);
+        if let Some(owner) = owner {
+            context["owner"] = json!(owner);
+        }
+        context
+    }
+
+    fn authorize(
+        &self,
+        caller: &Caller,
+        action: &str,
+        resource: &str,
+        owner: Option<&str>,
+    ) -> Result<(), RpcError> {
+        let context = Self::context(caller, owner);
         match self.policy.authorize(&PolicyRequest {
             principal: &caller.actor,
             action,
             resource,
             context: &context,
         }) {
-            PolicyDecision::Permit => Ok(caller),
+            PolicyDecision::Permit => Ok(()),
             PolicyDecision::Deny { reason } => {
                 // The determining policy and its reason stay operator-side. A
                 // Cedar denial names the action, the resource, and the policy
@@ -1585,12 +1802,8 @@ impl A2aServer {
         }
     }
 
-    fn permits(&self, caller: &Caller, action: &str, resource: &str) -> bool {
-        let context = json!({
-            "roles": caller.roles,
-            "peer": caller.actor,
-            "tenant": caller.tenant.as_str(),
-        });
+    fn permits(&self, caller: &Caller, action: &str, resource: &str, owner: Option<&str>) -> bool {
+        let context = Self::context(caller, owner);
         matches!(
             self.policy.authorize(&PolicyRequest {
                 principal: &caller.actor,
@@ -1760,6 +1973,7 @@ async fn rpc(
 ///
 /// Both are the same thing once the run exists: a view of the journal from a
 /// point onward. The only difference is whether this call is what created it.
+#[allow(clippy::too_many_lines)]
 async fn stream_method(
     server: A2aServer,
     headers: HeaderMap,
@@ -1780,12 +1994,23 @@ async fn stream_method(
         configuration.validate()?;
     }
 
-    let run = if req.method == method::SUBSCRIBE {
+    // A slot before anything else is done for this caller: a stream is a
+    // connection held open and a journal polled for as long as the run lives,
+    // so how many one peer may hold is a bound this surface states. Taken
+    // before admission, so a caller at its ceiling starts no work it then
+    // cannot watch; released when the stream ends or the client goes away.
+    let caller = server.authenticate(&headers).await?;
+    let slot = server
+        .streams
+        .claim(&caller.actor)
+        .ok_or_else(|| RpcError::new(code::QUOTA_EXHAUSTED, QUOTA_EXHAUSTED_MESSAGE))?;
+
+    let (run, records) = if req.method == method::SUBSCRIBE {
         let id = task_id(&params)?;
-        server
-            .gate(&headers, action::TASK_READ, &id.to_string())
+        let records = server
+            .authorized_task(&caller, action::TASK_READ, id)
             .await?;
-        id
+        (id, records)
     } else {
         let Some(message) = params.message.clone() else {
             return Err(RpcError::new(
@@ -1794,17 +2019,18 @@ async fn stream_method(
             ));
         };
         message.validate_parts()?;
-        if message.task_id.is_some() {
-            continue_task(&server, &headers, &message).await?
+        let run = if message.task_id.is_some() {
+            continue_task(&server, &caller, &message).await?
         } else {
             let skill = resolve_skill(&server, &message)?;
-            let caller = server.gate(&headers, action::MESSAGE_SEND, &skill).await?;
+            server.authorize(&caller, action::MESSAGE_SEND, &skill, None)?;
+            check_context(&server, &message, &caller).await?;
             if let Some(push) = params
                 .configuration
                 .as_ref()
                 .and_then(|configuration| configuration.task_push_notification_config.as_ref())
             {
-                validate_inline_push(&server, &headers, &skill, push).await?;
+                validate_inline_push(&server, &caller, &skill, push)?;
             }
             // Admitted before the stream opens. A stream that begins and *then*
             // reports a refusal has already told the client the work started —
@@ -1836,31 +2062,49 @@ async fn stream_method(
                 Err(crate::core::RuntimeError::Draining) => {
                     return Err(RpcError::new(code::DRAINING, DRAINING_MESSAGE));
                 }
-                Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
+                Err(e) => return Err(internal("admitting a streamed message", &e)),
             }
-        }
+        };
+        let records = server
+            .runtime
+            .journal()
+            .read(run, 1)
+            .await
+            .map_err(|e| internal("reading a task's journal", &e))?;
+        (run, records)
     };
 
-    let Some((task, case, from)) = super::a2a_stream::current(&server.runtime, run).await else {
-        return Err(RpcError::new(
-            code::TASK_NOT_FOUND,
-            format!("no such task: {run}"),
-        ));
+    // Decided from the records before anything is replayed: a subscription
+    // to a finished task is refused, and refusing it after a strict replay to
+    // build artifacts nobody will receive is a cost the caller chose for us.
+    let Some((state, detail)) = state_from_history(&records) else {
+        return Err(task_not_found(run));
     };
     // `closes` and not a second `matches!` with the same four states: this
     // decides whether a subscription is *refused*, and `closes` decides whether
     // a stream *ends*. Two spellings of one rule disagree the day somebody adds
     // a terminal state to one of them, and the result is either a subscription
     // accepted that shuts immediately or one refused that would have streamed.
-    if req.method == method::SUBSCRIBE && super::a2a_stream::closes(task.status.state) {
+    if req.method == method::SUBSCRIBE && super::a2a_stream::closes(state) {
         return Err(RpcError::new(
             code::UNSUPPORTED_OPERATION,
             "SubscribeToTask requires a non-terminal task",
         ));
     }
+    let case = records
+        .iter()
+        .find_map(|r| r.body.case.map(|c| c.to_string()));
+    let from = records.last().map_or(1, |last| last.body.seq + 1);
+    let mut task = task_of(run, state, &detail, case.clone());
+    task.artifacts = server
+        .artifacts_unmetered(run, state)
+        .await
+        .map_err(|e| internal("projecting a task's artifacts", &e))?;
 
     Ok(super::a2a_stream::tail(
         Arc::clone(&server.runtime),
+        Arc::clone(&server.artifact_cache),
+        slot,
         run,
         case,
         req.id,
@@ -1878,7 +2122,9 @@ async fn dispatch(
     server.check_tenant(&params)?;
 
     match req.method.as_str() {
-        method::SEND_MESSAGE => send_message(server, headers, params).await,
+        // Boxed: a send admits and may run a whole run inline, and that future
+        // is larger than the others this match holds.
+        method::SEND_MESSAGE => Box::pin(send_message(server, headers, params)).await,
         method::GET_TASK => get_task(server, headers, params).await,
         method::CANCEL_TASK => cancel_task(server, headers, params).await,
         method::GET_EXTENDED_CARD => get_extended_card(server, headers).await,
@@ -2022,7 +2268,7 @@ fn continue_sealed_task(
 /// consume this message.
 async fn continue_task(
     server: &A2aServer,
-    headers: &HeaderMap,
+    caller: &Caller,
     message: &A2aMessage,
 ) -> Result<RunId, RpcError> {
     let raw = message
@@ -2031,20 +2277,11 @@ async fn continue_task(
         .ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`taskId` is required"))?;
     let run = RunId::parse(raw)
         .map_err(|_| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {raw}")))?;
-    let caller = server
-        .gate(headers, action::TASK_CONTINUE, &run.to_string())
-        .await?;
     let records = server
-        .runtime
-        .journal()
-        .read(run, 1)
-        .await
-        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
+        .authorized_task(caller, action::TASK_CONTINUE, run)
+        .await?;
     let Some(last) = records.last() else {
-        return Err(RpcError::new(
-            code::TASK_NOT_FOUND,
-            format!("no such task: {run}"),
-        ));
+        return Err(task_not_found(run));
     };
     if matches!(
         last.kind(),
@@ -2133,7 +2370,13 @@ async fn continue_task(
             code::UNSUPPORTED_OPERATION,
             "this task is no longer waiting for input",
         )),
-        Err(error) => Err(RpcError::new(code::INTERNAL_ERROR, error.to_string())),
+        // A run waiting on a human task waits for the worklist's answer, and a
+        // message addressed to it by task id is not one.
+        Err(crate::core::RuntimeError::ReservedEventKind { .. }) => Err(RpcError::new(
+            code::UNSUPPORTED_OPERATION,
+            "this task is waiting for a decision on this plane's worklist, not for input",
+        )),
+        Err(error) => Err(internal("delivering a continuation", &error)),
     }
 }
 
@@ -2162,7 +2405,8 @@ async fn send_message(
             .configuration
             .as_ref()
             .and_then(|configuration| configuration.history_length);
-        let run = continue_task(server, headers, &message).await?;
+        let caller = server.authenticate(headers).await?;
+        let run = continue_task(server, &caller, &message).await?;
         return get_task(
             server,
             headers,
@@ -2177,8 +2421,9 @@ async fn send_message(
     }
     let skill = resolve_skill(server, &message)?;
     let caller = server.gate(headers, action::MESSAGE_SEND, &skill).await?;
+    check_context(server, &message, &caller).await?;
     if let Some(push) = &inline_push {
-        validate_inline_push(server, headers, &skill, push).await?;
+        validate_inline_push(server, &caller, &skill, push)?;
     }
 
     // Untrusted, and provenanced to the peer that sent it. A protected sink
@@ -2218,7 +2463,7 @@ async fn send_message(
             Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
                 Err(RpcError::new(code::TASK_NOT_FOUND, why))
             }
-            Err(e) => Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
+            Err(e) => Err(internal("admitting a message", &e)),
         };
     }
 
@@ -2255,7 +2500,7 @@ async fn send_message(
         Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
             return Err(RpcError::new(code::TASK_NOT_FOUND, why));
         }
-        Err(e) => return Err(RpcError::new(code::INTERNAL_ERROR, e.to_string())),
+        Err(e) => return Err(internal("admitting a message", &e)),
     };
     let outcome = match admission {
         crate::runtime::Admission::Fresh(outcome)
@@ -2356,7 +2601,11 @@ async fn spawn_a2a(
 
 /// The terms every A2A admission runs under: keyed by the producer-scoped
 /// message id, inside the case the caller named or a fresh one, and **acting
-/// as the caller** where the credential carried a chain.
+/// as the caller** — under the chain its credential carried, or under none.
+///
+/// The key is also what makes the run this caller's: its source half is the
+/// authenticated sender, so every later read or write of the task can ask
+/// whose it is without a second record — see [`task_owner`].
 ///
 /// The key carries its producer, in
 /// [`origin_key`](crate::core::origin_key)'s spelling: a bare `messageId` would
@@ -2371,17 +2620,21 @@ async fn spawn_a2a(
 ///
 /// The chain is the caller's, never the plane's: a plane that admitted every
 /// peer's run under its own chain would answer "on whose behalf" with the same
-/// name for all of them, and act for a caller whose credential permits less.
+/// name for all of them, and act for a caller whose credential permits less. A
+/// caller that presented no chain acts under **none**: the plane's chain
+/// bounds what it may be admitted for, and lends it none of its authority —
+/// the fallback would make the operator's authority ambient.
 fn run_terms(
     message: &A2aMessage,
     caller: &Caller,
 ) -> Result<crate::runtime::RunTerms, crate::core::RuntimeError> {
-    let source = super::peer_source(&caller.actor);
-    let keyed = crate::core::origin_key(&source, &message.message_id);
-    let mut terms = crate::runtime::RunTerms::default().once(&keyed);
-    if let Some(chain) = caller.acting_as.as_ref() {
-        terms = terms.acting_as(chain.clone());
-    }
+    let keyed = crate::core::origin_key(&admission_source(&caller.actor), &message.message_id);
+    // The authenticated peer, never a body field: the four-eyes exclusion
+    // reads it, and a caller who could name it could name somebody else.
+    let terms = crate::runtime::RunTerms::default()
+        .once(&keyed)
+        .served(caller.acting_as.clone())
+        .admitted_by(&caller.actor);
     Ok(match message.context_id.as_deref() {
         Some(context) => {
             let case = crate::core::CaseId::parse(context).map_err(|_| {
@@ -2397,10 +2650,93 @@ fn run_terms(
         // satisfies a schema and continues nothing.
         None => terms.correlated(
             "a2a.context",
-            &[crate::core::CorrelationKey::new("a2a-message", &keyed)],
+            &[crate::core::CorrelationKey::new(
+                CONTEXT_KEY_NAMESPACE,
+                &keyed,
+            )],
         ),
     })
 }
+
+/// The `source` half of every A2A admission key: this surface, then the
+/// authenticated sender.
+///
+/// Its own namespace rather than the bare [`peer_source`](super::peer_source)
+/// an inbound event's key carries, because ownership is read back from it: an
+/// embedder that keys a run with an event's `dedup_key` — the key this crate
+/// recommends — must not thereby hand that run to the event's sender as an A2A
+/// task.
+fn admission_source(actor: &str) -> String {
+    format!("{ADMISSION_NAMESPACE}{}", super::peer_source(actor))
+}
+
+const ADMISSION_NAMESPACE: &str = "a2a/";
+
+/// The peer that admitted a task over this surface, read from the run's
+/// admission key. `None` for a run nobody admitted here.
+fn task_owner(records: &[crate::journal::Record]) -> Option<&str> {
+    records
+        .first()?
+        .admission_source()?
+        .strip_prefix(ADMISSION_NAMESPACE)?
+        .strip_prefix("peer:")
+}
+
+/// The one answer for a task this caller may not address, whether it exists
+/// or not.
+fn task_not_found(run: RunId) -> RpcError {
+    RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {run}"))
+}
+
+/// A fault on this plane's side, told to the peer in one fixed sentence —
+/// see [`withheld_fault`](crate::core::withheld_fault).
+fn internal(doing: &str, error: &dyn std::fmt::Display) -> RpcError {
+    RpcError::new(
+        code::INTERNAL_ERROR,
+        crate::core::withheld_fault("a2a", doing, error),
+    )
+}
+
+/// Refuse a `contextId` this caller did not open.
+///
+/// A context is a case, and joining one puts this caller's run beside another
+/// peer's work and its case state in reach. So the case must be one a message
+/// from this caller opened — its correlation key carries the admitting
+/// sender — and anything else answers as a context that does not exist.
+async fn check_context(
+    server: &A2aServer,
+    message: &A2aMessage,
+    caller: &Caller,
+) -> Result<(), RpcError> {
+    let Some(context) = message.context_id.as_deref() else {
+        return Ok(());
+    };
+    let not_found = || RpcError::new(code::TASK_NOT_FOUND, format!("no such context: {context}"));
+    let case = crate::core::CaseId::parse(context).map_err(|_| not_found())?;
+    let Some(cases) = server.runtime.cases() else {
+        return Err(not_found());
+    };
+    let Some(case) = cases
+        .case(case)
+        .await
+        .map_err(|e| internal("reading a context's case", &e))?
+    else {
+        return Err(not_found());
+    };
+    let ours = admission_source(&caller.actor);
+    let opened_by_caller = case.correlation.iter().any(|key| {
+        key.namespace == CONTEXT_KEY_NAMESPACE
+            && crate::core::origin_source(&key.value) == Some(ours.as_str())
+    });
+    if opened_by_caller {
+        Ok(())
+    } else {
+        Err(not_found())
+    }
+}
+
+/// The correlation namespace a fresh A2A context is opened under.
+const CONTEXT_KEY_NAMESPACE: &str = "a2a-message";
 
 async fn task_context(server: &A2aServer, run: RunId) -> Result<Option<String>, RpcError> {
     server
@@ -2503,42 +2839,32 @@ async fn get_task(
     params: CommonParams,
 ) -> Result<Value, RpcError> {
     let id = task_id(&params)?;
-    server
-        .gate(headers, action::TASK_READ, &id.to_string())
-        .await?;
-
-    load_task(server, id, params.history_length).await
+    let (_, records) = server.gate_task(headers, action::TASK_READ, id).await?;
+    load_task(server, id, &records, params.history_length).await
 }
 
 async fn load_task(
     server: &A2aServer,
     id: RunId,
+    records: &[crate::journal::Record],
     history_length: Option<usize>,
 ) -> Result<Value, RpcError> {
-    let records = server
-        .runtime
-        .journal()
-        .read(id, 1)
-        .await
-        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
     // No records is no such task: a run this plane never admitted and a task id
     // a caller invented are the same fact from here.
-    let (state, detail) = state_from_history(&records)
-        .ok_or_else(|| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {id}")))?;
+    let (state, detail) = state_from_history(records).ok_or_else(|| task_not_found(id))?;
     let case = records
         .iter()
         .find_map(|r| r.body.case.map(|c| c.to_string()));
 
     let mut task = task_of(id, state, &detail, case.clone());
-    task.history = task_history(id, &records, history_length, case.as_deref());
+    task.history = task_history(id, records, history_length, case.as_deref());
     // Unmetered: one task, one replay, and the sealed-run cache spares the
     // poll loop that reads the same finished task every few seconds.
     task.artifacts = server
         .artifacts_unmetered(id, state)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
-    serde_json::to_value(task)
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))
+        .map_err(|error| internal("projecting a task's artifacts", &error))?;
+    serde_json::to_value(task).map_err(|error| internal("encoding a task", &error))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2558,8 +2884,8 @@ struct TaskCursor {
 /// read the complete journal of every run it returned.
 const TASK_SCAN: usize = 256;
 
-/// Default for [`A2aServer::filter_scan_budget`]: the most candidate journals
-/// one content-filtered `ListTasks` may read before being refused as too broad.
+/// Default for [`A2aServer::filter_scan_budget`]: the most candidates one
+/// `ListTasks` may examine before being refused as too broad.
 ///
 /// The number is a cost ceiling, not a result limit — results are bounded by
 /// `pageSize` already. At the default, the worst request a peer can make costs
@@ -2635,16 +2961,17 @@ async fn list_tasks(
     }
 
     // Whether the caller asked anything that can only be answered by reading a
-    // run's journal. `statusTimestampAfter` is not one of those — it compares
-    // against the activity index's own timestamp — and neither is the
-    // permission check, which sees only the run id.
+    // run's whole journal. `statusTimestampAfter` is not one of those — it
+    // compares against the activity index's own timestamp.
     //
-    // That split is the whole performance story. The expensive operation is
-    // `read`, which pulls a run's complete journal; everything else here is
-    // index data the store hands back beside the id. So an unfiltered listing
-    // reads exactly the journals that appear on the page, and a content-filtered
-    // one reads the candidates it must examine to answer honestly.
+    // The candidates are the caller's own runs and nobody else's: the index
+    // is narrowed to the admission source this surface keys the caller's runs
+    // with, so another peer's runs and the embedder's cost this listing
+    // nothing. An unfiltered listing reads the whole journal only of the
+    // tasks on the page; a content-filtered one reads the whole journal of
+    // every task it must examine.
     let content_filtered = params.context_id.is_some() || params.status.is_some();
+    let source = admission_source(&caller.actor);
 
     let mut cursor_pos = cursor
         .as_ref()
@@ -2652,69 +2979,67 @@ async fn list_tasks(
     let mut page: Vec<(RunId, u64, A2aTask)> = Vec::new();
     let mut matched: u64 = 0;
     let mut has_more = false;
-    let mut reads: usize = 0;
+    let mut examined: usize = 0;
 
-    loop {
+    'scan: loop {
         let batch = server
             .runtime
             .journal()
-            .recent_runs(cursor_pos, TASK_SCAN)
+            .recent_runs_from(&source, cursor_pos, TASK_SCAN)
             .await
-            .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the task index could not be read"))?;
+            .map_err(|e| internal("reading the task index", &e))?;
         if batch.is_empty() {
             break;
         }
         cursor_pos = batch.last().map(|(run, updated)| (*updated, *run));
 
         for (run, updated) in batch {
-            // Both of these read the index only, and the first is load-bearing
-            // for more than cost: a run the caller may not read must not reach
-            // the total either, or `totalSize` discloses the existence of tasks
-            // the policy just refused to show them.
-            if !server.permits(&caller, action::TASK_READ, &run.to_string()) {
-                continue;
-            }
             if after.is_some_and(|cutoff| {
                 i64::try_from(updated)
                     .ok()
                     .and_then(|seconds| time::OffsetDateTime::from_unix_timestamp(seconds).ok())
                     .is_none_or(|value| value < cutoff)
             }) {
+                // The index is newest first, so every row after this one is
+                // older still: the cutoff ends the scan, not just this row.
+                break 'scan;
+            }
+
+            // Whose task it is was settled by the index: every run in this
+            // range was admitted under the caller's source.
+            let owner = Some(caller.actor.as_str());
+            // The ceiling on what one listing may cost, refused rather than
+            // truncated — see `A2aServer::filter_scan_budget`.
+            examined += 1;
+            if examined > server.filter_scan_budget {
+                return Err(RpcError::new(
+                    code::INVALID_PARAMS,
+                    format!(
+                        "this listing would require examining more than {} tasks to answer \
+                         exactly — narrow it with statusTimestampAfter and page from there",
+                        server.filter_scan_budget
+                    ),
+                ));
+            }
+            // Load-bearing for more than cost: a run the caller may not read
+            // must not reach the total either, or `totalSize` discloses the
+            // existence of tasks it cannot see.
+            if !server.permits(&caller, action::TASK_READ, &run.to_string(), owner) {
                 continue;
             }
 
-            // Read only when the answer needs it: to evaluate a content filter,
-            // or to build a task that will actually be returned.
             let wanted = page.len() < page_size;
             if !content_filtered && !wanted {
                 matched += 1;
                 has_more = true;
                 continue;
             }
-
-            // The ceiling on what one filtered listing may cost. A `status` or
-            // `contextId` filter is answerable only by reading the candidate's
-            // journal, and the spec's `totalSize` is the exact pre-pagination
-            // total — so without a bound, one authenticated request costs every
-            // run the tenant ever wrote, which is the scan the paged index
-            // exists to prevent. Refused rather than truncated: a total that
-            // quietly stopped counting is a smaller tenant, not a bounded scan,
-            // and the refusal names the lever that narrows without reading —
-            // `statusTimestampAfter` is answered from the index.
-            reads += 1;
-            if content_filtered && reads > server.filter_scan_budget {
-                return Err(RpcError::new(
-                    code::INVALID_PARAMS,
-                    format!(
-                        "this filter would require examining more than {} tasks to answer \
-                         exactly — narrow it with statusTimestampAfter and page from there",
-                        server.filter_scan_budget
-                    ),
-                ));
-            }
-            let records = server.runtime.journal().read(run, 1).await.map_err(|_| {
-                RpcError::new(code::INTERNAL_ERROR, "a task journal could not be read")
-            })?;
+            let records = server
+                .runtime
+                .journal()
+                .read(run, 1)
+                .await
+                .map_err(|e| internal("reading a task's journal", &e))?;
             let task = task_from_records(run, &records, updated, params.history_length);
             if params
                 .context_id
@@ -2770,7 +3095,7 @@ async fn list_tasks(
             match server
                 .artifacts_bounded(*run, task.status.state, Some(&mut replays_left))
                 .await
-                .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?
+                .map_err(|error| internal("projecting a task's artifacts", &error))?
             {
                 ArtifactRead::Artifacts(artifacts) => task.artifacts = artifacts,
                 ArtifactRead::OverBudget => {
@@ -2909,8 +3234,8 @@ fn task_history(
 /// The uncached artifact projection: one strict replay of a completed run.
 ///
 /// Server request paths go through [`A2aServer::artifacts_bounded`], which
-/// caches sealed runs and meters `ListTasks`; this stays the raw read for the
-/// stream module, whose per-record use is bounded by the stream itself.
+/// caches sealed runs and meters `ListTasks`, and a stream through
+/// [`cached_artifacts`]; this stays the raw read for the push projection.
 pub(super) async fn task_artifacts(
     runtime: &Runtime,
     run: RunId,
@@ -2923,6 +3248,28 @@ pub(super) async fn task_artifacts(
         .replay(run, crate::runtime::Mode::Strict)
         .await
         .map(|outcome| task_of_outcome(&outcome).artifacts)
+}
+
+/// A task's artifacts through the sealed-run cache, unmetered.
+///
+/// What a stream reads when the run it watches concludes: every subscriber to
+/// one task would otherwise buy its own strict replay of the same immutable
+/// history.
+pub(super) async fn cached_artifacts(
+    runtime: &Runtime,
+    cache: &std::sync::Mutex<ArtifactCache>,
+    run: RunId,
+    state: TaskState,
+) -> Result<Option<Vec<A2aArtifact>>, crate::core::RuntimeError> {
+    if state != TaskState::Completed {
+        return Ok(None);
+    }
+    if let Some(ArtifactRead::Artifacts(artifacts)) = crate::core::poison::recover(cache).get(run) {
+        return Ok(artifacts);
+    }
+    let artifacts = task_artifacts(runtime, run, state).await?;
+    crate::core::poison::recover(cache).insert(run, artifacts.clone());
+    Ok(artifacts)
 }
 
 /// A sealed run's outcome word, as an A2A state.
@@ -2985,21 +3332,9 @@ async fn cancel_task(
     params: CommonParams,
 ) -> Result<Value, RpcError> {
     let id = task_id(&params)?;
-    let caller = server
-        .gate(headers, action::TASK_CANCEL, &id.to_string())
-        .await?;
-
-    let records = server
-        .runtime
-        .journal()
-        .read(id, 1)
-        .await
-        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
+    let (caller, records) = server.gate_task(headers, action::TASK_CANCEL, id).await?;
     let Some(last) = records.last() else {
-        return Err(RpcError::new(
-            code::TASK_NOT_FOUND,
-            format!("no such task: {id}"),
-        ));
+        return Err(task_not_found(id));
     };
     // A sealed run is finished, and A2A has a code for exactly this. Accepting
     // the request and reporting success would tell the caller a completed run
@@ -3016,11 +3351,19 @@ async fn cancel_task(
         .request_cancel(
             id,
             &crate::core::Operator::authenticated(caller.actor.clone())
-                .map_err(|e| RpcError::new(code::INVALID_PARAMS, e.to_string()))?,
+                .map_err(|e| internal("naming the authenticated caller", &e))?,
             "cancelled over A2A",
         )
         .await
-        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))?;
+        .map_err(|e| match e {
+            // Concluded between the read above and the request: the same
+            // answer the read would have given.
+            crate::core::RuntimeError::AlreadyConcluded { outcome, .. } => RpcError::new(
+                code::TASK_NOT_CANCELABLE,
+                format!("this task already finished as '{outcome}'"),
+            ),
+            other => internal("requesting a cancellation", &other),
+        })?;
 
     // The same resolution every other path uses, from the records already in
     // hand: A2A 1.0 puts `contextId` on every task, and the one place that
@@ -3039,15 +3382,14 @@ async fn cancel_task(
         "cancellation requested",
         case,
     ))
-    .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))
+    .map_err(|error| internal("encoding a task", &error))
 }
 
 async fn get_extended_card(server: &A2aServer, headers: &HeaderMap) -> Result<Value, RpcError> {
     server
         .gate(headers, action::CARD_EXTENDED, &server.card.name)
         .await?;
-    serde_json::to_value(&server.extended)
-        .map_err(|e| RpcError::new(code::INTERNAL_ERROR, e.to_string()))
+    serde_json::to_value(&server.extended).map_err(|e| internal("encoding the extended card", &e))
 }
 
 fn task_id(params: &CommonParams) -> Result<RunId, RpcError> {
@@ -3133,23 +3475,27 @@ fn push_not_supported_error() -> RpcError {
     )
 }
 
-async fn push_task(server: &A2aServer, raw: Option<&str>) -> Result<RunId, RpcError> {
+/// The task a push method addresses, refused unless this caller admitted it.
+///
+/// Authenticated before the wiring is disclosed, and owned before anything is
+/// read or written: a webhook registration is a standing instruction to send
+/// a task's history somewhere, so one peer registering on — or reading,
+/// listing, deleting the registrations of — another's task would be a read
+/// of that task with a delivery address attached.
+async fn push_task<'a>(
+    server: &'a A2aServer,
+    headers: &HeaderMap,
+    raw: Option<&str>,
+) -> Result<(RunId, &'a PushRuntime), RpcError> {
+    let caller = server.authenticate(headers).await?;
+    let push = push_runtime(server)?;
     let raw = raw.ok_or_else(|| RpcError::new(code::INVALID_PARAMS, "`taskId` is required"))?;
     let task = RunId::parse(raw)
         .map_err(|_| RpcError::new(code::TASK_NOT_FOUND, format!("no such task: {raw}")))?;
-    let records = server
-        .runtime
-        .journal()
-        .read(task, 1)
-        .await
-        .map_err(|_| RpcError::new(code::INTERNAL_ERROR, "the journal could not be read"))?;
-    if records.is_empty() {
-        return Err(RpcError::new(
-            code::TASK_NOT_FOUND,
-            format!("no such task: {task}"),
-        ));
-    }
-    Ok(task)
+    server
+        .authorized_task(&caller, action::TASK_PUSH, task)
+        .await?;
+    Ok((task, push))
 }
 
 fn push_request(params: &CommonParams) -> Result<PushRequest, RpcError> {
@@ -3180,9 +3526,9 @@ fn validate_push_request(server: &A2aServer, request: &PushRequest) -> Result<()
         .map_err(|error| RpcError::new(code::INVALID_PARAMS, error.to_string()))
 }
 
-async fn validate_inline_push(
+fn validate_inline_push(
     server: &A2aServer,
-    headers: &HeaderMap,
+    caller: &Caller,
     skill: &str,
     request: &PushRequest,
 ) -> Result<(), RpcError> {
@@ -3196,9 +3542,7 @@ async fn validate_inline_push(
             "taskPushNotificationConfig.taskId must be empty in SendMessage",
         ));
     }
-    server
-        .gate(headers, action::TASK_PUSH, &format!("new:{skill}"))
-        .await?;
+    server.authorize(caller, action::TASK_PUSH, &format!("new:{skill}"), None)?;
     validate_push_request(server, request)
 }
 
@@ -3232,7 +3576,7 @@ async fn register_push(
     push.store
         .put(&config, next_seq)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+        .map_err(|error| internal("storing a push configuration", &error))?;
     Ok(config)
 }
 
@@ -3241,23 +3585,20 @@ async fn push_create(
     headers: &HeaderMap,
     params: &CommonParams,
 ) -> Result<Value, RpcError> {
-    let resource = params.push_task.as_deref().unwrap_or("push");
-    server.gate(headers, action::TASK_PUSH, resource).await?;
-    push_runtime(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
+    let (task, _) = push_task(server, headers, params.push_task.as_deref()).await?;
     let request = push_request(params)?;
     let head = server
         .runtime
         .journal()
         .head(task)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+        .map_err(|error| internal("reading a task's head", &error))?;
     let tail = server
         .runtime
         .journal()
         .read(task, head.seq)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+        .map_err(|error| internal("reading a task's journal", &error))?;
     let next_seq = if tail
         .last()
         .is_some_and(|record| matches!(record.kind(), RecordKind::RunConcluded { .. }))
@@ -3276,10 +3617,7 @@ async fn push_get(
     headers: &HeaderMap,
     params: &CommonParams,
 ) -> Result<Value, RpcError> {
-    let resource = params.push_task.as_deref().unwrap_or("push");
-    server.gate(headers, action::TASK_PUSH, resource).await?;
-    let push = push_runtime(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
+    let (task, push) = push_task(server, headers, params.push_task.as_deref()).await?;
     let id = params
         .id
         .as_deref()
@@ -3287,7 +3625,7 @@ async fn push_get(
     push.store
         .get(task, id)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?
+        .map_err(|error| internal("reading a push configuration", &error))?
         .map(|config| config.redacted())
         .ok_or_else(|| {
             RpcError::new(
@@ -3302,15 +3640,12 @@ async fn push_list(
     headers: &HeaderMap,
     params: &CommonParams,
 ) -> Result<Value, RpcError> {
-    let resource = params.push_task.as_deref().unwrap_or("push");
-    server.gate(headers, action::TASK_PUSH, resource).await?;
-    let push = push_runtime(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
+    let (task, push) = push_task(server, headers, params.push_task.as_deref()).await?;
     let configs = push
         .store
         .list(task)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+        .map_err(|error| internal("listing push configurations", &error))?;
     Ok(json!({
         "configs": configs.iter().map(crate::push::PushConfig::redacted).collect::<Vec<_>>(),
         "nextPageToken": "",
@@ -3322,10 +3657,7 @@ async fn push_delete(
     headers: &HeaderMap,
     params: &CommonParams,
 ) -> Result<Value, RpcError> {
-    let resource = params.push_task.as_deref().unwrap_or("push");
-    server.gate(headers, action::TASK_PUSH, resource).await?;
-    let push = push_runtime(server)?;
-    let task = push_task(server, params.push_task.as_deref()).await?;
+    let (task, push) = push_task(server, headers, params.push_task.as_deref()).await?;
     let id = params
         .id
         .as_deref()
@@ -3333,7 +3665,7 @@ async fn push_delete(
     push.store
         .delete(task, id)
         .await
-        .map_err(|error| RpcError::new(code::INTERNAL_ERROR, error.to_string()))?;
+        .map_err(|error| internal("deleting a push configuration", &error))?;
     Ok(json!({}))
 }
 

@@ -434,6 +434,9 @@ impl Phase {
     }
 }
 
+/// The domain an effect key's hash is separated under.
+const EFFECT_KEY_DOMAIN: &[u8] = b"agentplane.effect.key.v1\0";
+
 impl EffectKey {
     /// `phase` separates the forward pass from the compensating one.
     ///
@@ -458,6 +461,9 @@ impl EffectKey {
         canonical_args: &[u8],
     ) -> Self {
         let mut h = Sha256::new();
+        // Domain-separated at the hash: the same bytes hashed for another
+        // purpose can never be mistaken for an effect's identity.
+        h.update(EFFECT_KEY_DOMAIN);
         h.update(step.0.to_be_bytes());
         h.update([phase as u8]);
         h.update(ordinal.to_be_bytes());
@@ -576,6 +582,22 @@ mod tests {
         let a = EffectKey::derive(StepId(0), Phase::Forward, 0, 1, "ab", b"c");
         let b = EffectKey::derive(StepId(0), Phase::Forward, 0, 1, "a", b"bc");
         assert_ne!(a, b);
+    }
+
+    /// The derivation's literal bytes, pinned.
+    ///
+    /// The tests above prove the inputs are separated from each other; none of
+    /// them notices the derivation changing as a whole — a dropped domain tag,
+    /// a reordered field — because both sides of every comparison move
+    /// together. A history written under one derivation replays against
+    /// another as divergence, so the bytes are the contract.
+    #[test]
+    fn effect_key_derivation_is_pinned_to_its_bytes() {
+        let key = EffectKey::derive(StepId(3), Phase::Forward, 2, 1, "tool.call", b"{\"a\":1}");
+        assert_eq!(
+            key.to_hex(),
+            "fe9b19d07dedb4894e2824916e1ca31860fad50c1065c398222892ef75fee502"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //! runs it carries, so disclosing an observed session does not disclose the
 //! plane's own work.
 //!
-//! The cost is stated rather than hidden: the journal now holds runs this plane
+//! The cost is stated rather than hidden: the journal holds runs this plane
 //! did not execute, so a query meaning *work this plane did* must key on the
 //! run's status rather than assume it.
 

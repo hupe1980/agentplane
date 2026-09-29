@@ -1,9 +1,10 @@
 # The summariser, hosted as an A2A 1.0 peer:
 #
+#   # tokens.yaml: examples/serve-tokens.yaml with its placeholders replaced
 #   agentplane serve examples/served.yaml \
 #     --url http://localhost:8080 \
 #     --policy examples/serve-policy.cedar \
-#     --tokens examples/serve-tokens.yaml \
+#     --tokens tokens.yaml \
 #     --store /tmp/served.redb
 #
 # One line differs from `summariser.yaml`, and it is the interesting one.

@@ -119,7 +119,10 @@ CREATE TABLE IF NOT EXISTS journal (
     -- case's runs otherwise — a join that also **misses** every record written
     -- by a run the case does not own, which is exactly what a sweep is.
     case_id    TEXT,
-    PRIMARY KEY (tenant, run_id, seq)
+    PRIMARY KEY (tenant, run_id, seq),
+    -- Both halves of a signature or neither: half of one is a damaged row,
+    -- and reading it as unsigned would strip the record's authorship.
+    CONSTRAINT journal_signature_whole CHECK ((key_id IS NULL) = (signature IS NULL))
 );
 
 -- One matter's history, in order, without touching another tenant's.
@@ -135,6 +138,14 @@ CREATE TABLE IF NOT EXISTS run_activity (
 );
 CREATE INDEX IF NOT EXISTS run_activity_recent
     ON run_activity (tenant, updated_at DESC, run_id DESC);
+-- The producer that admitted the run, from its `RunAdmitted` admission key:
+-- set by the append that writes that record and never changed after. The
+-- index is the same order narrowed to one producer, so a served listing reads
+-- only its caller's runs.
+ALTER TABLE run_activity ADD COLUMN IF NOT EXISTS admission_source TEXT;
+CREATE INDEX IF NOT EXISTS run_activity_by_source
+    ON run_activity (tenant, admission_source, updated_at DESC, run_id DESC)
+    WHERE admission_source IS NOT NULL;
 
 -- Exactly-once, as a constraint rather than a code path. A second
 -- `EffectStarted` for one effect key in one run cannot be written, whichever
@@ -161,24 +172,16 @@ CREATE INDEX IF NOT EXISTS run_lease_abandoned
     ON run_lease (tenant, expires_at)
     WHERE owner <> '';
 
--- An operator's stop request. Beside the chain rather than in it, and
--- deliberately not fenced: whoever wants a run stopped is not its owner, holds
--- no epoch, and is usually asking because the owner is busy. The primary key
--- makes the request idempotent, so a retry cannot overwrite the original asker.
--- The plane's Merkle log: one row per sealed run, positioned by a sequence.
+-- The plane's Merkle log: one row per sealed run, one log per tenant, so a
+-- checkpoint commits to that tenant's runs and no others.
 --
--- A sequence rather than `MAX + 1`, and that is what makes a log possible on
--- this backend at all. Several instances seal concurrently here — that is the
--- topology this backend exists for — and `MAX + 1` computed by two transactions
--- at once hands both the same position. A sequence is monotonic under
--- concurrency and never reissues a number after a delete: exactly the two
--- properties the log needs.
-CREATE SEQUENCE IF NOT EXISTS run_log_position;
-
--- One log per tenant, so a checkpoint commits to that tenant's runs and no
--- others. `log_index` is unique *within* a tenant: a shared sequence hands out
--- distinct numbers globally, and each tenant simply sees gaps, which the dense
--- rank in `inclusion_proof` removes before anything is proved.
+-- A position must follow *commit* order, not allocation order. Several
+-- instances seal concurrently here, and a position taken by a transaction that
+-- commits after a later position was already checkpointed lands a leaf inside
+-- that checkpoint: the log stops being append-only and a witness sees a fork.
+-- So `seal` takes a per-tenant transaction lock and allocates `MAX + 1` under
+-- it — the lock makes the allocation and the commit one act, and the
+-- positions dense. A sequence is monotonic in allocation, which is not enough.
 CREATE TABLE IF NOT EXISTS run_seal (
     tenant     TEXT   NOT NULL,
     run_id     TEXT   NOT NULL,
@@ -193,8 +196,9 @@ CREATE TABLE IF NOT EXISTS run_seal (
     UNIQUE (tenant, log_index)
 );
 
--- Conclusion ordering under concurrency, for the same reason as
--- run_log_position: several instances conclude runs at once here.
+-- Conclusion ordering under concurrency: several instances conclude runs at
+-- once here, and `MAX + 1` computed by two transactions hands both one number.
+-- Only newest-first paging reads it, so allocation order is enough.
 CREATE SEQUENCE IF NOT EXISTS run_conclusion_ordinal;
 
 -- Concluded runs by how they ended. **Derived**, not authoritative: fed by the
@@ -263,6 +267,10 @@ CREATE TABLE IF NOT EXISTS run_admission (
     PRIMARY KEY (tenant, key)
 );
 
+-- An operator's stop request. Beside the chain rather than in it, and
+-- deliberately not fenced: whoever wants a run stopped is not its owner, holds
+-- no epoch, and is usually asking because the owner is busy. The primary key
+-- makes the request idempotent, so a retry cannot overwrite the original asker.
 CREATE TABLE IF NOT EXISTS run_cancel (
     tenant       TEXT   NOT NULL,
     run_id       TEXT   NOT NULL,
@@ -372,8 +380,8 @@ impl PostgresStore {
         }
     }
 
-    /// This tenant's log leaves, in seal order — already leaf-hashed, which
-    /// the type now says rather than the comment.
+    /// This tenant's log leaves, in seal order — already leaf-hashed, as the
+    /// type says.
     async fn log_leaves(&self) -> Result<Vec<crate::core::merkle::LeafHash>, StoreError> {
         let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
         let rows = client
@@ -388,6 +396,30 @@ impl PostgresStore {
                 digest_from(&r.get::<_, Vec<u8>>(0)).map(|d| crate::core::merkle::leaf_hash(&d))
             })
             .collect::<Result<Vec<_>, _>>()
+    }
+}
+
+/// A journal row's signature columns, as one optional pair.
+///
+/// Half a signature is a damaged row rather than an unsigned record: read as
+/// unsigned, it strips the record's authorship without a word. The schema
+/// refuses to write one; this refuses to read one that got there anyway.
+fn signature_of(
+    seq: Seq,
+    key_id: Option<String>,
+    signature: Option<Vec<u8>>,
+) -> Result<Option<crate::core::KeySignature>, StoreError> {
+    match (key_id, signature) {
+        (Some(key_id), Some(signature)) => {
+            Ok(Some(crate::core::KeySignature { key_id, signature }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(StoreError::Corrupt {
+            seq,
+            detail: "journal row carries half a signature — a key id without its \
+                     signature, or the reverse"
+                .to_owned(),
+        }),
     }
 }
 
@@ -462,9 +494,8 @@ pub(super) fn pool_err(e: &impl std::fmt::Display) -> StoreError {
 ///
 /// Clamping rather than wrapping: a row edited around the `CHECK` should read as
 /// *nothing left* rather than as billions, since only one of those two keeps a
-/// ceiling closed. Here once rather than at each of the six call sites it had,
-/// which were three spellings of the same conversion and would have stayed in
-/// step only by luck.
+/// ceiling closed. Here once rather than at each call site, where separate
+/// spellings of the same conversion would stay in step only by luck.
 pub(super) const fn amount_of(v: i64) -> u64 {
     if v < 0 { 0 } else { v.cast_unsigned() }
 }
@@ -868,8 +899,8 @@ impl PostgresStore {
                         &record.prev_hash.as_bytes().to_vec(),
                         &record.hash.as_bytes().to_vec(),
                         &record.raw().to_vec(),
-                        &record.attestation.as_ref().map(|a| a.key_id.clone()),
-                        &record.attestation.as_ref().map(|a| a.signature.clone()),
+                        &record.signature.as_ref().map(|a| a.key_id.clone()),
+                        &record.signature.as_ref().map(|a| a.signature.clone()),
                         &record.body.case.map(|c| c.to_string()),
                     ],
                 )
@@ -881,7 +912,8 @@ impl PostgresStore {
             sealed.push(record);
         }
 
-        self.touch_activity(tx, run).await?;
+        let source = claimed.as_deref().and_then(crate::core::origin_source);
+        self.touch_activity(tx, run, source).await?;
         self.derive_indexes(tx, run, claimed, conclusion, waiting)
             .await?;
 
@@ -894,18 +926,27 @@ impl PostgresStore {
     /// records that moved it — a timestamp committed separately from the append
     /// it describes would order two runs by when their index writes landed
     /// rather than by when they were written.
+    ///
+    /// `source` is the admitting producer when this append writes the
+    /// `RunAdmitted`; once set it is kept, so the per-producer index moves
+    /// with the run's activity.
     async fn touch_activity(
         &self,
         tx: &deadpool_postgres::tokio_postgres::Transaction<'_>,
         run: RunId,
+        source: Option<&str>,
     ) -> Result<(), StoreError> {
         tx.execute(
-            "INSERT INTO run_activity (tenant, run_id, updated_at) VALUES ($1, $2, $3)
-             ON CONFLICT (tenant, run_id) DO UPDATE SET updated_at = EXCLUDED.updated_at",
+            "INSERT INTO run_activity (tenant, run_id, updated_at, admission_source)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (tenant, run_id) DO UPDATE SET updated_at = EXCLUDED.updated_at,
+                 admission_source = COALESCE(run_activity.admission_source,
+                                             EXCLUDED.admission_source)",
             &[
                 &self.tenant_name(),
                 &run.to_string(),
                 &now_secs().cast_signed(),
+                &source,
             ],
         )
         .await
@@ -1115,20 +1156,15 @@ impl JournalStore for PostgresStore {
             let raw: Vec<u8> = row.get(3);
             let key_id: Option<String> = row.get(4);
             let signature: Option<Vec<u8>> = row.get(5);
-            // `from_stored_attested` recomputes the hash from the bytes and
+            // `from_stored_signed` recomputes the hash from the bytes and
             // refuses a mismatch, so tampering is caught at read time, per
             // record, before chain verification even runs.
-            let _ = seq;
-            // Zipped, not defaulted: half a signature is a half-written row
-            // rather than an unsigned record.
-            let attestation = key_id
-                .zip(signature)
-                .map(|(key_id, signature)| crate::core::Attestation { key_id, signature });
-            out.push(Record::from_stored_attested(
+            let signature = signature_of(seq.cast_unsigned(), key_id, signature)?;
+            out.push(Record::from_stored_signed(
                 raw,
                 digest_from(&prev)?,
                 digest_from(&hash)?,
-                attestation,
+                signature,
             )?);
         }
         Ok(out)
@@ -1274,6 +1310,57 @@ impl JournalStore for PostgresStore {
             .collect()
     }
 
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        // The same cursor as `recent_runs`, seeking the per-producer index.
+        let rows = match after {
+            Some((updated, run)) => {
+                client
+                    .query(
+                        "SELECT run_id, updated_at FROM run_activity
+                         WHERE tenant = $1 AND admission_source = $2
+                           AND (updated_at, run_id) < ($3, $4)
+                         ORDER BY updated_at DESC, run_id DESC LIMIT $5",
+                        &[
+                            &self.tenant_name(),
+                            &source,
+                            &i64::try_from(updated).unwrap_or(i64::MAX),
+                            &run.to_string(),
+                            &cap,
+                        ],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        "SELECT run_id, updated_at FROM run_activity
+                         WHERE tenant = $1 AND admission_source = $2
+                         ORDER BY updated_at DESC, run_id DESC LIMIT $3",
+                        &[&self.tenant_name(), &source, &cap],
+                    )
+                    .await
+            }
+        }
+        .map_err(|error| be(&error))?;
+        rows.into_iter()
+            .map(|row| {
+                let id: String = row.get(0);
+                let updated: i64 = row.get(1);
+                Ok((
+                    RunId::parse(&id).map_err(|error| StoreError::Backend(error.to_string()))?,
+                    updated.cast_unsigned(),
+                ))
+            })
+            .collect()
+    }
+
     async fn case_history(
         &self,
         case: crate::core::CaseId,
@@ -1302,14 +1389,12 @@ impl JournalStore for PostgresStore {
             let hash: Vec<u8> = row.get(2);
             let key_id: Option<String> = row.get(3);
             let signature: Option<Vec<u8>> = row.get(4);
-            let attestation = key_id
-                .zip(signature)
-                .map(|(key_id, signature)| crate::core::Attestation { key_id, signature });
-            out.push(Record::from_stored_attested(
+            let signature = signature_of(0, key_id, signature)?;
+            out.push(Record::from_stored_signed(
                 raw,
                 digest_from(&prev)?,
                 digest_from(&hash)?,
-                attestation,
+                signature,
             )?);
         }
         Ok(out)
@@ -1617,12 +1702,24 @@ impl JournalStore for PostgresStore {
             None => Digest::ZERO,
         };
 
-        // Enter the log. `DO NOTHING` keeps a repeated seal idempotent — a run
-        // that seals twice must not take two positions, or the log's size stops
-        // matching the number of runs it commits to.
+        // Enter the log at its end. The tenant's seal lock is held to commit,
+        // so no other seal can take a position and commit after this one
+        // while this one is still open: positions follow commit order, and
+        // every checkpoint is a prefix of every later one. `MAX + 1` is read
+        // under the lock, after any earlier holder committed.
+        tx.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&format!("run-seal:{}", self.tenant_name())],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        // `DO NOTHING` keeps a repeated seal idempotent — a run that seals
+        // twice must not take two positions, or the log's size stops matching
+        // the number of runs it commits to.
         tx.execute(
             "INSERT INTO run_seal (tenant, run_id, chain_head, log_index, sealed_at, outcome)
-             VALUES ($1, $2, $3, nextval('run_log_position'), $4, $5)
+             SELECT $1, $2, $3, COALESCE(MAX(log_index), 0) + 1, $4, $5
+               FROM run_seal WHERE tenant = $1
              ON CONFLICT (tenant, run_id) DO NOTHING",
             &[
                 &self.tenant_name(),
@@ -1689,8 +1786,8 @@ impl JournalStore for PostgresStore {
         else {
             return Ok(None);
         };
-        // Position in the *tree* is the dense rank, not the sequence value: a
-        // sequence skips numbers after a rollback and a tree cannot have holes.
+        // Position in the *tree* is the dense rank, which a tree without
+        // holes needs whatever the stored positions are.
         let index: i64 = row.get(0);
         let seal = digest_from(&row.get::<_, Vec<u8>>(1))?;
         let index = usize::try_from(index).unwrap_or(0);

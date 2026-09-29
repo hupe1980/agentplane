@@ -450,9 +450,17 @@ async fn stopping_a_finished_run_does_not_reopen_it() {
         .unwrap();
     assert!(matches!(out.status, RunStatus::Succeeded));
 
-    rt.request_cancel(out.run_id, &operator("ops"), "too late")
+    let refused = rt
+        .request_cancel(out.run_id, &operator("ops"), "too late")
         .await
-        .unwrap();
+        .expect_err("a stop was recorded against a run that has finished");
+    assert!(
+        matches!(
+            refused,
+            agentplane::core::RuntimeError::AlreadyConcluded { .. }
+        ),
+        "{refused}"
+    );
     let after = rt.replay(out.run_id, Mode::Resume).await.unwrap();
     assert!(
         matches!(after.status, RunStatus::Succeeded),

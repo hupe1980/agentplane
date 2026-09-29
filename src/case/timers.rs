@@ -41,20 +41,28 @@ pub trait TimerStore: Send + Sync + Debug {
     /// Claiming is what makes a wake-up single-delivery. Two sweepers running
     /// against one store must not both resume the same run — that is the same
     /// requirement `claim_for` has for events, for the same reason.
+    ///
+    /// `limit` bounds what is *returned*, not what is looked at: a timer
+    /// another sweeper holds under an unexpired claim is passed over without
+    /// counting against it, or a page of held timers at the head of the due
+    /// order would hide every due one behind them. A timer whose run is
+    /// sealed is retired rather than returned — nothing can resume it.
     async fn claim_due(&self, now: Timestamp, limit: usize) -> Result<Vec<Timer>, StoreError>;
 
     /// Retire a fired timer.
     async fn disarm(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError>;
 
-    /// How many runs are sleeping.
+    /// Retire every timer a run still has armed, returning how many.
     ///
-    /// Separate from `pending` because that is `limit`-bounded, and a gauge read
-    /// from a truncated list silently flattens exactly when the number matters.
-    async fn pending_count(&self) -> Result<u64, StoreError>;
+    /// Called when the run concludes closed. A sealed run cannot record a
+    /// wake, so a timer left armed is claimed, fails, and is claimed again
+    /// every lease period for as long as the store exists.
+    async fn disarm_run(&self, run: RunId) -> Result<usize, StoreError>;
 
-    /// Timers not yet due, soonest first.
+    /// How many runs are sleeping, for the gauge.
     ///
-    /// For operators: "what is this plane waiting for, and until when" should be
-    /// one query, not an inference from suspended runs.
-    async fn pending(&self, limit: usize) -> Result<Vec<Timer>, StoreError>;
+    /// A count rather than a list: "which runs are waiting, and until when" is
+    /// `JournalStore::waiting_runs`, derived from the journal so it still
+    /// answers after a restore, when these rows are exactly what is missing.
+    async fn pending_count(&self) -> Result<u64, StoreError>;
 }

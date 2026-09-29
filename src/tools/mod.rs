@@ -251,6 +251,14 @@ pub struct ToolSafety {
     pub output_sensitivity: Sensitivity,
     /// How many attempts, and how spaced.
     pub retry: RetryPolicy,
+    /// Whether a call the tool ran and reported failed may be tried again
+    /// under [`retry`](Self::retry).
+    ///
+    /// `false` by default: a tool that ran and answered with an error has
+    /// given its answer, and asking again repeats the work for the same one.
+    /// A read-only tool whose failures are transient says so here.
+    #[serde(default)]
+    pub retry_landed: bool,
     /// High-risk JSON arguments whose source constraints are stricter than
     /// ordinary content fields.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -265,6 +273,7 @@ impl Default for ToolSafety {
             max_sensitivity: Sensitivity::Public,
             output_sensitivity: Sensitivity::Public,
             retry: RetryPolicy::never(),
+            retry_landed: false,
             protected_fields: Vec::new(),
         }
     }
@@ -333,6 +342,14 @@ impl ToolSafety {
     #[must_use]
     pub fn retry(mut self, r: RetryPolicy) -> Self {
         self.retry = r;
+        self
+    }
+
+    /// Let a failure the tool ran and reported be retried — see
+    /// [`retry_landed`](Self::retry_landed).
+    #[must_use]
+    pub const fn retry_landed(mut self, yes: bool) -> Self {
+        self.retry_landed = yes;
         self
     }
 
@@ -1011,6 +1028,10 @@ impl Effect for ToolCall {
 
     fn retry(&self) -> RetryPolicy {
         self.safety.retry
+    }
+
+    fn retries_landed(&self) -> bool {
+        self.safety.retry_landed
     }
 
     fn max_sensitivity(&self) -> Sensitivity {

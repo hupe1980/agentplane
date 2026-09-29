@@ -708,8 +708,7 @@ mod tests {
     /// The same two refusals, reported rather than thrown.
     ///
     /// The pair matters: a `try_` variant that accepted what `new` panics on
-    /// would be a second door with a weaker rule, which is the shape this crate
-    /// has already been bitten by — a check enforced at one of its two doors.
+    /// would be a second door with a weaker rule.
     #[test]
     fn the_fallible_constructor_refuses_exactly_what_the_panicking_one_does() {
         assert_eq!(

@@ -755,8 +755,9 @@ fn telemetry_did_not_loosen_the_determinism_gate() {
     //
     //   effects.rs  — the `Clock` effect, whose whole job is to read the clock
     //                 and journal the result.
-    //   executor.rs — `now_for_admission`, for the case row's `opened_at` stamp,
-    //                 which never enters the journal.
+    //   executor.rs — `now_for_admission`, for the case row's `opened_at` stamp
+    //                 and a rate reservation's instant, neither of which
+    //                 enters the journal.
     //   ctx.rs      — `subscription_clock`, store metadata like a lease.
     //
     // Instrumentation must observe, not reach: a span may not read a clock or
@@ -2211,6 +2212,7 @@ fn every_durably_spelled_variant_is_in_its_all() {
         ("src/core/task.rs", "TaskState"),
         ("src/core/task.rs", "Priority"),
         ("src/core/task.rs", "OnExpiry"),
+        ("src/core/task.rs", "Withheld"),
         ("src/core/id.rs", "Phase"),
         ("src/batch/mod.rs", "ItemOutcome"),
     ];
@@ -2773,9 +2775,11 @@ fn every_versioned_crypto_domain_is_enumerated_and_at_version_one() {
     let known: &[&str] = &[
         "agentplane.policy.bundle.v1",      // PolicyBundleIdentity::digest
         "agentplane.calendar.wallclock.v1", // WallClock::digest
-        "io.github.hupe1980.agentplane/manifest/v1", // attest::DOMAIN_MANIFEST
-        "io.github.hupe1980.agentplane/record/v1", // attest::DOMAIN_RECORD
-        "io.github.hupe1980.agentplane/provenance/v1", // attest::DOMAIN_PROVENANCE
+        "agentplane.task.justification.v1", // Justification::digest
+        "agentplane.effect.key.v1",         // EffectKey::derive
+        "io.github.hupe1980.agentplane/manifest/v1", // signature::DOMAIN_MANIFEST
+        "io.github.hupe1980.agentplane/record/v1", // signature::DOMAIN_RECORD
+        "io.github.hupe1980.agentplane/provenance/v1", // signature::DOMAIN_PROVENANCE
     ];
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3006,59 +3010,68 @@ fn every_public_function_is_called_or_tested_somewhere() {
 
 /// **Every verb a remedy names is one the surface printing it has.**
 ///
-/// `agentplane attention` exists to answer *does anything here need a person*.
-/// It opens a store, exits non-zero, and names each condition's remedy in the
-/// operator's own vocabulary — so a remedy naming a verb this binary does not
-/// have is a diagnosis whose prescription the diagnosing surface cannot fill.
-/// That is [I13](https://docs.rs/agentplane) applied to verbs: the finding is
-/// findable and the fix is not.
+/// `agentplane attention` and `GET /attention` exist to answer *does anything
+/// here need a person*, and each names a remedy per condition — so a remedy
+/// naming a verb its surface does not have is a diagnosis whose prescription
+/// the diagnosing surface cannot fill. That is [I13](https://docs.rs/agentplane)
+/// applied to verbs: the finding is findable and the fix is not.
 ///
-/// It bit. `reconcile`, `reopen`, `abandon`, `acknowledge` and re-arming were
-/// all HTTP-only while `attention` told a terminal to perform them — and on
-/// the embedded backend the HTTP surface is unreachable exactly when the plane
-/// is down, which is when somebody is most likely to be typing.
+/// It bit twice. `reconcile`, `reopen`, `abandon`, `acknowledge` and re-arming
+/// were all HTTP-only while the terminal was told to perform them; and the API
+/// then served the terminal's remedies — `replay`, `halt --lift`, `drill` — to
+/// a dashboard that has none of those verbs.
 ///
-/// Held from the two files that hold both lists, because neither can drift
-/// without the other noticing: the remedies are `&'static str` in the runtime
-/// and the verbs are clap's `Commands` block.
+/// So each remedy has two spellings, and each is held to its own surface: a
+/// backticked word in a `cli:` remedy is an `agentplane` verb; a backticked
+/// `METHOD /path` in an `http:` remedy is a route in the operator API's table,
+/// and a backticked `agentplane <verb>` there names the terminal verb where
+/// the API has none. A remedy with nothing to run must say `no verb:` — prose
+/// that names no verb and does not say so reads as a remedy nobody can find.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn every_verb_an_attention_remedy_names_is_one_the_cli_has() {
     let remedies = read("src/runtime/attention.rs");
     let cli = read("src/bin/agentplane.rs");
+    let api = read("src/api/mod.rs");
 
-    // Backticked words inside the `remedy` strings. A remedy names a verb in
-    // code font or describes an act in prose; only the first is a promise
-    // this binary can be held to.
-    let mut named: Vec<String> = Vec::new();
-    for line in remedies.lines() {
-        let t = line.trim_start();
-        // The remedy literals live in the condition table and in `note`
-        // calls; both are plain string content, so scan any line that is not
-        // a doc comment.
-        if t.starts_with("///") || t.starts_with("//") {
-            continue;
-        }
-        let mut rest = line;
-        while let Some(open) = rest.find('`') {
-            let after = &rest[open + 1..];
-            let Some(close) = after.find('`') else { break };
-            let word = &after[..close];
-            // `halt --lift` names a verb plus a flag; the verb is the part a
-            // command list can answer for.
-            let verb = word.split_whitespace().next().unwrap_or("");
-            if !verb.is_empty() && verb.chars().all(|c| c.is_ascii_lowercase() || c == '-') {
-                named.push(verb.to_owned());
+    // The string literal after each `cli:` / `http:` field, with `\`-newline
+    // continuations folded the way the compiler folds them.
+    let literals = |field: &str| -> Vec<String> {
+        let marker = format!("{field}: \"");
+        let mut out = Vec::new();
+        let mut rest = remedies.as_str();
+        while let Some(at) = rest.find(&marker) {
+            let body = &rest[at + marker.len()..];
+            let mut text = String::new();
+            let mut chars = body.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => {
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                                chars.next();
+                            }
+                        } else if let Some(escaped) = chars.next() {
+                            text.push(escaped);
+                        }
+                    }
+                    other => text.push(other),
+                }
             }
-            rest = &after[close + 1..];
+            out.push(text);
+            rest = &body[1..];
         }
-    }
-    named.sort();
-    named.dedup();
-    assert!(
-        named.len() >= 5,
-        "this guard read {named:?} out of the remedy table — it is scanning the \
-         wrong thing, and a guard that finds nothing passes"
-    );
+        out
+    };
+    let backticked = |text: &str| -> Vec<String> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect()
+    };
 
     // clap derives the verb from the variant name, so the command list is the
     // enum: `    Reconcile(ReconcileArgs),` → `reconcile`.
@@ -3091,13 +3104,84 @@ fn every_verb_an_attention_remedy_names_is_one_the_cli_has() {
          wrong thing"
     );
 
-    let missing: Vec<&String> = named.iter().filter(|v| !commands.contains(v)).collect();
+    // `.route("/runs/{run}/cancel", post(cancel_run))` → `POST /runs/{run}/cancel`.
+    let mut routes: Vec<String> = Vec::new();
+    for line in api.lines() {
+        let t = line.trim();
+        let Some(after) = t.strip_prefix(".route(\"") else {
+            continue;
+        };
+        let Some((path, handlers)) = after.split_once('"') else {
+            continue;
+        };
+        for method in ["get", "post", "put", "delete", "patch"] {
+            if handlers.contains(&format!("{method}(")) {
+                routes.push(format!("{} {path}", method.to_ascii_uppercase()));
+            }
+        }
+    }
     assert!(
-        missing.is_empty(),
-        "`attention` tells an operator to run {missing:?}, and this binary has no \
-         such verb. A surface that reports what needs a person and cannot perform \
-         the remedy it names is a control nobody can reach during an incident.\n\
-         remedies named: {named:?}\ncommands: {commands:?}"
+        routes.len() > 10,
+        "this guard read {routes:?} as the route table — it is scanning the wrong thing"
+    );
+
+    let cli_remedies = literals("cli");
+    let http_remedies = literals("http");
+    assert!(
+        cli_remedies.len() >= 8 && cli_remedies.len() == http_remedies.len(),
+        "this guard read {} terminal and {} API remedies — every condition has \
+         both, and fewer than eight means it is scanning the wrong thing",
+        cli_remedies.len(),
+        http_remedies.len()
+    );
+
+    let mut problems = Vec::new();
+    for remedy in &cli_remedies {
+        let named = backticked(remedy);
+        if named.is_empty() && !remedy.starts_with("no verb:") {
+            problems.push(format!(
+                "terminal remedy names no verb and does not say so: {remedy}"
+            ));
+        }
+        for word in named {
+            // `halt --lift` names a verb plus a flag; the verb is the part a
+            // command list can answer for.
+            let verb = word.split_whitespace().next().unwrap_or("");
+            if !commands.iter().any(|c| c == verb) {
+                problems.push(format!(
+                    "terminal remedy runs `{word}`, and the CLI has no `{verb}`"
+                ));
+            }
+        }
+    }
+    for remedy in &http_remedies {
+        let named = backticked(remedy);
+        if named.is_empty() && !remedy.starts_with("no verb:") {
+            problems.push(format!(
+                "API remedy names no route and does not say so: {remedy}"
+            ));
+        }
+        for word in named {
+            if let Some(verb) = word.strip_prefix("agentplane ") {
+                let verb = verb.split_whitespace().next().unwrap_or("");
+                if !commands.iter().any(|c| c == verb) {
+                    problems.push(format!(
+                        "API remedy sends the reader to `{word}`, and the CLI has no `{verb}`"
+                    ));
+                }
+            } else if !routes.contains(&word) {
+                problems.push(format!(
+                    "API remedy names `{word}`, which is neither a route in the operator \
+                     API nor an `agentplane` verb"
+                ));
+            }
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "a surface that reports what needs a person and cannot perform the remedy \
+         it names is a control nobody can reach during an incident:\n{problems:#?}\n\
+         commands: {commands:?}\nroutes: {routes:?}"
     );
 }
 
@@ -3260,4 +3344,67 @@ fn no_record_kind_field_collides_with_the_record_body() {
          fails only when something reads it back into its own type:\n  {}",
         collisions.join("\n  ")
     );
+}
+
+/// **The offline policy check reads a file, and nothing else.**
+///
+/// Its report is about history and must not become a way back into it: a
+/// check that opened a store could write, take a lease or be pointed at a
+/// live plane, and one that held a client could reach the network. The key
+/// ring is the one seam it may hold, and only when its caller hands one over.
+#[test]
+fn the_policy_check_imports_no_store_or_client() {
+    const FORBIDDEN: &[&str] = &[
+        "JournalStore",
+        "CaseStore",
+        "EventStore",
+        "TaskStore",
+        "TimerStore",
+        "BlobStore",
+        "Lease",
+        "ToolClient",
+        "reqwest",
+        "crate::store",
+        "crate::api",
+        "crate::runtime",
+        "std::fs",
+        "std::net",
+        "tokio::",
+    ];
+    let code = code_only(&read("src/policy/check.rs"));
+    // Shape 3: a guard over an empty or moved file prohibits nothing.
+    assert!(
+        code.contains("pub async fn run") && code.contains("fn read_export"),
+        "this guard is not reading the policy check"
+    );
+    for needle in FORBIDDEN {
+        assert!(
+            !code.contains(needle),
+            "src/policy/check.rs names `{needle}` — the offline check opens no store \
+             and holds no client"
+        );
+    }
+}
+
+/// **Nothing that executes a run can reach the offline check.**
+///
+/// Replay does not re-judge history under current policy, and the check is
+/// exactly that judgement: reachable from the executor, a policy edit could
+/// change what a resumed run does.
+#[test]
+fn the_policy_check_is_reachable_from_no_executor_path() {
+    let sources = walk("src/runtime");
+    assert!(
+        sources.len() > 10,
+        "only {} runtime sources were found, so this guard is reading the wrong \
+         directory rather than passing",
+        sources.len()
+    );
+    for path in sources {
+        let code = code_only(&read(&path));
+        assert!(
+            !code.contains("policy::check"),
+            "{path} names the offline policy check, which no executor path may reach"
+        );
+    }
 }

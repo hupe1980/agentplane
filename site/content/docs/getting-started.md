@@ -54,7 +54,7 @@ cargo run --example durable_pipeline
 Read those five lines slowly, because they are the product:
 
 - **2** — replaying performed *nothing*. The counter did not move.
-- **3** — the crash resumed at stage 2. Stage 0 ran once across both attempts,
+- **3** — the crash resumed at stage 1. Stage 0 ran once across both attempts,
   not twice.
 - **4** — a *different build* replaying an old journal is *quarantined*. It is
   not silently accepted, and it is not a crash to recover from. Changing code and
@@ -93,6 +93,7 @@ spec:
 ```sh
 cargo install agentplane --features cli
 
+agentplane init agent.yaml              # or start from a starter that validates
 agentplane validate summariser.yaml
 agentplane digest   summariser.yaml     # what a registry pins
 agentplane run      summariser.yaml --input '{"ticket": "printer on fire"}'
@@ -110,7 +111,7 @@ published schema in a modeline — see
 `--input -` reads stdin, the convention every pipe-shaped tool honours. A
 recorded run is re-executed with its own verb — `agentplane replay <run-id>
 --store runs.redb --manifest summariser.yaml`, plus `--strict` to verify rather
-than resume — and `agentplane card <manifest> --url <base>` prints the Agent
+than resume, under the same manifest or an [edited one](@/docs/operations.md#strict-replay) — and `agentplane card <manifest> --url <base>` prints the Agent
 Card a served manifest would advertise, so what a peer will see is reviewable
 before anything listens on a socket.
 
@@ -138,9 +139,8 @@ not contain an HTTP server or a database client at all.
 
 ### Tools, still without Rust
 
-`execution.kind: tool-calling` runs the loop from a file — but a loop needs
-tools, and until now reaching a tool server took a Rust program. The manifest
-grants `tool://tickets/read`; **which transport reaches `tickets`** is named on
+`execution.kind: tool-calling` runs the loop from a file, and a loop needs
+tools. The manifest grants `tool://tickets/read`; **which transport reaches `tickets`** is named on
 the command line, exactly as a model's base URL is:
 
 ```sh
@@ -182,10 +182,15 @@ A manifest can also be **served** — the A2A 1.0 peer surface that passes the
 protocol project's own conformance kit, started from the same file:
 
 ```sh
+# The shipped token file holds placeholders `serve` refuses: generate the tokens.
+sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+    -e "s/replace-me:ops-alice:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+    examples/serve-tokens.yaml > tokens.yaml
+
 agentplane serve examples/served.yaml \
   --url http://localhost:8080 \
   --policy examples/serve-policy.cedar \
-  --tokens examples/serve-tokens.yaml \
+  --tokens tokens.yaml \
   --operator-addr 127.0.0.1:9090 \
   --store ./served.redb
 
@@ -193,10 +198,14 @@ curl http://localhost:8080/.well-known/agent-card.json
 curl "http://localhost:9090/runs?outcome=quarantined" -H 'authorization: Bearer …'
 ```
 
+`serve` refuses a token shorter than 32 bytes, and it refuses the file's
+placeholders by name: a credential copied out of a public repository is one
+every reader holds. The bearer for the operator surface is the `ops-alice` line
+of `tokens.yaml`.
+
 That second URL is the point of `--operator-addr`. Every conclusion this runtime
 reaches is meant to be *queryable by whoever must clear it* rather than merely
-emitted — and until a shipped binary could serve it, that guarantee needed a Rust
-program to reach. It is **off unless asked for and on its own listener**: the
+emitted. It is **off unless asked for and on its own listener**: the
 public address is the one a peer holds, and putting the worklist and task
 decisions behind it is one policy mistake away from a peer reading every run.
 
@@ -212,7 +221,7 @@ listed in its comment and permitted by no rule, and neither is `data:release`,
 so a run that reaches a typed release is refused. Cedar denies what no rule
 permits, which is the right default and an opaque one: the caller is told only
 that it was declined. Before a deployment carries work, grant the verbs whoever
-is on call will need, and read [security](../security/) for the release gate.
+is on call will need, and read [security](@/docs/security.md) for the release gate.
 
 `--push-host <host>` (repeatable) turns on **A2A push notifications** to that
 exact host. Without one, push is not wired and the Agent Card advertises it as
@@ -250,7 +259,7 @@ instance](@/docs/operations.md#stopping-an-instance).
 
 Four things are refused rather than defaulted, and each refusal is the design:
 
-- **`--policy`** — a Cedar policy set. A permissive engine and no engine are the
+- **`--policy`** — a Cedar policy file, or a bundle directory. A permissive engine and no engine are the
   same behaviour, and only one of them looks governed.
 - **`--tokens`** — bearer tokens naming callers. A server that authenticates
   nobody has no actor to record a decision against; an unknown credential is
@@ -291,15 +300,42 @@ declared orchestrator; say `--capability` when the file leaves any doubt.
 
 Every verb takes only its own flags — `agentplane run --push-host …` does not
 parse, because the flag lives on `serve`'s struct. Deployment wiring also reads
-`AGENTPLANE_STORE`, `AGENTPLANE_URL`, `AGENTPLANE_POLICY`, `AGENTPLANE_TOKENS`,
-`AGENTPLANE_ADDR`, `AGENTPLANE_OPERATOR_ADDR` and `AGENTPLANE_DRAIN_SECS`, with the flag winning when
+`AGENTPLANE_STORE`, `AGENTPLANE_TENANT`, `AGENTPLANE_URL`, `AGENTPLANE_POLICY`,
+`AGENTPLANE_TOKENS`, `AGENTPLANE_ADDR`, `AGENTPLANE_OPERATOR_ADDR`,
+`AGENTPLANE_SWEEP_EVERY`, `AGENTPLANE_DRILL_EVERY`, `AGENTPLANE_DRAIN_SECS` and
+`AGENTPLANE_LOG_FORMAT`, with the flag winning when
 both are given — one rule, rather than a config file and a precedence table.
 `agentplane <verb> --help` is generated from the same structs that enforce the
 flags, so it cannot describe an option nobody implemented.
 
 The answer goes to stdout and everything else to stderr, so it pipes. A run that
-is refused, exhausted or failed exits non-zero, because whoever scripts this
-needs the shell's own answer to "did it work".
+is refused, exhausted or failed exits `1`, because whoever scripts this needs
+the shell's own answer to "did it work". A run that stopped to **wait** — for a
+person, a timer or an event — exits `3`, neither an answer nor a failure, and
+prints what it waits for and the commands that move it on, naming the store and
+the tenant it ran on (a `postgres://` password is left out; a store taken from
+`AGENTPLANE_STORE` is printed as that variable). A command this binary refuses
+exits `2`, a store it cannot reach `4`, and an answer `--limit` cut short `5` —
+the whole table is at the foot of `agentplane --help` and in
+[operations](@/docs/operations.md#exit-statuses).
+
+Every `run` opens or joins a **case**, because oversight, obligations and
+`$correlation/<namespace>` memory subjects all live on one. With no
+`--correlate` the run gets a case of its own; `--correlate customer=C-7`
+(repeatable) joins the open case that key belongs to. So a manifest with
+`spec.oversight` runs from a terminal end to end —
+`examples/approval.yaml` is one:
+
+```sh
+agentplane run examples/approval.yaml --input '{"ticket": "T-1"}' --store runs.redb
+# run run_01… is waiting for a person to decide task_…   (exit 3)
+agentplane tasks  --store runs.redb                      # the worklist
+agentplane decide task_… approve --reason "checked" --actor ada --store runs.redb
+agentplane replay run_01… --manifest examples/approval.yaml --store runs.redb
+```
+
+A run that calls an A2A peer (`--peer`) also needs `--acting-as <subject>`: a
+peer call is made on somebody's behalf, and the flag names whose.
 
 Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `GEMINI_API_KEY` — or `GOOGLE_API_KEY`), never from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain
@@ -355,7 +391,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `bedrock` | Amazon Bedrock Runtime Converse through the AWS SDK, plus Titan/Cohere **embeddings**; separate because the dependency graph is substantial |
 | `media` | governed remote-media fetch: exact grants, SSRF-safe pinned DNS, redirects, limits, validation, digest and retention |
 | `cedar` | Cedar as the authorization engine |
-| `signing` | Ed25519 record attestation |
+| `signing` | Ed25519 record signing |
 | `manifest` | declare an agent's grants and ceilings in a reviewable YAML file, and pin it by digest |
 | `cli` | the `agentplane` binary — run a declarative agent from a YAML file with no Rust at all |
 | `witness-http` | submit checkpoints to a real witness over C2SP `tlog-witness`, and read back what it holds — the half that gives the split-view guarantee a counterparty. Included in `cli`, because the deletion check needs a checkpoint from outside the store |
@@ -363,7 +399,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `keyring` | envelope encryption for payload bytes, and the cryptographic erasure it makes provable — destroying a key erases every copy, including backups |
 | `keyring-vault` | a key ring that is somebody else: HashiCorp Vault's transit engine over its HTTP API, so the wrapping key never leaves Vault |
 | `fake-model` | a model provider with no model behind it: deterministic answers, real usage figures. What makes `provider: fake` run without a key or a network; `cli` includes it |
-| `testkit` | fault injection, store conformance, a signer that mints its own attestations, and the plaintext-loopback exceptions. **Never in a shipped build** — no feature a release enables pulls it in, and a guard holds that |
+| `testkit` | fault injection, store conformance, a stub signer that proves nothing, and the plaintext-loopback exceptions. **Never in a shipped build** — no feature a release enables pulls it in, and a guard holds that |
 
 **Check what you got.** The MSRV is **1.94.1**, and the patch component is the
 part that bites: a workspace declaring `rust-version = "1.94"` does not fail
@@ -498,46 +534,75 @@ hello_skill` — so the shape above is something you execute, not only read.
 
 ## 6. Do something to the outside world 🌍 {#do-something-to-the-outside-world}
 
-The point of the journal is effects. Here is a tool call:
+The point of the journal is effects. A tool is one type — its arguments are the
+tool, so the schema the model is offered comes from the struct and the body
+receives the struct:
 
 ```rust
-use agentplane::core::{ProtectedField, Release, ReleaseScope, Tainted};
-use agentplane::tools::{ToolCall, ToolCatalog, ToolId, ToolSafety};
+use agentplane::prelude::*;
+use agentplane::tools::ToolFailure;
+use serde_json::{Value, json};
 
-// The operator declares what a tool does. A tool absent from the catalogue
-// cannot be called at all — a tool nobody declared is one nobody reasoned about.
-let catalog = ToolCatalog::new()
-  .allow(
-    ToolId::new("ledger", "post_entry"),
-    ToolSafety::default().protect(ProtectedField::trusted("/account")),
-  );
+/// Post one entry to the ledger.
+#[derive(Debug, serde::Deserialize, agentplane::schemars::JsonSchema)]
+#[schemars(crate = "agentplane::schemars")]
+struct PostEntry {
+    account: String,
+    memo: String,
+}
+
+#[async_trait]
+impl Tool for PostEntry {
+    const SERVER: &'static str = "ledger";
+    const NAME: &'static str = "post_entry";
+
+    async fn call(self) -> Result<Value, ToolFailure> {
+        Ok(json!({ "posted": self.account, "memo": self.memo }))
+    }
+}
+```
+
+What the tool may be handed is the **manifest's** to say, because that is the
+document a reviewer signs. The grant names the tool and protects the field that
+carries authority:
+
+```yaml
+  tools:
+    - ref: "tool://ledger/post_entry"
+      mutates: true
+      description: "Post one ledger entry."
+      protected_fields:
+        - path: /account
+          require_trusted: true
+```
+
+Wire the tool with `Runtime::builder(store).toolbox(ToolBox::new().with::<PostEntry>())`
+beside `.agent(Agent::new(&manifest).skill(YourSkill))`. `toolbox` derives the
+catalogue from the manifests and **refuses to build** when the code and the
+reviewed grant disagree — a tool that says it mutates granted as read-only, a
+grant nothing implements. Then, inside the skill:
+
+```rust
+use agentplane::tools::ToolId;
 
 let args = Tainted::object([
   ("account", Tainted::trusted(json!("receivables"))),
   ("memo", model_written_memo), // may remain untrusted
 ]);
-// The plane's destination allowlist, captured before the closure — which
-// cannot borrow `cx`. `cx.call_tool` does this for you.
-let egress = cx.tool_egress();
 let result = cx
-  .sink_with(&args, |value| {
-    ToolCall::prepare(
-      &catalog, client, ToolId::new("ledger", "post_entry"), value, egress.as_deref(),
-    )
-  })
+  .call_tool(ToolId::new("ledger", "post_entry"), args)
   .await?; // exact bytes, protected account
 ```
 
-`ToolSafety::default()` says **mutates**, and that default is the whole posture: a
-tool nobody has thought about gets the treatment that makes the runtime cautious,
-not the one that makes it fast. A mutating call whose outcome is unknown escalates
-to an operator rather than being retried. Any effect that exposes outbound
-arguments must go through the sink gate; `effect` refuses it, so the check cannot
-be skipped. `sink_with` hands the labelled value to the effect and the gate in
-one motion — the closure receives the inner value, so the bytes the gates check
-and the bytes the tool is sent cannot be two versions of one argument. The
-protected account must be trusted, while an ordinary memo can retain model
-provenance.
+`call_tool` is the governed path whole: the manifest gate refuses a tool this
+agent's declaration does not grant, the protected account must be trusted while
+an ordinary memo can keep its model provenance, the egress ceiling applies, and
+the call is journaled — so a replay reads the result back instead of posting
+twice. `mutates` defaults to **true**, and that default is the whole posture: a
+tool nobody has thought about gets the treatment that makes the runtime
+cautious, not the one that makes it fast. A mutating call whose outcome is
+unknown escalates to an operator rather than being retried. The result comes
+back `Tainted` and untrusted, whatever the tool says about itself.
 
 If a person or trusted process authorizes a label change, use a typed release:
 
@@ -554,23 +619,32 @@ let args = cx.release(
 ).await?;
 ```
 
-This asks policy under `data:release`, retains provenance, and journals the
+This asks policy under `data:release` — a plane with no policy engine refuses
+every release, since nothing permitted it — retains provenance, and journals the
 releaser, scope, destination, basis and evidence. It never returns a bare value.
 
 ## 7. Wait for a human ⏸️ {#wait-for-a-human}
 
 ```rust
+use agentplane::core::{Expiry, TaskSpec};
+
 let decision = cx.task(
     &TaskSpec::new("rejection-handling", justification, "decision")
         .role("ops")
-        .excluding("agent:proposer")   // four eyes: the proposer cannot approve
-        .on_expiry(OnExpiry::Escalate),
+        .excluding("agent:proposer")   // four eyes; the run's own requester is barred already
+        // Escalation carries who it widens to: the roles are part of the answer.
+        .on_expiry(Expiry::escalate_to(["ops-lead"])),
 ).await?;
 ```
 
 The run **suspends**. Its frame goes to disk and the task is dropped — a
 suspended run costs bytes, not a thread, so a plane can hold 10⁵ of them waiting
 for approval. When someone decides, the run resumes exactly where it was.
+
+`Expiry` is `Deny` unless you say otherwise. Acting without a person is spelled
+`Expiry::ProceedUnattended` — the only way to write it, so the choice is
+explicit and greppable. From a terminal, `agentplane tasks` lists what is
+waiting and `agentplane decide <task> approve --reason … --actor …` answers it.
 
 ## 8. Test it 🧪 {#test-it}
 
@@ -676,8 +750,8 @@ derived from a source outside the allowlist, or above its own sensitivity
 ceiling. Fix the dataflow or use a narrowly scoped, policy-authorized `Release`;
 do not mark the whole object trusted.
 
-**`Exhausted(...)`** — a declared step/effect/token/cost/time/denial budget
-bound the run. This is a journaled **pause**, not a transient provider failure
+**`Exhausted(...)`** — a declared budget, or a tool's `rate_limit`, bound the
+run. This is a journaled **pause**, not a transient provider failure
 and not a fault: the run did what it was told, and what it was told included a
 ceiling, so its completed work stands. Raise the reviewed ceiling and resume —
 the recorded refusal is re-evaluated against the current ledger — or cancel,

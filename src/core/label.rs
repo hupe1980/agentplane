@@ -101,6 +101,7 @@ impl std::fmt::Display for Sensitivity {
 /// where the operations that can prove value lineage — projection, assembly,
 /// transformation — are the only ways to move one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Label {
     /// Every source that influenced this value, unioned through each join.
     ///
@@ -1217,40 +1218,83 @@ mod tests {
         }
     }
 
-    /// Rebase and projection are inverse where a projection is defined.
+    /// Rebase and projection agree with a segment-level model of pointers.
     ///
     /// The mark algebra has one law worth a model: carrying a mark *into* an
     /// assembled parent ([`ReleaseMark::rebased`], used by `object`/`array`)
-    /// and projecting the same field back out ([`ReleaseMark::projected`],
-    /// used by `project_pointer`) must return the original mark. A drift
-    /// between the two is a mark that silently covers the wrong field after a
-    /// round trip through assembly — checked here over whole-value, field,
-    /// and nested-field scopes.
+    /// and projecting back out ([`ReleaseMark::projected`], used by
+    /// `project_pointer`) must say exactly what the pointers mean. The domain
+    /// is JSON Pointers, which is infinite, so this is **bounded, not
+    /// exhaustive**: every field of depth 0–2, every parent of depth 1–2 and
+    /// every projection of depth 1–4, over segments chosen for the traps a
+    /// string implementation falls into — `a` beside `ab` (a prefix that is
+    /// not an ancestor), an array index, and an escaped `/`.
+    ///
+    /// The oracle compares segment lists, never strings: a projection at an
+    /// ancestor of the mark carries the rest of its field down, one at the
+    /// mark or below it is covered whole, and anything else is not covered.
     #[test]
-    fn rebase_then_projection_returns_the_original_mark() {
-        for field in ["", "/account", "/account/iban"] {
-            let mark = ReleaseMark::of(
-                &Release::whole(
-                    ReleaseScope::trust(),
-                    "reviewed",
-                    "tool://ledger/transfer",
-                    ["ticket:1"],
-                ),
-                field.to_owned(),
-            );
-            let carried = mark.clone().rebased("/payment");
-            assert_eq!(
-                carried.projected("/payment"),
-                Some(mark.clone()),
-                "a mark on {field:?} did not survive assembly and projection \
-                 unchanged"
-            );
-            assert_eq!(
-                carried.projected("/other"),
-                None,
-                "a mark rebased under /payment answered a projection of a \
-                 sibling it never covered"
-            );
+    fn rebase_and_projection_agree_with_the_pointer_model() {
+        const SEGMENTS: [&str; 4] = ["a", "ab", "0", "a~1b"];
+        fn pointers(depths: std::ops::RangeInclusive<usize>) -> Vec<Vec<&'static str>> {
+            let mut out: Vec<Vec<&'static str>> = vec![Vec::new()];
+            let mut level: Vec<Vec<&'static str>> = vec![Vec::new()];
+            for _ in 1..=*depths.end() {
+                level = level
+                    .iter()
+                    .flat_map(|p| {
+                        SEGMENTS.iter().map(move |s| {
+                            let mut q = p.clone();
+                            q.push(*s);
+                            q
+                        })
+                    })
+                    .collect();
+                out.extend(level.iter().cloned());
+            }
+            out.retain(|p| depths.contains(&p.len()));
+            out
+        }
+        fn spell(segments: &[&str]) -> String {
+            segments.iter().fold(String::new(), |mut out, s| {
+                out.push('/');
+                out.push_str(s);
+                out
+            })
+        }
+
+        let release = Release::whole(
+            ReleaseScope::trust(),
+            "reviewed",
+            "tool://ledger/transfer",
+            ["ticket:1"],
+        );
+        let (fields, parents, queries) = (pointers(0..=2), pointers(1..=2), pointers(1..=4));
+        for field in &fields {
+            let mark = ReleaseMark::of(&release, spell(field));
+            for parent in &parents {
+                let carried = mark.clone().rebased(&spell(parent));
+                assert_eq!(
+                    carried.projected(&spell(parent)),
+                    Some(mark.clone()),
+                    "a mark on {field:?} did not survive assembly under {parent:?}"
+                );
+                let full: Vec<&str> = parent.iter().chain(field).copied().collect();
+                for query in &queries {
+                    let expected = if query.starts_with(&full) {
+                        Some(ReleaseMark::of(&release, String::new()))
+                    } else if full.starts_with(query) {
+                        Some(ReleaseMark::of(&release, spell(&full[query.len()..])))
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        carried.projected(&spell(query)),
+                        expected,
+                        "a mark on {field:?} under {parent:?}, projected at {query:?}"
+                    );
+                }
+            }
         }
     }
 

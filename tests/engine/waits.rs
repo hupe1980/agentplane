@@ -583,6 +583,14 @@ impl JournalStore for CountsAcquires {
     ) -> Result<Vec<(RunId, u64)>, StoreError> {
         self.inner.recent_runs(after, limit).await
     }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs_from(source, after, limit).await
+    }
     async fn case_history(
         &self,
         case: agentplane::core::CaseId,
@@ -712,5 +720,100 @@ async fn a_timer_wake_resumes_under_its_own_lease_and_releases_it_after() {
             .await
             .unwrap()
             .contains(&out.run_id)
+    );
+}
+
+/// **A wake whose resume was fenced still happened.**
+///
+/// Once the delivery or the timer has recorded the awaited result, the run is
+/// somebody's to finish: if this lease lapses mid-resume and another instance
+/// claims the run, that instance reads the recorded wake back like any other
+/// completed effect. The resume here learns it lost the run as `Fenced` on its
+/// next append — and telling the sender the delivery failed makes it retry into
+/// a duplicate of a message that was delivered, while telling the sweep the
+/// wake failed counts a failure where nothing failed.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_wake_whose_resume_was_fenced_still_happened() {
+    use agentplane::testkit::{Fault, Faulty, Schedule};
+
+    let redb = Arc::new(RedbStore::open_in_memory().unwrap());
+    let fenced = Arc::new(Faulty::new(
+        redb.clone() as Arc<dyn JournalStore>,
+        Schedule::healthy().on_kind("RunConcluded", Fault::Fenced),
+    ));
+    let done = Arc::new(AtomicUsize::new(0));
+    let woke = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::builder(fenced.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .cases(redb.clone() as Arc<dyn CaseStore>)
+        .events(redb.clone() as Arc<dyn EventStore>)
+        .timers(redb.clone() as Arc<dyn TimerStore>)
+        .skill(AwaitsApproval {
+            done: Arc::clone(&done),
+            matter: "M-7",
+        })
+        .skill(Naps {
+            woke: Arc::clone(&woke),
+        })
+        .build();
+
+    // A delivery.
+    let waiting = rt
+        .run_plan_correlated(
+            await_plan(),
+            Tainted::trusted(json!({})),
+            "matter",
+            &[CorrelationKey::new("matter", "M-7")],
+        )
+        .await
+        .unwrap();
+    assert!(waiting.status.is_suspended(), "got {:?}", waiting.status);
+    let delivery = rt
+        .deliver(
+            &InboundEvent::new(
+                "urn:test:approver",
+                "EV-7",
+                "go.ahead",
+                json!({ "ok": true }),
+            )
+            .correlate(CorrelationKey::new("matter", "M-7")),
+        )
+        .await;
+    assert_eq!(
+        delivery
+            .expect("the event is recorded; losing the run afterwards is not a failed delivery"),
+        Delivery::Resumed {
+            run: waiting.run_id
+        }
+    );
+    assert_eq!(
+        done.load(Ordering::SeqCst),
+        1,
+        "the resume ran past the wait"
+    );
+
+    // A timer.
+    let sleeping = rt
+        .run("demo.nap", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(sleeping.status.is_suspended());
+    let fired = rt.fire_timers(later(3600)).await.unwrap();
+    assert_eq!(
+        (fired.fired, fired.failed),
+        (1, 0),
+        "the wake is recorded; losing the run afterwards is not a failed wake"
+    );
+    assert_eq!(
+        woke.load(Ordering::SeqCst),
+        1,
+        "the resume ran past the sleep"
+    );
+
+    assert_eq!(
+        fenced.injected().len(),
+        2,
+        "both resumes must have been fenced, or this tested nothing"
     );
 }

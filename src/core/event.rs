@@ -128,6 +128,17 @@ impl InboundEvent {
     }
 }
 
+/// Whether `kind` is one this plane mints for itself.
+///
+/// A worklist decision reaches the run waiting on it as an event of a kind in
+/// the `agentplane.` namespace. Accepted from outside, a message of that kind
+/// would decide a human task for whoever may post an event — no claim, no
+/// eligibility, no four-eyes. So every external intake refuses the namespace,
+/// and the worklist is the one door into it.
+pub(crate) fn is_reserved_kind(kind: &str) -> bool {
+    kind.starts_with("agentplane.")
+}
+
 /// A producer-scoped identity — `(source, id)` — as one key.
 ///
 /// # Why a separator is not enough
@@ -156,6 +167,23 @@ impl InboundEvent {
 #[must_use]
 pub fn origin_key(source: &str, id: &str) -> String {
     format!("{}\u{1f}{source}\u{1f}{id}", source.len())
+}
+
+/// The `source` half of an [`origin_key`], read back.
+///
+/// Read the way the construction says: the digits, then exactly that many
+/// bytes. `None` for a key [`origin_key`] did not produce — so a surface asking
+/// "which producer admitted this run" gets no answer from a key somebody
+/// spelled by hand, rather than a wrong one.
+#[must_use]
+pub fn origin_source(key: &str) -> Option<&str> {
+    let (len, rest) = key.split_once('\u{1f}')?;
+    if len.is_empty() || !len.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let len: usize = len.parse().ok()?;
+    let source = rest.get(..len)?;
+    rest[len..].starts_with('\u{1f}').then_some(source)
 }
 
 /// What a run is waiting for.
@@ -243,7 +271,7 @@ pub struct Timer {
 
 /// Why a run stopped without finishing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case")]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SuspendReason {
     /// Waiting for an inbound message that has not arrived.
@@ -307,11 +335,15 @@ impl std::fmt::Display for SuspendReason {
 pub enum Delivery {
     /// A waiting run consumed it and ran to its next stopping point.
     Resumed { run: RunId },
-    /// Stored, but nobody is waiting for it *yet*.
+    /// Stored durably, and not yet driven onward by this call.
     ///
-    /// Not an error and not a dead letter. The counterpart run may not have
-    /// reached its wait, or may not have started. The event stays claimable
-    /// until a wait finds it or the sweep ages it out.
+    /// Not an error and not a dead letter. Either nobody is waiting for it
+    /// *yet* — the counterpart run may not have reached its wait, or may not
+    /// have started, and the event stays claimable until a wait finds it or the
+    /// sweep ages it out — or it was recorded as a waiting run's answer by a
+    /// plane that could not continue that run (its owner was busy, or this
+    /// plane holds no agent for it), and the run's own plane, the sweep or a
+    /// replay continues it.
     Buffered,
     /// This event id was already delivered. Retries are safe.
     Duplicate,
@@ -359,5 +391,27 @@ mod tests {
         assert_eq!(Delivery::Resumed { run }.resumed_run(), Some(run));
         assert_eq!(Delivery::Buffered.resumed_run(), None);
         assert_eq!(Delivery::Duplicate.resumed_run(), None);
+    }
+
+    /// The source is read back whatever either half contains.
+    #[test]
+    fn an_origin_keys_source_reads_back_exactly() {
+        for (source, id) in [
+            ("peer:a", "m1"),
+            ("a\u{1f}b", "c"),
+            ("a", "b\u{1f}c"),
+            ("", "x"),
+        ] {
+            assert_eq!(origin_source(&origin_key(source, id)), Some(source));
+        }
+        for key in [
+            "",
+            "m1",
+            "x\u{1f}peer:a\u{1f}m1",
+            "9\u{1f}peer:a\u{1f}m1",
+            "6\u{1f}peer:a",
+        ] {
+            assert_eq!(origin_source(key), None, "{key:?} is not an origin key");
+        }
     }
 }

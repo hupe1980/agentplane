@@ -13,10 +13,12 @@ pub mod effects;
 mod executor;
 pub mod group;
 pub mod metrics;
+pub mod replay_only;
 mod sweeper;
 pub mod telemetry;
+mod verdict;
 
-pub use attention::{Attention, Condition};
+pub use attention::{Attention, Condition, Remedy, SUBJECTS_LISTED};
 pub use batch::BatchSpec;
 pub use build_error::BuildError;
 pub use ctx::{BuildsEffect, Mode, StepCtx};
@@ -42,6 +44,7 @@ pub use executor::{
     RuntimeBuilder, SEALED_OUTCOMES, Spawned, Stores,
 };
 pub use group::{EffectGroup, Invariant};
+pub use verdict::{CannotReplay, Finding, Verdict};
 
 /// The embedder and the index it embeds for, wired as one thing.
 ///

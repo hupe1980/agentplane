@@ -11,14 +11,22 @@
 # admitted under a chain rooted at `peer-a` with exactly this authority, and
 # the journal names peer-a — not this plane — as who the run acted for. A
 # `not_after` beside it would expire the chain at admission. Leave both out
-# and the caller has no chain of its own.
+# and the caller has no chain of its own: its runs are bounded by the plane's
+# chain and hold none of its authority.
 #
-# Obviously demo values. A real deployment mounts this as a secret.
-- token: "a-long-random-string"
+# The two values below are placeholders, and `serve` refuses to start on them —
+# as it refuses any token shorter than 32 bytes. Generate real ones:
+#
+#   sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+#       -e "s/replace-me:ops-alice:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+#       examples/serve-tokens.yaml > tokens.yaml
+#
+# and mount the result as a secret.
+- token: "replace-me:peer-a:openssl-rand-hex-32"
   actor: peer-a
   roles: [peer]
   scope: [support.*]
 
-- token: "another-long-random-string"
+- token: "replace-me:ops-alice:openssl-rand-hex-32"
   actor: ops-alice
   roles: [operator]

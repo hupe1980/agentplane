@@ -198,8 +198,9 @@ before dispatch at which "this is the final turn" is known, and a schema
 attached only where the runtime guessed the answer would land is a contract the
 model can step around by answering a turn early. A turn that asks for tools is
 untouched; the turn that answers is provider-constrained during generation, and
-the settled answer is validated against the schema before it is returned. An agent still asking when `max_turns` runs out
-**fails** rather than returning half-formed reasoning as its answer.
+the settled answer is validated against the schema before it is returned. An
+agent still asking when `max_turns` runs out **fails** rather than returning
+half-formed reasoning as its answer.
 
 **`planned`** — plan first, then execute without the model. One privileged
 call reads the run's input — which **must be trusted**, refused otherwise —
@@ -249,12 +250,10 @@ show up as a diff with a reviewer on it. A procedure held in code has no version
 at all.
 
 The block is optional because an embedder may compose its prompt in code — in
-which case the digest simply does not cover it, and the page says so rather than
-implying otherwise.
+which case the digest does not cover it.
 
-**A coded skill is not forced into that trade, and reading only the paragraph
-above suggests it is.** `StepCtx::manifest()` hands a skill the declaration it is
-running under, and `Identity::system_prompt()` renders `role`, a blank line, then
+**A coded skill can still take its prompt from here.** `StepCtx::manifest()`
+hands a skill the declaration it is running under, and `Identity::system_prompt()` renders `role`, a blank line, then
 `constraints` — the same string a declarative agent gets:
 
 ```rust
@@ -270,9 +269,7 @@ let system = cx
 So behaviour can stay in Rust while the prompt stays in the reviewed, digested
 file. What a coded agent gives up is coverage of its **conduct**, not of its
 prompt: the manifest still pins what it says, and cannot pin what the code then
-does with the answer. That distinction is worth stating plainly, because an
-evaluation reasoned from the paragraph above that the two were exclusive and
-recorded the trade-off as settled.
+does with the answer.
 
 There is no templating — no `{variables}`, no dynamic-instructions callback,
 no state injection. A templated instruction has no reviewable identity, and
@@ -301,7 +298,7 @@ that guessed would refuse manifests over the word "search".
 |---|---|---|
 | `mode` | `single` | `single`, `collaborative` |
 | `role` | `specialist` | `specialist`, `orchestrator` |
-| `reason` | **required** | `parallel-disjoint`, `distinct-authority` |
+| `reason` | none — required for `collaborative`, refused otherwise | `parallel-disjoint`, `distinct-authority` |
 
 Three combinations are refused, and each refusal is the point:
 
@@ -329,7 +326,7 @@ confidence.
 
 | Field | Default | Notes |
 |---|---|---|
-| `max_sensitivity_egress` | unbounded | `public`, `internal`, `confidential`, `secret`. Combined with each sink's own ceiling at dispatch; the **stricter** wins. |
+| `max_sensitivity_egress` | none — each sink's own ceiling binds, which for `model.complete` is `public` | `public`, `internal`, `confidential`, `secret`. Combined with each sink's own ceiling at dispatch; the **stricter** wins. |
 | `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records** — *may this be written down forever*, where egress asks *may this leave*. Refused at dispatch, before anything is recorded; `.keyring(..)` is the *seal it* answer → [erasure and keys](@/docs/erasure.md). |
 | `max_delegation_depth` | role-dependent | Checked against the configured identity *and* against every delegating sink, including in-plane `commission`. |
 
@@ -337,7 +334,7 @@ confidence.
 
 | Field | Notes |
 |---|---|
-| `provides` | The capability names this agent answers to. `Runtime::run(capability, input)` dispatches on these, and a plane **refuses to build** if two agents claim one capability or if a declarative agent provides none. |
+| `provides` | The capability names this agent answers to. `Runtime::run(capability, input)` dispatches on these, and a plane **refuses to build** if two agents claim one capability. A declarative agent that omits it provides `[metadata.name]`, resolved before the digest, so spelling the default out does not change the digest. |
 
 A coded agent may provide several capabilities — each has its own skill
 behind it, and the build refuses a declared capability no registered skill
@@ -346,7 +343,10 @@ otherwise: the capability never reaches the prompt, so a second name would be
 a distinction nothing executes. Two capabilities are two documents in one
 room file.
 
-There is no `requires` twin. Parsed and digest-covered but never enforced, it would be a control the runtime does not check — exactly what a reviewable file exists to eliminate. A build-time check that every required capability is available on the plane is a well-formed future control; a field that only *documents* intent belongs in prose, not beside enforced ceilings.
+There is no `requires` twin. Parsed and digest-covered but never enforced, it
+would be a control the runtime does not check — exactly what a reviewable file
+exists to eliminate. A field that only *documents* intent belongs in prose, not
+beside enforced ceilings.
 
 There is no `SKILL.md`, no `kind: Skill`, and no free-form `spec.config`:
 instructions live in `identity.constraints`, on-demand references are
@@ -369,19 +369,21 @@ model did all the work — a control the file claims and the runtime never
 applies. A **coded** agent may declare both: its skill chooses, so the roles are
 a reviewed allowlist rather than something a tier selects from.
 
-Both are `{ provider, model }` plus two optional per-role ceilings —
-`max_tokens`, a per-call output ceiling, and `reasoning_effort`, an explicit
-reasoning depth. The ceilings are enforced on **every** call the role serves:
-the quarantined role's included, so a memory-formation extraction or a `parse`
-step runs under the reviewed bounds rather than the driver's defaults.
-`provider` is the name a driver was registered under. The `agentplane` binary ships `openai`, `anthropic`, `gemini`,
-`bedrock`, `chat-completions` and `fake`; an embedder registers its own with
+Both are `{ provider, model }` plus three optional per-role ceilings —
+`max_tokens`, a per-call output ceiling; `max_input_tokens`, a per-call input
+ceiling; and `reasoning_effort`, an explicit reasoning depth — and an optional
+`pricing`, what the role's tokens cost. The ceilings are enforced on **every**
+call the role serves, the quarantined role's included, so a memory-formation
+extraction or a `parse` step runs under the reviewed bounds rather than the
+driver's defaults. `provider` is the name a driver was registered under. The
+`agentplane` binary ships `openai`, `anthropic`, `gemini`, `bedrock`,
+`chat-completions` and `fake`; an embedder registers its own with
 `RuntimeBuilder::provider`, and a name nothing was registered under is refused
 at build rather than at the first call. The pair is
 **refused when both roles name the same provider and model**: two roles behind
 one model keeps the label and removes the control it stands for.
 
-What `quarantined` does today: it is part of the reviewed model allowlist,
+What `quarantined` does: it is part of the reviewed model allowlist,
 **memory formation** runs on it when declared, and a `planned` agent's
 **`parse` steps** run on it — no tools, a bounded schema, and nothing handed
 back to the privileged path but success or failure. The agent's answer stays
@@ -391,6 +393,31 @@ between the two by content.
 Absent means *wired in code*. `models: {}` means **no inference at all**,
 declared on purpose — a rules-only agent is a legitimate design, and saying so is
 what distinguishes it from one whose model wiring somebody forgot.
+
+#### What one call can cost {#per-call-bound}
+
+`max_tokens` is sent to the provider, so output is bounded before a call.
+Input is not — it is whatever the conversation has grown to — so
+`max_input_tokens` is held against the input the provider reports: a call that
+sent more **fails**, billed as reported, and its answer is not handed on. `0`
+is refused, since no prompt is empty.
+
+Together they state what one call through the role can cost: `max_input_tokens`
+plus the output ceiling (`max_tokens`, or the default every call is sent with)
+in tokens, and those tokens at the role's `pricing` in money — input at the
+dearest of the input, cache-read and cache-write rates, because which of them a
+call's input lands in is the provider's decision. The run's per-call bound is
+the dearest declared role's, and it is **unbounded** while any role omits
+`max_input_tokens`.
+
+That figure is what a tenant's spend quota reserves beside the run's ceiling —
+a run can end one call past `max_tokens` or `max_minor_units` per step in
+flight — so under a spend quota an agent whose per-call bound is unbounded is
+refused at admission ([per-tenant ceilings](@/docs/operations.md#per-tenant-ceilings)).
+`agentplane validate` prints the worst case per agent — the ceiling plus the
+width times one call, and for a `tool-calling` agent `max_turns` times one call —
+derived from the file alone, naming every term the file leaves unbounded
+instead of printing a total for it.
 
 There is no `fallback` role. Fallback changes behaviour and must be explicit
 orchestration, not decorative configuration the runtime never executes.
@@ -405,12 +432,37 @@ decision that has to be visible — declare `budgets: {}` to mean it.
 | `max_steps` | steps |
 | `max_effects` | effects |
 | `max_tokens` | tokens, across every model call in the run |
-| `max_minor_units` | money in **minor units** — cents, not euros. A float would make a budget that fails to bind by a rounding error, and it is **unsigned**, so a negative ceiling is a parse failure rather than a ceiling that un-spends itself |
+| `max_minor_units` | money in **minor units** — cents, not euros. A float would make a budget that fails to bind by a rounding error, and it is **unsigned**, so a negative ceiling is a parse failure rather than a ceiling that un-spends itself. Requires `pricing` on every declared model role → [money](#money) |
 | `max_replans` | replans |
 | `max_wallclock_secs` | seconds, named for its unit so a manifest cannot mean minutes → [what it costs](#wallclock) |
 | `max_denials` | policy refusals, before the run is stopped |
 | `max_parallel_steps` | how many of a plan's ready steps run at once |
-| `max_egress_bytes` | bytes sent **into sinks** — a tool call's arguments, a model call's prompt, a peer call's payload. Reads cost nothing → [volume](#egress) |
+| `max_egress_bytes` | bytes sent **into sinks** — a tool call's arguments, a peer call's payload, and a model call's whole request: prompt, tool declarations, every earlier tool result, continuation state and each granted media artifact at its encoded size. Reads cost nothing → [volume](#egress) |
+
+#### What a model costs {#money}
+
+No driver knows what your contract with a provider costs, and this crate ships
+no price table — rates change, differ per model, and a guessed number is a
+ceiling that binds in the wrong place without saying so. So a model role states
+its price, in **minor units per million tokens**, and every call it serves is
+priced from its reported usage at the effect boundary, rounded up:
+
+```yaml
+models:
+  privileged:
+    provider: anthropic
+    model: claude-sonnet-5
+    # Your rates, not these: minor units per million tokens.
+    pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+```
+
+All four rates are required; a provider with no cache-write charge states `0`.
+A metered failure — a stream that died after generating — is priced exactly as
+an answer is. `max_minor_units` beside a role with no `pricing` is **refused at
+load**: that role's calls would report no money, and the ceiling would never
+bind on the agent's largest cost. The price is covered by the manifest digest,
+so a rate change is a version bump; it is not part of any effect key, because it
+changes what a run is billed rather than what the provider is asked.
 
 #### The one ceiling on *how much left* {#egress}
 
@@ -419,8 +471,8 @@ extraction sized just under any of them passes, because a label answers *what ma
 this value touch* and never *how much of it went*. `max_egress_bytes` bounds the
 quantity.
 
-It is the only ceiling that is **exact**. A token cost is unknown until the call
-returns, so those refuse once consumption has reached the limit and the run
+Unlike the metered ceilings, it is **exact**. A token cost is unknown until the
+call returns, so those refuse once consumption has reached the limit and the run
 overshoots by one operation; an outbound size is in hand before dispatch, so the
 effect that would cross the ceiling is the effect refused and nothing over the
 limit is ever sent. The refusal names what the call would have sent, so you can
@@ -491,10 +543,11 @@ exactly like one that replans without bound.
 | `ref` | **required** | `tool://server/name`, transport-neutral — see [what `server` may be](#tool-refs) below. |
 | `mutates` | `true` | Whether calling it changes the world. The cautious default. |
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
-| `description` | **required** | What the model is told. Required for a `tool-calling` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
+| `description` | none | What the model is told. Required by a `tool-calling` or `planned` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
 | `arguments` | derived | JSON Schema. Omit it for a typed `Tool`: the schema comes from the Rust argument type, and stating it twice is refused because a second copy can only drift. |
 | `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` and a kind that calls tools (`tool-calling` or `planned`); refused without either. See [approve with an amendment](#amendment). |
 | `protected_fields` | none | See below. |
+| `rate_limit` | none | `{ count, window_seconds }`: at most `count` calls in any `window_seconds`, across every run of the tenant. See [rate ceilings](#rate-limit). |
 
 ### Approving with an amendment {#amendment}
 
@@ -514,6 +567,39 @@ against an in-process double in a test and a real server in production.
 A peer grant dispatches through `StepCtx::call_peer`: a delegating hop that
 extends the run's chain, counts against `max_delegation_depth`, and is held to
 this grant's fields and ceiling.
+
+### Rate ceilings {#rate-limit}
+
+```yaml
+tools:
+  - ref: "tool://payments/refund"
+    rate_limit: { count: 20, window_seconds: 3600 }   # twenty an hour
+```
+
+A run's budget sees one run; this sees every run. The count is kept per tenant
+per tool reference in the quota store, so instances sharing a store share it,
+and every ceiling any declaration on the plane states for one tool binds every
+agent calling it. The window slides: twenty an hour admits twenty in any hour,
+not forty across an hour boundary.
+
+A call past the ceiling is refused before it is announced, recorded on the run
+as a budget refusal naming the tool, the ceiling and the count reached, and the
+run stops `exhausted`. It costs the run's own budget nothing and is not a
+policy denial. Resume the run once the window has room; a resume inside a
+still-full window stands the refusal without recording a second. Replay reads
+the refusal back and never asks the count.
+
+A retry of one call, and a call re-dispatched after a crash, spend once. Two
+runs making the same call each spend. An undo is counted and never refused.
+Nothing is refunded early: a call that was reserved and never announced ages
+out with the window, because nothing proves it did not reach the world. The
+instant is each instance's clock, so a window across instances inherits their
+skew. A ceiling on another agent's plane counts only where that plane's
+declarations are held.
+
+Refused at parse: a zero `count`, a zero `window_seconds` or one longer than the
+calendar, and a ceiling on an `agent` grant. Refused at build: a plane with no
+quota store.
 
 ### `protected_fields`
 
@@ -893,7 +979,7 @@ identifiers that are not literally present*.
   the runtime builds and verifies the corresponding graph. Arbitrary skill code
   cannot be proven to follow one, so there is no such field rather than a
   review-only one.
-* **`routed`/`router` topology**, and a **`fallback`** model role — both accepted
-  YAML the runtime never executed.
+* **`routed`/`router` topology**, and a **`fallback`** model role — both would be
+  YAML the runtime never executes.
 * **A model-capability matrix.** Schema mode is configured per model on the
   driver, because a static matrix drifts faster than this crate releases.

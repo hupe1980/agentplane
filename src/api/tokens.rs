@@ -2,18 +2,12 @@
 //!
 //! # Why this ships at all
 //!
-//! [`Authenticator`] is a seam, and the crate deliberately
-//! shipped no implementation of it: authentication is a deployment's own
-//! decision, and a runtime with an opinion about it is a runtime fighting
-//! whatever the deployment already has.
-//!
-//! That held right up until the A2A server needed to be startable **without
-//! writing Rust**. `agentplane serve` cannot ask its operator to implement a
-//! trait — the whole premise of the declarative tier is that there is no Rust —
-//! so the binary has to carry one authenticator, and the choice is between
-//! shipping a real one and shipping none, which would mean the A2A 1.0 server
-//! that passes the protocol project's own conformance kit can only be reached
-//! by people who write Rust.
+//! [`Authenticator`] is a seam: authentication is a deployment's own decision,
+//! and a runtime with an opinion about it fights whatever the deployment
+//! already has. But `agentplane serve` cannot ask its operator to implement a
+//! trait — the declarative tier has no Rust — so the binary carries one
+//! authenticator, or its servers could be reached only by people who write
+//! Rust.
 //!
 //! # What it is, stated narrowly
 //!
@@ -30,8 +24,8 @@
 //! to one plane, so a token copied to another must not spend there. Every run
 //! the caller starts is admitted under that chain and journaled as its
 //! `IdentityBound`: the record says *this peer, for this*. An entry declaring
-//! neither carries no chain, and its runs act under whatever the plane was
-//! built with.
+//! neither carries no chain: its runs are bounded by the plane's chain —
+//! scope, admissibility and depth — but hold none of its standing authority.
 //!
 //! What it is *not* is the thing that grants authority. A caller's roles are an
 //! input to the policy engine, which is what decides. An authenticator that
@@ -51,6 +45,9 @@
 //! * **An empty file is refused at load.** A token file that parsed to zero
 //!   callers would start a server nobody can reach, which reads as a
 //!   configuration problem long after it reads as an outage.
+//! * **A short or published token is refused at load.** Under
+//!   [`MIN_TOKEN_BYTES`] is guessable at the rate a server answers, and a value
+//!   printed in this project's examples is one every reader holds.
 //! * **Duplicate tokens are refused at load.** Two entries sharing a token means
 //!   one of them silently never applies, and which one depends on file order.
 
@@ -60,6 +57,23 @@ use axum::http::HeaderMap;
 
 use super::{AuthError, Authenticator, Caller};
 use crate::core::{Delegation, Principal, Scope, Secret, TenantId, Timestamp};
+
+/// The shortest token a file may carry, in bytes.
+///
+/// A shared secret is guessed at the rate a server answers, and a short one is
+/// guessed in hours. `openssl rand -hex 32` prints 64 characters, so the
+/// documented way to make one clears this with margin.
+pub const MIN_TOKEN_BYTES: usize = 32;
+
+/// Tokens this project has published — the example file's placeholders and the
+/// values it shipped before them. Every reader of the repository holds these,
+/// so a file carrying one is refused whatever its length.
+const PUBLISHED_TOKENS: &[&str] = &[
+    "a-long-random-string",
+    "another-long-random-string",
+    "replace-me:peer-a:openssl-rand-hex-32",
+    "replace-me:ops-alice:openssl-rand-hex-32",
+];
 
 /// Bearer tokens, each naming exactly one caller.
 #[derive(Debug)]
@@ -89,6 +103,18 @@ pub enum TokenFileError {
          by anyone who presented none"
     )]
     BlankToken { index: usize },
+
+    #[error(
+        "entry {index} has a token of {len} bytes, and {MIN_TOKEN_BYTES} is the least \
+         accepted — generate one with `openssl rand -hex 32`"
+    )]
+    ShortToken { index: usize, len: usize },
+
+    #[error(
+        "entry {index} has a token published in this project's examples, which every \
+         reader of them holds — generate one with `openssl rand -hex 32`"
+    )]
+    PublishedToken { index: usize },
 
     #[error(
         "entry {index} has no actor; a decision recorded against an unnamed \
@@ -128,6 +154,15 @@ impl TokenAuthenticator {
             if entry.token.trim().is_empty() {
                 return Err(TokenFileError::BlankToken { index });
             }
+            if PUBLISHED_TOKENS.contains(&entry.token.as_str()) {
+                return Err(TokenFileError::PublishedToken { index });
+            }
+            if entry.token.len() < MIN_TOKEN_BYTES {
+                return Err(TokenFileError::ShortToken {
+                    index,
+                    len: entry.token.len(),
+                });
+            }
             if entry.actor.trim().is_empty() {
                 return Err(TokenFileError::BlankActor { index });
             }
@@ -165,7 +200,7 @@ impl TokenAuthenticator {
     /// Read a token file.
     ///
     /// ```yaml
-    /// - token: "a-long-random-string"
+    /// - token: "…"                      # 32 bytes or more: `openssl rand -hex 32`
     ///   actor: peer-a
     ///   roles: [peer]
     ///   tenant: acme                      # optional; the default tenant when absent
@@ -256,7 +291,7 @@ mod scheme_tests {
 
     fn ring() -> TokenAuthenticator {
         TokenAuthenticator::from_yaml(
-            "- token: a-long-random-string\n  actor: peer-a\n  roles: [peer]\n",
+            "- token: a-long-random-string-of-at-least-32-bytes\n  actor: peer-a\n  roles: [peer]\n",
         )
         .expect("one caller")
     }
@@ -286,15 +321,19 @@ mod scheme_tests {
         let auth = ring();
         for spelling in ["Bearer", "bearer", "BEARER", "BeArEr"] {
             let caller = auth
-                .authenticate(&presenting(&format!("{spelling} a-long-random-string")))
+                .authenticate(&presenting(&format!(
+                    "{spelling} a-long-random-string-of-at-least-32-bytes"
+                )))
                 .await
                 .unwrap_or_else(|e| panic!("'{spelling}' is a legal auth-scheme spelling: {e}"));
             assert_eq!(caller.actor, "peer-a");
         }
         assert!(
             matches!(
-                auth.authenticate(&presenting("Bearer A-LONG-RANDOM-STRING"))
-                    .await,
+                auth.authenticate(&presenting(
+                    "Bearer A-LONG-RANDOM-STRING-OF-AT-LEAST-32-BYTES"
+                ))
+                .await,
                 Err(AuthError::Rejected)
             ),
             "the token was matched case-insensitively, which silently shrinks \
@@ -307,12 +346,15 @@ mod scheme_tests {
     #[tokio::test]
     async fn a_scoped_entry_is_the_callers_chain() {
         let auth = TokenAuthenticator::from_yaml(
-            "- token: t\n  actor: peer-a\n  roles: [peer]\n  tenant: acme\n  \
+            "- token: t-0123456789abcdef0123456789abcdef\n  actor: peer-a\n  roles: [peer]\n  tenant: acme\n  \
              scope: [support.*]\n  not_after: 2027-01-01T00:00:00Z\n\
-             - token: u\n  actor: peer-b\n  roles: [peer]\n",
+             - token: u-0123456789abcdef0123456789abcdef\n  actor: peer-b\n  roles: [peer]\n",
         )
         .expect("two callers");
-        let scoped = auth.authenticate(&presenting("Bearer t")).await.unwrap();
+        let scoped = auth
+            .authenticate(&presenting("Bearer t-0123456789abcdef0123456789abcdef"))
+            .await
+            .unwrap();
         let chain = scoped.acting_as.expect("a scoped entry carries a chain");
         assert_eq!(chain.subject().id, "peer-a");
         assert_eq!(chain.depth(), 0, "rooted at the actor");
@@ -337,11 +379,33 @@ mod scheme_tests {
             "2027-01-01T00:00:00Z"
         );
 
-        let bare = auth.authenticate(&presenting("Bearer u")).await.unwrap();
+        let bare = auth
+            .authenticate(&presenting("Bearer u-0123456789abcdef0123456789abcdef"))
+            .await
+            .unwrap();
         assert!(
             bare.acting_as.is_none(),
-            "an entry declaring neither bound carries no chain, so its runs act \
-             under whatever the plane was built with"
+            "an entry declaring neither bound carries no chain of its own"
+        );
+    }
+
+    /// **A short token, and one this project published, are refused at load.**
+    ///
+    /// The shipped example file is the case that matters: a server started on
+    /// it would accept a credential every reader of the repository holds.
+    #[test]
+    fn a_short_or_published_token_is_refused_at_load() {
+        let err = TokenAuthenticator::from_yaml("- token: short-token\n  actor: peer-a\n")
+            .expect_err("eleven bytes");
+        assert!(
+            matches!(err, TokenFileError::ShortToken { index: 0, len: 11 }),
+            "{err:?}"
+        );
+        let err = TokenAuthenticator::from_yaml(include_str!("../../examples/serve-tokens.yaml"))
+            .expect_err("the example file holds placeholders");
+        assert!(
+            matches!(err, TokenFileError::PublishedToken { index: 0 }),
+            "{err:?}"
         );
     }
 
@@ -350,8 +414,10 @@ mod scheme_tests {
     /// at admission with the token file reading as fine.
     #[test]
     fn an_empty_scope_is_refused_at_load() {
-        let err = TokenAuthenticator::from_yaml("- token: t\n  actor: peer-a\n  scope: []\n")
-            .expect_err("permits nothing");
+        let err = TokenAuthenticator::from_yaml(
+            "- token: t-0123456789abcdef0123456789abcdef\n  actor: peer-a\n  scope: []\n",
+        )
+        .expect_err("permits nothing");
         assert!(
             matches!(err, TokenFileError::EmptyScope { index: 0 }),
             "{err:?}"
@@ -364,9 +430,9 @@ mod scheme_tests {
     async fn a_credential_that_is_not_a_bearer_token_names_nobody() {
         let auth = ring();
         for raw in [
-            "Basic a-long-random-string",
+            "Basic a-long-random-string-of-at-least-32-bytes",
             "Bearer",
-            "a-long-random-string",
+            "a-long-random-string-of-at-least-32-bytes",
             "",
         ] {
             assert!(

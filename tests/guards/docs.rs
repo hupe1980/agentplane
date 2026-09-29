@@ -214,12 +214,11 @@ fn the_release_workflow_selects_the_published_package_by_name() {
 
 /// **Nothing a release ships pulls `testkit` in.**
 ///
-/// `testkit` carries fault injection, a signer that mints its own attestations,
+/// `testkit` carries fault injection, a signer that mints its own signatures,
 /// and the exception that lets a peer be reached over plaintext — each of them
 /// documented, at its definition, as a thing that cannot exist in a production
-/// build. That claim was false for a year: `cli` listed `testkit`, so the
-/// published binary and the container image carried all three. The one thing
-/// `cli` actually needed was `provider: fake`, which is now `fake-model`.
+/// build. The fake provider a shipped binary may carry is `fake-model`, not
+/// `testkit`.
 ///
 /// A comment cannot hold this, because the failure is silent in both
 /// directions: adding `testkit` to a shipped feature compiles, tests pass, and
@@ -574,6 +573,37 @@ fn names_internal_document(line: &str) -> bool {
     })
 }
 
+/// This project's feature specifications and the Spec Kit machinery that writes
+/// them. Internal on the same terms as the design documents — gitignored and
+/// never packaged — so a path into either is a dead link.
+const INTERNAL_SPEC_FOLDERS: &[&str] = &["specs/", ".specify/"];
+
+/// Whether a line points into a feature specification.
+///
+/// Two spellings: a path under one of the folders above, and a bare requirement
+/// or success-criterion identifier (`FR-012`, `SC-003`), which is a pointer into
+/// a specification the reader does not have exactly as `§11.1` is a pointer into
+/// a design document. A folder name inside a longer path segment (`tla/specs/`
+/// would be one) is still the folder; a word that merely ends in the letters is
+/// not, which is what the preceding-character test decides.
+fn names_internal_specification(line: &str) -> bool {
+    let in_folder = INTERNAL_SPEC_FOLDERS.iter().any(|folder| {
+        line.match_indices(folder).any(|(at, _)| {
+            !line[..at].ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+    });
+    in_folder
+        || ["FR-", "SC-"].iter().any(|prefix| {
+            line.match_indices(prefix).any(|(at, _)| {
+                let digits = line[at + prefix.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .count();
+                !line[..at].ends_with(|c: char| c.is_ascii_alphanumeric()) && digits == 3
+            })
+        })
+}
+
 /// Whether a line cites a section of a document the reader does not have.
 ///
 /// A named specification before the section is a citation a reader can follow;
@@ -674,6 +704,36 @@ fn the_internal_reference_detectors_recognise_what_they_are_for() {
         !names_internal_document("see @/docs/concepts.md for the ideas"),
         "the site's own page must not be mistaken for the internal folder"
     );
+    assert!(
+        names_internal_specification(
+            "/// as specs/003-the-models-the-ladder-requires/spec.md requires"
+        ),
+        "the detector does not recognise a path into a feature specification"
+    );
+    assert!(
+        names_internal_specification("see .specify/memory/constitution.md"),
+        "the detector does not recognise the Spec Kit folder"
+    );
+    assert!(
+        names_internal_specification("/// holds FR-004 even after a restore"),
+        "the detector does not recognise a bare requirement identifier"
+    );
+    assert!(
+        names_internal_specification("/// the bound (SC-002) is measured, not stated"),
+        "the detector does not recognise a bare success-criterion identifier"
+    );
+    assert!(
+        !names_internal_specification("/// the TLA+ specs are checked by tla/verify.sh"),
+        "the detector fires on the word without the folder"
+    );
+    assert!(
+        !names_internal_specification("/// OWASP ASI-01 and a CVE-2026-12345 identifier"),
+        "the detector fires on somebody else's identifier scheme"
+    );
+    assert!(
+        !names_internal_specification("/// the XFR-001 register and an SC-12 tag"),
+        "the detector fires on a prefix inside a longer token or a different width"
+    );
 }
 
 /// Shipped source must not cite sections of the internal design document.
@@ -727,7 +787,10 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
             continue;
         }
         for (n, line) in text.lines().enumerate() {
-            if cites_internal_section(line) || names_internal_document(line) {
+            if cites_internal_section(line)
+                || names_internal_document(line)
+                || names_internal_specification(line)
+            {
                 offenders.push(format!(
                     "{}:{}: {}",
                     path.strip_prefix(root).unwrap_or(path).display(),
@@ -740,10 +803,11 @@ fn nothing_a_reader_sees_cites_an_internal_section_number() {
 
     assert!(
         offenders.is_empty(),
-        "an artifact a reader can see points into the internal design document — \
-         by section number, which they cannot resolve and which goes stale \
-         silently when the document is renumbered, or by name, which is a dead \
-         link because that file ships nowhere. State the reasoning instead:\n{}",
+        "an artifact a reader can see points into the internal design documents \
+         or feature specifications — by section number or requirement id, which \
+         they cannot resolve and which goes stale silently, or by path, which is \
+         a dead link because those files ship nowhere. State the reasoning \
+         instead:\n{}",
         offenders.join("\n")
     );
 }
@@ -1811,12 +1875,9 @@ fn the_published_no_provider_message_is_the_one_the_runtime_writes() {
 /// correct, because two documents would then be wrong the other way.
 const ABSENT_BY_DESIGN: &[(&str, &str)] = &[
     ("Egress", "allow_all"),
-    // Names the **upgrading** page cites because they were removed or renamed.
-    // That page is a historical record: its job is to say *this used to be X*,
-    // so the old spelling appearing there is correct and the guard asserts the
-    // absence rather than exempting the page. Re-adding one of these would make
-    // an upgrade note wrong in the other direction, which is why this list
-    // fails on resurrection instead of on mention.
+    // Names removed in a hard cut. Asserted absent rather than forgotten, so
+    // bringing one back is a decision somebody makes on purpose instead of a
+    // drift nobody notices.
     ("McpTaskSnapshot", "ttl_ms"),
     ("PlanNode", "with_quorum"),
     ("Spend", "is_zero"),
@@ -3135,20 +3196,6 @@ fn the_changelog_top_entry_is_this_version_and_released_ones_are_dated() {
     }
 }
 
-/// **A documented `agentplane` command line actually parses.**
-///
-/// The recovery drill is the block an operator copies during an incident, and a
-/// flag that does not exist fails there rather than in review. Every command in
-/// it had drifted — a positional documented as `--file`, `--anchor` for what is
-/// spelled `--checkpoint`, an `--out` that was never a flag — while the same
-/// page spelled `export` correctly two hundred lines earlier.
-///
-/// Read out of the source rather than by running the binary, for the reason
-/// the route walk is: a test that shells out is a test that is skipped wherever
-/// the binary is not built.
-///
-/// `upgrading.md` is exempt. Showing the old spelling beside the new one is
-/// that page's whole content.
 /// One `clap::Args` struct's long flags, including the renamed ones and **the
 /// ones it flattens**.
 ///
@@ -3198,9 +3245,15 @@ fn flags_of(cli: &str, ty: &str, depth: usize) -> std::collections::BTreeSet<Str
         {
             if flattening {
                 flattening = false;
+                // An optional group (`Option<StoreRef>`, flattened beside a
+                // subcommand) carries the same flags as the group itself.
                 out.extend(flags_of(
                     cli,
-                    rest.trim().trim_end_matches(',').trim(),
+                    rest.trim()
+                        .trim_end_matches(',')
+                        .trim()
+                        .trim_start_matches("Option<")
+                        .trim_end_matches('>'),
                     depth + 1,
                 ));
                 continue;
@@ -3213,6 +3266,17 @@ fn flags_of(cli: &str, ty: &str, depth: usize) -> std::collections::BTreeSet<Str
     out
 }
 
+/// **A documented `agentplane` command line actually parses.**
+///
+/// The recovery drill is the block an operator copies during an incident, and a
+/// flag that does not exist fails there rather than in review. Every command in
+/// it had drifted — a positional documented as `--file`, `--anchor` for what is
+/// spelled `--checkpoint`, an `--out` that was never a flag — while the same
+/// page spelled `export` correctly two hundred lines earlier.
+///
+/// Read out of the source rather than by running the binary, for the reason
+/// the route walk is: a test that shells out is a test that is skipped wherever
+/// the binary is not built.
 #[test]
 fn every_documented_command_line_uses_flags_the_cli_has() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3246,7 +3310,7 @@ fn every_documented_command_line_uses_flags_the_cli_has() {
 
     let mut pages: Vec<std::path::PathBuf> = walk(&root.join("site/content/docs"))
         .into_iter()
-        .filter(|p| p.extension().is_some_and(|e| e == "md") && !p.ends_with("upgrading.md"))
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
         .collect();
     pages.push(root.join("README.md"));
 
@@ -3267,7 +3331,17 @@ fn every_documented_command_line_uses_flags_the_cli_has() {
             let Some(ty) = verb_args.get(verb) else {
                 continue; // prose, or a verb that takes no flags
             };
-            let have = flags_of(&cli, ty, 0);
+            let mut have = flags_of(&cli, ty, 0);
+            // `agentplane retention plan --store …`: a subcommand's flags are
+            // the ones its line may use, beside any its parent takes.
+            if let Some(sub) = rest
+                .split_whitespace()
+                .nth(1)
+                .filter(|w| !w.starts_with('-'))
+                .and_then(|w| verb_args.get(w))
+            {
+                have.extend(flags_of(&cli, sub, 0));
+            }
             // Inline `# …` annotations are documentation, not arguments.
             let args: String = rest.split('`').step_by(2).collect::<Vec<_>>().join(" ");
             for word in args.split_whitespace() {

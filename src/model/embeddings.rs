@@ -238,7 +238,7 @@ impl Embedder for OpenAiEmbedder {
         let response = request
             .send()
             .await
-            .map_err(|e| StoreError::Backend(format!("{url}: {e}")))?;
+            .map_err(|e| StoreError::Backend(crate::netguard::transport_text(&e)))?;
         let status = response.status();
         // An embedding is one vector — a few tens of kilobytes — so the small
         // ceiling is generous here, and reading to end-of-stream would let the
@@ -667,7 +667,7 @@ impl Embedder for GeminiEmbedder {
             .json(&body)
             .send()
             .await
-            .map_err(|e| StoreError::Backend(format!("{url}: {e}")))?;
+            .map_err(|e| StoreError::Backend(crate::netguard::transport_text(&e)))?;
         let status = response.status();
         // An embedding is one vector — a few tens of kilobytes — so the small
         // ceiling is generous here, and reading to end-of-stream would let the

@@ -187,6 +187,7 @@ fn a_task_carries_no_component_array() {
         on_expiry: OnExpiry::Deny,
         created_at: at(),
         due_at: Some(at()),
+        withheld: None,
     };
     assert_no_component_array("Task", &task);
 }

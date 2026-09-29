@@ -284,7 +284,7 @@ impl Skill for Post {
         // `Recorded` binds its payload as the value a sink would send, so it
         // goes through `cx.sink` with the *same* value the gate is shown. Pass
         // anything else and the argument binding refuses the call — correctly,
-        // and the refusal now names the first differing JSON pointer.
+        // and the refusal names the first differing JSON pointer.
         let arguments = Tainted::trusted(json!(null));
         let posted = cx.sink(Recorded::new("ledger.post"), &arguments).await?;
         Ok(Outcome::done(posted))

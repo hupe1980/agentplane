@@ -8,11 +8,8 @@ group = "Trust"
 +++
 
 > **Evaluating this against a control catalogue?** The questions evaluators
-> actually ask — and keep re-asking, because the answers are spread across
-> pages — are collected in one table:
-> [answers evaluators have had to ask for](@/docs/regulation.md#evaluator-questions).
-> It sits on the regulation page and is not a statutory table; start there and
-> follow the links.
+> ask, with a link to where each is answered, are one table on the regulation
+> page: [evaluator questions](@/docs/regulation.md#evaluator-questions).
 
 What this runtime defends, how, and — the part most security documents omit —
 **what it does not cover**. The residual column in every table below is not
@@ -214,8 +211,7 @@ A refused redirect is `ModelError::Egress` — this plane's decision, not the
 provider's — so it spends no retry attempt and sends whoever reads it to their
 own gateway configuration rather than to a vendor status page.
 `tests/guards/layering.rs::every_outbound_client_is_guarded` counts the
-constructions, because a prose list of the doors is what this rule carried
-before and it went stale twice. Governed media is the one exception and is
+constructions, because a prose list of the doors goes stale. Governed media is the one exception and is
 named there: it resolves a URL itself and pins the connection to the addresses
 it judged, which `reqwest` applies *over* a custom resolver rather than
 through it.
@@ -243,8 +239,8 @@ call carries a timeout, which bounds how long an answer may take and says
 nothing about how much arrives inside it — a fast endpoint delivers a gigabyte
 long before one fires, and one OOM takes down every run on the instance.
 
-`netguard::intake` is that ceiling, applied twice per call: against the declared `Content-Length`
-before a byte is read, then against the accumulated bytes. The second is the one
+`netguard::intake` is that ceiling, applied twice per call: against the declared
+`Content-Length` before a byte is read, then against the accumulated bytes. The second is the one
 that matters — the header is a claim by the party under suspicion.
 
 | What is being read | Ceiling |
@@ -280,8 +276,8 @@ gateway has no public address, and refusing it leaves an operator running a
 sidecar that terminates TLS and forwards in clear.
 
 An MCP server URL is not that string. This crate **never dereferences it**:
-`McpClient::connect` takes a transport and `McpClient::new` an already-initialised `rmcp` service, so the transport is
-dialled by the embedder's own code and an initialised `RunningService` does not
+`McpClient::connect` takes a transport and `McpClient::new` an already-initialised
+`rmcp` service, so the transport is dialled by the embedder's own code and an initialised `RunningService` does not
 disclose the host it reached. The `mcp-http` feature enables an `rmcp` transport;
 it does not add a URL this crate holds. So there is nothing here for `netguard`
 to guard — and correspondingly nothing for the crate to parse, which is exactly
@@ -289,7 +285,7 @@ why `Destination` is a value the wiring supplies rather than something the clien
 infers.
 
 What that leaves is the operator's own decision, which is the one the table
-above now covers: name the host in `.egress(..)` and in the client's
+above covers: name the host in `.egress(..)` and in the client's
 `destination()`, and a remote MCP server is held to the same allowlist as a
 model provider.
 
@@ -340,11 +336,9 @@ might be attacking the policy learns nothing it can tell apart.
 
 There is exactly one path in the runtime where a refusal reaches a model — the
 tool-calling loop's failed-call result — and it is the enforcement point rather
-than a place the rule is remembered. Worth stating plainly, because the rule
-being written down is not the same as it being applied: `for_model` existed and
-was tested by calling it directly, which proves the *function* is uniform and
-says nothing about whether anything uses it. The test that matters runs an agent
-whose call is refused and reads what the next turn was told.
+than a place the rule is remembered. A test of `for_model` alone proves the
+*function* is uniform, not that anything uses it; the test that matters runs an
+agent whose call is refused and reads what the next turn was told.
 
 That leaves the refused/allowed bit itself, which no wording removes short of
 fabricating success. `Budget::max_denials` bounds it instead — a ceiling on how
@@ -353,15 +347,17 @@ operational one: a run stuck in a denial loop has stopped making progress.
 
 #### What `max_denials` counts {#what-max-denials-counts}
 
-**The two paths do not behave alike.** A **sink** refusal — an untrusted value in a protected
-field, a sensitivity over a ceiling — comes back to a tool-calling model as
+**The two paths do not behave alike.** A **sink** refusal — an untrusted value in
+a protected field, a sensitivity over a ceiling — comes back to a tool-calling model as
 `REFUSED`, the loop continues, and the model may try again. Those accumulate,
 and this is the ceiling that stops them: it is the channel a model can actually
 probe. An **engine** denial is not model-facing at all. In that same loop it
 ends the run outright, which is a stricter bound than any ceiling, and it
 accumulates only where a run's own code catches `StepError::Denied` and carries
 on. Both are counted, because counting only the second would leave the ceiling
-naming a channel it never reached.
+naming a channel it never reached. A tool's [rate ceiling](@/docs/manifest.md#rate-limit)
+refusing a call is not counted: it is back-pressure across runs, not a probe of
+this one's authority.
 
 The check sits **before** the policy is consulted, and that is a statement about
 its position rather than its purpose: a refusal is journaled as it happens, so a
@@ -414,7 +410,7 @@ data may set parameters, not choose control flow.
 ### Quarantining a parse
 
 The dual-model pattern's quarantined step — a model with no tools parsing
-hostile text into a bounded shape — exists three ways, and none promotes
+hostile text into a bounded shape — exists four ways, and none promotes
 trust:
 
 * **A `planned` agent's `parse` step** — the full form: control flow fixed
@@ -601,8 +597,11 @@ replay reads it back from `IdentityBound` rather than from the plane's current
 configuration. It also travels across every hand-off: `cx.commission` admits its
 sub-run under the orderer's chain plus one link naming the commissioned agent
 (`agent/<capability>`, the orderer's effective scope, its expiry and audience
-inherited), and `cx.call_peer` sends the peer the same chain plus one link
-naming the peer, narrowed to the registry's grant — so a room's every journal,
+inherited) — or, for an orderer with no chain, exactly as the orderer acts: a
+chainless served caller's sub-run under none, the plane's own run's sub-run as
+the plane, which on a plane with no chain of its own is what holds the
+tenant's standing authorities — and `cx.call_peer` sends the peer the same
+chain plus one link naming the peer, narrowed to the registry's grant — so a room's every journal,
 on this plane or another, answers "on whose behalf" with the same owner, and a
 chain with no room for another hop refuses at the hand-off.
 
@@ -648,8 +647,9 @@ Without it a deployment could write *"amounts over 5000 need approval"* but not
 two graphs would exist only in the checks this crate happens to have written.
 
 `cx.effect` presents no label, because it has no labelled value to bind. Absent
-is **not** trusted: a rule requiring a source simply does not match, so it fails
-closed.
+is **not** trusted: a rule guarded with `context has label` does not match, and
+an unguarded read is an evaluation error, which refuses the call —
+[below](#the-authorization-context).
 
 ### Where a content classifier hangs, and where it does not
 
@@ -682,17 +682,48 @@ the policy seam it stops the run with a rule name and no evidence at all.
 
 Policy is total and side-effect free so that a third party can re-derive a
 verdict without running the plane. That only works if **every input it consulted
-is on the record** — otherwise re-deriving means guessing at the parts that are
-missing, and the honest answer becomes *take our word for it*.
+is on the record**, and something performs the derivation.
 
-So a `sink` dispatch journals the label the gate saw, on `EffectStarted`, beside
-the descriptor it authorized. An effect that binds no value records none, so the
-field says *what was presented* rather than defaulting to something plausible.
+`agentplane policy check --bundle <bundle> --from export.jsonl` does. It rebuilds
+each gated request from the export — through the same builders the live gates
+call, so the two cannot drift — and evaluates it against the bundle:
 
-This was a real gap and a recent one: the label reached the policy request one
-revision before it reached the journal. A control strengthened without its
-evidence following is the shape that makes an audit trail quietly insufficient
-while looking complete.
+| request | rebuilt from |
+|---|---|
+| `run:admit` | `RunAdmitted` (capability, input, declaration) and `IdentityBound` |
+| `effect:perform` | `EffectStarted` (descriptor, `mutates`, outbound label), with the above |
+| `data:release` | `Released` (release, label), with the above |
+
+`EffectStarted.mutates` is the value the gate was asked with — the effect's
+claim widened by a grant — and the outbound label is journaled for the same
+reason. The **tenant** is on no record, so the check is told it (`--tenant`)
+and the report says whether it was supplied or assumed.
+
+A run is evaluated only when the supplied bundle's identity is the one its
+`RunAdmitted` names; otherwise it is a *mismatch*, and a run no bundle governed
+is *ungoverned* — neither is ever reported clean. A recorded permit the bundle
+refuses is a finding. With `--candidate`, every recorded permit is also
+evaluated against a second bundle and the report lists, per run, what it would
+newly deny and where it could not evaluate at all.
+
+What it reports as **not evaluable** rather than guessing:
+
+* a refusal — `PolicyDenied` names the action and resource, not the arguments,
+  label and `mutates` a rule read, so a candidate cannot be said to permit it;
+* arguments sealed without a key ring, or erased;
+* a compensating effect (it never passed the gate), a member of a group that
+  did not commit (its reversals skipped the gate and nothing marks them), and
+  an effect of a durable wait's kind (`timer.sleep`, `event.await`), which a
+  skill may also use;
+* a step of a run whose steps ran more than one skill — the gate presents the
+  acting skill's declaration, and only the admitted one's is recorded.
+
+A refused admission leaves no journal, and the served surfaces' gates do not
+journal their roles or callers, so neither is in any export; the report says so
+once. The check proves agreement between a bundle and a record, not that the
+record is whole — `verify` the same file for that. It reads one file, writes
+nothing and is reachable from no replay: its answer is a report about history,
+never an input to a gate.
 
 ### The engine cannot fail
 
@@ -865,12 +896,13 @@ always present
   context.run               string    the run id
   context.step              long
   context.tenant            string
-  context.mutates           bool      whether this effect changes the world
+  context.mutates           bool      whether this effect changes the world — its own
+                                      claim, widened by a grant declaring it mutating
   context.args              record    the effect's own descriptor arguments
 
 conditional — guard with `context has …` before reading
   context.label             record    sinks only — see below
-  context.owner             string    only where a delegation chain is configured
+  context.owner             string    only where the run acts under a delegation chain
   context.subject           string    ditto
   context.delegation_depth  long      ditto
   context.scope             list      ditto — the chain's effective scope patterns
@@ -905,7 +937,10 @@ The plane refuses to build rather than letting you find this at the first
 effect of the first run: `try_build` evaluates the compiled set against a
 canonical request of each shape it will actually issue — including, when no
 chain is configured, the shape without the delegation attributes — and reports
-any rule that cannot be evaluated as `BuildError::PolicyUnevaluable`. A run
+any rule that cannot be evaluated as `BuildError::PolicyUnevaluable`. A served
+surface (A2A, MCP) also probes the one shape the build cannot know about — a
+caller acting under no chain on a plane that has one — and refuses to start
+over a rule that cannot evaluate it. A run
 that reaches a broken rule anyway is refused as `Malformed` rather than
 `Deny`, because *the rules say no* and *the rules are broken* call for
 opposite responses and the difference should not live in a sentence somebody
@@ -932,8 +967,8 @@ For `tool.call`, `context.args` carries `{ server, tool, arguments }` — which 
 what lets a rule speak about one server without speaking about every tool on it.
 
 The governing declaration arrives under `context.agent`, at **every** gate a
-declared agent reaches — `run:admit`, `effect:perform` and
-`information_flow.release`:
+declared agent reaches — `run:admit`, `effect:perform` and `data:release` (asked
+on the resource `information_flow.label`):
 
 ```text
 context.agent.name       the declared name — for reading, never for granting
@@ -943,11 +978,11 @@ context.agent.publisher  the KeyId that vouched for it, or absent
 ```
 
 It is the same block in each, because a deployment writes one rule about a
-revision and expects it to mean the same thing wherever it is evaluated. It
-matters most *away* from admission: an effect's principal is the agent's own
-`metadata.name`, which any file can claim, so a rule that wants to trust one
-revision — an escalation that auto-approves, a sink only a reviewed build may
-reach — has to bind to the digest rather than to the name beside it.
+revision and expects it to mean the same thing wherever it is evaluated. The
+**principal** is the same at all three as well: the subject of the chain the run
+acts under, or — for a run with no chain — the capability it was admitted for.
+Neither names a revision, so a rule that wants to trust one — an escalation that
+auto-approves, a sink only a reviewed build may reach — binds to the digest.
 
 Guard it: a run no declaration governs carries no `agent` block at all, so a rule
 reads `context has agent` before reading into it. Absent rather than fabricated
@@ -972,7 +1007,7 @@ permit(
 permit(principal, action == Action::"effect:perform", resource);
 
 forbid(principal, action == Action::"effect:perform", resource)
-when { context.mutates && context.label.trust == "untrusted" };
+when { context.mutates && context has label && context.label.trust == "untrusted" };
 ```
 
 **That one denies every mutating call a tool loop will ever make, and it is the
@@ -980,8 +1015,8 @@ snippet on this page most likely to be copied.** `context.label` is the label of
 the **whole argument bundle**, and in a `tool-calling` agent the bundle is
 assembled from a model completion — which is untrusted unconditionally, because
 its source is a model. So after any model turn the `forbid` matches everything
-mutating. A deployment shipped this rule, passed its own unit tests, and found
-it end to end: a hand-written context is a context assembled to suit the rule.
+mutating. A unit test with a hand-written context does not show this; a run
+does.
 
 Per-argument trust is what [protected sink
 fields](@/docs/manifest.md) are for, and they are the reason this coarse rule is
@@ -991,8 +1026,11 @@ runtime enforces the coarse version structurally anyway — a mutating grant tha
 names no protected fields is refused for a `tool-calling` agent **at parse**, so
 the case this rule is reaching for cannot be deployed in the first place.
 
-Write it, if you write it, for the effects a *skill* dispatches, where the
-argument bundle's label is something your own code decided:
+Write it, if you write it, for a coded skill's `cx.sink` calls, where the
+value's label is something your own code decided. `label` is present only on
+sink calls — a skill's `cx.effect` carries none — so the rule reads
+`context has label` before it reads into it; without the guard it errors on
+every mutating call that is not a sink, and the gate refuses them all:
 
 ```cedar
 // Scoped to the kinds a coded skill builds its own arguments for, so a tool
@@ -1002,6 +1040,7 @@ permit(principal, action == Action::"effect:perform", resource);
 forbid(principal, action == Action::"effect:perform", resource)
 when {
     context.mutates &&
+    context has label &&
     context.label.trust == "untrusted" &&
     !context.label.provenance.containsAny(["model:privileged", "model:quarantined"])
 };
@@ -1023,6 +1062,7 @@ permit(principal, action == Action::"effect:perform", resource);
 
 forbid(principal, action == Action::"effect:perform", resource)
 when {
+    context has label &&
     context.label.sensitivity == "confidential" &&
     context.label.provenance.contains("peer:broker")
 };
@@ -1030,9 +1070,12 @@ when {
 
 ```cedar
 // A depth cap, expressible only because the runtime puts depth in the context.
+// Guarded: a run with no chain carries no depth, and neither does any request
+// the operator API or A2A surface asks.
 permit(principal, action == Action::"effect:perform", resource);
 
-forbid(principal, action, resource) when { context.delegation_depth >= 3 };
+forbid(principal, action, resource)
+when { context has delegation_depth && context.delegation_depth >= 3 };
 ```
 
 **Why each of those carries a `permit`.** Cedar denies unless some `permit`
@@ -1049,14 +1092,15 @@ narrow it — because Cedar allows on **any** matching permit. A baseline is
 something to remove deliberately, not something to inherit.
 
 **The failure mode to know about.** Cedar is *total*: a `when` clause reading an
-attribute that is not in the context does not raise — the policy is simply
-unsatisfied, and an evaluation error surfaces only in the diagnostics beside
-the decision. So a `forbid` keyed on a misspelled attribute contributes
-nothing, and whatever `permit` accompanies it would decide. The adapter
-refuses to let that happen: **an `Allow` accompanied by evaluation errors is
-denied**, because the one rule that would have said no may be exactly the one
-that broke. The failure this closes is quiet: a rule reading a context key the
-runtime never sends fails open while every test around it passes. Check a
+attribute that is not in the context does not raise out of the evaluator —
+Cedar records an evaluation error in the diagnostics beside the decision and
+skips that rule. Left there, a `forbid` keyed on a misspelled attribute would
+contribute nothing, and whatever `permit` accompanies it would decide. The
+adapter refuses to let that happen: **any evaluation error refuses the
+request** as `Malformed`, whatever Cedar decided, because the one rule that
+would have said no may be exactly the one that broke. The failure this closes is
+quiet: a rule reading a context key the runtime never sends fails open while
+every test around it passes. Check a
 policy against the shape above, or against a real run; never against a context
 assembled to suit the rule.
 
@@ -1118,10 +1162,11 @@ cryptographically verifiable ID rather than trusting a workload's own claim abou
 who it is.
 
 So the declaration reaches policy as **context** — name, version and digest — and
-the principal stays an authenticated identity: the delegation chain's subject
-where one is configured, and otherwise the capability, which claims nothing. The
-same fallback is used by the scope check, so one refused run gives one answer to
-*who was refused* rather than two.
+the principal stays an authenticated identity: the subject of the chain the run
+acts under — its caller's, or the plane's — and otherwise the capability, which
+claims nothing. The same principal is asked at admission, at every effect and at
+every release, and the scope check refuses under it too, so one run gives one
+answer to *who* at every gate.
 
 Rules that need to bind to an exact revision bind to `context.agent.digest`. The
 digest is content-addressed and covers the prompt, the model grants and the
@@ -1188,7 +1233,7 @@ shallow on purpose: only the direct elements of the conversation positions a
 driver hands to the wire, because data the model reasons about may
 legitimately contain a `role` field, and inside content it instructs nobody.
 
-The residual is unchanged and worth stating: this does not stop a model being
+The residual is worth stating: this does not stop a model being
 *persuaded* by content in `messages`. It stops the persuasion from arriving with
 the authority of the task itself, and everything downstream — untrusted output,
 protected sink fields, the egress ceiling — still stands between a persuaded
@@ -1326,9 +1371,13 @@ passes, and the only volume-shaped ceilings — a budget's effect count, a tenan
 quota — are cost controls that bound work rather than disclosure. An extraction
 sized just under either is invisible to them.
 
-So `EffectStarted` carries **`outbound_bytes`**: the canonical size of the value
-that crossed the sink, beside the label of what crossed it. Absent when an effect
-binds no value, so the ordinary record is unchanged.
+So `EffectStarted` carries **`outbound_bytes`**: the canonical size of what the
+effect sends, beside the label of what crossed the sink. For most effects that is
+the bound value itself; a model call sends more than its prompt — the tool
+declarations, every earlier tool result, the continuation state, and each granted
+media artifact at its base64 size — and counts all of it, because a tool-loop
+turn's prompt can be two bytes while its request is megabytes. Absent when an
+effect binds no value, so the ordinary record is unchanged.
 
 The figure is not itself a control — *forty times the median for this
 capability* is a threshold a deployment sets against its own traffic, not one
@@ -1336,10 +1385,9 @@ this crate could pick. What it supplies is the number, so that rule is an
 ordinary query over the journal.
 
 Beside it sits the ceiling: **`Budget::max_egress_bytes`**, declarable as
-`spec.budgets.max_egress_bytes`, bounding the total a run may send. It is the
-one ceiling in this crate that is **exact** — every metered limit compares a cost
-it cannot know until the call returns and so overshoots by one operation, while
-an outbound size is in hand before dispatch, so the call that would cross the
+`spec.budgets.max_egress_bytes`, bounding the total a run may send. Unlike the
+metered limits it is **exact** — they compare a cost they cannot know until the
+call returns and so overshoot by one operation, while an outbound size is in hand before dispatch, so the call that would cross the
 ceiling is the call refused. Zero is meaningful and says *may read, may not
 send*.
 
@@ -1460,10 +1508,14 @@ and authority never depends on it.
 [nist]: https://csrc.nist.gov/pubs/sp/800/207/a/final
 [spiffe]: https://spiffe.io/
 
+### A resumed run meets the bundle it was admitted under
+
 An open run in `Resume` mode can cross the end of history and dispatch effects.
 It must present exactly the bundle recorded at admission; any difference is a
-loud `PolicyBundleChanged` refusal. `Strict` replay dispatches nothing, so it
-does not need the historical evaluator and does not compare bundles.
+`PolicyBundleChanged` refusal, journaled as the run's quarantine so the run stays
+listed until somebody reopens it under the recorded bundle or abandons it.
+`Strict` replay dispatches nothing, so it does not need the historical evaluator
+and does not compare bundles.
 
 The live tail past the recorded prefix runs under **every** gate the original
 live pass ran under — the egress and sensitivity ceilings, the mutates
@@ -1572,10 +1624,9 @@ tool may do; the transport decides what is known about what happened.
 | `UnexpectedResponse` | `Landed` |
 
 A successful response prefers `structuredContent`; otherwise every MCP content
-block is serialized as typed JSON. Flattening only text blocks made a valid
-image, audio or embedded-resource result become an empty string. Interpretation
-still belongs to the skill, but transport must not destroy data before the
-skill sees it.
+block — text, image, audio, embedded resource — is serialized as typed JSON.
+Interpretation belongs to the skill, and the transport destroys nothing before
+the skill sees it.
 
 Three of those are worth defending, because the tempting answer is wrong in the
 expensive direction each time:
@@ -1587,11 +1638,6 @@ expensive direction each time:
   the same error.
 * **A non-rejection `McpError` is not `DidNotHappen`.** Only an explicit
   rejection — bad method, bad params, unparseable — means the tool never ran.
-
-That last one had **no test** until mutation testing found it: the suite
-exercised only `INVALID_PARAMS`, which is legitimately a rejection, so a mutation
-collapsing the whole `McpError` arm into "the server declined" passed everything.
-`a_server_error_during_execution_is_in_doubt_not_a_rejection` covers it now.
 
 Tests run a real rmcp server in-process over a duplex pipe — genuine
 initialisation, `tools/list` and `tools/call` — with no network and no child
@@ -1617,10 +1663,8 @@ invites the effect's `Recovery` to resolve the outcome, and for one the peer has
 already reported there is nothing to resolve — asking again returns the same
 error, and repeating the call is the only other option.
 
-Fitting MCP to this exposed a gap in `EffectError`: there was no way to say *the
-peer performed the operation and it failed*. `Rejected` means nothing was
-applied, and the only other `Landed` variant was a decode error. Hence
-`EffectError::Performed`.
+`EffectError::Performed` is how a transport says *the peer performed the
+operation and it failed*; `Rejected` means nothing was applied.
 
 ## Content guardrails
 
@@ -1669,6 +1713,42 @@ in a refusal a prober can map.
 Providers without a native guardrail get **no emulation**. That is the same
 honest smaller contract as reasoning effort on Converse: a control this
 runtime cannot actually apply is not one it will claim.
+
+## What a reviewer is shown {#what-a-reviewer-is-shown}
+
+An approval is a control only over what the approver could see. Two things
+stand between a proposal and a person's eyes, and the plane answers both on
+every surface that shows a task — the HTTP worklist and `agentplane tasks`
+print one rendering, computed from the stored task alone.
+
+**Characters that render as nothing are shown.** A Unicode tag suffix on an
+account, a right-to-left override that reverses an amount's digits, a
+zero-width space or a variation selector carrying data: each is escaped in
+place (`\u{202E}`) in the rendering, and the task says it needed escaping. The
+classes are control characters, bidirectional marks, embeddings, overrides
+and isolates, zero-width and joiner controls, the byte-order mark, fillers that
+render blank, variation selectors and the tag block.
+
+**A word mixing alphabets is flagged, not changed.** `Pаypal` with a Cyrillic
+`а` is listed beside the text with where it occurs and which scripts it mixes.
+Nothing is refused: the plane holds no script policy, and a payee named in a
+non-Latin script is not an attack. The script table is coarse — the alphabets
+homoglyphs are drawn from — and is not Unicode's full confusable relation.
+
+**A proposal the plane cannot open is withheld, and says why.** Sealed at rest
+and read without the key ring, erased with its case, or damaged: the task
+carries the reason and no proposal, never the sealed envelope a client could
+display as the arguments. An approval of it is refused before anything is
+claimed or recorded, in its own error class; a rejection, which refuses the
+unseen, records. The reason travels with the row out of band, so clear
+arguments that happen to be spelled like an envelope are approvable
+arguments, not a withheld proposal.
+
+What is bound stays what was stored: an approval names the digest of the
+justification its decider claimed, and the run refuses one that is not the
+task it proposed. A client that shows the structured `justification` to a
+person instead of the rendering shows invisible characters as nothing — that
+choice is the client's.
 
 ## What is not covered
 
@@ -1775,7 +1855,7 @@ wrongly:
 | **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. This runtime does not claim to sandbox native code: untrusted executables belong behind a governed MCP/A2A/tool boundary and an OS process or container boundary |
 | **An operator who holds the signing key** | Signatures bind authorship, not existence. Whoever controls the workload identity can produce a perfectly signed alternative history |
 | **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, and `HttpWitness` speaks C2SP `tlog-witness` — the [wire and its outcomes](@/docs/journal.md#the-audit-an-outsider-runs). What is absent is not code but a **counterparty**: until a second party runs a witness for your log, a witness you host yourself does not protect auditors from you |
-| **Revocation** | A delegation is valid until it expires; there is no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead |
+| **Revocation** | A delegation is valid until it expires; the policy gate consults no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead, and an operator withdraws a credential with a halt scoped to its subject, which pauses the runs acting for it → [the emergency stop](@/docs/operations.md#the-emergency-stop) |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |
 | **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL; the Bedrock driver takes no `Egress`, because the AWS SDK will not disclose the endpoint it dialled. What stands in its place is the deployment's own network policy |

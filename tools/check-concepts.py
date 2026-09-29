@@ -36,6 +36,15 @@ Three rules, all of them stated in `concepts/README.md`:
    not the only honest one: a wait that is prose rather than work — because
    nothing here can start it — owns its deferral the same way, by naming it and
    saying what would settle it.
+7. **Every open item is specified, and every specification is open.** The
+   roadmap is the direction and the only list of open work; the detail of what
+   an item must deliver lives in `specs/NNN-slug/spec.md`, written with Spec
+   Kit. Each `###` item carries `**Specified as:**` naming its folder, and each
+   folder directly under `specs/` is named by exactly one item — so a spec
+   whose item was discharged has moved to `specs/archive/`, and an item cannot
+   point at detail that does not exist. Rules 1 and 4 read the specifications
+   too: a spec cites the same sections and the same code the folder does, and
+   rots the same way.
 5. **A deferred cost is named where it will be paid.** A decision that parks a
    durable-format change until the format freeze marks itself a *pre-freeze
    record change*, and the freeze act is the one place that list is worth
@@ -54,6 +63,8 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent / "concepts"
+SPECS = ROOT.parent / "specs"
+SPEC_DIR = re.compile(r"^\d{3}-[a-z0-9-]+$")
 
 # Reference to somebody else's specification, which this folder's numbering
 # says nothing about. Anything else is a claim about a heading here.
@@ -101,6 +112,12 @@ def main() -> int:
         print(f"{ROOT} holds no documents")
         return 1
 
+    specs: dict[str, str] = {}
+    if SPECS.is_dir():
+        for d in sorted(SPECS.iterdir()):
+            if d.is_dir() and SPEC_DIR.match(d.name) and (d / "spec.md").is_file():
+                specs[f"specs/{d.name}/spec.md"] = (d / "spec.md").read_text()
+
     defined: set[str] = set()
     for text in docs.values():
         for m in re.finditer(r"^#{1,4}\s+(\d+(?:\.\d+)*)[.\s]", text, re.M):
@@ -109,7 +126,7 @@ def main() -> int:
     faults: list[str] = []
 
     # 1. Section references.
-    for name, text in docs.items():
+    for name, text in {**docs, **specs}.items():
         for m in re.finditer(r"§(\d+(?:\.\d+)*)", text):
             before = text[max(0, m.start() - 12) : m.start()]
             if FOREIGN.search(before + "§"):
@@ -172,7 +189,7 @@ def main() -> int:
     # somebody else's lowercase vocabulary skip without an exemption list.
     modules = {p.stem for p in (ROOT.parent / "src").rglob("*.rs")}
     modules |= {d.name for d in (ROOT.parent / "src").iterdir() if d.is_dir()}
-    for name, text in docs.items():
+    for name, text in {**docs, **specs}.items():
         for m in re.finditer(r"`([a-z_][a-z0-9_]*)::([a-z_][A-Za-z0-9_]*)`", text):
             module, item = m.group(1), m.group(2)
             if module not in modules or item in surface or item in modules:
@@ -183,7 +200,7 @@ def main() -> int:
                 f"and an item it does not"
             )
 
-    for name, text in docs.items():
+    for name, text in {**docs, **specs}.items():
         for m in re.finditer(r"`([A-Z][A-Za-z0-9]*)::([A-Za-z_][A-Za-z0-9_]*)`", text):
             ty, member = m.group(1), m.group(2)
             # A type this crate does not define is somebody else's vocabulary —
@@ -278,10 +295,45 @@ def main() -> int:
                 f"status page does not defer it under that name"
             )
 
+    # 7. Open items and their specifications, one to one.
+    #
+    # Both directions, and the absence of the folder is a fault rather than a
+    # skip: an item naming a specification is a claim, and a check that passes
+    # because the subject is missing is the shape this project treats as a
+    # defect.
+    roadmap = docs.get("ROADMAP.md", "")
+    live = {name.split("/")[1] for name in specs}
+    owners: dict[str, list[str]] = {}
+    items = re.findall(r"^### (.+?)\n(.*?)(?=^#{2,3} |\Z)", roadmap, re.M | re.S)
+    for heading, body in items:
+        named = re.findall(r"^\*\*Specified as:\*\*\s+`([^`]+)`", body, re.M)
+        if len(named) != 1:
+            faults.append(
+                f"ROADMAP.md: {heading!r} names {len(named)} specifications — every "
+                f"open item carries exactly one `**Specified as:**` line"
+            )
+            continue
+        owners.setdefault(named[0], []).append(heading)
+        if named[0] not in live:
+            where = (
+                "is archived — a discharged specification's item is deleted, not kept"
+                if (SPECS / "archive" / named[0]).is_dir()
+                else "does not exist"
+            )
+            faults.append(f"ROADMAP.md: {heading!r} is specified as {named[0]!r}, which {where}")
+    for spec, headings in sorted(owners.items()):
+        if len(headings) > 1:
+            faults.append(f"ROADMAP.md: {spec!r} is claimed by {len(headings)} items: {headings}")
+    for spec in sorted(live - owners.keys()):
+        faults.append(
+            f"specs/{spec}: no roadmap item names it. Open work outside the roadmap is "
+            f"a second backlog; a discharged one moves to specs/archive/"
+        )
+
     checked = sum(len(re.findall(r"\]\([A-Z][A-Za-z]*\.md", t)) for t in docs.values())
     print(
-        f"{len(docs)} documents, {len(defined)} sections, {checked} cross-file links, "
-        f"{len(surface)} names on the crate surface"
+        f"{len(docs)} documents, {len(specs)} specifications, {len(defined)} sections, "
+        f"{checked} cross-file links, {len(surface)} names on the crate surface"
     )
     for fault in faults:
         print(f"  {fault}")

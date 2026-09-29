@@ -826,7 +826,7 @@ pub async fn audit(
         }
         let chain = match evidence.verifier {
             Some(v) => {
-                Record::verify_attested(&records, Digest::ZERO, v, evidence.require_signatures)
+                Record::verify_signed(&records, Digest::ZERO, v, evidence.require_signatures)
             }
             None => Record::verify_chain(&records, Digest::ZERO),
         };

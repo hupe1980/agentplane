@@ -14,7 +14,7 @@ use serde_json::Value;
 use crate::case::{CaseStore, EventStore, TaskStore, TimerStore};
 use crate::core::{
     AwaitSpec, Calendar, CaseId, CaseStatus, CaseVersion, CorrelationKey, Deadline, DeadlineSpec,
-    DeadlineState, Decision, Effect, EffectDescriptor, EffectKey, Epoch, Ledger, OnExpiry, Phase,
+    DeadlineState, Decision, Effect, EffectDescriptor, EffectKey, Epoch, Expiry, Ledger, Phase,
     PolicyError, RunId, StepError, StepId, Subscription, Tainted, Task, TaskId, TaskSpec,
     TaskState, Timestamp, canon,
 };
@@ -31,6 +31,23 @@ use super::effects::{Clock, ResolveDeadline};
 use super::metrics;
 use super::telemetry;
 use tracing::Instrument;
+
+/// The label an effect's output carries, from its declaration and source.
+///
+/// Raised, never lowered: an untrusted result is already `Internal`, and an
+/// effect that could declare its output *less* sensitive than its provenance
+/// implies would be a laundering primitive.
+fn output_label(
+    declared: crate::core::DeclaredOutput,
+    source: &crate::core::SourceId,
+) -> crate::core::Label {
+    let base = match declared.trust {
+        crate::core::Trust::Trusted => crate::core::Label::trusted(),
+        crate::core::Trust::Untrusted => crate::core::Label::untrusted(source.clone()),
+    };
+    let sensitivity = base.sensitivity.max(declared.sensitivity);
+    base.with_sensitivity(sensitivity)
+}
 
 /// What the wiring declares about an effect's data ceilings, carried to the
 /// manifest gate beside the descriptor.
@@ -96,8 +113,21 @@ impl std::fmt::Debug for CaseContext {
 /// `Repair` says the wait was announced but its registration may not have
 /// survived — the caller re-registers idempotently under the same key.
 enum ReplayedWait {
-    Recorded(Tainted<Value>),
+    Recorded(Box<Arrival>),
     Repair,
+}
+
+/// What a durable wait received: the value, and who the delivery named.
+///
+/// The value's label already carries the sender as provenance; the two fields
+/// beside it are for a wait that must hold an answer to its origin rather than
+/// merely label it — a human task, whose answer counts only from the worklist.
+struct Arrival {
+    value: Tainted<Value>,
+    /// The sender, as the delivery recorded it.
+    source: Option<String>,
+    /// The operator this plane minted the event for, when it minted one.
+    by: Option<crate::core::Operator>,
 }
 
 /// What the journal says about an effect attempt a replay just met.
@@ -187,6 +217,9 @@ pub(crate) struct Frame {
     /// dispatches no tool call for an allowlist to judge.
     #[cfg(feature = "manifest")]
     pub egress: Option<Arc<crate::core::Egress>>,
+    /// The plane's rate ceilings and the store that counts them.
+    #[cfg(feature = "manifest")]
+    pub rates: Option<Arc<Rates>>,
     /// The highest sensitivity this plane will write into a record, when it
     /// says. The plane-level twin of `spec.security.max_sensitivity_journaled`.
     pub journal_ceiling: Option<crate::core::Sensitivity>,
@@ -246,6 +279,32 @@ pub(crate) struct RecordedGroup {
     pub(crate) settled: usize,
 }
 
+/// The first attempt of every dispatch; attempts are 1-based.
+const FIRST_ATTEMPT: u32 = 1;
+
+/// A rate counter that could not answer, as the step error it becomes.
+///
+/// Fails **closed**: a ceiling that yields when its store is unreachable is one
+/// an attacker removes by making the store unreachable. Not journaled — nothing
+/// was decided, and a resume asks again.
+#[cfg(feature = "manifest")]
+fn rate_counter_unreachable(error: &crate::quota::QuotaError) -> StepError {
+    StepError::Store(crate::core::StoreError::Backend(error.to_string()))
+}
+
+/// The rate ceilings a plane's declarations state, and where they are counted.
+///
+/// Plane-wide rather than per declaration: the count is per tool reference, so
+/// every ceiling any agent on the plane states for a tool binds every dispatch
+/// of it, whoever makes it.
+#[cfg(feature = "manifest")]
+#[derive(Debug)]
+pub(crate) struct Rates {
+    pub(crate) store: Arc<dyn crate::quota::QuotaStore>,
+    /// Every distinct ceiling stated per tool reference, tightest count first.
+    pub(crate) ceilings: BTreeMap<String, Vec<crate::quota::RateCeiling>>,
+}
+
 /// Per-step execution context.
 #[derive(Debug)]
 pub struct StepCtx<'a> {
@@ -273,6 +332,8 @@ pub struct StepCtx<'a> {
     /// Where the plane's tool transports may connect, when it says so.
     #[cfg(feature = "manifest")]
     egress: Option<Arc<crate::core::Egress>>,
+    #[cfg(feature = "manifest")]
+    rates: Option<Arc<Rates>>,
     /// The highest sensitivity this plane will write into a record.
     journal_ceiling: Option<crate::core::Sensitivity>,
     meter: crate::runtime::metrics::Meter,
@@ -316,6 +377,14 @@ pub struct StepCtx<'a> {
     /// an ambient one, because members reach the world through the same two
     /// methods everything else does.
     member_dispatch: bool,
+    /// The label the last failed effect's output would have carried.
+    ///
+    /// A failure's text is written by the far side as much as its answer is —
+    /// an MCP tool's `isError` content, a peer's error message — so it
+    /// carries the same class of data. A caller relaying that text onward
+    /// (the declarative loop hands it to the model) must join this label
+    /// first, or a confidential tool can reach a public model by failing.
+    failed_output: Option<crate::core::Label>,
     /// Whether this step has appended anything to the journal.
     ///
     /// The executor's "did this step do new work" bit: a resumed step that
@@ -347,6 +416,8 @@ impl<'a> StepCtx<'a> {
             tools,
             #[cfg(feature = "manifest")]
             egress,
+            #[cfg(feature = "manifest")]
+            rates,
             journal_ceiling,
             meter,
             #[cfg(feature = "keyring")]
@@ -385,6 +456,8 @@ impl<'a> StepCtx<'a> {
             tools,
             #[cfg(feature = "manifest")]
             egress,
+            #[cfg(feature = "manifest")]
+            rates,
             journal_ceiling,
             meter,
             #[cfg(feature = "keyring")]
@@ -404,8 +477,20 @@ impl<'a> StepCtx<'a> {
             reversing: false,
             open_group: None,
             member_dispatch: false,
+            failed_output: None,
             wrote: false,
         }
+    }
+
+    /// Take the label the last failed effect's output would have carried.
+    ///
+    /// Set whenever an effect fails with an [`EffectError`], from the same
+    /// declaration a success is labelled with. `None` when the last failure
+    /// was not the effect's own — a policy refusal, whose text this plane
+    /// wrote.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn take_failed_output_label(&mut self) -> Option<crate::core::Label> {
+        self.failed_output.take()
     }
 
     /// Whether this step appended anything — the executor's "did new work" bit.
@@ -549,10 +634,12 @@ impl<'a> StepCtx<'a> {
         input: Tainted<Value>,
     ) -> Result<Tainted<Value>, StepError> {
         let plane = self.plane.clone();
-        let depth = self
-            .identity
-            .as_ref()
-            .map_or(0, crate::core::Delegation::depth);
+        // A run acting under no chain starts from the plane's depth: it is
+        // bounded by that chain, so it is no closer to the owner.
+        let depth = self.identity.as_ref().map_or_else(
+            || plane.upgrade().map_or(0, |p| p.own_depth()),
+            crate::core::Delegation::depth,
+        );
         // The link carries this run's effective scope unchanged: what the
         // commissioned agent may do is its own manifest's business, and the
         // chain's job is to say for whom and how far from the owner.
@@ -571,6 +658,8 @@ impl<'a> StepCtx<'a> {
                     "commissioning '{capability}' refused: {e}"
                 )))
             })?;
+        let initiator = self.initiator().await?;
+        let served_unchained = self.served_unchained().await?;
         let commissioned = self
             .effect(Commission {
                 capability: capability.to_owned(),
@@ -579,8 +668,21 @@ impl<'a> StepCtx<'a> {
                 plane,
                 depth,
                 chain,
+                initiator,
+                served_unchained,
             })
             .await?;
+        // What the sub-run spent counts against **this** run's ceilings, so a
+        // delegating agent's budget bounds the work it ordered — but not
+        // against this pass's live spend. The sub-run is a run of its own: it
+        // held its own reservation and settled its own spend into the tenant's
+        // period, and settling it again from here would charge the period
+        // twice. Billed here rather than as the effect's spend so the journal,
+        // the live pass and a replay reach one figure by one path.
+        self.bill_delegated(crate::core::Spend {
+            tokens: commissioned.peek().tokens,
+            minor_units: commissioned.peek().minor_units,
+        });
         // Raised, never lowered — the same rule the effect layer applies to a
         // declared sensitivity, applied here because only now is the figure
         // known. A specialist that handled `Confidential` data must not have
@@ -1060,13 +1162,12 @@ impl<'a> StepCtx<'a> {
     /// spellings of "how big is this" would agree until one of them learned to
     /// measure something else.
     ///
-    /// `None` — an effect binding no outbound value — is zero rather than
-    /// absent: nothing crossed a sink, and a read must not consume an egress
-    /// ceiling.
+    /// The effect's own [`Effect::outbound_bytes`]: an effect binding no
+    /// outbound value is zero rather than absent, so a read does not consume
+    /// an egress ceiling, and an effect whose request carries more than its
+    /// bound value counts all of it.
     pub(crate) fn outbound_size<E: crate::core::Effect>(effect: &E) -> u64 {
-        effect.sink_arguments().map_or(0, |args| {
-            crate::core::canon::to_bytes(args).map_or(0, |b| b.len() as u64)
-        })
+        effect.outbound_bytes()
     }
 
     /// Take an effect's slot for an announcement no ceiling gates.
@@ -1080,6 +1181,17 @@ impl<'a> StepCtx<'a> {
             .lock()
             .expect("budget mutex")
             .count_effect(outbound);
+    }
+
+    /// Add what a commissioned sub-run spent to this run's consumption, and
+    /// not to this pass's live spend: the sub-run settles it into the
+    /// tenant's period itself. Called on every pass alike, from the recorded
+    /// answer, so a replay reaches the verdict the live pass did.
+    fn bill_delegated(&self, spend: crate::core::Spend) {
+        self.ledger
+            .lock()
+            .expect("budget mutex")
+            .record_spend(spend);
     }
 
     /// Add what a **freshly dispatched** attempt cost. Its slot was taken at
@@ -1220,21 +1332,23 @@ impl<'a> StepCtx<'a> {
                 ),
             });
         }
+        // A failure's text came from the same far side a result would have,
+        // so it carries the label a result would have carried.
+        let failure_label = output_label(crate::core::DeclaredOutput::of(&effect), &source);
+        self.failed_output = None;
         // The declaration comes back with the value, because for a replayed
         // effect it is **history** rather than a fresh reading of the
         // catalogue. See `DeclaredOutput` for what re-reading would cost.
-        let (output, declared) = self.effect_unlabelled(effect, outbound).await?;
-
-        let labelled = match declared.trust {
-            crate::core::Trust::Trusted => Tainted::trusted(output),
-            crate::core::Trust::Untrusted => Tainted::from_source(output, source),
+        let (output, declared) = match self.effect_unlabelled(effect, outbound).await {
+            Ok(answered) => answered,
+            Err(error) => {
+                if matches!(error, StepError::Effect(_)) {
+                    self.failed_output = Some(failure_label);
+                }
+                return Err(error);
+            }
         };
-        // Raised, never lowered: an untrusted result is already `Internal`, and
-        // an effect that could declare its output *less* sensitive than its
-        // provenance implies would be a laundering primitive.
-        let sensitivity = labelled.label().sensitivity.max(declared.sensitivity);
-        let label = labelled.label().clone().with_sensitivity(sensitivity);
-        Ok(Tainted::with_label(labelled.into_unlabelled(), label))
+        Ok(Tainted::with_label(output, output_label(declared, &source)))
     }
 
     /// The effect protocol itself, before the result is labelled.
@@ -1284,6 +1398,19 @@ impl<'a> StepCtx<'a> {
                 self.phase,
                 ordinal,
                 attempt,
+                &descriptor.kind,
+                &canon::value_bytes(&descriptor.args),
+            );
+
+            // The dispatch's identity across its attempts: the first attempt's
+            // key, which a retry, a recovered re-dispatch and a resumed pass
+            // all derive again. A rate ceiling counts under it, so a retry
+            // spends once.
+            let dispatch = EffectKey::derive(
+                self.step,
+                self.phase,
+                ordinal,
+                FIRST_ATTEMPT,
                 &descriptor.kind,
                 &canon::value_bytes(&descriptor.args),
             );
@@ -1339,6 +1466,7 @@ impl<'a> StepCtx<'a> {
             let outbound_bytes = Self::outbound_size(&effect);
             self.gate(
                 key,
+                dispatch,
                 &descriptor,
                 effect.mutates(),
                 outbound,
@@ -1407,7 +1535,7 @@ impl<'a> StepCtx<'a> {
             attempt,
             policy,
             &failure.to_string(),
-            matches!(failure, crate::core::EffectError::Refused(_)),
+            permanent_failure(effect, failure),
             effect.mutates(),
         ) {
             return Err(stop);
@@ -1542,9 +1670,15 @@ impl<'a> StepCtx<'a> {
     /// requires the exact bundle recorded at admission, so the verdict is
     /// consumed rather than re-decided — a gate must not re-decide a dispatch
     /// history already settled.
+    ///
+    /// A tool's rate ceiling is re-asked beside the ledger, without taking
+    /// room: a window still full stands the refusal as a ledger that still
+    /// refuses does, rather than re-admitting a dispatch the gate would refuse
+    /// again under a second record.
     pub(crate) async fn replayed_refusal(
         &mut self,
         key: EffectKey,
+        descriptor: &EffectDescriptor,
         refusal: EffectReplay,
         outbound_bytes: u64,
     ) -> Result<(), StepError> {
@@ -1571,8 +1705,25 @@ impl<'a> StepCtx<'a> {
             .lock()
             .expect("budget mutex")
             .can_admit_effect(outbound_bytes);
+        #[cfg(feature = "manifest")]
+        let verdict = match (verdict, self.rate_ceilings(descriptor), self.rates.as_ref()) {
+            (Ok(()), Some((grant, ceilings)), Some(rates)) => {
+                match rates
+                    .store
+                    .rate_room(&grant, &ceilings, super::executor::now_for_admission())
+                    .await
+                {
+                    Ok(()) => Ok(()),
+                    Err(crate::quota::QuotaError::RateLimited { .. }) => Err(()),
+                    Err(other) => return Err(rate_counter_unreachable(&other)),
+                }
+            }
+            (verdict, _, _) => verdict.map_err(|_| ()),
+        };
+        #[cfg(not(feature = "manifest"))]
+        let _ = descriptor;
         if verdict.is_err() {
-            // The ledger now in force still refuses: the run concludes
+            // The ceiling now in force still refuses: the run concludes
             // exhausted again, and the standing refusal already says so — no
             // second record.
             return Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
@@ -1676,6 +1827,7 @@ impl<'a> StepCtx<'a> {
             Some(EffectReplay::Done {
                 output,
                 source,
+                by,
                 spend,
                 // An inbound payload's label is rebuilt from `source` and the
                 // wait's own kind, which `label_inbound` holds together.
@@ -1683,11 +1835,11 @@ impl<'a> StepCtx<'a> {
             }) => {
                 // A wait hands nothing to a sink: what arrives is inbound.
                 self.bill_replayed(spend, 0);
-                Ok(Some(ReplayedWait::Recorded(Self::label_inbound(
-                    output,
-                    &spec.kind,
-                    source.as_deref(),
-                ))))
+                Ok(Some(ReplayedWait::Recorded(Box::new(Arrival {
+                    value: Self::label_inbound(output, &spec.kind, source.as_deref()),
+                    source,
+                    by,
+                }))))
             }
             Some(EffectReplay::Refused { limit, used }) => {
                 Err(StepError::Budget(crate::core::BudgetExceeded::Recorded {
@@ -1796,9 +1948,14 @@ impl<'a> StepCtx<'a> {
     ///
     /// Compensation is exempt from both, for the same reason: refusing to undo
     /// is how a run ends with a charged card and no order.
+    ///
+    /// `dispatch` is the dispatch's first attempt's key, which a tool's rate
+    /// ceiling counts under: a retry derives the same one and spends nothing.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn gate(
         &mut self,
         key: EffectKey,
+        dispatch: EffectKey,
         descriptor: &EffectDescriptor,
         mutates: bool,
         outbound: Option<&crate::core::Label>,
@@ -1812,9 +1969,12 @@ impl<'a> StepCtx<'a> {
         // Exempt from the *verdict*, not from the count: the undo still
         // announces an effect, so a replay of this history bills one and a
         // live pass that billed none would exhaust later than its own replay.
-        // The overshoot stays visible rather than becoming invisible.
+        // The overshoot stays visible rather than becoming invisible. A rate
+        // ceiling counts it the same way.
         if !self.phase.is_forward() || self.reversing {
             self.count_unadmitted(outbound_bytes);
+            #[cfg(feature = "manifest")]
+            self.count_undo(dispatch, descriptor).await;
             return Ok(());
         }
         // First, because it is the cheapest and the most fundamental: an effect
@@ -1824,14 +1984,161 @@ impl<'a> StepCtx<'a> {
         self.declared(key, descriptor, ceilings).await?;
         #[cfg(not(feature = "manifest"))]
         let _ = ceilings;
-        // The reviewed grant may only tighten. A tool the operator declared
-        // mutating gets the cautious treatment even if the catalogue advertises
-        // otherwise, because a server's own description of itself is an
-        // advertisement and the grant is the operator's decision about it.
-        #[cfg(feature = "manifest")]
-        let mutates = mutates || self.tool_grant_for(descriptor).is_some_and(|g| g.mutates);
+        let mutates = self.gated_mutates(descriptor, mutates);
         self.authorize(key, descriptor, mutates, outbound).await?;
-        self.admit(key, &descriptor.kind, outbound_bytes).await
+        // A tool's rate ceiling after the run's own budget, which is asked
+        // first **without** taking its slot: a rate refusal must cost the run
+        // nothing, because replay bills slots from announcements and a refusal
+        // has none — a live pass billed for it would exhaust before its own
+        // replay does.
+        #[cfg(feature = "manifest")]
+        if let Some(rated) = self.rate_ceilings(descriptor) {
+            self.admit(key, &descriptor.kind, outbound_bytes, false)
+                .await?;
+            self.reserve_rate(key, dispatch, rated).await?;
+        }
+        #[cfg(not(feature = "manifest"))]
+        let _ = dispatch;
+        self.admit(key, &descriptor.kind, outbound_bytes, true)
+            .await
+    }
+
+    /// Whether the gate treats this dispatch as mutating: the effect's own
+    /// claim, widened by the reviewed grant.
+    ///
+    /// The grant may only tighten. A tool the operator declared mutating gets
+    /// the cautious treatment even if the catalogue advertises otherwise,
+    /// because a server's own description of itself is an advertisement and
+    /// the grant is the operator's decision about it.
+    ///
+    /// One function for the gate and for `EffectStarted.mutates`, so the
+    /// record states the request the gate was asked rather than the effect's
+    /// claim — an offline re-derivation reads it back from there.
+    #[cfg_attr(not(feature = "manifest"), allow(clippy::unused_self))]
+    fn gated_mutates(&self, descriptor: &EffectDescriptor, claimed: bool) -> bool {
+        #[cfg(feature = "manifest")]
+        let widened = self.tool_grant_for(descriptor).is_some_and(|g| g.mutates);
+        #[cfg(not(feature = "manifest"))]
+        let widened = {
+            let _ = descriptor;
+            false
+        };
+        claimed || widened
+    }
+
+    /// The tool reference a dispatch is counted under and every ceiling the
+    /// plane states for it, or `None` when nothing limits its rate.
+    ///
+    /// A tool call and a peer call are both granted as `tool://server/name`;
+    /// an agent consultation is never here, because it dispatches through
+    /// commission and a manifest refuses a ceiling on one.
+    #[cfg(feature = "manifest")]
+    fn rate_ceilings(
+        &self,
+        descriptor: &EffectDescriptor,
+    ) -> Option<(String, Vec<crate::quota::RateCeiling>)> {
+        let rates = self.rates.as_ref()?;
+        let (server, name) = match descriptor.kind.as_str() {
+            "tool.call" => ("server", "tool"),
+            "a2a.peer/call" => ("peer", "capability"),
+            _ => return None,
+        };
+        let reference = crate::tools::ToolId::new(
+            descriptor.args[server].as_str()?,
+            descriptor.args[name].as_str()?,
+        )
+        .reference();
+        let ceilings = rates.ceilings.get(&reference)?.clone();
+        Some((reference, ceilings))
+    }
+
+    /// Take room for this dispatch under its tool's rate ceilings, journalling
+    /// a refusal.
+    ///
+    /// Refused as a budget is — `BudgetRefused` under the refused effect's key,
+    /// before the error returns — so the run stops `exhausted` and a resume
+    /// once the window has room re-admits it beside the refusal. The count is
+    /// never asked on replay: this runs on live dispatch only, and a replayed
+    /// refusal is read back.
+    #[cfg(feature = "manifest")]
+    async fn reserve_rate(
+        &mut self,
+        key: EffectKey,
+        dispatch: EffectKey,
+        (grant, ceilings): (String, Vec<crate::quota::RateCeiling>),
+    ) -> Result<(), StepError> {
+        let Some(rates) = self.rates.clone() else {
+            return Ok(());
+        };
+        let reservation = crate::quota::RateReservation {
+            grant,
+            run: self.run,
+            dispatch,
+            ceilings,
+            at: super::executor::now_for_admission(),
+            exempt: false,
+        };
+        let refused = match rates.store.reserve_rate(&reservation).await {
+            Ok(()) => return Ok(()),
+            Err(crate::quota::QuotaError::RateLimited {
+                grant,
+                ceiling,
+                reached,
+                ..
+            }) => crate::core::BudgetExceeded::Rate {
+                grant,
+                allowed: ceiling.count,
+                window_seconds: ceiling.window_seconds,
+                reached,
+            },
+            Err(other) => return Err(rate_counter_unreachable(&other)),
+        };
+        tracing::warn!(
+            target: telemetry::BUDGET_REFUSED,
+            run = %self.run,
+            step = %self.step,
+            kind = %reservation.grant,
+            limit = %refused,
+        );
+        self.meter.count(metrics::BUDGET_REFUSALS, refused.as_str());
+        let rate_refusal = RecordKind::BudgetRefused {
+            limit: refused.to_string(),
+            used: format!("{:?}", self.budget()),
+        };
+        self.append_effect(key, rate_refusal).await?;
+        Err(StepError::Budget(refused))
+    }
+
+    /// Count an undo under its tool's rate ceilings, never refusing it.
+    ///
+    /// An unreachable counter does not stop the undo either: refusing to undo
+    /// is the outcome the exemption exists to prevent, so the miss is logged
+    /// and the undo goes out uncounted.
+    #[cfg(feature = "manifest")]
+    async fn count_undo(&self, dispatch: EffectKey, descriptor: &EffectDescriptor) {
+        let (Some(rates), Some((grant, ceilings))) =
+            (self.rates.as_ref(), self.rate_ceilings(descriptor))
+        else {
+            return;
+        };
+        let reservation = crate::quota::RateReservation {
+            grant,
+            run: self.run,
+            dispatch,
+            ceilings,
+            at: super::executor::now_for_admission(),
+            exempt: true,
+        };
+        if let Err(error) = rates.store.reserve_rate(&reservation).await {
+            tracing::warn!(
+                target: telemetry::BUDGET_REFUSED,
+                run = %self.run,
+                step = %self.step,
+                kind = %reservation.grant,
+                %error,
+                "an undo went out uncounted by its rate ceiling",
+            );
+        }
     }
 
     /// Check an effect against the agent's **own manifest**, journalling any
@@ -2032,6 +2339,29 @@ impl<'a> StepCtx<'a> {
         })
     }
 
+    /// Who is asking, as every policy question inside this run states it.
+    ///
+    /// The same answer admission gave: the chain's subject when this run acts
+    /// under one, and otherwise the capability the run was admitted for, which
+    /// claims nothing. One answer at every gate, so `principal == X` means the
+    /// same thing wherever a rule is evaluated.
+    ///
+    /// The agent block is the declaration governing **this step's skill**. It
+    /// equals `RunAdmitted.governed_by` whenever the step runs the skill the
+    /// run was admitted to; a plan whose steps run other skills presents their
+    /// declarations, which no record names.
+    fn acting(&self) -> crate::policy::requests::Acting<'_> {
+        crate::policy::requests::Acting {
+            tenant: self.tenant.as_str(),
+            capability: self.agent.as_str(),
+            #[cfg(feature = "manifest")]
+            agent: self.declaration.as_ref(),
+            #[cfg(not(feature = "manifest"))]
+            agent: None,
+            chain: self.identity.as_ref(),
+        }
+    }
+
     /// Check an effect against the policy in force, journalling any denial.
     ///
     /// Runs **only on live dispatch**. A replayed effect never reaches here,
@@ -2053,64 +2383,21 @@ impl<'a> StepCtx<'a> {
             return Ok(());
         };
 
-        let mut context = serde_json::json!({
-            "run": self.run.to_string(),
-            "step": self.step.0,
-            // Every authorization request carries the tenant, not only
-            // admission. A gate that knows which tenant is acting at the door
-            // and forgets by the time an effect reaches the world is a gate
-            // that cannot express "this tenant may not call that tool".
-            "tenant": self.tenant.as_str(),
-            "mutates": mutates,
-            "args": descriptor.args,
-        });
-        // **Where the value came from**, not only what it is.
-        //
-        // Provenance and authorization are two graphs, and an attack lives in
-        // the gap between them: an agent is permitted to call a tool in general,
-        // and that permission never accounts for the provenance of the
-        // particular value it is called with. This crate closes the gap with
-        // checks written *here* — the taint gate and per-field source rules —
-        // but without the label in the request a **deployment** cannot express
-        // the alignment at all. It could say "amounts over 5000 need approval";
-        // it could not say "not with data that passed through that peer".
-        //
-        // Present only for `sink`, which is the only call that has a labelled
-        // value to bind — so a rule reading it must guard on `context has
-        // label`. Unguarded is not "fails closed for this request": Cedar
-        // evaluates every rule against every request, so reading an absent
-        // attribute **errors**, and an unevaluable rule refuses the call
-        // whatever it would have decided. One such rule denies every effect of
-        // every run, which is why `preflight_policy` asks these questions at
-        // build rather than leaving them to the first dispatch.
-        if let Some(label) = outbound {
-            context["label"] = serde_json::to_value(label).unwrap_or(Value::Null);
-        }
-        // **Which revision is acting**, on the same terms admission offers it.
-        //
-        // Admission refuses to make the agent's `metadata.name` its principal,
-        // because a name is whatever a manifest's author typed and a rule
-        // granting authority to one grants it to any file claiming it — and then
-        // tells rules to bind to `context.agent.digest` instead. At an effect
-        // that name *is* the principal, so without this the advice admission
-        // gives cannot be followed at the gate where the call actually goes out:
-        // a deployment could say which revision may start and not which may
-        // reach a particular sink.
-        //
-        // Nothing new is on the record: the same identity is journaled at
-        // admission as `RunAdmitted.governed_by`, so a third party re-deriving
-        // this verdict offline still has every input to it.
-        #[cfg(feature = "manifest")]
-        if let Some(id) = self.declaration.as_ref() {
-            context["agent"] = agent_context(id);
-        }
-        merge_identity(&mut context, self.identity.as_ref());
-        let request = crate::core::PolicyRequest {
-            principal: &self.agent,
-            action: crate::core::ACTION_PERFORM,
-            resource: &descriptor.kind,
-            context: &context,
-        };
+        // Built by the one function an offline re-derivation over an export
+        // also calls, and handed to the engine untouched: every input is on
+        // the record or named by the checker (the tenant), so `policy check`
+        // reaches this verdict again or reports the request as not evaluable.
+        // A key added here, after the builder, is a question nobody can ask
+        // again.
+        let request = crate::policy::requests::effect(
+            &self.acting(),
+            self.run,
+            self.step,
+            &descriptor.kind,
+            &descriptor.args,
+            mutates,
+            outbound,
+        );
 
         // Before the policy is consulted, not after. A refusal is journaled as
         // it happens, so a ceiling applied afterwards bounds nothing an
@@ -2131,7 +2418,7 @@ impl<'a> StepCtx<'a> {
         // moment the vocabulary grows. `Malformed` is refused like a denial
         // and journaled like one; what differs is the operator's telemetry,
         // because the fix is the policy set rather than the request.
-        let decision = engine.authorize(&request);
+        let decision = engine.authorize(&request.as_request());
         let malformed = decision.is_malformed();
         let Some(reason) = decision.reason().map(ToOwned::to_owned) else {
             return Ok(());
@@ -2179,18 +2466,26 @@ impl<'a> StepCtx<'a> {
     /// Without it a replayed run reaches this point, finds no history, and
     /// reports that the *build* performs more effects than the record — sending
     /// an operator to look for a code change that does not exist.
+    ///
+    /// `take` is whether an admitted effect takes its slot now. A caller that
+    /// asks first and dispatches later — the rate ceiling sits between — asks
+    /// without, and takes it on the second call.
     async fn admit(
         &mut self,
         key: EffectKey,
         kind: &str,
         outbound_bytes: u64,
+        take: bool,
     ) -> Result<(), StepError> {
         // Scoped so the guard is gone before any await below.
-        let verdict = self
-            .ledger
-            .lock()
-            .expect("budget mutex")
-            .admit_effect(outbound_bytes);
+        let verdict = {
+            let mut ledger = self.ledger.lock().expect("budget mutex");
+            if take {
+                ledger.admit_effect(outbound_bytes)
+            } else {
+                ledger.can_admit_effect(outbound_bytes)
+            }
+        };
         let Err(exceeded) = verdict else {
             return Ok(());
         };
@@ -2367,7 +2662,7 @@ impl<'a> StepCtx<'a> {
             Some(refusal @ (EffectReplay::Refused { .. } | EffectReplay::Denied { .. })) => {
                 // Re-admitted refusals fall through to a live dispatch of the
                 // same key; everything else re-raises inside.
-                self.replayed_refusal(key, refusal, Self::outbound_size(effect))
+                self.replayed_refusal(key, descriptor, refusal, Self::outbound_size(effect))
                     .await?;
                 Ok(Replayed::Continue(attempt))
             }
@@ -2499,7 +2794,11 @@ impl<'a> StepCtx<'a> {
     /// two allow:
     ///
     /// 1. [`Landed`](crate::core::Disposition::Landed) — the call took effect.
-    ///    Repeating it would be a second real performance, so it never happens.
+    ///    For a mutating effect, repeating it would be a second real
+    ///    performance, so it never happens; a non-mutating one falls through
+    ///    to the policy, since asking again changes nothing but the bill —
+    ///    unless the failure is permanent, the far side's answer rather than a
+    ///    fault.
     /// 2. [`InDoubt`](crate::core::Disposition::InDoubt) — the same
     ///    undecidability a crash produces, resolved the same way: by the
     ///    declared [`Recovery`], never by guessing.
@@ -2521,6 +2820,23 @@ impl<'a> StepCtx<'a> {
         use crate::core::{Disposition, Recovery};
 
         match disposition {
+            // A call that changed nothing may be asked again: what landed was
+            // a read, or a completion — a bill, which the failure already
+            // carried to the budget — and the policy decides whether another
+            // attempt is worth its cost. A model stream that died after
+            // generating is the common case. A permanent landed failure is an
+            // answer — a tool that ran and reported failure — and asking again
+            // repeats the work for the same answer.
+            Disposition::Landed if !mutates && !permanent => {}
+            Disposition::Landed if !mutates => {
+                return Some(StepError::Effect(crate::core::EffectError::Final {
+                    detail: format!(
+                        "effect {key} ran and failed on attempt {attempt}, and the failure is \
+                         its answer rather than a fault ({message}); no retry would change it"
+                    ),
+                    disposition,
+                }));
+            }
             Disposition::Landed => {
                 return Some(StepError::Effect(crate::core::EffectError::Final {
                     detail: format!(
@@ -3231,6 +3547,10 @@ impl<'a> StepCtx<'a> {
     /// [`Tainted::object`](crate::core::Tainted::object) or
     /// [`Tainted::array`](crate::core::Tainted::array), so precision can never
     /// be invented after provenance was flattened.
+    ///
+    /// Refused on a plane with no policy engine: a release is the one call
+    /// that lowers a label, and without a rule permitting `data:release` there
+    /// is nobody to have decided it.
     pub async fn release(
         &mut self,
         value: Tainted<Value>,
@@ -3322,29 +3642,10 @@ impl<'a> StepCtx<'a> {
         release: &crate::core::Release,
         label: &crate::core::Label,
     ) -> Result<(), StepError> {
-        let Some(engine) = self.policy.clone() else {
-            return Ok(());
-        };
-
-        let mut context = serde_json::json!({
-            "run": self.run.to_string(),
-            "step": self.step.0,
-            "release": release,
-            "label": label,
-        });
-        // The acting revision, on the same terms every other gate offers it —
-        // see the effect gate for why a rule must be able to name it.
-        #[cfg(feature = "manifest")]
-        if let Some(id) = self.declaration.as_ref() {
-            context["agent"] = agent_context(id);
-        }
-        merge_identity(&mut context, self.identity.as_ref());
-        let request = crate::core::PolicyRequest {
-            principal: &self.agent,
-            action: crate::core::ACTION_RELEASE,
-            resource: "information_flow.label",
-            context: &context,
-        };
+        // The builder the effect gate and `policy check` share, for the same
+        // reason: `Released` records the release and label asked about.
+        let request =
+            crate::policy::requests::release(&self.acting(), self.run, self.step, release, label);
 
         self.ledger
             .lock()
@@ -3358,7 +3659,22 @@ impl<'a> StepCtx<'a> {
         // moment the vocabulary grows. `Malformed` is refused like a denial
         // and journaled like one; what differs is the operator's telemetry,
         // because the fix is the policy set rather than the request.
-        let decision = engine.authorize(&request);
+        //
+        // **No engine is a refusal here**, unlike at the effect gate. A plane
+        // with no policy performs what its code asks, and the structural gates
+        // — the taint gate, protected fields, sink and journal ceilings — hold
+        // regardless. A release is the one call that switches those off for a
+        // value, so an ungoverned release would let any skill lower a label
+        // below a ceiling nobody agreed to lift.
+        let decision = self.policy.as_ref().map_or_else(
+            || {
+                crate::core::PolicyDecision::deny(
+                    "this plane has no policy engine, and a release lowers a label \
+                     only when a rule permits it — wire one that permits `data:release`",
+                )
+            },
+            |engine| engine.authorize(&request.as_request()),
+        );
         let malformed = decision.is_malformed();
         let Some(reason) = decision.reason().map(ToOwned::to_owned) else {
             return Ok(());
@@ -3537,12 +3853,16 @@ impl<'a> StepCtx<'a> {
         // declared recovery mode decides — which is only possible because the
         // start was durable first.
         if write_start {
+            let descriptor = effect.descriptor();
+            // The value the gate was asked with, not the effect's own claim:
+            // see `gated_mutates`.
+            let mutates = self.gated_mutates(&descriptor, effect.mutates());
             self.append_effect(
                 key,
                 RecordKind::EffectStarted {
-                    descriptor: effect.descriptor(),
+                    descriptor,
                     recovery: effect.recovery(),
-                    mutates: effect.mutates(),
+                    mutates,
                     attempt,
                     backoff_ms,
                     outbound_label: outbound.cloned(),
@@ -3618,7 +3938,7 @@ impl<'a> StepCtx<'a> {
                             disposition: e.disposition(),
                             // An answer, not a fault — recorded so the replayed
                             // retry decision stops where the live one did.
-                            permanent: matches!(e, crate::core::EffectError::Refused(_)),
+                            permanent: permanent_failure(effect, &e),
                         },
                     )
                     .await
@@ -3678,42 +3998,35 @@ impl<'a> StepCtx<'a> {
 /// and the declared tier must refuse the same shapes, or which tier an agent
 /// was written in decides whether its oversight declaration is checked.
 ///
-/// Three shapes are refused:
+/// Roles beside a policy that never escalates cannot be written — they live
+/// inside [`Expiry::Escalate`] — so two shapes are left to refuse:
 ///
 /// * `Escalate` naming nobody — "widen the audience" with no audience to add
 ///   is a state flag wearing a control's name;
 /// * `Escalate` over an empty `candidate_roles` — empty already means
 ///   *anyone*, and `Task::escalate` deliberately will not narrow it, so the
-///   declared widening would do nothing;
-/// * `escalate_to` beside a policy that never escalates — a declaration
-///   nothing reads, which reads in review exactly like one something does.
+///   declared widening would do nothing.
 fn escalation_names_its_audience(spec: &TaskSpec) -> Result<(), StepError> {
     let refuse = |detail: &str| {
         Err(StepError::Effect(crate::core::EffectError::Other(
             detail.into(),
         )))
     };
-    if spec.on_expiry == OnExpiry::Escalate {
-        if spec.escalate_to.is_empty() {
+    if let Expiry::Escalate { to } = &spec.on_expiry {
+        if to.is_empty() {
             return refuse(
-                "OnExpiry::Escalate requires `escalate_to(role)`: widening the audience \
-                 is escalation's one enforceable meaning, so the declaration must say \
-                 who is added",
+                "Expiry::Escalate names no role: widening the audience is escalation's \
+                 one enforceable meaning, so the declaration must say who is added — \
+                 `Expiry::escalate_to([\"role\"])`",
             );
         }
         if spec.candidate_roles.is_empty() {
             return refuse(
-                "OnExpiry::Escalate needs a bounded audience: an empty `candidate_roles` \
+                "Expiry::Escalate needs a bounded audience: an empty `candidate_roles` \
                  already means anyone, and there is no wider audience than that — \
                  name the initial reviewers with `role(..)`, or use `Deny`",
             );
         }
-    } else if !spec.escalate_to.is_empty() {
-        return refuse(
-            "`escalate_to` names an escalation audience, but this task never escalates — \
-             set `on_expiry(OnExpiry::Escalate)` or drop the roles, so the declaration \
-             and the policy say the same thing",
-        );
     }
     Ok(())
 }
@@ -3911,16 +4224,34 @@ impl StepCtx<'_> {
     /// Expiry is evaluated against this run's journaled clock, so a replay
     /// reaches the verdict the live run did rather than today's.
     ///
+    /// # Which authority, and whose
+    ///
+    /// The id is a labelled value, and an untrusted one is refused: which
+    /// mandate to spend is an authority-bearing choice, and one a model or a
+    /// peer made is a choice this run did not. The authority must also be held
+    /// by the principal this run acts for — its chain's owner, or its tenant
+    /// for a run the plane started with no chain, and nobody for a served
+    /// caller that presented none ([`holder_of`](crate::authority::holder_of))
+    /// — so knowing an id is not enough to spend it.
+    ///
     /// # Errors
     ///
-    /// [`StepError::Store`] when no authority store is wired, and the effect's
-    /// own error carrying whichever of the five refusals applies — unknown,
-    /// exhausted, out of draws, revoked, or expired.
+    /// [`StepError::Store`] when no authority store is wired, a policy refusal
+    /// for an untrusted id, and the effect's own error carrying whichever
+    /// refusal applies — unknown, not this run's holder, exhausted, out of
+    /// draws, revoked, or expired.
     pub async fn draw(
         &mut self,
-        id: &crate::authority::AuthorityId,
+        id: &Tainted<crate::authority::AuthorityId>,
         amount: crate::core::Spend,
     ) -> Result<crate::authority::Drawn, StepError> {
+        if id.label().is_untrusted() {
+            return Err(PolicyError::ProtectedFieldTaint {
+                sink: "authority.draw".to_owned(),
+                path: "/authority".to_owned(),
+            }
+            .into());
+        }
         let authorities = self.authorities.clone().ok_or_else(|| {
             StepError::Store(crate::core::StoreError::Backend(
                 "no standing-authority store is configured; \
@@ -3934,7 +4265,11 @@ impl StepCtx<'_> {
         Ok(self
             .effect(crate::runtime::effects::DrawOnAuthority {
                 authorities,
-                id: id.clone(),
+                id: id.peek().clone(),
+                holder: crate::authority::holder_of(
+                    self.identity.as_ref(),
+                    self.served_unchained().await?,
+                ),
                 amount,
                 at,
                 key: None,
@@ -3983,10 +4318,10 @@ impl StepCtx<'_> {
             ))
         })?;
 
-        if query.as_of.is_none() {
-            query.as_of = Some(self.now().await?);
-        }
-        let recall_at = query.as_of.expect("recall cutoff set above");
+        // The cutoff is never earlier than now: a caller-chosen past instant
+        // would read memories whose retention has already lapsed.
+        let now = self.now().await?;
+        query.as_of = Some(query.as_of.map_or(now, |cutoff| cutoff.max(now)));
         let refresh_access = query.refresh_access;
         let selected = self
             .effect(crate::runtime::effects::RecallMemory {
@@ -4000,7 +4335,7 @@ impl StepCtx<'_> {
             self.effect(crate::runtime::effects::TouchMemory {
                 memories: Arc::clone(&memories),
                 ids: selected.iter().map(|pick| pick.id.clone()).collect(),
-                at: recall_at,
+                at: now,
             })
             .await?;
         }
@@ -4576,6 +4911,25 @@ impl StepCtx<'_> {
         Ok(written)
     }
 
+    /// The blob store `fetcher` files its bytes in.
+    ///
+    /// [`blobs`](Self::blobs) for case-linked retention; the policy's own
+    /// erasure unit for a named external one, whose bytes a case-scoped handle
+    /// cannot address. Hand this to
+    /// [`ModelCall::with_media`](crate::model::ModelCall::with_media) to
+    /// materialize what [`fetch_media`](Self::fetch_media) stored.
+    ///
+    /// # Errors
+    ///
+    /// As [`blobs`](Self::blobs).
+    #[cfg(feature = "media")]
+    pub fn media_blobs(
+        &self,
+        fetcher: &crate::media::GovernedMedia,
+    ) -> Result<Arc<dyn crate::blob::BlobStore>, StepError> {
+        self.blobs_scoped(fetcher.external_scope().as_deref())
+    }
+
     /// The blob store for this run, sealed to its case.
     ///
     /// **Use this rather than a store held from the builder.** With a key ring
@@ -4725,10 +5079,13 @@ impl StepCtx<'_> {
     /// validators, and writes the bytes to content-addressed blob storage. The
     /// journal receives only [`FetchedMedia`](crate::media::FetchedMedia).
     ///
-    /// When the run belongs to a case, the digest is linked before blob storage
-    /// so [`erase_case`](crate::blob::erase_case) can enforce retention even
-    /// across crashes. Strict replay consumes the same clock record but never
-    /// rewrites that link.
+    /// Under case-linked retention the digest is linked to the run's case
+    /// before blob storage, so [`erase_case`](crate::blob::erase_case) can
+    /// enforce retention even across crashes. Strict replay consumes the same
+    /// clock record but never rewrites that link. Under a named external
+    /// retention policy the bytes belong to that policy's erasure unit, not the
+    /// case, so nothing is linked and a case erasure does not reach them; read
+    /// them back through [`media_blobs`](Self::media_blobs).
     ///
     /// # Errors
     ///
@@ -4975,6 +5332,27 @@ fn formation_schema(max_items: usize) -> Value {
     })
 }
 
+/// Hold a task's answer to the one door that may give it.
+///
+/// Every external intake refuses the kind a task waits on, so this is the
+/// second of two locks rather than the only one: an answer that reached the run
+/// from anywhere but the worklist — an embedder's store, a door added later
+/// that forgot the refusal — is not a decision, and neither is one whose
+/// decider is not the operator it was delivered under. Checked on replay as
+/// live, from the same record, so a run cannot pass it once and fail it later.
+fn answered_by_the_worklist(answer: &Arrival, decision: &Decision) -> Result<(), StepError> {
+    let from_worklist = answer.source.as_deref() == Some(super::sweeper::SOURCE_WORKLIST);
+    if !from_worklist || decision.decided.operator() != answer.by.as_ref() {
+        return Err(StepError::Effect(crate::core::EffectError::Other(format!(
+            "a task's answer arrived from {} for decider '{}' — only this plane's worklist \
+             decides a task, under the operator who decided it",
+            answer.source.as_deref().unwrap_or("no sender"),
+            decision.decided,
+        ))));
+    }
+    Ok(())
+}
+
 /// Durable waits.
 impl StepCtx<'_> {
     /// Wait for an inbound event correlated by business key.
@@ -5012,6 +5390,7 @@ impl StepCtx<'_> {
             |_| async { Ok(()) },
         )
         .await
+        .map(|arrival| arrival.value)
     }
 
     /// Ask a human, and wait for the answer.
@@ -5033,28 +5412,19 @@ impl StepCtx<'_> {
             ))
         })?;
 
-        // Acting unattended must be chosen deliberately, not picked off a list.
-        if spec.on_expiry == OnExpiry::Proceed && !spec.allow_unattended {
-            return Err(StepError::Effect(crate::core::EffectError::Other(
-                "OnExpiry::Proceed requires `allow_unattended()`: acting without a human \
-                 when the window closes must be an explicit decision, not a default"
-                    .into(),
-            )));
-        }
         escalation_names_its_audience(spec)?;
 
         let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
         // The run's journaled clock, not the obligation's instant.
         //
-        // `created_at` was the deadline. Both fields then said *when this is
-        // due*, so a worklist reported every row as created in the future and
-        // "oldest first" silently meant "soonest due" — a reasonable ordering
-        // under a field name that denies it, which is the worst combination for
-        // an operator trying to explain a backlog.
+        // Were `created_at` the deadline, both fields would say *when this is
+        // due*: a worklist would show every row as created in the future and
+        // "oldest first" would silently mean "soonest due".
         let created_at = self.now().await?;
         let run = self.run;
         let case_id = cx.case_id;
-        let spec = spec.clone();
+        let spec = self.four_eyes(spec).await?;
+        let spec_digest = spec.justification.digest();
 
         let answer = self
             .wait_on(
@@ -5079,14 +5449,15 @@ impl StepCtx<'_> {
                                 kind: spec.kind.clone(),
                                 justification: spec.justification.clone(),
                                 candidate_roles: spec.candidate_roles.clone(),
-                                escalate_to: spec.escalate_to.clone(),
+                                escalate_to: spec.on_expiry.escalate_roles().to_vec(),
                                 excluded_actors: spec.excluded_actors.clone(),
                                 assignee: None,
                                 priority: spec.priority,
                                 state: TaskState::Open,
-                                on_expiry: spec.on_expiry,
+                                on_expiry: spec.on_expiry.policy(),
                                 created_at,
                                 due_at: Some(due_at),
+                                withheld: None,
                             })
                             .await?;
                         Ok(())
@@ -5096,7 +5467,23 @@ impl StepCtx<'_> {
             .await?;
 
         // A decision is a human's assertion, not a fact the engine verified.
-        let decision: Decision = serde_json::from_value(answer.peek().clone())?;
+        let decision: Decision = serde_json::from_value(answer.value.peek().clone())?;
+        answered_by_the_worklist(&answer, &decision)?;
+        // A person's approval holds only for the task this run proposed. The
+        // digest is what the store held when they decided; any other value —
+        // or none — is an approval of something else, and acting on it would
+        // dispatch arguments nobody reviewed.
+        if decision.approved
+            && decision.decided.operator().is_some()
+            && decision.reviewed != Some(spec_digest)
+        {
+            return Err(StepError::Effect(crate::core::EffectError::Refused(
+                "the approval does not name the task this run proposed — the task was \
+                 changed between proposal and decision, so what was approved is not \
+                 what would be dispatched"
+                    .into(),
+            )));
+        }
         Ok(decision)
     }
 
@@ -5141,13 +5528,13 @@ impl StepCtx<'_> {
                 "human tasks need a task store — build the runtime with `.tasks(store)`".into(),
             ))
         })?;
-        // A notification is not a decision, so `OnExpiry::Proceed` has nothing
+        // A notification is not a decision, so `Expiry::ProceedUnattended` has nothing
         // to proceed *past* and the unattended consent it demands would be
         // consent to nothing. Refused rather than accepted-and-ignored.
-        if spec.on_expiry == OnExpiry::Proceed {
+        if spec.on_expiry == Expiry::ProceedUnattended {
             return Err(StepError::Effect(crate::core::EffectError::Other(
                 "a task opened beside an answer has no decision to wait for, so \
-                 `OnExpiry::Proceed` describes nothing — the run has already proceeded. \
+                 `Expiry::ProceedUnattended` describes nothing — the run has already proceeded. \
                  Use `Deny` to let the window close, or `Escalate` to widen the audience"
                     .into(),
             )));
@@ -5156,18 +5543,66 @@ impl StepCtx<'_> {
         let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
         let at = self.now().await?;
         let run = self.run;
+        let spec = self.four_eyes(spec).await?;
         Ok(self
             .effect(crate::runtime::effects::OpenTask {
                 tasks,
                 run,
                 case: cx.case_id,
-                spec: spec.clone(),
+                spec,
                 at,
                 due_at,
                 key: None,
             })
             .await?
             .into_unlabelled())
+    }
+
+    /// Who asked for this run, when admission named them.
+    ///
+    /// Read from the run's `RunAdmitted` record, which is immutable — so a
+    /// replay reads what the live run read. `None` when nobody was named.
+    ///
+    /// # Errors
+    ///
+    /// [`StepError::Store`] if the journal cannot be read.
+    pub async fn initiator(&self) -> Result<Option<String>, StepError> {
+        let first = self.store.read_page(self.run, 1, 1).await?;
+        Ok(first.into_iter().find_map(|record| match record.kind() {
+            RecordKind::RunAdmitted { admitted_by, .. } => admitted_by.clone(),
+            _ => None,
+        }))
+    }
+
+    /// Whether this run was admitted for a served caller that presented no
+    /// chain — read from the journal, so a replay draws as the holder the
+    /// live run did.
+    async fn served_unchained(&self) -> Result<bool, StepError> {
+        let first = self.store.read_page(self.run, 1, 1).await?;
+        Ok(first.into_iter().any(|record| {
+            matches!(
+                record.kind(),
+                RecordKind::RunAdmitted {
+                    served_unchained: true,
+                    ..
+                }
+            )
+        }))
+    }
+
+    /// `spec`, with the run's initiator barred from deciding it.
+    ///
+    /// Applied to every task a run opens, coded or declarative: the person
+    /// whose request produced the action is the one reviewer four-eyes exists
+    /// to exclude, and a declarative agent has no code in which to say so.
+    async fn four_eyes(&self, spec: &TaskSpec) -> Result<TaskSpec, StepError> {
+        let mut spec = spec.clone();
+        if let Some(initiator) = self.initiator().await?
+            && !spec.excluded_actors.contains(&initiator)
+        {
+            spec.excluded_actors.push(initiator);
+        }
+        Ok(spec)
     }
 
     /// The shared machinery behind [`Self::await_event`] and [`Self::task`].
@@ -5182,7 +5617,7 @@ impl StepCtx<'_> {
         correlate: C,
         deadline: &str,
         before_suspend: F,
-    ) -> Result<Tainted<Value>, StepError>
+    ) -> Result<Arrival, StepError>
     where
         C: FnOnce(EffectKey) -> Vec<CorrelationKey> + Send,
         F: FnOnce(EffectKey) -> Fut + Send,
@@ -5233,7 +5668,7 @@ impl StepCtx<'_> {
         let mut repair = false;
         if self.mode.is_replaying() {
             match self.replayed_wait(key, &descriptor, spec, &cx).await? {
-                Some(ReplayedWait::Recorded(recorded)) => return Ok(recorded),
+                Some(ReplayedWait::Recorded(recorded)) => return Ok(*recorded),
                 Some(ReplayedWait::Repair) => repair = true,
                 None => {}
             }
@@ -5291,8 +5726,8 @@ impl StepCtx<'_> {
         // Look in the buffer: the event may already be here. The journal
         // write comes **before** the unsubscribe, because unsubscribing sheds
         // the claimed row's payload — the journal holds the delivered copy
-        // from then on — and the old order left a crash window in which the
-        // payload existed nowhere: claimed and stripped in the buffer,
+        // from then on — and the reverse order leaves a crash window in which
+        // the payload exists nowhere: claimed and stripped in the buffer,
         // never journaled. The delivery worker orders these two the same way.
         if let Some(buffered) = events.claim_for(&subscription, now).await? {
             self.append_effect(
@@ -5311,11 +5746,15 @@ impl StepCtx<'_> {
             )
             .await?;
             events.unsubscribe(self.run, key).await?;
-            return Ok(Self::label_inbound(
-                buffered.event.payload,
-                &spec.kind,
-                Some(&buffered.event.source),
-            ));
+            return Ok(Arrival {
+                value: Self::label_inbound(
+                    buffered.event.payload,
+                    &spec.kind,
+                    Some(&buffered.event.source),
+                ),
+                source: Some(buffered.event.source),
+                by: buffered.event.by,
+            });
         }
 
         Err(StepError::Suspended(self.suspend_reason(spec, &cx).await?))
@@ -5426,56 +5865,15 @@ impl<T: Effect, Er: Into<StepError>> BuildsEffect<T> for Result<T, Er> {
     }
 }
 
-/// The declaration, as every gate reports it.
+/// Whether a failure is an answer no retry would change.
 ///
-/// One construction shared by admission and by each effect gate, because a
-/// deployment writes *one* rule about a revision and expects it to mean the
-/// same thing wherever it is evaluated. Two spellings would let a rule permitted
-/// at the door read differently at the sink.
-///
-/// `name` is beside the digest for readability and must not be authorized on: a
-/// file claims a name, but only the holder of a key can claim a publisher.
-///
-/// **Publisher absent, never `null`.** An `Option` serialized straight into the
-/// context puts a JSON `null` there for every unpublished manifest — which is
-/// most of them, since attestation is opt-in — and Cedar refuses a context
-/// containing one: not the field, the whole record. A policy asks
-/// `context.agent has publisher` and then reads it, which is the idiom for an
-/// optional attribute and what the absent form supports.
-pub(crate) fn agent_context(id: &crate::journal::AgentIdentity) -> serde_json::Value {
-    let mut agent = serde_json::json!({
-        "name": id.name,
-        "version": id.version,
-        "digest": id.digest.to_hex(),
-    });
-    if let Some(value) = id
-        .publisher
-        .as_ref()
-        .and_then(|p| serde_json::to_value(p).ok())
-    {
-        agent["publisher"] = value;
-    }
-    agent
-}
-
-/// Fold a delegation chain into a policy context object.
-///
-/// Merged rather than nested under a key so a rule reads `context.owner` and
-/// `context.delegation_depth` directly — which is the shape the Cedar
-/// examples assume, and a rule that has to reach through an extra level is a
-/// rule somebody writes wrong once.
-pub(crate) fn merge_identity(
-    context: &mut serde_json::Value,
-    identity: Option<&crate::core::Delegation>,
-) {
-    let (Some(chain), Some(obj)) = (identity, context.as_object_mut()) else {
-        return;
-    };
-    if let Some(extra) = chain.as_context().as_object() {
-        for (k, v) in extra {
-            obj.insert(k.clone(), v.clone());
-        }
-    }
+/// A refusal is one by definition. A landed failure is one where the effect
+/// says its landed failures are not retried — a tool that ran and reported
+/// failure, unless its operator declared otherwise. Recorded on the failure,
+/// so a replay stops where the live run stopped.
+fn permanent_failure<E: Effect + ?Sized>(effect: &E, failure: &crate::core::EffectError) -> bool {
+    matches!(failure, crate::core::EffectError::Refused(_))
+        || (failure.disposition() == crate::core::Disposition::Landed && !effect.retries_landed())
 }
 
 #[cfg(test)]
@@ -5569,6 +5967,14 @@ struct Commission {
     /// Not in the descriptor — the parent's `IdentityBound` already records
     /// it, and the sub-run's records its own.
     chain: Option<crate::core::Delegation>,
+    /// Who asked for the commissioning run, carried to the sub-run so its
+    /// tasks bar the same person. Not in the descriptor, for the reason the
+    /// chain is not: both runs' `RunAdmitted` records it.
+    initiator: Option<String>,
+    /// Whether the commissioning run acts for a served caller that presented
+    /// no chain. Read from its `RunAdmitted`, and the one fact that tells a
+    /// chainless served run from the plane's own chainless run.
+    served_unchained: bool,
 }
 
 /// What a commission produced, and what it cost.
@@ -5593,9 +5999,9 @@ struct Commissioned {
     /// answer arrived at the default `Internal` floor, which silently
     /// downgrades a specialist that handled anything above it — delegation as
     /// a laundering primitive, reached without anyone writing a release.
-    /// Absent in history written before this field existed, which reads back
-    /// as the floor an untrusted effect output already carries — the old
-    /// behaviour exactly, rather than a guess that could raise a ceiling.
+    /// Absent in a record that does not carry it, which reads back as the
+    /// floor an untrusted effect output already carries, rather than a guess
+    /// that could raise a ceiling.
     #[serde(default = "internal_floor")]
     sensitivity: crate::core::Sensitivity,
 }
@@ -5652,13 +6058,11 @@ impl Effect for Commission {
         Some(self.depth + 1)
     }
 
-    /// Bill the commissioning run for what the sub-run spent, so a delegating
-    /// agent's ceiling bounds the work it ordered.
-    fn spend(&self, output: &Self::Output) -> crate::core::Spend {
-        crate::core::Spend {
-            tokens: output.tokens,
-            minor_units: output.minor_units,
-        }
+    /// Nothing, as an effect: what the sub-run spent is its own run's to
+    /// settle. [`StepCtx::commission`] bills it to this run's ceilings
+    /// without settling it into the tenant's period a second time.
+    fn spend(&self, _output: &Self::Output) -> crate::core::Spend {
+        crate::core::Spend::ZERO
     }
 
     async fn perform(&self) -> Result<Self::Output, crate::core::EffectError> {
@@ -5667,9 +6071,18 @@ impl Effect for Commission {
             .upgrade()
             .ok_or_else(|| crate::core::EffectError::Other("the plane is gone".into()))?;
 
-        let mut terms = super::RunTerms::default();
-        if let Some(chain) = self.chain.as_ref() {
-            terms = terms.acting_as(chain.clone());
+        // The sub-run acts as the commissioning run does. Under its chain
+        // when it has one; under none when it serves a caller that presented
+        // none, so the plane's authority is not picked up on the way down; and
+        // as the plane when it is the plane's own run, which on a plane with
+        // no chain of its own is what holds the tenant's mandates.
+        let mut terms = match (&self.chain, self.served_unchained) {
+            (Some(chain), _) => super::RunTerms::default().acting_as(chain.clone()),
+            (None, true) => super::RunTerms::default().served(None),
+            (None, false) => super::RunTerms::default(),
+        };
+        if let Some(initiator) = self.initiator.as_deref() {
+            terms = terms.admitted_by(initiator);
         }
         // `Interrupted`, not `Rejected`: this caller cannot know whether the
         // commissioned agent performed effects before it failed, and asserting

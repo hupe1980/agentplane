@@ -26,7 +26,7 @@
 //!    hallucinating planner would do — is refused at the sink. The argument
 //!    schema admits the string; the provenance rule does not admit its author.
 //!
-//! Run with: `cargo run --example planned_run --features redb,testkit,manifest`
+//! Run with: `cargo run --example planned_run --features redb,fake-model,manifest`
 
 use std::sync::{Arc, Mutex};
 

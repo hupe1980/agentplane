@@ -1,8 +1,7 @@
 //! What does the gate cost, and which part of it dominates?
 //!
 //! The question an adopter asks first about a runtime whose central claim is
-//! *the journal is the plan of record*, and one this repository could not answer
-//! until it had a way to produce a number. Every performance sentence in the
+//! *the journal is the plan of record*. Every performance sentence in the
 //! docs comes from here, and carries the command that re-derives it — a figure
 //! nobody can reproduce is decoration, not evidence.
 //!

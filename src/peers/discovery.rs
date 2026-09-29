@@ -317,7 +317,7 @@ impl CardClient {
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| DiscoveryError::Unreachable(e.to_string()))?;
+            .map_err(|e| DiscoveryError::Unreachable(crate::netguard::transport_text(&e)))?;
 
         if !response.status().is_success() {
             return Err(DiscoveryError::Unreachable(format!(

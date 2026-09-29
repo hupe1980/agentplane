@@ -42,12 +42,15 @@
 //!
 //! ```cedar
 //! @id("betragsgrenze-5000-eur")
-//! forbid (principal, action == Action::"effect:perform", resource)
-//! when { context.args.amount_eur > 5000 };
+//! forbid (
+//!     principal,
+//!     action == Action::"effect:perform",
+//!     resource == Resource::"payment.transfer"
+//! ) when { context.args has amount_eur && context.args.amount_eur > 5000 };
 //! ```
 //!
 //! ```text
-//! policy denied 'effect:perform' on 'tool.call': refused by betragsgrenze-5000-eur
+//! policy denied 'effect:perform' on 'payment.transfer': refused by betragsgrenze-5000-eur
 //! ```
 //!
 //! The reason names the **rule and nothing else**: every caller already holds
@@ -166,8 +169,11 @@ const ADAPTER_CONFIGURATION: &[u8] =
 ///
 /// ```cedar
 /// @id("betragsgrenze-5000-eur")
-/// forbid (principal, action == Action::"effect:perform", resource)
-/// when { context.args.amount_eur > 5000 };
+/// forbid (
+///     principal,
+///     action == Action::"effect:perform",
+///     resource == Resource::"payment.transfer"
+/// ) when { context.args has amount_eur && context.args.amount_eur > 5000 };
 /// ```
 pub const RULE_NAME_ANNOTATION: &str = "id";
 
@@ -358,6 +364,26 @@ impl CedarEngine {
     fn rule_name(&self, id: &cedar_policy::PolicyId) -> String {
         effective_rule_name(&self.policies, id)
     }
+
+    /// Every `Resource` a rule's scope names with `==` or `in`, deduplicated.
+    fn scoped_resources(&self) -> Vec<String> {
+        use cedar_policy::ResourceConstraint;
+        let mut named: Vec<String> = self
+            .policies
+            .policies()
+            .filter_map(|policy| match policy.resource_constraint() {
+                ResourceConstraint::Eq(uid)
+                | ResourceConstraint::In(uid)
+                | ResourceConstraint::IsIn(_, uid) => Some(uid),
+                ResourceConstraint::Any | ResourceConstraint::Is(_) => None,
+            })
+            .filter(|uid| uid.type_name().to_string() == "Resource")
+            .map(|uid| uid.id().unescaped().to_owned())
+            .collect();
+        named.sort();
+        named.dedup();
+        named
+    }
 }
 
 /// The first rule the validator says can never apply, if there is one.
@@ -449,26 +475,18 @@ fn check_rule_names(policies: &PolicySet) -> Result<(), CedarError> {
 /// while nothing was evaluated at all. This adapter reports that as *malformed*
 /// rather than as a refusal precisely because the two are different situations.
 ///
-/// It was not hypothetical. Two contexts the runtime sends carried nulls, and
-/// between them they denied everything a Cedar plane did:
-///
-/// * `context.agent.publisher` — `None` for every unpublished manifest, which
-///   is most of them, so **every admission** was malformed. Fixed at the source
-///   too, since the adapter's own documentation already said *"or absent"*.
-/// * `context.args` — the effect's own arguments, which are **arbitrary caller
-///   JSON**. A model call's request profile carries `null` for every optional
-///   knob nobody set. No amount of fixing at the source closes this one: the
-///   runtime cannot promise that data it did not author contains no nulls.
-///
-/// That second case is why the fix lives here rather than only at the callers.
-/// A control implemented once per producer is one the next producer does not
-/// have, and the producer here is *the user's own arguments*.
+/// The producer that makes this the adapter's job is `context.args`: the
+/// effect's own arguments, which are **arbitrary caller JSON** — a model call's
+/// request profile carries `null` for every optional knob nobody set. The
+/// runtime cannot promise that data it did not author contains no nulls, and a
+/// control implemented once per producer is one the next producer does not
+/// have.
 ///
 /// # What the mapping means
 ///
 /// A null-valued object member becomes an **absent attribute**, which is
 /// Cedar's own idiom for optional data — `context.agent has publisher` is how a
-/// policy asks, and it now answers correctly instead of failing to parse.
+/// policy asks.
 ///
 /// This cannot weaken a rule. Cedar has no null literal, so no policy can match
 /// on one; stripping removes only values that were already unmatchable, and the
@@ -637,24 +655,44 @@ impl PolicyEngine for CedarEngine {
     /// from a policy set that parsed and validated cleanly — which is exactly
     /// how a deployment found itself with a plane that refused everything.
     ///
+    /// Each probe is asked on its own resource and again on **every resource a
+    /// rule's scope names** that no probe names itself. A probe's placeholder
+    /// resource reaches only the rules scoped to any resource, so a `forbid`
+    /// on `resource == Resource::"payment.transfer"` whose condition is
+    /// unguarded would otherwise never be evaluated here — and would refuse
+    /// every transfer. Its arguments are the probe's, which carry none, so a
+    /// rule reading one guards it with `context.args has …`.
+    ///
     /// Only unevaluable sets are reported. A set that merely *denies* the
     /// probes is a working default-deny plane, and reporting it would make
     /// this check the reason nobody writes one.
     fn preflight(&self, requests: &[PolicyRequest<'_>]) -> Vec<String> {
-        requests
-            .iter()
-            .filter_map(|request| {
-                let decision = self.authorize(request);
-                decision.is_malformed().then(|| {
-                    format!(
+        // A resource the caller already probes is asked in the shape the
+        // caller gave it, which knows that kind's arguments; the rest are
+        // asked in each probe's shape.
+        let mut named = self.scoped_resources();
+        named.retain(|resource| !requests.iter().any(|r| r.resource == resource));
+        let mut problems = Vec::new();
+        for request in requests {
+            let resources =
+                std::iter::once(request.resource).chain(named.iter().map(String::as_str));
+            for resource in resources {
+                let probe = PolicyRequest {
+                    resource,
+                    ..*request
+                };
+                let decision = self.authorize(&probe);
+                if decision.is_malformed() {
+                    problems.push(format!(
                         "`{}` on `{}`: {}",
-                        request.action,
-                        request.resource,
+                        probe.action,
+                        probe.resource,
                         decision.reason().unwrap_or_default()
-                    )
-                })
-            })
-            .collect()
+                    ));
+                }
+            }
+        }
+        problems
     }
 
     fn bundle(&self) -> PolicyBundleIdentity {

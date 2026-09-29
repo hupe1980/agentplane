@@ -15,7 +15,7 @@ use crate::core::{
     Timestamp,
 };
 
-use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded};
+use super::redb::{MAX_STR, RedbStore, be, begin_write, decoded, is_sealed};
 
 fn phase_from(s: &str) -> Result<crate::core::Phase, StoreError> {
     decoded("step phase", s, crate::core::Phase::parse(s))
@@ -137,7 +137,25 @@ const EVENTS_CLAIMED: TableDefinition<(&str, &str, &str), ()> =
 const SUBS_BY_TIME: TableDefinition<(&str, i64, &str, &str, &str, &str), ()> =
     TableDefinition::new("subscriptions_by_time");
 
+/// `(tenant, run_id, effect_key) -> parked_at`, waits holding a claimed event
+/// nothing has delivered yet.
+///
+/// The redelivery pass's access path. It walks this rather than
+/// [`SUBS_BY_TIME`], which holds every registered wait: a plane holds far more
+/// long, legitimate waits than one redelivery page, and a parked pair behind
+/// them would never be reached. Cleared with the subscription it marks.
+const PARKED: TableDefinition<(&str, &str, &str), i64> =
+    TableDefinition::new("subscriptions_parked");
+
+/// `(tenant, event_id) -> ()`, rows whose payload `erase_payload` removed.
+///
+/// Its own table rather than a thirteenth column: set once and never cleared,
+/// and read only by the claim that must never hand an erased row to a run as
+/// a value, whatever its claim says.
+const EVENTS_ERASED: TableDefinition<(&str, &str), ()> = TableDefinition::new("inbound_erased");
+
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
+    w.open_table(EVENTS_ERASED).map_err(|e| be(&e))?;
     w.open_table(EVENTS).map_err(|e| be(&e))?;
     w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
     w.open_table(EVENT_BY_KEY).map_err(|e| be(&e))?;
@@ -147,6 +165,7 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(EVENTS_DEAD).map_err(|e| be(&e))?;
     w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
     w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
+    w.open_table(PARKED).map_err(|e| be(&e))?;
     Ok(())
 }
 
@@ -265,6 +284,115 @@ fn strip_payload(
     Ok(true)
 }
 
+/// Retire an erased event nobody had claimed, with the reason `erased`.
+///
+/// Its payload is already `null`; left live, the next matching waiter would
+/// claim that `null` as the counterparty's message. Dead-lettered instead, it
+/// keeps its identity for dedup and names itself in the operator's list.
+fn dead_letter_as_erased(
+    w: &redb::WriteTransaction,
+    events: &mut redb::Table<'_, (&'static str, &'static str), EventRow<'static>>,
+    tenant: &str,
+    key: &str,
+    received: i64,
+) -> Result<(), StoreError> {
+    let Some(row) = events.get((tenant, key)).map_err(|e| be(&e))?.map(|v| {
+        let (src, bid, kd, pl, ra, _, _, _, _, _, ba, bb) = v.value();
+        (
+            src.to_owned(),
+            bid.to_owned(),
+            kd.to_owned(),
+            pl.to_owned(),
+            ra,
+            ba.to_owned(),
+            bb.to_owned(),
+        )
+    }) else {
+        return Ok(());
+    };
+    events
+        .insert(
+            (tenant, key),
+            (
+                row.0.as_str(),
+                row.1.as_str(),
+                row.2.as_str(),
+                row.3.as_str(),
+                row.4,
+                "",
+                0i64,
+                0u8,
+                1u8,
+                crate::case::ERASED_REASON,
+                row.5.as_str(),
+                row.6.as_str(),
+            ),
+        )
+        .map_err(|e| be(&e))?;
+    w.open_table(EVENTS_LIVE)
+        .map_err(|e| be(&e))?
+        .remove((tenant, received, key))
+        .map_err(|e| be(&e))?;
+    w.open_table(EVENTS_DEAD)
+        .map_err(|e| be(&e))?
+        .insert((tenant, received, key), ())
+        .map_err(|e| be(&e))?;
+    Ok(())
+}
+
+/// Unpark the waits of `run` that `event_id`'s correlation keys match.
+///
+/// The erasure of a claimed, undelivered event releases its claim; the wait
+/// that was parked holding it is a wait again, matchable by the next event,
+/// rather than a pair the redelivery pass tries for ever.
+fn unpark_for(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run: &str,
+    event_id: &str,
+) -> Result<(), StoreError> {
+    let keys = load_correlation(
+        &w.open_table(EVENT_CORR).map_err(|e| be(&e))?,
+        tenant,
+        event_id,
+    )?;
+    let effects: Vec<String> = w
+        .open_table(PARKED)
+        .map_err(|e| be(&e))?
+        .range((tenant, run, "")..=(tenant, run, MAX_STR))
+        .map_err(|e| be(&e))?
+        .map(|e| e.map(|(k, _)| k.value().2.to_owned()).map_err(|e| be(&e)))
+        .collect::<Result<_, _>>()?;
+    let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+    let mut matching = Vec::new();
+    for effect in effects {
+        for k in &keys {
+            if subs
+                .get((
+                    tenant,
+                    run,
+                    effect.as_str(),
+                    k.namespace.as_str(),
+                    k.value.as_str(),
+                ))
+                .map_err(|e| be(&e))?
+                .is_some()
+            {
+                matching.push(effect.clone());
+                break;
+            }
+        }
+    }
+    drop(subs);
+    let mut parked = w.open_table(PARKED).map_err(|e| be(&e))?;
+    for effect in matching {
+        parked
+            .remove((tenant, run, effect.as_str()))
+            .map_err(|e| be(&e))?;
+    }
+    Ok(())
+}
+
 /// Write an event's correlation rows and its match-path index.
 ///
 /// Its own function because `buffer` was over the line limit with it inline, and
@@ -301,6 +429,7 @@ fn index_correlation(
 /// *may I claim this for them*. Returns the wait's identity and the fields the
 /// caller needs to rebuild it.
 fn oldest_waiter(
+    w: &redb::WriteTransaction,
     tenant: &str,
     by_key: &impl ReadableTable<SubKey<'static>, ()>,
     subs: &impl ReadableTable<
@@ -342,6 +471,17 @@ fn oldest_waiter(
         {
             let (sk, _) = e.map_err(|e| be(&e))?;
             let (_, _, ns, val, _, run, effect) = sk.value();
+            // A sealed run consumes nothing. Passed over, so the event goes
+            // to the next live waiter rather than to a claim nobody reads.
+            if is_sealed(w, tenant, run)? {
+                continue;
+            }
+            // A parked wait already holds its claimed event and is waiting
+            // only for redelivery. It is not a waiter: a second event elected
+            // for it would be claimed for a satisfied wait and never consumed.
+            if is_parked(w, tenant, run, effect)? {
+                continue;
+            }
             if let Some(v) = subs
                 .get((tenant, run, effect, ns, val))
                 .map_err(|e| be(&e))?
@@ -359,6 +499,166 @@ fn oldest_waiter(
         }
     }
     Ok(None)
+}
+
+/// Whether a wait is parked: it holds a claimed event nothing delivered yet.
+fn is_parked(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run: &str,
+    effect: &str,
+) -> Result<bool, StoreError> {
+    Ok(w.open_table(PARKED)
+        .map_err(|e| be(&e))?
+        .get((tenant, run, effect))
+        .map_err(|e| be(&e))?
+        .is_some())
+}
+
+/// Register a wait under each of its correlation keys, in the caller's
+/// transaction. Idempotent per key: a resumed run re-registering the same wait
+/// keeps its original registration instant.
+fn register_wait(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    sub: &Subscription,
+    at: i64,
+) -> Result<(), StoreError> {
+    let run = sub.run.to_string();
+    let effect = sub.effect.to_hex();
+    let case = sub.case.map(|c| c.to_string()).unwrap_or_default();
+    let has_case = u8::from(sub.case.is_some());
+    let phase = sub.phase.as_str();
+    let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+    let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
+    let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
+    for k in &sub.correlation {
+        let key = (
+            tenant,
+            run.as_str(),
+            effect.as_str(),
+            k.namespace.as_str(),
+            k.value.as_str(),
+        );
+        if subs.get(key).map_err(|e| be(&e))?.is_none() {
+            subs.insert(
+                key,
+                (
+                    case.as_str(),
+                    has_case,
+                    sub.step.0,
+                    phase,
+                    sub.kind.as_str(),
+                    at,
+                ),
+            )
+            .map_err(|e| be(&e))?;
+            by_key
+                .insert(
+                    (
+                        tenant,
+                        sub.kind.as_str(),
+                        k.namespace.as_str(),
+                        k.value.as_str(),
+                        at,
+                        run.as_str(),
+                        effect.as_str(),
+                    ),
+                    (),
+                )
+                .map_err(|e| be(&e))?;
+            by_time
+                .insert(
+                    (
+                        tenant,
+                        at,
+                        run.as_str(),
+                        effect.as_str(),
+                        k.namespace.as_str(),
+                        k.value.as_str(),
+                    ),
+                    (),
+                )
+                .map_err(|e| be(&e))?;
+        }
+    }
+    Ok(())
+}
+
+/// Retire one wait — its rows, both indexes and its parked mark — in the
+/// caller's transaction. A stale index entry would hand a message to a run
+/// that stopped waiting.
+fn drop_wait(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run: &str,
+    effect: &str,
+) -> Result<(), StoreError> {
+    let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+    let mut doomed = Vec::new();
+    for e in subs
+        .range((tenant, run, effect, "", "")..=(tenant, run, effect, MAX_STR, MAX_STR))
+        .map_err(|e| be(&e))?
+    {
+        let (k, v) = e.map_err(|e| be(&e))?;
+        let (_, _, _, ns, val) = k.value();
+        let (_, _, _, _, kind, created) = v.value();
+        doomed.push((ns.to_owned(), val.to_owned(), kind.to_owned(), created));
+    }
+    let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
+    let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
+    for (ns, val, kind, created) in doomed {
+        subs.remove((tenant, run, effect, ns.as_str(), val.as_str()))
+            .map_err(|e| be(&e))?;
+        by_key
+            .remove((
+                tenant,
+                kind.as_str(),
+                ns.as_str(),
+                val.as_str(),
+                created,
+                run,
+                effect,
+            ))
+            .map_err(|e| be(&e))?;
+        by_time
+            .remove((tenant, created, run, effect, ns.as_str(), val.as_str()))
+            .map_err(|e| be(&e))?;
+    }
+    w.open_table(PARKED)
+        .map_err(|e| be(&e))?
+        .remove((tenant, run, effect))
+        .map_err(|e| be(&e))?;
+    Ok(())
+}
+
+/// Shed the buffer's copy of every payload `run` holds claimed.
+///
+/// A run's unsubscribe is the store's signal that delivery was journaled, so
+/// the row keeps its `(source, id)` identity, claim and dead-letter fields —
+/// dedup and accounting need those, and only the content was ever the erasure
+/// concern. Stripping at the *claim* instead would lose the payload for a run
+/// that crashed between claim and resume, whose recovery re-reads it from the
+/// buffer.
+fn shed_claimed(w: &redb::WriteTransaction, tenant: &str, run: &str) -> Result<(), StoreError> {
+    let mut claimed = w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
+    let held: Vec<String> = claimed
+        .range((tenant, run, "")..=(tenant, run, MAX_STR))
+        .map_err(|e| be(&e))?
+        .map(|entry| {
+            entry
+                .map(|(key, _)| key.value().2.to_owned())
+                .map_err(|error| be(&error))
+        })
+        .collect::<Result<_, _>>()?;
+    let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
+    for id in held {
+        strip_payload(&mut events, tenant, &id)?;
+        claimed
+            .remove((tenant, run, id.as_str()))
+            .map_err(|e| be(&e))?;
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -422,64 +722,10 @@ impl EventStore for RedbStore {
 
     async fn subscribe(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
-        let run = sub.run.to_string();
-        let effect = sub.effect.to_hex();
-        let case = sub.case.map(|c| c.to_string()).unwrap_or_default();
-        let has_case = u8::from(sub.case.is_some());
-        let step = sub.step.0;
-        let phase = sub.phase.as_str();
-        let kind = sub.kind.clone();
-        let keys = sub.correlation.clone();
+        let sub = sub.clone();
         self.with_db(move |db| {
             let w = begin_write(db)?;
-            {
-                let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
-                let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
-                let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
-                for k in &keys {
-                    let key = (
-                        tenant.as_str(),
-                        run.as_str(),
-                        effect.as_str(),
-                        k.namespace.as_str(),
-                        k.value.as_str(),
-                    );
-                    if subs.get(key).map_err(|e| be(&e))?.is_none() {
-                        subs.insert(
-                            key,
-                            (case.as_str(), has_case, step, phase, kind.as_str(), ts(at)),
-                        )
-                        .map_err(|e| be(&e))?;
-                        by_key
-                            .insert(
-                                (
-                                    tenant.as_str(),
-                                    kind.as_str(),
-                                    k.namespace.as_str(),
-                                    k.value.as_str(),
-                                    ts(at),
-                                    run.as_str(),
-                                    effect.as_str(),
-                                ),
-                                (),
-                            )
-                            .map_err(|e| be(&e))?;
-                        by_time
-                            .insert(
-                                (
-                                    tenant.as_str(),
-                                    ts(at),
-                                    run.as_str(),
-                                    effect.as_str(),
-                                    k.namespace.as_str(),
-                                    k.value.as_str(),
-                                ),
-                                (),
-                            )
-                            .map_err(|e| be(&e))?;
-                    }
-                }
-            }
+            register_wait(&w, &tenant, &sub, ts(at))?;
             w.commit().map_err(|e| be(&e))?;
             Ok(())
         })
@@ -558,7 +804,13 @@ impl EventStore for RedbStore {
                         // message arrived in time and was lost anyway. Single
                         // delivery is untouched, because only the claiming run
                         // can re-claim.
-                        if row.0 == kind && (row.3 == 0 || row.7 == run) && row.4 == 0 {
+                        let erased = w
+                            .open_table(EVENTS_ERASED)
+                            .map_err(|e| be(&e))?
+                            .get((tenant.as_str(), id.as_str()))
+                            .map_err(|e| be(&e))?
+                            .is_some();
+                        if row.0 == kind && (row.3 == 0 || row.7 == run) && row.4 == 0 && !erased {
                             hit = Some((id, row));
                             break 'outer;
                         }
@@ -644,7 +896,7 @@ impl EventStore for RedbStore {
             let found = {
                 let by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
                 let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
-                let hit = oldest_waiter(&tenant, &by_key, &subs, &kind, &keys)?;
+                let hit = oldest_waiter(&w, &tenant, &by_key, &subs, &kind, &keys)?;
                 drop(by_key);
 
                 match hit {
@@ -735,6 +987,10 @@ impl EventStore for RedbStore {
                             // recovers its own claimed event through the
                             // crash-recovery arm, so nothing legitimate needs
                             // the stale registration.
+                            w.open_table(PARKED)
+                                .map_err(|e| be(&e))?
+                                .remove((tenant.as_str(), run.as_str(), effect.as_str()))
+                                .map_err(|e| be(&e))?;
                             for (ns, val, sub_kind, created) in retired {
                                 subs.remove((
                                     tenant.as_str(),
@@ -889,6 +1145,7 @@ impl EventStore for RedbStore {
                     correlation.push(CorrelationKey::new(namespace.to_owned(), value.to_owned()));
                 }
                 drop(subs);
+                let subscription_effect = effect.clone();
 
                 let subscription = Subscription {
                     run: target,
@@ -945,6 +1202,16 @@ impl EventStore for RedbStore {
                         .map_err(|e| be(&e))?
                         .insert((tenant.as_str(), run.as_str(), id.as_str()), ())
                         .map_err(|e| be(&e))?;
+                    // Parked until the run's unsubscribe: a crash between this
+                    // claim and the resume leaves a pair the redelivery pass
+                    // finds.
+                    w.open_table(PARKED)
+                        .map_err(|e| be(&e))?
+                        .insert(
+                            (tenant.as_str(), run.as_str(), subscription_effect.as_str()),
+                            ts(at),
+                        )
+                        .map_err(|e| be(&e))?;
                     // The subscription is deliberately **not** retired here,
                     // unlike `match_waiter` — the asymmetry is the two paths'
                     // retry semantics. A retried targeted delivery rebuilds
@@ -969,96 +1236,151 @@ impl EventStore for RedbStore {
         let (run, effect) = (run.to_string(), effect.to_hex());
         self.with_db(move |db| {
             let w = begin_write(db)?;
-            {
-                let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
-                let mut doomed = Vec::new();
-                for e in subs
+            drop_wait(&w, &tenant, &run, &effect)?;
+            shed_claimed(&w, &tenant, &run)?;
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
+        let tenant = self.tenant_name();
+        let run = run.to_string();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let effects: std::collections::BTreeSet<String> = {
+                let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+                subs.range(
+                    (tenant.as_str(), run.as_str(), "", "", "")
+                        ..=(tenant.as_str(), run.as_str(), MAX_STR, MAX_STR, MAX_STR),
+                )
+                .map_err(|e| be(&e))?
+                .map(|e| e.map(|(k, _)| k.value().2.to_owned()).map_err(|e| be(&e)))
+                .collect::<Result<_, _>>()?
+            };
+            for effect in &effects {
+                drop_wait(&w, &tenant, &run, effect)?;
+            }
+            shed_claimed(&w, &tenant, &run)?;
+            w.commit().map_err(|e| be(&e))?;
+            Ok(effects.len())
+        })
+        .await
+    }
+
+    async fn park_wait(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let sub = sub.clone();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            register_wait(&w, &tenant, &sub, ts(at))?;
+            w.open_table(PARKED)
+                .map_err(|e| be(&e))?
+                .insert(
+                    (
+                        tenant.as_str(),
+                        sub.run.to_string().as_str(),
+                        sub.effect.to_hex().as_str(),
+                    ),
+                    ts(at),
+                )
+                .map_err(|e| be(&e))?;
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn parked_waits(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            // A sealed run can record no delivery. Its parked pairs are
+            // retired here rather than listed, or the redelivery pass tries
+            // each, fails, and finds it again every tick.
+            let listed: Vec<(String, String)> = {
+                let parked = w.open_table(PARKED).map_err(|e| be(&e))?;
+                parked
+                    .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                    .map_err(|e| be(&e))?
+                    .map(|e| {
+                        e.map(|(k, _)| {
+                            let (_, run, effect) = k.value();
+                            (run.to_owned(), effect.to_owned())
+                        })
+                        .map_err(|e| be(&e))
+                    })
+                    .collect::<Result<_, _>>()?
+            };
+            let mut live = Vec::new();
+            for (run, effect) in listed {
+                if is_sealed(&w, &tenant, &run)? {
+                    drop_wait(&w, &tenant, &run, &effect)?;
+                    shed_claimed(&w, &tenant, &run)?;
+                } else {
+                    live.push((run, effect));
+                }
+            }
+            let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+            let mut out = Vec::new();
+            for (run, effect) in &live {
+                if out.len() >= limit {
+                    break;
+                }
+                let (run, effect) = (run.as_str(), effect.as_str());
+                let mut found: Option<(String, u8, u32, String, String)> = None;
+                let mut correlation = Vec::new();
+                for row in subs
                     .range(
-                        (tenant.as_str(), run.as_str(), effect.as_str(), "", "")
-                            ..=(
-                                tenant.as_str(),
-                                run.as_str(),
-                                effect.as_str(),
-                                MAX_STR,
-                                MAX_STR,
-                            ),
+                        (tenant.as_str(), run, effect, "", "")
+                            ..=(tenant.as_str(), run, effect, MAX_STR, MAX_STR),
                     )
                     .map_err(|e| be(&e))?
                 {
-                    let (k, v) = e.map_err(|e| be(&e))?;
-                    let (_, _, _, ns, val) = k.value();
-                    let (_, _, _, _, kind, created) = v.value();
-                    doomed.push((ns.to_owned(), val.to_owned(), kind.to_owned(), created));
+                    let (key, value) = row.map_err(|e| be(&e))?;
+                    let (_, _, _, ns, val) = key.value();
+                    let (case, has_case, step, phase, kind, _) = value.value();
+                    correlation.push(CorrelationKey::new(ns.to_owned(), val.to_owned()));
+                    found.get_or_insert_with(|| {
+                        (
+                            case.to_owned(),
+                            has_case,
+                            step,
+                            phase.to_owned(),
+                            kind.to_owned(),
+                        )
+                    });
                 }
-                let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
-                let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
-                for (ns, val, kind, created) in doomed {
-                    subs.remove((
-                        tenant.as_str(),
-                        run.as_str(),
-                        effect.as_str(),
-                        ns.as_str(),
-                        val.as_str(),
-                    ))
-                    .map_err(|e| be(&e))?;
-                    // The index goes with it, in the same transaction: a stale
-                    // index entry would hand a message to a run that stopped
-                    // waiting.
-                    by_key
-                        .remove((
-                            tenant.as_str(),
-                            kind.as_str(),
-                            ns.as_str(),
-                            val.as_str(),
-                            created,
-                            run.as_str(),
-                            effect.as_str(),
-                        ))
-                        .map_err(|e| be(&e))?;
-                    by_time
-                        .remove((
-                            tenant.as_str(),
-                            created,
-                            run.as_str(),
-                            effect.as_str(),
-                            ns.as_str(),
-                            val.as_str(),
-                        ))
-                        .map_err(|e| be(&e))?;
-                }
+                let Some((case, has_case, step, phase, kind)) = found else {
+                    continue;
+                };
+                out.push(Subscription {
+                    run: RunId::parse(run).map_err(|e| StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!("bad run id '{run}': {e}"),
+                    })?,
+                    case: if has_case == 1 {
+                        Some(CaseId::parse(&case).map_err(|e| StoreError::Corrupt {
+                            seq: 0,
+                            detail: format!("bad case id '{case}': {e}"),
+                        })?)
+                    } else {
+                        None
+                    },
+                    effect: EffectKey::from_hex(effect).map_err(|e| StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!("bad effect key '{effect}': {e}"),
+                    })?,
+                    step: crate::core::StepId(step),
+                    phase: phase_from(&phase)?,
+                    kind,
+                    correlation,
+                });
             }
-            {
-                // The run's unsubscribe is the store's signal that delivery
-                // was journaled, so the buffer's copy of every payload this
-                // run claimed is shed here — the row keeps its `(source, id)`
-                // identity, claim and dead-letter fields, because dedup and
-                // accounting need those and only the content was ever the
-                // erasure concern. Stripping at the *claim* instead would lose
-                // the payload for a run that crashed between claim and
-                // resume, whose recovery re-reads it from the buffer.
-                let mut claimed = w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
-                let held: Vec<String> = claimed
-                    .range(
-                        (tenant.as_str(), run.as_str(), "")
-                            ..=(tenant.as_str(), run.as_str(), MAX_STR),
-                    )
-                    .map_err(|e| be(&e))?
-                    .map(|entry| {
-                        entry
-                            .map(|(key, _)| key.value().2.to_owned())
-                            .map_err(|error| be(&error))
-                    })
-                    .collect::<Result<_, _>>()?;
-                let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
-                for id in held {
-                    strip_payload(&mut events, &tenant, &id)?;
-                    claimed
-                        .remove((tenant.as_str(), run.as_str(), id.as_str()))
-                        .map_err(|e| be(&e))?;
-                }
-            }
+            drop(subs);
             w.commit().map_err(|e| be(&e))?;
-            Ok(())
+            Ok(out)
         })
         .await
     }
@@ -1080,10 +1402,75 @@ impl EventStore for RedbStore {
             let w = begin_write(db)?;
             let existed = {
                 let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
-                strip_payload(&mut events, &tenant, &key)?
+                // Read before the strip: whether the row was still undelivered
+                // decides whether it leaves the claimable set.
+                let row = events
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (_, _, _, _, received, by, _, claimed, dead, _, _, _) = v.value();
+                        (received, by.to_owned(), claimed == 1, dead == 1)
+                    });
+                let existed = strip_payload(&mut events, &tenant, &key)?;
+                if existed {
+                    w.open_table(EVENTS_ERASED)
+                        .map_err(|e| be(&e))?
+                        .insert((tenant.as_str(), key.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                }
+                if let Some((received, claimant, claimed, dead)) = row {
+                    // Claimed and not yet journaled: the claimant's
+                    // unsubscribe removes this index entry when it sheds the
+                    // delivered payload, so an entry here is a claim no run
+                    // has consumed.
+                    let undelivered_claim = claimed
+                        && w.open_table(EVENTS_CLAIMED)
+                            .map_err(|e| be(&e))?
+                            .remove((tenant.as_str(), claimant.as_str(), key.as_str()))
+                            .map_err(|e| be(&e))?
+                            .is_some();
+                    if (!claimed && !dead) || undelivered_claim {
+                        dead_letter_as_erased(&w, &mut events, &tenant, &key, received)?;
+                    }
+                    if undelivered_claim {
+                        drop(events);
+                        unpark_for(&w, &tenant, &claimant, &key)?;
+                    }
+                }
+                existed
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(existed)
+        })
+        .await
+    }
+
+    async fn minter(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<crate::case::Minter>, StoreError> {
+        let tenant = self.tenant_name();
+        let key = crate::core::origin_key(source, id);
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(events) = r.open_table(EVENTS) else {
+                return Ok(None);
+            };
+            let Some(row) = events
+                .get((tenant.as_str(), key.as_str()))
+                .map_err(|e| be(&e))?
+                .map(|v| {
+                    let (.., ba, bb) = v.value();
+                    (ba.to_owned(), bb.to_owned())
+                })
+            else {
+                return Ok(None);
+            };
+            Ok(Some(decode_minter(&row.0, &row.1)?.map_or(
+                crate::case::Minter::Nobody,
+                crate::case::Minter::Operator,
+            )))
         })
         .await
     }
@@ -1322,13 +1709,7 @@ mod codec_tests {
 
     /// **A subscription phase this store cannot read is damage, not `Forward`.**
     ///
-    /// The third copy of one decoder. The shared-store backend refused a bad
-    /// phase and the timer store was taught to; this one still answered
-    /// `Forward` for anything it did not recognise, with a comment defending
-    /// the totality — while the case id and effect key decoded three lines
-    /// away already answered `Corrupt`.
-    ///
-    /// What the default costs is specific: the phase selects the replay cursor
+    /// What a default would cost is specific: the phase selects the replay cursor
     /// the delivery is journaled under, and forward and compensating effects
     /// must never share one. A compensating wait whose phase is misread has its
     /// answer filed on the forward cursor — so that wait is never satisfied and

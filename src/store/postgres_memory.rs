@@ -281,8 +281,8 @@ impl MemoryStore for PostgresStore {
         .map_err(|error| be(&error))?;
 
         // Sliding retention starts at the write, not at the first touch.
-        // Initialized lazily, an item with a window and no fixed expiry was
-        // *immortal* until somebody touched it — opt-in garbage that never
+        // Initialized lazily, an item with a window and no fixed expiry would
+        // be *immortal* until somebody touched it — opt-in garbage that never
         // collects. The write is itself an access, so the window opens here
         // and each journaled touch slides it; a version written without the
         // window drops the row, because retention is a property of what is
@@ -478,9 +478,7 @@ impl MemoryStore for PostgresStore {
             .map_err(|error| be(&error))?
             .is_some()
         {
-            return Err(StoreError::Backend(format!(
-                "memory '{id}' is under legal hold"
-            )));
+            return Err(StoreError::UnderLegalHold { id: id.to_owned() });
         }
         // Edges deliberately stay — both directions. Outgoing, so a correction
         // that later becomes an erasure request can still find this memory's
@@ -519,7 +517,7 @@ impl MemoryStore for PostgresStore {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
+    async fn forget_cascading(&self, id: &str) -> Result<crate::memory::Cascade, StoreError> {
         let mut client = self.pool_ref().get().await.map_err(|error| {
             StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
         })?;
@@ -637,16 +635,16 @@ impl MemoryStore for PostgresStore {
                 .map_err(|error| be(&error))?
                 .is_some()
             {
-                return Err(StoreError::Backend(format!(
-                    "memory '{memory_id}' is under legal hold"
-                )));
+                return Err(StoreError::UnderLegalHold {
+                    id: memory_id.clone(),
+                });
             }
         }
 
-        // Counted per node that actually held rows, so a tombstoned
+        // Named per node that actually held rows, so a tombstoned
         // intermediate the traversal passed through is not reported as an
         // erasure it did not perform.
-        let mut erased = 0usize;
+        let mut erased = Vec::new();
         for memory_id in &doomed {
             tx.execute(
                 "DELETE FROM memory_derived
@@ -655,15 +653,15 @@ impl MemoryStore for PostgresStore {
             )
             .await
             .map_err(|error| be(&error))?;
-            let rows = tx
-                .execute(
-                    "DELETE FROM memory_items WHERE tenant = $1 AND id = $2",
+            let removed = tx
+                .query(
+                    "DELETE FROM memory_items WHERE tenant = $1 AND id = $2 RETURNING version",
                     &[&tenant, memory_id],
                 )
                 .await
                 .map_err(|error| be(&error))?;
-            if rows > 0 {
-                erased += 1;
+            if let Some(highest) = removed.iter().map(|row| row.get::<_, i64>(0)).max() {
+                erased.push((memory_id.clone(), highest.cast_unsigned()));
             }
             // Sliding-retention residue goes with the id — every erasure path
             // removes it.
@@ -686,7 +684,8 @@ impl MemoryStore for PostgresStore {
         // alive. Only the version row goes: the id keeps its current entry and
         // — no tombstone — its future. `AND NOT current` is belt on top of the
         // traversal's own check; the graph lock makes the two agree.
-        let mut partly: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut partly: std::collections::BTreeMap<&str, Vec<u64>> =
+            std::collections::BTreeMap::new();
         for (memory_id, version) in &doomed_versions {
             if doomed.contains(memory_id) {
                 continue;
@@ -709,13 +708,23 @@ impl MemoryStore for PostgresStore {
                 .await
                 .map_err(|error| be(&error))?;
             if rows > 0 {
-                partly.insert(memory_id.as_str());
+                partly
+                    .entry(memory_id.as_str())
+                    .or_default()
+                    .push(version.cast_unsigned());
             }
         }
-        erased += partly.len();
+        let trimmed: Vec<(String, Vec<u64>)> = partly
+            .into_iter()
+            .map(|(id, mut versions)| {
+                versions.sort_unstable();
+                versions.dedup();
+                (id.to_owned(), versions)
+            })
+            .collect();
 
         tx.commit().await.map_err(|error| be(&error))?;
-        Ok(erased)
+        Ok(crate::memory::Cascade { erased, trimmed })
     }
 
     async fn forget_subject(&self, subject: &str) -> Result<usize, StoreError> {
@@ -758,9 +767,7 @@ impl MemoryStore for PostgresStore {
                 .map_err(|error| be(&error))?
                 .is_some()
             {
-                return Err(StoreError::Backend(format!(
-                    "memory '{id}' is under legal hold"
-                )));
+                return Err(StoreError::UnderLegalHold { id: id.clone() });
             }
         }
         for id in &ids {
@@ -884,7 +891,10 @@ impl MemoryStore for PostgresStore {
             .map_err(|error| be(&error))
     }
 
-    async fn sweep_expired(&self, at: crate::core::Timestamp) -> Result<usize, StoreError> {
+    async fn sweep_expired(
+        &self,
+        at: crate::core::Timestamp,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
         let mut client = self.pool_ref().get().await.map_err(|error| {
             StoreError::Backend(format!("PostgreSQL pool unavailable: {error}"))
         })?;
@@ -909,7 +919,7 @@ impl MemoryStore for PostgresStore {
         .map_err(|error| be(&error))?;
         let rows = tx
             .query(
-                "SELECT item.id
+                "SELECT item.id, item.version
                  FROM memory_items item
                                  LEFT JOIN memory_access_expiry access
                                      ON access.tenant = item.tenant AND access.id = item.id
@@ -930,8 +940,12 @@ impl MemoryStore for PostgresStore {
             )
             .await
             .map_err(|error| be(&error))?;
-        let ids: Vec<String> = rows.iter().map(|row| row.get("id")).collect();
-        for id in &ids {
+        // The current version is the highest: versions only grow.
+        let swept: Vec<(String, u64)> = rows
+            .iter()
+            .map(|row| (row.get("id"), row.get::<_, i64>("version").cast_unsigned()))
+            .collect();
+        for (id, _) in &swept {
             tx.execute(
                 "DELETE FROM memory_access_expiry WHERE tenant = $1 AND id = $2",
                 &[&tenant, id],
@@ -963,7 +977,7 @@ impl MemoryStore for PostgresStore {
             .map_err(|error| be(&error))?;
         }
         tx.commit().await.map_err(|error| be(&error))?;
-        Ok(ids.len())
+        Ok(swept)
     }
 
     async fn touch(&self, ids: &[String], at: crate::core::Timestamp) -> Result<(), StoreError> {

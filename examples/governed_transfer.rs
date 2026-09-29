@@ -25,7 +25,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use agentplane::core::{Release, ReleaseScope, SourceId};
+use agentplane::core::{
+    ACTION_RELEASE, Digest, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
+    Release, ReleaseScope, SourceId,
+};
 use agentplane::manifest::Manifest;
 use agentplane::prelude::*;
 use agentplane::runtime::Agent;
@@ -144,6 +147,32 @@ impl Skill for Transfer {
     }
 }
 
+/// The deployment's rules. A release lowers a label, so a plane with no
+/// policy engine refuses every one; this engine permits effects and admission,
+/// and a release only toward the ledger.
+#[derive(Debug)]
+struct TreasuryPolicy;
+
+impl PolicyEngine for TreasuryPolicy {
+    fn authorize(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+        if request.action != ACTION_RELEASE {
+            return PolicyDecision::Permit;
+        }
+        match request
+            .context
+            .pointer("/release/destination")
+            .and_then(Value::as_str)
+        {
+            Some("tool://ledger/transfer") => PolicyDecision::Permit,
+            _ => PolicyDecision::deny("a release toward anything but the ledger"),
+        }
+    }
+
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(Digest::of(b"treasury-policy-v1"), "treasury/v1")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory()?);
@@ -158,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transport: Arc<dyn ToolClient> = ledger.clone();
     let runtime = Runtime::builder(Arc::clone(&store))
+        .policy(Arc::new(TreasuryPolicy))
         .tools(Arc::new(catalog), transport)
         .agent(Agent::new(&manifest).skill(Transfer))
         .try_build()?;

@@ -26,8 +26,8 @@
 use std::sync::Arc;
 
 use crate::core::{
-    CaseId, CaseStatus, DeadlineState, Decision, InboundEvent, OnExpiry, RunId, RuntimeError,
-    StoreError, SweptAction, TaskState, Timestamp,
+    CaseId, DeadlineState, Decision, InboundEvent, OnExpiry, RunId, RuntimeError, StoreError,
+    SweptAction, TaskState, Timestamp,
 };
 use crate::journal::{Append, JournalStore, RecordKind};
 
@@ -65,15 +65,15 @@ pub(crate) const SWEEP_OUTCOME: &str = "swept";
 /// behind: opening a run per tick would fill the Merkle log with evidence that
 /// nothing happened, and a log of nothings is where the somethings hide.
 ///
-/// **Each decision is durable before it is applied** — I2's
-/// announce-before-act, applied to the sweeper itself. A note buffered until
-/// the tick ends inverts that precisely where it matters most: the state
-/// changes a sweep applies (a breach, an escalation) are idempotent
-/// transitions, so a crash between applying one and writing its buffered
-/// evidence orphans the record *permanently* — the next tick finds the
-/// transition already applied and re-decides nothing. So `note` appends
-/// immediately, before the caller touches state, and `seal` only closes the
-/// run the notes already live in.
+/// **No decision is ever off the record.** A note buffered until the tick
+/// ends orphans its record permanently on a crash: the state changes a sweep
+/// applies (a breach, an escalation) are idempotent transitions, so the next
+/// tick finds the transition already applied and re-decides nothing. So `note`
+/// appends immediately, and `seal` only closes the run the notes already live
+/// in. Most decisions are noted before they act. A breach acts first — the
+/// store marks it as owing its account in the same write — and is noted
+/// after, so a breach that lost its race writes nothing and one that applied
+/// is found again by the next tick until its notes land.
 struct SweepLedger {
     run: Option<RunId>,
     /// Whether at least one note has durably landed — the difference between
@@ -92,9 +92,9 @@ impl SweepLedger {
 
     /// Durably note one decision, opening the tick's run the first time.
     ///
-    /// Called **before** the state change it describes; a note that cannot be
-    /// written fails the decision, which is then not applied — an unrecorded
-    /// breach is worse than a breach noticed one tick late.
+    /// A note that cannot be written fails the tick loudly. Before the state
+    /// change it describes, that leaves the decision unapplied; after a
+    /// breach, it leaves the breach owed its account for the next tick.
     ///
     /// `case` stamps the record so `JournalStore::case_history` finds it. That
     /// is the whole point of writing this down: the question is *why is this
@@ -219,12 +219,12 @@ pub struct WokenRuns {
     pub failed: usize,
 }
 
-/// What one redelivery pass finished, and how much of the waiting list it saw.
+/// What one redelivery pass finished, and how many parked waits it saw.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Redelivered {
     /// Deliveries this pass completed.
     pub finished: usize,
-    /// Waiting subscriptions this pass examined.
+    /// Parked waits this pass examined.
     ///
     /// The cap is judged on this rather than on `finished`, for the reason the
     /// timer pass counts failed wakes: a tick whose whole batch was still
@@ -644,9 +644,10 @@ impl Runtime {
     /// waits forever while looking exactly like work in progress.
     ///
     /// Per-run failures are contained: one unresumable run is counted, logged
-    /// and retried next tick rather than blocking the runs behind it. A lease
-    /// held by someone else is not a failure at all — another instance got
-    /// there first, which is the mechanism working.
+    /// and retried once the lease this pass left on it lapses, rather than
+    /// blocking the runs behind it. A lease held by someone else is not a
+    /// failure at all — another instance got there first, which is the
+    /// mechanism working.
     async fn recover_abandoned(
         &self,
         report: &mut SweepReport,
@@ -708,8 +709,9 @@ impl Runtime {
                 // page an operator about a race the design already settles.
                 // The note above stands, and honestly: this instance observed
                 // the lapse and moved to take the run over; the run's own
-                // journal shows who won.
-                Err(RuntimeError::Store(StoreError::LeaseHeld { .. })) => {}
+                // journal shows who won. `Fenced` is the same race lost
+                // later: the other instance claimed the run mid-resume.
+                Err(RuntimeError::LeaseHeld { .. } | RuntimeError::Fenced { .. }) => {}
                 // A lease over an **empty** journal: admission acquired and
                 // died before its first append landed. There is no run — the
                 // atomic admission batch never committed, so nothing was
@@ -911,11 +913,11 @@ impl Runtime {
         // lists only leases that expired while still naming an owner. Handing
         // the lease over keeps the run owned continuously from wake to
         // conclusion, so a crash anywhere in the resume leaves an owned lease
-        // the sweep drains. A `LeaseHeld` can still surface if this lease
-        // lapses mid-resume and somebody else claims the run — they will read
-        // the recorded wake like any other completed effect.
+        // the sweep drains. A `Fenced` surfaces if this lease lapses
+        // mid-resume and somebody else claims the run — they read the recorded
+        // wake like any other completed effect, so the wake still happened.
         match self.resume_holding(timer.run, lease).await {
-            Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => Ok(()),
+            Ok(_) | Err(RuntimeError::Fenced { .. }) => Ok(()),
             Err(e) => Err(e),
         }
     }
@@ -931,6 +933,19 @@ impl Runtime {
             return Ok(0);
         };
 
+        // Breaches a crashed tick applied and never accounted for, first: the
+        // obligation has left `due`, so this is the only pass that finds it.
+        let owed = cases
+            .breaches_to_note(DEADLINE_BATCH)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        if owed.len() >= DEADLINE_BATCH {
+            report.saturated.deadlines = true;
+        }
+        for deadline in owed {
+            self.account_for_breach(&deadline, report, ledger).await?;
+        }
+
         let mut warned = 0;
         let due = cases
             .due(now, DEADLINE_BATCH)
@@ -944,58 +959,24 @@ impl Runtime {
                 // Past the instant with the obligation unmet. This is the event
                 // the whole deadline machinery exists to produce.
                 //
-                // The notes land **before** the transitions — I2, applied to
-                // the sweeper. Acting first orphans the decision permanently:
-                // the transition is idempotent, so the next tick finds it
-                // already applied and writes nothing, leaving a breached case
-                // with no durable account of who breached it or when. Written
-                // first, a crash leaves a note whose transition the next tick
-                // re-applies — a duplicate decision on the record, which is
-                // honest, rather than an applied decision off it.
-                ledger
-                    .note(
-                        self.store(),
-                        Some(deadline.case),
-                        deadline.case.to_string(),
-                        SweptAction::DeadlineBreached,
-                        Some(format!(
-                            "'{}' was due {} and was not met",
-                            deadline.name, deadline.resolved_at
-                        )),
-                    )
-                    .await?;
-                ledger
-                    .note(
-                        self.store(),
-                        Some(deadline.case),
-                        deadline.case.to_string(),
-                        SweptAction::CaseEscalated,
-                        Some(format!("obligation '{}' was breached", deadline.name)),
-                    )
-                    .await?;
-                // The de-indexing write goes last. `due` selects obligations
-                // that are still outstanding, so writing `Breached` is what
-                // removes this one from the pass driving it — put anything
-                // after that write and a crash there strands a breach no tick
-                // will select again. Escalating twice is a no-op, so the order
-                // that repeats work is the order that is safe. `sweep_tasks`
-                // follows the same rule.
-                cases
-                    .set_status(deadline.case, CaseStatus::Escalated)
+                // **The act first, then its account.** One conditional write:
+                // `due` is a read that is already stale — a run may have met
+                // the obligation and closed the case since — and the store
+                // breaches only what is still outstanding and due, escalating
+                // only a case that is not closed, in one transaction. A breach
+                // that did not apply wrote nothing, so there is nothing on the
+                // record to correct. One that did is marked in the same write
+                // as owing its account, and the notes below retire the mark:
+                // a crash between the two leaves an obligation the next tick's
+                // drain notes, rather than a note claiming a breach that lost
+                // its race.
+                let applied = cases
+                    .breach_deadline(deadline.case, &deadline.name, now)
                     .await
                     .map_err(RuntimeError::from_store)?;
-                cases
-                    .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Breached)
-                    .await
-                    .map_err(RuntimeError::from_store)?;
-                tracing::error!(
-                    target: super::telemetry::DEADLINE_BREACHED,
-                    case = %deadline.case,
-                    obligation = %deadline.name,
-                    due = %deadline.resolved_at,
-                );
-                self.meter().count(metrics::DEADLINE_BREACHES, "");
-                report.breached += 1;
+                if applied {
+                    self.account_for_breach(&deadline, report, ledger).await?;
+                }
             } else if deadline.needs_warning(now) {
                 ledger
                     .note(
@@ -1009,14 +990,86 @@ impl Runtime {
                         )),
                     )
                     .await?;
-                cases
+                // A run that met the obligation since `due` read it has
+                // settled it; the warning is moot, not a failure of the tick.
+                // A warning is noted before it is set, so the note above is
+                // corrected on the record: the last word about the subject is
+                // what happened to it.
+                match cases
                     .set_deadline_state(deadline.case, &deadline.name, DeadlineState::Warned)
                     .await
-                    .map_err(RuntimeError::from_store)?;
-                warned += 1;
+                {
+                    Ok(()) => warned += 1,
+                    Err(StoreError::DeadlineFinal { .. }) => {
+                        ledger
+                            .note(
+                                self.store(),
+                                Some(deadline.case),
+                                deadline.case.to_string(),
+                                SweptAction::NotApplied,
+                                Some(format!(
+                                    "warning for '{}' not applied: the obligation was settled first",
+                                    deadline.name
+                                )),
+                            )
+                            .await?;
+                    }
+                    Err(e) => return Err(RuntimeError::from_store(e)),
+                }
             }
         }
         Ok(warned)
+    }
+
+    /// Write the account of an applied breach — the breach and the escalation
+    /// it caused — then retire the obligation's owed mark.
+    ///
+    /// The notes land before the mark is cleared, so a crash between them
+    /// repeats the account next tick rather than losing it: a duplicate note
+    /// is honest about a breach that happened, a missing one is not.
+    async fn account_for_breach(
+        &self,
+        deadline: &crate::core::Deadline,
+        report: &mut SweepReport,
+        ledger: &mut SweepLedger,
+    ) -> Result<(), RuntimeError> {
+        let Some(cases) = self.cases() else {
+            return Ok(());
+        };
+        ledger
+            .note(
+                self.store(),
+                Some(deadline.case),
+                deadline.case.to_string(),
+                SweptAction::DeadlineBreached,
+                Some(format!(
+                    "'{}' was due {} and was not met",
+                    deadline.name, deadline.resolved_at
+                )),
+            )
+            .await?;
+        ledger
+            .note(
+                self.store(),
+                Some(deadline.case),
+                deadline.case.to_string(),
+                SweptAction::CaseEscalated,
+                Some(format!("obligation '{}' was breached", deadline.name)),
+            )
+            .await?;
+        cases
+            .mark_breach_noted(deadline.case, &deadline.name)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        tracing::error!(
+            target: super::telemetry::DEADLINE_BREACHED,
+            case = %deadline.case,
+            obligation = %deadline.name,
+            due = %deadline.resolved_at,
+        );
+        self.meter().count(metrics::DEADLINE_BREACHES, "");
+        report.breached += 1;
+        Ok(())
     }
 
     /// Apply the declared expiry policy to tasks nobody answered.
@@ -1077,24 +1130,93 @@ impl Runtime {
                             Some(format!("window closed; applied {policy:?}")),
                         )
                         .await?;
-                    self.answer_task(task.id, &decision).await?;
-                    tasks
+                    // A duplicate means an answer is already on record: a
+                    // reviewer's whose settlement was lost, or this policy's
+                    // own from a tick that died before settling. Whichever it
+                    // was, the task is settled to it here — skipped, it would
+                    // stay overdue and every tick write a fresh expiry note — and a
+                    // reviewer's answer puts the loss of this one on the
+                    // record after the note that claimed it.
+                    let delivery = self.answer_task(task.id, &decision).await?;
+                    if delivery == crate::core::Delivery::Duplicate {
+                        match self.settle_answered(task.id).await? {
+                            Some(crate::case::Minter::Operator(by)) => {
+                                ledger
+                                    .note(
+                                        self.store(),
+                                        task.case,
+                                        task.id.to_hex(),
+                                        SweptAction::NotApplied,
+                                        Some(format!(
+                                            "expiry not applied: '{}' answered first",
+                                            by.actor()
+                                        )),
+                                    )
+                                    .await?;
+                            }
+                            Some(crate::case::Minter::Nobody) => report.tasks_expired += 1,
+                            None => {}
+                        }
+                        continue;
+                    }
+                    if tasks
                         .set_state(task.id, TaskState::Expired)
                         .await
-                        .map_err(RuntimeError::from_store)?;
-                    report.tasks_expired += 1;
+                        .map_err(RuntimeError::from_store)?
+                    {
+                        report.tasks_expired += 1;
+                    }
                 }
             }
         }
         Ok(())
     }
 
+    /// Settle a task whose answer is already on record to that answer's
+    /// state, returning who minted it — or `None` when no answer is buffered.
+    ///
+    /// The delivery that met a duplicate learns here whose answer is already
+    /// on record: a person's settles the task `Completed`, the expiry
+    /// policy's `Expired`. Idempotent — a task already settled stays as it is.
+    async fn settle_answered(
+        &self,
+        id: crate::core::TaskId,
+    ) -> Result<Option<crate::case::Minter>, RuntimeError> {
+        let (Some(tasks), Some(events)) = (self.tasks(), self.events()) else {
+            return Ok(None);
+        };
+        let minter = events
+            .minter(SOURCE_WORKLIST, &decision_event_id(id))
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let state = match &minter {
+            Some(crate::case::Minter::Operator(_)) => TaskState::Completed,
+            Some(crate::case::Minter::Nobody) => TaskState::Expired,
+            None => return Ok(None),
+        };
+        if tasks
+            .set_state(id, state)
+            .await
+            .map_err(RuntimeError::from_store)?
+        {
+            Ok(minter)
+        } else {
+            // Already settled: nothing changed, so nothing is reported.
+            Ok(None)
+        }
+    }
+
     /// Record a human decision and resume the run waiting on it.
     ///
     /// The decision is delivered as an ordinary inbound event, so it travels the
     /// same buffered, deduplicated, single-consumer path as any other message —
-    /// including the case where the run has not yet reached its wait.
-    pub async fn answer_task(
+    /// including the case where the run has not yet reached its wait. It is
+    /// the one door into the reserved kind a waiting task listens for, which
+    /// is why it is not public: an answer that skipped [`decide_task`]'s claim
+    /// and eligibility checks would be an approval nobody was checked for.
+    ///
+    /// [`decide_task`]: Self::decide_task
+    pub(crate) async fn answer_task(
         &self,
         id: crate::core::TaskId,
         decision: &Decision,
@@ -1106,7 +1228,7 @@ impl Runtime {
             SOURCE_WORKLIST,
             // One decision per task: the event id makes a double submit a
             // duplicate rather than a second answer.
-            format!("task-decision:{}", id.to_hex()),
+            decision_event_id(id),
             super::ctx::TASK_DECIDED,
             serde_json::to_value(decision)?,
         )
@@ -1125,7 +1247,7 @@ impl Runtime {
             None => event,
         };
 
-        self.deliver(&event).await
+        self.deliver_minted(&event).await
     }
 
     /// Complete a task on behalf of a person, enforcing eligibility first.
@@ -1165,13 +1287,72 @@ impl Runtime {
         // [`RuntimeError::TaskClaim`], exactly as the claim verb reports them.
         // Wrapped as a policy denial they would claim a rule fired when none
         // did, and collapse three different answers into one class.
-        tasks.claim(id, by.actor(), roles).await?;
+        // An approval is only of what its decider can be shown. A plane whose
+        // key ring cannot open this proposal — a terminal holding no key, a
+        // key an erasure destroyed, an envelope that did not decode — reads
+        // the row back withheld, and an approval of that is an approval of
+        // arguments nobody saw. Refused before the claim, so the task stays
+        // open for a surface that can show it. A rejection refuses unseen
+        // arguments, which is safe.
+        //
+        // The reason is the one the store carried out of band, never the
+        // proposal's shape: clear arguments spelled like an envelope are
+        // arguments, and reading the shape let untrusted input make a task
+        // nobody could approve.
+        if decision.approved
+            && let Some(task) = tasks.task(id).await.map_err(RuntimeError::from_store)?
+            && let Some(reason) = task.withheld
+        {
+            return Err(RuntimeError::ProposalWithheld {
+                task: id.to_string(),
+                reason,
+            });
+        }
 
-        let delivery = self.answer_task(id, decision).await?;
+        let claimed = tasks.claim(id, by.actor(), roles).await?;
+
+        // Bound to what the store holds as this person decides. The run
+        // compares it with the task it proposed, so a row edited in between
+        // — its arguments swapped for ones the reviewer would pass — yields an
+        // approval of something nobody proposed, and the run refuses it.
+        let mut decision = decision.clone();
+        decision.reviewed = Some(claimed.justification.digest());
+        let delivery = self.answer_task(id, &decision).await?;
+        // An answer to this task is already on record. This decider's own —
+        // a resubmission after the settlement below was lost — settles the
+        // task and succeeds. Anybody else's, or the expiry policy's applied
+        // since the claim, is the answer the run acted on: the task is settled
+        // to it and this decision is refused rather than recorded over it.
+        if matches!(delivery, crate::core::Delivery::Duplicate) {
+            let events = self.events().ok_or_else(|| {
+                RuntimeError::PlanContract("this runtime has no event store".into())
+            })?;
+            let minter = events
+                .minter(SOURCE_WORKLIST, &decision_event_id(id))
+                .await
+                .map_err(RuntimeError::from_store)?;
+            let own = matches!(
+                &minter,
+                Some(crate::case::Minter::Operator(first)) if first.actor() == by.actor()
+            );
+            self.settle_answered(id).await?;
+            if own {
+                return Ok(delivery);
+            }
+            return Err(RuntimeError::TaskClaim(
+                crate::core::ClaimError::AlreadyAnswered { task: id },
+            ));
+        }
         tasks
             .set_state(id, TaskState::Completed)
             .await
             .map_err(RuntimeError::from_store)?;
         Ok(delivery)
     }
+}
+
+/// The id of the one event that answers a task: derived from the task, so a
+/// second answer is a duplicate rather than a second decision.
+fn decision_event_id(id: crate::core::TaskId) -> String {
+    format!("task-decision:{}", id.to_hex())
 }

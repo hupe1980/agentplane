@@ -60,13 +60,65 @@ pub struct RunTerms {
     /// that is where the store claims it — see
     /// [`JournalStore::admitted_as`](crate::journal::JournalStore::admitted_as).
     idempotency_key: Option<String>,
-    /// The chain this run acts under, when it is not the plane's own.
-    ///
-    /// Set per request by a served surface from the authenticated caller. The
-    /// plane's chain ([`RuntimeBuilder::acting_as`]) is what an in-process
-    /// embedder's runs act under; binding it to every *peer's* run as well
-    /// would make it an ambient credential.
-    acting_as: Option<crate::core::Delegation>,
+    /// On whose authority this run acts.
+    acting_as: Acting,
+    /// Who asked for this run, when a person or peer did. Journaled on
+    /// `RunAdmitted`, and barred from deciding the run's own tasks.
+    admitted_by: Option<String>,
+}
+
+/// On whose authority a run acts.
+///
+/// Three answers, not two, because "no chain was presented" means different
+/// things at different doors. An in-process embedder that names no chain is
+/// the plane itself, and acts under the plane's
+/// ([`RuntimeBuilder::acting_as`]). A served caller whose credential carried
+/// none is **somebody else** — and falling back to the plane's chain for them
+/// would make the operator's authority an ambient credential every
+/// authenticated peer holds.
+///
+/// Acting under a chain and being bounded by one are separate questions. A
+/// served caller with no chain acts under none, and is still bounded by the
+/// plane's: that chain is the most this plane may do for anybody, so its
+/// scope and its admissibility gate the plan
+/// ([`ceiling`](Self::ceiling)) while nothing of it reaches the policy
+/// context, the journal or a withdrawal lookup.
+#[derive(Debug, Clone, Default)]
+enum Acting {
+    /// The plane's own chain, if it has one: a run the embedder started.
+    #[default]
+    Plane,
+    /// The chain an authenticated caller presented.
+    Caller(crate::core::Delegation),
+    /// A served caller that presented no chain: this run acts under none.
+    Nobody,
+}
+
+impl Acting {
+    /// The chain this run acts under, given the plane's own.
+    const fn resolve<'a>(
+        &'a self,
+        plane: Option<&'a crate::core::Delegation>,
+    ) -> Option<&'a crate::core::Delegation> {
+        match self {
+            Self::Plane => plane,
+            Self::Caller(chain) => Some(chain),
+            Self::Nobody => None,
+        }
+    }
+
+    /// The chain that bounds what this run may be admitted for: the one it
+    /// acts under, or — for a served caller that presented none — the
+    /// plane's, which it does not act under.
+    const fn ceiling<'a>(
+        &'a self,
+        plane: Option<&'a crate::core::Delegation>,
+    ) -> Option<&'a crate::core::Delegation> {
+        match self {
+            Self::Plane | Self::Nobody => plane,
+            Self::Caller(chain) => Some(chain),
+        }
+    }
 }
 
 impl RunTerms {
@@ -74,7 +126,8 @@ impl RunTerms {
         Self {
             case: Some(case),
             idempotency_key: None,
-            acting_as: None,
+            acting_as: Acting::Plane,
+            admitted_by: None,
         }
     }
 
@@ -112,7 +165,34 @@ impl RunTerms {
     /// [`Delegation::admissible`]: crate::core::Delegation::admissible
     #[must_use]
     pub fn acting_as(mut self, chain: crate::core::Delegation) -> Self {
-        self.acting_as = Some(chain);
+        self.acting_as = Acting::Caller(chain);
+        self
+    }
+
+    /// Act for a served caller: under the chain its credential carried, or
+    /// under **none** — never the plane's.
+    ///
+    /// The door every surface that admits work for somebody else goes through.
+    /// [`acting_as`](Self::acting_as) alone cannot say "this caller presented
+    /// nothing", and leaving it unset means the plane's own chain.
+    #[must_use]
+    pub fn served(mut self, chain: Option<crate::core::Delegation>) -> Self {
+        self.acting_as = chain.map_or(Acting::Nobody, Acting::Caller);
+        self
+    }
+
+    /// Record who asked for this run: the authenticated caller a served
+    /// surface admitted it for, or the operator an embedder started it on
+    /// behalf of.
+    ///
+    /// Journaled as `RunAdmitted.admitted_by`, and excluded from deciding
+    /// every task the run opens — the four-eyes control, applied to the one
+    /// actor a declarative agent's approvals could not otherwise name. A
+    /// caller who could approve the call their own request produced would be
+    /// one person on both sides of the review.
+    #[must_use]
+    pub fn admitted_by(mut self, actor: impl Into<String>) -> Self {
+        self.admitted_by = Some(actor.into());
         self
     }
 
@@ -553,9 +633,8 @@ impl RunStatus {
     /// `None` only for [`Succeeded`](Self::Succeeded), which has no reason to
     /// give. Every other conclusion carries one, and the point of gathering
     /// them here is that an embedder mapping outcomes onto its own wire type
-    /// should not have to match every variant to find the sentence — a
-    /// deployment shipped an empty summary on failed runs for a while because
-    /// the lazy path was to read the status and stop there.
+    /// should not have to match every variant to find the sentence, and an
+    /// embedder that reads only the status ships an empty summary on failure.
     ///
     /// Borrowed where the variant already holds a string and formatted where
     /// it holds a typed value: a suspension names what it waits for and an
@@ -792,6 +871,24 @@ pub const OUTCOMES_OF_RECORD: &[&str] = &[
     OBSERVED_OUTCOME,
 ];
 
+/// How a resume came to hold its lease, which decides what a failure does
+/// with it.
+///
+/// A lease that lapses while still naming an owner is what the recovery sweep
+/// lists, so keeping one on failure is how a run stays findable; releasing it
+/// is right only where the run is findable without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    /// Claimed by the resume itself, over a run whose journal already lists
+    /// it — failed, exhausted, withheld, quarantined, waiting.
+    Standing,
+    /// Handed over by a wake or a delivery that recorded the awaited result
+    /// under it, which took the run off the waiting listing.
+    Unlisted,
+    /// Claimed by the recovery sweep over a lease its owner died holding.
+    Recovering,
+}
+
 /// A run that exists but has not run.
 ///
 /// Produced by admission and consumed by execution, so the two can happen in
@@ -821,6 +918,10 @@ struct QuotaPass {
     period: Option<String>,
     enabled: bool,
     release_slot: bool,
+    /// How many steps this pass may dispatch at once, when the tenant bounds
+    /// spend: the width the run's reservation was sized for. `None` leaves
+    /// the run's own budget as the only bound.
+    width: Option<usize>,
 }
 
 impl QuotaPass {
@@ -833,6 +934,7 @@ impl QuotaPass {
             period: quota.bounds_spend().then(|| quota.period.key_for(at)),
             enabled: true,
             release_slot,
+            width: None,
         }
     }
 
@@ -841,7 +943,25 @@ impl QuotaPass {
             period: None,
             enabled: false,
             release_slot: false,
+            width: None,
         }
+    }
+
+    /// Held to the width a spend reservation was sized for, whenever the
+    /// tenant bounds spend.
+    fn sized_for(mut self, width: usize) -> Self {
+        if self.period.is_some() {
+            self.width = Some(width);
+        }
+        self
+    }
+
+    /// How wide this pass may dispatch: the budget's own width, narrowed to
+    /// the one its reservation was sized for. A replan may widen the plan; it
+    /// does not widen what the period holds for it.
+    fn parallelism(&self, budget: &Budget) -> usize {
+        self.width
+            .map_or_else(|| budget.parallelism(), |w| budget.parallelism().min(w))
     }
 
     fn period(&self) -> Option<&str> {
@@ -860,6 +980,7 @@ impl QuotaPass {
         run: RunId,
         epoch: crate::core::Epoch,
         spend: Spend,
+        concludes: bool,
     ) -> Option<crate::quota::QuotaSettlement> {
         self.enabled.then(|| crate::quota::QuotaSettlement {
             run,
@@ -867,8 +988,18 @@ impl QuotaPass {
             period: self.period.clone(),
             spend,
             release_slot: self.release_slot,
+            concludes,
         })
     }
+}
+
+/// How many steps a run may have in flight: its budget's width, or its
+/// admitted plan's node count when that is narrower or nothing narrows it.
+///
+/// What a spend reservation multiplies the per-call bound by, since each step
+/// in flight may hold one operation the ledger admitted and has not billed.
+fn reserved_width(budget: &Budget, plan: &PlanIR) -> usize {
+    budget.parallelism().min(plan.nodes.len()).max(1)
 }
 
 /// The peers a plane may call, and how it reaches them.
@@ -993,6 +1124,10 @@ pub struct Runtime {
     meter: super::metrics::Meter,
     /// Durable per-tenant ceilings, when a deployment wires them.
     quotas: Option<Arc<dyn crate::quota::QuotaStore>>,
+    /// The rate ceilings this plane's declarations state, and the quota store
+    /// that counts them. `None` when no grant declares one.
+    #[cfg(feature = "manifest")]
+    rates: Option<Arc<super::ctx::Rates>>,
     quota: crate::quota::TenantQuota,
     budget: Budget,
     /// Whether every plan this runtime admits must carry a verifier.
@@ -1437,8 +1572,16 @@ impl Runtime {
     ///   next step boundary. Nothing is interrupted mid-effect, deliberately:
     ///   stopping between "announced" and "recorded" manufactures the in-doubt
     ///   case the effect protocol exists to avoid.
-    /// * **Already concluded** — the request is recorded and does nothing. A
-    ///   sealed run is not reopened by an operator changing their mind.
+    /// * **Quarantined** — refused with [`RuntimeError::CannotUnwind`]: the
+    ///   unwind a stop promises is what a quarantine forbids, and reopening or
+    ///   abandoning it are the verbs that apply.
+    /// * **Concluded and closed** (succeeded, abandoned, cancelled) — refused
+    ///   with [`RuntimeError::AlreadyConcluded`] and nothing is recorded; a run
+    ///   somebody already stopped answers `false`. A failed or exhausted run is
+    ///   resumable, and stopping it unwinds its work.
+    /// * **Held by no provider on this plane** — an operator's terminal: the
+    ///   request is recorded and not driven, and the plane that holds the run's
+    ///   agent observes it on its next resume.
     ///
     /// Returns whether *this* call recorded the request. A second caller gets
     /// `false`: the first asker stays on the record, because "who intervened"
@@ -1446,14 +1589,24 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// [`RuntimeError`] if the store is unreachable, or if resuming a suspended
-    /// run fails.
+    /// [`RuntimeError::PlanContract`] for a blank reason,
+    /// [`RuntimeError::CannotUnwind`] for a quarantined run,
+    /// [`RuntimeError::AlreadyConcluded`] for a closed one, and
+    /// [`RuntimeError`] if the store is unreachable or resuming a suspended run
+    /// fails.
     pub async fn request_cancel(
         &self,
         run: RunId,
         actor: &crate::core::Operator,
         reason: &str,
     ) -> Result<bool, RuntimeError> {
+        // An intervention with no stated reason documents nobody's judgement,
+        // and it is the one field of the record the requester writes.
+        if reason.trim().is_empty() {
+            return Err(RuntimeError::PlanContract(
+                "stopping a run needs a reason — what the person stopping it saw".to_owned(),
+            ));
+        }
         // Checked before recording. Writing first and failing afterwards leaves a
         // request standing against an id that does not exist, and the operator's
         // retry then comes back "somebody else already asked" — which is a
@@ -1485,6 +1638,24 @@ impl Runtime {
                 run: run.to_string(),
             });
         }
+        // Refused only where the conclusion closes the run. A failed or an
+        // exhausted run is resumable and its work stands, so stopping it is the
+        // operator's remedy — the unwind it asks for is exactly what those
+        // conclusions left undone. Read from the latest conclusion, not the
+        // last record: an answer to a doubt may follow a conclusion, and the
+        // run is no less closed for it. A run already stopped answers `false`
+        // rather than an error, so a second asker is told the intervention of
+        // record is somebody else's.
+        if let Some(status) = resume_is_closed(&records) {
+            if self.cancellation(run).await?.is_some() {
+                return Ok(false);
+            }
+            return Err(RuntimeError::AlreadyConcluded {
+                run: run.to_string(),
+                outcome: recorded_conclusion(&records)
+                    .unwrap_or_else(|| status.as_str().to_owned()),
+            });
+        }
 
         let fresh = self
             .store
@@ -1510,9 +1681,18 @@ impl Runtime {
         // anyway would, on the owner's own instance, hand the resume the *same
         // epoch* the live execution is writing under — two executors on one
         // chain that fencing, by construction, cannot tell apart.
+        //
+        // A plane holding no provider for the run — an operator's terminal —
+        // records the request and leaves the driving to the plane that does:
+        // that plane's next resume finds the request standing.
         if fresh {
             match self.replay(run, Mode::Resume).await {
-                Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => {}
+                Ok(_)
+                | Err(
+                    RuntimeError::LeaseHeld { .. }
+                    | RuntimeError::NoProvider { .. }
+                    | RuntimeError::PayloadsSealed { .. },
+                ) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -1595,8 +1775,11 @@ impl Runtime {
         }
         // Handed over rather than released and re-taken: the same window a wake
         // path closes. Both decisions travel this path — an abandonment is
-        // concluded inside the resume, from the record just written.
-        self.resume_holding(run, lease).await
+        // concluded inside the resume, from the record just written. The run
+        // still stands quarantined on the record, so it keeps its listing
+        // whatever this pass does.
+        self.replay_releasing(run, Mode::Resume, Some(lease), Claim::Standing)
+            .await
     }
 
     /// Answer a quarantine **without driving the run**.
@@ -1943,6 +2126,37 @@ impl Runtime {
         quotas.lift_halt(scope).await.map_err(RuntimeError::Store)
     }
 
+    /// The quota store, when one is wired.
+    pub(crate) fn quota_store_if_wired(&self) -> Option<&Arc<dyn crate::quota::QuotaStore>> {
+        self.quotas.as_ref()
+    }
+
+    /// Every run holding spend against this tenant's periods, and how much.
+    ///
+    /// The runs a [`QuotaError::SpentOut`](crate::quota::QuotaError::SpentOut)
+    /// refusal counts as *reserved*. A run holds its reservation until it
+    /// concludes, so the ones that stopped waiting on a person — quarantined,
+    /// exhausted, withheld, failed — hold it until that person acts;
+    /// [`attention`](Self::attention) names those.
+    ///
+    /// # Errors
+    ///
+    /// If no quota store is wired, or it is unreachable.
+    pub async fn reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::quota::Held>, RuntimeError> {
+        let quotas = self.quotas.as_ref().ok_or_else(|| {
+            RuntimeError::Store(crate::core::StoreError::Backend(
+                "no quota store is wired, so no run holds spend against a period".to_owned(),
+            ))
+        })?;
+        quotas
+            .reservations(limit)
+            .await
+            .map_err(RuntimeError::Store)
+    }
+
     /// The quota store, or the refusal that says why an emergency stop needs one.
     fn quota_store(&self) -> Result<&std::sync::Arc<dyn crate::quota::QuotaStore>, RuntimeError> {
         self.quotas.as_ref().ok_or_else(|| {
@@ -2159,6 +2373,33 @@ impl Runtime {
     #[must_use]
     pub fn tenant(&self) -> &crate::core::TenantId {
         &self.tenant
+    }
+
+    /// What this plane's policy engine cannot evaluate for a served caller
+    /// that presented no chain.
+    ///
+    /// The build probes the chain shapes this plane's own runs take: its own
+    /// chain where it has one, and both shapes where it has none. A served
+    /// surface adds the one the build cannot know about — a caller acting
+    /// under no chain on a plane that has one — so every surface that admits
+    /// work for a stranger asks this before it starts.
+    #[cfg(any(feature = "a2a-server", feature = "mcp-server"))]
+    pub(crate) fn served_policy_problems(&self) -> Vec<String> {
+        match (&self.policy, &self.identity) {
+            (Some(engine), Some(_)) => runtime_policy_problems(engine.as_ref(), None),
+            _ => Vec::new(),
+        }
+    }
+
+    /// How far from its owner the plane's own chain is, or zero without one.
+    ///
+    /// The depth a run bound by the plane's chain but acting under none starts
+    /// from: acting under no chain does not put a served caller closer to the
+    /// owner than the plane that serves it.
+    pub(crate) fn own_depth(&self) -> usize {
+        self.identity
+            .as_ref()
+            .map_or(0, crate::core::Delegation::depth)
     }
 
     /// The journal, under the name the batch driver reads it by.
@@ -2478,11 +2719,12 @@ impl Runtime {
         governed_by: Option<&crate::journal::AgentIdentity>,
         subject: Option<&str>,
         at: crate::core::Timestamp,
+        (budget, width): (&Budget, usize),
     ) -> Result<QuotaPass, RuntimeError> {
         let Some(quotas) = self.quotas.as_ref() else {
             return Ok(QuotaPass::disabled());
         };
-        let pass = QuotaPass::at(&self.quota, at, true);
+        let pass = QuotaPass::at(&self.quota, at, true).sized_for(width);
 
         // The halt is checked **before** the unlimited shortcut, because an
         // emergency stop is not a ceiling and a tenant with no ceilings is
@@ -2523,16 +2765,36 @@ impl Runtime {
             }
         }
 
-        if let Some(period) = pass.period() {
-            let spent = quotas.spent(period).await.map_err(|e| {
-                RuntimeError::QuotaExceeded(crate::quota::QuotaError::Unavailable(e.to_string()))
-            })?;
-            crate::quota::check_spend(self.tenant.as_str(), period, &self.quota, spent)
-                .map_err(RuntimeError::QuotaExceeded)?;
-        }
+        // What the run can cost at most, held against the period in the same
+        // store transaction that checks the ceiling and takes the slot. A run
+        // that leaves a bounded unit unbounded is refused here: admitted, it
+        // would hold nothing against a period it can spend without limit.
+        let hold = match crate::quota::reservation(&self.quota, budget, width as u64) {
+            Ok(amount) => {
+                amount
+                    .zip(pass.period())
+                    .map(|(amount, period)| crate::quota::SpendHold {
+                        period: period.to_owned(),
+                        amount,
+                    })
+            }
+            Err(field) => {
+                return Err(RuntimeError::QuotaExceeded(
+                    crate::quota::QuotaError::Unbounded {
+                        tenant: self.tenant.as_str().to_owned(),
+                        unit: if field.contains("minor") {
+                            "money"
+                        } else {
+                            "tokens"
+                        },
+                        field,
+                    },
+                ));
+            }
+        };
 
         quotas
-            .reserve(run, self.quota.max_concurrent_runs, at)
+            .reserve(run, &self.quota, hold.as_ref(), at)
             .await
             .map_err(RuntimeError::QuotaExceeded)?;
         Ok(pass)
@@ -2551,24 +2813,29 @@ impl Runtime {
         epoch: crate::core::Epoch,
         spend: Spend,
         pass: &QuotaPass,
+        concludes: bool,
     ) -> Result<(), RuntimeError> {
-        if !pass.enabled {
-            return Ok(());
-        }
         let Some(quotas) = self.quotas.as_ref() else {
             return Ok(());
         };
+        let pending = |error: crate::core::StoreError| RuntimeError::QuotaSettlementPending {
+            run: run.to_string(),
+            epoch,
+            detail: error.to_string(),
+        };
+        if !pass.enabled {
+            // A conclusion no pass opened — an abandonment decided while the
+            // run was stopped — still ends the run, and a run that has ended
+            // holds nothing against the period.
+            if concludes {
+                quotas.release(run).await.map_err(pending)?;
+            }
+            return Ok(());
+        }
         let settlement = pass
-            .settlement(run, epoch, spend)
+            .settlement(run, epoch, spend, concludes)
             .expect("an enabled quota pass has a settlement");
-        quotas
-            .settle(&settlement)
-            .await
-            .map_err(|error| RuntimeError::QuotaSettlementPending {
-                run: run.to_string(),
-                epoch,
-                detail: error.to_string(),
-            })
+        quotas.settle(&settlement).await.map_err(pending)
     }
 
     /// Release a reservation for an admission whose journal never existed.
@@ -2632,11 +2899,24 @@ impl Runtime {
                     period: period.clone(),
                     spend,
                     release_slot: *release_slot,
+                    concludes: concluded_in(records, epoch),
                 })
                 .await
                 .map_err(|error| RuntimeError::QuotaSettlementPending {
                     run: run.to_string(),
                     epoch,
+                    detail: error.to_string(),
+                })?;
+        }
+        // A run whose history has ended holds nothing against the period,
+        // whichever path ended it — including one no pass marker opened.
+        if records.iter().any(is_sealing_conclusion) {
+            quotas
+                .release(run)
+                .await
+                .map_err(|error| RuntimeError::QuotaSettlementPending {
+                    run: run.to_string(),
+                    epoch: records.last().map_or(0, |r| r.body.epoch),
                     detail: error.to_string(),
                 })?;
         }
@@ -2682,10 +2962,14 @@ impl Runtime {
 
         let status = recorded_status(outcome, reason.as_deref(), exhaustion.as_ref(), records);
         let chain_head = if SEALED_OUTCOMES.contains(&outcome.as_str()) {
-            self.store
+            let head = self
+                .store
                 .seal(run, lease.epoch, outcome)
                 .await
-                .map_err(RuntimeError::from_store)?
+                .map_err(RuntimeError::from_store)?;
+            // A repaired seal is a conclusion like any other.
+            self.retire_waits(run).await;
+            head
         } else {
             self.store
                 .head(run)
@@ -2715,10 +2999,15 @@ impl Runtime {
         };
         let outcome = recorded_conclusion(records).unwrap_or_else(|| status.as_str().to_owned());
         let chain_head = if SEALED_OUTCOMES.contains(&outcome.as_str()) {
-            self.store
+            let head = self
+                .store
                 .seal(run, lease.epoch, &outcome)
                 .await
-                .map_err(RuntimeError::from_store)?
+                .map_err(RuntimeError::from_store)?;
+            // The crash this repairs may have landed before the conclusion
+            // retired the run's waits; retiring twice is harmless.
+            self.retire_waits(run).await;
+            head
         } else {
             self.store
                 .head(run)
@@ -2773,11 +3062,20 @@ impl Runtime {
         run: RunId,
         mode: Mode,
         lease: Option<&crate::journal::Lease>,
+        width: usize,
     ) -> Result<QuotaPass, RuntimeError> {
-        if mode != Mode::Resume || self.quotas.is_none() {
+        let (Mode::Resume, Some(quotas)) = (mode, self.quotas.as_ref()) else {
             return Ok(QuotaPass::disabled());
+        };
+        let pass = QuotaPass::at(&self.quota, now_for_admission(), false).sized_for(width);
+        // The run spends in the period it resumes in, so what it still holds
+        // moves there — never refused, because a resume is not.
+        if let Some(period) = pass.period() {
+            quotas
+                .carry(run, period)
+                .await
+                .map_err(RuntimeError::Store)?;
         }
-        let pass = QuotaPass::at(&self.quota, now_for_admission(), false);
         self.store
             .append(
                 lease.expect("resume holds a lease").epoch,
@@ -3437,12 +3735,18 @@ impl Runtime {
     /// chain issued for another plane or past its validity is refused before
     /// the run exists, and a run admitted under a live chain is never re-judged
     /// — replay reads the recorded chain back.
+    ///
+    /// `acts_under` is whether the run acts under `ceiling` or is only bounded
+    /// by it. A refusal names the chain's subject only in the first case: a
+    /// caller bounded by the plane's chain is not its subject, and a denial
+    /// naming the operator would say the operator was refused.
     fn authorize_scope(
         &self,
         plan: &PlanIR,
-        chain: Option<&crate::core::Delegation>,
+        ceiling: Option<&crate::core::Delegation>,
+        acts_under: bool,
     ) -> Result<(), RuntimeError> {
-        let Some(chain) = chain else {
+        let Some(chain) = ceiling else {
             return Ok(());
         };
         chain.admissible(self.tenant.as_str(), now_for_admission())?;
@@ -3451,7 +3755,11 @@ impl Runtime {
             if !scope.permits(&node.capability) {
                 return Err(RuntimeError::PolicyDenied(
                     crate::core::PolicyError::Denied {
-                        principal: chain.subject().id.clone(),
+                        principal: if acts_under {
+                            chain.subject().id.clone()
+                        } else {
+                            node.capability.to_string()
+                        },
                         action: crate::core::ACTION_ADMIT.to_owned(),
                         resource: node.capability.to_string(),
                     },
@@ -3476,15 +3784,6 @@ impl Runtime {
         let Some(engine) = self.policy.as_ref() else {
             return Ok(());
         };
-        let mut context = serde_json::json!({ "input": input, "tenant": self.tenant.as_str() });
-        // The declaration, so a rule can bind to the **digest** rather than to a
-        // name anyone can reuse: "this exact declaration may admit, and an
-        // edited one may not" is otherwise inexpressible, and a name-only rule
-        // keeps permitting an agent whose prompt and grants have since changed.
-        if let Some(id) = governed_by {
-            context["agent"] = super::ctx::agent_context(id);
-        }
-        super::ctx::merge_identity(&mut context, chain);
         // Who is acting, and what is being asked for. Passing one string as both
         // made every admission rule a tautology — `principal == resource` cannot
         // express "this agent may not run that capability", which is the whole
@@ -3498,34 +3797,34 @@ impl Runtime {
         // The agent's `metadata.name` is deliberately *not* used, tempting as it
         // is. A name is self-asserted — a manifest is a file, and its name is
         // whatever the author typed — so a rule granting authority to a name
-        // grants it to any file claiming that name. A name is only as good as
-        // the resolution path that produced it, and at admission the runtime
-        // cannot know whether it came from a verified registry lookup or a
-        // string literal. Worse, a fallback would be *silent*: `principal == X`
-        // would mean an authenticated identity in a deployment with a delegation
-        // chain and a self-asserted label in one without, so the same rule would
-        // change meaning with the wiring.
+        // grants it to any file claiming that name. Worse, a fallback would be
+        // *silent*: `principal == X` would mean an authenticated identity in a
+        // deployment with a delegation chain and a self-asserted label in one
+        // without, so the same rule would change meaning with the wiring.
         //
         // Rules that need to bind to the agent bind to `context.agent.digest`,
         // which is content-addressed and pins what the declaration actually
-        // said. The capability is the fallback because it claims nothing: it is
-        // what was asked for, not who asked.
-        let principal = self
-            .identity
-            .as_ref()
-            .map_or(capability, |chain| chain.subject().id.as_str());
-        let request = crate::core::PolicyRequest {
-            principal,
-            action: crate::core::ACTION_ADMIT,
-            resource: capability,
-            context: &context,
-        };
+        // said — so "this exact declaration may admit, and an edited one may
+        // not" is expressible. The capability is the fallback principal because
+        // it claims nothing: it is what was asked for, not who asked.
+        //
+        // Built by the function `policy check` also calls, from the values
+        // `RunAdmitted` and `IdentityBound` record.
+        let request = crate::policy::requests::admission(
+            &crate::policy::requests::Acting {
+                tenant: self.tenant.as_str(),
+                capability,
+                agent: governed_by,
+                chain,
+            },
+            input,
+        );
         // Every refusal, not only a rule's. `let … else` over `Deny` alone
         // admits the run for every other decision, so a policy set that cannot
         // be evaluated would open the door it exists to hold — the fail-open a
         // widened vocabulary creates for free unless the permit is the arm that
         // has to be named.
-        let decision = engine.authorize(&request);
+        let decision = engine.authorize(&request.as_request());
         let malformed = decision.is_malformed();
         let Some(reason) = decision.reason().map(ToOwned::to_owned) else {
             return Ok(());
@@ -3542,7 +3841,7 @@ impl Runtime {
             .count(metrics::POLICY_DENIALS, crate::core::ACTION_ADMIT);
         Err(RuntimeError::PolicyDenied(
             crate::core::PolicyError::Denied {
-                principal: principal.to_owned(),
+                principal: request.principal,
                 action: crate::core::ACTION_ADMIT.to_owned(),
                 resource: capability.to_owned(),
             },
@@ -3560,6 +3859,8 @@ impl Runtime {
         governed_by: Option<crate::journal::AgentIdentity>,
         input: &Tainted<Value>,
         idempotency_key: Option<String>,
+        admitted_by: Option<String>,
+        served_unchained: bool,
     ) -> RecordKind {
         RecordKind::RunAdmitted {
             capability: capability.to_owned(),
@@ -3569,6 +3870,8 @@ impl Runtime {
             policy_bundle: self.policy.as_ref().map(|p| Box::new(p.bundle())),
             canon: crate::core::canon::VERSION,
             idempotency_key,
+            admitted_by,
+            served_unchained,
         }
     }
 
@@ -3614,8 +3917,12 @@ impl Runtime {
         // The caller's chain where one was presented, the plane's otherwise —
         // one choice, made once, so the gate, the policy context and the
         // record cannot disagree about whom this run acts for.
-        let chain = terms.acting_as.as_ref().or(self.identity.as_ref());
-        self.authorize_scope(&plan, chain)?;
+        let chain = terms.acting_as.resolve(self.identity.as_ref());
+        self.authorize_scope(
+            &plan,
+            terms.acting_as.ceiling(self.identity.as_ref()),
+            chain.is_some(),
+        )?;
         self.authorize_admission(&agent, governed_by.as_ref(), chain, input.peek())?;
 
         self.admit_reserved(run, plan, input, terms, agent, governed_by)
@@ -3654,8 +3961,12 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
 
-        let quota = match self
-            .check_quota(
+        let budget = self.budget_for(&agent);
+        // Boxed: the quota decision holds its store round trips across awaits,
+        // and inlined it pushes every admission future past the size clippy
+        // allows on the served surfaces that await one.
+        let quota = match Box::pin(
+            self.check_quota(
                 run,
                 governed_by.as_ref(),
                 // **The chain this run acts under, not the plane's.** A served
@@ -3665,12 +3976,13 @@ impl Runtime {
                 // refusal that does not happen, which leaves no trace anywhere.
                 terms
                     .acting_as
-                    .as_ref()
-                    .or(self.identity.as_ref())
+                    .resolve(self.identity.as_ref())
                     .map(|c| c.subject().id.as_str()),
                 now_for_admission(),
-            )
-            .await
+                (&budget, reserved_width(&budget, &plan)),
+            ),
+        )
+        .await
         {
             Ok(pass) => pass,
             Err(error) => {
@@ -3715,12 +4027,20 @@ impl Runtime {
             case,
             idempotency_key,
             acting_as,
+            admitted_by,
         } = terms;
-        let chain = acting_as.as_ref().or(self.identity.as_ref());
+        let chain = acting_as.resolve(self.identity.as_ref());
         let mut records = vec![
             Append::new(
                 run,
-                self.admission(agent, governed_by, &input, idempotency_key),
+                self.admission(
+                    agent,
+                    governed_by,
+                    &input,
+                    idempotency_key,
+                    admitted_by,
+                    matches!(acting_as, Acting::Nobody),
+                ),
             ),
             // From here the plan is an authorization graph: compiled from
             // trusted input, frozen before anything untrusted was read, and
@@ -3980,9 +4300,77 @@ impl Runtime {
         self.execute_admitted(admitted).await
     }
 
-    /// Ensure an open run cannot cross its history frontier under different
-    /// authorization semantics than those recorded at admission.
-    fn ensure_resume_policy_bundle(&self, records: &[Record]) -> Result<(), RuntimeError> {
+    /// Why an open run may not cross its history frontier on this plane, if it
+    /// may not.
+    ///
+    /// Two facts recorded at admission are compared with what this plane holds:
+    /// the policy bundle (who may authorize an effect) and, for a declarative
+    /// agent, the declaration (what the agent *is*). A resume under either one
+    /// changed would continue one run's journal under another's rules. The
+    /// answer is a refusal to journal rather than an error to raise; the caller
+    /// decides where it goes.
+    fn resume_refusal(&self, records: &[Record]) -> Result<Option<RuntimeError>, RuntimeError> {
+        if let Some(refusal) = self.policy_bundle_refusal(records)? {
+            return Ok(Some(refusal));
+        }
+        #[cfg(feature = "manifest")]
+        if let Some(refusal) = self.declaration_refusal(records)? {
+            return Ok(Some(refusal));
+        }
+        Ok(None)
+    }
+
+    /// [`RuntimeError::NoProvider`] when a capability any of the run's plans
+    /// names resolves to nothing on this plane.
+    ///
+    /// Every plan the run froze is checked, not only the one in force: an
+    /// unwind resolves the steps that ran, and those may belong to a plan a
+    /// replan replaced.
+    fn refuse_undrivable(&self, records: &[Record]) -> Result<(), RuntimeError> {
+        let plans = records.iter().filter_map(|r| match r.kind() {
+            RecordKind::PlanFrozen { plan, .. } => {
+                serde_json::from_value::<PlanIR>(plan.clone()).ok()
+            }
+            _ => None,
+        });
+        for node in plans.flat_map(|p| p.nodes) {
+            self.resolve(&node.capability.0)?;
+        }
+        Ok(())
+    }
+
+    /// Journal a resume refusal as the run's quarantine, naming what moved.
+    async fn quarantine_refused(
+        &self,
+        run: RunId,
+        records: &[Record],
+        lease: &crate::journal::Lease,
+        refusal: &RuntimeError,
+    ) -> Result<RunOutcome, RuntimeError> {
+        self.conclude(
+            run,
+            lease.epoch,
+            RunStatus::Quarantined(refusal.to_string()),
+            None,
+            true,
+            self.recorded_case(records).map(|c| c.id()),
+            Consumed::default(),
+            Spend::ZERO,
+            &QuotaPass::disabled(),
+        )
+        .await
+    }
+
+    /// The bundle half of [`resume_refusal`](Self::resume_refusal).
+    ///
+    /// Resume can dispatch new effects after it reaches the end of history.
+    /// They must be judged by the same complete bundle recorded at admission,
+    /// or one run would claim one policy while later effects were authorized
+    /// by another.
+    fn policy_bundle_refusal(
+        &self,
+        records: &[Record],
+    ) -> Result<Option<RuntimeError>, RuntimeError> {
         let recorded = records
             .iter()
             .find_map(|record| match record.kind() {
@@ -3996,24 +4384,22 @@ impl Runtime {
             })?;
         let configured = self.policy.as_ref().map(|policy| policy.bundle());
         if recorded != configured {
-            return Err(RuntimeError::PolicyBundleChanged {
+            return Ok(Some(RuntimeError::PolicyBundleChanged {
                 recorded: recorded.as_ref().map(PolicyBundleIdentity::digest),
                 configured: configured.as_ref().map(PolicyBundleIdentity::digest),
-            });
+            }));
         }
-        Ok(())
+        Ok(None)
     }
 
-    /// Ensure an open run cannot cross its history frontier under a different
-    /// **declaration** than the one it was admitted under.
+    /// The declaration half of [`resume_refusal`](Self::resume_refusal).
     ///
-    /// The bundle check above covers who may authorize an effect; this covers
-    /// what the agent *is*. For a declarative agent the manifest is the whole
-    /// behaviour, and a resume under an edited one runs a different program over
-    /// the first one's journal — which replay would eventually catch as a key
-    /// mismatch, several effects in and without being able to say what changed.
-    /// The digest is already on the record at admission, so refusing here costs
-    /// a comparison and turns a late diagnosis into a named remedy.
+    /// For a declarative agent the manifest is the whole behaviour, and a resume
+    /// under an edited one runs a different program over the first one's
+    /// journal — which replay would eventually catch as a key mismatch, several
+    /// effects in and without being able to say what changed. The digest is
+    /// already on the record at admission, so refusing here costs a comparison
+    /// and turns a late diagnosis into a named remedy.
     ///
     /// **Silent in two cases, and deliberately.** A run admitted with no
     /// declaration is a coded skill, whose behaviour is the embedder's binary:
@@ -4022,31 +4408,64 @@ impl Runtime {
     /// declaratively at all, so the refusal it needs is the one plan resolution
     /// already gives.
     #[cfg(feature = "manifest")]
-    fn ensure_resume_declaration(&self, records: &[Record]) -> Result<(), RuntimeError> {
+    fn declaration_refusal(
+        &self,
+        records: &[Record],
+    ) -> Result<Option<RuntimeError>, RuntimeError> {
         let Some(recorded) = records.iter().find_map(|record| match record.kind() {
             RecordKind::RunAdmitted { governed_by, .. } => governed_by.as_deref().cloned(),
             _ => None,
         }) else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(current) = self
             .governed_by
             .values()
             .find(|m| m.metadata.name == recorded.name)
         else {
-            return Ok(());
+            return Ok(None);
         };
         let configured = current
             .digest()
             .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
         if configured != recorded.digest {
-            return Err(RuntimeError::DeclarationChanged {
+            return Ok(Some(RuntimeError::DeclarationChanged {
                 agent: recorded.name,
                 recorded: recorded.digest,
                 configured,
-            });
+            }));
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// A plan left sealed is erased only where a key ring could have opened
+    /// it.
+    ///
+    /// A wired ring opens every payload whose key still exists and fails the
+    /// read when it cannot be reached, so a payload still sealed behind one was
+    /// erased. Behind no ring it says nothing about the key at all: the data
+    /// is intact, and telling a reader it is gone sends them to the wrong
+    /// remedy.
+    fn sealed_or_erased(&self, error: RuntimeError) -> RuntimeError {
+        match error {
+            RuntimeError::PayloadsErased { run } if !self.holds_key_ring() => {
+                RuntimeError::PayloadsSealed { run }
+            }
+            other => other,
+        }
+    }
+
+    /// Whether this plane was handed a key ring to open sealed payloads with.
+    #[cfg_attr(not(feature = "keyring"), allow(clippy::unused_self))]
+    const fn holds_key_ring(&self) -> bool {
+        #[cfg(feature = "keyring")]
+        {
+            self.keyring.is_some()
+        }
+        #[cfg(not(feature = "keyring"))]
+        {
+            false
+        }
     }
 
     /// Re-execute a recorded run from its journal.
@@ -4082,7 +4501,135 @@ impl Runtime {
             None
         };
 
-        self.replay_releasing(run, mode, lease, false).await
+        self.replay_releasing(run, mode, lease, Claim::Standing)
+            .await
+    }
+
+    /// Replay a recorded run strictly and say what it found.
+    ///
+    /// [`replay`](Self::replay) with [`Mode::Strict`], answered as a
+    /// [`Verdict`](super::Verdict) rather than a status: *verified* when every
+    /// recorded effect was asked for again and the run reached the ending it
+    /// recorded, whatever that ending was; *diverged* at the first effect this
+    /// build asked for differently; *cannot replay* when the run cannot be
+    /// re-derived here, for a reason that is not the declaration. Both
+    /// revisions are named on every answer — the one the run was admitted
+    /// under and the one this plane holds by that name.
+    ///
+    /// Writes nothing, takes no lease and dispatches nothing, as a strict
+    /// replay never does. It is the question an author asks of an edited
+    /// manifest: replayed under the edit, this run's history either reaches
+    /// nothing it changed or names the first effect it did.
+    ///
+    /// # Errors
+    ///
+    /// If the run does not exist or its journal does not verify, or on a store
+    /// failure — never for a divergence or a reason the verdict names.
+    pub async fn verify(&self, run: RunId) -> Result<super::Verdict, RuntimeError> {
+        use super::{CannotReplay, Finding};
+
+        let records = self
+            .store
+            .read(run, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        if records.is_empty() {
+            return Err(RuntimeError::Store(crate::core::StoreError::NotFound(
+                run.to_string(),
+            )));
+        }
+        let recorded = records.iter().find_map(|r| match r.kind() {
+            RecordKind::RunAdmitted { governed_by, .. } => governed_by.as_deref().cloned(),
+            _ => None,
+        });
+        let candidate = self.candidate_revision(recorded.as_ref());
+        let verdict = |finding| super::Verdict {
+            run,
+            recorded: recorded.clone(),
+            candidate: candidate.clone(),
+            finding,
+        };
+
+        // A property of the history rather than of how it ended, so it is
+        // named whatever the run's state: every key moves under another rule.
+        if let Err(RuntimeError::CanonicalizationChanged {
+            recorded,
+            implemented,
+        }) = ensure_replayable_canon(&records)
+        {
+            return Ok(verdict(Finding::CannotReplay(
+                CannotReplay::CanonicalizationChanged {
+                    recorded,
+                    implemented,
+                },
+            )));
+        }
+        let Some(ending) = recorded_ending(&records) else {
+            return Ok(verdict(Finding::CannotReplay(CannotReplay::NotConcluded)));
+        };
+        if ended_by_an_act(&ending) {
+            return Ok(verdict(Finding::CannotReplay(CannotReplay::EndedByAnAct {
+                outcome: ending,
+            })));
+        }
+
+        let mut dispatched = false;
+        let mut divergence = None;
+        let replayed = self
+            .replay_under(
+                run,
+                Mode::Strict,
+                None,
+                Claim::Standing,
+                &mut dispatched,
+                &mut divergence,
+            )
+            .await;
+        let finding = match (replayed, divergence) {
+            (Ok(_), Some(d)) => Finding::Diverged(d),
+            (Ok(outcome), None) if outcome.status.as_str() == ending => {
+                Finding::Verified { outcome: ending }
+            }
+            (Ok(outcome), None) => Finding::OutcomeDiffers {
+                recorded: ending,
+                replayed: outcome.status.as_str().to_owned(),
+            },
+            (Err(RuntimeError::PayloadsErased { .. }), _) => {
+                Finding::CannotReplay(CannotReplay::Erased)
+            }
+            (Err(RuntimeError::PayloadsSealed { .. }), _) => {
+                Finding::CannotReplay(CannotReplay::KeyAbsent)
+            }
+            (Err(RuntimeError::NoProvider { target, .. }), _) => {
+                Finding::CannotReplay(CannotReplay::EntryPointRemoved { capability: target })
+            }
+            (Err(other), _) => return Err(other),
+        };
+        Ok(verdict(finding))
+    }
+
+    /// The declaration this plane holds under the recorded agent's name.
+    #[cfg(feature = "manifest")]
+    fn candidate_revision(
+        &self,
+        recorded: Option<&crate::journal::AgentIdentity>,
+    ) -> Option<crate::journal::AgentIdentity> {
+        let name = &recorded?.name;
+        let held = self
+            .governed_by
+            .values()
+            .find(|m| &m.metadata.name == name)?;
+        self.identity_of(held)
+    }
+
+    /// Without the manifest there are no declarations to name.
+    #[cfg(not(feature = "manifest"))]
+    #[allow(clippy::unused_self)]
+    const fn candidate_revision(
+        &self,
+        _recorded: Option<&crate::journal::AgentIdentity>,
+    ) -> Option<crate::journal::AgentIdentity> {
+        None
     }
 
     /// Resume a run under a lease the caller already holds.
@@ -4096,17 +4643,27 @@ impl Runtime {
     /// while still holding an owner. Handing the lease over closes the window;
     /// the run is owned continuously from wake to conclusion, and a crash
     /// anywhere in between leaves an expired *owned* lease the sweep drains.
+    ///
+    /// A resume that fails does the same thing a crash does, and for the same
+    /// reason: the recorded wake took the run off the waiting listing, so the
+    /// lease is the only thing left that names it.
     pub(crate) async fn resume_holding(
         &self,
         run: RunId,
         lease: crate::journal::Lease,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.replay_releasing(run, Mode::Resume, Some(lease), false)
+        self.replay_releasing(run, Mode::Resume, Some(lease), Claim::Unlisted)
             .await
     }
 
     /// Recover an owner-abandoned run without turning settlement repair into
     /// an operator-requested retry of a recorded conclusion.
+    ///
+    /// A recovery that fails for a reason no retry changes — the journal, not
+    /// the moment, is what refuses — quarantines the run under the lease the
+    /// failed pass kept, naming the reason. Left alone it would lapse owned
+    /// and be recovered, and refused, every lease period for ever; a
+    /// quarantine is listed, counted, and answered by a person.
     pub(crate) async fn recover_abandoned_run(
         &self,
         run: RunId,
@@ -4116,8 +4673,25 @@ impl Runtime {
             .acquire(run, &self.owner, self.lease_ttl)
             .await
             .map_err(RuntimeError::from_store)?;
-        self.replay_releasing(run, Mode::Resume, Some(lease), true)
+        match self
+            .replay_releasing(run, Mode::Resume, Some(lease.clone()), Claim::Recovering)
             .await
+        {
+            Err(error) if recurs_on_every_resume(&error) => {
+                let records = self
+                    .store
+                    .read(run, 1)
+                    .await
+                    .map_err(RuntimeError::from_store)?;
+                let refusal = RuntimeError::PlanContract(format!(
+                    "recovery refused, and would be refused the same way on every attempt: \
+                     {error}"
+                ));
+                self.quarantine_refused(run, &records, &lease, &refusal)
+                    .await
+            }
+            other => other,
+        }
     }
 
     async fn replay_releasing(
@@ -4125,21 +4699,34 @@ impl Runtime {
         run: RunId,
         mode: Mode,
         lease: Option<crate::journal::Lease>,
-        recovering: bool,
+        claim: Claim,
     ) -> Result<RunOutcome, RuntimeError> {
+        let mut dispatched = false;
         let outcome = self
-            .replay_under(run, mode, lease.as_ref(), recovering)
+            .replay_under(run, mode, lease.as_ref(), claim, &mut dispatched, &mut None)
             .await;
 
-        // Idempotent: a resume that reached execution already handed its lease
-        // back in `conclude`, and re-releasing the same epoch changes nothing.
-        // What this covers is every path that returns *before* executing — a
-        // closed run's no-op, a refused resume, an unverifiable chain — which
-        // would otherwise strand the freshly claimed lease until it expired
-        // and the recovery sweep "recovered" a run nobody was running.
-        let settlement_pending =
-            matches!(outcome, Err(RuntimeError::QuotaSettlementPending { .. }));
-        if !settlement_pending
+        // Idempotent: a resume that reached a conclusion already handed its
+        // lease back in `conclude`, and re-releasing the same epoch changes
+        // nothing. Released on success, and on a failure only where the run
+        // is still listed somewhere else: the caller claimed a run whose
+        // journal already says where it stands, and the refusal came before
+        // anything past the frontier was written. Every other failure keeps
+        // the lease so it lapses owned, which is what puts the run on the
+        // abandonment listing the recovery sweep drains. A wake or a delivery
+        // has already recorded the awaited result, so the run is off the
+        // waiting listing; a recovery holds a run nothing else lists; and a
+        // pass that failed mid-flight wrote records past a conclusion that no
+        // longer describes it. Releasing any of those strands the run with no
+        // driver and on no listing.
+        let release = match &outcome {
+            Ok(_) => true,
+            // Settlement is retried by recovery, which finds the run through
+            // this lease.
+            Err(RuntimeError::QuotaSettlementPending { .. }) => false,
+            Err(_) => claim == Claim::Standing && !dispatched,
+        };
+        if release
             && let Some(lease) = &lease
             && let Err(e) = self.store.release_lease(run, lease.epoch).await
         {
@@ -4157,7 +4744,9 @@ impl Runtime {
         run: RunId,
         mode: Mode,
         lease: Option<&crate::journal::Lease>,
-        recovering: bool,
+        claim: Claim,
+        dispatched: &mut bool,
+        divergence: &mut Option<crate::journal::Divergence>,
     ) -> Result<RunOutcome, RuntimeError> {
         let records = self
             .store
@@ -4187,7 +4776,7 @@ impl Runtime {
                     run,
                     &records,
                     lease.expect("resume holds a lease"),
-                    recovering,
+                    claim == Claim::Recovering,
                 )
                 .await?
         {
@@ -4228,20 +4817,49 @@ impl Runtime {
         let input = records.iter().find_map(recorded_input).ok_or_else(|| {
             RuntimeError::PlanContract("journal has no RunAdmitted record".into())
         })?;
-        let plan = frozen_plan(run, &records)?;
+        let plan = frozen_plan(run, &records).map_err(|e| self.sealed_or_erased(e))?;
 
-        // Resume can dispatch new effects after it reaches the end of history.
-        // They must be judged by the same complete bundle recorded at
-        // admission, or one run would claim one policy while later effects were
-        // authorized by another. Strict replay performs no effects and remains
-        // usable as an offline verifier without loading the historical engine.
+        // Only a plane that can drive the run judges it. A plane holding no
+        // provider for the run's steps — an operator's terminal, a fleet
+        // member serving other agents — answers `NoProvider` before comparing
+        // its policy or declarations with the run's: a mismatch there says
+        // nothing about the run, and quarantining it would stop a run this
+        // plane could never have continued.
         if mode == Mode::Resume {
-            self.ensure_resume_policy_bundle(&records)?;
-            #[cfg(feature = "manifest")]
-            self.ensure_resume_declaration(&records)?;
+            self.refuse_undrivable(&records)?;
         }
 
-        let quota = self.start_replay_quota_pass(run, mode, lease).await?;
+        // Resume can dispatch new effects past the end of history, so it is
+        // held to the bundle and the declaration recorded at admission. Strict
+        // replay performs no effects and remains usable as an offline verifier
+        // without loading the historical engine.
+        //
+        // A refusal here is journaled as a quarantine rather than returned. The
+        // callers that reach this unattended — a wake, a delivery, the recovery
+        // sweep — have already recorded the result that took the run off its
+        // waiting listing, and an error there reaches nobody: the run would
+        // sit on no listing, or be retried every tick into the same refusal.
+        // A quarantine is the state that already means *the runtime cannot go
+        // on and a person must decide*, it is listed and counted, and both of
+        // its answers work here — reopen on a plane holding the recorded
+        // revision, or abandon.
+        if mode == Mode::Resume
+            && let Some(refusal) = self.resume_refusal(&records)?
+        {
+            let lease = lease.expect("resume holds a lease");
+            return self
+                .quarantine_refused(run, &records, lease, &refusal)
+                .await;
+        }
+
+        *dispatched = true;
+        // The agent recorded at admission, so a replay is bounded by the
+        // ceilings the run actually had — and dispatched no wider than the
+        // width its reservation was sized for.
+        let budget = self.budget_for(&recorded_agent(&records));
+        let quota = self
+            .start_replay_quota_pass(run, mode, lease, reserved_width(&budget, &plan))
+            .await?;
 
         let case_ctx = self.recorded_case(&records);
 
@@ -4264,12 +4882,7 @@ impl Runtime {
                 input,
                 mode,
                 case: case_ctx,
-                budget: {
-                    // The agent recorded at admission, so a replay is bounded by
-                    // the ceilings the run actually had.
-                    let recorded = recorded_agent(&records);
-                    self.budget_for(&recorded)
-                },
+                budget,
                 agent: recorded_agent(&records),
                 identity: recorded_chain(&records)?,
                 // A step-level refusal has no effect key, so it cannot ride the
@@ -4296,6 +4909,7 @@ impl Runtime {
             &mut cursor,
         )
         .await
+        .inspect(|_| *divergence = cursor.divergence().cloned())
     }
 
     /// The trace root. Every span below is a child, so "what did this run do"
@@ -4404,6 +5018,10 @@ impl Runtime {
         // Resolving the compensation from the live plan then undoes something
         // that never ran, which is a refund for a charge nobody made.
         let mut completed: Vec<(StepId, Capability)> = Vec::new();
+        // The node each completed step ran as. A successor may carry a
+        // completed step over only as this exact node: `done` is by id, so a
+        // redeclared node would count as done on the strength of other work.
+        let mut ran: BTreeMap<StepId, PlanNode> = BTreeMap::new();
         let mut outputs: BTreeMap<StepId, Tainted<Value>> = BTreeMap::new();
 
         // ── Ready-set scheduling ───────────────────────────────────────────
@@ -4605,7 +5223,7 @@ impl Runtime {
                         started: &started,
                         finished: &finished,
                         recorded_groups: &recorded_groups,
-                        parallelism: budget.parallelism(),
+                        parallelism: quota.parallelism(&budget),
                     },
                 )
                 .await;
@@ -4632,6 +5250,11 @@ impl Runtime {
                         continue;
                     }
                     if let Some(missing) = cursor.unconsumed_in(step, Phase::Forward) {
+                        cursor.note_divergence(crate::journal::Divergence::unconsumed(
+                            step,
+                            Phase::Forward,
+                            &missing,
+                        ));
                         self.meter.count(metrics::DIVERGENCES, "");
                         tracing::error!(
                             target: telemetry::NONDETERMINISM,
@@ -4662,8 +5285,15 @@ impl Runtime {
             // A step that stops for any reason stops the run: whatever remains
             // either depended on it, or will be dispatched when it resumes.
             // Anything already done may need undoing first.
-            let mut stopped = apply(&current, outcomes, &mut done, &mut completed, &mut outputs)
-                .or_else(|| refused.map(RunStatus::Exhausted));
+            let mut stopped = apply(
+                &current,
+                outcomes,
+                &mut done,
+                &mut completed,
+                &mut ran,
+                &mut outputs,
+            )
+            .or_else(|| refused.map(RunStatus::Exhausted));
 
             if let Some(RunStatus::Replanning(reason)) = &stopped {
                 let recorded = recorded_successors.get(replans as usize);
@@ -4674,7 +5304,9 @@ impl Runtime {
                     stamp: &stamp,
                 };
                 let cx = Replan {
+                    run,
                     current: &current,
+                    ran: &ran,
                     reason,
                     already_replanned: replans,
                     max_replans: budget.max_replans,
@@ -4729,6 +5361,9 @@ impl Runtime {
         if mode == Mode::Strict
             && let Some((step, phase, missing)) = cursor.first_unconsumed()
         {
+            cursor.note_divergence(crate::journal::Divergence::unconsumed(
+                step, phase, &missing,
+            ));
             self.meter.count(metrics::DIVERGENCES, "");
             tracing::error!(
                 target: telemetry::NONDETERMINISM,
@@ -4884,7 +5519,30 @@ impl Runtime {
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         completed: &[(StepId, Capability)],
     ) -> Result<Result<PlanIR, RunStatus>, RuntimeError> {
-        let next = match self.successor(cx, outputs, completed).await {
+        // What each step that started and journaled an effect ran as, read
+        // from the journal only when a successor is about to be checked — a
+        // replay reads the successor back instead.
+        let started = if cx.recorded.is_none() {
+            let records = self
+                .store
+                .read(cx.run, 1)
+                .await
+                .map_err(RuntimeError::from_store)?;
+            let effectful: BTreeSet<StepId> = records
+                .iter()
+                .filter(|r| r.body.phase.is_forward())
+                .filter_map(|r| match r.kind() {
+                    RecordKind::EffectStarted { .. } => r.body.step,
+                    _ => None,
+                })
+                .collect();
+            let mut started = started_skills(&records);
+            started.retain(|step, _| effectful.contains(step));
+            started
+        } else {
+            BTreeMap::new()
+        };
+        let next = match self.successor(cx, outputs, completed, &started).await {
             Ok(next) => next,
             Err(refusal) => return Ok(Err(refusal)),
         };
@@ -4953,6 +5611,7 @@ impl Runtime {
         cx: Replan<'_>,
         outputs: &BTreeMap<StepId, Tainted<Value>>,
         completed: &[(StepId, Capability)],
+        started: &BTreeMap<StepId, String>,
     ) -> Result<PlanIR, RunStatus> {
         if let Some(source) = untrusted_in(outputs) {
             return Err(RunStatus::Failed(format!(
@@ -4993,20 +5652,62 @@ impl Runtime {
         crate::plan::validate(&next, &self.contract())
             .map_err(|e| RunStatus::Failed(format!("the successor plan is invalid: {e}")))?;
 
-        // A completed step's id may not be reused for different work. Effect
-        // keys are derived from the step id, so new work at a used id makes the
-        // run unreplayable — and the saga, which undoes what `completed` says
-        // ran, would compensate something that never happened.
-        for (step, ran) in completed {
-            if let Some(node) = next.node(*step)
-                && node.capability != *ran
-            {
+        // A completed step carries over only as the node it ran as, or not at
+        // all. Other work at its id breaks replay — effect keys derive from the
+        // step id — and has the saga undo something that never ran. The same
+        // capability redeclared is refused too: `done` is by id, so a node with
+        // new arguments, dependencies or flags would count as done on the
+        // strength of work done before any of them held — a terminal verifier
+        // satisfied without ever seeing what it verifies.
+        for (step, node_ran) in cx.ran {
+            let Some(node) = next.node(*step) else {
+                continue;
+            };
+            if node.capability != node_ran.capability {
                 return Err(RunStatus::Failed(format!(
                     "the successor plan reuses step {step} — which already ran \
-                     as '{}' — for '{}'. Keep a completed step's capability or \
-                     leave the step out; effect keys are derived from the step \
-                     id, so new work at a used id cannot be replayed",
-                    ran.0, node.capability.0
+                     as '{}' — for '{}'. Keep a completed step's node or leave \
+                     the step out; effect keys are derived from the step id, so \
+                     new work at a used id cannot be replayed",
+                    node_ran.capability.0, node.capability.0
+                )));
+            }
+            if node != node_ran {
+                return Err(RunStatus::Failed(format!(
+                    "the successor plan redeclares completed step {step} ('{}') \
+                     with different arguments, dependencies or flags. A \
+                     completed step counts as done by its id, so the new node \
+                     would be satisfied by work done under the old one — carry \
+                     it over unchanged, or give the new work a fresh id",
+                    node.capability.0
+                )));
+            }
+        }
+
+        // A step that started, journaled an effect and did not complete holds
+        // keys derived from its id just the same — it may have charged before
+        // asking to replan — so its id may not be reused for work another
+        // skill would do. One that journaled nothing, the step that asked for
+        // a fallback before touching anything, leaves its id free.
+        for (step, skill) in started {
+            if cx.ran.contains_key(step) {
+                continue;
+            }
+            let Some(node) = next.node(*step) else {
+                continue;
+            };
+            let resolved = self
+                .resolve(&node.capability.0)
+                .map(|s| s.descriptor().name)
+                .ok();
+            if resolved.as_deref() != Some(skill.as_str()) {
+                return Err(RunStatus::Failed(format!(
+                    "the successor plan reuses step {step} — which already \
+                     started as '{skill}' and journaled effects — for '{}'. Keep the step's \
+                     capability or leave the step out; effect keys are derived \
+                     from the step id, and the unwind undoes a started step as \
+                     the skill that ran",
+                    node.capability.0
                 )));
             }
         }
@@ -5202,6 +5903,9 @@ impl Runtime {
             && !matches!(unwound, RunStatus::Quarantined(_))
             && let Some((step, phase, missing)) = cursor.first_unconsumed()
         {
+            cursor.note_divergence(crate::journal::Divergence::unconsumed(
+                step, phase, &missing,
+            ));
             self.meter.count(metrics::DIVERGENCES, "");
             tracing::error!(
                 target: telemetry::NONDETERMINISM,
@@ -5302,10 +6006,10 @@ impl Runtime {
             // two honest options both need them standing — raise the ceiling
             // and resume (which continues *over* the completed work), or
             // cancel (which unwinds through this same function under a status
-            // that does). Unwinding on exhaustion made the three ends of an
-            // exhausted run contradict each other: the work was reversed, the
-            // run stayed resumable, and the resume then reported success over
-            // a world where the work no longer stood.
+            // that does). Unwinding on exhaustion would make the three ends of
+            // an exhausted run contradict each other: the work reversed, the
+            // run still resumable, and the resume reporting success over a
+            // world where the work no longer stands.
             RunStatus::Failed(_) | RunStatus::Cancelled { .. } => {}
             other => return Ok(other),
         }
@@ -5316,8 +6020,10 @@ impl Runtime {
         };
         let UnwindEvidence {
             mutated,
+            started: _,
             undone: already_undone,
             recorded_groups,
+            failed: _,
         } = evidence;
         let completed = &list[..];
 
@@ -5407,12 +6113,13 @@ impl Runtime {
                     .map_err(RuntimeError::from_store)?;
             }
 
-            if result.is_err() {
+            if let Err(fault) = &result {
                 tracing::error!(
                     target: telemetry::COMPENSATION_FAILED,
                     run = %cx.run,
                     %step,
-                    detail = %outcome,
+                    error_type = fault.class(),
+                    reason_digest = %telemetry::reason_digest(&outcome),
                 );
                 self.meter.count(metrics::COMPENSATIONS, "failed");
                 // Not a problem more compensation solves. Unwinding further
@@ -5427,6 +6134,16 @@ impl Runtime {
         }
 
         Ok(status)
+    }
+
+    /// Whether `run`'s journal holds a landed mutation no compensation undid.
+    ///
+    /// The attention roll-up's question about a failed run: `failed` alone may
+    /// be cleared by a resume, but one standing on landed work leaves that
+    /// work in the world until somebody finishes or unwinds it.
+    pub(super) async fn holds_landed_work(&self, run: RunId) -> Result<bool, RuntimeError> {
+        let evidence = self.unwind_evidence(run).await?;
+        Ok(!evidence.mutated.is_subset(&evidence.undone))
     }
 
     /// What the journal knows about an unwind before it starts:
@@ -5446,6 +6163,12 @@ impl Runtime {
     /// attempt starts from doubt again, so a retry that lands after a refusal
     /// is still evidence the step touched the world.
     ///
+    /// **Nor does a member of a group that settled `Aborted`.** That settlement
+    /// is written only once every landed member was reversed, so the group's
+    /// effects — members and reversals alike — left nothing standing, and
+    /// counting them marked a cleanly aborted step as mutated: a quarantine for
+    /// a step declaring no compensation, a second undo for one that did.
+    ///
     /// What this does **not** establish is that a `DidNotHappen` classification
     /// is true — that is the driver's claim, and a driver that mislabels a
     /// landed call leaves a mutation nothing here will undo.
@@ -5459,17 +6182,42 @@ impl Runtime {
         // Per mutating forward effect: the step it belongs to, and whether the
         // record leaves it capable of having touched the world.
         let mut touching: BTreeMap<crate::core::EffectKey, (StepId, bool)> = BTreeMap::new();
+        // The mutating effects of the group each step has open. A step holds
+        // at most one open group, so the step is the key.
+        let mut grouped: BTreeMap<StepId, Vec<crate::core::EffectKey>> = BTreeMap::new();
         let mut undone = BTreeSet::new();
+        let mut failed = BTreeSet::new();
         for r in &records {
             let Some(step) = r.body.step else { continue };
             let key = r.effect_key();
             match r.kind() {
+                RecordKind::StepFinished { outcome } if r.body.phase.is_forward() => {
+                    if outcome == RunStatus::Succeeded.as_str() {
+                        failed.remove(&step);
+                    } else {
+                        failed.insert(step);
+                    }
+                }
                 RecordKind::EffectStarted { mutates: true, .. } if r.body.phase.is_forward() => {
                     if let Some(key) = key {
                         // A fresh attempt is undecided until its own terminal
                         // record says otherwise, so it supersedes whatever the
                         // previous attempt concluded.
                         touching.insert(key, (step, true));
+                        if let Some(members) = grouped.get_mut(&step) {
+                            members.push(key);
+                        }
+                    }
+                }
+                RecordKind::GroupOpened { .. } if r.body.phase.is_forward() => {
+                    grouped.insert(step, Vec::new());
+                }
+                RecordKind::GroupSettled { outcome, .. } if r.body.phase.is_forward() => {
+                    let members = grouped.remove(&step).unwrap_or_default();
+                    if *outcome == crate::core::GroupOutcome::Aborted {
+                        for member in members {
+                            touching.remove(&member);
+                        }
                     }
                 }
                 RecordKind::EffectFailed { disposition, .. }
@@ -5490,8 +6238,10 @@ impl Runtime {
             .collect();
         Ok(UnwindEvidence {
             mutated,
+            started: started_skills(&records),
             undone,
             recorded_groups: recorded_groups(&records),
+            failed,
         })
     }
 
@@ -5534,6 +6284,8 @@ impl Runtime {
             journal_ceiling: self.journal_ceiling,
             #[cfg(feature = "manifest")]
             egress: self.egress.clone(),
+            #[cfg(feature = "manifest")]
+            rates: self.rates.clone(),
             meter: self.meter.clone(),
             #[cfg(feature = "keyring")]
             keyring: self.keyring.clone(),
@@ -5595,7 +6347,14 @@ impl Runtime {
         );
 
         let result = skill.compensate(&mut ctx, &output).await;
-        cursor.restore(step, Phase::Compensating, ctx.into_cursor());
+        let mut slice = ctx.into_cursor();
+        if let Err(crate::core::SkillError::Step(error)) = &result
+            && let Some(divergence) =
+                crate::journal::Divergence::of(step, Phase::Compensating, error, &slice)
+        {
+            slice.note_divergence(divergence);
+        }
+        cursor.restore(step, Phase::Compensating, slice);
         result
     }
 
@@ -5619,9 +6378,16 @@ impl Runtime {
         // and on replay, and it is what lets an *undeclared* step be judged
         // on what it did instead of on what nobody said about it.
         let evidence = self.unwind_evidence(cx.run).await?;
-        let list = if status.is_cancelled() || self.will_compensate(completed, &evidence.mutated) {
+        // The question is asked of the interrupted siblings too: a sibling
+        // holding landed work the failure stranded is work the unwind must
+        // reach, and asked of completed steps alone, a failure with nothing
+        // completed to compensate left it standing. The failing step itself
+        // is not asked — its own landed work leaves the run resumable.
+        let candidates = Self::with_interrupted_siblings(completed, &evidence);
+        let list = if status.is_cancelled() || self.will_compensate(&candidates, &evidence.mutated)
+        {
             match self
-                .stop_list(cx.run, completed, cx.ir, &evidence.mutated)
+                .stop_list(cx.run, completed, &evidence.started, &evidence.mutated)
                 .await?
             {
                 Ok(list) => list,
@@ -5647,7 +6413,7 @@ impl Runtime {
         &self,
         run: RunId,
         completed: &[(StepId, Capability)],
-        ir: &PlanIR,
+        started: &BTreeMap<StepId, String>,
         mutated: &BTreeSet<StepId>,
     ) -> Result<Result<Vec<(StepId, Capability)>, RunStatus>, RuntimeError> {
         if let Some(step) = self.undecided_effect(run).await? {
@@ -5658,7 +6424,9 @@ impl Runtime {
                  it would undo everything except the one thing nobody can account for"
             ))));
         }
-        Ok(Ok(Self::with_interrupted_steps(completed, ir, mutated)))
+        Ok(Ok(Self::with_interrupted_steps(
+            completed, started, mutated,
+        )))
     }
 
     /// Whether an unwind over these completed steps would compensate anything.
@@ -5688,10 +6456,39 @@ impl Runtime {
         })
     }
 
+    /// The completed steps, plus every sibling a failure interrupted holding
+    /// landed work: a step that mutated, never completed, and did not itself
+    /// fail. Undone as the skill its `StepStarted` names, as
+    /// [`with_interrupted_steps`](Self::with_interrupted_steps) undoes it.
+    fn with_interrupted_siblings(
+        completed: &[(StepId, Capability)],
+        evidence: &UnwindEvidence,
+    ) -> Vec<(StepId, Capability)> {
+        let mut out = completed.to_vec();
+        let done: BTreeSet<StepId> = out.iter().map(|(s, _)| *s).collect();
+        for step in evidence
+            .mutated
+            .iter()
+            .filter(|s| !done.contains(s) && !evidence.failed.contains(s))
+        {
+            if let Some(skill) = evidence.started.get(step) {
+                out.push((*step, Capability::new(skill.as_str())));
+            }
+        }
+        out
+    }
+
     /// The unwind list for a stop: completed steps, plus any step that mutated
     /// without completing — the one a cancellation interrupted, or the sibling
     /// a failure stranded mid-suspension. The interrupted steps go last, so
     /// the caller's reverse walk undoes them first.
+    ///
+    /// An interrupted step is undone as the skill its `StepStarted` names —
+    /// the capability that ran — never as whatever the plan in force has at
+    /// its id. A step that charged and then asked to replan is interrupted
+    /// under a successor that may drop it or put other work at its id, and
+    /// either reading would leave the charge standing or refund it through a
+    /// skill that never ran.
     ///
     /// A step whose compensation is already on the record stays in the list,
     /// exactly as a completed step does. The walk re-runs its compensation
@@ -5703,14 +6500,14 @@ impl Runtime {
     /// telling the truth.
     fn with_interrupted_steps(
         completed: &[(StepId, Capability)],
-        ir: &PlanIR,
+        started: &BTreeMap<StepId, String>,
         mutated: &BTreeSet<StepId>,
     ) -> Vec<(StepId, Capability)> {
         let mut out = completed.to_vec();
         let done: BTreeSet<StepId> = out.iter().map(|(s, _)| *s).collect();
         for step in mutated.iter().filter(|s| !done.contains(s)) {
-            if let Some(node) = ir.node(*step) {
-                out.push((*step, node.capability.clone()));
+            if let Some(skill) = started.get(step) {
+                out.push((*step, Capability::new(skill.as_str())));
             }
         }
         out
@@ -5865,13 +6662,25 @@ impl Runtime {
         };
         let result = settle_abandoned_group(&mut cx, result).await;
         let wrote = cx.wrote_records();
-        let cursor = cx.into_cursor();
+        let mut cursor = cx.into_cursor();
+        if let Err(crate::core::SkillError::Step(error)) = &result
+            && let Some(divergence) = crate::journal::Divergence::of(step, phase, error, &cursor)
+        {
+            cursor.note_divergence(divergence);
+        }
         ledger.lock().expect("budget mutex").record_step();
 
+        let fault = result.as_ref().err().map(crate::core::SkillError::class);
         let (status, output) = classify(&self.meter, result);
         tracing::Span::current().record(telemetry::OUTCOME, status.as_str());
         if let RunStatus::Quarantined(why) = &status {
-            tracing::error!(target: telemetry::QUARANTINED, %step, reason = %why);
+            tracing::error!(
+                target: telemetry::QUARANTINED,
+                %run,
+                %step,
+                error_type = fault.unwrap_or("quarantined"),
+                reason_digest = %telemetry::reason_digest(why),
+            );
         }
 
         // Record the ending only where the journal does not already hold it:
@@ -5921,11 +6730,15 @@ impl Runtime {
     ) -> Result<RunOutcome, RuntimeError> {
         // Loud toward the operator, ordinary toward the caller. A failed run is
         // a conclusion a resume can honestly answer, so it is not an incident —
-        // but until this, nothing said why one failed except the journal and an
-        // index that needs the HTTP surface mounted, so `agentplane serve`
-        // reported "failed" to a peer and gave its own operator nothing.
+        // but without this event nothing says why one failed except the
+        // journal and an index that needs the HTTP surface mounted.
         if let RunStatus::Failed(reason) = &status {
-            tracing::warn!(target: telemetry::RUN_FAILED, %run, reason = %reason);
+            tracing::warn!(
+                target: telemetry::RUN_FAILED,
+                %run,
+                error_type = "failed",
+                reason_digest = %telemetry::reason_digest(reason),
+            );
         }
 
         // A suspended run is not sealed: its chain is going to be extended the
@@ -6031,13 +6844,17 @@ impl Runtime {
             // it fails, the conclusion remains open under an owned lease; once
             // that lease expires, recovery derives this pass from the journal
             // and retries the idempotent receipt.
-            self.settle_quota(run, epoch, live_spend, quota).await?;
+            self.settle_quota(run, epoch, live_spend, quota, status.seals())
+                .await?;
 
             let chain_head = if status.seals() {
-                self.store
+                let head = self
+                    .store
                     .seal(run, epoch, status.as_str())
                     .await
-                    .map_err(RuntimeError::from_store)?
+                    .map_err(RuntimeError::from_store)?;
+                self.retire_waits(run).await;
+                head
             } else {
                 chain_head
             };
@@ -6101,7 +6918,45 @@ fn run_output(ir: &PlanIR, outputs: &BTreeMap<StepId, Tainted<Value>>) -> Option
         .or_else(|| outputs.iter().next_back().map(|(_, v)| v.clone()))
 }
 
+/// Effects a run announced and never recorded an outcome for — the waits a
+/// closed run leaves behind.
+fn unanswered_waits(records: &[Record]) -> Vec<crate::core::EffectKey> {
+    let settled: BTreeSet<_> = records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.kind(),
+                RecordKind::EffectDone { .. }
+                    | RecordKind::EffectFailed { .. }
+                    | RecordKind::EffectReconciled { .. }
+            )
+        })
+        .filter_map(Record::effect_key)
+        .collect();
+    records
+        .iter()
+        .filter(|r| matches!(r.kind(), RecordKind::EffectStarted { .. }))
+        .filter_map(Record::effect_key)
+        .filter(|k| !settled.contains(k))
+        .collect()
+}
+
 /// Spend durably recorded by effects written under one live pass epoch.
+/// Whether `epoch` holds the conclusion that sealed the run — the pass whose
+/// settlement releases what the run still held.
+fn concluded_in(records: &[Record], epoch: crate::core::Epoch) -> bool {
+    records
+        .iter()
+        .any(|r| r.body.epoch == epoch && is_sealing_conclusion(r))
+}
+
+fn is_sealing_conclusion(record: &Record) -> bool {
+    matches!(
+        record.kind(),
+        RecordKind::RunConcluded { outcome, .. } if SEALED_OUTCOMES.contains(&outcome.as_str())
+    )
+}
+
 fn spend_recorded_in_epoch(records: &[Record], epoch: crate::core::Epoch) -> Spend {
     records
         .iter()
@@ -6144,7 +6999,7 @@ fn announce_replan(meter: &super::metrics::Meter, run: RunId, next: &PlanIR, rea
         %run,
         from = next.derived_from.map(Digest::to_hex),
         version = next.version,
-        %reason,
+        reason_digest = %telemetry::reason_digest(reason),
     );
     meter.count(metrics::REPLANS, "");
 }
@@ -6157,13 +7012,23 @@ fn announce(meter: &super::metrics::Meter, run: RunId, status: &RunStatus) {
     meter.count(metrics::RUNS, status.as_str());
     match status {
         RunStatus::Quarantined(why) => {
-            tracing::error!(target: telemetry::QUARANTINED, %run, reason = %why);
+            tracing::error!(
+                target: telemetry::QUARANTINED,
+                %run,
+                error_type = "quarantined",
+                reason_digest = %telemetry::reason_digest(why),
+            );
             meter.count(metrics::QUARANTINES, "");
         }
         // Loud, though a person asked for it. The operator who decided already
         // knows; this reaches whoever answers for what the run left standing.
         RunStatus::Abandoned { actor, reason } => {
-            tracing::error!(target: telemetry::ABANDONED, %run, %actor, %reason);
+            tracing::error!(
+                target: telemetry::ABANDONED,
+                %run,
+                %actor,
+                reason_digest = %telemetry::reason_digest(reason),
+            );
         }
         RunStatus::Exhausted(limit) => {
             tracing::warn!(target: telemetry::BUDGET_REFUSED, %run, %limit);
@@ -6192,6 +7057,7 @@ fn apply(
     outcomes: Vec<StepOutcome>,
     done: &mut BTreeSet<StepId>,
     completed: &mut Vec<(StepId, Capability)>,
+    ran: &mut BTreeMap<StepId, PlanNode>,
     outputs: &mut BTreeMap<StepId, Tainted<Value>>,
 ) -> Option<RunStatus> {
     let mut stopped: Option<RunStatus> = None;
@@ -6211,6 +7077,7 @@ fn apply(
         done.insert(step);
         if let Some(node) = plan.node(step) {
             completed.push((step, node.capability.clone()));
+            ran.insert(step, node.clone());
         }
     }
     stopped
@@ -6325,15 +7192,23 @@ struct Withdrawal {
 struct UnwindEvidence {
     /// Steps that announced a mutating forward effect.
     mutated: BTreeSet<StepId>,
+    /// The skill each step that started ran as, from its `StepStarted`.
+    started: BTreeMap<StepId, String>,
     /// Steps whose compensation is already on the record.
     undone: BTreeSet<StepId>,
     /// Group records already on the journal, by writing step and phase.
     recorded_groups: BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup>,
+    /// Steps whose last forward ending is not a success: the failing step,
+    /// which stays resumable, as opposed to a sibling the failure interrupted.
+    failed: BTreeSet<StepId>,
 }
 
 /// What producing a successor plan needs.
 struct Replan<'a> {
+    run: RunId,
     current: &'a PlanIR,
+    /// The node each completed step ran as.
+    ran: &'a BTreeMap<StepId, PlanNode>,
     reason: &'a str,
     already_replanned: u32,
     max_replans: Option<u32>,
@@ -6507,6 +7382,21 @@ fn recorded_started_steps(records: &[Record]) -> BTreeSet<StepId> {
         .iter()
         .filter_map(|r| match r.kind() {
             RecordKind::StepStarted { .. } => r.body.step,
+            _ => None,
+        })
+        .collect()
+}
+
+/// The skill each step started as, from its forward `StepStarted`.
+///
+/// The capability that actually ran, which after a replan the plan in force
+/// may no longer name at that id — or may name as other work.
+fn started_skills(records: &[Record]) -> BTreeMap<StepId, String> {
+    records
+        .iter()
+        .filter(|r| r.body.phase.is_forward())
+        .filter_map(|r| match (r.kind(), r.body.step) {
+            (RecordKind::StepStarted { skill }, Some(step)) => Some((step, skill.clone())),
             _ => None,
         })
         .collect()
@@ -6835,6 +7725,25 @@ fn recorded_chain(records: &[Record]) -> Result<Option<crate::core::Delegation>,
         .map_err(RuntimeError::Delegation)
 }
 
+/// Whether a resume refused with `error` would be refused the same way on
+/// every attempt: the journal it read is what refuses, not the store, a lease,
+/// a quota or this plane's configuration.
+///
+/// Named rather than negated: a failure not listed here is retried, so a
+/// transient one added later costs a retry loop rather than a quarantine.
+/// `PlanContract` is not listed because some of its refusals are about this
+/// plane — a quota store it lacks — and another plane may settle what this
+/// one cannot.
+const fn recurs_on_every_resume(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Encoding(_)
+            | RuntimeError::ChainBroken { .. }
+            | RuntimeError::CanonicalizationChanged { .. }
+            | RuntimeError::Delegation(_)
+    )
+}
+
 fn recorded_agent(records: &[Record]) -> String {
     records
         .iter()
@@ -7040,7 +7949,9 @@ fn classify(
                 }) => {
                     tracing::error!(
                         target: telemetry::NONDETERMINISM,
-                        %seq, %expected, %actual, %detail,
+                        %seq, %expected, %actual,
+                        error_type = "nondeterminism",
+                        reason_digest = %telemetry::reason_digest(detail),
                     );
                     meter.count(metrics::DIVERGENCES, "");
                 }
@@ -7052,11 +7963,20 @@ fn classify(
                     meter.count(metrics::DIVERGENCES, "");
                 }
                 SkillError::Step(StepError::Undecidable { key, detail, .. }) => {
-                    tracing::error!(target: telemetry::UNDECIDABLE, %key, %detail);
+                    tracing::error!(
+                        target: telemetry::UNDECIDABLE,
+                        %key,
+                        error_type = "undecidable",
+                        reason_digest = %telemetry::reason_digest(detail),
+                    );
                     meter.count(metrics::UNDECIDABLE, "");
                 }
                 SkillError::Step(StepError::Unreproducible { what, detail }) => {
-                    tracing::error!(target: telemetry::UNREPRODUCIBLE, %what, %detail);
+                    tracing::error!(
+                        target: telemetry::UNREPRODUCIBLE,
+                        error_type = "unreproducible",
+                        reason_digest = %telemetry::reason_digest(&format!("{what}: {detail}")),
+                    );
                     meter.count(metrics::UNREPRODUCIBLE, "");
                 }
                 _ => {}
@@ -7169,11 +8089,11 @@ const UNATTRIBUTED: &str = "the chain records this ending and not who asked for 
 ///
 /// * A step's outcome is not the run's. They coincide only in a one-step plan.
 /// * `find_map` **skips** a record it does not recognise and keeps looking. A
-///   run whose last step failed after earlier steps succeeded therefore matched
-///   an *earlier* `StepFinished { outcome: "succeeded" }` and was reported
-///   closed-and-succeeded. Every multi-step run that suspended after a failure
-///   — every saga waiting on an approval to finish unwinding — could never be
-///   resumed, and reported success while doing it.
+///   run whose last step failed after earlier steps succeeded would match an
+///   *earlier* `StepFinished { outcome: "succeeded" }` and be reported
+///   closed-and-succeeded: every multi-step run suspended after a failure —
+///   every saga waiting on an approval to finish unwinding — could never be
+///   resumed, and would report success while stuck.
 ///
 /// `RunSealed` is written by `conclude` for exactly the runs that reached a
 /// conclusion, and never for a suspended one. That is the fact this needs, so
@@ -7486,6 +8406,36 @@ fn sealed_payload(value: &serde_json::Value) -> bool {
     }
 }
 
+/// How the run's history says it last ended, or that it is waiting.
+///
+/// The last conclusion or suspension on the record, as the outcome word a
+/// replay's own status reports, so the two compare directly. `None` for a run
+/// that has neither: it is still in flight, and a strict replay of it would
+/// stop at its frontier and call that divergence.
+fn recorded_ending(records: &[Record]) -> Option<String> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::RunConcluded { outcome, .. } => Some(outcome.clone()),
+        RecordKind::RunSuspended { .. } => Some("suspended".to_owned()),
+        _ => None,
+    })
+}
+
+/// Whether an ending was an act rather than something the run's steps reached.
+///
+/// A cancellation, an abandonment, a sweep, a break-glass crossing, a
+/// withdrawal and an observation are each recorded by whoever took them; a
+/// strict replay re-derives steps, and no step decided these.
+fn ended_by_an_act(outcome: &str) -> bool {
+    matches!(outcome, "cancelled" | "abandoned")
+        || [
+            super::sweeper::SWEEP_OUTCOME,
+            BREAK_GLASS_OUTCOME,
+            WITHHELD_OUTCOME,
+            OBSERVED_OUTCOME,
+        ]
+        .contains(&outcome)
+}
+
 /// The plan a run was admitted under, read back from its own history.
 ///
 /// Read back rather than recompiled. Recompiling could produce a different
@@ -7576,14 +8526,16 @@ fn recorded_withholding(records: &[Record]) -> Option<(String, String)> {
     })
 }
 
-/// Wall-clock read for the case's `opened_at` stamp.
+/// Wall-clock read for the case's `opened_at` stamp, and for a rate
+/// reservation's instant.
 ///
 /// Admission happens before any step exists, so there is no `StepCtx` to
-/// journal through. The value is descriptive metadata on the case row and never
-/// participates in replay — run-visible time still goes through
-/// `StepCtx::now`, which journals it.
+/// journal through. Both values are store metadata and never participate in
+/// replay: a rate refusal is journaled on the run and read back, never
+/// re-counted — run-visible time still goes through `StepCtx::now`, which
+/// journals it.
 #[allow(clippy::disallowed_methods)]
-fn now_for_admission() -> crate::core::Timestamp {
+pub(super) fn now_for_admission() -> crate::core::Timestamp {
     crate::core::Timestamp::now_utc()
 }
 
@@ -8434,10 +9386,9 @@ impl RuntimeBuilder {
     /// answerable from history rather than reconstructed from timestamps.
     ///
     /// It is **not** the identity of a run a served surface admits for a
-    /// caller: those act under the chain the caller presented
-    /// ([`RunTerms::acting_as`]), which takes precedence over this one. A plane
-    /// that bound its own chain to every peer's run would be an ambient
-    /// credential.
+    /// caller: those act under the chain the caller presented, or under none
+    /// when it presented none ([`RunTerms::served`]). A plane that bound its own
+    /// chain to every peer's run would be an ambient credential.
     ///
     /// Verification of the *credential* belongs to whatever authenticates the
     /// caller; what arrives here is already a chain, and its attenuation is
@@ -9158,6 +10109,39 @@ impl RuntimeBuilder {
             }
         }
 
+        // Every ceiling any declaration on this plane states, by tool: the
+        // count is per tool, so the tightest binds every agent calling it.
+        #[cfg(feature = "manifest")]
+        let rates = {
+            let mut declarations: Vec<&Arc<crate::manifest::Manifest>> =
+                governed_by.values().collect();
+            declarations.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+            let mut ceilings: BTreeMap<String, Vec<crate::quota::RateCeiling>> = BTreeMap::new();
+            let mut first = None;
+            for m in declarations {
+                for grant in &m.spec.tools {
+                    let Some(rate) = grant.rate_limit else {
+                        continue;
+                    };
+                    first.get_or_insert_with(|| (m.metadata.name.clone(), grant.reference.clone()));
+                    let stated = ceilings.entry(grant.reference.clone()).or_default();
+                    let ceiling = crate::quota::RateCeiling::from(rate);
+                    if !stated.contains(&ceiling) {
+                        stated.push(ceiling);
+                        stated.sort();
+                    }
+                }
+            }
+            if ceilings.is_empty() {
+                None
+            } else if let Some(store) = self.quotas.clone() {
+                Some(Arc::new(super::ctx::Rates { store, ceilings }))
+            } else {
+                let (agent, grant) = first.unwrap_or_default();
+                return Err(BuildError::RateLimitWithoutQuotaStore { agent, grant });
+            }
+        };
+
         // Both or neither, checked here because a builder cannot see the other
         // half at the moment either is set.
         let witnesses = match (self.witnesses.is_empty(), self.quorum) {
@@ -9203,6 +10187,8 @@ impl RuntimeBuilder {
             #[cfg(feature = "manifest")]
             egress: self.egress,
             quotas: self.quotas,
+            #[cfg(feature = "manifest")]
+            rates,
             quota: self.quota,
             budget: self.budget,
             require_verifier: self.require_verifier,
@@ -9228,10 +10214,6 @@ impl RuntimeBuilder {
     }
 }
 
-/// Refuse a plane whose store serves a different tenant.
-///
-/// Not a misconfiguration that shows up at runtime — it *works*, and writes this
-/// tenant's runs into another's keyspace while every key-scoped erasure and
 /// Ask the policy set the questions this plane will ask, before it asks them
 /// for real.
 ///
@@ -9240,95 +10222,126 @@ impl RuntimeBuilder {
 /// errors, and an unevaluable rule may be the `forbid` that would have stopped
 /// the call, so the gate refuses. One unguarded rule therefore denies every
 /// effect of every run, from a policy set that compiled cleanly and validated
-/// against its schema. A deployment met exactly that: rules written when a
-/// delegation chain was always configured, against a plane that later ran
-/// without one.
+/// against its schema.
 ///
-/// The probes are the *thin* shape of each request — the attributes always
-/// present — because that is what exposes an unguarded read of a conditional
-/// one. Evaluation is total and side-effect free, so asking costs nothing and
-/// happens where the answer is still cheap to act on.
+/// The probes cover every shape a runtime request takes: an effect that reads
+/// and one that mutates, each with and without a label (only `sink` carries
+/// one), a release, and an admission. `mutates` matters on its own: `&&`
+/// short-circuits, so `context.mutates && context.label.trust == ..` evaluates
+/// cleanly on a read and errors on every mutating call that carries no label.
+///
+/// The delegation attributes follow the plane. A plane with a chain carries
+/// `owner`, `scope` and `delegation_depth` on every request, and a rule reading
+/// them unguarded is correct there. A plane without one never carries them on
+/// its own runs — and still admits runs under a caller's chain from a served
+/// surface, so both shapes are asked.
 ///
 /// What this does **not** establish: that the rules are *right*. A set that
 /// permits everything passes here, as does one whose rules error only on a
 /// shape carrying an attribute of an unexpected type. It answers one question
 /// — can this plane's own requests be evaluated at all — which is the question
-/// whose wrong answer looks like a working plane that refuses everything.
+/// whose wrong answer looks like a working plane that refuses everything. The
+/// served surfaces ask their own actions with their own contexts, and check
+/// those where they are built.
 #[cfg_attr(not(feature = "manifest"), allow(dead_code))]
 fn preflight_policy(
     engine: &dyn crate::core::PolicyEngine,
     identity: Option<&crate::core::Delegation>,
 ) -> Result<(), BuildError> {
-    use crate::core::{
-        ACTION_ADMIT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE,
-    };
-
-    // Values are placeholders; only the *presence* of each key matters, since
-    // what is being probed is whether a rule can read what it reads.
-    let run = "run_00000000000000000000000000";
-    // Empty objects rather than nulls, for two reasons. A real request never
-    // carries a null here — `args` is the effect's own arguments and `label`
-    // is a label — so a null probe asks a question no gate will ask. And the
-    // adapter *strips* nulls before evaluating, tracing each strip; probing
-    // with them made every plane build walk that path, which is not what a
-    // preflight is for.
-    let effect = serde_json::json!({
-        "run": run,
-        "step": 0,
-        "tenant": "preflight",
-        "mutates": false,
-        "args": {},
-    });
-    let release = serde_json::json!({
-        "run": run,
-        "step": 0,
-        "release": {},
-        "label": {},
-    });
-    let admit = serde_json::json!({
-        "tenant": "preflight",
-        "input": {},
-    });
-    // The delegation attributes are merged by the *same function* the gates
-    // use, so a probe cannot drift from the shape it is standing in for. A
-    // plane with a chain configured carries `owner`, `scope` and
-    // `delegation_depth` on every request, and a rule reading them is correct
-    // there; a plane without one never carries them, and the same rule denies
-    // everything. Which plane this is decides which question gets asked.
-    let (mut effect, mut release, mut admit) = (effect, release, admit);
-    for context in [&mut effect, &mut release, &mut admit] {
-        super::ctx::merge_identity(context, identity);
-    }
-    let probes = [
-        (ACTION_PERFORM, "preflight.effect", &effect),
-        (ACTION_DECLARED, "preflight.effect", &effect),
-        (ACTION_EGRESS, "preflight.effect", &effect),
-        (ACTION_RELEASE, "information_flow.label", &release),
-        (ACTION_ADMIT, "preflight.capability", &admit),
-    ];
-    let requests: Vec<crate::core::PolicyRequest<'_>> = probes
-        .iter()
-        .map(|(action, resource, context)| crate::core::PolicyRequest {
-            principal: "preflight",
-            action,
-            resource,
-            context,
-        })
-        .collect();
-
-    // Asked through the engine's own preflight rather than by calling
-    // `authorize` here, and the difference is not ceremony. An engine written
-    // as Rust code has no missing-attribute trap and nothing to report, so
-    // probing it at build would be asking a question it cannot answer — and it
-    // would consult engines whose contract is about *when* they are consulted.
-    // The engine that has the trap implements the method.
-    let problems = engine.preflight(&requests);
+    let problems = runtime_policy_problems(engine, identity);
     if problems.is_empty() {
         return Ok(());
     }
     Err(BuildError::PolicyUnevaluable {
         problems: problems.join("; "),
     })
+}
+
+/// The runtime tier's probes, answered by `engine`.
+fn runtime_policy_problems(
+    engine: &dyn crate::core::PolicyEngine,
+    identity: Option<&crate::core::Delegation>,
+) -> Vec<String> {
+    use crate::policy::requests;
+
+    // Values are placeholders shaped like the real ones: a rule reading
+    // `context.label.trust` on a release must find a label there, or the probe
+    // reports a defect the real request would never hit. Nulls are absent for
+    // the same reason — no gate sends one, and the adapter strips them.
+    let run = RunId(ulid::Ulid::nil());
+    let step = StepId(0);
+    let label = crate::core::Label::untrusted(crate::core::SourceId::new("preflight"));
+    let release = crate::core::Release::whole(
+        crate::core::ReleaseScope::trust(),
+        "preflight",
+        "tool://preflight/probe",
+        ["preflight"],
+    );
+    // A tool call's arguments are the one shape the runtime fixes for a kind,
+    // so a rule scoped to `tool.call` may read `context.args.server` as-is.
+    let tool_args = serde_json::json!({
+        "server": "preflight",
+        "tool": "preflight",
+        "arguments": {},
+        "protected_fields": [],
+    });
+
+    // The chain shapes this plane's requests take. A chain of the plane's own
+    // is on every request; without one, a run may still carry its caller's.
+    let caller = crate::core::Delegation::root(crate::core::Principal::new(
+        "preflight",
+        crate::core::Scope::root(),
+    ));
+    let chains: Vec<Option<&crate::core::Delegation>> = match identity {
+        Some(chain) => vec![Some(chain)],
+        None => vec![None, Some(&caller)],
+    };
+
+    // Built by the gates' own builders, so a probe cannot drift from the
+    // shape it stands in for: an effect that reads and one that mutates, each
+    // with and without a label (only `sink` carries one), a release, and an
+    // admission.
+    let mut built = Vec::new();
+    for chain in chains {
+        let acting = requests::Acting {
+            tenant: "preflight",
+            capability: "preflight.capability",
+            agent: None,
+            chain,
+        };
+        for (kind, args) in [
+            ("preflight.effect", serde_json::json!({})),
+            ("tool.call", tool_args.clone()),
+        ] {
+            for (mutates, labelled) in [(false, false), (true, false), (false, true), (true, true)]
+            {
+                built.push(requests::effect(
+                    &acting,
+                    run,
+                    step,
+                    kind,
+                    &args,
+                    mutates,
+                    labelled.then_some(&label),
+                ));
+            }
+        }
+        built.push(requests::release(&acting, run, step, &release, &label));
+        built.push(requests::admission(&acting, &serde_json::json!({})));
+    }
+    let requests: Vec<crate::core::PolicyRequest<'_>> = built
+        .iter()
+        .map(requests::GatedRequest::as_request)
+        .collect();
+
+    // Asked through the engine's own preflight rather than by calling
+    // `authorize` here. An engine written as Rust code has no missing-attribute
+    // trap and nothing to report; the engine that has the trap implements the
+    // method, and knows which resources its own rules name.
+    let mut problems = engine.preflight(&requests);
+    problems.sort();
+    problems.dedup();
+    problems
 }
 
 /// Refuse a plane whose stores answer for somebody else.
@@ -9401,6 +10414,16 @@ fn check_same_tenant(
     Ok(())
 }
 
+/// Refuse an event from outside whose kind this plane mints for itself.
+fn refuse_reserved_kind(event: &InboundEvent) -> Result<(), RuntimeError> {
+    if crate::core::is_reserved_kind(&event.kind) {
+        return Err(RuntimeError::ReservedEventKind {
+            kind: event.kind.clone(),
+        });
+    }
+    Ok(())
+}
+
 /// Inbound event delivery.
 impl Runtime {
     /// Deliver an inbound event, resuming whichever run was waiting for it.
@@ -9417,7 +10440,25 @@ impl Runtime {
     /// ([`EventStore::sweep_unclaimed`](crate::case::EventStore::sweep_unclaimed))
     /// decides an event is genuinely unroutable, because that is a claim about
     /// the future rather than about this instant.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::ReservedEventKind`] for a kind in the `agentplane.`
+    /// namespace, which only this plane mints; [`RuntimeError`] for a store
+    /// failure or a refused resume.
     pub async fn deliver(&self, event: &InboundEvent) -> Result<Delivery, RuntimeError> {
+        refuse_reserved_kind(event)?;
+        self.deliver_minted(event).await
+    }
+
+    /// Deliver an event this plane minted itself — a worklist decision.
+    ///
+    /// The one path into the reserved namespace [`deliver`](Self::deliver)
+    /// refuses from outside.
+    pub(crate) async fn deliver_minted(
+        &self,
+        event: &InboundEvent,
+    ) -> Result<Delivery, RuntimeError> {
         let events = self.events.as_ref().ok_or_else(|| {
             RuntimeError::PlanContract(
                 "this runtime has no event store — build it with `.events(store)`".into(),
@@ -9456,11 +10497,19 @@ impl Runtime {
     ///
     /// The event store atomically inserts and claims the event for this run. A
     /// run that is not waiting leaves no buffered event behind for another run.
+    ///
+    /// # Errors
+    ///
+    /// As [`deliver`](Self::deliver), and [`RuntimeError::PlanContract`] when
+    /// `run` is not waiting for this input. Addressing a run by id is no way
+    /// around the reserved namespace: a run waiting on a human task is waiting
+    /// for exactly the kind this refuses.
     pub async fn deliver_to(
         &self,
         run: RunId,
         event: &InboundEvent,
     ) -> Result<Delivery, RuntimeError> {
+        refuse_reserved_kind(event)?;
         let events = self.events.as_ref().ok_or_else(|| {
             RuntimeError::PlanContract(
                 "this runtime has no event store — build it with `.events(store)`".into(),
@@ -9521,14 +10570,13 @@ impl Runtime {
                 Err(crate::core::StoreError::LeaseHeld { .. }) => {
                     // The claim retired the subscription, so nothing lists
                     // this run as waiting any more — and the claimed event
-                    // blocks every dedup'd retry of itself. Re-registering
-                    // the subscription is what keeps the pair findable: the
-                    // sweep's redelivery pass walks waiting subscriptions,
-                    // re-claims (a claim by the same run is returned, not
-                    // filtered), and finishes the delivery once the owner
-                    // concludes.
+                    // blocks every dedup'd retry of itself. Parking the pair
+                    // is what keeps it findable: the sweep's redelivery pass
+                    // walks parked waits, re-claims (a claim by the same run
+                    // is returned, not filtered), and finishes the delivery
+                    // once the owner concludes.
                     events
-                        .subscribe(&sub, now_for_admission())
+                        .park_wait(&sub, now_for_admission())
                         .await
                         .map_err(RuntimeError::from_store)?;
                     tracing::warn!(
@@ -9607,14 +10655,75 @@ impl Runtime {
         // expired while still naming an owner. The handover keeps the run
         // owned continuously from delivery to conclusion.
         match self.resume_holding(sub.run, lease).await {
-            // A `LeaseHeld` means this lease lapsed mid-resume and somebody
+            // A `Fenced` means this lease lapsed mid-resume and somebody
             // claimed the run — a concurrent delivery, a recovery sweep. The
             // event is durably recorded, so whoever holds the lease replays
-            // it; this delivery still delivered.
-            Ok(_) | Err(RuntimeError::LeaseHeld { .. }) => {}
+            // it; this delivery still delivered, and a sender told otherwise
+            // retries into a duplicate.
+            Ok(_) | Err(RuntimeError::Fenced { .. }) => {}
+            // This plane holds no agent for the run — an operator's terminal
+            // recording a decision. The answer is durable, and the lease is
+            // kept so it lapses owned: that puts the run on the abandonment
+            // listing, where the plane that runs the agent recovers it from
+            // the recorded answer. Failing here would leave a recorded
+            // decision reported as lost and the task it answers still claimed.
+            // A plane holding no key ring for a sealed run is the same
+            // terminal on a sealed plane: it cannot read the run, and the
+            // plane that holds the ring can.
+            Err(RuntimeError::NoProvider { .. } | RuntimeError::PayloadsSealed { .. }) => {
+                return Ok(Delivery::Buffered);
+            }
             Err(e) => return Err(e),
         }
         Ok(Delivery::Resumed { run: sub.run })
+    }
+
+    /// Retire everything a run that concluded closed was still waiting on:
+    /// its timers, its event subscriptions and its unanswered tasks.
+    ///
+    /// A sealed run can record nothing, so each of these left behind is work
+    /// the plane keeps doing for nobody — a timer claimed and failed every
+    /// lease period, the oldest waiter on a key taking the next event from a
+    /// live run behind it, a task offered for a decision no answer reaches.
+    ///
+    /// Called after every seal of a concluded run — the conclusion's own and
+    /// the one resume writes to repair a crash between conclusion and seal —
+    /// and idempotent, so retiring twice is harmless.
+    ///
+    /// After the seal, and best-effort: the conclusion is already durable, and
+    /// the stores pass over a sealed run's timers and subscriptions on their
+    /// own, so a retirement that fails here costs clutter rather than a
+    /// delivery. A task left pending by that failure is withdrawn by nothing
+    /// else, which is why the failure is logged loudly.
+    async fn retire_waits(&self, run: RunId) {
+        if let Some(timers) = &self.timers
+            && let Err(error) = timers.disarm_run(run).await
+        {
+            tracing::error!(%run, %error, "a closed run's timers could not be retired");
+        }
+        if let Some(events) = &self.events
+            && let Err(error) = events.unsubscribe_run(run).await
+        {
+            tracing::error!(%run, %error, "a closed run's subscriptions could not be retired");
+        }
+        if let Some(tasks) = &self.tasks {
+            // The waits the run announced and never had answered. A task opened
+            // beside an answer completes its own effect and is not among them:
+            // it is a finding for a desk, and outlives the run by design.
+            let awaited = match self.store.read(run, 1).await {
+                Ok(records) => unanswered_waits(&records)
+                    .into_iter()
+                    .map(|effect| crate::core::TaskId::derive(run, effect))
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    tracing::error!(%run, %error, "a closed run's open tasks could not be withdrawn");
+                    return;
+                }
+            };
+            if let Err(error) = tasks.withdraw_run(run, &awaited).await {
+                tracing::error!(%run, %error, "a closed run's open tasks could not be withdrawn");
+            }
+        }
     }
 
     /// Finish deliveries that died between the claim and the resume.
@@ -9622,13 +10731,14 @@ impl Runtime {
     /// A delivery that raced a live owner leaves an event durably claimed for
     /// a run nothing resumed, and the counterparty's retries deduplicate
     /// against that claim — so no future delivery drives the run, and a
-    /// message that arrived in time is parked forever. The giving-up delivery
-    /// re-registers the subscription precisely so the pair stays findable;
-    /// this pass walks the waiting subscriptions, re-claims (idempotently —
-    /// a claim by the same run is returned, not filtered), and finishes the
-    /// delivery. Runs whose owner is *still* live are skipped and found again
-    /// next tick, so the delivery's retry bound bounds latency, never
-    /// delivery.
+    /// message that arrived in time is stranded. The giving-up delivery parks
+    /// the pair precisely so it stays findable; this pass walks the parked
+    /// waits — never every registered wait, whose long legitimate members
+    /// would fill the page ahead of a pair parked after them — re-claims
+    /// (idempotently: a claim by the same run is returned, not filtered), and
+    /// finishes the delivery. Runs whose owner is *still* live are skipped and
+    /// found again next tick, so the delivery's retry bound bounds latency,
+    /// never delivery.
     ///
     /// What this does **not** cover, honestly: a crash inside the store
     /// commit between an event's claim and the resume retires the
@@ -9642,13 +10752,13 @@ impl Runtime {
         let Some(events) = self.events.as_ref() else {
             return Ok(crate::runtime::Redelivered::default());
         };
-        let waiting = events
-            .waiting(limit)
+        let parked = events
+            .parked_waits(limit)
             .await
             .map_err(RuntimeError::from_store)?;
-        let examined = waiting.len();
+        let examined = parked.len();
         let mut delivered = 0usize;
-        for sub in waiting {
+        for sub in parked {
             let Some(buffered) = events
                 .claim_for(&sub, now_for_admission())
                 .await
@@ -9921,7 +11031,7 @@ mod resume_agreement_tests {
 
     /// **An ending a person caused reports the words that person gave.**
     ///
-    /// The conclusion no longer carries them: one sentence, one record. So the
+    /// The conclusion does not carry them: one sentence, one record. So the
     /// reader has to reach the attribution record for the reason exactly as it
     /// already does for the actor, and a reader that only learned the second
     /// half would answer an incident review with a blank where the operator

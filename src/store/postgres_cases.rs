@@ -174,12 +174,19 @@ CREATE TABLE IF NOT EXISTS case_deadlines (
     state           TEXT   NOT NULL,
     -- Who accounted for the breach, once somebody has. Absent on every other
     -- state; `acknowledged_at` is what says the other two mean anything.
-    acknowledged_at   BIGINT,
-    acknowledged_by   TEXT,
-    acknowledged_note TEXT,
+    acknowledged_at    BIGINT,
+    acknowledged_by    TEXT,
+    acknowledged_basis TEXT,
+    acknowledged_note  TEXT,
     PRIMARY KEY (tenant, case_id, name),
     FOREIGN KEY (tenant, case_id) REFERENCES cases (tenant, case_id) ON DELETE CASCADE
 );
+-- A breach applied whose account the sweep has not yet written: set by the
+-- breach in its own statement, cleared once the sweep's notes land.
+ALTER TABLE case_deadlines ADD COLUMN IF NOT EXISTS breach_unnoted BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS case_deadlines_unnoted
+    ON case_deadlines (tenant, resolved_at)
+    WHERE breach_unnoted;
 
 -- The sweep's read: outstanding obligations by due instant.
 CREATE INDEX IF NOT EXISTS case_deadlines_due
@@ -221,6 +228,9 @@ CREATE TABLE IF NOT EXISTS inbound_events (
     dead_reason TEXT,
     PRIMARY KEY (tenant, event_id)
 );
+-- Set by `erase_payload` and never cleared: an erased row is never handed to
+-- a run as a value, whatever its claim says.
+ALTER TABLE inbound_events ADD COLUMN IF NOT EXISTS erased BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- The sweep's read: live unclaimed events by age. Partial, so the index is
 -- exactly the sweep's candidate set rather than the whole buffer.
@@ -268,6 +278,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     namespace  TEXT   NOT NULL,
     value      TEXT   NOT NULL,
     created_at BIGINT NOT NULL,
+    -- Set while the wait holds a claimed event nothing has delivered yet: the
+    -- redelivery pass reads these rows rather than every registered wait.
+    parked_at  BIGINT,
     PRIMARY KEY (tenant, run_id, effect_key, namespace, value)
 );
 
@@ -285,6 +298,12 @@ CREATE INDEX IF NOT EXISTS subscriptions_by_key
 -- population a plane is *expected* to accumulate.
 CREATE INDEX IF NOT EXISTS subscriptions_waiting
     ON subscriptions (tenant, created_at, run_id, effect_key);
+
+-- The redelivery pass's read: waits parked with a claimed event. Partial, so a
+-- plane's long legitimate waits never stand in front of the pairs it is for.
+CREATE INDEX IF NOT EXISTS subscriptions_parked
+    ON subscriptions (tenant, parked_at, run_id, effect_key)
+    WHERE parked_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS timers (
     tenant     TEXT   NOT NULL,
@@ -325,6 +344,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     priority_rank   SMALLINT NOT NULL,
     created_at      BIGINT NOT NULL,
     due_at          BIGINT,
+    -- `Withheld::as_str` when the proposal is sealed at rest; the decorator
+    -- that sealed it writes it, so no argument value can spell it.
+    withheld        TEXT,
     PRIMARY KEY (tenant, task_id)
 );
 
@@ -348,7 +370,10 @@ CREATE TABLE IF NOT EXISTS batches (
 CREATE TABLE IF NOT EXISTS batch_items (
     tenant   TEXT   NOT NULL,
     batch_id TEXT   NOT NULL,
-    item_key TEXT   NOT NULL,
+    -- Byte order, as the embedded backend compares keys: the resume cursor is
+    -- a `<` over these, and a locale collation would order a source's pages
+    -- differently from the source.
+    item_key TEXT   COLLATE \"C\" NOT NULL,
     run_id   TEXT   NOT NULL,
     outcome  TEXT,
     detail   TEXT,
@@ -446,7 +471,35 @@ CREATE TABLE IF NOT EXISTS quota_settled (
     tokens       BIGINT  NOT NULL CHECK (tokens >= 0),
     minor_units  BIGINT  NOT NULL CHECK (minor_units >= 0),
     release_slot BOOLEAN NOT NULL,
+    concludes    BOOLEAN NOT NULL,
     PRIMARY KEY (tenant, run_id, epoch)
+);
+
+-- What an open run still holds against a period: written beside the slot at
+-- admission, reduced by every pass settlement and removed by the concluding
+-- one, each in the transaction that writes the receipt. One row per run, so a
+-- resume in a later period moves it rather than adding a second.
+CREATE TABLE IF NOT EXISTS quota_reserved (
+    tenant      TEXT   NOT NULL,
+    run_id      TEXT   NOT NULL,
+    period      TEXT   NOT NULL,
+    tokens      BIGINT NOT NULL CHECK (tokens >= 0),
+    minor_units BIGINT NOT NULL CHECK (minor_units >= 0),
+    PRIMARY KEY (tenant, run_id)
+);
+
+-- One row per dispatch of a rate-ceilinged tool. The key is the idempotency:
+-- a retry and a recovered re-dispatch carry the same run and first-attempt
+-- key and find their own row. The count is the rows for (tenant, grant_ref)
+-- inside the window, decided under a per-grant advisory lock. Rows age out
+-- with the widest window and are never refunded early.
+CREATE TABLE IF NOT EXISTS quota_rate (
+    tenant      TEXT   NOT NULL,
+    grant_ref   TEXT   NOT NULL,
+    run_id      TEXT   NOT NULL,
+    dispatch    TEXT   NOT NULL,
+    reserved_at BIGINT NOT NULL,
+    PRIMARY KEY (tenant, grant_ref, run_id, dispatch)
 );
 ";
 
@@ -720,6 +773,7 @@ impl CaseStore for PostgresStore {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn import_case(
         &self,
         case: &Case,
@@ -799,8 +853,8 @@ impl CaseStore for PostgresStore {
             tx.execute(
                 "INSERT INTO case_deadlines
                     (tenant, case_id, name, resolved_at, calendar_digest, warn_at, state,
-                     acknowledged_at, acknowledged_by, acknowledged_note)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                     acknowledged_at, acknowledged_by, acknowledged_note, acknowledged_basis)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                 &[
                     &tenant,
                     &key,
@@ -813,8 +867,15 @@ impl CaseStore for PostgresStore {
                         .acknowledged
                         .as_ref()
                         .map(|a| a.at.unix_timestamp()),
-                    &deadline.acknowledged.as_ref().map(|a| a.by.clone()),
+                    &deadline
+                        .acknowledged
+                        .as_ref()
+                        .map(|a| a.by.actor().to_owned()),
                     &deadline.acknowledged.as_ref().map(|a| a.note.clone()),
+                    &deadline
+                        .acknowledged
+                        .as_ref()
+                        .map(|a| a.by.basis().as_str()),
                 ],
             )
             .await
@@ -1149,8 +1210,8 @@ impl CaseStore for PostgresStore {
         tx.execute(
             "INSERT INTO case_deadlines
                    (case_id, name, resolved_at, calendar_digest, warn_at, state, tenant,
-                    acknowledged_at, acknowledged_by, acknowledged_note)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    acknowledged_at, acknowledged_by, acknowledged_note, acknowledged_basis)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  ON CONFLICT (tenant, case_id, name) DO NOTHING",
             &[
                 &d.case.to_string(),
@@ -1161,8 +1222,9 @@ impl CaseStore for PostgresStore {
                 &d.state.as_str(),
                 &self.tenant_name(),
                 &d.acknowledged.as_ref().map(|a| a.at.unix_timestamp()),
-                &d.acknowledged.as_ref().map(|a| a.by.clone()),
+                &d.acknowledged.as_ref().map(|a| a.by.actor().to_owned()),
                 &d.acknowledged.as_ref().map(|a| a.note.clone()),
+                &d.acknowledged.as_ref().map(|a| a.by.basis().as_str()),
             ],
         )
         .await
@@ -1176,7 +1238,7 @@ impl CaseStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state,
-                        acknowledged_at, acknowledged_by, acknowledged_note
+                        acknowledged_at, acknowledged_by, acknowledged_note, acknowledged_basis
                    FROM case_deadlines
                   WHERE case_id = $1 AND tenant = $2 ORDER BY resolved_at ASC",
                 &[&case.to_string(), &self.tenant_name()],
@@ -1243,12 +1305,80 @@ impl CaseStore for PostgresStore {
         Ok(())
     }
 
+    async fn breach_deadline(
+        &self,
+        case: CaseId,
+        name: &str,
+        now: Timestamp,
+    ) -> Result<bool, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let (key, tenant) = (case.to_string(), self.tenant_name());
+        // The case row's lock first, as `close` takes it: closure and this
+        // breach then decide one at a time, and a closure that won has already
+        // met or cancelled the obligation this checks.
+        let status: Option<String> = tx
+            .query_opt(
+                "SELECT status FROM cases WHERE case_id = $1 AND tenant = $2 FOR UPDATE",
+                &[&key, &tenant],
+            )
+            .await
+            .map_err(|e| be(&e))?
+            .map(|r| r.get(0));
+        let Some(status) = status else {
+            return Err(StoreError::NotFound(key));
+        };
+        let breached = tx
+            .execute(
+                "UPDATE case_deadlines SET state = $4, breach_unnoted = TRUE
+                  WHERE case_id = $1 AND name = $2 AND tenant = $3
+                    AND state = ANY($5::text[]) AND resolved_at <= $6",
+                &[
+                    &key,
+                    &name.to_owned(),
+                    &tenant,
+                    &DeadlineState::Breached.as_str(),
+                    &deadline_states(DeadlineState::is_open),
+                    &now.unix_timestamp(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if breached == 0 {
+            let exists = tx
+                .query_opt(
+                    "SELECT 1 FROM case_deadlines
+                      WHERE case_id = $1 AND name = $2 AND tenant = $3",
+                    &[&key, &name.to_owned(), &tenant],
+                )
+                .await
+                .map_err(|e| be(&e))?
+                .is_some();
+            tx.commit().await.map_err(|e| be(&e))?;
+            return if exists {
+                Ok(false)
+            } else {
+                Err(StoreError::NotFound(format!("{case}/{name}")))
+            };
+        }
+        if status != CaseStatus::Closed.as_str() {
+            tx.execute(
+                "UPDATE cases SET status = $3 WHERE case_id = $1 AND tenant = $2",
+                &[&key, &tenant, &CaseStatus::Escalated.as_str()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(true)
+    }
+
     async fn due(&self, now: Timestamp, limit: usize) -> Result<Vec<Deadline>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
                 "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state,
-                        acknowledged_at, acknowledged_by, acknowledged_note
+                        acknowledged_at, acknowledged_by, acknowledged_note, acknowledged_basis
                    FROM case_deadlines
                   WHERE tenant = $3 AND state = ANY($4::text[])
                     AND (resolved_at <= $1 OR (warn_at IS NOT NULL AND warn_at <= $1))
@@ -1265,6 +1395,41 @@ impl CaseStore for PostgresStore {
         rows.iter().map(deadline_from).collect()
     }
 
+    async fn breaches_to_note(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state,
+                        acknowledged_at, acknowledged_by, acknowledged_note, acknowledged_basis
+                   FROM case_deadlines
+                  WHERE tenant = $2 AND breach_unnoted
+                  ORDER BY resolved_at ASC LIMIT $1",
+                &[
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.iter().map(deadline_from).collect()
+    }
+
+    async fn mark_breach_noted(&self, case: CaseId, name: &str) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let n = client
+            .execute(
+                "UPDATE case_deadlines SET breach_unnoted = FALSE
+                  WHERE tenant = $1 AND case_id = $2 AND name = $3",
+                &[&self.tenant_name(), &case.to_string(), &name.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if n == 0 {
+            return Err(StoreError::NotFound(format!("{case}/{name}")));
+        }
+        Ok(())
+    }
+
     async fn breached(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         // Served by `case_deadlines_due`, whose leading columns are the two this
@@ -1273,7 +1438,7 @@ impl CaseStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT case_id, name, resolved_at, calendar_digest, warn_at, state,
-                        acknowledged_at, acknowledged_by, acknowledged_note
+                        acknowledged_at, acknowledged_by, acknowledged_note, acknowledged_basis
                    FROM case_deadlines
                   WHERE tenant = $2 AND state = 'breached' AND acknowledged_at IS NULL
                   ORDER BY resolved_at ASC LIMIT $1",
@@ -1320,15 +1485,17 @@ impl CaseStore for PostgresStore {
         }
         tx.execute(
             "UPDATE case_deadlines
-                SET acknowledged_at = $4, acknowledged_by = $5, acknowledged_note = $6
+                SET acknowledged_at = $4, acknowledged_by = $5, acknowledged_note = $6,
+                    acknowledged_basis = $7
               WHERE case_id = $1 AND name = $2 AND tenant = $3",
             &[
                 &case.to_string(),
                 &name.to_owned(),
                 &self.tenant_name(),
                 &note.at.unix_timestamp(),
-                &note.by,
+                &note.by.actor(),
                 &note.note,
+                &note.by.basis().as_str(),
             ],
         )
         .await
@@ -1635,10 +1802,11 @@ fn acknowledged_from(row: &tokio_postgres::Row) -> Result<Option<BreachNote>, St
     let at: Option<i64> = row.get(6);
     let by: Option<String> = row.get(7);
     let note: Option<String> = row.get(8);
-    match (at, by, note) {
-        (None, None, None) => Ok(None),
-        (Some(at), Some(by), Some(note)) => Ok(Some(BreachNote {
-            by,
+    let basis: Option<String> = row.get(9);
+    match (at, by, note, basis) {
+        (None, None, None, None) => Ok(None),
+        (Some(at), Some(by), Some(note), Some(basis)) => Ok(Some(BreachNote {
+            by: super::decode_operator(&by, &basis, "case_deadlines")?,
             note,
             at: Timestamp::from_unix_timestamp(at)
                 .map_err(|e| corrupt("unrepresentable acknowledged_at", e))?,
@@ -1771,7 +1939,7 @@ impl EventStore for PostgresStore {
                            WHERE e.tenant = $6 AND e.kind = $3
                              AND c.namespace = $4 AND c.value = $5
                              AND (e.claimed_by IS NULL OR e.claimed_by = $1)
-                             AND NOT e.dead
+                             AND NOT e.dead AND NOT e.erased
                            ORDER BY e.received_at ASC
                            FOR UPDATE SKIP LOCKED
                            LIMIT 1)
@@ -1816,13 +1984,22 @@ impl EventStore for PostgresStore {
             // only retires rows with no claim. Locking the row makes the loser
             // wait; the winner's retirement then deletes it, and the loser's
             // re-evaluation finds no waiter and leaves its event live.
+            //
+            // A parked wait is passed over: it already holds its claimed
+            // event and waits only for redelivery, so a second event elected
+            // for it would be claimed for a satisfied wait and never consumed.
             let Some(row) = tx
                 .query_opt(
                     "SELECT run_id, effect_key, case_id, step, phase FROM subscriptions
                       WHERE tenant = $4 AND event_kind = $1
                         AND namespace = $2 AND value = $3
+                        AND parked_at IS NULL
+                        AND NOT EXISTS (
+                              SELECT 1 FROM run_seal s
+                               WHERE s.tenant = subscriptions.tenant
+                                 AND s.run_id = subscriptions.run_id)
                       ORDER BY created_at ASC LIMIT 1
-                      FOR UPDATE",
+                      FOR UPDATE OF subscriptions",
                     &[&event.kind, &k.namespace, &k.value, &self.tenant_name()],
                 )
                 .await
@@ -2030,6 +2207,15 @@ impl EventStore for PostgresStore {
             .await
             .map_err(|e| be(&e))?;
         }
+        // Parked until the run's unsubscribe: a crash between this claim and
+        // the resume leaves a pair the redelivery pass finds.
+        tx.execute(
+            "UPDATE subscriptions SET parked_at = $4
+              WHERE tenant = $1 AND run_id = $2 AND effect_key = $3",
+            &[&tenant, &target.to_string(), &effect, &at.unix_timestamp()],
+        )
+        .await
+        .map_err(|e| be(&e))?;
 
         tx.commit().await.map_err(|e| be(&e))?;
         Ok(TargetedDelivery::Matched(subscription))
@@ -2063,31 +2249,227 @@ impl EventStore for PostgresStore {
         Ok(())
     }
 
-    async fn erase_payload(&self, source: &str, id: &str) -> Result<bool, StoreError> {
-        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        // Through the one implementation of the dedup identity, not a second
-        // spelling of its separator.
-        let key = InboundEvent {
-            source: source.to_owned(),
-            id: id.to_owned(),
-            kind: String::new(),
-            correlation: Vec::new(),
-            payload: serde_json::Value::Null,
-            by: None,
-        }
-        .dedup_key();
-        // The row survives with its identity, claim state and dead-letter
-        // reason — dedup still refuses a replay of the erased message, the
-        // dead-letter list stays countable, and only the payload goes.
-        let n = client
-            .execute(
-                "UPDATE inbound_events SET payload = 'null'
-                  WHERE tenant = $1 AND event_id = $2",
-                &[&self.tenant_name(), &key],
+    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let retired = tx
+            .query(
+                "DELETE FROM subscriptions WHERE tenant = $1 AND run_id = $2
+                 RETURNING effect_key",
+                &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
-        Ok(n > 0)
+        // The same shedding `unsubscribe` does, for the same reason.
+        tx.execute(
+            "UPDATE inbound_events SET payload = 'null'
+              WHERE tenant = $1 AND claimed_by = $2",
+            &[&self.tenant_name(), &run.to_string()],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        tx.commit().await.map_err(|e| be(&e))?;
+        let waits: std::collections::BTreeSet<String> =
+            retired.iter().map(|row| row.get(0)).collect();
+        Ok(waits.len())
+    }
+
+    async fn park_wait(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        for k in &sub.correlation {
+            tx.execute(
+                "INSERT INTO subscriptions
+                       (run_id, effect_key, case_id, step, phase, event_kind,
+                        namespace, value, created_at, tenant, parked_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9)
+                     ON CONFLICT (tenant, run_id, effect_key, namespace, value)
+                     DO UPDATE SET parked_at = EXCLUDED.parked_at",
+                &[
+                    &sub.run.to_string(),
+                    &sub.effect.to_hex(),
+                    &sub.case.map(|c| c.to_string()),
+                    &i64::from(sub.step.0),
+                    &crate::core::Phase::as_str(sub.phase),
+                    &sub.kind,
+                    &k.namespace,
+                    &k.value,
+                    &at.unix_timestamp(),
+                    &self.tenant_name(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(())
+    }
+
+    async fn parked_waits(&self, limit: usize) -> Result<Vec<Subscription>, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // A sealed run can record no delivery. Its parked pairs are retired
+        // here rather than listed, or the redelivery pass tries each, fails,
+        // and finds it again every tick — and the payloads it held claimed
+        // are shed as a conclusion's retirement sheds them.
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let retired = tx
+            .query(
+                "DELETE FROM subscriptions s
+                  WHERE s.tenant = $1 AND s.parked_at IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM run_seal r
+                                 WHERE r.tenant = s.tenant AND r.run_id = s.run_id)
+              RETURNING s.run_id",
+                &[&self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let sealed: std::collections::BTreeSet<String> =
+            retired.iter().map(|row| row.get(0)).collect();
+        for run in &sealed {
+            tx.execute(
+                "UPDATE inbound_events SET payload = 'null'
+                  WHERE tenant = $1 AND claimed_by = $2",
+                &[&self.tenant_name(), run],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
+        // One row per wait, its keys gathered: a parked wait with two keys is
+        // one pair to redeliver, not two.
+        let rows = client
+            .query(
+                "SELECT run_id, effect_key, MIN(case_id), MIN(step), MIN(phase),
+                        MIN(event_kind), array_agg(namespace), array_agg(value)
+                   FROM subscriptions
+                  WHERE tenant = $2 AND parked_at IS NOT NULL
+                  GROUP BY run_id, effect_key
+                  ORDER BY MIN(parked_at) ASC, run_id, effect_key
+                  LIMIT $1",
+                &[
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                    &self.tenant_name(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let run: String = row.get(0);
+            let effect: String = row.get(1);
+            let case: Option<String> = row.get(2);
+            let step: i64 = row.get(3);
+            let phase: String = row.get(4);
+            let namespaces: Vec<String> = row.get(6);
+            let values: Vec<String> = row.get(7);
+            out.push(Subscription {
+                run: RunId::parse(&run).map_err(|e| corrupt("bad run id", e))?,
+                case: case
+                    .map(|c| CaseId::parse(&c))
+                    .transpose()
+                    .map_err(|e| corrupt("bad case id", e))?,
+                effect: EffectKey::from_hex(&effect).map_err(|e| corrupt("bad effect key", e))?,
+                step: crate::core::StepId(u32::try_from(step).unwrap_or(0)),
+                phase: phase_from(&phase)?,
+                kind: row.get(5),
+                correlation: namespaces
+                    .into_iter()
+                    .zip(values)
+                    .map(|(ns, value)| CorrelationKey::new(ns, value))
+                    .collect(),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn erase_payload(&self, source: &str, id: &str) -> Result<bool, StoreError> {
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let key = crate::core::origin_key(source, id);
+        let tenant = self.tenant_name();
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let Some(row) = tx
+            .query_opt(
+                "SELECT claimed_by, payload <> 'null' FROM inbound_events
+                  WHERE tenant = $1 AND event_id = $2 FOR UPDATE",
+                &[&tenant, &key],
+            )
+            .await
+            .map_err(|e| be(&e))?
+        else {
+            tx.commit().await.map_err(|e| be(&e))?;
+            return Ok(false);
+        };
+        let claimed_by: Option<String> = row.get(0);
+        let holds_payload: bool = row.get(1);
+        // Undelivered: nobody claimed it, or a run claimed it and has not yet
+        // journaled it — the delivered payload is shed at the run's
+        // unsubscribe, so a claimed row still holding one never reached the
+        // run's journal. Either way it leaves the claimable set as a dead
+        // letter, in this write, so no recovery hands the run the emptied row;
+        // the claim is released and the claimant's wait is unparked, so the
+        // wait stays open for its deadline to bound. A delivered row keeps its
+        // claim and its accounting. Every right-hand side reads the row as it
+        // was before the update.
+        let undelivered = claimed_by.is_none() || holds_payload;
+        tx.execute(
+            "UPDATE inbound_events SET payload = 'null', erased = TRUE,
+                    dead = dead OR $3,
+                    dead_reason = CASE WHEN $3 AND NOT dead THEN $4 ELSE dead_reason END,
+                    claimed_by = CASE WHEN $3 THEN NULL ELSE claimed_by END,
+                    claimed_at = CASE WHEN $3 THEN NULL ELSE claimed_at END
+              WHERE tenant = $1 AND event_id = $2",
+            &[&tenant, &key, &undelivered, &crate::case::ERASED_REASON],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        if let (true, Some(run)) = (undelivered, claimed_by) {
+            tx.execute(
+                "UPDATE subscriptions s SET parked_at = NULL
+                  WHERE s.tenant = $1 AND s.run_id = $2 AND s.parked_at IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM inbound_correlation c
+                                 WHERE c.tenant = s.tenant AND c.event_id = $3
+                                   AND c.namespace = s.namespace AND c.value = s.value)",
+                &[&tenant, &run, &key],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(true)
+    }
+
+    async fn minter(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<crate::case::Minter>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                "SELECT by_actor, by_basis FROM inbound_events
+                  WHERE tenant = $1 AND event_id = $2",
+                &[&self.tenant_name(), &crate::core::origin_key(source, id)],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        match (
+            row.get::<_, Option<String>>(0),
+            row.get::<_, Option<String>>(1),
+        ) {
+            (Some(actor), Some(basis)) => Ok(Some(crate::case::Minter::Operator(
+                super::decode_operator(&actor, &basis, "inbound_events")?,
+            ))),
+            (None, None) => Ok(Some(crate::case::Minter::Nobody)),
+            _ => Err(StoreError::Corrupt {
+                seq: 0,
+                detail: "inbound_events holds half an operator: a minted event carries a \
+                         name and what established it, or neither"
+                    .to_owned(),
+            }),
+        }
     }
 
     async fn sweep_unclaimed(
@@ -2315,6 +2697,19 @@ impl TimerStore for PostgresStore {
 
     async fn claim_due(&self, now: Timestamp, limit: usize) -> Result<Vec<Timer>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        // A sealed run can record no wake. Its due timers are retired rather
+        // than claimed, or each is claimed and fails once per lease period for
+        // ever.
+        client
+            .execute(
+                "DELETE FROM timers t
+                  WHERE t.tenant = $2 AND t.fire_at <= $1
+                    AND EXISTS (SELECT 1 FROM run_seal s
+                                 WHERE s.tenant = t.tenant AND s.run_id = t.run_id)",
+                &[&now.unix_timestamp(), &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
         // Claimed and selected in one statement, with `SKIP LOCKED` so a second
         // sweeper takes different rows rather than blocking on the first's.
         let rows = client
@@ -2365,20 +2760,16 @@ impl TimerStore for PostgresStore {
         Ok(())
     }
 
-    async fn pending(&self, limit: usize) -> Result<Vec<Timer>, StoreError> {
+    async fn disarm_run(&self, run: RunId) -> Result<usize, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        let rows = client
-            .query(
-                "SELECT run_id, effect_key, case_id, step, phase, fire_at
-                   FROM timers WHERE tenant = $2 ORDER BY fire_at ASC LIMIT $1",
-                &[
-                    &i64::try_from(limit).unwrap_or(i64::MAX),
-                    &self.tenant_name(),
-                ],
+        let n = client
+            .execute(
+                "DELETE FROM timers WHERE tenant = $2 AND run_id = $1",
+                &[&run.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
-        rows.iter().map(timer_from).collect()
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
     }
 }
 
@@ -2442,8 +2833,8 @@ impl TaskStore for PostgresStore {
                 "INSERT INTO tasks (task_id, run_id, case_id, kind, justification,
                                     candidate_roles, escalate_to, excluded_actors, assignee,
                                     priority, state, on_expiry, priority_rank, created_at,
-                                    due_at, tenant)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                                    due_at, tenant, withheld)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
                  ON CONFLICT (tenant, task_id) DO NOTHING",
                 &[
                     &task.id.to_hex(),
@@ -2462,6 +2853,7 @@ impl TaskStore for PostgresStore {
                     &task.created_at.unix_timestamp(),
                     &task.due_at.map(Timestamp::unix_timestamp),
                     &self.tenant_name(),
+                    &task.withheld.map(crate::core::Withheld::as_str),
                 ],
             )
             .await
@@ -2677,23 +3069,53 @@ impl TaskStore for PostgresStore {
         Ok(())
     }
 
-    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
+    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<bool, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        // The row count is read, for the reason `release` and `record` read
-        // theirs: a state write that matched nothing reported success, and the
-        // expiry sweep believed it had settled a task no store holds. The
-        // redb backend answers `NotFound`; the conformance battery pins both.
+        // A compare-and-set from the pending states: the settlement that lost
+        // the race to a decision or an expiry must not overwrite the winner's.
         let n = client
             .execute(
-                "UPDATE tasks SET state = $2 WHERE task_id = $1 AND tenant = $3",
-                &[&id.to_hex(), &state.as_str(), &self.tenant_name()],
+                "UPDATE tasks SET state = $2
+                  WHERE task_id = $1 AND tenant = $3 AND state = ANY($4::text[])",
+                &[
+                    &id.to_hex(),
+                    &state.as_str(),
+                    &self.tenant_name(),
+                    &task_states(TaskState::is_pending),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;
-        if n == 0 {
-            return Err(StoreError::NotFound(id.to_string()));
+        if n > 0 {
+            return Ok(true);
         }
-        Ok(())
+        // Nothing moved: settled already, or no such task — and the caller
+        // needs to know which, as the embedded backend tells it.
+        match task_on(&client, &self.tenant_name(), id).await? {
+            Some(_) => Ok(false),
+            None => Err(StoreError::NotFound(id.to_string())),
+        }
+    }
+
+    async fn withdraw_run(&self, run: RunId, awaited: &[TaskId]) -> Result<usize, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let awaited: Vec<String> = awaited.iter().map(|id| id.to_hex()).collect();
+        let n = client
+            .execute(
+                "UPDATE tasks SET state = $3
+                  WHERE tenant = $1 AND run_id = $2 AND state = ANY($4::text[])
+                    AND task_id = ANY($5::text[])",
+                &[
+                    &self.tenant_name(),
+                    &run.to_string(),
+                    &TaskState::Withdrawn.as_str(),
+                    &task_states(TaskState::is_pending),
+                    &awaited,
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(usize::try_from(n).unwrap_or(usize::MAX))
     }
 
     async fn escalate(&self, id: TaskId) -> Result<Task, StoreError> {
@@ -2831,7 +3253,7 @@ impl TaskStore for PostgresStore {
 
 const TASK_COLS: &str = "task_id, run_id, case_id, kind, justification, candidate_roles, \
                          escalate_to, excluded_actors, assignee, priority, state, on_expiry, \
-                         created_at, due_at";
+                         created_at, due_at, withheld";
 
 fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
     let id: String = row.get(0);
@@ -2842,6 +3264,7 @@ fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
     let state: String = row.get(10);
     let on_expiry: String = row.get(11);
     let due: Option<i64> = row.get(13);
+    let withheld: Option<String> = row.get(14);
 
     Ok(Task {
         id: TaskId::parse(&id).map_err(|e| corrupt("bad task id", e))?,
@@ -2865,6 +3288,9 @@ fn task_from(row: &tokio_postgres::Row) -> Result<Task, StoreError> {
             .map(Timestamp::from_unix_timestamp)
             .transpose()
             .map_err(|e| corrupt("unrepresentable due_at", e))?,
+        withheld: withheld
+            .map(|w| decoded("withheld reason", &w, crate::core::Withheld::parse(&w)))
+            .transpose()?,
     })
 }
 
@@ -2999,7 +3425,8 @@ impl BatchStore for PostgresStore {
             ItemOutcome::Failed(d)
             | ItemOutcome::Quarantined(d)
             | ItemOutcome::Suspended(d)
-            | ItemOutcome::Exhausted(d) => Some(d.clone()),
+            | ItemOutcome::Exhausted(d)
+            | ItemOutcome::Withheld(d) => Some(d.clone()),
         };
         let state = outcome.as_str();
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
@@ -3097,6 +3524,7 @@ impl BatchStore for PostgresStore {
                         ItemOutcome::Quarantined(_) => c.quarantined = n,
                         ItemOutcome::Suspended(_) => c.suspended = n,
                         ItemOutcome::Exhausted(_) => c.exhausted = n,
+                        ItemOutcome::Withheld(_) => c.withheld = n,
                     }
                 }
                 // Reserved, no outcome recorded.

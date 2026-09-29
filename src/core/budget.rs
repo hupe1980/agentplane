@@ -80,6 +80,7 @@ use crate::core::Timestamp;
 /// Deliberately unit-agnostic: the engine never learns what a token is or which
 /// currency `minor_units` is in. It adds them up and compares them to a limit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Spend {
     /// Model tokens, or any other metered unit the deployment counts.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
@@ -334,6 +335,31 @@ pub struct Budget {
     /// bounds the worst case; the figure catches the case that stayed under it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_egress_bytes: Option<u64>,
+    /// The most tokens one operation of this run can report.
+    ///
+    /// Not a ceiling the ledger checks — a metered cost is unknown until the
+    /// call returns — but the size of the overshoot the ceilings above permit:
+    /// a run stops once [`max_tokens`](Self::max_tokens) is reached, so it can
+    /// end one operation past it per step in flight. A tenant's spend quota
+    /// reserves the ceiling **plus** that overshoot at admission, and this is
+    /// the figure it reserves per step, so under a token quota a run that
+    /// declares none is refused.
+    ///
+    /// A manifest derives it from its model roles (`max_input_tokens` plus
+    /// `max_tokens` per call), and a model call reporting more input than its
+    /// role declares fails. An embedder's own effects cannot be inspected, so
+    /// for those it is a declaration the reservation is only as exact as —
+    /// the same footing as a price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_call_tokens: Option<u64>,
+    /// The most money, in minor units, one operation of this run can report.
+    ///
+    /// [`max_call_tokens`](Self::max_call_tokens) for
+    /// [`max_minor_units`](Self::max_minor_units): the per-step overshoot a
+    /// tenant's money quota reserves beside the ceiling. A manifest derives it
+    /// from each role's per-call token maxima at the role's declared price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_call_minor_units: Option<u64>,
 }
 
 impl Budget {
@@ -391,6 +417,8 @@ impl Budget {
             max_denials: None,
             max_parallel_steps: None,
             max_egress_bytes: None,
+            max_call_tokens: None,
+            max_call_minor_units: None,
         }
     }
 
@@ -435,6 +463,22 @@ impl Budget {
     #[must_use]
     pub const fn egress_bytes(mut self, n: u64) -> Self {
         self.max_egress_bytes = Some(n);
+        self
+    }
+
+    /// The most tokens one operation may report. See
+    /// [`max_call_tokens`](Self::max_call_tokens).
+    #[must_use]
+    pub const fn call_tokens(mut self, n: u64) -> Self {
+        self.max_call_tokens = Some(n);
+        self
+    }
+
+    /// The most money one operation may report. See
+    /// [`max_call_minor_units`](Self::max_call_minor_units).
+    #[must_use]
+    pub const fn call_minor_units(mut self, n: u64) -> Self {
+        self.max_call_minor_units = Some(n);
         self
     }
 
@@ -527,7 +571,7 @@ pub struct Consumed {
 /// call would have sent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[non_exhaustive]
-#[serde(tag = "limit", rename_all = "snake_case")]
+#[serde(tag = "limit", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BudgetExceeded {
     #[error("step budget exhausted: {allowed} step(s) permitted")]
     Steps { allowed: usize },
@@ -593,6 +637,22 @@ pub enum BudgetExceeded {
         used: u64,
         attempted: u64,
     },
+
+    /// A tool's cross-run rate ceiling had no room for this call.
+    ///
+    /// Not this run's consumption: the count is the tenant's, across runs, so
+    /// `reached` is how many calls to `grant` already fell in the window. The
+    /// window slides, so a resume once enough of them have aged out continues
+    /// the run.
+    #[error(
+        "rate ceiling reached: '{grant}' admits {allowed} call(s) per {window_seconds}s          across runs, and {reached} already fall in the window"
+    )]
+    Rate {
+        grant: String,
+        allowed: u32,
+        window_seconds: u64,
+        reached: u64,
+    },
 }
 
 impl BudgetExceeded {
@@ -614,6 +674,7 @@ impl BudgetExceeded {
             Self::Money { .. } => "money",
             Self::Wallclock { .. } => "wallclock",
             Self::Egress { .. } => "egress_bytes",
+            Self::Rate { .. } => "rate",
         }
     }
 }

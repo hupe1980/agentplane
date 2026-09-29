@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 /// an operator alerting on what an unattended agent did should not be matching
 /// on sentences, and a variant added here is one every reader must consider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "step")]
+#[serde(rename_all = "snake_case", tag = "step", deny_unknown_fields)]
 pub enum ObservedStep {
     /// The agent was given a turn.
     ///
@@ -89,7 +89,7 @@ pub enum ObservedStatus {
 
 /// What came back when a person was asked to permit a call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "outcome")]
+#[serde(rename_all = "snake_case", tag = "outcome", deny_unknown_fields)]
 pub enum ObservedDecision {
     /// An option the agent offered was selected.
     ///

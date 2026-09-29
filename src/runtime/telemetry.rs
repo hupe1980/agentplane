@@ -71,6 +71,21 @@
 //! it cost, which tool ran, how it ended — and the journal for the content, where
 //! the same values are sealed, labelled and erasable.
 //!
+//! # A reason is a digest here, never text
+//!
+//! The same rule reaches the loud events. A run's failure reason, a
+//! quarantine's, an undecidable effect's detail and a compensation's error are
+//! free text a provider, a peer or a skill wrote — and that text quotes the
+//! request it refused, which is the caller's data. The journal seals exactly
+//! these fields and an erasure destroys them; a log line carrying the same words
+//! in clear would outlive both, in the least protected store a deployment has.
+//!
+//! So every event that concerns a reason carries the run, the class of fault
+//! ([`ERROR_TYPE`]'s vocabulary, as the `error_type` field) and
+//! [`reason_digest`] of the text, and never the text. The digest joins the event
+//! to the reason an operator reads through the API — which honours erasure — and
+//! says nothing on its own.
+//!
 //! Three more the convention defines that this plane does not emit, each for its
 //! own reason. `gen_ai.response.id`, because no shared part of a [`Completion`]
 //! carries one. `gen_ai.provider.name` on the **run** span, because the agent is
@@ -276,12 +291,13 @@ pub const ABANDONED: &str = "agentplane.run.abandoned";
 ///
 /// A failure is an ordinary conclusion here rather than an incident — it stays
 /// open, findable under `GET /runs?outcome=failed`, and resumable. But *ordinary*
-/// is not *invisible*: an operator running the shipped server had no way at all
-/// to learn why a run failed, because the outcome index needs the HTTP surface
-/// and the reason otherwise reached only the journal. That is I13's
-/// detection-without-delivery on the most common conclusion there is. The
-/// reason string is the same one the outcome index already hands an operator,
-/// so this discloses nothing new — it delivers it to somebody watching.
+/// is not *invisible*: the outcome index needs the HTTP surface, and without
+/// this event a plane serving none tells its operator of a failure only through
+/// the journal — I13's detection-without-delivery on the most common
+/// conclusion there is. It carries the run and a [`reason_digest`], never the
+/// reason: the words are a provider's or a skill's over the caller's data,
+/// sealed in the journal under a key ring and destroyed by an erasure, and the
+/// operator reads them through the API, which honours both.
 pub const RUN_FAILED: &str = "agentplane.run.failed";
 /// An outcome could not be determined and guessing was forbidden.
 pub const UNDECIDABLE: &str = "agentplane.effect.undecidable";
@@ -349,6 +365,20 @@ pub const LOUD_EVENTS: &[&str] = &[
     POLICY_DENIED,
     WITNESS_INTEGRITY,
 ];
+
+/// What a loud event carries in place of a reason's text.
+///
+/// `sha256:` and the first sixteen hex digits of SHA-256 over the text's UTF-8
+/// bytes. Enough to join an event to the reason the API returns for the same run,
+/// and to tell two failures apart; the text itself stays where erasure reaches
+/// it. A digest is still a commitment — anyone holding a guess can test it — so
+/// it is the least an event can say, not a way to say more.
+#[must_use]
+pub fn reason_digest(text: &str) -> String {
+    use sha2::Digest as _;
+    let hash = sha2::Sha256::digest(text.as_bytes());
+    format!("sha256:{}", hex::encode(&hash[..8]))
+}
 
 /// How a run is being executed, as a span attribute.
 #[must_use]

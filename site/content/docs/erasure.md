@@ -33,15 +33,15 @@ one builder call:
 | **Model prompts** | journal — inside `EffectStarted.descriptor.args`, because the prompt is part of effect identity | **no**, verbatim | sealed, per-case scope |
 | **Tool call arguments** | journal — same field, same reason | **no**, verbatim | sealed, per-case scope |
 | Effect outputs — completions, tool results | journal — `EffectDone.output`, and a reconciliation probe's `EffectReconciled.output`, which is the same data | **no**, verbatim | sealed, per-case scope |
-| Failure messages, notes, frozen plans | journal — `EffectFailed.error` (the message only), `Note.text`, `PlanFrozen.plan`, which embeds the trusted input the plan was compiled from | **no**, verbatim | sealed, per-case scope |
+| Failure messages, notes, frozen plans | journal — `EffectFailed.error` (the message only), a compensation's `StepCompensated.outcome` (its error text when it failed), `Note.text`, `PlanFrozen.plan`, which embeds the trusted input the plan was compiled from | **no**, verbatim | sealed, per-case scope |
 | Case state writes, status changes, deadline transitions | journal (the effect) **and** the case store | **no** in the journal; the case store's copy is overwritten, not erased | sealed in both, one scope |
 | Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | **no** | sealed in both; the buffer's copy is its own unit, keyed `(source, id)` |
 | Human task proposals — `Justification.proposed_action`, the exact thing a reviewer is shown, and `evidence`, the trail behind it | journal (the task effect) **and** the task store | **no** | sealed in both; the task's `summary` stays readable so a queue stays usable, and every entry keeps its trust label so a reviewer still knows who wrote a line whose words are gone |
-| Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep | unreadable everywhere with an explicit `EncryptedMemoryStore` wrap — **not** covered by `.keyring(..)`, see below |
+| Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep, in the live store | unreadable everywhere with an explicit `EncryptedMemoryStore` wrap: each item version has its own key, destroyed by the verb that erases it — **not** covered by `.keyring(..)`, see below |
 | Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone, in the live store only | unreadable everywhere, backups included |
 | Correlation keys, deadline names, task summaries, statuses | case / task store | no, and deliberately — they are what the store is asked questions *about* | unchanged: still readable |
 | Admission keys — a message's `source`/`id` | journal — `RunAdmitted.idempotency_key` — **and** the `run_admission` index | no, and deliberately: the index is looked up by a value the caller holds in the clear, and sealing it would leave a store that cannot refuse a redelivery | unchanged: still readable |
-| Blob digest and classification | journal | no, and it does not need to be — a digest is not the bytes | unchanged |
+| Blob digest and classification | journal | no — a digest hides a high-entropy value, not a guessable one ([below](#a-digest-is-not-erasure)) | unchanged |
 
 Read the first column as the floor and the second as what one call buys. Both
 are honest positions: a deployment that would rather **refuse** the data than
@@ -64,14 +64,36 @@ That is deliberate. A size-triggered spill would make erasability depend on how
 long a value happened to be — the same field permanent for one customer and
 erasable for another. So **references are the intended shape**, not a
 workaround: journal a digest or an identifier, and fetch details through an
-authorised tool call.
+authorised tool call. A digest stands in for the bytes only when the bytes
+cannot be guessed — see [a digest is not erasure](#a-digest-is-not-erasure).
 
 Prompts are the hard case, because the prompt *is* effect identity — replay
 reconstructs a run by re-deriving the same key, so a prompt cannot be redacted
 after the fact without making the run unreplayable. A prompt built from a
-customer record puts that record in the chain permanently. Pass a reference or
-a digest and materialize the bytes at dispatch, as governed media already does,
-or treat the run as retained data with a retention period on the whole store.
+customer record puts that record in the chain permanently. Pass a reference —
+a blob address, or an identifier the tool resolves — and materialize the bytes
+at dispatch, as governed media already does, or treat the run as retained data
+with a retention period on the whole store.
+
+### A digest is not erasure {#a-digest-is-not-erasure}
+
+Every digest here is unsalted SHA-256, and it stays in the clear after the key
+that sealed its plaintext is destroyed. Whoever holds the record can hash every
+candidate and compare. That hides a value only when the candidates cannot be
+enumerated:
+
+| Digest over | After erasure |
+|---|---|
+| A document, a free-text prompt, any long unpredictable bytes | hidden: too many candidates to try |
+| A yes/no, an amount, a date, a status, a name from a known list | **recoverable** by trying every candidate |
+
+Two such digests are written by the runtime and stay in the clear by design:
+the **effect key**, derived from the effect kind and its canonical arguments,
+and a `Released` record's **`value`** digest. An effect whose arguments are one
+small value — `{"approved": true}`, an amount — leaves that value recoverable
+from its key. When such a value must be erasable, pass an opaque identifier the
+tool resolves instead of the value. A blob does not help: a blob is addressed by
+the digest of its plaintext.
 
 **Declare the ceiling and the runtime enforces it.** `spec.security.max_sensitivity_journaled`
 refuses, at dispatch, any argument more sensitive than a deployment is willing
@@ -85,8 +107,7 @@ spec:
     max_sensitivity_journaled: internal   # what may be written down forever
 ```
 
-Absent means unbounded, which is what every deployment had before the field
-existed.
+Absent means unbounded.
 
 **A plane of hand-written skills declares the same ceiling in code**, since it
 runs under no manifest:
@@ -139,9 +160,17 @@ so it holds its contract on a single-writer deployment and nowhere else.
 Wrapping it automatically would hand that adapter to an active-active
 `PostgreSQL` plane, where the mutex coordinates nothing and the hold race it
 exists to prevent is the result — a control that is worse than absent, because
-it reads as present. Its erasure unit differs too: `tenant/memory/<subject>`
-outlives every case, so `erase_case` was never the act that reaches it. Wrap it
-where you can see the deployment:
+it reads as present. Its erasure unit differs too: each **version** of each
+item is its own, `tenant/memory-item/<id>@<version>`, and none of them is a
+case, so `erase_case` was never the act that reaches it. Erasing an id — by
+`forget`, the expiry sweep, or a cascade that reaches its current version —
+destroys the keys of every version it held; a cascade that reaches only a
+superseded version (a rolling summary whose v1 absorbed the erased source)
+destroys exactly that version's key, so a backup taken before the cascade no
+longer opens it while the current version stays readable. `Cascade.trimmed`
+names each such id with the versions it lost. A subject is not a key scope —
+erasing one destroys the keys of the items it held and leaves the subject
+writable under new ids. Wrap it where you can see the deployment:
 
 ```rust
 let memories = EncryptedMemoryStore::new(inner, Arc::clone(&keys), tenant.clone());
@@ -150,14 +179,20 @@ Runtime::builder(store).memory(Arc::new(memories)).keyring(keys).build()
 
 ### Erasing on more than one instance
 
-Destroying a subject's wrapping key is not one operation. It reads the subject's
-items, checks every legal hold, tombstones, and then asks a KMS to destroy the
-scope — and **between the hold check and the destroy**, a write on another
+Erasing a subject is not one operation. It reads the subject's items, checks
+every legal hold, asks a KMS to destroy each item's scope, and only then removes
+the rows — and **between the hold check and the destroy**, a write on another
 instance can add an item, or an operator can place a hold on one. Either makes
-the erasure wrong in a way nothing detects: the new item is sealed under a scope
-that is about to stop existing, and the held item is destroyed anyway.
+the erasure wrong in a way nothing detects: the new item outlives an erasure
+that reported the subject gone, and the held item is destroyed anyway.
 
-`EncryptedMemoryStore` closed that window with a process-local mutex, which is
+A held item refuses the whole erasure with `StoreError::UnderLegalHold` before
+any key is touched. A failure to remove the rows *after* the keys are gone is
+not reported as success: `erase_subject` returns an `Erasure` whose
+`cleanup_failed` names it — the erasure happened, no copy opens, and retrying
+the call removes the rows. `SealedEvents::erase_event` answers the same way.
+
+`EncryptedMemoryStore` closes that window with a process-local mutex, which is
 correct on a single writer and silently nothing on an active-active plane. The
 lock is a seam, and the default is honest about being local:
 
@@ -252,12 +287,28 @@ no case to erase it with. So the event is its own unit, scoped by the
 granularity a request about one message could ask for:
 
 ```rust
-keys.destroy(&scope(&tenant, "event/bank.example/MSG-7"), at, reason).await?;
+keys.destroy(&event_scope(&tenant, "bank.example", "MSG-7"), at, reason).await?;
 ```
+
+`event_scope` puts the length of `source` in front of the pair. A source is a
+URI and contains `/`, so a plain `source/id` join would give `("bus/x", "1")`
+and `("bus", "x/1")` one key, and erasing either would destroy both.
 
 Its *delivered* copy is a separate matter and already covered: claiming an
 event journals the payload under the awaiting effect, sealed under that run's
 case like every other journal payload.
+
+**An erased message is never delivered.** Erasing a buffered event nobody has
+claimed moves it to the dead-letter list with the reason `erased`, in the same
+write that removes its payload, so no waiter claims the emptied row as the
+counterparty's word. A message a run had **claimed but not yet journaled** —
+a delivery that crashed between its claim and its resume — is treated the same
+way: dead-lettered as `erased`, its claim released, and the wait it was parked
+with unparked. The wait stays open, bounded by its deadline, and the next
+matching message is delivered to it; the run is never handed an empty payload
+as a value, and no failure is recorded on its behalf. Every erased row is
+marked erased and no claim returns one. A sealed buffer checks the same on the
+way out: a claimed message whose key was destroyed is not handed to the run.
 
 **The composed claim is tested, not merely asserted.** *One erasure reaches
 every copy* is a sentence about three mechanisms sharing one scope, and
@@ -297,17 +348,16 @@ let report = plane.retain(cutoff, now, "retention: 7 years from opening").await?
 ```
 
 ```sh
-agentplane retain --store ./journal.redb \
-  --older-than-days 2555 --reason "retention: 7 years from opening" --dry-run
+agentplane retention plan --store ./journal.redb --older-than-days 2555
 ```
 
-The verb **lists**; it does not erase. The shipped binary wires no blob store
+The verb **plans**; it does not erase. The shipped binary wires no blob store
 and no key ring — a redb file is a journal and a case layer — so nothing in it
 can make a byte unreadable, and a verb that walked the cases and printed
 `erased: 0` beside a clean exit code would be a control that reads as having
 run. It answers the half it can, through the same selection rule the pass uses
 (`retention::plan`, so a listing and an erasure cannot disagree about which
-cases), and refuses to run without `--dry-run`. The pass itself is
+cases). The pass itself is
 `Runtime::retain`, from a plane built with the stores that can act.
 
 **A pass erases closed cases only, and the window is measured from `opened_at`.** A
@@ -319,8 +369,8 @@ states rather than works around.
 
 `--older-than-days` has **no default**, for the reason `forget-admissions` has
 none: a retention period is a legal and business decision, and a crate that
-picked one would be choosing somebody else's. `--reason` is required and lands
-on every tombstone and key destruction, so a later read says *expired, on this
+picked one would be choosing somebody else's. The pass's `reason` lands on
+every tombstone and key destruction, so a later read says *expired, on this
 date, for this reason* rather than *missing* — which is the distinction the
 recovery drill's verdict is built on.
 
@@ -338,7 +388,7 @@ agentplane hold --store ./journal.redb \
 
 # Everything standing, for somebody who does not know which case to ask about.
 # Each row carries who placed it and whether a credential or a terminal said so.
-agentplane hold --store ./journal.redb
+agentplane hold list --store ./journal.redb
 
 # Release it. The next pass erases the matter normally.
 agentplane hold --store ./journal.redb --case case_01JD... --lift
@@ -351,12 +401,13 @@ cases
     .await?;
 ```
 
-Run it: `cargo run --example retention_hold --features redb,testkit`
+Run it: `cargo run --example retention_hold --features redb`
 
 **Nothing is half-done.** The hold is read before the first tombstone and before
 any key is destroyed, so a refused erasure leaves no expired blobs and no missing
-key. Over HTTP it is `GET`/`POST /holds` and `POST /holds/release`, under three
-capabilities — `api:hold.place` and `api:hold.release` are separate, so whoever
+key. Over HTTP it is `GET`/`POST /holds` and `POST /holds/release`, under
+`api:hold.list`, `api:hold.place` and `api:hold.release` — placing and releasing
+are separate, so whoever
 may authorise destruction is a grant you hand out separately from whoever may
 prevent it.
 
@@ -371,7 +422,9 @@ stops both: `retention::retain` (closed cases past a window) and
 `MemoryStore::sweep_expired` (memories past their effective expiry). Nothing else
 scheduled destroys anything — `forget_admissions` retires index rows and alters no
 history, `sweep_unclaimed` moves an event to the dead-letter listing with its
-payload, and journal records are append-only. The deliberate verbs —
+payload, and journal records are append-only. A hold travels with its case
+through `agentplane export` and restore — instant, reason and operator — so the
+first retention pass on a recovered plane finds it. The deliberate verbs —
 `erase_case`, `forget`, `forget_subject` — all consult a hold; `erase_run` does
 not, because its unit is a run bound to no matter.
 
@@ -384,8 +437,9 @@ issued the order.
 **What it does not cover.** A hold is placed on a *case*, the unit a preservation
 order names. Bind a run to a case if it must be preserved — that is also what
 gives it an obligation trail. Memory items carry their own finer hold
-(`MemoryStore::set_legal_hold`, listable with `legal_holds`), because the memory
-erasure unit is a subject rather than a matter.
+(`MemoryStore::set_legal_hold`, listable with `legal_holds`), because memory is
+erased by item and by subject rather than by matter; an erasure it stops answers
+`StoreError::UnderLegalHold` naming the item.
 
 ### An expired address stays expired {#an-expired-address-stays-expired}
 
@@ -427,7 +481,11 @@ Every pass returns a coverage list beside its count, for the same reason
   "not_erasable": [
     "no key ring is wired: blob tombstones cover the live store only, and journal payloads — run input, prompts, tool arguments, effect outputs — stay verbatim and permanent…",
     "journal records are append-only: the chain, the routing fields and the fact each run happened remain — by design…",
-    "a run that belongs to no case is not reached by a case walk; erase one with `blob::erase_run`"
+    "a run that belongs to no case is not reached by a case walk; erase one with `blob::erase_run`",
+    "governed memory is erased by item and by subject, never by case — including memory a declaration keyed to `$case` or `$correlation/<namespace>`…",
+    "an inbound event is its own erasure unit: the event buffer's copy, and every backup of it, is erased by `SealedEvents::erase_event`…",
+    "media fetched under a named external retention policy belongs to that policy's unit, not the case…",
+    "semantic-index vectors are derived from memory content and live in the retriever's index; nothing here removes them…"
   ]
 }
 ```
@@ -650,7 +708,7 @@ Each payload gets its **own** data key, wrapped under the scope's key and stored
 *inside the envelope* alongside the ciphertext:
 
 ```text
-[u32 len][wrapped data key][24-byte nonce][ciphertext ‖ tag]
+[u8 version][u32 len][wrapped data key][24-byte nonce][ciphertext ‖ tag]
 ```
 
 That shape is not a convenience — it is what a key-management service actually
@@ -672,15 +730,23 @@ API — four calls, no SDK — so the wrapping key is created inside Vault and n
 leaves it, and erasure becomes something this crate asks for and cannot undo.
 A single key-ring conformance battery is run against both the in-process ring
 and a real Vault, because the two fail in different places: one cannot get a
-status code wrong, the other cannot get a `HashMap` wrong. That is not a
-formality — running it against Vault found three defects, all the same root
-cause: **Vault reports a destroyed key as a 400 with a message, not a 404**, so
-a completed erasure was arriving as an ordinary refusal and a caller could not
-tell it from a permission problem.
+status code wrong, the other cannot get a `HashMap` wrong. **Vault reports a
+destroyed key as a 400 with a message, not a 404**, and only the Vault run can
+hold the ring to reading that as a completed erasure rather than as a refusal
+indistinguishable from a permission problem.
 
 One operational detail matters enough to state: **a transit key cannot be deleted
 unless it was configured to allow it**, so an erasure against a default key fails
 loudly here rather than reporting a success that did not happen.
+
+**A scope is never a Vault path.** Scopes carry `/`, and an event scope carries a
+counterparty's own `source` and `id` — `?`, `#`, `..` included — so written raw
+into a URL they would truncate two messages onto one key or walk the plane's
+token to another path. Each scope maps to the transit key
+`ap-<hex SHA-256 of the scope>`; `VaultTransit::key_name(scope)` names it for
+whoever sets `deletion_allowed` on it. The battery runs against scopes shaped
+like the ones the plane writes, and checks that erasing one leaves its sibling
+readable.
 
 `MemoryKeyRing` lives in `testkit` and is unreachable without it: it holds the
 wrapping keys beside the data they protect, so the feature gate is the guarantee
@@ -744,8 +810,9 @@ destroy another matter's copy of the same bytes.
 **The plane and its stores must agree, and `try_build` checks.** The tenant
 scopes the plane's data keys; each store handle is scoped separately, so the two
 are set in different places and can differ. When a key ring is wired that
-difference is invisible: `build()` seals case, event, task, memory and outbox
-state under the *plane's* tenant while the store writes its rows under its own,
+difference is invisible: `build()` seals case, event, task and outbox state
+under the *plane's* tenant, and an `EncryptedMemoryStore` seals memory under the
+tenant it was constructed with, while each store writes its rows under its own —
 both scopes are real, every run works — and an erasure destroys exactly the key
 it was asked for without reaching the rows, then reports success. That is the
 one failure a deletion guarantee may not have, so it is a startup refusal:
@@ -781,7 +848,8 @@ tenant naming another is precisely the case where they disagree.
 
 **Quotas** are per tenant too, and durable for the same reason the keys are: an
 in-process ceiling vanishes the moment a second instance starts, and it fails
-*open*. Concurrent runs and spend per billing period are both bounded, refused at
-admission, and never consulted on replay — a ceiling crossed since a run happened
+*open*. Concurrent runs and spend per billing period are both bounded — a run's
+worst-case spend is reserved when it is admitted — refused at admission, and
+never consulted on replay — a ceiling crossed since a run happened
 must not turn its history into a refusal. See
 [operations](@/docs/operations.md).

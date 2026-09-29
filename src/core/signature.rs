@@ -59,9 +59,10 @@ use crate::core::Digest;
 /// and the second is what an audit is asking for.
 pub type KeyId = String;
 
-/// A signature over a record's chain hash.
+/// A signature, and the key that made it — over a record's chain hash, a
+/// manifest or a provenance block, each under its own domain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Attestation {
+pub struct KeySignature {
     /// Which key. Not which *algorithm* — that is the verifier's business, and a
     /// self-described algorithm is a downgrade attack waiting to be written.
     pub key_id: KeyId,
@@ -96,9 +97,9 @@ pub trait Signer: Send + Sync + Debug {
     /// Sign a record's chain hash.
     fn sign(&self, hash: &Digest) -> Vec<u8>;
 
-    /// Attach an attestation to a hash.
-    fn attest(&self, hash: &Digest) -> Attestation {
-        Attestation {
+    /// Attach a signature to a hash.
+    fn signature_over(&self, hash: &Digest) -> KeySignature {
+        KeySignature {
             key_id: self.key_id(),
             signature: self.sign(hash),
         }
@@ -118,16 +119,12 @@ pub trait Signer: Send + Sync + Debug {
 /// a prefix of another with the boundary landing inside the payload — the same
 /// reason canonical encodings length-prefix their fields.
 ///
-/// **Universal for every signature this crate defines**, which it was not when
-/// it was written: manifests used it and record attestations and provenance
-/// seals signed their digest directly. The caveat recorded here at the time said
-/// the argument for leaving them — that confusing two would need a preimage —
-/// "stops holding when somebody adds a surface where the signer's input is more
-/// attacker-shaped". Provenance sealing was then added and is exactly that
-/// surface: its payload carries a caller-chosen `target` and an arguments
-/// digest, and the sealed block travels to third-party tool servers and peers.
-///
-/// So the three are separated rather than argued about.
+/// **Universal for every signature this crate defines.** "Confusing two would
+/// need a preimage" does not hold where the signer's input is attacker-shaped,
+/// and provenance sealing is exactly that surface: its payload carries a
+/// caller-chosen `target` and an arguments digest, and the sealed block
+/// travels to third-party tool servers and peers. So the three are separated
+/// rather than argued about.
 ///
 /// The **one** signature deliberately not routed through here is the checkpoint
 /// cosignature. Its input is a C2SP `signed-note` body, which is an
@@ -148,11 +145,11 @@ pub fn signing_hash(domain: &str, payload: &Digest) -> Digest {
 /// The domain a manifest signature is made under.
 pub const DOMAIN_MANIFEST: &str = "io.github.hupe1980.agentplane/manifest/v1";
 
-/// The domain a journal record's attestation is made under.
+/// The domain a journal record's signature is made under.
 ///
 /// Answers *this key appended this record to this chain*. Distinct from
 /// [`DOMAIN_PROVENANCE`] because the two are signed by the **same** workload key
-/// on the same plane, and an attestation lifted from one to the other would say
+/// on the same plane, and a signature lifted from one to the other would say
 /// something nobody attested to.
 pub const DOMAIN_RECORD: &str = "io.github.hupe1980.agentplane/record/v1";
 
@@ -249,9 +246,9 @@ pub trait Verifier: Send + Sync + Debug {
     fn verify(&self, key_id: &str, hash: &Digest, signature: &[u8]) -> bool;
 }
 
-/// Why a chain's attestations were not acceptable.
+/// Why a chain's signatures were not acceptable.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum AttestError {
+pub enum SignatureError {
     /// A record carries no signature and one was required.
     ///
     /// Distinct from a bad signature on purpose: the two call for opposite

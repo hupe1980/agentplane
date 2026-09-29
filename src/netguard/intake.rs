@@ -90,7 +90,11 @@ impl std::fmt::Display for IntakeError {
                 f,
                 "the answer grew past {limit} bytes, which is the most this plane reads"
             ),
-            Self::Transport(e) => write!(f, "the answer could not be read: {e}"),
+            Self::Transport(e) => write!(
+                f,
+                "the answer could not be read: {}",
+                super::transport_text(e)
+            ),
         }
     }
 }

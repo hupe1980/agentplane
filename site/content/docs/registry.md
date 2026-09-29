@@ -42,8 +42,14 @@ spec:
     max_tokens: 120000
     max_minor_units: 250
   models:
-    privileged:  { provider: anthropic, model: claude-sonnet-5 }
-    quarantined: { provider: anthropic, model: claude-haiku-4-5-20251001 }
+    privileged:
+      provider: anthropic
+      model: claude-sonnet-5
+      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+    quarantined:
+      provider: anthropic
+      model: claude-haiku-4-5-20251001
+      pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125 }
   output:
     schema:
       type: object
@@ -144,9 +150,11 @@ Four refusals:
   own moment to ask, so there is nothing here for the runtime to apply. Allowing
   it would let a file claim a human is in the loop when no human ever is — the
   precise decoration the binding rule exists to prevent.
-* **`on_expiry: proceed` needs `allow_unattended: true`.** The runtime already
-  demands that; the file demands it too, so the decision is greppable in the
-  document a reviewer reads rather than only in code they do not.
+* **`on_expiry: proceed` needs `allow_unattended: true`.** In Rust the same
+  consent is the one spelling `Expiry::ProceedUnattended`; the file demands it
+  as a second field, so the decision is greppable in the document a reviewer
+  reads rather than only in code they do not. Both are the author's: there is
+  no deployment switch that grants or withholds unattended proceed.
 * **`on_expiry: escalate` needs `escalate_to`, and bounded audiences.** Widening
   the audience is escalation's one enforceable meaning — the declared roles join
   the reviewers, the stale claim is cleared — so the declaration must say who is
@@ -158,8 +166,7 @@ Four refusals:
 **What you will not find is a condition.** "Require approval when severity is
 high" is a predicate, and a predicate is one step from an `if` — the point where
 config stops being config. An agent whose oversight depends on what it found is a
-skill, written in a language built for decisions. This is the field flagged in
-advance as most likely to break that line.
+skill, written in a language built for decisions.
 
 ### What a manifest is worth: it binds
 
@@ -195,9 +202,7 @@ something the agent was built to do; a manifest refusal is the agent doing
 something its own reviewed declaration never mentioned, which is a defect in the
 code rather than a tightening of the rules.
 
-There are no review-only security fields, and no architectural injection-pattern
-label: arbitrary native skill code cannot be proven to follow one, and such a
-label would manufacture confidence. `spec.output.schema` is carried to the
+There are no review-only security fields. `spec.output.schema` is carried to the
 provider, into the effect key, and is checked against the value that comes back
 — a parseable but non-conforming answer is a metered unusable result, not data
 that reaches downstream code.
@@ -284,9 +289,8 @@ whose outputs changed. `spec.models` puts the provider and model in the digest.
 
 The role names remain part of the allowlist and digest: a hand-written skill can
 route untrusted material to a separately declared quarantined model. The
-manifest does not claim that this architecture occurred. That would require
-proving the conduct of arbitrary native code, so there is no `security.pattern`
-label rather than a review-only one.
+manifest does not claim that this architecture occurred — see
+[below](#what-a-manifest-does-and-does-not-do).
 
 `models: {}` declares **no inference at all** — a rules-only agent is a
 legitimate design, and saying so out loud distinguishes it from one whose model
@@ -409,12 +413,12 @@ call should be the one you can see at the call site.
 
 `publish_signed` supplies the half a digest cannot: *who* approved the artifact.
 The signature covers a domain-separated manifest hash, so it cannot be replayed
-as a journal-record attestation. An identical unsigned artifact may adopt its
-first attestation later without changing its digest; once publisher evidence
+as a journal-record signature. An identical unsigned artifact may adopt its
+first signature later without changing its digest; once publisher evidence
 exists, another signer is refused rather than silently replacing it. Supporting
-several publishers requires an explicit attestation set and is not built.
+several publishers requires an explicit signature set and is not built.
 
-`MemoryRegistry` is process-local. The trait leaves room for a durable or remote
-registry, but none ships today. Key creation, rotation, revocation, and the
-decision to trust the identity returned by `resolve_verified` remain deployment
-responsibilities.
+`RedbStore` and `PostgresStore` implement the registry durably, and `names` and
+`versions` enumerate what is published; `MemoryRegistry` is process-local, for
+tests. Key creation, rotation, revocation, and the decision to trust the
+identity returned by `resolve_verified` remain deployment responsibilities.

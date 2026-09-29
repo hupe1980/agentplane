@@ -22,10 +22,16 @@ pipeline is right and you find out late; the justfile exists so they cannot, and
 a guard in `tests/guards/docs.rs` holds every recipe the workflows invoke to
 either `just ci` or a named exemption.
 
-**Two exemptions, both because they need a daemon**: `just test-postgres` and
-`just test-vault` want a container, so they stay their own CI jobs rather than
-making the local gate depend on Docker. Run them before touching a store
-backend or the key ring.
+Features are specified with [GitHub Spec Kit](https://github.com/github/spec-kit)
+before they are built. Those working files are not published; every behaviour
+they ask for is a test, and the tests are what `just ci` runs.
+
+**What `just ci` leaves out.** `just mutants` and `just specs` are slow and run
+as their own CI jobs. `just test-postgres` needs a PostgreSQL container and runs
+as its own CI job, so the local gate does not depend on Docker. `just test-vault`
+needs a Vault container and is not run by CI at all. Run `test-postgres` before
+touching a store backend and `test-vault` before touching the key ring. The full
+exemption list, each with its reason, is `OWN_JOB` in `tests/guards/docs.rs`.
 
 **What to run when:**
 
@@ -35,32 +41,28 @@ backend or the key ring.
 | `just test` | seconds | while working |
 | `just audit` | seconds | before pushing; part of `just ci` |
 | `just ci` | ~5 minutes | before pushing |
-| `just mutants` | ~1.5 hours, or a tenth of that per shard | before a release, or after touching a guarantee |
+| `just mutants` | ~1.5 hours, or a slice of that per shard | before a release, or after touching a guarantee |
 | `just specs` | ~2 minutes | after changing anything [`tla/README.md`](tla/README.md) names a spec for |
 | `just test-live` | seconds, and real money | after touching a model driver or a schema this crate sends |
 
 `just audit` needs `cargo-audit` (`cargo install cargo-audit`, or
 `brew install cargo-audit`). It is in `just ci` rather than the release gate
-because an advisory published this morning is a fact about today's tree — and
-because this crate's assurance layers all govern code we wrote, while the
-finding that prompted the check was in code we merely linked: the AWS SDK's
-default TLS feature pinned a `rustls-webpki` with three advisories against
-certificate validation.
+because an advisory published this morning is a fact about today's tree, and
+because every other assurance layer here governs code this crate wrote rather
+than code it links.
 
 `just site-check` needs [zola](https://www.getzola.org) (`brew install zola`),
 pinned in CI to the version the docs site deploys with — a heading's generated
 id is that version's slugification rule, so two versions would be two rules. It
-refuses a broken internal link or anchor and deliberately skips external ones:
-an anchor is a property of this repository, an external link is a property of
-somebody else's server, and a gate that checks the second makes a green build
-depend on the internet.
+runs `zola check`, which refuses a broken internal link or anchor and also
+checks external links — so it needs network access, and an unreachable
+external site fails it.
 
 `just mutants` is deliberately **not** an inner-loop check — it rebuilds the
-library once per mutation. `MUTANTS_SHARD=k/10` runs one slice, which is how CI
+library once per mutation. `MUTANTS_SHARD=k/n` runs one slice, which is how CI
 splits it; the slices are ordered so each stays inside one or two feature sets,
-because cargo keeps a separate build per feature combination and this table has
-thirteen of them. `just anchors` is the one that belongs in your muscle
-memory, and it catches the silent half: a refactor that moves the code a mutation
+because cargo keeps a separate build per feature combination the table uses.
+`just anchors` is the one that belongs in your muscle memory, and it catches the silent half: a refactor that moves the code a mutation
 is anchored to leaves that guarantee unverified while still looking verified.
 
 ## 🧪 What a change is expected to come with
@@ -109,8 +111,7 @@ python3 tools/mutants.py --affected HEAD~1   # or since a commit
 
 It lists rather than judges — a parameter count parsed out of Rust by regex
 would be a check that answers wrongly — so `--verify` what it names. It reads
-signature *spans*, not `fn` lines: the parameter that broke this twice was added
-on a line of its own.
+signature *spans*, not `fn` lines, so a parameter on a line of its own is seen.
 
 `just anchors` runs the cheap half of that constantly: a text-only pass proving
 every mutation's anchor still appears exactly once in the code it names — the
@@ -122,8 +123,8 @@ worse than one that declines.
 
 **The first example must still build.** `just doc-examples` assembles the
 getting-started skill and wiring into a fresh crate and runs it, because
-`cargo test --doc` only covers rustdoc inside `src/` — the markdown a newcomer
-actually copies was unverified until this existed. It is part of `just ci`, so
+`cargo test --doc` only covers rustdoc inside `src/`, not the markdown a
+newcomer actually copies. It is part of `just ci`, so
 renaming a public item breaks it immediately rather than at somebody's first
 five minutes with the crate.
 
@@ -142,9 +143,9 @@ can ask, which makes writing it beside the change the only control there is.
 ## 🚫 Things that will be pushed back on
 
 **Reading the clock, RNG, or generating an id directly.** These are denied
-crate-wide by `clippy.toml`. There are three legitimate escapes, each carrying an
-explicit `#[allow]` and a comment naming the journal record that captures the
-value. A fourth needs to argue for itself — including for instrumentation, which
+crate-wide by `clippy.toml`. The runtime has three legitimate escapes, each
+carrying an explicit `#[allow]` and a comment naming what captures the value,
+and a guard counts them. A fourth needs to argue for itself — including for instrumentation, which
 is the most plausible-sounding reason to want one and would make a replayed run
 re-measure calls it never made.
 
@@ -153,7 +154,7 @@ the egress ceiling *and* the replan refusal at once, silently. There is a guard
 that counts them and fails the build when the count changes.
 
 **An assertion that accepts two outcomes.** `assert!(matches!(x, A(_)) || x.is_b())`
-passed for a year here while hiding two separate bugs. `||` between "right" and
+passes while either half hides a bug. `||` between "right" and
 "also acceptable", `all()` over a possibly-empty slice, and `is_ok()` without
 checking the value are three ways to write a test that cannot fail.
 
@@ -178,7 +179,7 @@ generated rather than committed by hand:
 - `site/public/` — the build output.
 
 Diagrams are **hand-authored inline SVG**, not a diagram-as-code toolchain.
-Three diagrams do not justify a Node build step, and inline SVG inherits the
+A few diagrams do not justify a Node build step, and inline SVG inherits the
 page's colours through `currentColor`, so it themes for free and costs nothing
 at runtime. Every one needs `<title>` and `<desc>` — a diagram a screen reader
 cannot read is decoration.
@@ -206,7 +207,7 @@ mechanism does not do what the docs say. Include what you expected, from which
 document, and what happened. If a mutation survives that shouldn't, say which.
 
 **A security issue** should not go in a public issue. The threat model, including
-what is deliberately *not* covered, is in [security](site/content/docs/security.md#%EF%B8%8F-what-is-not-covered)
+what is deliberately *not* covered, is in [security](site/content/docs/security.md#what-is-not-covered)
 — please check there first, since several gaps are known and recorded rather than
 undiscovered.
 

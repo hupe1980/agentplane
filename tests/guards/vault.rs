@@ -41,6 +41,25 @@ async fn the_memory_key_ring_satisfies_the_key_ring_contract() {
     let ring = MemoryKeyRing::new();
     let report = conformance_keyring::check(&ring, "conformance-scope").await;
     report.assert_conforms("MemoryKeyRing");
+    let (scope, doomed, sibling) = realistic_scopes();
+    conformance_keyring::check(&ring, &scope)
+        .await
+        .assert_conforms("MemoryKeyRing, a tenant-qualified scope");
+    conformance_keyring::check_isolated(&ring, &doomed, &sibling)
+        .await
+        .assert_conforms("MemoryKeyRing, sibling event scopes");
+}
+
+/// Scopes shaped like the ones the crate writes: a tenant-qualified case
+/// scope, and two event scopes whose counterparty-chosen `source` carries `?`,
+/// `#` and `..`, identical up to the `?`.
+fn realistic_scopes() -> (String, String, String) {
+    let tenant = agentplane::core::TenantId::new("acme").expect("tenant");
+    (
+        agentplane::keyring::scope(&tenant, "case_01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        agentplane::keyring::event_scope(&tenant, "bus/orders?x#y/../..", "1"),
+        agentplane::keyring::event_scope(&tenant, "bus/orders?x#y/../..", "2"),
+    )
 }
 
 /// The published port, retried.
@@ -109,13 +128,27 @@ async fn vault_transit_satisfies_the_key_ring_contract() {
     // this has a key ring that mints, opens and rotates perfectly and cannot
     // erase anything — which is the failure worth reproducing here rather than
     // discovering during an Article 17 request.
-    for (path, body) in [
-        (format!("keys/{scope}"), serde_json::json!({})),
-        (
-            format!("keys/{scope}/config"),
-            serde_json::json!({ "deletion_allowed": true }),
-        ),
-    ] {
+    let (realistic, doomed, sibling) = realistic_scopes();
+    let provisioned = [
+        scope.to_owned(),
+        realistic.clone(),
+        doomed.clone(),
+        sibling.clone(),
+    ];
+    let keys: Vec<(String, serde_json::Value)> = provisioned
+        .iter()
+        .map(|s| VaultTransit::key_name(s))
+        .flat_map(|name| {
+            [
+                (format!("keys/{name}"), serde_json::json!({})),
+                (
+                    format!("keys/{name}/config"),
+                    serde_json::json!({ "deletion_allowed": true }),
+                ),
+            ]
+        })
+        .collect();
+    for (path, body) in keys {
         let response = http
             .post(format!("{address}/v1/transit/{path}"))
             .header("X-Vault-Token", ROOT_TOKEN)
@@ -136,6 +169,12 @@ async fn vault_transit_satisfies_the_key_ring_contract() {
 
     let report = conformance_keyring::check(ring.as_ref(), scope).await;
     report.assert_conforms("VaultTransit");
+    conformance_keyring::check(ring.as_ref(), &realistic)
+        .await
+        .assert_conforms("VaultTransit, a tenant-qualified scope");
+    conformance_keyring::check_isolated(ring.as_ref(), &doomed, &sibling)
+        .await
+        .assert_conforms("VaultTransit, sibling event scopes");
 }
 
 /// Erasure against a key that never allowed deletion fails, and says why.
@@ -172,12 +211,15 @@ async fn erasing_a_key_that_forbids_deletion_is_refused_not_retried() {
 
     // Created, but never told deletion is allowed.
     let scope = "undeletable-scope";
-    http.post(format!("{address}/v1/transit/keys/{scope}"))
-        .header("X-Vault-Token", ROOT_TOKEN)
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .expect("create the key");
+    http.post(format!(
+        "{address}/v1/transit/keys/{}",
+        VaultTransit::key_name(scope)
+    ))
+    .header("X-Vault-Token", ROOT_TOKEN)
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .expect("create the key");
 
     let ring = VaultTransit::new(&address, "transit", ROOT_TOKEN).expect("build");
     let at = agentplane::core::Timestamp::from_unix_timestamp(1_760_000_000).expect("instant");

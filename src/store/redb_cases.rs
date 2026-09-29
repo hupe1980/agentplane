@@ -91,10 +91,11 @@ const DEADLINES: TableDefinition<(&str, &str, &str), DeadlineRow<'static>> =
 
 /// `(trigger_at, case_id, name) -> resolved_at`, pending and warned only.
 ///
-/// Keyed by `min(resolved_at, warn_at)` — the moment the obligation first needs
-/// looking at. Keying on `resolved_at` alone would hide a deadline whose warning
-/// has passed but whose due date has not, which is exactly the one a warning
-/// exists to surface early.
+/// Keyed by when the obligation next needs looking at — see [`trigger_at`]:
+/// `min(resolved_at, warn_at)` while pending, `resolved_at` once warned.
+/// Keying a pending obligation on `resolved_at` alone would hide a deadline
+/// whose warning has passed but whose due date has not, which is exactly the
+/// one a warning exists to surface early.
 const DEADLINES_DUE: TableDefinition<(&str, i64, &str, &str), i64> =
     TableDefinition::new("case_deadlines_due");
 
@@ -108,6 +109,12 @@ const DEADLINES_DUE: TableDefinition<(&str, i64, &str, &str), i64> =
 /// cannot disagree.
 const DEADLINES_UNACCOUNTED: TableDefinition<(&str, i64, &str, &str), ()> =
     TableDefinition::new("case_deadlines_unaccounted");
+
+/// `(tenant, case_id, name) -> ()`, breaches applied whose account the sweep
+/// has not yet written. Set by `breach_deadline` in its transaction, cleared by
+/// `mark_breach_noted`.
+const DEADLINES_UNNOTED: TableDefinition<(&str, &str, &str), ()> =
+    TableDefinition::new("case_deadlines_unnoted");
 
 /// `(opened_at, case_id) -> ()`, cases that are not closed.
 ///
@@ -171,6 +178,105 @@ fn is_outstanding(state: &str) -> bool {
 /// [`is_outstanding`], which is the half that fails closed.
 fn unaccounted(state: &str, has_ack: u8) -> bool {
     DeadlineState::parse(state).is_some_and(|s| s.is_unaccounted(has_ack != 0))
+}
+
+/// One obligation's row, owned: `(resolved, digest, warn, has_warn, state,
+/// has_ack, ack_at, by, note)`.
+type OwnedDeadline = (i64, Vec<u8>, i64, u8, String, u8, i64, String, String);
+
+fn deadline_row(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    key: &str,
+    name: &str,
+) -> Result<Option<OwnedDeadline>, StoreError> {
+    let d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
+    let row = d.get((tenant, key, name)).map_err(|e| be(&e))?.map(|v| {
+        let (res, dig, warn, has, st, has_ack, at, by, note) = v.value();
+        (
+            res,
+            dig.to_vec(),
+            warn,
+            has,
+            st.to_owned(),
+            has_ack,
+            at,
+            by.to_owned(),
+            note.to_owned(),
+        )
+    });
+    Ok(row)
+}
+
+/// Move one obligation to `state` and keep both indexes in step, in the
+/// caller's transaction.
+fn move_deadline(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    key: &str,
+    name: &str,
+    row: &OwnedDeadline,
+    state: DeadlineState,
+) -> Result<(), StoreError> {
+    let (resolved, digest, warn, has_warn, was, has_ack, ack_at, by, note) = row;
+    let to = state.as_str();
+
+    // How an obligation ended is not editable. `cx.meet_deadline` reaches this
+    // from a skill, so without the check a run that answered late would take
+    // the miss off the operator's listing and out of the row at once.
+    let from = deadline_state_from(was)?;
+    if !from.may_become(state) {
+        return Err(StoreError::DeadlineFinal {
+            case: key.to_owned(),
+            obligation: name.to_owned(),
+            from: was.clone(),
+            to: to.to_owned(),
+        });
+    }
+    w.open_table(DEADLINES)
+        .map_err(|e| be(&e))?
+        .insert(
+            (tenant, key, name),
+            (
+                *resolved,
+                digest.as_slice(),
+                *warn,
+                *has_warn,
+                to,
+                *has_ack,
+                *ack_at,
+                by.as_str(),
+                note.as_str(),
+            ),
+        )
+        .map_err(|e| be(&e))?;
+
+    // The sweep index tracks outstanding obligations only, keyed by when each
+    // next needs attention, and it is updated in the same transaction as the
+    // state it reflects.
+    let warn_opt = (*has_warn == 1).then_some(*warn);
+    let before = trigger_at(was, *resolved, warn_opt);
+    let after = trigger_at(to, *resolved, warn_opt);
+    let mut due = w.open_table(DEADLINES_DUE).map_err(|e| be(&e))?;
+    let (listed, lists) = (is_outstanding(was), is_outstanding(to));
+    if listed && (!lists || before != after) {
+        due.remove((tenant, before, key, name))
+            .map_err(|e| be(&e))?;
+    }
+    if lists && (!listed || before != after) {
+        due.insert((tenant, after, key, name), *resolved)
+            .map_err(|e| be(&e))?;
+    }
+    drop(due);
+    reindex_unaccounted(
+        w,
+        tenant,
+        key,
+        name,
+        *resolved,
+        unaccounted(was, *has_ack),
+        unaccounted(to, *has_ack),
+    )
 }
 
 /// Keep [`DEADLINES_UNACCOUNTED`] in step with one obligation's row, inside the
@@ -248,14 +354,26 @@ fn reclaim_correlation(
 /// One encoder so the four writers of a deadline row cannot spell absence four
 /// ways — `has_ack` is what says whether the rest mean anything, exactly as
 /// `has_warn` does for `warn_at`.
-fn ack_columns(note: Option<&BreachNote>) -> (u8, i64, &str, &str) {
-    note.map_or((0, 0, "", ""), |n| {
-        (1, ts(n.at), n.by.as_str(), n.note.as_str())
+/// The `by` column holds the whole operator — actor and basis — as JSON, so an
+/// account of a breach carries what established the name as every other
+/// operator act does.
+fn ack_columns(note: Option<&BreachNote>) -> Result<(u8, i64, String, &str), StoreError> {
+    note.map_or(Ok((0, 0, String::new(), "")), |n| {
+        let by = serde_json::to_string(&n.by).map_err(|e| StoreError::Backend(e.to_string()))?;
+        Ok((1, ts(n.at), by, n.note.as_str()))
     })
 }
 
-/// When an obligation first needs attention.
-fn trigger_at(resolved_at: i64, warn_at: Option<i64>) -> i64 {
+/// When an obligation next needs attention: the earlier of its warning and its
+/// due instant while pending, and its due instant once it has warned.
+///
+/// A warned obligation keyed at its warning instant stays at the head of the
+/// sweep's ascending scan until it comes due, and a page of those hides a
+/// pending obligation that is already overdue behind them.
+fn trigger_at(state: &str, resolved_at: i64, warn_at: Option<i64>) -> i64 {
+    if state == DeadlineState::Warned.as_str() {
+        return resolved_at;
+    }
     warn_at.map_or(resolved_at, |w| w.min(resolved_at))
 }
 
@@ -285,7 +403,10 @@ fn build_deadline(case: &str, name: &str, row: DeadlineRow<'_>) -> Result<Deadli
         state: deadline_state_from(state)?,
         acknowledged: if has_ack == 1 {
             Some(BreachNote {
-                by: by.to_owned(),
+                by: serde_json::from_str(by).map_err(|e| StoreError::Corrupt {
+                    seq: 0,
+                    detail: format!("a breach account this build cannot attribute: {e}"),
+                })?,
                 note: note.to_owned(),
                 at: from_ts(ack_at)?,
             })
@@ -305,6 +426,7 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(CORR_OPEN).map_err(|e| be(&e))?;
     w.open_table(CORR_ALL).map_err(|e| be(&e))?;
     w.open_table(DEADLINES_UNACCOUNTED).map_err(|e| be(&e))?;
+    w.open_table(DEADLINES_UNNOTED).map_err(|e| be(&e))?;
     w.open_table(CASE_RUNS).map_err(|e| be(&e))?;
     w.open_table(CASE_BLOBS).map_err(|e| be(&e))?;
     w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
@@ -668,7 +790,7 @@ impl CaseStore for RedbStore {
                     let warn = deadline.warn_at.map(ts);
                     let digest = deadline.calendar_digest.as_bytes().to_vec();
                     let state = deadline.state.as_str();
-                    let (has_ack, ack_at, by, note) = ack_columns(deadline.acknowledged.as_ref());
+                    let (has_ack, ack_at, by, note) = ack_columns(deadline.acknowledged.as_ref())?;
                     d.insert(
                         (tenant.as_str(), key.as_str(), deadline.name.as_str()),
                         (
@@ -679,7 +801,7 @@ impl CaseStore for RedbStore {
                             state,
                             has_ack,
                             ack_at,
-                            by,
+                            by.as_str(),
                             note,
                         ),
                     )
@@ -688,7 +810,7 @@ impl CaseStore for RedbStore {
                         due.insert(
                             (
                                 tenant.as_str(),
-                                trigger_at(resolved, warn),
+                                trigger_at(state, resolved, warn),
                                 key.as_str(),
                                 deadline.name.as_str(),
                             ),
@@ -1080,7 +1202,7 @@ impl CaseStore for RedbStore {
                 if closed {
                     return Err(StoreError::CaseClosed { case });
                 }
-                let (has_ack, ack_at, by, note) = ack_columns(ack.as_ref());
+                let (has_ack, ack_at, by, note) = ack_columns(ack.as_ref())?;
                 let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
                 // First registration wins, as `ON CONFLICT DO NOTHING` did.
                 if d.get((tenant.as_str(), case.as_str(), name.as_str()))
@@ -1097,7 +1219,7 @@ impl CaseStore for RedbStore {
                             state,
                             has_ack,
                             ack_at,
-                            by,
+                            by.as_str(),
                             note,
                         ),
                     )
@@ -1108,7 +1230,7 @@ impl CaseStore for RedbStore {
                             .insert(
                                 (
                                     tenant.as_str(),
-                                    trigger_at(resolved, warn),
+                                    trigger_at(state, resolved, warn),
                                     case.as_str(),
                                     name.as_str(),
                                 ),
@@ -1156,93 +1278,108 @@ impl CaseStore for RedbStore {
     ) -> Result<(), StoreError> {
         let tenant = self.tenant_name();
         let (key, name) = (case.to_string(), name.to_owned());
-        let to = state.as_str();
         self.with_db(move |db| {
             let w = begin_write(db)?;
-            {
-                let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
-                let Some(row) = d
-                    .get((tenant.as_str(), key.as_str(), name.as_str()))
-                    .map_err(|e| be(&e))?
-                    .map(|v| {
-                        let (res, dig, warn, has, st, has_ack, at, by, note) = v.value();
-                        (
-                            res,
-                            dig.to_vec(),
-                            warn,
-                            has,
-                            st.to_owned(),
-                            has_ack,
-                            at,
-                            by.to_owned(),
-                            note.to_owned(),
-                        )
-                    })
-                else {
-                    return Err(StoreError::NotFound(format!("{key}/{name}")));
-                };
-                let (resolved, digest, warn, has_warn, was, has_ack, ack_at, by, note) = row;
+            let Some(row) = deadline_row(&w, &tenant, &key, &name)? else {
+                return Err(StoreError::NotFound(format!("{key}/{name}")));
+            };
+            move_deadline(&w, &tenant, &key, &name, &row, state)?;
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
 
-                // How an obligation ended is not editable. `cx.meet_deadline`
-                // reaches this from a skill, so without the check a run that
-                // answered late would take the miss off the operator's listing
-                // and out of the row at once.
-                let from = deadline_state_from(&was)?;
-                if !from.may_become(state) {
-                    return Err(StoreError::DeadlineFinal {
-                        case: key,
-                        obligation: name,
-                        from: was,
-                        to: to.to_owned(),
-                    });
-                }
-                d.insert(
-                    (tenant.as_str(), key.as_str(), name.as_str()),
-                    (
-                        resolved,
-                        digest.as_slice(),
-                        warn,
-                        has_warn,
-                        to,
-                        has_ack,
-                        ack_at,
-                        by.as_str(),
-                        note.as_str(),
-                    ),
-                )
-                .map_err(|e| be(&e))?;
-
-                // The sweep index tracks outstanding obligations only, and it is
-                // updated in the same transaction as the state it reflects.
-                let warn_opt = (has_warn == 1).then_some(warn);
-                let trigger = trigger_at(resolved, warn_opt);
-                let mut due = w.open_table(DEADLINES_DUE).map_err(|e| be(&e))?;
-                match (is_outstanding(&was), is_outstanding(to)) {
-                    (true, false) => {
-                        due.remove((tenant.as_str(), trigger, key.as_str(), name.as_str()))
-                            .map_err(|e| be(&e))?;
-                    }
-                    (false, true) => {
-                        due.insert(
-                            (tenant.as_str(), trigger, key.as_str(), name.as_str()),
-                            resolved,
-                        )
-                        .map_err(|e| be(&e))?;
-                    }
-                    _ => {}
-                }
-                drop(due);
-                drop(d);
-                reindex_unaccounted(
-                    &w,
-                    &tenant,
-                    &key,
-                    &name,
-                    resolved,
-                    unaccounted(&was, has_ack),
-                    unaccounted(to, has_ack),
-                )?;
+    async fn breach_deadline(
+        &self,
+        case: CaseId,
+        name: &str,
+        now: Timestamp,
+    ) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let (key, name) = (case.to_string(), name.to_owned());
+        let now = ts(now);
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let Some(row) = deadline_row(&w, &tenant, &key, &name)? else {
+                return Err(StoreError::NotFound(format!("{key}/{name}")));
+            };
+            // Decided against the row this transaction writes: a run that met
+            // the obligation after the sweep read it has already won.
+            if !is_outstanding(&row.4) || row.0 > now {
+                return Ok(false);
             }
+            move_deadline(&w, &tenant, &key, &name, &row, DeadlineState::Breached)?;
+            // Owed its account until the sweep's notes land.
+            w.open_table(DEADLINES_UNNOTED)
+                .map_err(|e| be(&e))?
+                .insert((tenant.as_str(), key.as_str(), name.as_str()), ())
+                .map_err(|e| be(&e))?;
+            let current = w
+                .open_table(CASES)
+                .map_err(|e| be(&e))?
+                .get((tenant.as_str(), key.as_str()))
+                .map_err(|e| be(&e))?
+                .map(|v| {
+                    let (k, s, st, ver, at) = v.value();
+                    (k.to_owned(), s.to_owned(), st.to_owned(), ver, at)
+                });
+            let Some((kind, was, state, ver, at)) = current else {
+                return Err(StoreError::NotFound(key));
+            };
+            let escalated = CaseStatus::Escalated.as_str();
+            if was != CaseStatus::Closed.as_str() && was != escalated {
+                w.open_table(CASES)
+                    .map_err(|e| be(&e))?
+                    .insert(
+                        (tenant.as_str(), key.as_str()),
+                        (kind.as_str(), escalated, state.as_str(), ver, at),
+                    )
+                    .map_err(|e| be(&e))?;
+                reindex_status(&w, &tenant, &key, &was, escalated, at)?;
+            }
+            w.commit().map_err(|e| be(&e))?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn breaches_to_note(&self, limit: usize) -> Result<Vec<Deadline>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let idx = r.open_table(DEADLINES_UNNOTED).map_err(|e| be(&e))?;
+            let d = r.open_table(DEADLINES).map_err(|e| be(&e))?;
+            let mut out = Vec::new();
+            for e in idx
+                .range((tenant.as_str(), "", "")..=(tenant.as_str(), MAX_STR, MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                let (k, _) = e.map_err(|e| be(&e))?;
+                let (_, case, name) = k.value();
+                if let Some(row) = d.get((tenant.as_str(), case, name)).map_err(|e| be(&e))? {
+                    out.push(build_deadline(case, name, row.value())?);
+                }
+            }
+            out.sort_by_key(|d| d.resolved_at);
+            out.truncate(limit);
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn mark_breach_noted(&self, case: CaseId, name: &str) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let (key, name) = (case.to_string(), name.to_owned());
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            if deadline_row(&w, &tenant, &key, &name)?.is_none() {
+                return Err(StoreError::NotFound(format!("{key}/{name}")));
+            }
+            w.open_table(DEADLINES_UNNOTED)
+                .map_err(|e| be(&e))?
+                .remove((tenant.as_str(), key.as_str(), name.as_str()))
+                .map_err(|e| be(&e))?;
             w.commit().map_err(|e| be(&e))?;
             Ok(())
         })
@@ -1465,7 +1602,7 @@ impl CaseStore for RedbStore {
                     let _ = (ack_at, by, prior);
                     return Ok(false);
                 }
-                let (now_ack, ack_at, by, n) = ack_columns(Some(&note));
+                let (now_ack, ack_at, by, n) = ack_columns(Some(&note))?;
                 d.insert(
                     (tenant.as_str(), key.as_str(), name.as_str()),
                     (
@@ -1476,7 +1613,7 @@ impl CaseStore for RedbStore {
                         state.as_str(),
                         now_ack,
                         ack_at,
-                        by,
+                        by.as_str(),
                         n,
                     ),
                 )

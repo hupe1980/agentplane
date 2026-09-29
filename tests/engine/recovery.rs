@@ -558,6 +558,8 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 ),
                 // Replay reads the plan back from history rather than
@@ -1431,6 +1433,64 @@ async fn a_takeover_whose_note_cannot_be_written_is_not_taken() {
     );
 }
 
+/// **A recovery that loses the race to another instance is not a failure.**
+///
+/// The pass lists abandoned runs and then claims each one, and an instance
+/// that claims a run in between wins it: the claim answers `LeaseHeld`, and
+/// the run is being handled by whoever holds it. Counting that as a recovery
+/// failure pages an operator about the mechanism working. The listing here is
+/// stale on purpose — it names a run another instance holds live — because
+/// that is the state the pass sees when it loses.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_recovery_that_loses_the_race_is_not_a_failure() {
+    use agentplane::testkit::{Faulty, Schedule};
+    use std::time::Duration;
+
+    let inner = Arc::new(RedbStore::open_in_memory().unwrap());
+    let crash_at = Arc::new(AtomicUsize::new(0));
+    let calls = tally();
+    let first = Runtime::builder(inner.clone() as Arc<dyn JournalStore>)
+        .skill(pipeline(&crash_at, &calls))
+        .build()
+        .run("pipeline", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(first.status, RunStatus::Failed(_)));
+
+    // Another instance took the run over after the listing was read.
+    (inner.clone() as Arc<dyn JournalStore>)
+        .acquire(first.run_id, "the-other-instance", Duration::from_secs(60))
+        .await
+        .unwrap();
+    crash_at.store(NO_CRASH, Ordering::SeqCst);
+    let stale = Arc::new(Faulty::new(
+        inner.clone() as Arc<dyn JournalStore>,
+        Schedule::healthy().contested(first.run_id),
+    ));
+    let rt = Runtime::builder(stale as Arc<dyn JournalStore>)
+        .skill(pipeline(&crash_at, &calls))
+        .build();
+
+    let report = rt
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.recovery_failures, 0,
+        "a claim lost to a live instance was counted as a failure to recover"
+    );
+    assert_eq!(
+        report.runs_recovered, 0,
+        "the run was not this pass's to recover"
+    );
+    assert_eq!(
+        calls[1].load(Ordering::SeqCst),
+        0,
+        "the losing pass resumed a run another instance holds"
+    );
+}
+
 /// A lease with nothing under it — admission died between acquiring and its
 /// first append — is cleared rather than retried forever.
 #[tokio::test]
@@ -1464,6 +1524,89 @@ async fn a_lease_over_an_empty_journal_is_cleared_not_retried() {
         .unwrap();
     assert_eq!(again.runs_recovered, 0);
     assert_eq!(again.recovery_failures, 0);
+}
+
+/// A recovery that fails the same way on every attempt is quarantined, naming
+/// why, rather than retried every lease period with a sweep note each time.
+#[tokio::test]
+async fn a_recovery_that_cannot_succeed_is_quarantined_not_retried() {
+    use agentplane::journal::{Append, RecordKind};
+    use std::time::Duration;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    let rt = Runtime::builder(store.clone()).build();
+
+    // An admission whose frozen plan is not a plan, left by an owner that
+    // died holding it: no attempt on this build can resume it.
+    let run = agentplane::core::RunId::generate();
+    let lease = journal
+        .acquire(run, "dead-instance", Duration::from_secs(2))
+        .await
+        .unwrap();
+    journal
+        .append(
+            lease.epoch,
+            vec![
+                Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "pipeline".into(),
+                        governed_by: None,
+                        input: json!({}),
+                        input_label: agentplane::core::Label::trusted(),
+                        policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
+                        idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
+                    },
+                ),
+                Append::new(
+                    run,
+                    RecordKind::PlanFrozen {
+                        steps: vec!["pipeline".into()],
+                        plan: json!(["not", "a", "plan"]),
+                    },
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    rt.sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    let concluded = journal
+        .read(run, 1)
+        .await
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|r| match r.kind() {
+            RecordKind::RunConcluded {
+                outcome, reason, ..
+            } => Some((outcome.clone(), reason.clone())),
+            _ => None,
+        });
+    let Some((outcome, reason)) = concluded else {
+        panic!("the unrecoverable run was left to be retried every lease period");
+    };
+    assert_eq!(outcome, "quarantined");
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains("every attempt")),
+        "the quarantine names what recovery could not get past: {reason:?}"
+    );
+    assert!(
+        journal
+            .runs_by_outcome("quarantined", 10)
+            .await
+            .unwrap()
+            .contains(&run)
+    );
 }
 
 /// **Every conclusion but success says why, through one accessor.**

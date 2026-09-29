@@ -612,10 +612,9 @@ mod tests {
     /// Build events with `json!` rather than by hand.
     ///
     /// Tool fragments are JSON *inside* a JSON string, so hand-written fixtures
-    /// need two levels of escaping. The first version of these tests got that
-    /// wrong, the events failed to parse, the accumulator ignored them exactly
-    /// as it ignores any malformed event — and the test reported the feature
-    /// broken when the fixture was.
+    /// need two levels of escaping. Get that wrong and the events fail to
+    /// parse, the accumulator ignores them as it ignores any malformed event,
+    /// and the test reports the feature broken when the fixture is.
     fn tool_start(index: u64, id: &str, name: &str) -> String {
         serde_json::json!({
             "type": "content_block_start",

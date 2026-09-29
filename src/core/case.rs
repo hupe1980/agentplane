@@ -30,6 +30,7 @@ use crate::core::{CaseId, Digest, RunId, Timestamp};
 /// Inbound messages do not know run ids. They carry document numbers, meter
 /// ids, order references — so that is what correlation matches on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorrelationKey {
     /// What kind of identifier this is, e.g. `"document-number"`, `"meter"`.
     pub namespace: String,
@@ -373,10 +374,12 @@ impl DeadlineState {
 /// [`CaseStore::breached`]: crate::case::CaseStore::breached
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BreachNote {
-    /// The authenticated actor who accounted for it. Never taken from a request
-    /// body: an account of a missed obligation that names whoever the caller
-    /// said they were is not an account.
-    pub by: String,
+    /// Who accounted for it, and what established the name — an
+    /// authenticated credential, or an assertion by whoever could open the
+    /// store. Never taken from a request body: an account of a missed
+    /// obligation that names whoever the caller said they were is not an
+    /// account.
+    pub by: crate::core::Operator,
     /// What they had to say. May be empty — an operator who has looked and has
     /// nothing to add has still answered the question the listing asked.
     pub note: String,
@@ -482,4 +485,13 @@ pub enum SweptAction {
     /// must be answerable from the journal rather than inferred from an epoch
     /// gap. The detail names the outcome the resume reached.
     RunRecovered,
+    /// The decision noted just before this one for the same subject did not
+    /// take effect.
+    ///
+    /// Written where the sweep notes a decision before it acts: a warning,
+    /// whose obligation a run settled before the sweep's write, and a task
+    /// expiry that met an answer a person had already given. Without it the
+    /// note alone would claim a decision that never applied. A breach needs
+    /// none: it is acted on first and noted only once it applied.
+    NotApplied,
 }

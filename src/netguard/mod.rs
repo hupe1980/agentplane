@@ -35,9 +35,6 @@
 //!
 //! The classification lives here, once, because two implementations of one rule
 //! diverge and the one that diverges is whichever nobody probed at the boundary.
-//! That is not hypothetical: this crate has already shipped a ceiling that was
-//! correct in one backend and wrong in the other at exactly the edge case an
-//! operator relies on.
 //!
 //! # Pure, and deliberately not in `core`
 //!
@@ -105,6 +102,50 @@ pub(crate) use resolver::judge;
 pub mod intake;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+/// A transport failure as text an operator may read: what went wrong, the host
+/// it went wrong at, and the causes beneath it — **never the URL**.
+///
+/// `reqwest` renders its error with the whole request URL, and a webhook's or a
+/// peer's URL routinely carries a bearer secret in its path or query. That text
+/// is logged, parked beside a push registration and returned by the operator
+/// API, so every error that becomes text on an outbound door goes through here.
+#[cfg(any(
+    feature = "push",
+    feature = "a2a",
+    feature = "providers",
+    feature = "witness-http",
+    feature = "keyring-vault",
+    feature = "media",
+))]
+#[must_use]
+pub(crate) fn transport_text(error: &reqwest::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = std::error::Error::source(error);
+    while let Some(inner) = cause {
+        text.push_str(": ");
+        text.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    if let Some(url) = error.url() {
+        let host = url.host_str().unwrap_or("?");
+        text = text
+            .replace(&format!(" for url ({url})"), &format!(" to {host}"))
+            .replace(url.as_str(), host);
+    }
+    text
+}
+
+/// The host of a URL, for a log line: the one part of an address that is not a
+/// credential.
+#[cfg(feature = "push")]
+#[must_use]
+pub(crate) fn host_of(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "?".to_owned())
+}
 
 /// Whether this address is one the plane may connect to.
 ///
@@ -206,8 +247,7 @@ pub fn is_loopback_name(host: &str) -> bool {
 ///
 /// One implementation, in the module both callers already share for the
 /// address rule, because the copy that diverges is whichever nobody probed at
-/// the boundary — exactly how this crate shipped the same host check twice with
-/// one silent gap.
+/// the boundary.
 ///
 /// `None` for anything that is not a bare host a URL could name: a grant
 /// carrying a port, userinfo, a path, a query or a fragment is not the exact

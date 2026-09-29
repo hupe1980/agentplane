@@ -27,4 +27,5 @@ mod resume_gates;
 mod retries;
 mod self_records;
 mod simulation;
+mod verdicts;
 mod waits;

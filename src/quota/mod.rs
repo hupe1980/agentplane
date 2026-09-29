@@ -36,30 +36,64 @@
 //! work a tenant can push in, which is the lever a noisy neighbour actually
 //! pulls.
 //!
-//! **Spend** bounds *admission*, and it is checked there rather than mid-run. A
-//! run already admitted when the ceiling is crossed keeps spending until it
-//! finishes, and so does one that resumes afterwards — a resume is not gated,
-//! for the reason above. A tighter cap would mean consulting the store on every
-//! effect, which buys exactness at the cost of a round trip per step.
+//! **Spend** bounds what a period's admitted work can cost, by **reserving**
+//! it. Admission holds each run's worst case against the period in the same
+//! transaction that checks the ceiling and takes the slot, and refuses when
+//! settled spend plus every outstanding reservation plus this one would pass
+//! the ceiling. A run's worst case is its own ceiling plus the overshoot the
+//! ledger permits: a metered cost is known only when the call returns, so a
+//! run stops once it has *reached* its ceiling and can end one operation past
+//! it per step in flight. So the reservation is
+//! `ceiling + width × per-call bound` — the width being the run's
+//! `max_parallel_steps`, or its admitted plan's node count, to which its
+//! dispatch is then held — and a run whose budget leaves either term
+//! unbounded is refused under a quota on that unit rather than admitted
+//! holding nothing.
 //!
-//! **The overshoot is therefore not what it looks like.** Each run is bounded by
-//! its own budget, which survives suspension: the ledger bills replayed history
-//! as it was billed live, so no number of resumes buys a second allowance. What
-//! nothing here bounds is how many such runs exist — the concurrency ceiling
-//! covers the ones executing, and the suspended population it deliberately holds
-//! no slot for is unbounded. So the period ceiling bounds what a tenant may
-//! *start* and the per-run budget bounds what already started; only the pair
-//! bounds a period. A halt does not close it either, and
-//! [`Runtime::set_halt`](crate::runtime::Runtime::set_halt) says so: the
-//! workload scopes stop admission, and only a subject-scoped halt reaches work
-//! already running.
+//! Every pass settlement moves that pass's spend out of the run's reservation
+//! and into the settled total, and the pass that concludes the run releases
+//! what is left — in the transaction that writes the receipt. A suspended run
+//! keeps its remainder, and a resume is never refused for spend: the work was
+//! admitted already, and refusing it strands a run mid-saga.
+//!
+//! **What this bounds, exactly.** A period's settled total never exceeds its
+//! ceiling through work admitted in it, however many runs suspend, run
+//! concurrently or admit from several instances at once. Two things still
+//! reach past it, and both are stated rather than hidden:
+//!
+//! * **A resume in a later period** brings its run's remainder with it: the
+//!   old period's hold is released and what is left of the run's budget is
+//!   held in the new one, unconditionally, because a resume is not refused. A
+//!   period can therefore start with holds it never admitted, and new
+//!   admissions are refused until they settle.
+//! * **An operation that reports more than the per-call bound.** A model call
+//!   is held to its role's `max_input_tokens` by the usage the provider
+//!   reports, and one that sent more fails — billed as reported, so that one
+//!   call's excess is outside the bound. An embedder's own effects and the
+//!   `Budget` figures it declares for them cannot be inspected: for those the
+//!   bound is as exact as the declaration, the footing a price stands on. A
+//!   compensating call is exempt from every ceiling, so what an undo reports
+//!   is outside it too.
+//!
+//! A commissioned run is its own run: it reserves and settles its own spend,
+//! and the commissioning run's ledger is billed the same figure for its own
+//! ceiling without settling it a second time into the period.
+//!
+//! A run that never concludes — quarantined, or waiting on something nothing
+//! will answer — holds its remainder indefinitely. That is a backlog, and a
+//! refusal says how much of the period is reserved rather than settled; the
+//! holders are listed by [`QuotaStore::reservations`], and `attention` names
+//! the stopped ones with the verb that releases them. A halt does not release
+//! a reservation, and [`Runtime::set_halt`](crate::runtime::Runtime::set_halt)
+//! says what it does reach: the workload scopes stop admission, and only a
+//! subject-scoped halt reaches work already running.
 //!
 //! One live execution pass belongs to the period in which it starts. Admission
-//! checks that period and settlement accrues the pass's spend to the same key,
-//! even if midnight or month-end passes while work is running. A later resume
-//! is a new pass in the period in which it resumes. Without that identity a run
-//! can be authorized against the old period and charged to the new one, leaving
-//! both ledgers wrong in opposite directions.
+//! reserves against that period and settlement accrues the pass's spend to the
+//! same key, even if midnight or month-end passes while work is running. A
+//! later resume is a new pass in the period in which it resumes. Without that
+//! identity a run can be authorized against the old period and charged to the
+//! new one, leaving both ledgers wrong in opposite directions.
 //!
 //! # The window is a billing period, not an arbitrary bucket
 //!
@@ -70,12 +104,126 @@
 //! month's budget in the last hour of one month and the first hour of the next
 //! *is* two months of budget, correctly accounted. A sliding window would be the
 //! wrong answer to a question nobody asked.
+//!
+//! # A rate ceiling slides
+//!
+//! A grant's rate ceiling — *at most twenty refunds an hour* — is not a billing
+//! period, and a fixed hourly bucket would admit forty refunds in the two
+//! minutes around its boundary, which is the burst the ceiling exists to stop.
+//! So it counts [`RateReservation`]s whose instant falls inside the window
+//! ending now. One row per dispatch, keyed by the run and the dispatch's first
+//! attempt, so a retry or a recovered re-dispatch spends once and two runs
+//! making the same call each spend. Rows are never refunded early: nothing
+//! proves an unannounced call did not reach the world. They age out with the
+//! window.
+//!
+//! The count is per tenant per tool reference, judged against every ceiling
+//! the dispatching plane's declarations state for that reference. Instances
+//! sharing a store share the count; each judges it against the declarations
+//! it holds, and the instant is each instance's own clock, so a window across
+//! instances inherits their skew.
+//!
+//! The rows are operational state, not evidence: replay never reads them, a
+//! refusal is journaled on the run, and they stay out of the export.
 
 use std::fmt::Debug;
 
 use async_trait::async_trait;
 
-use crate::core::{RunId, Spend, StoreError, Timestamp};
+use crate::core::{Budget, EffectKey, RunId, Spend, StoreError, Timestamp};
+
+/// At most `count` dispatches in any `window_seconds`, across runs.
+///
+/// Declared on a grant, and never zero in either figure: a manifest refuses
+/// both at parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RateCeiling {
+    pub count: u32,
+    pub window_seconds: u64,
+}
+
+impl std::fmt::Display for RateCeiling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "at most {} per {} second(s)",
+            self.count, self.window_seconds
+        )
+    }
+}
+
+/// One dispatch asking for room under the rate ceilings on its tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateReservation {
+    /// The tool reference the count is kept for, `tool://server/name`.
+    pub grant: String,
+    /// The dispatching run. Part of the key because an effect key does not
+    /// contain it: two runs making the same call would otherwise share a row.
+    pub run: RunId,
+    /// The dispatch's **first** attempt's key, which a retry, a recovered
+    /// re-dispatch and a resumed pass all derive again. Each attempt's own key
+    /// would charge every retry.
+    pub dispatch: EffectKey,
+    /// Every ceiling the dispatch is judged against; each must have room.
+    pub ceilings: Vec<RateCeiling>,
+    /// The plane clock at reservation.
+    pub at: Timestamp,
+    /// Counted and never refused: an undo. Refusing to undo is how a run ends
+    /// with a charged card and no order.
+    pub exempt: bool,
+}
+
+/// The first instant a window ending at `at` no longer counts.
+///
+/// A row counts when its instant is **after** this, which makes the window
+/// slide with `at` rather than restart at a bucket boundary. Shared by both
+/// backends so the boundary is one comparison.
+#[must_use]
+pub fn rate_window_start(at: i64, window_seconds: u64) -> i64 {
+    at.saturating_sub(i64::try_from(window_seconds).unwrap_or(i64::MAX))
+}
+
+/// Refuse a dispatch whose tool has no room under one of its ceilings.
+///
+/// `instants` are the reservation instants the store holds for the tool, read
+/// inside the transaction that would insert this one. A row stamped after `at`
+/// — another instance's clock running ahead — counts, so skew errs toward
+/// refusing.
+///
+/// # Errors
+///
+/// [`QuotaError::RateLimited`] naming the first ceiling without room.
+pub fn check_rate(
+    tenant: &str,
+    grant: &str,
+    ceilings: &[RateCeiling],
+    instants: &[i64],
+    at: Timestamp,
+) -> Result<(), QuotaError> {
+    let at = at.unix_timestamp();
+    for ceiling in ceilings {
+        let start = rate_window_start(at, ceiling.window_seconds);
+        let reached = instants.iter().filter(|&&t| t > start).count();
+        if reached >= ceiling.count as usize {
+            return Err(QuotaError::RateLimited {
+                tenant: tenant.to_owned(),
+                grant: grant.to_owned(),
+                ceiling: *ceiling,
+                reached: u64::try_from(reached).unwrap_or(u64::MAX),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The instant at or before which no ceiling in `ceilings` counts a row.
+///
+/// Rows at or before it are pruned in the reserving transaction.
+#[must_use]
+pub fn rate_prune_floor(at: Timestamp, ceilings: &[RateCeiling]) -> i64 {
+    let widest = ceilings.iter().map(|c| c.window_seconds).max().unwrap_or(0);
+    rate_window_start(at.unix_timestamp(), widest)
+}
 
 /// One live execution pass to settle exactly once.
 ///
@@ -95,6 +243,82 @@ pub struct QuotaSettlement {
     /// Fresh admission does; resume does not. Settlement removes the slot in
     /// the same transaction that records the receipt and accrues spend.
     pub release_slot: bool,
+    /// Whether this pass concluded the run.
+    ///
+    /// Every settlement moves its spend out of the run's reservation; the
+    /// concluding one also releases what is left, so a run that finished under
+    /// its budget gives the period back the difference. Part of the receipt,
+    /// so a retry that disagrees about it is corruption like any other field.
+    pub concludes: bool,
+}
+
+/// Spend one admission holds against a period until the run settles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendHold {
+    /// The period the admitting pass starts in.
+    pub period: String,
+    /// What the run can cost at most: see [`reservation`].
+    pub amount: Spend,
+}
+
+/// One run holding spend against this tenant's period.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Held {
+    pub run: RunId,
+    /// The period the hold is counted in.
+    pub period: String,
+    /// What is still held: the reservation, less every pass settled since.
+    pub remaining: Spend,
+}
+
+/// What admitting a run under `quota` holds against the period.
+///
+/// Per unit the quota bounds: the run's ceiling, plus `width` steps' worth of
+/// the one-operation overshoot the ledger permits — `ceiling + width × per-call
+/// bound`, saturating. A unit the quota does not bound is held at zero, and
+/// nothing is held — `Ok(None)` — when the quota bounds no spend at all.
+///
+/// `width` is how many steps the run may have in flight: each can be holding
+/// an operation the ledger admitted below the ceiling and has not yet billed.
+///
+/// # Errors
+///
+/// The [`Budget`] field that leaves a bounded unit unbounded, for the refusal
+/// to name — an unbounded run is an unbounded reservation.
+pub fn reservation(
+    quota: &TenantQuota,
+    budget: &Budget,
+    width: u64,
+) -> Result<Option<Spend>, &'static str> {
+    if !quota.bounds_spend() {
+        return Ok(None);
+    }
+    let hold = |bounded: bool,
+                ceiling: Option<u64>,
+                call: Option<u64>,
+                names: (&'static str, &'static str)|
+     -> Result<u64, &'static str> {
+        if !bounded {
+            return Ok(0);
+        }
+        let ceiling = ceiling.ok_or(names.0)?;
+        let call = call.ok_or(names.1)?;
+        Ok(ceiling.saturating_add(width.saturating_mul(call)))
+    };
+    Ok(Some(Spend {
+        tokens: hold(
+            quota.max_tokens_per_period.is_some(),
+            budget.max_tokens,
+            budget.max_call_tokens,
+            ("max_tokens", "max_call_tokens"),
+        )?,
+        minor_units: hold(
+            quota.max_minor_units_per_period.is_some(),
+            budget.max_minor_units,
+            budget.max_call_minor_units,
+            ("max_minor_units", "max_call_minor_units"),
+        )?,
+    }))
 }
 
 /// What one tenant may consume.
@@ -387,17 +611,44 @@ pub enum QuotaError {
     )]
     TooManyRuns { tenant: String, running: u32 },
 
-    /// The tenant has spent its ceiling for this period.
+    /// Admitting this run would let the period pass its ceiling.
+    ///
+    /// Settled and reserved are named apart, because they call for different
+    /// answers: settled spend is gone until the period turns, while reserved
+    /// spend is held by open runs — some of which may be quarantined or waiting
+    /// on nothing, and releasing theirs is an operator's act.
     #[error(
-        "tenant '{tenant}' has spent {spent} of its {limit} {unit} for period {period} — \
-         this does not reset until the period does"
+        "tenant '{tenant}' has {settled} {unit} settled and {reserved} reserved by open \
+         runs against its {limit} for period {period}, and this run holds up to \
+         {requested} — settled spend resets with the period; reserved spend is released \
+         as its runs conclude, and `agentplane attention` names the stopped ones"
     )]
     SpentOut {
         tenant: String,
         period: String,
         unit: &'static str,
-        spent: u64,
+        settled: u64,
+        reserved: u64,
+        requested: u64,
         limit: u64,
+    },
+
+    /// The tenant bounds a unit per period and this run declares no bound on it.
+    ///
+    /// A run with no ceiling, or no per-call bound, would hold an unbounded
+    /// reservation — the period ceiling would stop binding the moment it was
+    /// admitted. `field` is the [`Budget`] field that is absent.
+    #[error(
+        "tenant '{tenant}' bounds {unit} per period, and this run declares no {field}, so \
+         what it can cost is unbounded and cannot be reserved — a manifest sets \
+         spec.budgets.max_tokens / max_minor_units, and bounds one call with \
+         max_input_tokens (and a price) on every model role; an embedder sets the same \
+         fields on its Budget"
+    )]
+    Unbounded {
+        tenant: String,
+        unit: &'static str,
+        field: &'static str,
     },
 
     /// An operator stopped this work from starting.
@@ -417,6 +668,22 @@ pub enum QuotaError {
         tenant: String,
         scope: HaltScope,
         reason: String,
+    },
+
+    /// A tool's rate ceiling has no room in the window ending now.
+    ///
+    /// Back-pressure, like [`TooManyRuns`](Self::TooManyRuns): the window
+    /// slides, and the refused dispatch fits once enough of the counted ones
+    /// age out of it.
+    #[error(
+        "'{grant}' is limited to {ceiling} for tenant '{tenant}', and {reached} dispatch(es) \
+         already fall in the window ending now — wait for the window to pass"
+    )]
+    RateLimited {
+        tenant: String,
+        grant: String,
+        ceiling: RateCeiling,
+        reached: u64,
     },
 
     /// The accounting itself could not be reached.
@@ -448,37 +715,73 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// mismatch must be refused at build rather than inferred from behavior.
     fn tenant(&self) -> &str;
 
-    /// Take a concurrency slot for `run`, or refuse.
+    /// Take a concurrency slot for `run`, and hold its spend, or refuse.
     ///
-    /// **Must count and insert in one transaction.** A read followed by a write
-    /// leaves a window two instances admit through, and the ceiling is then a
-    /// suggestion — worse under exactly the load it exists for.
+    /// **Must decide and insert in one transaction.** The slot count against
+    /// `quota.max_concurrent_runs`, and — when `hold` is given — settled spend
+    /// plus every outstanding reservation in the hold's period plus this one
+    /// against the period ceilings, through [`check_spend`]. A read followed
+    /// by a write leaves a window two instances admit through, and the ceiling
+    /// is then a suggestion — worse under exactly the load it exists for.
     ///
-    /// Idempotent per run: reserving a run that already holds a slot must
-    /// succeed without taking a second, so a retried admission cannot consume
-    /// two.
+    /// Idempotent per run: reserving a run that already holds a slot, or
+    /// already holds spend, must succeed without taking a second, so a retried
+    /// admission cannot consume two.
     ///
     /// # Errors
     ///
-    /// [`QuotaError::TooManyRuns`] at the ceiling, or
+    /// [`QuotaError::TooManyRuns`] at the concurrency ceiling,
+    /// [`QuotaError::SpentOut`] when the hold does not fit, or
     /// [`QuotaError::Unavailable`] if the store cannot be reached.
     async fn reserve(
         &self,
         run: RunId,
-        limit: Option<u32>,
+        quota: &TenantQuota,
+        hold: Option<&SpendHold>,
         at: Timestamp,
     ) -> Result<(), QuotaError>;
 
-    /// Give back a reservation whose admission journal never landed. Idempotent.
+    /// Give back, idempotently, the slot and the spend hold of an admission
+    /// whose journal never landed, or of a run that concluded with no pass to
+    /// settle.
     ///
     /// Normal pass completion MUST use [`settle`](Self::settle), which couples
-    /// release to the receipt and spend transaction. This separate verb exists
-    /// only for the pre-journal admission cleanup path.
+    /// release to the receipt and spend transaction.
     ///
     /// # Errors
     ///
     /// If the store cannot be reached.
     async fn release(&self, run: RunId) -> Result<(), StoreError>;
+
+    /// Move a run's spend hold into `period`, where a resume is about to spend.
+    ///
+    /// Releases what the run held in its old period and holds the same
+    /// remainder in the new one, in one transaction. Unconditional — a resume
+    /// is never refused for spend — and a no-op when the run holds nothing or
+    /// already holds it in `period`.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn carry(&self, run: RunId, period: &str) -> Result<(), StoreError>;
+
+    /// Every run holding spend against this tenant's periods, by run id.
+    ///
+    /// The listing a [`QuotaError::SpentOut`] refusal points at: reserved
+    /// spend belongs to named runs, and one that is quarantined or waiting on
+    /// nothing holds its remainder until somebody concludes it.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn reservations(&self, limit: usize) -> Result<Vec<Held>, StoreError>;
+
+    /// What open runs hold against `period`.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn reserved(&self, period: &str) -> Result<Spend, StoreError>;
 
     /// Stop work at `scope` from starting.
     ///
@@ -539,10 +842,12 @@ pub trait QuotaStore: Send + Sync + Debug {
 
     /// Settle one live pass exactly once.
     ///
-    /// The receipt, spend accrual, and admission-slot release MUST commit in one
+    /// The receipt, spend accrual, the reduction of the run's spend hold by
+    /// the pass's spend (floored at zero), the hold's release when the pass
+    /// concludes the run, and admission-slot release MUST commit in one
     /// transaction. Repeating an identical settlement MUST succeed without
-    /// accruing again. Reusing `(run, epoch)` with a different period, spend, or
-    /// slot flag MUST fail as corruption: accepting it makes retries a way to
+    /// accruing again. Reusing `(run, epoch)` with a different period, spend,
+    /// slot flag or conclusion MUST fail as corruption: accepting it makes retries a way to
     /// rewrite the bill.
     ///
     /// `period: None` records the receipt and releases the slot without adding a
@@ -555,7 +860,8 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// settlement.
     async fn settle(&self, settlement: &QuotaSettlement) -> Result<(), StoreError>;
 
-    /// What this tenant has spent in `period`.
+    /// What this tenant has settled in `period` — spend that happened, not
+    /// spend held.
     ///
     /// # Errors
     ///
@@ -594,44 +900,94 @@ pub trait QuotaStore: Send + Sync + Debug {
     ///
     /// [`JournalStore::abandoned_runs`]: crate::journal::JournalStore::abandoned_runs
     async fn running_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError>;
+
+    /// Take room for one dispatch under its tool's rate ceilings, or refuse.
+    ///
+    /// **Must decide and insert in one transaction**, through [`check_rate`],
+    /// for the reason [`reserve`](Self::reserve) must: two instances reading a
+    /// window with one place left both land otherwise. The window slides —
+    /// see the module's *A rate ceiling slides*.
+    ///
+    /// Idempotent per `(grant, run, dispatch)`: a key already present succeeds
+    /// without inserting and without being judged, so a retry and a recovered
+    /// re-dispatch spend once. An [`exempt`](RateReservation::exempt)
+    /// reservation inserts without being judged. Rows at or before
+    /// [`rate_prune_floor`] are deleted in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// [`QuotaError::RateLimited`] when a ceiling has no room, or
+    /// [`QuotaError::Unavailable`] if the store cannot be reached.
+    async fn reserve_rate(&self, reservation: &RateReservation) -> Result<(), QuotaError>;
+
+    /// Whether a dispatch of `grant` would have room now, taking none.
+    ///
+    /// A resume at a standing rate refusal asks this before re-admitting: a
+    /// window still full re-concludes the run on the refusal already on its
+    /// record, rather than stacking a re-admission and a second refusal.
+    ///
+    /// # Errors
+    ///
+    /// As [`reserve_rate`](Self::reserve_rate).
+    async fn rate_room(
+        &self,
+        grant: &str,
+        ceilings: &[RateCeiling],
+        at: Timestamp,
+    ) -> Result<(), QuotaError>;
 }
 
-/// Refuse a run whose tenant has already spent its ceiling.
+/// Refuse a hold that would take a period past its ceiling.
 ///
 /// Separate from the store so both backends share one comparison: two
-/// implementations of "is this over the line" is two chances to get `>=` wrong,
-/// and the one that is wrong is whichever nobody tested at the boundary.
+/// implementations of "is this over the line" is two chances to get `>` wrong,
+/// and the one that is wrong is whichever nobody tested at the boundary. Both
+/// call it **inside** the transaction that inserts the hold.
+///
+/// Admits when `settled + reserved + request` stays at or under the ceiling:
+/// the reservation is a run's worst case, so a period filled exactly is a
+/// period its admitted work can reach and not pass.
 ///
 /// # Errors
 ///
-/// [`QuotaError::SpentOut`] when a ceiling is reached.
+/// [`QuotaError::SpentOut`] naming the first unit that would not fit.
 pub fn check_spend(
     tenant: &str,
     period: &str,
     quota: &TenantQuota,
-    spent: Spend,
+    settled: Spend,
+    reserved: Spend,
+    request: Spend,
 ) -> Result<(), QuotaError> {
-    if let Some(limit) = quota.max_tokens_per_period
-        && spent.tokens >= limit
-    {
-        return Err(QuotaError::SpentOut {
-            tenant: tenant.to_owned(),
-            period: period.to_owned(),
-            unit: "tokens",
-            spent: spent.tokens,
-            limit,
-        });
-    }
-    if let Some(limit) = quota.max_minor_units_per_period
-        && spent.minor_units >= limit
-    {
-        return Err(QuotaError::SpentOut {
-            tenant: tenant.to_owned(),
-            period: period.to_owned(),
-            unit: "minor units",
-            spent: spent.minor_units,
-            limit,
-        });
+    for (unit, limit, settled, reserved, requested) in [
+        (
+            "tokens",
+            quota.max_tokens_per_period,
+            settled.tokens,
+            reserved.tokens,
+            request.tokens,
+        ),
+        (
+            "minor units",
+            quota.max_minor_units_per_period,
+            settled.minor_units,
+            reserved.minor_units,
+            request.minor_units,
+        ),
+    ] {
+        if let Some(limit) = limit
+            && settled.saturating_add(reserved).saturating_add(requested) > limit
+        {
+            return Err(QuotaError::SpentOut {
+                tenant: tenant.to_owned(),
+                period: period.to_owned(),
+                unit,
+                settled,
+                reserved,
+                requested,
+                limit,
+            });
+        }
     }
     Ok(())
 }

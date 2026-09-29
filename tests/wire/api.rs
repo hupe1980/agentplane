@@ -576,7 +576,7 @@ async fn a_run_can_be_stopped_and_the_stopper_is_named() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert_eq!(body["recorded"], false, "{body}");
 }
 
@@ -1644,6 +1644,102 @@ async fn event_delivery_reports_the_outcome_by_name() {
     assert_eq!(body["delivery"], "duplicate");
 }
 
+/// A task's answer, as an outside party would forge it.
+///
+/// Everything in it is readable by a caller: the kind is the plane's own
+/// constant, and the correlation is the task id `GET /tasks` serves.
+fn forged_decision(task: &str) -> Value {
+    json!({
+        "id": format!("forged-{task}"),
+        "kind": "agentplane.task.decided",
+        "correlation": [{ "namespace": "task", "value": task }],
+        "payload": serde_json::to_value(agentplane::core::Decision::approve(
+            agentplane::core::Operator::asserted("bob").unwrap(),
+            "approved",
+        ))
+        .unwrap()
+    })
+}
+
+/// **A task is decided on the worklist, never by posting its answer.**
+///
+/// A run waiting on a human task is woken by an event of a kind this plane
+/// mints, correlated by the task's id. Accepted from `POST /events`, that
+/// message decides the task for whoever may post an event — Carol, a clerk
+/// the task's roles exclude, approving as Bob with no claim, no eligibility
+/// check and no four-eyes. The policy here permits every delivery, so the
+/// refusal cannot be the gate's; it is the namespace's.
+#[tokio::test]
+async fn a_decision_posted_as_an_event_is_forbidden() {
+    let f = fixture();
+    let task = f.pending_task().await;
+    let task_id = agentplane::core::TaskId::parse(&task).unwrap();
+    let run = (f.store.clone() as Arc<dyn TaskStore>)
+        .task(task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .run;
+    let router = f.router();
+
+    let (status, body) = send(
+        &router,
+        post("/events", Some("carol"), &forged_decision(&task)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a clerk answered a compliance officer's task by posting its answer: {body}"
+    );
+
+    assert!(
+        (f.store.clone() as Arc<dyn TaskStore>)
+            .task(task_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state
+            .is_pending(),
+        "the forged answer decided the task"
+    );
+    assert!(
+        (f.store.clone() as Arc<dyn JournalStore>)
+            .waiting_runs(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| w.run == run),
+        "the forged answer resumed the run"
+    );
+}
+
+/// **A forged answer posted before its task opens is not held for it.**
+///
+/// An event nobody waits for is buffered, so the task that opens later finds it
+/// already there and takes it as its answer. Refused at the door, it is never
+/// in the buffer to be found.
+#[tokio::test]
+async fn a_decision_posted_before_its_task_opens_is_not_buffered() {
+    let f = fixture();
+    let router = f.router();
+    // A task id is derived from its run and its wait, so an attacker who can
+    // predict both can post ahead of the task; any id stands in for one here.
+    let ahead = "7".repeat(64);
+
+    let (status, body) = send(
+        &router,
+        post("/events", Some("carol"), &forged_decision(&ahead)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(
+        f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap(),
+        0,
+        "the refused answer sat in the buffer, where a task opening later would claim it"
+    );
+}
+
 /// A store failure does not describe the store.
 #[tokio::test]
 async fn a_missing_store_does_not_describe_the_plane() {
@@ -1656,6 +1752,132 @@ async fn a_missing_store_does_not_describe_the_plane() {
     let (status, body) = send(&router, get("/tasks", Some("bob"))).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     assert_eq!(body["error"], "this plane has no task store");
+}
+
+/// An event store whose writes fail with a message naming its connection.
+#[derive(Debug)]
+struct LeakyEvents(Arc<RedbStore>);
+
+#[async_trait::async_trait]
+impl EventStore for LeakyEvents {
+    async fn buffer(
+        &self,
+        _event: &agentplane::core::InboundEvent,
+        _at: agentplane::core::Timestamp,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        Err(agentplane::core::StoreError::Backend(
+            "connection refused: dsn=secret".into(),
+        ))
+    }
+    async fn subscribe(
+        &self,
+        sub: &agentplane::core::Subscription,
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.subscribe(sub, at).await
+    }
+    async fn claim_for(
+        &self,
+        sub: &agentplane::core::Subscription,
+        at: agentplane::core::Timestamp,
+    ) -> Result<Option<agentplane::case::BufferedEvent>, agentplane::core::StoreError> {
+        self.0.claim_for(sub, at).await
+    }
+    async fn match_waiter(
+        &self,
+        event: &agentplane::core::InboundEvent,
+        at: agentplane::core::Timestamp,
+    ) -> Result<Option<agentplane::core::Subscription>, agentplane::core::StoreError> {
+        self.0.match_waiter(event, at).await
+    }
+    async fn deliver_to(
+        &self,
+        run: agentplane::core::RunId,
+        event: &agentplane::core::InboundEvent,
+        at: agentplane::core::Timestamp,
+    ) -> Result<agentplane::case::TargetedDelivery, agentplane::core::StoreError> {
+        self.0.deliver_to(run, event, at).await
+    }
+    async fn unsubscribe(
+        &self,
+        run: agentplane::core::RunId,
+        effect: agentplane::core::EffectKey,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.unsubscribe(run, effect).await
+    }
+    async fn unsubscribe_run(
+        &self,
+        run: agentplane::core::RunId,
+    ) -> Result<usize, agentplane::core::StoreError> {
+        self.0.unsubscribe_run(run).await
+    }
+    async fn park_wait(
+        &self,
+        sub: &agentplane::core::Subscription,
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.park_wait(sub, at).await
+    }
+    async fn parked_waits(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Subscription>, agentplane::core::StoreError> {
+        self.0.parked_waits(limit).await
+    }
+    async fn minter(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<Option<agentplane::case::Minter>, agentplane::core::StoreError> {
+        self.0.minter(source, id).await
+    }
+    async fn erase_payload(
+        &self,
+        source: &str,
+        id: &str,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.0.erase_payload(source, id).await
+    }
+    async fn sweep_unclaimed(
+        &self,
+        older_than: agentplane::core::Timestamp,
+        reason: &str,
+    ) -> Result<usize, agentplane::core::StoreError> {
+        self.0.sweep_unclaimed(older_than, reason).await
+    }
+    async fn dead_letters(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::DeadLetter>, agentplane::core::StoreError> {
+        self.0.dead_letters(limit).await
+    }
+    async fn waiting(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Subscription>, agentplane::core::StoreError> {
+        self.0.waiting(limit).await
+    }
+}
+
+/// A store outage is a 503 a bus retries, and it does not describe the store.
+///
+/// The backend's own message carries its DSN, host and table; a counterparty
+/// posting an event learns only that the plane could not take it right now.
+#[tokio::test]
+async fn an_event_store_outage_does_not_describe_the_store() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .events(Arc::new(LeakyEvents(Arc::clone(&store))) as Arc<dyn EventStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .build();
+    let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
+    let event = json!({"id": "evt-1", "kind": "acknowledgement.received", "payload": {}});
+    let (status, body) = send(&router, post("/events", Some("bob"), &event)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(
+        !body.to_string().contains("dsn=secret"),
+        "the store's own error reached the caller: {body}"
+    );
 }
 
 /// A caller cannot choose the source of the event it delivers.
@@ -2772,7 +2994,10 @@ async fn the_live_listing_attributes_each_run_and_marks_a_stranded_slot() {
 
     let at = agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap();
     let held = agentplane::core::RunId::generate();
-    quotas.reserve(held, None, at).await.unwrap();
+    quotas
+        .reserve(held, &agentplane::quota::TenantQuota::default(), None, at)
+        .await
+        .unwrap();
 
     let (status, body) = send(&router, get("/runs/live", Some("bob"))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2797,7 +3022,15 @@ async fn the_live_listing_attributes_each_run_and_marks_a_stranded_slot() {
     // a field hard-coded to `false`. One second is the store's own granularity
     // floor, so this is the shortest honest version of the wait.
     let stranded = agentplane::core::RunId::generate();
-    quotas.reserve(stranded, None, at).await.unwrap();
+    quotas
+        .reserve(
+            stranded,
+            &agentplane::quota::TenantQuota::default(),
+            None,
+            at,
+        )
+        .await
+        .unwrap();
     (store.clone() as Arc<dyn JournalStore>)
         .acquire(
             stranded,
@@ -2848,5 +3081,423 @@ async fn the_live_listing_attributes_each_run_and_marks_a_stranded_slot() {
     assert!(
         body["runs"].as_array().is_some_and(Vec::is_empty),
         "a released slot is still listed as running: {body}"
+    );
+}
+
+/// **A subject filter over a truncated page says the page was truncated.**
+///
+/// The page bounds what is read, and the filter narrows what was read. Asked
+/// "what is still acting under alice" with more runs live than one page, the
+/// runs past the page were never looked at — so `truncated: false` beside an
+/// empty list would tell a responder a withdrawal reached everything it had to
+/// when it was never checked.
+#[tokio::test]
+async fn a_filtered_live_listing_reports_the_truncation_of_its_page() {
+    use agentplane::quota::QuotaStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let quotas = store.clone() as Arc<dyn QuotaStore>;
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .quota(quotas.clone(), agentplane::quota::TenantQuota::default())
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .build();
+    let router = Api::new(rt, Arc::new(HeaderAuth))
+        .expect("the fixture wires a policy engine")
+        .limit(1)
+        .router();
+
+    let at = agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap();
+    for _ in 0..2 {
+        quotas
+            .reserve(
+                agentplane::core::RunId::generate(),
+                &agentplane::quota::TenantQuota::default(),
+                None,
+                at,
+            )
+            .await
+            .unwrap();
+    }
+
+    let (status, body) = send(&router, get("/runs/live?subject=alice", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["runs"].as_array().is_some_and(Vec::is_empty), "{body}");
+    assert_eq!(
+        body["truncated"], true,
+        "two runs are live and one page of one was read, yet the filtered answer \
+         claims it saw everything: {body}"
+    );
+}
+
+/// Finishes at once, so a test has a sealed run to point at.
+#[derive(Debug)]
+struct Finishes;
+
+#[async_trait::async_trait]
+impl Skill for Finishes {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("finishes").provides("demo.finish")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::done(input))
+    }
+}
+
+/// **Stopping a run says what it can and cannot do, in the status it means.**
+///
+/// A blank reason is a request that documents nobody's judgement, and is the
+/// caller's to fix: 400. A run that already concluded has nothing left to
+/// stop, and `202 recorded: true` would tell the operator a stop was on its
+/// way: 409, as A2A answers `TaskNotCancelable`. An authenticator that named
+/// nobody is the deployment's defect, not the request's: 500.
+#[tokio::test]
+async fn a_cancel_is_refused_in_the_status_its_cause_calls_for() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .skill(Finishes)
+        .build();
+    let sealed = rt
+        .run("demo.finish", Tainted::trusted(json!({})))
+        .await
+        .expect("a run that finishes")
+        .run_id;
+    let router = Api::new(rt.clone(), Arc::new(HeaderAuth))
+        .expect("policy wired")
+        .router();
+    let path = format!("/runs/{sealed}/cancel");
+
+    let (status, body) = send(&router, post(&path, Some("bob"), &json!({"reason": "  "}))).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a blank reason was accepted: {body}"
+    );
+
+    let (status, body) = send(
+        &router,
+        post(&path, Some("bob"), &json!({"reason": "stop"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a stop was accepted for a run that already concluded: {body}"
+    );
+    assert!(
+        rt.cancellation(sealed).await.expect("read").is_none(),
+        "a request against a sealed run was stored anyway"
+    );
+
+    let (status, body) = send(&router, post(&path, Some(""), &json!({"reason": "stop"}))).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an authenticator that named nobody was blamed on the request: {body}"
+    );
+}
+
+/// **A refusal names what was wrong, in words.**
+///
+/// The identifier helper produced "not a disposition: expected … id" for a
+/// field that is not an identifier at all.
+#[tokio::test]
+async fn a_malformed_reconciliation_is_refused_in_a_sentence() {
+    let f = fixture();
+    let (status, body) = send(
+        &f.router(),
+        post(
+            "/runs/run_01ARZ3NDEKTSV4RRFFQ69G5FAV/reconcile",
+            Some("bob"),
+            &json!({
+                "effect": "0000000000000000000000000000000000000000000000000000000000000000",
+                "disposition": "maybe",
+                "note": "looked"
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let said = body["error"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("'landed' or 'did_not_happen'") && !said.ends_with(" id"),
+        "the refusal did not read as a sentence: {said}"
+    );
+}
+
+/// **A hold or event carrying a field this plane does not know is refused.**
+///
+/// Accepted silently, a misspelt field is a request that did something other
+/// than what its sender believes.
+#[tokio::test]
+async fn unknown_fields_on_a_hold_or_an_event_are_refused() {
+    let f = fixture();
+    let router = f.router();
+    for (path, body) in [
+        (
+            "/holds",
+            json!({"case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "litigation", "untill": "never"}),
+        ),
+        (
+            "/holds/release",
+            json!({"case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "settled", "force": true}),
+        ),
+        (
+            "/events",
+            json!({"id": "e-1", "kind": "k", "payload": {}, "corelation": []}),
+        ),
+    ] {
+        let (status, answer) = send(&router, post(path, Some("bob"), &body)).await;
+        assert!(
+            status.is_client_error(),
+            "{path} accepted an unknown field: {status} {answer}"
+        );
+    }
+}
+
+/// **`/events` authenticates before it reads the body.**
+///
+/// The parser's refusals describe the shapes the route accepts; a caller with
+/// no identity is owed none of them.
+#[tokio::test]
+async fn an_unauthenticated_event_is_refused_before_its_body_is_read() {
+    let f = fixture();
+    let (status, body) = send(
+        &f.router(),
+        post("/events", None, &json!({"nonsense": true})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an unauthenticated body was parsed and critiqued: {body}"
+    );
+}
+
+// ── What a reviewer is shown ────────────────────────────────────────────────
+
+/// Put one task straight onto the worklist, as a store holding it would.
+async fn listed_task(
+    store: &Arc<RedbStore>,
+    summary: &str,
+    proposed: Value,
+    withheld: Option<agentplane::core::Withheld>,
+) -> String {
+    use agentplane::core::{
+        EffectDescriptor, EffectKey, OnExpiry, Phase, RunId, StepId, Task, TaskId, TaskState,
+    };
+    let run = RunId::generate();
+    let key = EffectKey::for_effect(
+        StepId(0),
+        Phase::Forward,
+        0,
+        1,
+        &EffectDescriptor::new("agent.approve_call", json!({ "summary": summary })),
+    );
+    let task = Task {
+        id: TaskId::derive(run, key),
+        run,
+        case: None,
+        kind: "approval".into(),
+        justification: Justification::new(Tainted::trusted(summary.to_owned()), proposed),
+        candidate_roles: vec!["compliance-officer".into()],
+        escalate_to: Vec::new(),
+        assignee: None,
+        priority: Priority::Normal,
+        state: TaskState::Open,
+        on_expiry: OnExpiry::Deny,
+        excluded_actors: Vec::new(),
+        created_at: time::OffsetDateTime::now_utc(),
+        due_at: None,
+        withheld,
+    };
+    (Arc::clone(store) as Arc<dyn TaskStore>)
+        .open(&task)
+        .await
+        .expect("listed");
+    task.id.to_hex()
+}
+
+/// **A withheld proposal is served as withheld, never as an envelope.**
+///
+/// A plane that cannot open a proposal — no key ring here, a destroyed key, a
+/// damaged envelope — used to serve the sealed `{"$sealed": …}` object as the
+/// proposal, a value a client renders as if it were the arguments. The view
+/// says *withheld, and why*, and carries no envelope anywhere.
+#[tokio::test]
+async fn a_withheld_proposal_is_served_as_withheld() {
+    let f = fixture();
+    let task = listed_task(
+        &f.store,
+        "Refund the disputed invoice",
+        json!({ "$sealed": "AAECAwQFBgc=" }),
+        Some(agentplane::core::Withheld::Sealed),
+    )
+    .await;
+
+    let (status, body) = send(&f.router(), get(&format!("/tasks/{task}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["withheld"], "sealed", "{body}");
+    assert_eq!(
+        body["justification"]["proposed_action"],
+        Value::Null,
+        "{body}"
+    );
+    assert_eq!(body["rendering"]["withheld"], "sealed", "{body}");
+    assert_eq!(body["rendering"]["proposed_action"], Value::Null, "{body}");
+    assert!(
+        !body.to_string().contains("$sealed"),
+        "the envelope was served as a value: {body}"
+    );
+}
+
+/// **An approval of a withheld proposal is refused in a class of its own.**
+///
+/// Not a conflict — nobody else holds the task and retrying here fails the
+/// same way. 422 with the reason, and the rejection that needs no proposal
+/// still records.
+#[tokio::test]
+async fn a_withheld_proposal_refuses_an_approval_with_its_own_status() {
+    let f = fixture();
+    let task = listed_task(
+        &f.store,
+        "Refund the disputed invoice",
+        json!({ "$sealed": "AAECAwQFBgc=" }),
+        Some(agentplane::core::Withheld::Erased),
+    )
+    .await;
+    let router = f.router();
+
+    let (status, body) = send(
+        &router,
+        post(
+            &format!("/tasks/{task}/decide"),
+            Some("bob"),
+            &json!({ "approved": true, "reason": "looks fine" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.to_string().contains("erased"), "{body}");
+
+    let (status, body) = send(
+        &router,
+        post(
+            &format!("/tasks/{task}/decide"),
+            Some("bob"),
+            &json!({ "approved": false, "reason": "cannot see it, so no" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a rejection of the unseen is safe: {body}"
+    );
+}
+
+/// **Every hidden or direction-changing code point is shown, on the view a
+/// person reads.**
+///
+/// A tag-character suffix on a destination, a right-to-left override that
+/// reverses an amount's digits, a zero-width space in a payee: each renders
+/// as nothing, or as something else, in a client that prints the value. The
+/// rendering escapes each in place and says it did.
+#[tokio::test]
+async fn every_surface_escapes_what_a_reviewer_cannot_see() {
+    let f = fixture();
+    let task = listed_task(
+        &f.store,
+        "Pay\u{200B} the vendor",
+        json!({
+            "destination": "DE89\u{E0041}\u{E0042}",
+            "amount": "\u{202E}0001",
+        }),
+        None,
+    )
+    .await;
+
+    let (status, body) = send(&f.router(), get(&format!("/tasks/{task}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let shown = &body["rendering"];
+    assert_eq!(shown["escaped"], true, "{body}");
+    assert_eq!(shown["summary"], "Pay\\u{200B} the vendor", "{body}");
+    assert_eq!(
+        shown["proposed_action"]["destination"], "DE89\\u{E0041}\\u{E0042}",
+        "{body}"
+    );
+    assert_eq!(
+        shown["proposed_action"]["amount"], "\\u{202E}0001",
+        "{body}"
+    );
+    let rendered = shown.to_string();
+    for hidden in ['\u{200B}', '\u{E0041}', '\u{202E}'] {
+        assert!(
+            !rendered.contains(hidden),
+            "U+{:04X} reached the rendering raw: {rendered}",
+            hidden as u32
+        );
+    }
+}
+
+/// **A word mixing alphabets is flagged beside it, and left as written.**
+///
+/// A Cyrillic `а` in a Latin payee is the homoglyph a reviewer cannot see.
+/// The plane holds no script policy, so it refuses nothing and changes
+/// nothing — it says which word, where, and which scripts.
+#[tokio::test]
+async fn a_word_mixing_scripts_is_flagged() {
+    let f = fixture();
+    let task = listed_task(
+        &f.store,
+        "Pay the vendor",
+        json!({ "payee": "P\u{430}ypal Europe" }),
+        None,
+    )
+    .await;
+
+    let (_, body) = send(&f.router(), get(&format!("/tasks/{task}"), Some("bob"))).await;
+    let shown = &body["rendering"];
+    assert_eq!(shown["escaped"], false, "nothing here is hidden: {body}");
+    assert_eq!(
+        shown["proposed_action"]["payee"], "P\u{430}ypal Europe",
+        "a flagged word is shown as written: {body}"
+    );
+    assert_eq!(
+        shown["mixed_script"],
+        json!([{
+            "at": "proposed_action/payee",
+            "word": "P\u{430}ypal",
+            "scripts": ["Latin", "Cyrillic"],
+        }]),
+        "{body}"
+    );
+}
+
+/// **Clear arguments spelled like the sealed marker are arguments.**
+///
+/// Nothing sealed them, so nothing withholds them: the view shows them as
+/// the value they are, and only the out-of-band reason could say otherwise.
+#[tokio::test]
+async fn an_argument_spelled_like_the_sealed_marker_is_not_withheld() {
+    let f = fixture();
+    let task = listed_task(
+        &f.store,
+        "Store this note",
+        json!({ "$sealed": "AAECAwQFBgc=" }),
+        None,
+    )
+    .await;
+    let (_, body) = send(&f.router(), get(&format!("/tasks/{task}"), Some("bob"))).await;
+    assert!(body.get("withheld").is_none(), "{body}");
+    assert_eq!(
+        body["rendering"]["proposed_action"],
+        json!({ "$sealed": "AAECAwQFBgc=" }),
+        "{body}"
     );
 }

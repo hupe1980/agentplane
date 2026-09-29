@@ -7,9 +7,8 @@ weight = 3
 group = "Start here"
 +++
 
-The vocabulary. Nine ideas, then the two surfaces you program against —
-everything else in the crate is a consequence of one of them. Read this once and
-the rest of the documentation stops needing footnotes.
+The vocabulary, then the two surfaces you program against — everything else
+in the crate is a consequence of one of them.
 
 ---
 
@@ -64,7 +63,7 @@ Append-only, hash-chained, one row per record. `hash = H(prev_hash ‖ record)`.
 
 It is not a log *of* the run. It **is** the run — the thing recovery reads, the
 thing an auditor checks, the thing cost is summed from, the thing a regression
-test replays. Six obligations, one mechanism.
+test replays.
 
 That fusion is the design's central bet: **an audit trail that is also the
 recovery mechanism cannot quietly rot**, because the system stops working with
@@ -259,8 +258,7 @@ escalates to the higher, provenance accumulates. Model output derived from
 untrusted input stays untrusted, which is the rule most systems get wrong.
 
 The label is applied **by the effect, at the source** — not by the caller. A
-label the caller applies is a label the caller forgets, and this crate's own test
-fixtures forgot it once, which made an existing guarantee untestable for months.
+label the caller applies is a label the caller forgets.
 
 Every outbound effect must go through the sink gate — `cx.sink_with`, or the
 two-arg `cx.sink` for an effect that binds its outbound value internally —
@@ -309,10 +307,7 @@ This is a design statement, not an API detail, and it is the thing to know
 before designing around `commission`.
 
 `StepCtx::commission` takes `&mut self` and is singular, and there is no
-`join`/`select` helper anywhere — so it is easy to conclude that in-run fan-out
-is impossible and to put the concurrency above the runtime. That conclusion is
-wrong, and it has been reached and written down as settled by at least one
-evaluation.
+`join`/`select` helper — which does not make in-run fan-out impossible.
 
 Independent nodes are a **ready set**: `PlanIR::fan_out` dispatches every branch
 concurrently inside one run, each with its own journal slice, feeding one
@@ -326,8 +321,7 @@ let out = rt.run_plan(plan, Tainted::trusted(input)).await?;
 ```
 
 `PlanIR` lives in `agentplane::core`, not `agentplane::plan` — the `plan` module
-holds `Contract`, `Replanner` and `validate`. That split is a fair share of why
-the type gets missed.
+holds `Contract`, `Replanner` and `validate`.
 
 Determinism does not depend on completion order: admission happens in
 deterministic ready order, outcomes are applied in deterministic ready order,
@@ -395,9 +389,11 @@ wire types deliberately carry **no actor field** — who is acting comes from th
 request's identity, never from its body, so an approval cannot be forged by the
 thing being approved.
 
-Unattended expiry needs two explicit opt-ins: a declared `on_expiry: proceed`
-*and* `allow_unattended: true`. Acting with no human is a greppable decision
-somebody made rather than an enum variant they picked off a list.
+Unattended expiry needs two explicit opt-ins in the declaration: `on_expiry:
+proceed` *and* `allow_unattended: true` (in Rust, the one spelling
+`Expiry::ProceedUnattended`). Both belong to the agent's author — no deployment
+setting grants or withholds it — so acting with no human is a greppable
+decision somebody made rather than an enum variant they picked off a list.
 
 See the [manifest reference](@/docs/manifest.md#spec-oversight) for the
 declaration, and `api::{Worklist, TaskView, DecisionRequest}` for the HTTP
@@ -430,15 +426,13 @@ discovering one call at a time.
 | `group()` | a transactional effect group |
 | `manifest()`, `budget()`, `run_id()` | what this agent was declared to be, and what it has spent |
 
-Two things about `commission` are worth stating because every multi-agent
-adopter asks: it takes `&mut self` and is **singular**, so a step delegates to
-one peer at a time. That is deliberate rather than unfinished. `StepCtx` is the
-deterministic admission boundary — journal position, policy and budget decisions
-all pass through it — and handing out concurrent borrows would move those
-decisions outside it. **Fan out above the runtime**: independent opinions are
-better as independent runs with their own journals, which is also what makes each
-one separately replayable. There is no `join`/`select` helper and there
-deliberately will not be one.
+`commission` takes `&mut self` and is **singular**, so a step delegates to one
+peer at a time. `StepCtx` is the deterministic admission boundary — journal
+position, policy and budget decisions all pass through it — and handing out
+concurrent borrows would move those decisions outside it. Concurrency belongs to
+the plan: independent nodes are a
+[ready set](#the-unit-of-concurrency-is-the-plan-node), each branch with its own
+journal slice.
 
 ## 12. 📄 Coded and declarative agents {#agent-tiers}
 

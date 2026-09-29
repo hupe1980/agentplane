@@ -1176,7 +1176,7 @@ fn null_stripping_is_visible_to_an_audit() {
 /// The runtime describes the declaration to policy so a rule can bind to the
 /// **digest** rather than to a reusable name. One field it sends is `publisher`,
 /// the key that vouched for the manifest — and most manifests have none, because
-/// publisher attestation is opt-in.
+/// publisher signature is opt-in.
 ///
 /// `Option::None` serialized straight into the context put a JSON `null` there,
 /// which by the test above makes the entire request unevaluable. So **every run
@@ -1329,4 +1329,279 @@ fn a_default_deny_policy_set_still_assembles() {
         ))
         .try_build()
         .expect("a set that denies everything is a working plane, not a broken one");
+}
+
+// ── Every published Cedar snippet survives the plane's own preflight ────────
+
+/// One published snippet: where it came from, whether it is a counter-example,
+/// and its source.
+struct Snippet {
+    origin: String,
+    refused: bool,
+    source: String,
+}
+
+/// The fence info strings this guard reads: `cedar` is a policy to copy,
+/// `cedar,refused` a counter-example that must fail the preflight.
+fn fence_kind(info: &str) -> Option<bool> {
+    match info.trim() {
+        "cedar" => Some(false),
+        "cedar,refused" => Some(true),
+        _ => None,
+    }
+}
+
+/// Fenced blocks from `lines`, each already stripped of any comment prefix.
+fn fenced(origin: &str, lines: impl Iterator<Item = String>, out: &mut Vec<Snippet>) {
+    let mut open: Option<(bool, Vec<String>, usize)> = None;
+    for (number, line) in lines.enumerate() {
+        let trimmed = line.trim_start();
+        match open.take() {
+            None => {
+                if let Some(info) = trimmed.strip_prefix("```")
+                    && let Some(refused) = fence_kind(info)
+                {
+                    open = Some((refused, Vec::new(), number + 1));
+                }
+            }
+            Some((refused, body, start)) if trimmed.starts_with("```") => {
+                out.push(Snippet {
+                    origin: format!("{origin}:{start}"),
+                    refused,
+                    source: body.join("\n"),
+                });
+            }
+            Some((refused, mut body, start)) => {
+                body.push(line);
+                open = Some((refused, body, start));
+            }
+        }
+    }
+    assert!(open.is_none(), "{origin}: a cedar fence is never closed");
+}
+
+fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("a source directory") {
+        let path = entry.expect("a directory entry").path();
+        if path.is_dir() {
+            rust_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every Cedar policy this repository publishes: the site's docs, the README,
+/// the example policy files, and the doc comments in `src/`.
+fn published_snippets() -> Vec<Snippet> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+
+    let mut pages: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("site/content/docs"))
+        .expect("the docs directory")
+        .map(|e| e.expect("a docs entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    pages.push(root.join("README.md"));
+    for page in pages {
+        let text = std::fs::read_to_string(&page).expect("a readable page");
+        fenced(
+            &page.display().to_string(),
+            text.lines().map(ToOwned::to_owned),
+            &mut out,
+        );
+    }
+
+    for entry in std::fs::read_dir(root.join("examples")).expect("the examples directory") {
+        let path = entry.expect("an examples entry").path();
+        if path.extension().is_some_and(|e| e == "cedar") {
+            out.push(Snippet {
+                origin: path.display().to_string(),
+                refused: false,
+                source: std::fs::read_to_string(&path).expect("a readable policy file"),
+            });
+        }
+    }
+
+    let mut sources = Vec::new();
+    rust_files(&root.join("src"), &mut sources);
+    for file in sources {
+        let text = std::fs::read_to_string(&file).expect("a readable source file");
+        // Doc comments only, with the prefix and its one space removed. A
+        // non-doc line keeps its place so a fence's line number stays true.
+        let docs = text.lines().map(|line| {
+            let t = line.trim_start();
+            t.strip_prefix("//!")
+                .or_else(|| t.strip_prefix("///"))
+                .map(|rest| rest.strip_prefix(' ').unwrap_or(rest).to_owned())
+                .unwrap_or_default()
+        });
+        fenced(&file.display().to_string(), docs, &mut out);
+    }
+    out
+}
+
+/// Why `source` would refuse a plane, a served surface, or both — empty when
+/// it would not, on a plane with a chain and on one without.
+fn preflight_refusals(source: &str) -> Vec<String> {
+    let engine = match CedarEngine::new(source) {
+        Ok(engine) => Arc::new(engine),
+        Err(e) => return vec![format!("does not compile: {e}")],
+    };
+    let chain = Delegation::root(Principal::new("user:hupe", Scope::root()))
+        .delegate(Principal::new("pay", Scope::of(["pay"])))
+        .expect("a one-link chain");
+    let mut refusals = Vec::new();
+    for identity in [None, Some(chain)] {
+        let shape = if identity.is_some() {
+            "with a chain"
+        } else {
+            "without a chain"
+        };
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
+        let mut builder = Runtime::builder(store as Arc<dyn JournalStore>)
+            .policy(Arc::clone(&engine) as Arc<dyn PolicyEngine>);
+        if let Some(chain) = identity {
+            builder = builder.acting_as(chain);
+        }
+        if let Err(e) = builder.try_build() {
+            refusals.push(format!("plane {shape}: {e}"));
+        }
+    }
+    #[cfg(feature = "http")]
+    refusals.extend(
+        agentplane::api::policy_problems(engine.as_ref())
+            .into_iter()
+            .map(|p| format!("operator API: {p}")),
+    );
+    #[cfg(feature = "a2a-server")]
+    refusals.extend(
+        agentplane::api::a2a::policy_problems(engine.as_ref())
+            .into_iter()
+            .map(|p| format!("A2A: {p}")),
+    );
+    refusals
+}
+
+/// Every Cedar policy the repository publishes assembles a plane and a served
+/// surface — with a delegation chain and without one.
+///
+/// A published rule is one somebody copies. Several did not survive their own
+/// runtime: an amount ceiling read an argument every other effect lacks, a
+/// taint gate read `context.label` on mutating calls that carry none, and a
+/// depth cap refused every operator request. Each compiled cleanly and was
+/// refused — or denied everything — only once a plane evaluated it.
+///
+/// A counter-example is fenced as `cedar,refused` and must be refused, so a
+/// page cannot show a broken rule as the fix.
+#[test]
+fn every_published_cedar_snippet_passes_the_preflight_it_will_meet() {
+    let snippets = published_snippets();
+    assert!(
+        snippets.len() >= 10,
+        "only {} cedar snippets were found across the docs, README, examples \
+         and doc comments — the scan stopped matching them, and this guard is \
+         now inert",
+        snippets.len()
+    );
+    for snippet in &snippets {
+        let refusals = preflight_refusals(&snippet.source);
+        if snippet.refused {
+            assert!(
+                !refusals.is_empty(),
+                "{} is published as a counter-example and passes the preflight:\n{}",
+                snippet.origin,
+                snippet.source
+            );
+        } else {
+            assert!(
+                refusals.is_empty(),
+                "{} publishes a policy the plane refuses:\n{}\n{}",
+                snippet.origin,
+                snippet.source,
+                refusals.join("\n")
+            );
+        }
+    }
+}
+
+/// The published taint gate as it used to read: `&&` short-circuits on a read,
+/// so only a *mutating* probe reaches `context.label` — which a mutating
+/// non-sink call does not carry.
+#[test]
+fn the_preflight_asks_a_mutating_call_without_a_label() {
+    let old = r#"
+        permit(principal, action == Action::"effect:perform", resource);
+        forbid(principal, action == Action::"effect:perform", resource)
+        when { context.mutates && context.label.trust == "untrusted" };
+    "#;
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let err = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(CedarEngine::new(old).expect("it compiles")))
+        .try_build()
+        .expect_err("every mutating effect() call would be refused as malformed");
+    assert!(err.to_string().contains("label"), "{err}");
+}
+
+/// A rule scoped to one resource is evaluated on that resource, where a probe
+/// on a placeholder never reaches it.
+#[test]
+fn the_preflight_asks_every_resource_a_rule_names() {
+    let old = r#"
+        permit(principal, action, resource);
+        forbid(
+            principal,
+            action == Action::"effect:perform",
+            resource == Resource::"payment.transfer"
+        ) when { context.args.amount_eur > 5000 };
+    "#;
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let err = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(CedarEngine::new(old).expect("it compiles")))
+        .try_build()
+        .expect_err("every transfer without the argument would be refused as malformed");
+    let text = err.to_string();
+    assert!(
+        text.contains("payment.transfer") && text.contains("amount_eur"),
+        "{text}"
+    );
+}
+
+/// The published depth cap as it used to read: correct on a plane with a
+/// chain, and a 500 on every operator request, which carries no depth.
+#[cfg(feature = "http")]
+#[test]
+fn a_depth_cap_with_no_action_scope_is_refused_by_the_operator_api() {
+    #[derive(Debug)]
+    struct Nobody;
+    #[async_trait::async_trait]
+    impl agentplane::api::Authenticator for Nobody {
+        async fn authenticate(
+            &self,
+            _: &axum::http::HeaderMap,
+        ) -> Result<agentplane::api::Caller, agentplane::api::AuthError> {
+            Err(agentplane::api::AuthError::Missing)
+        }
+    }
+
+    let old = r"
+        permit(principal, action, resource);
+        forbid(principal, action, resource) when { context.delegation_depth >= 3 };
+    ";
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(CedarEngine::new(old).expect("it compiles")))
+        .acting_as(Delegation::root(Principal::new("user:hupe", Scope::root())))
+        .try_build()
+        .expect("every runtime request of this plane carries the depth");
+    let err = agentplane::api::Api::new(rt, Arc::new(Nobody))
+        .expect_err("every operator request would be refused as malformed");
+    assert!(
+        matches!(
+            err,
+            agentplane::api::ApiSetupError::PolicyUnevaluable { .. }
+        ),
+        "{err}"
+    );
+    assert!(err.to_string().contains("delegation_depth"), "{err}");
 }

@@ -21,7 +21,10 @@
 //! well that it reached the provider, because we watched it generate. What we
 //! lack is the *answer*, and repeating the call buys a second bill for the same
 //! question. `InDoubt` would invite [`Recovery`] to resolve an outcome that is
-//! not in doubt at all.
+//! not in doubt at all. Because a completion changes nothing in the world, a
+//! landed failure is still repeated when the call's [`RetryPolicy`] permits —
+//! whether a second bill is worth an answer is the caller's call, and the
+//! default policy declines.
 //!
 //! # Determinism
 //!
@@ -590,11 +593,13 @@ pub struct Usage {
     /// as wrong.
     #[serde(default)]
     pub cache_read_tokens: u64,
-    /// Money in minor units, if the provider reports it.
+    /// Money in minor units.
     ///
-    /// Priced by the driver rather than derived here: rates change, differ per
-    /// model, and are a deployment's contract with its provider, not this
-    /// crate's guess.
+    /// Filled from the [`Pricing`] the call was configured with, at the effect
+    /// boundary — rates change, differ per model, and are a deployment's
+    /// contract with its provider, not this crate's guess. Zero from an
+    /// unpriced call, which is why a money ceiling is refused beside a model
+    /// role that states no price.
     pub minor_units: u64,
 }
 
@@ -624,7 +629,11 @@ impl Usage {
         cache_read_tokens: u64,
     ) -> Self {
         Self {
-            input_tokens: input_tokens + cache_write_tokens + cache_read_tokens,
+            // Saturating, for the reason `spend` is: these are a provider's
+            // numbers, and a wrapped sum bills astronomical usage as nothing.
+            input_tokens: input_tokens
+                .saturating_add(cache_write_tokens)
+                .saturating_add(cache_read_tokens),
             output_tokens,
             cache_write_tokens,
             cache_read_tokens,
@@ -662,6 +671,53 @@ impl Usage {
         self.input_tokens
             .saturating_sub(self.cache_write_tokens)
             .saturating_sub(self.cache_read_tokens)
+    }
+}
+
+/// What a model's tokens cost, as the deployment states it.
+///
+/// Every rate is in **minor units per million tokens** — integers, so a price
+/// cannot fail to bind by a rounding error. There is no built-in price table:
+/// rates change, differ per model and per contract, and a number this crate
+/// guessed would be a ceiling that binds at the wrong place without saying so,
+/// so a deployment that declares a money ceiling states what its models cost.
+///
+/// All four rates are required. Cache writes are billed at a premium and cache
+/// reads at a fraction of the input rate, and defaulting either to the input
+/// rate would be a guess in one direction or the other; a provider with no
+/// cache-write charge states `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Pricing {
+    /// Ordinary input tokens — neither written to nor read from a cache.
+    pub input: u64,
+    /// Generated tokens, reasoning included.
+    pub output: u64,
+    /// Input tokens served from a cache.
+    pub cache_read: u64,
+    /// Input tokens written into a cache.
+    pub cache_write: u64,
+}
+
+impl Pricing {
+    /// What `usage` costs, in minor units, rounded **up**.
+    ///
+    /// Up, because this figure feeds a ceiling: a call priced at a fraction of
+    /// a cent is not free, and a thousand of them rounded down would pass a
+    /// money limit they exceeded. Saturating, because the counts are whatever
+    /// a provider's response said they were.
+    #[must_use]
+    pub fn price(&self, usage: &Usage) -> u64 {
+        let parts = [
+            (usage.uncached_input_tokens(), self.input),
+            (usage.output_tokens, self.output),
+            (usage.cache_read_tokens, self.cache_read),
+            (usage.cache_write_tokens, self.cache_write),
+        ];
+        let micro = parts.iter().fold(0u128, |sum, (tokens, rate)| {
+            sum.saturating_add(u128::from(*tokens).saturating_mul(u128::from(*rate)))
+        });
+        u64::try_from(micro.div_ceil(1_000_000)).unwrap_or(u64::MAX)
     }
 }
 
@@ -989,8 +1045,12 @@ pub struct ModelRole {
     pub model: ModelId,
     /// Cap on generated tokens, when the declaration set one.
     pub max_output_tokens: Option<u32>,
+    /// Cap on the tokens one call may send, when the declaration set one.
+    pub max_input_tokens: Option<u32>,
     /// Requested reasoning depth, when the declaration set one.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// What this role's tokens cost, when the declaration stated it.
+    pub pricing: Option<Pricing>,
 }
 
 impl ModelRole {
@@ -1000,7 +1060,9 @@ impl ModelRole {
         Self {
             model,
             max_output_tokens: None,
+            max_input_tokens: None,
             reasoning_effort: None,
+            pricing: None,
         }
     }
 
@@ -1014,8 +1076,14 @@ impl ModelRole {
         if let Some(max_output_tokens) = self.max_output_tokens {
             call = call.with_max_output_tokens(max_output_tokens);
         }
+        if let Some(max_input_tokens) = self.max_input_tokens {
+            call = call.with_max_input_tokens(max_input_tokens);
+        }
         if let Some(effort) = self.reasoning_effort {
             call = call.with_reasoning_effort(effort);
+        }
+        if let Some(pricing) = self.pricing {
+            call = call.with_pricing(pricing);
         }
         call
     }
@@ -1158,7 +1226,10 @@ pub trait ModelProvider: Send + Sync + Debug {
     /// It is part of [`ModelCall`]'s effect identity. A provider switching from
     /// native schema enforcement to a forced tool, changing endpoint/API
     /// version, or changing streaming behavior must not replay an answer
-    /// produced under the old transport contract. API keys never belong here.
+    /// produced under the old transport contract. API keys never belong here,
+    /// and neither does anything that changes only how this plane waits — a
+    /// timeout is not part of the request, and two deployments differing only
+    /// in patience must replay each other's history.
     fn request_profile(&self, _model: &ModelId) -> Value {
         Value::Null
     }
@@ -1289,15 +1360,21 @@ pub struct ModelCall {
     continuation: Option<ProviderContinuation>,
     stream: Option<Arc<dyn ModelStreamObserver>>,
     max_output_tokens: u32,
+    /// What one call may send, when a role declared it. Checked against the
+    /// provider's reported usage, since input cannot be bounded before it.
+    max_input_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
+    pricing: Option<Pricing>,
     provider: Arc<dyn ModelProvider>,
     max_sensitivity: Sensitivity,
     output_sensitivity: Sensitivity,
     retry: RetryPolicy,
     #[cfg(feature = "media")]
     media: Option<Arc<dyn crate::blob::BlobStore>>,
+    /// Each granted artifact, with its size in bytes: the size is what an
+    /// egress ceiling counts when the marker in the prompt is materialized.
     #[cfg(feature = "media")]
-    media_grants: std::collections::BTreeSet<(crate::core::Digest, String)>,
+    media_grants: std::collections::BTreeMap<(crate::core::Digest, String), u64>,
     /// `/system` when the prompt has one, empty otherwise.
     ///
     /// Computed at construction rather than returned fresh, because
@@ -1308,9 +1385,14 @@ pub struct ModelCall {
 }
 
 impl ModelCall {
-    /// Conservative per-call output ceiling used when the caller does not set
-    /// one explicitly.
-    pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
+    /// Per-call output ceiling used when the caller does not set one.
+    ///
+    /// Sized for reasoning models, whose thinking tokens count against the
+    /// same limit as the answer: at 4096 a model reasoning at medium effort
+    /// regularly spends the whole allowance thinking and returns a truncated
+    /// turn with no answer in it. A role that needs a tighter bound declares
+    /// `max_tokens`; the spend ceilings, not this default, bound cost.
+    pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
     /// A completion from this provider.
     #[must_use]
@@ -1324,7 +1406,9 @@ impl ModelCall {
             continuation: None,
             stream: None,
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
+            max_input_tokens: None,
             reasoning_effort: None,
+            pricing: None,
             provider,
             max_sensitivity: Sensitivity::Public,
             output_sensitivity: Sensitivity::Public,
@@ -1332,7 +1416,7 @@ impl ModelCall {
             #[cfg(feature = "media")]
             media: None,
             #[cfg(feature = "media")]
-            media_grants: std::collections::BTreeSet::new(),
+            media_grants: std::collections::BTreeMap::new(),
             protected: Vec::new(),
         }
         .with_protected_instruction()
@@ -1422,11 +1506,47 @@ impl ModelCall {
         self
     }
 
+    /// Bound how many tokens this call may send, cached ones included.
+    ///
+    /// Input cannot be bounded before the call — it is whatever the
+    /// conversation has grown to — so this is held against the usage the
+    /// provider reports: a completion that sent more is a failed call, billed
+    /// as reported. That keeps the per-call figure a tenant's spend quota
+    /// reserves a bound on every answer a run goes on to use. Not part of the
+    /// effect key: it changes which answers are accepted, not what the
+    /// provider is asked.
+    #[must_use]
+    pub const fn with_max_input_tokens(mut self, max_input_tokens: u32) -> Self {
+        self.max_input_tokens = Some(max_input_tokens);
+        self
+    }
+
     /// Request an explicit reasoning depth.
     #[must_use]
     pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
         self
+    }
+
+    /// Price this call's usage, so its spend carries money as well as tokens.
+    ///
+    /// Applied at the effect boundary to every usage the call reports — the
+    /// answer's and a metered failure's alike — so a money ceiling counts a
+    /// stream that died after generating exactly as it counts one that
+    /// finished. Not part of the effect key: a price changes what the run is
+    /// billed, not what the provider is asked.
+    #[must_use]
+    pub const fn with_pricing(mut self, pricing: Pricing) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
+    /// `usage` with its money filled from this call's pricing, if it has one.
+    fn priced(&self, mut usage: Usage) -> Usage {
+        if let Some(pricing) = self.pricing {
+            usage.minor_units = pricing.price(&usage);
+        }
+        usage
     }
 
     /// The highest sensitivity this model may be shown.
@@ -1495,8 +1615,10 @@ impl ModelCall {
     ) -> Self {
         self.media = Some(media);
         for artifact in artifacts {
-            self.media_grants
-                .insert((artifact.digest, artifact.media_type.clone()));
+            self.media_grants.insert(
+                (artifact.digest, artifact.media_type.clone()),
+                artifact.bytes as u64,
+            );
         }
         self
     }
@@ -1621,6 +1743,26 @@ impl Effect for ModelCall {
         Some(&self.prompt)
     }
 
+    /// Everything the provider is sent, not only the prompt the sink gate
+    /// binds.
+    ///
+    /// The prompt of a tool-loop turn can be two bytes while the request
+    /// carries every declared tool, every earlier tool result, the provider's
+    /// continuation state and each granted image — and all of it leaves the
+    /// plane. So the figure is the canonical size of every provider-visible
+    /// input (the same set the effect key holds) plus each referenced media
+    /// artifact at its encoded size, since the marker in the prompt is a few
+    /// dozen bytes standing in for megabytes.
+    fn outbound_bytes(&self) -> u64 {
+        let request = crate::core::canon::to_bytes(&self.descriptor().args)
+            .map_or(0, |bytes| bytes.len() as u64);
+        #[cfg(feature = "media")]
+        let media = granted_media_bytes(&self.prompt, &self.media_grants);
+        #[cfg(not(feature = "media"))]
+        let media = 0;
+        request.saturating_add(media)
+    }
+
     /// Model output is untrusted, and this is the case the rule was written for.
     ///
     /// A completion is a plausible-sounding string produced from whatever was in
@@ -1711,14 +1853,28 @@ impl Effect for ModelCall {
         // relies on it: `structured` is indexed into rather than re-checked.
         // Held here as well as in each driver, for the reason stated above the
         // media check — the provider trait is public.
-        let answered = answered.and_then(|completion| {
+        let answered = answered.and_then(|mut completion| {
+            completion.usage = self.priced(completion.usage);
+            if let Some(max) = self.max_input_tokens
+                && completion.usage.input_tokens > u64::from(max)
+            {
+                return Err(ModelError::Unusable {
+                    model: self.model.clone(),
+                    usage: completion.usage,
+                    detail: format!(
+                        "the call sent {} input token(s), over the {max} its role declares \
+                         as max_input_tokens",
+                        completion.usage.input_tokens
+                    ),
+                });
+            }
             honour_declared_schema(&completion, self.schema.as_ref(), &self.model)?;
             Ok(completion)
         });
 
         answered.map_err(|e| {
             let detail = e.to_string();
-            let spend = e.usage().spend();
+            let spend = self.priced(e.usage()).spend();
             // A failure that consumed nothing is an ordinary failure. One
             // that generated tokens has to carry them, or the ceiling that
             // exists to bound a runaway provider counts zero.
@@ -1782,7 +1938,7 @@ struct MediaMaterialization {
 async fn materialize_media(
     prompt: &Value,
     store: Option<&Arc<dyn crate::blob::BlobStore>>,
-    grants: &std::collections::BTreeSet<(crate::core::Digest, String)>,
+    grants: &std::collections::BTreeMap<(crate::core::Digest, String), u64>,
 ) -> Result<Value, EffectError> {
     let mut references = Vec::new();
     collect_media_references(prompt, &mut references)?;
@@ -1800,7 +1956,7 @@ async fn materialize_media(
 
     let mut replacements = std::collections::BTreeMap::new();
     for reference in references {
-        if !grants.contains(&(reference.digest, reference.media_type.clone())) {
+        if !grants.contains_key(&(reference.digest, reference.media_type.clone())) {
             return Err(EffectError::Rejected(format!(
                 "governed media {} with type '{}' is not explicitly granted to this model call",
                 reference.digest, reference.media_type
@@ -1828,6 +1984,37 @@ async fn materialize_media(
     }
 
     replace_media_references(prompt, &replacements)
+}
+
+/// The encoded size of every granted artifact the prompt references.
+///
+/// Base64 with the data-URL prefix where the marker asks for one: the size the
+/// bytes will have on the wire. A reference with no grant counts nothing —
+/// dispatch refuses it before anything is sent.
+#[cfg(feature = "media")]
+fn granted_media_bytes(
+    prompt: &Value,
+    grants: &std::collections::BTreeMap<(crate::core::Digest, String), u64>,
+) -> u64 {
+    let mut references = Vec::new();
+    if collect_media_references(prompt, &mut references).is_err() {
+        return 0;
+    }
+    references.sort();
+    references.dedup();
+    references
+        .iter()
+        .filter_map(|reference| {
+            let size = grants.get(&(reference.digest, reference.media_type.clone()))?;
+            let encoded = size.div_ceil(3).saturating_mul(4);
+            let prefix = if reference.encoding == "data_url" {
+                format!("data:{};base64,", reference.media_type).len() as u64
+            } else {
+                0
+            };
+            Some(encoded.saturating_add(prefix))
+        })
+        .fold(0u64, u64::saturating_add)
 }
 
 #[cfg(feature = "media")]
@@ -2024,6 +2211,98 @@ mod tests {
         );
     }
 
+    /// A price is per million tokens, split by rate, and rounded up.
+    ///
+    /// Up because it feeds a ceiling: a thousand sub-cent calls rounded down
+    /// would pass a money limit they exceeded.
+    #[test]
+    fn pricing_splits_cached_input_and_rounds_up() {
+        let pricing = Pricing {
+            input: 300,
+            output: 1_500,
+            cache_read: 30,
+            cache_write: 375,
+        };
+        let usage = Usage {
+            input_tokens: 1_000_000,
+            output_tokens: 100_000,
+            cache_write_tokens: 200_000,
+            cache_read_tokens: 400_000,
+            minor_units: 0,
+        };
+        // 400k uncached at 300, 100k out at 1500, 400k read at 30, 200k write at 375.
+        assert_eq!(pricing.price(&usage), 120 + 150 + 12 + 75);
+        let one = Usage {
+            output_tokens: 1,
+            ..Usage::default()
+        };
+        assert_eq!(pricing.price(&one), 1, "a sub-cent call was priced as free");
+        let hostile = Usage {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        assert_eq!(
+            u128::from(pricing.price(&hostile)),
+            (u128::from(u64::MAX) * 1_800).div_ceil(1_000_000),
+            "provider-reported counts wrapped the price"
+        );
+    }
+
+    /// A driver's timeout is how long this plane waits, not what it asks.
+    ///
+    /// The profile is effect identity, and a timeout changes nothing on the
+    /// wire: two deployments differing only in patience must replay each
+    /// other's history rather than report divergence on every model call.
+    #[cfg(feature = "providers")]
+    #[test]
+    fn a_drivers_timeout_is_not_part_of_the_effect_identity() {
+        use std::time::Duration;
+        let pairs: Vec<(Arc<dyn ModelProvider>, Arc<dyn ModelProvider>)> = vec![
+            (
+                Arc::new(anthropic::Anthropic::new("k").unwrap()),
+                Arc::new(
+                    anthropic::Anthropic::new("k")
+                        .unwrap()
+                        .timeout(Duration::from_secs(7)),
+                ),
+            ),
+            (
+                Arc::new(openai::OpenAi::new("k").unwrap()),
+                Arc::new(
+                    openai::OpenAi::new("k")
+                        .unwrap()
+                        .timeout(Duration::from_secs(7)),
+                ),
+            ),
+            (
+                Arc::new(gemini::Gemini::new("k").unwrap()),
+                Arc::new(
+                    gemini::Gemini::new("k")
+                        .unwrap()
+                        .timeout(Duration::from_secs(7)),
+                ),
+            ),
+            (
+                Arc::new(chat_completions::ChatCompletions::new("https://llm.example/v1").unwrap()),
+                Arc::new(
+                    chat_completions::ChatCompletions::new("https://llm.example/v1")
+                        .unwrap()
+                        .timeout(Duration::from_secs(7)),
+                ),
+            ),
+        ];
+        for (patient, hasty) in pairs {
+            let model = ModelId::new("p", "m");
+            let a = ModelCall::new(patient, model.clone(), json!({"q": "hi"})).descriptor();
+            let b = ModelCall::new(hasty, model, json!({"q": "hi"})).descriptor();
+            assert_eq!(
+                a, b,
+                "two drivers differing only in timeout produced different effect identities"
+            );
+        }
+    }
+
     /// Captures the label the runtime hands a driver for live stream delivery.
     #[derive(Debug, Default)]
     struct StreamLabelProbe(std::sync::Mutex<Option<crate::core::Label>>);
@@ -2049,6 +2328,47 @@ mod tests {
     struct DropsEvents;
     impl ModelStreamObserver for DropsEvents {
         fn event(&self, _event: crate::core::Tainted<ModelStreamEvent>) {}
+    }
+
+    /// A completion that sent more than its role's input ceiling is a failed
+    /// call, billed as reported.
+    ///
+    /// Input is the one side of a call nothing bounds before it is sent, so
+    /// the declared ceiling is held against the provider's own count: an
+    /// answer past it is not handed on — the run's next call would carry an
+    /// even longer conversation — and its cost is still counted.
+    #[cfg(feature = "fake-model")]
+    #[tokio::test]
+    async fn a_call_over_its_input_ceiling_fails_and_is_billed() {
+        let prompt = json!({"q": "a prompt long enough to report several input tokens"});
+        let over = ModelCall::new(
+            super::fake::FakeProvider::new(),
+            ModelId::new("fake", "m"),
+            prompt.clone(),
+        )
+        .with_max_input_tokens(2);
+        match over.perform().await {
+            Err(EffectError::Metered {
+                spend,
+                disposition: Disposition::Landed,
+                ..
+            }) => assert!(
+                spend.tokens > 2,
+                "the failed call was not billed: {spend:?}"
+            ),
+            other => panic!("a call past its input ceiling was accepted: {other:?}"),
+        }
+
+        let within = ModelCall::new(
+            super::fake::FakeProvider::new(),
+            ModelId::new("fake", "m"),
+            prompt,
+        )
+        .with_max_input_tokens(10_000);
+        within
+            .perform()
+            .await
+            .expect("a call under its ceiling completes");
     }
 
     /// Stream delivery never carries less than the terminal completion's floor.
@@ -2239,6 +2559,45 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(data_url.starts_with("data:image/png;base64,iVBOR"));
+    }
+
+    /// A granted image counts at the size it will have on the wire.
+    ///
+    /// The prompt holds a marker of a few dozen bytes; the request holds the
+    /// base64 of the whole artifact. An egress ceiling reading the marker
+    /// lets a megabyte image through a kilobyte limit.
+    #[cfg(feature = "media")]
+    #[test]
+    fn a_granted_image_counts_at_its_encoded_size() {
+        use crate::media::{FetchedMedia, MediaRetention};
+
+        let fetched = FetchedMedia {
+            digest: crate::core::Digest::of(b"image"),
+            media_type: "image/png".to_owned(),
+            bytes: 3_000_000,
+            source_url: "https://media.example/a.png".to_owned(),
+            final_url: "https://media.example/a.png".to_owned(),
+            redirects: 0,
+            validated_by: Vec::new(),
+            hops: Vec::new(),
+            retention: MediaRetention::External {
+                policy: "test".to_owned(),
+            },
+        };
+        let call = ModelCall::new(
+            Arc::new(RecordingProvider(Arc::new(AtomicUsize::new(0)))),
+            ModelId::new("openai", "vision"),
+            json!({ "input": [{ "content": [fetched.openai_image()] }] }),
+        )
+        .with_media(
+            Arc::new(crate::blob::MemoryBlobs::new()) as Arc<dyn crate::blob::BlobStore>,
+            [&fetched],
+        );
+        assert!(
+            Effect::outbound_bytes(&call) >= 4_000_000,
+            "a 3 MB image counted as {} bytes of egress",
+            Effect::outbound_bytes(&call)
+        );
     }
 
     #[cfg(feature = "media")]

@@ -1304,4 +1304,14 @@ fn usage_a_provider_invented_cannot_wrap_a_ceiling() {
         minor_units: 0,
     };
     assert_eq!(normal.spend().tokens, 70);
+
+    // Nor can the cache counts a provider reports beside its prompt count: in
+    // a debug build the sum panics, in a release build it wraps to a small
+    // number and the run reads as nearly free.
+    let beside = Usage::with_cache_beside_input(u64::MAX, 1, 5, 5);
+    assert_eq!(
+        beside.input_tokens,
+        u64::MAX,
+        "cache counts reported beside the prompt wrapped the input total"
+    );
 }

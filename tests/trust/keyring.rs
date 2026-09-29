@@ -651,6 +651,8 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             )],
         )
@@ -766,6 +768,101 @@ async fn a_conclusions_reason_is_sealed_and_its_outcome_stays_readable() {
     );
 }
 
+/// A compensation's outcome is a payload, sealed under the case's scope and
+/// erased with it.
+///
+/// On failure it is the compensation's error text — a refund provider's
+/// refusal quoting the charge it was asked to reverse, which is the caller's
+/// data. `compensation` is the declared class and stays readable: the audit
+/// asks *what kind of undo was owed* of a journal whose words are gone.
+#[tokio::test]
+async fn a_compensations_outcome_is_sealed_and_erased_with_the_case() {
+    use agentplane::core::{
+        CaseId, Compensation, Digest, Phase, RunId, StepId, TenantId, Timestamp,
+    };
+    use agentplane::journal::{Append, JournalStore, Record, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+
+    let plain: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+    let tenant = TenantId::default();
+    let sealed = SealedJournal::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant.clone(),
+    );
+
+    let run = RunId::generate();
+    let case = CaseId::generate();
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    sealed
+        .append(
+            lease.epoch,
+            vec![
+                Append::new(
+                    run,
+                    RecordKind::StepCompensated {
+                        compensation: Compensation::Compensatable,
+                        outcome: "refund refused: card 4111 of Ada Lovelace is closed".into(),
+                    },
+                )
+                .step(StepId(1))
+                .phase(Phase::Compensating)
+                .case(case),
+            ],
+        )
+        .await
+        .expect("append");
+
+    let raw = plain.read(run, 1).await.expect("raw read");
+    let RecordKind::StepCompensated {
+        compensation,
+        outcome,
+    } = raw[0].kind()
+    else {
+        panic!("unexpected record: {:?}", raw[0].kind())
+    };
+    assert_eq!(*compensation, Compensation::Compensatable);
+    assert!(
+        payload::is_sealed_text(outcome),
+        "the compensation's outcome reached the store in the clear: {outcome}"
+    );
+    assert!(
+        !String::from_utf8_lossy(raw[0].raw()).contains("Lovelace"),
+        "the plaintext is in the bytes the store keeps"
+    );
+
+    let opened = sealed.read(run, 1).await.expect("read");
+    let RecordKind::StepCompensated { outcome, .. } = opened[0].kind() else {
+        panic!("unexpected record")
+    };
+    assert_eq!(
+        outcome,
+        "refund refused: card 4111 of Ada Lovelace is closed"
+    );
+
+    keys.destroy(
+        &agentplane::keyring::scope(&tenant, &case.to_string()),
+        Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("destroy");
+    let after = sealed.read(run, 1).await.expect("read still works");
+    let RecordKind::StepCompensated { outcome, .. } = after[0].kind() else {
+        panic!("unexpected record")
+    };
+    assert!(
+        payload::is_sealed_text(outcome),
+        "the outcome opened after the case was erased: {outcome}"
+    );
+    Record::verify_chain(&raw, Digest::ZERO).expect("the chain verifies without keys");
+}
+
 /// After the scope's key is destroyed the payload is unreadable **and the
 /// chain still verifies** — an erasure that does not cost the tamper evidence.
 ///
@@ -804,6 +901,8 @@ async fn erasing_the_key_leaves_the_chain_verifiable() {
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             )],
         )
@@ -978,6 +1077,8 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 )
                 .case(case),
@@ -1179,6 +1280,8 @@ async fn a_case_less_runs_payloads_are_erasable_by_run() {
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             )],
         )
@@ -1289,7 +1392,7 @@ async fn a_buffered_event_payload_is_sealed_and_erasable_on_its_own() {
 
     // One message, one scope: erasing this event erases exactly it.
     keys.destroy(
-        &agentplane::keyring::scope(&tenant, "event/bank.example/MSG-7"),
+        &agentplane::keyring::event_scope(&tenant, "bank.example", "MSG-7"),
         at,
         "subject exercised the right to erasure",
     )
@@ -1302,6 +1405,88 @@ async fn a_buffered_event_payload_is_sealed_and_erasable_on_its_own() {
     );
     // Still listed, so the wrong-correlation-key signal survives the erasure.
     assert_eq!(after[0].event.id, "MSG-7");
+}
+
+/// **Erasing one event never destroys another's key.**
+///
+/// A `source` is a URI and routinely contains `/`, so `("bus/x", "1")` and
+/// `("bus", "x/1")` are two producers' messages whose plain `source/id` join
+/// is the same string. Sharing a scope, the first erasure would destroy the
+/// second message's key and report success for both.
+#[tokio::test]
+async fn erasing_one_event_leaves_a_lookalike_pair_readable() {
+    use agentplane::case::EventStore;
+    use agentplane::core::{InboundEvent, TenantId, Timestamp};
+    use agentplane::journal::payload;
+    use agentplane::keyring::SealedEvents;
+
+    let plain: Arc<dyn EventStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let keys = Arc::new(MemoryKeyRing::default());
+    let tenant = TenantId::default();
+    let sealed = SealedEvents::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant.clone(),
+    );
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("time");
+    let event = |source: &str, id: &str| InboundEvent {
+        source: source.to_owned(),
+        id: id.to_owned(),
+        kind: "payment.settled".to_owned(),
+        correlation: vec![agentplane::core::CorrelationKey::new("claim", "NOBODY")],
+        payload: serde_json::json!({ "from": source }),
+        by: None,
+    };
+    assert!(
+        sealed
+            .buffer(&event("bus/x", "1"), at)
+            .await
+            .expect("buffer")
+    );
+    assert!(
+        sealed
+            .buffer(&event("bus", "x/1"), at)
+            .await
+            .expect("buffer")
+    );
+    sealed
+        .sweep_unclaimed(
+            Timestamp::from_unix_timestamp(1_760_009_999).expect("time"),
+            "nobody was waiting",
+        )
+        .await
+        .expect("sweep");
+
+    assert_ne!(
+        agentplane::keyring::event_scope(&tenant, "bus/x", "1"),
+        agentplane::keyring::event_scope(&tenant, "bus", "x/1"),
+        "two producers' messages derive one erasure scope"
+    );
+    let erasure = sealed
+        .erase_event("bus/x", "1", at, "subject exercised the right to erasure")
+        .await
+        .expect("erase");
+    assert!(erasure.is_complete(), "{erasure:?}");
+
+    let letters = sealed.dead_letters(10).await.expect("dead letters");
+    let survivor = letters
+        .iter()
+        .find(|l| l.event.source == "bus")
+        .expect("the other producer's message is still listed");
+    assert_eq!(
+        survivor.event.payload,
+        serde_json::json!({ "from": "bus" }),
+        "erasing ('bus/x', '1') destroyed the key of ('bus', 'x/1')"
+    );
+    let erased = letters
+        .iter()
+        .find(|l| l.event.source == "bus/x")
+        .expect("the erased message is still listed");
+    assert!(
+        erased.event.payload.is_null() || payload::is_sealed(&erased.event.payload),
+        "the erased message still opens"
+    );
 }
 
 /// **One call seals every store the plane holds.**
@@ -1370,6 +1555,8 @@ async fn configuring_a_key_ring_seals_every_store() {
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             )],
         )
@@ -1870,6 +2057,7 @@ async fn a_tasks_evidence_is_sealed_but_its_provenance_is_not() {
         on_expiry: OnExpiry::Deny,
         created_at: agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("t"),
         due_at: None,
+        withheld: None,
     };
     sealed.open(&task).await.expect("opened");
 
@@ -2009,6 +2197,8 @@ async fn a_journal_read_during_a_key_ring_outage_is_not_an_erasure() {
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             )],
         )
@@ -2217,4 +2407,229 @@ impl agentplane::core::Skill for Stalls {
         }
         Ok(agentplane::core::Outcome::done(input))
     }
+}
+
+// ── A strict replay names why it cannot read a sealed run ───────────────────
+
+/// Record one `Stalls` run on a plane sealed under `ring`, and hand back the
+/// store and the run.
+async fn sealed_run(
+    ring: &Arc<dyn KeyRing>,
+) -> (Arc<agentplane::store::RedbStore>, agentplane::core::RunId) {
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{RunStatus, Runtime};
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .keyring(Arc::clone(ring))
+        .skill(Stalls {
+            crash: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+        .build();
+    let out = rt
+        .run(
+            "demo.stalls",
+            agentplane::core::Tainted::trusted(serde_json::json!({})),
+        )
+        .await
+        .expect("run");
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+    (store, out.run_id)
+}
+
+/// **A sealed run read without its key is not reported as erased.**
+///
+/// A terminal, a restored export or a verifier handed no key ring reads the
+/// plan still sealed, and that says nothing about the key: the data is intact.
+/// Telling the reader it was erased sends them to the wrong remedy, and it is
+/// what the plane said until the no-ring case had a name of its own.
+#[tokio::test]
+async fn a_sealed_run_without_its_key_is_not_reported_as_erased() {
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{CannotReplay, Finding, Mode, Runtime};
+
+    let ring = Arc::new(MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let (store, run) = sealed_run(&ring).await;
+
+    // The same store, read by a plane that holds no ring.
+    let keyless = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Stalls {
+            crash: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+        .build();
+    let verdict = keyless.verify(run).await.expect("a verdict, not an error");
+    assert_eq!(
+        verdict.finding,
+        Finding::CannotReplay(CannotReplay::KeyAbsent),
+        "a sealed run read without a ring was reported as something else: {verdict}"
+    );
+    assert!(
+        verdict
+            .to_string()
+            .contains("nothing is known to be erased"),
+        "{verdict}"
+    );
+    match keyless.replay(run, Mode::Strict).await {
+        Err(agentplane::core::RuntimeError::PayloadsSealed { run: named }) => {
+            assert_eq!(named, run.to_string());
+        }
+        other => panic!("a sealed run with no ring must say the key is absent: {other:?}"),
+    }
+}
+
+/// **An erased run cannot be replayed under any revision, and says erased.**
+///
+/// The other half of the distinction: behind a wired ring that reports the
+/// key destroyed, the payloads are gone, and a verdict of *key absent* would
+/// send a reader looking for a key that no longer exists.
+#[tokio::test]
+async fn an_erased_run_cannot_be_replayed_under_any_revision() {
+    use agentplane::core::{TenantId, Timestamp};
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{CannotReplay, Finding, Runtime};
+
+    let ring = Arc::new(MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let (store, run) = sealed_run(&ring).await;
+    ring.destroy(
+        &agentplane::core::erasure_scope(&TenantId::default(), &run.to_string()),
+        Timestamp::from_unix_timestamp(1_800_000_000).expect("time"),
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("destroy");
+
+    let plane = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .keyring(Arc::clone(&ring))
+        .skill(Stalls {
+            crash: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+        .build();
+    let verdict = plane.verify(run).await.expect("a verdict, not an error");
+    assert_eq!(
+        verdict.finding,
+        Finding::CannotReplay(CannotReplay::Erased),
+        "{verdict}"
+    );
+    assert!(!verdict.is_diverged(), "an erasure is not a divergence");
+}
+
+// ── A withheld proposal says why ────────────────────────────────────────────
+
+/// A task for the worklist tests below, proposing `proposed`.
+fn proposal(proposed: serde_json::Value) -> agentplane::core::Task {
+    use agentplane::core::{
+        Justification, OnExpiry, Priority, RunId, Tainted, Task, TaskId, TaskState,
+    };
+    let run = RunId::generate();
+    Task {
+        id: TaskId::derive(
+            run,
+            agentplane::core::EffectKey::for_effect(
+                agentplane::core::StepId(0),
+                agentplane::core::Phase::Forward,
+                0,
+                1,
+                &agentplane::core::EffectDescriptor::new("approval", serde_json::json!({})),
+            ),
+        ),
+        run,
+        case: None,
+        kind: "approve".into(),
+        justification: Justification::new(Tainted::trusted("approve this".to_owned()), proposed),
+        candidate_roles: vec![],
+        escalate_to: vec![],
+        excluded_actors: vec![],
+        assignee: None,
+        priority: Priority::Normal,
+        state: TaskState::Open,
+        on_expiry: OnExpiry::Deny,
+        created_at: agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).expect("t"),
+        due_at: None,
+        withheld: None,
+    }
+}
+
+/// **An undecodable proposal is not reported as erased.**
+///
+/// An erasure is an answer somebody asked for; a row whose sealed bytes do
+/// not decode is damage, and the two send a reader opposite ways. The opener
+/// used to leave both as the envelope, indistinguishable; it now says which —
+/// and a row it sealed and could open says nothing is withheld at all.
+#[tokio::test]
+async fn an_undecodable_proposal_is_not_reported_as_erased() {
+    use agentplane::case::TaskStore;
+    use agentplane::core::{TenantId, Timestamp, Withheld};
+    use agentplane::keyring::SealedTasks;
+
+    let tenant = TenantId::default();
+    let keys = Arc::new(MemoryKeyRing::default());
+    let raw = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let plain: Arc<dyn TaskStore> = Arc::clone(&raw) as Arc<dyn TaskStore>;
+    let sealed = SealedTasks::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn KeyRing>,
+        tenant.clone(),
+    );
+
+    // Sealed by the decorator and readable: nothing withheld.
+    let clear = proposal(serde_json::json!({ "amount_eur": 42 }));
+    sealed.open(&clear).await.expect("sealed");
+    let read = sealed.task(clear.id).await.expect("read").expect("present");
+    assert_eq!(read.withheld, None);
+    assert_eq!(read.justification.proposed_action["amount_eur"], 42);
+    assert_eq!(
+        plain.task(clear.id).await.unwrap().unwrap().withheld,
+        Some(Withheld::Sealed),
+        "the row at rest says it is sealed, for a reader with no ring"
+    );
+
+    // Marked sealed at rest, and what is there is not an envelope.
+    let mut damaged = proposal(serde_json::json!({ "$sealed": "not base64 at all" }));
+    damaged.withheld = Some(Withheld::Sealed);
+    plain.open(&damaged).await.expect("written");
+    let read = sealed
+        .task(damaged.id)
+        .await
+        .expect("read")
+        .expect("present");
+    assert_eq!(
+        read.withheld,
+        Some(Withheld::Undecodable),
+        "a damaged row read as {:?}",
+        read.withheld
+    );
+
+    // A row nothing sealed is not opened, whatever its arguments look like.
+    let spelled = proposal(serde_json::json!({ "$sealed": "AAECAwQFBgc=" }));
+    plain.open(&spelled).await.expect("written");
+    let read = sealed
+        .task(spelled.id)
+        .await
+        .expect("read")
+        .expect("present");
+    assert_eq!(
+        read.withheld, None,
+        "a value shaped like an envelope was opened"
+    );
+    assert_eq!(
+        read.justification.proposed_action,
+        serde_json::json!({ "$sealed": "AAECAwQFBgc=" })
+    );
+
+    // And a row whose key was destroyed is the erasure.
+    let erased = proposal(serde_json::json!({ "amount_eur": 7 }));
+    sealed.open(&erased).await.expect("sealed");
+    keys.destroy(
+        &agentplane::core::erasure_scope(&tenant, &erased.run.to_string()),
+        Timestamp::from_unix_timestamp(1_800_000_000).expect("time"),
+        "erased on request",
+    )
+    .await
+    .expect("destroy");
+    let read = sealed
+        .task(erased.id)
+        .await
+        .expect("read")
+        .expect("present");
+    assert_eq!(read.withheld, Some(Withheld::Erased));
 }

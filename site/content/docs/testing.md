@@ -31,7 +31,7 @@ cargo add --dev tokio --features macros,rt-multi-thread
 construction, **never reports a call as free**, and refuses to answer as a real
 provider — so a journal it produced can never be mistaken for a genuine one.
 
-Three things to know:
+Things to know:
 
 **`FakeProvider::new()` returns `Arc<Self>` already.** Wrapping it again gives
 `Arc<Arc<FakeProvider>>`, whose error reads as though the type does not
@@ -47,6 +47,11 @@ could not be asked for fails here rather than on its first real call — includi
 a schema outside [the subset constrained decoding accepts](@/docs/manifest.md#spec-output).
 `provider.without_constrained_decoding()` opts out for a deployment on a provider
 that genuinely accepts more.
+
+**Unscripted, it calls the first offered tool on a tool loop's first turn**, with
+a value of that tool's argument schema, and answers on every later turn — so a
+fake-driven run proves its transport was reached. A test expecting a plain
+answer on turn one offers no tools, or scripts the turn.
 
 ```rust,ignore
 use agentplane::testkit::FakeProvider;
@@ -103,11 +108,9 @@ assert_eq!(read.parameters["properties"]["account"]["type"], "string");
 assert_eq!(asked[1].exchanges[0].output, "the request was not permitted");
 ```
 
-The `exchanges` field exists because of a real defect. A tool-calling loop was
-handing the model the *precise* policy denial — an oracle a prober could map the
-authorization vocabulary with — and every test passed, because they all called
-the uniform-refusal formatter directly and asserted it was uniform. Nothing
-asserted what the next turn was told.
+Assert on `exchanges` rather than on the formatter: a precise policy denial
+handed to the model is an oracle a prober maps the authorization vocabulary
+with, and a test of the formatter alone cannot see which one the loop sent.
 
 ## Deterministic fault injection
 
@@ -121,7 +124,7 @@ use agentplane::testkit::{Fault, Faulty, Schedule};
 let store = Faulty::new(inner, Schedule::default().at(7, Fault::CommittedThenLost));
 ```
 
-Three faults, and the middle one is why the module exists:
+The faults, and `CommittedThenLost` is why the module exists:
 
 | | |
 |---|---|
@@ -167,17 +170,34 @@ If you implement `JournalStore` — for a database this crate does not ship —
 a racing check no sequential test can replace.
 
 ```rust,ignore
+use std::sync::Arc;
+use agentplane::JournalStore;
 use agentplane::testkit::check_journal_store;
 
-let report = check_journal_store(|| my_store()).await;
-assert!(report.violations.is_empty(), "{report:#?}");
+// A factory: every check starts from a fresh, empty store.
+let report = check_journal_store(&|| {
+    Box::pin(async { Arc::new(my_store()) as Arc<dyn JournalStore> })
+})
+.await;
+report.assert_conforms("MyStore");
 ```
 
-There are matching batteries for the case layer, the quota store, the registry,
-the push store, the key ring, **blob storage**, **the calendar** and **the
-policy engine**. They exist as shipped code rather than as this crate's private
-tests for one reason: rebuilding a conformance suite per project is how each one
-ends up checking a slightly different, slightly weaker thing.
+The other batteries, each a module under `agentplane::testkit`:
+
+| Seam | Module |
+|---|---|
+| Case layer | `conformance_case` |
+| Quota store | `conformance_quota` |
+| Registry | `conformance_registry` |
+| Push store | `conformance_push` |
+| Key ring | `conformance_keyring` |
+| Blob storage | `conformance_blob` |
+| Calendar | `conformance_calendar` |
+| Policy engine | `conformance_policy` |
+| Authenticator | `conformance_auth` — [below](#holding-your-own-authenticator-to-the-contract) |
+
+They ship as code rather than as this crate's private tests so that every
+implementation is held to the same checks rather than to a per-project copy.
 
 **Run them against the handle you actually hold, not the one underneath it.** A
 decorator is a store in its own right — wire a key ring and the runtime is given
@@ -280,11 +300,13 @@ one sentence to a caller.
 ## Testing a policy against the *real* context
 
 A Cedar policy is only as good as the attributes it reads, and a policy tested
-against a context the test invented is a policy tested against itself. This bit
-for real: a taint gate in this repository keyed on `context.args_trust`, which
-the runtime has never sent. Cedar is **total**, so a `when` clause reading a
-missing attribute does not raise — the rule is simply unsatisfied, the `forbid`
-never matched, and the gate failed **open** while every assertion passed.
+against a context the test invented is a policy tested against itself. An
+unguarded read of an attribute the runtime does not send is an evaluation
+error: the call is refused, and `try_build` refuses a policy set in which a
+rule errors against a request shape the plane issues. A **guarded** read
+(`context has x && …`) of an attribute the runtime never sends is not an error —
+the rule never matches, so a `forbid` keyed on it is disarmed while a test that
+built its own context passes.
 
 So drive policy tests through a run, or build the context from what
 [the security model](@/docs/security.md#the-authorization-context) documents —

@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example manifest_run --features redb,testkit,manifest
+//! cargo run --example manifest_run --features redb,fake-model,manifest
 //! ```
 //!
 //! No API key, no network — `model::fake::FakeProvider` stands in for the provider.

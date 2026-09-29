@@ -4,7 +4,7 @@ use std::fmt::Debug;
 
 use async_trait::async_trait;
 
-use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, Timestamp};
+use crate::core::{CaseId, RunId, StoreError, Task, TaskId, TaskState, Timestamp};
 
 pub use crate::core::ClaimError;
 
@@ -116,7 +116,29 @@ pub trait TaskStore: Send + Sync + Debug {
         roles: &[String],
     ) -> Result<Task, ClaimError>;
 
-    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError>;
+    /// Settle a pending task, returning whether this call settled it.
+    ///
+    /// A compare-and-set from the pending states: a task already completed,
+    /// expired or withdrawn is left as it stands and the answer is `false`.
+    /// The expiry sweep and a reviewer's decision race to settle one task,
+    /// and whichever lost must not overwrite the state the winner wrote —
+    /// the worklist would then contradict the answer the run consumed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] when no task has this id.
+    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<bool, StoreError>;
+
+    /// Withdraw the tasks in `awaited` that belong to `run` and are still
+    /// pending, returning how many.
+    ///
+    /// Called when the run concludes closed, naming the tasks it was still
+    /// waiting on. Nobody can answer a task whose run is sealed, so left
+    /// pending it is a decision the worklist offers and the backlog counts
+    /// that no answer can reach. A task the run opened *beside* its answer is
+    /// not awaited, and outlives the run by design; a task whose answer the
+    /// run consumed is settled by whoever delivered it.
+    async fn withdraw_run(&self, run: RunId, awaited: &[TaskId]) -> Result<usize, StoreError>;
 
     /// Widen an unanswered task to its declared escalation audience.
     ///

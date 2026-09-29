@@ -34,7 +34,8 @@ fn outcome_to_row(o: &ItemOutcome) -> (&'static str, String) {
         ItemOutcome::Failed(d)
         | ItemOutcome::Quarantined(d)
         | ItemOutcome::Suspended(d)
-        | ItemOutcome::Exhausted(d) => d.clone(),
+        | ItemOutcome::Exhausted(d)
+        | ItemOutcome::Withheld(d) => d.clone(),
     };
     (o.as_str(), detail)
 }
@@ -315,6 +316,7 @@ impl BatchStore for RedbStore {
                         ItemOutcome::Quarantined(_) => c.quarantined += 1,
                         ItemOutcome::Suspended(_) => c.suspended += 1,
                         ItemOutcome::Exhausted(_) => c.exhausted += 1,
+                        ItemOutcome::Withheld(_) => c.withheld += 1,
                     }
                 } else {
                     // Reserved, no outcome recorded.

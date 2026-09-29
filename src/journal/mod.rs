@@ -8,7 +8,8 @@
 
 mod atomic;
 mod note;
-#[cfg(feature = "keyring")]
+// Unconditional: a build with no key ring still reads an export a sealed
+// plane wrote, and must tell a sealed payload from a readable one.
 pub mod payload;
 
 mod record;
@@ -23,7 +24,9 @@ pub use atomic::{AtomicJournal, AtomicResource, AtomicTx, AtomicWork, SqlValue};
 pub use note::{NoteSignature, SignedNote, key_id};
 pub(crate) use record::unreadable;
 pub use record::{AgentIdentity, Append, Record, RecordBody, RecordKind};
-pub use replay::{EffectReplay, ReplayCursor, StepCursor, undecided_effects};
+pub use replay::{
+    Divergence, EffectReplay, ReplayCursor, StepCursor, Unconsumed, undecided_effects,
+};
 pub use store::{Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease, WaitingRun};
 pub use upcast::{Identity, Upcaster};
 pub use witness::{

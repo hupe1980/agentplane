@@ -720,6 +720,8 @@ async fn a_tenant_cannot_read_another_tenants_run_even_holding_its_id() {
                 policy_bundle: None,
                 canon: agentplane::core::canon::VERSION,
                 idempotency_key: None,
+                admitted_by: None,
+                served_unchained: false,
             },
         )],
     )
@@ -954,6 +956,7 @@ async fn one_tenants_tasks_are_not_another_tenants_to_decide() {
         on_expiry: OnExpiry::Deny,
         created_at: ts(1_000),
         due_at: None,
+        withheld: None,
     };
     acme.open(&task).await.expect("acme opens");
 
@@ -1673,5 +1676,36 @@ async fn erasing_a_case_that_is_still_open_is_refused() {
     assert_eq!(
         cases.case(case).await.expect("read").expect("case").status,
         CaseStatus::Closed
+    );
+}
+
+/// **Erasing a matter the plane does not hold is refused, not reported done.**
+///
+/// A mistyped case id in an erasure request destroys nothing — and an `Ok(0)`
+/// answer reads exactly like a matter that stored no blobs and was erased, so
+/// the request is closed while the real matter is untouched.
+#[tokio::test]
+async fn erasing_an_unknown_case_is_not_found() {
+    use agentplane::blob::{EraseError, erase_case};
+    use agentplane::core::StoreError;
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let tenant = agentplane::core::TenantId::new("acme").expect("tenant");
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+    let unknown = agentplane::core::CaseId::generate();
+    let outcome = erase_case(
+        Some(blobs.as_ref()),
+        store.as_ref(),
+        #[cfg(feature = "keyring")]
+        None,
+        &tenant,
+        unknown,
+        ts(9_000),
+        "art-17 request",
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(EraseError::Store(StoreError::NotFound(ref id))) if id == &unknown.to_string()),
+        "an erasure of a case this plane never held reported {outcome:?}"
     );
 }

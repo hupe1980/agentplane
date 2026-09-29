@@ -506,6 +506,50 @@ async fn a_tool_call_is_performed_once_and_replayed_from_the_journal() {
     );
 }
 
+/// A read-only tool that ran and reported failure is not asked again, even
+/// under a retry policy — unless its operator declared its landed failures
+/// transient.
+#[tokio::test]
+async fn a_tool_that_ran_and_failed_is_retried_only_when_declared() {
+    let failed = || {
+        Err(ToolError::ToolFailed {
+            tool: ToolId::new("ledger", "read"),
+            detail: "account locked".into(),
+        })
+    };
+    let run = |retry_landed: bool| async move {
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
+        // Answers pop from the back: the first call fails, the second succeeds.
+        let client = Fake::new(vec![Ok(json!({ "result": "fine" })), failed()]);
+        let safety = ToolSafety::read_only()
+            .retry(
+                agentplane::core::RetryPolicy::attempts(3)
+                    .with_backoff(std::time::Duration::ZERO, std::time::Duration::ZERO),
+            )
+            .retry_landed(retry_landed);
+        let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+            .skill(Calls {
+                catalog: ToolCatalog::new().allow(ToolId::new("ledger", "read"), safety),
+                client: Arc::clone(&client),
+            })
+            .build();
+        let out = rt
+            .run("call", Tainted::trusted(json!({})))
+            .await
+            .expect("run");
+        let calls = client.calls.lock().unwrap().len();
+        (out.status, calls)
+    };
+
+    let (status, calls) = run(false).await;
+    assert!(matches!(status, RunStatus::Failed(_)), "got {status:?}");
+    assert_eq!(calls, 1, "a tool's reported failure was asked again");
+
+    let (status, calls) = run(true).await;
+    assert!(matches!(status, RunStatus::Succeeded), "got {status:?}");
+    assert_eq!(calls, 2, "a declared-transient failure was not retried");
+}
+
 /// Tool output reaching a mutating sink is refused, without anyone remembering.
 #[tokio::test]
 async fn tool_output_cannot_steer_a_mutating_call() {
@@ -2243,6 +2287,16 @@ async fn run_tool_calling<T: agentplane::tools::Tool>(
     agentplane::runtime::RunOutcome,
     Arc<agentplane::testkit::FakeProvider>,
 ) {
+    run_tool_calling_in::<T>(&tool_calling_agent(ceiling)).await
+}
+
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+async fn run_tool_calling_in<T: agentplane::tools::Tool>(
+    manifest: &str,
+) -> (
+    agentplane::runtime::RunOutcome,
+    Arc<agentplane::testkit::FakeProvider>,
+) {
     use agentplane::manifest::Manifest;
     use agentplane::runtime::Agent;
     use agentplane::testkit::FakeProvider;
@@ -2253,7 +2307,7 @@ async fn run_tool_calling<T: agentplane::tools::Tool>(
     provider.will_say("the balance is 42");
 
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
-    let manifest = Manifest::parse(&tool_calling_agent(ceiling)).expect("parse");
+    let manifest = Manifest::parse(manifest).expect("parse");
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .provider(
             "fake",
@@ -2449,12 +2503,24 @@ async fn a_refusal_tells_the_model_nothing_it_can_differentiate() {
 /// test above while blinding the model to the one thing it can act on. A tool
 /// that ran and declined is information the model needs in order to try
 /// something else, and it is text the far side already controls — withholding
-/// it protects nothing.
+/// it protects nothing from the far side.
+///
+/// It is still the tool's output, and carries the tool's label: the model is
+/// cleared for `internal` here, exactly as it would have to be to read the
+/// tool's answer had it succeeded.
 #[cfg(all(feature = "manifest", feature = "testkit"))]
 #[tokio::test]
 async fn a_tool_that_ran_and_failed_reports_its_own_words() {
-    let (out, provider) = run_tool_calling::<Declines>("      max_sensitivity: internal").await;
-    assert!(matches!(out.status, RunStatus::Succeeded));
+    let manifest = tool_calling_agent("      max_sensitivity: internal").replace(
+        "  budgets: {}",
+        "  security: { max_sensitivity_egress: internal }\n  budgets: {}",
+    );
+    let (out, provider) = run_tool_calling_in::<Declines>(&manifest).await;
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "{:?}",
+        out.status
+    );
 
     let told: Vec<String> = provider
         .asked()

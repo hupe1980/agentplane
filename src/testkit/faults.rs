@@ -107,6 +107,8 @@ pub struct Schedule {
     on_kind: Vec<(&'static str, Fault)>,
     unreadable: Vec<RunId>,
     leafless: Vec<RunId>,
+    contested: Vec<RunId>,
+    detail: Option<&'static str>,
 }
 
 impl Schedule {
@@ -120,6 +122,8 @@ impl Schedule {
             on_kind: Vec::new(),
             unreadable: Vec::new(),
             leafless: Vec::new(),
+            contested: Vec::new(),
+            detail: None,
         }
     }
 
@@ -136,6 +140,8 @@ impl Schedule {
             on_kind: Vec::new(),
             unreadable: Vec::new(),
             leafless: Vec::new(),
+            contested: Vec::new(),
+            detail: None,
         }
     }
 
@@ -165,6 +171,30 @@ impl Schedule {
     #[must_use]
     pub fn leafless(mut self, run: RunId) -> Self {
         self.leafless.push(run);
+        self
+    }
+
+    /// List one run as abandoned whatever its lease says, as a listing read
+    /// just before another instance took the run over would.
+    ///
+    /// A recovery pass lists, then claims, and the claim can lose to an
+    /// instance that got there in between. A healthy store answers the listing
+    /// and the claim consistently in any single-threaded test, so the lost race
+    /// is unreachable without saying which run the stale listing names.
+    #[must_use]
+    pub fn contested(mut self, run: RunId) -> Self {
+        self.contested.push(run);
+        self
+    }
+
+    /// Word every injected failure with `detail` instead of the default text.
+    ///
+    /// For a surface that must not repeat a store's error to whoever asked: a
+    /// real backend's message carries a DSN, a host or a table name, and a test
+    /// that injects `"dsn=secret"` can then assert it never reaches the wire.
+    #[must_use]
+    pub const fn detail(mut self, detail: &'static str) -> Self {
+        self.detail = Some(detail);
         self
     }
 
@@ -323,7 +353,10 @@ impl JournalStore for Faulty {
             Some(f @ Fault::FailedClean) => {
                 self.record(n, f);
                 Err(StoreError::Backend(
-                    "injected: append failed, nothing written".into(),
+                    self.schedule
+                        .detail
+                        .unwrap_or("injected: append failed, nothing written")
+                        .into(),
                 ))
             }
 
@@ -353,8 +386,9 @@ impl JournalStore for Faulty {
 
     async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
         if self.schedule.unreadable.contains(&run) {
-            return Err(StoreError::Backend(format!(
-                "injected: run {run} cannot be read"
+            return Err(StoreError::Backend(self.schedule.detail.map_or_else(
+                || format!("injected: run {run} cannot be read"),
+                ToOwned::to_owned,
             )));
         }
         self.inner.read(run, from).await
@@ -367,8 +401,9 @@ impl JournalStore for Faulty {
         limit: usize,
     ) -> Result<Vec<Record>, StoreError> {
         if self.schedule.unreadable.contains(&run) {
-            return Err(StoreError::Backend(format!(
-                "injected: run {run} cannot be read"
+            return Err(StoreError::Backend(self.schedule.detail.map_or_else(
+                || format!("injected: run {run} cannot be read"),
+                ToOwned::to_owned,
             )));
         }
         self.inner.read_page(run, from, limit).await
@@ -404,6 +439,14 @@ impl JournalStore for Faulty {
     ) -> Result<Vec<(RunId, u64)>, StoreError> {
         self.inner.recent_runs(after, limit).await
     }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError> {
+        self.inner.recent_runs_from(source, after, limit).await
+    }
 
     async fn case_history(
         &self,
@@ -436,7 +479,13 @@ impl JournalStore for Faulty {
     }
 
     async fn abandoned_runs(&self, limit: usize) -> Result<Vec<RunId>, StoreError> {
-        self.inner.abandoned_runs(limit).await
+        let mut runs = self.inner.abandoned_runs(limit).await?;
+        for run in &self.schedule.contested {
+            if !runs.contains(run) {
+                runs.push(*run);
+            }
+        }
+        Ok(runs)
     }
 
     async fn waiting_runs(
@@ -552,6 +601,14 @@ mod tests {
         }
         async fn recent_runs(
             &self,
+            _: Option<(u64, RunId)>,
+            _: usize,
+        ) -> Result<Vec<(RunId, u64)>, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn recent_runs_from(
+            &self,
+            _: &str,
             _: Option<(u64, RunId)>,
             _: usize,
         ) -> Result<Vec<(RunId, u64)>, StoreError> {

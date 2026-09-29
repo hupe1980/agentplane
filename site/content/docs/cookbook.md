@@ -87,7 +87,7 @@ impl Skill for Triage {
         let provider = Arc::clone(&self.provider);
         let completion = cx
             .sink_with(&prompt, |value| {
-                ModelCall::new(provider, ModelId::new("anthropic", "claude-sonnet-4-5"), value)
+                ModelCall::new(provider, ModelId::new("anthropic", "claude-sonnet-5"), value)
                     // The ceiling that matters for a hosted model: a prompt
                     // assembled from a secret is an exfiltration whether or
                     // not anyone meant it.
@@ -189,15 +189,10 @@ Two things it deliberately does not do:
   genuinely disjoint inputs — a fan-out over one shared input is *not* that, and
   the validator will say so — while `distinct-authority` is the reason that fits
   independent opinions from differently-privileged specialists.
-* **There is no `race`.** First-wins-cancel-the-rest is the one shape this
-  runtime refuses, and not for want of plumbing: abandoning an in-flight branch
-  leaves an announced effect with no terminal record, which is exactly the
-  unknown outcome the effect protocol exists to prevent. It would also make a
-  crash mid-race unrecoverable — some losers announced, no winner recorded, and
-  nothing safe to do on resume — and it would make the answer depend on which
-  machine was less loaded that day. Every branch runs to completion and every
-  outcome is on the record. That costs more, and it is the only version that can
-  be replayed.
+* **There is no `race`.** Abandoning an in-flight branch leaves an announced
+  effect with no terminal record — the unknown outcome the effect protocol
+  exists to prevent — and makes the answer depend on which machine was less
+  loaded. Every branch runs to completion and every outcome is on the record.
 
 **The trap:** letting untrusted text become the instruction. A model reads its
 order and its data as the same undifferentiated text, so a document saying
@@ -277,7 +272,7 @@ constant neutral name `document`; AWS explicitly treats caller-chosen document
 names as prompt-injection-bearing content. Unsupported media types and every
 remote/S3 provider source are refused rather than guessed.
 
-Run `cargo run --example media_run --features redb,testkit,media` for the
+Run `cargo run --example media_run --features redb,fake-model,media` for the
 offline, executable half of this contract: provider-URL refusal, an exact
 digest/type capability, live-only materialization, untrusted output, and strict
 replay with unchanged blob-read and provider-call counters. The example does
@@ -287,6 +282,9 @@ pinning or per-hop redirect authorization.
 The default retention regime requires the run to belong to a case and links the
 digest automatically. Outside a case, name the lifecycle controller explicitly
 with `external_retention("policy/version")`; an unnamed unlinked blob is refused.
+Externally retained bytes belong to that policy's erasure unit even when the run
+has a case: they are not linked to it, `erase_case` does not reach them, and
+`cx.media_blobs(&fetcher)` is the handle that reads them back.
 HTTPS/443, no retries, identity encoding and three redirects are the defaults.
 Cleartext HTTP, another port, or retries each require a separate explicit grant.
 Automatic redirects, proxies, referrers, cookies and content decompression are
@@ -367,7 +365,7 @@ answer *with* the arguments: an approval's `amendment` dispatches in the
 model's place as the reviewer's own trusted value (provenance
 `task:agent.approve_call`, which a source-bound field must list before it
 stands there).
-`cargo run --example approved_call --features redb,testkit,manifest` runs the
+`cargo run --example approved_call --features redb,fake-model,manifest` runs the
 whole shape: suspend, worklist, approve, refuse or amend, and a strict replay
 that re-opens nothing.
 
@@ -688,8 +686,16 @@ spec:
     max_sensitivity_egress: internal
     max_delegation_depth: 2
   models:
-    privileged:  { provider: anthropic, model: claude-sonnet-5 }
-    quarantined: { provider: anthropic, model: claude-haiku-4-5-20251001 }
+    # Pricing is yours to state — minor units per million tokens. A money
+    # ceiling beside an unpriced role is refused at load.
+    privileged:
+      provider: anthropic
+      model: claude-sonnet-5
+      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+    quarantined:
+      provider: anthropic
+      model: claude-haiku-4-5-20251001
+      pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125 }
   tools:
     - ref: "tool://validator/apply_correction"
       mutates: true
@@ -981,7 +987,7 @@ a digest. So erase by case:
 ```rust
 use agentplane::blob::erase_case;
 
-let n = erase_case(Some(blobs.as_ref()), cases.as_ref(), case, now, "art-17 request").await?;
+let n = erase_case(Some(blobs.as_ref()), cases.as_ref(), &tenant, case, now, "art-17 request").await?;
 ```
 
 Every blob that case produced is tombstoned; other cases are untouched, even
@@ -1035,14 +1041,14 @@ different errors: the first usually means it was published before signing was
 configured, the second means somebody tampered or a key rotated wrongly.
 
 Signing can be enabled after an identical unsigned version was published:
-`publish_signed` attaches that artifact's first publisher attestation without
+`publish_signed` attaches that artifact's first publisher signature without
 changing its digest. Once present, publisher evidence is immutable too; another
-signer gets `PublisherChanged` rather than silently taking authorship. Multiple
-publishers would need an explicit attestation-set design, which is not built.
+signer gets `PublisherChanged` rather than silently taking authorship. A
+version has at most one publisher.
 
 The signature is over a **domain-separated** hash, not the manifest digest. A
 bare digest signature is structurally identical whatever it was about, so without
-this a record attestation could be presented as a publisher's blessing of an
+this a record signature could be presented as a publisher's blessing of an
 agent.
 
 **Pinning is not the same as trusting the registry.** Immutability is a promise
@@ -1050,8 +1056,9 @@ the registry makes about itself, so it is worth nothing if the registry is the
 compromised party. `resolve_pinned` is the caller declining to need that promise.
 Prefer it anywhere the answer decides what an agent may do.
 
-`MemoryRegistry` is deliberately process-local. The `Registry` trait is the seam
-for a durable or remote implementation; no such implementation ships today.
+`MemoryRegistry` is deliberately process-local; the redb and Postgres stores
+are the durable registries (below), and the `Registry` trait is the seam for a
+remote one.
 
 ---
 
@@ -1121,7 +1128,7 @@ like a question that was answered.
 
 **Making it a rule rather than a convention.** Because the runtime never reads
 the map, nothing in it can notice that a production agent shipped without an
-owner. That check belongs in review, so `validate` will do it:
+owner. That check belongs in review, and `validate` does it:
 
 ```sh
 agentplane validate agent.yaml \
@@ -1129,7 +1136,7 @@ agentplane validate agent.yaml \
   --require-annotation example.com/risk-class
 ```
 
-Repeatable, exits non-zero naming each agent and key that is absent, and checked
+Repeatable, exits 1 naming each agent and key that is absent, and checked
 per agent — in a room, "one of them has an owner" is not the rule anybody meant.
 The runtime still reads nothing: the keys stay your vocabulary and the
 enforcement is a job you run, which is the division `--policy` already draws.
@@ -1186,8 +1193,8 @@ let rt = agents.values().fold(Runtime::builder(store), |b, m| {
 ```
 
 `Manifest::parse_all` is for a **room** — several agents in one file, because
-they are one deployable thing. This is the other layout, and it had no support at
-all, so every embedder wrote the same table by hand:
+they are one deployable thing. This is the other layout, and the macro replaces
+the table an embedder would otherwise write by hand:
 
 ```text
 const AGENTS: &[(&str, &str)] = &[
@@ -1399,8 +1406,8 @@ which is how "the process just stalled" stops being a category of incident.
 let decision = cx.task(
     &TaskSpec::new("rejection-handling", justification, "decision")
         .role("compliance-officer")
-        .excluding("agent:switch-bot")     // the proposer cannot approve
-        .on_expiry(OnExpiry::Escalate),
+        .excluding("agent:switch-bot")     // barred too; whoever asked for the run always is
+        .on_expiry(Expiry::escalate_to(["compliance-lead"])),
 ).await?;
 ```
 
@@ -1409,10 +1416,14 @@ an actor, so a body that can name one is a bypass. The actor comes from the
 authenticated caller, and the wire type has no field for it — a caller cannot
 spoof what they cannot express.
 
-**The other trap:** `OnExpiry::Proceed` — acting because nobody answered — needs
-a *second* opt-in (`allow_unattended()`). One enum variant among four is too easy
-to pick off a list, and "the human didn't answer so we did it anyway" should be
-greppable.
+**The other trap:** acting because nobody answered. It is spelled
+`Expiry::ProceedUnattended` and nothing else, so "the human didn't answer so we
+did it anyway" is greppable. An escalation carries its roles
+(`Expiry::escalate_to([..])`) — one naming nobody is refused at the task.
+
+From a terminal, `agentplane tasks --store …` lists the worklist (`--role` to
+see it as a reviewer holding that role does, `--show <task>` for one task whole)
+and `agentplane decide <task> approve|reject --reason … --actor …` answers it.
 
 ## 🔍 Show a reviewer the consequences, not the instruction {#show-a-reviewer-the-consequences-not-the-instruction}
 
@@ -1743,13 +1754,19 @@ spec:
 ```sh
 AGENTPLANE_PEER_TOKEN_REVIEWER=... \
 agentplane run desk.yaml --input '{"invoice": "INV-9"}' \
-  --peer reviewer=https://reviewer.example/a2a
+  --peer reviewer=https://reviewer.example/a2a --acting-as alice
 ```
 
 `--peer` wires the A2A client for that name (needs `--features cli,a2a`, or
 the `:full` image); the registry scope is exactly the capabilities the
-manifests grant under `tool://reviewer/…`, and the bearer token comes from
-the environment, never the command line. In Rust the same wiring is one
+manifests grant under `tool://reviewer/…`, the registration is read-only when
+every such grant says `mutates: false`, and the bearer token comes from the
+environment, never the command line. **`--acting-as` is required beside it**:
+a peer call is made on somebody's behalf, so the run's chain is rooted at that
+subject and scoped to what the file declares — the capabilities it provides and
+the ones it grants under a peer's name — and the peer receives that chain plus
+one link naming it. `--peer` without it does not parse, rather than letting the
+model be offered a peer every call to which is refused. In Rust the same wiring is one
 builder call, and a coded skill reaches the peer through the plane rather
 than through a client it carries:
 
@@ -1789,7 +1806,8 @@ is also a wired tool server (a grant would mean two things), a manifest grant
 naming a capability outside the peer's registry scope, and a peer grant on a
 `specialist` (a hop is delegation). A run admitted under **no** chain has
 nothing to extend and is refused at the call — admit it with
-`RunTerms::acting_as`, or build the plane with `RuntimeBuilder::acting_as`.
+`RunTerms::acting_as`, build the plane with `RuntimeBuilder::acting_as`, or
+pass `--acting-as` to `agentplane run`.
 
 The `peer_call` example runs both planes in one process: a served reviewer on
 a loopback port and a desk that consults it, then a strict replay of the desk's
@@ -1824,7 +1842,7 @@ enforceable — declare the mailer `mutates: true` with
 and a recipient the planner writes as a literal is refused at the sink: a
 model completion is not among the allowed sources, however well-shaped the
 string. Run
-`cargo run --example planned_run --features redb,testkit,manifest` to watch
+`cargo run --example planned_run --features redb,fake-model,manifest` to watch
 both: a prompt injection arrive in a tool output and find no reader, and a
 planner-invented recipient stop at the field rule. `just camel-live` runs the
 same shape against two real `OpenAI` models and asserts, at the wire, that the
@@ -1836,8 +1854,7 @@ or a `parse` step instead, or use `tool-calling`.
 
 ## 🧱 Where are the built-in tools? {#where-are-the-built-in-tools}
 
-There are none, and the reason is worth two paragraphs because every other
-framework ships some.
+There are none.
 
 The tools they ship are mostly **provider-hosted** — ADK's Google Search and
 Code Execution, the OpenAI Agents SDK's `WebSearchTool` and
@@ -1926,12 +1943,12 @@ every time — `tools/call` keeps working, the tasks extension and structured
 results simply never appear, and nothing says why. `connect` discovers first
 and falls back to `initialize` only when the server is legacy; the version it
 landed on is readable as `negotiated_version()`, and `agentplane serve` prints
-it. `McpClient::new` still wraps a service you already started, for an embedder
+it. `McpClient::new` wraps a service you already started, for an embedder
 whose transport is running.
 
 The client profile `connect` offers (`McpClient::host_info()`) negotiates the
 Tasks extension and nothing else: elicitation, sampling, roots and
-subscriptions stay absent until a governed runtime callback exists.
+subscriptions are absent, because none has a governed runtime callback.
 
 MCP context is available without turning it into a tool. Exact grants may live
 in the manifest:
@@ -1981,8 +1998,8 @@ something the reviewed file claims.
 One client per server, resolved by name. A `ToolRouter` does the resolving, and
 it matters more than it looks: a single client handed every tool id cannot tell
 `tool://ledger/read` from `tool://tickets/read`, so a plane that granted one and
-wired the other got a **successful answer from the wrong server** under the first
-one's operator safety. A server nobody wired is `Unreachable`, and a grant naming
+wired the other would get a **successful answer from the wrong server** under the
+first one's operator safety. A server nobody wired is `Unreachable`, and a grant naming
 one is refused at build rather than at the first call.
 
 ### `discover()` is a diff, not a source
@@ -2050,8 +2067,7 @@ deployment's. A tool absent from *either* is not callable.
 
 ## ⚖️ Turn on a policy engine {#turn-on-a-policy-engine}
 
-The policy text is in [security](@/docs/security.md); this is the wiring, which
-nothing else showed.
+The policy text is in [security](@/docs/security.md); this is the wiring.
 
 ```rust
 use agentplane::policy::CedarEngine;
@@ -2083,7 +2099,14 @@ Three things bite:
   the runtime's gates on who asked, give the caller a delegation chain — a
   `scope` on its token-file entry, or `Caller::acting_as` from your own
   `Authenticator` — and its `owner`/`subject`/`scope` are merged into those
-  requests for every run that caller starts.
+  requests for every run that caller starts. A caller whose credential carries
+  no chain acts under **none**: the plane's own `RuntimeBuilder::acting_as` is
+  for the runs its embedder starts, and is never lent to a served caller. It is
+  still the caller's **ceiling** — a chainless caller asking for a skill outside
+  the plane's chain is declined, and its commissions count depth from the
+  plane's — without anything of it reaching the policy context or the journal.
+  A surface that serves strangers therefore also probes the runtime's gates in
+  the no-chain shape at startup, and refuses a rule set that cannot evaluate it.
 
 ## 📡 Host an agent as an A2A peer {#host-an-agent-as-an-a2a-peer}
 
@@ -2120,7 +2143,7 @@ walkthrough is in [getting started](@/docs/getting-started.md).
 A token-file entry may carry the caller's own authority:
 
 ```yaml
-- token: "a-long-random-string"
+- token: "3f9c…"                    # openssl rand -hex 32; under 32 bytes is refused
   actor: peer-a
   roles: [peer]
   scope: [support.*]                # what runs peer-a may start
@@ -2131,8 +2154,8 @@ Every run peer-a starts is then admitted under a chain rooted at `peer-a`,
 bound to this plane's tenant, and the journal's `IdentityBound` names peer-a —
 not the plane. A message naming a skill outside the scope is declined; a
 message after the instant is refused with the expiry named. Leave both out and
-the caller has no chain: its runs act under whatever the plane was built with,
-which for `serve` is none.
+the caller has no chain: its runs act under none, bounded by whatever chain the
+plane was built with — which for `serve` is none.
 
 ## 🛑 Stop an instance without turning it into a crash {#stop-an-instance-without-turning-it-into-a-crash}
 
@@ -2521,12 +2544,18 @@ they take it back* — that is an authorization rather than a throttle, and it i
 what `authority` is for.
 
 ```rust
-use agentplane::authority::{AuthorityId, AuthorityStore, StandingAuthority};
+use agentplane::authority::{AuthorityId, AuthorityStore, Holder, StandingAuthority};
 use agentplane::core::Spend;
 
-// Issued once, from wherever the approval actually happened.
+// Issued once, from wherever the approval actually happened — to the person
+// who gave it.
 store.issue(
-    &StandingAuthority::new("mandate-42", "approval:SET-42", Spend::money(50_000))
+    &StandingAuthority::new(
+        "mandate-42",
+        Holder::subject("user:alice"),
+        "approval:SET-42",
+        Spend::money(50_000),
+    )
         .max_draws(10)
         .expires_at(end_of_quarter),
 ).await?;
@@ -2535,9 +2564,18 @@ store.issue(
 Inside a skill, drawing is an ordinary journaled effect:
 
 ```rust
-let drawn = cx.draw(&AuthorityId::new("mandate-42"), Spend::money(12_000)).await?;
+let id = Tainted::trusted(AuthorityId::new("mandate-42"));
+let drawn = cx.draw(&id, Spend::money(12_000)).await?;
 // drawn.remaining is what is left, from the receipt — not a second read
 ```
+
+**Knowing the id is not enough.** A draw is refused unless the run acts for the
+authority's holder — `Holder::Subject` naming its delegation chain's owner, or
+`Holder::Tenant` for a run the plane started for itself with no chain — and
+refused when the id itself is untrusted: which mandate to spend is not a choice
+a model or a peer makes. The holder is typed, so a chain whose owner is spelled
+like a tenant is still a subject, and a served caller that presented no chain
+holds nothing at all: the tenant's mandates are the deployment's.
 
 Four things make this different from a counter:
 
@@ -2571,16 +2609,15 @@ The accounting is in the store rather than the process, for the same reason
 quotas are: an in-memory balance fails **open** the moment a second instance
 starts, which is exactly when a shared ceiling was needed.
 
-`cargo run --example standing_authority --features redb,testkit` runs all of
+`cargo run --example standing_authority --features redb,fake-model` runs all of
 this end to end: one envelope spent across two separate runs, a draw over the
 ceiling that consumes nothing, a revocation, and the terms still readable
 afterwards — because an authority that vanished on revocation would take with it
 the record of what the draws already taken were authorized by.
 
 There is deliberately no refund. `Spend` is unsigned, so no draw can un-spend a
-ceiling — a negative amount reverses the accumulation every ceiling here is
-built on, and one would have removed the per-run budget and the tenant quota
-alongside this. Restoring headroom means issuing another authority, which leaves
+ceiling — a negative amount would reverse the accumulation every ceiling here,
+the per-run budget and the tenant quota included, is built on. Restoring headroom means issuing another authority, which leaves
 both decisions on the record rather than netting them out to a number nobody can
 explain.
 
@@ -2955,9 +2992,12 @@ sharing a naming convention nobody wrote down. Full rules:
 
 With feature `keyring`, wrap a single-node memory backend in
 `EncryptedMemoryStore::new`. Content is ciphertext in the backing
-store. `erase_subject(subject, at, reason)` checks legal holds, destroys the
-tenant/subject wrapping scope, then cleans rows, leaving pre-erasure backups
-undecryptable. This process-local lifecycle coordinator is not an active-active
+store, and each item is sealed under its own scope, so `forget`,
+`forget_cascading` and the expiry sweep destroy the keys of what they erase.
+`erase_subject(subject, at, reason)` checks legal holds, destroys every item
+scope of the subject, then cleans rows, leaving pre-erasure backups
+undecryptable; a cleanup failure after the keys are gone comes back in the
+returned `Erasure` rather than as success. This process-local lifecycle coordinator is not an active-active
 erasure barrier.
 
 **The second trap:** expecting `forget` to be enough for an erasure request. It
@@ -2990,8 +3030,8 @@ The driver supports Converse text, tools/results, usage, truncation, native JSON
 Schema output with forced-tool fallback and exact reasoning-content
 continuation. It streams through `ConverseStream` by default and classifies
 partial failures according to whether generation and usage were observed;
-`.buffered()` is explicit. Region, stream mode, timeout and schema mode are in
-effect identity.
+`.buffered()` is explicit. Region, stream mode and schema mode are in effect
+identity.
 
 Explicit `reasoning_effort` is refused by default, because Converse has no
 portable mapping across its model families — one envelope covers Anthropic's
@@ -3080,7 +3120,7 @@ cx.compact(
     },
     &old,
     provider,
-    ModelId::new("gpt-5"),
+    ModelId::new("openai", "gpt-5"),
 ).await?;
 ```
 

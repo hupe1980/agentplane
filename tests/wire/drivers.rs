@@ -431,6 +431,37 @@ async fn a_declined_request_did_not_happen() {
     }
 }
 
+/// **An unreachable peer's error names the host, never the URL.**
+///
+/// A peer endpoint can carry a credential in its path or query; the error text
+/// becomes an effect failure, a log line and an operator's reading.
+#[tokio::test]
+async fn an_unreachable_peer_is_not_quoted_by_url() {
+    let client = A2aClient::new(Endpoint::new("http://127.0.0.1:1/a2a/CANARY?token=CANARY"))
+        .unwrap()
+        .allow_loopback();
+    let err = client
+        .send(
+            &PeerId::new("peer"),
+            "audit.check",
+            &json!({}),
+            &chain(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        !text.contains("CANARY"),
+        "the peer error quotes its URL: {text}"
+    );
+    assert!(
+        text.contains("127.0.0.1"),
+        "the error lost the host: {text}"
+    );
+}
+
 /// A2A 1.0 defines `-32006` as `InvalidAgentResponseError` and maps it to
 /// INTERNAL/HTTP 500. It cannot prove that this request caused no work.
 #[tokio::test]
@@ -1329,6 +1360,139 @@ async fn a_cut_off_answer_says_so() {
         out.usage.spend().tokens,
         4101,
         "a truncated answer is still billed"
+    );
+}
+
+/// Completeness is an allowlist on Responses: incomplete for a reason other
+/// than the output budget, or a status this driver does not know, is not an
+/// answer — and the text that came with it reads like one.
+#[tokio::test]
+async fn openai_a_filtered_or_unknown_status_is_not_an_answer() {
+    for (status, details) in [
+        ("incomplete", json!({ "reason": "content_filter" })),
+        ("cancelled", Value::Null),
+        ("", Value::Null),
+    ] {
+        let (c, _) = canned(
+            200,
+            json!({
+                "status": status,
+                "incomplete_details": details,
+                "output": [{ "content": [{ "type": "output_text", "text": "looks whole" }] }],
+                "usage": { "input_tokens": 5, "output_tokens": 3 }
+            }),
+        );
+        let provider = OpenAi::new("k").unwrap().base(serve(c).await).buffered();
+        let error = provider
+            .complete(ask(&gpt(), &json!("x")))
+            .await
+            .expect_err(status);
+        assert!(
+            matches!(error, ModelError::Unusable { .. }),
+            "{status}: {error}"
+        );
+        assert_eq!(
+            error.usage().output_tokens,
+            3,
+            "{status} was billed as free"
+        );
+    }
+}
+
+/// Completeness is an allowlist on Messages: a stop reason this driver has
+/// not seen, or none, is not an answer.
+#[tokio::test]
+async fn anthropic_an_unknown_stop_reason_is_not_an_answer() {
+    for reason in [json!("a_reason_not_yet_invented"), Value::Null] {
+        let (c, _) = canned(
+            200,
+            json!({
+                "content": [{ "type": "text", "text": "looks whole" }],
+                "usage": { "input_tokens": 1, "output_tokens": 3 },
+                "stop_reason": reason
+            }),
+        );
+        let provider = Anthropic::new("k").unwrap().base(serve(c).await).buffered();
+        let error = provider
+            .complete(ask(&model(), &json!("x")))
+            .await
+            .expect_err("an unknown stop is not an answer");
+        assert!(
+            matches!(error, ModelError::Unusable { .. }),
+            "{reason}: {error}"
+        );
+        assert_eq!(
+            error.usage().output_tokens,
+            3,
+            "{reason} was billed as free"
+        );
+    }
+}
+
+/// `OpenAI` names no reasoning effort `max`: refused before dispatch, as every
+/// other driver refuses a level its provider does not name.
+#[tokio::test]
+async fn openai_refuses_a_max_reasoning_effort_before_dispatch() {
+    let (c, seen) = canned(
+        200,
+        json!({
+            "status": "completed",
+            "output": [{ "content": [{ "type": "output_text", "text": "ok" }] }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 }
+        }),
+    );
+    let provider = OpenAi::new("k").unwrap().base(serve(c).await).buffered();
+    let model = gpt();
+    let prompt = json!("x");
+    let mut request = ask(&model, &prompt);
+    request.reasoning_effort = Some(ReasoningEffort::Max);
+    let error = provider
+        .complete(request)
+        .await
+        .expect_err("`max` is not an OpenAI effort");
+    assert!(matches!(error, ModelError::Refused { .. }), "{error}");
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "the request was sent anyway"
+    );
+}
+
+/// Anthropic rejects thinking beside a forced tool choice, so the forced-tool
+/// schema fallback with a declared effort is refused locally rather than sent.
+#[tokio::test]
+async fn anthropic_refuses_reasoning_with_a_forced_tool_before_dispatch() {
+    let (c, seen) = canned(
+        200,
+        json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "usage": { "input_tokens": 1, "output_tokens": 1 },
+            "stop_reason": "end_turn"
+        }),
+    );
+    let provider = Anthropic::new("k")
+        .unwrap()
+        .base(serve(c).await)
+        .buffered()
+        .structured_via(SchemaMode::ForcedTool);
+    let sch = json!({ "type": "object" });
+    let error = provider
+        .complete(agentplane::model::Request {
+            model: &model(),
+            prompt: &json!("x"),
+            max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
+            reasoning_effort: Some(ReasoningEffort::High),
+            schema: Some(&sch),
+            tools: &[],
+            exchanges: &[],
+            continuation: None,
+            stream: None,
+        })
+        .await
+        .expect_err("thinking with a forced tool is refused");
+    assert!(matches!(error, ModelError::Refused { .. }), "{error}");
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "the request was sent anyway"
     );
 }
 
@@ -2480,6 +2644,123 @@ data: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\"
     assert_eq!(err.disposition(), Disposition::Landed);
 }
 
+/// Serves one SSE body per request, in order, repeating the last.
+async fn serve_sse_sequence(bodies: Vec<String>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    #[derive(Clone)]
+    struct Sequence {
+        bodies: Arc<Vec<String>>,
+        served: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    async fn next(State(seq): State<Sequence>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let n = seq.served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = seq.bodies[n.min(seq.bodies.len() - 1)].clone();
+        (
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            body,
+        )
+            .into_response()
+    }
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = Router::new()
+        .route("/v1/messages", post(next))
+        .with_state(Sequence {
+            bodies: Arc::new(bodies),
+            served: Arc::clone(&served),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), served)
+}
+
+/// **A stream that died after generating is retried under the declared
+/// policy, and the dead attempt is billed.**
+///
+/// A completion changes nothing in the world, so the only cost of asking again
+/// is money — which the failure already carried to the budget. Treated as
+/// permanent, one `overloaded_error` mid-stream failed the step however many
+/// attempts the caller had declared.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_stream_that_died_after_generating_is_retried_and_billed() {
+    use agentplane::core::{Outcome, RetryPolicy, Skill, SkillDescriptor, SkillError, Tainted};
+    use agentplane::journal::JournalStore;
+    use agentplane::runtime::{RunStatus, Runtime, StepCtx};
+
+    #[derive(Debug)]
+    struct Asks(Arc<dyn ModelProvider>);
+    #[async_trait::async_trait]
+    impl Skill for Asks {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("asks").provides("asks")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let provider = Arc::clone(&self.0);
+            let answer = cx
+                .sink_with(&Tainted::trusted(json!("hi")), |prompt| {
+                    ModelCall::new(provider, model(), prompt).with_retry(
+                        RetryPolicy::attempts(3).with_backoff(
+                            std::time::Duration::from_millis(1),
+                            std::time::Duration::from_millis(1),
+                        ),
+                    )
+                })
+                .await?;
+            Ok(Outcome::done(answer.map(|c| json!(c.text))))
+        }
+    }
+
+    let died = format!(
+        "{ANTHROPIC_HEAD}\
+event: error
+data: {{\"type\":\"error\",\"error\":{{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}}}
+
+"
+    );
+    let whole = format!(
+        "{ANTHROPIC_HEAD}\
+event: message_delta
+data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\"}},\"usage\":{{\"output_tokens\":315}}}}
+
+event: message_stop
+data: {{\"type\":\"message_stop\"}}
+
+"
+    );
+    let (url, served) = serve_sse_sequence(vec![died, whole]).await;
+    let provider: Arc<dyn ModelProvider> = Arc::new(Anthropic::new("k").unwrap().base(url));
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let out = Runtime::builder(store as Arc<dyn JournalStore>)
+        .skill(Asks(provider))
+        .build()
+        .run("asks", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "a mid-stream overload with attempts left failed the step: {:?}",
+        out.status
+    );
+    assert_eq!(
+        served.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the second attempt must be made"
+    );
+    assert_eq!(
+        out.consumed.spend.tokens,
+        400 + 415,
+        "the dead attempt's generation must be billed beside the answer's"
+    );
+}
+
 /// Streaming carries the forced-tool emulation too.
 #[tokio::test]
 async fn a_streamed_forced_tool_call_is_reassembled() {
@@ -2738,7 +3019,7 @@ async fn a_peer_call_carries_attested_provenance() {
         .expect("provenance rides under the extension");
 
     assert!(
-        meta.contains_key("io.github.hupe1980.agentplane/attestation"),
+        meta.contains_key("io.github.hupe1980.agentplane/signature"),
         "{meta:?}"
     );
     let back = agentplane::core::Provenance::from_meta(meta).expect("parses peer-side");
@@ -3085,6 +3366,41 @@ async fn chat_completions_truncation_is_a_typed_fact() {
         "finish_reason 'length' must surface as `truncated`, not as a \
          silently shortened string"
     );
+}
+
+/// Completeness is an allowlist: `content_filter`, a server's own reason, or
+/// no reason at all ended generation without an answer.
+#[tokio::test]
+async fn chat_completions_a_filtered_or_unknown_stop_is_not_an_answer() {
+    for reason in [json!("content_filter"), json!("abort"), Value::Null] {
+        let (canned, _seen) = canned(
+            200,
+            json!({
+                "choices": [{
+                    "message": { "content": "looks whole" },
+                    "finish_reason": reason,
+                }],
+                "usage": { "prompt_tokens": 5, "completion_tokens": 3 },
+            }),
+        );
+        let url = serve(canned).await;
+        let driver = ChatCompletions::new(url).unwrap().buffered();
+        let model = ModelId::new("chat-completions", "m");
+        let prompt = json!("hello");
+        let error = driver
+            .complete(cc_request(&model, &prompt))
+            .await
+            .expect_err("a filtered stop is not an answer");
+        assert!(
+            matches!(error, ModelError::Unusable { .. }),
+            "{reason}: {error}"
+        );
+        assert_eq!(
+            error.usage().output_tokens,
+            3,
+            "{reason} was billed as free"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3932,6 +4248,79 @@ async fn gemini_a_safety_stop_is_metered_not_free() {
         "a decline was billed as free"
     );
     assert!(error.to_string().contains("SAFETY"), "{error}");
+}
+
+/// Visible and thinking tokens are summed without wrapping: both are the
+/// provider's numbers, and a wrapped sum reads a huge bill as a tiny one.
+#[tokio::test]
+async fn gemini_output_and_thought_counts_saturate() {
+    let (canned, _seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "ok" }] },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 1,
+                "candidatesTokenCount": u64::MAX,
+                "thoughtsTokenCount": 2,
+            },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let completion = driver
+        .complete(gemini_request(&model, &json!("q"), &[], &[], None))
+        .await
+        .unwrap();
+    assert_eq!(completion.usage.output_tokens, u64::MAX);
+}
+
+/// Completeness is an allowlist: only `STOP` is an answer.
+///
+/// `OTHER`, `LANGUAGE`, a malformed or unexpected tool call, and a reason no
+/// release of this driver has seen all end generation without one, and each
+/// came back as a whole answer while the reasons were a denylist.
+#[tokio::test]
+async fn gemini_every_finish_reason_but_stop_is_not_an_answer() {
+    for reason in [
+        "OTHER",
+        "LANGUAGE",
+        "MALFORMED_FUNCTION_CALL",
+        "UNEXPECTED_TOOL_CALL",
+        "TOO_MANY_TOOL_CALLS",
+        "IMAGE_SAFETY",
+        "A_REASON_NOT_YET_INVENTED",
+    ] {
+        let (canned, _seen, _headers) = canned_observed(
+            200,
+            json!({
+                "candidates": [{
+                    "content": { "role": "model", "parts": [{ "text": "looks whole" }] },
+                    "finishReason": reason,
+                }],
+                "usageMetadata": { "promptTokenCount": 11, "candidatesTokenCount": 2 },
+            }),
+        );
+        let url = serve(canned).await;
+        let driver = Gemini::new("k").unwrap().base(url).buffered();
+        let model = ModelId::new("gemini", "gemini-3.5-flash");
+        let error = driver
+            .complete(gemini_request(&model, &json!("q"), &[], &[], None))
+            .await
+            .expect_err(reason);
+        assert!(
+            matches!(error, ModelError::Unusable { .. }),
+            "{reason}: {error}"
+        );
+        assert_eq!(
+            error.usage().output_tokens,
+            2,
+            "{reason} was billed as free"
+        );
+    }
 }
 
 /// A prompt blocked before generating is a refusal that says why.

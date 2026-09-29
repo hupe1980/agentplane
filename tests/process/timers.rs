@@ -186,29 +186,44 @@ async fn a_refired_timer_does_not_duplicate_the_recorded_wake() {
         f.rt.run("demo.sleep", Tainted::trusted(json!({})))
             .await
             .unwrap();
-    let fired = f.rt.fire_timers(later(120)).await.unwrap();
-    assert_eq!(fired.fired, 1);
+    let timer = f
+        .store
+        .armed_timer_rows(out.run_id)
+        .await
+        .unwrap()
+        .remove(0);
 
-    // Reconstruct the crash's leftover state: the wake is in the journal, and
-    // the timer row is still armed because the disarm never ran.
-    let records = f.store.read(out.run_id, 1).await.unwrap();
-    let wake = records
-        .iter()
-        .find(|r| {
-            matches!(r.kind(), RecordKind::EffectDone { output, .. }
-                if output.get("fired_at").is_some())
-        })
-        .expect("the wake is on the record");
-    let timer = agentplane::core::Timer {
-        run: out.run_id,
-        case: None,
-        effect: wake.effect_key().unwrap(),
-        step: wake.body.step.unwrap(),
-        phase: wake.body.phase,
-        fire_at: later(60),
-    };
-    (f.store.clone() as Arc<dyn TimerStore>)
-        .arm(&timer)
+    // Reconstruct the crash's leftover state: the wake is in the journal, the
+    // timer row is still armed because the disarm never ran, and the run has
+    // not resumed past it.
+    let lease = f
+        .store
+        .acquire(out.run_id, "crashed-sweeper", Duration::from_mins(1))
+        .await
+        .unwrap();
+    f.store
+        .append(
+            lease.epoch,
+            vec![
+                agentplane::journal::Append::new(
+                    out.run_id,
+                    RecordKind::EffectDone {
+                        output: json!({ "fired_at": timer.fire_at.unix_timestamp() }),
+                        source: None,
+                        by: None,
+                        spend: agentplane::core::Spend::default(),
+                        declared: agentplane::core::DeclaredOutput::trusted(),
+                    },
+                )
+                .effect(timer.effect)
+                .step(timer.step)
+                .phase(timer.phase),
+            ],
+        )
+        .await
+        .unwrap();
+    f.store
+        .release_lease(out.run_id, lease.epoch)
         .await
         .unwrap();
 
@@ -298,7 +313,7 @@ async fn the_wake_instant_is_journaled_not_recomputed() {
             .await
             .unwrap();
 
-    let armed = f.rt.timers().unwrap().pending(10).await.unwrap();
+    let armed = f.store.armed_timer_rows(out.run_id).await.unwrap();
     assert_eq!(armed.len(), 1);
     let fire_at = armed[0].fire_at;
 
@@ -334,7 +349,7 @@ async fn a_late_sweep_records_the_due_instant_not_its_own() {
         f.rt.run("demo.sleep", Tainted::trusted(json!({})))
             .await
             .unwrap();
-    let due = f.rt.timers().unwrap().pending(10).await.unwrap()[0].fire_at;
+    let due = f.store.armed_timer_rows(out.run_id).await.unwrap()[0].fire_at;
 
     // The sweep runs an hour late.
     f.rt.fire_timers(later(3600)).await.unwrap();
@@ -380,13 +395,13 @@ async fn replaying_a_sleeping_run_does_not_reset_its_clock() {
         f.rt.run("demo.sleep", Tainted::trusted(json!({})))
             .await
             .unwrap();
-    let armed = f.rt.timers().unwrap().pending(10).await.unwrap();
+    let armed = f.store.armed_timer_rows(out.run_id).await.unwrap();
     let original = armed[0].fire_at;
 
     let again = f.rt.replay(out.run_id, Mode::Resume).await.unwrap();
     assert!(again.status.is_suspended(), "still asleep");
 
-    let still = f.rt.timers().unwrap().pending(10).await.unwrap();
+    let still = f.store.armed_timer_rows(out.run_id).await.unwrap();
     assert_eq!(still.len(), 1, "no second timer was armed");
     assert_eq!(still[0].fire_at, original, "and the instant did not move");
 }
@@ -796,4 +811,81 @@ async fn a_restored_wait_is_armed_by_nothing_until_the_run_is_resumed() {
         0,
         "the resume ran the work past the sleep instead of waiting again"
     );
+}
+
+// ── A closed run sleeps no longer ───────────────────────────────────────────
+
+/// **A run cancelled while it sleeps leaves no timer armed.**
+///
+/// A sealed run can record no wake. Its timer, left armed, is claimed by every
+/// sweep once the instant passes, fails to append, and is claimed again once
+/// its claim lapses — for as long as the store exists, with a fresh lease the
+/// recovery pass then walks each time.
+#[tokio::test]
+async fn a_cancelled_sleeping_run_leaves_no_timer_armed() {
+    let f = fixture(Duration::from_mins(1));
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    assert!(out.status.is_suspended());
+    assert_eq!(f.store.armed_timers(out.run_id).await.unwrap(), 1);
+
+    let ops = agentplane::core::Operator::asserted("ops").unwrap();
+    f.rt.request_cancel(out.run_id, &ops, "no longer needed")
+        .await
+        .unwrap();
+    assert!(
+        f.rt.recorded_outcome(out.run_id)
+            .await
+            .unwrap()
+            .is_some_and(|o| o.status.is_cancelled()),
+        "the fixture did not conclude the run cancelled"
+    );
+
+    assert_eq!(
+        f.store.armed_timers(out.run_id).await.unwrap(),
+        0,
+        "a cancelled run's timer is still armed — every sweep past its instant \
+         claims it, fails to record a wake on a sealed run, and claims it again"
+    );
+}
+
+/// **A sealed run's timer is retired by the sweep rather than fired.**
+///
+/// The runtime retires a closed run's timers as it seals it; this is the store
+/// half, for a timer that outlived that — a crash between the seal and the
+/// retirement. Claimed and fired, it fails on the sealed journal every lease
+/// period; passed over, it would sit at the head of the due order for ever.
+#[tokio::test]
+async fn a_sealed_runs_leftover_timer_is_retired_not_fired() {
+    let f = fixture(Duration::from_mins(1));
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    let timers = f.store.clone() as Arc<dyn TimerStore>;
+    let armed = f.store.armed_timer_rows(out.run_id).await.unwrap();
+    assert_eq!(armed.len(), 1);
+
+    let ops = agentplane::core::Operator::asserted("ops").unwrap();
+    f.rt.request_cancel(out.run_id, &ops, "no longer needed")
+        .await
+        .unwrap();
+    // The crash's leftover: the run is sealed and its timer is armed again.
+    timers.arm(&armed[0]).await.unwrap();
+    assert_eq!(f.store.armed_timers(out.run_id).await.unwrap(), 1);
+
+    let woken = f.rt.fire_timers(later(120)).await.unwrap();
+    assert_eq!(
+        (woken.fired, woken.failed),
+        (0, 0),
+        "a sealed run's timer was claimed and fired: {woken:?}"
+    );
+    assert_eq!(
+        f.store.armed_timers(out.run_id).await.unwrap(),
+        0,
+        "the sweep passed over a sealed run's timer instead of retiring it"
+    );
+    assert_eq!(f.woke.load(Ordering::SeqCst), 0);
 }

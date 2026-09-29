@@ -458,6 +458,31 @@ pub trait JournalStore: Send + Sync + Debug {
         limit: usize,
     ) -> Result<Vec<(RunId, u64)>, StoreError>;
 
+    /// [`recent_runs`](Self::recent_runs), narrowed to the runs one producer
+    /// admitted: those whose `RunAdmitted` carries an admission key whose
+    /// source half ([`origin_source`](crate::core::origin_source)) is
+    /// `source`.
+    ///
+    /// A derived index maintained by [`append`](Self::append) in the
+    /// transaction that writes the `RunAdmitted`, like the admission-key
+    /// index, and moved with the run's activity on every later append. It
+    /// exists so a served listing costs the caller's own runs: filtering
+    /// [`recent_runs`](Self::recent_runs) by owner would read the admission
+    /// record of every run in the tenant — every other peer's, and the
+    /// embedder's — to find the few that are the caller's. The same order, tie-break and
+    /// cursor as `recent_runs`. Unlike the admission key, the source is never
+    /// forgotten: whose run it is does not expire.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(RunId, u64)>, StoreError>;
+
     /// Every record belonging to a case, oldest first.
     ///
     /// *Show me everything about this matter* is the question a regulated

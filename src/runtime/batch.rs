@@ -165,7 +165,10 @@ impl Runtime {
             self.admit_plan_as(
                 reserved.run,
                 spec.plan.clone(),
-                crate::core::Tainted::trusted(item.input.clone()),
+                // Untrusted from `batch:<id>` unless the item says otherwise:
+                // a source is somebody else's data far more often than it is
+                // the operator's own.
+                crate::core::Tainted::with_label(item.input.clone(), item.admission_label(id)),
                 // A batch item's at-most-once identity is its reservation, not
                 // an admission key: the run id is written to the batch store
                 // before the run starts, so a retry replays that journal rather
@@ -239,6 +242,7 @@ impl Runtime {
             status: status_of(&census, exhausted),
             in_flight: census.in_flight + census.suspended,
             exhausted: census.exhausted,
+            withheld: census.withheld,
             spend: census.spend,
             cursor,
         })
@@ -255,7 +259,8 @@ impl Runtime {
 ///
 /// Note there is no path to a status that says "succeeded": see `crate::batch`.
 fn status_of(c: &BatchCensus, source_exhausted: bool) -> BatchStatus {
-    if !source_exhausted || c.in_flight > 0 || c.suspended > 0 || c.exhausted > 0 {
+    if !source_exhausted || c.in_flight > 0 || c.suspended > 0 || c.exhausted > 0 || c.withheld > 0
+    {
         return BatchStatus::Running;
     }
     BatchStatus::Completed {
@@ -294,12 +299,10 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
         // `Failed` taught operators to re-run items whose work was intact.
         RunStatus::Exhausted(limit) => ItemOutcome::Exhausted(limit.to_string()),
         // The same shape, from the other cause: the item's work stands and the
-        // remedy is an operator's, not a re-run. Reported as exhausted because
-        // that is what this coarse enum means by *paused, do not retry blindly*
-        // — and the reason names the withdrawn subject, so the two are told
-        // apart by whoever reads it.
+        // remedy is lifting the halt on the subject, not raising a budget — so
+        // it is its own outcome rather than a reason string under `Exhausted`.
         RunStatus::Withheld { subject, reason } => {
-            ItemOutcome::Exhausted(format!("authority '{subject}' withdrawn: {reason}"))
+            ItemOutcome::Withheld(format!("authority '{subject}' withdrawn: {reason}"))
         }
         // An item somebody stopped did not settle, and the batch must not
         // report otherwise — but the reason names the person, so a partial
@@ -327,11 +330,41 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
 
 /// Fetch the next page, mapping a source failure onto the runtime's errors.
 async fn store_page(spec: &BatchSpec, after: Option<&str>) -> Result<Vec<BatchItem>, RuntimeError> {
-    spec.source
+    let page = spec
+        .source
         .next(after, spec.page)
         .await
         // Surfaced, never swallowed into an empty page: a source failure that
         // read as "no more items" would truncate a settlement run silently,
         // which is the exact failure this crate exists to make loud.
-        .map_err(|e| RuntimeError::PlanContract(e.to_string()))
+        .map_err(|e| RuntimeError::PlanContract(e.to_string()))?;
+    in_cursor_order(after, &page)?;
+    Ok(page)
+}
+
+/// Refuse a page whose keys do not strictly increase in byte order past
+/// `after`.
+///
+/// The resume cursor is the greatest key of the finished prefix, compared as
+/// bytes. A source that pages in any other order — a locale collation, a
+/// numeric sort of `"9"` before `"10"`, a repeated key — resumes from a cursor
+/// that skips items it never ran or re-offers ones it did, and the batch
+/// reports complete either way.
+fn in_cursor_order(after: Option<&str>, page: &[BatchItem]) -> Result<(), RuntimeError> {
+    let mut previous = after;
+    for item in page {
+        if let Some(p) = previous
+            && item.key.as_bytes() <= p.as_bytes()
+        {
+            return Err(RuntimeError::PlanContract(format!(
+                "batch source returned key '{}' after '{p}': keys must strictly \
+                 increase in byte order, which is the order the resume cursor \
+                 compares — a source paging in any other order skips or repeats \
+                 items on resume",
+                item.key
+            )));
+        }
+        previous = Some(item.key.as_str());
+    }
+    Ok(())
 }

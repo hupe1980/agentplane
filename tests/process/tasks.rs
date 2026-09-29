@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{
-    CaseStatus, CorrelationKey, DeadlineSpec, DeadlineState, Decided, Decision, Justification,
-    OnExpiry, Outcome, Priority, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec, TaskState,
-    Timestamp,
+    CaseStatus, CorrelationKey, DeadlineSpec, DeadlineState, Decided, Decision, Expiry,
+    InboundEvent, Justification, OnExpiry, Outcome, Priority, Skill, SkillDescriptor, SkillError,
+    Tainted, TaskId, TaskSpec, TaskState, Timestamp,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{RunOutcome, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -37,16 +37,14 @@ fn by(actor: &str) -> agentplane::core::Operator {
 /// Proposes a refund and waits for a human.
 #[derive(Debug)]
 struct ProposesRefund {
-    on_expiry: OnExpiry,
-    allow_unattended: bool,
+    on_expiry: Expiry,
     exclude: Option<&'static str>,
 }
 
 impl ProposesRefund {
-    fn new(on_expiry: OnExpiry) -> Self {
+    fn new(on_expiry: Expiry) -> Self {
         Self {
             on_expiry,
-            allow_unattended: false,
             exclude: None,
         }
     }
@@ -82,18 +80,10 @@ impl Skill for ProposesRefund {
         let mut spec = TaskSpec::new("refund-approval", justification, "approval")
             .role("compliance-officer")
             .priority(Priority::High)
-            .on_expiry(self.on_expiry);
-
-        // Escalation must name who it widens to — the runtime refuses it bare.
-        if self.on_expiry == OnExpiry::Escalate {
-            spec = spec.escalate_to("senior-compliance");
-        }
+            .on_expiry(self.on_expiry.clone());
 
         if let Some(a) = self.exclude {
             spec = spec.excluding(a);
-        }
-        if self.allow_unattended {
-            spec = spec.allow_unattended();
         }
 
         let decision = cx.task(&spec).await?;
@@ -130,7 +120,7 @@ fn officer() -> Vec<String> {
 /// A run that needs a human suspends, and the proposal lands in a queue.
 #[tokio::test]
 async fn a_run_awaiting_a_human_suspends_and_queues_a_task() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
 
     let out =
         f.rt.run_correlated(
@@ -161,7 +151,7 @@ async fn a_run_awaiting_a_human_suspends_and_queues_a_task() {
 /// approval you cannot evaluate is not a control.
 #[tokio::test]
 async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     f.rt.run_correlated(
         "demo.refund",
         Tainted::trusted(json!({})),
@@ -202,7 +192,7 @@ async fn a_task_carries_what_a_reviewer_needs_to_disagree() {
 /// A decision resumes the run and is recorded with the name of whoever made it.
 #[tokio::test]
 async fn a_decision_resumes_the_run_and_names_the_decider() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     let out =
         f.rt.run_correlated(
             "demo.refund",
@@ -253,6 +243,225 @@ async fn a_decision_resumes_the_run_and_names_the_decider() {
     );
 }
 
+/// **A decision recorded where the agent is not still completes the task.**
+///
+/// An operator's terminal opens the store and holds no agent: it can record a
+/// decision and cannot continue the run. The answer is durable either way, so
+/// that plane must report it recorded and complete the task — not fail after
+/// the record, leaving the task claimed and the decider told it was lost. The
+/// run's own plane then continues it from the record.
+#[tokio::test]
+async fn a_decision_recorded_by_a_plane_without_the_agent_completes_the_task() {
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
+    let out =
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-TERMINAL")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+    let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+
+    // The terminal: the same store, no skill.
+    let terminal = Runtime::builder(f.store.clone() as Arc<dyn JournalStore>)
+        .cases(f.store.clone() as Arc<dyn CaseStore>)
+        .events(f.store.clone() as Arc<dyn EventStore>)
+        .tasks(f.store.clone() as Arc<dyn TaskStore>)
+        .lease_ttl(std::time::Duration::from_secs(2))
+        .build();
+    let delivery = terminal
+        .decide_task(
+            task.id,
+            &Decision::approve(by("alice"), "confirmed by phone"),
+            &officer(),
+        )
+        .await
+        .expect("a plane that cannot continue the run still records the decision");
+    assert_eq!(delivery, agentplane::core::Delivery::Buffered);
+    assert_eq!(
+        f.store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Completed,
+        "the decision was recorded and the task left claimed"
+    );
+
+    // The terminal keeps the lease its failed resume took, so the run stays
+    // listed as abandoned rather than on no listing; once it lapses, the plane
+    // that holds the agent continues from the recorded decision.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let resumed =
+        f.rt.replay(out.run_id, agentplane::runtime::Mode::Resume)
+            .await
+            .unwrap();
+    assert!(
+        matches!(resumed.status, RunStatus::Succeeded),
+        "the run's own plane did not continue from the recorded decision: {:?}",
+        resumed.status
+    );
+}
+
+/// Permits everything under a bundle of its own, so a plane without it holds
+/// a different policy than the one a run was admitted under.
+#[derive(Debug)]
+struct Governs;
+
+impl agentplane::core::PolicyEngine for Governs {
+    fn authorize(
+        &self,
+        _r: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"governs"),
+            "agentplane-test/policy-v1",
+        )
+    }
+}
+
+/// A plane holding the agent under a policy, and a run of it waiting on a
+/// decision.
+async fn governed_waiting_run(invoice: &str) -> (Fixture, agentplane::core::RunId) {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .policy(Arc::new(Governs) as Arc<dyn agentplane::core::PolicyEngine>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    let out = rt
+        .run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key(invoice)],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+    (Fixture { store, rt }, out.run_id)
+}
+
+/// The operator's terminal: the same stores, no policy and no agent.
+fn bare_terminal(store: &Arc<RedbStore>) -> Arc<Runtime> {
+    Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .lease_ttl(std::time::Duration::from_secs(2))
+        .build()
+}
+
+async fn last_conclusion(store: &Arc<RedbStore>, run: agentplane::core::RunId) -> Option<String> {
+    store
+        .read(run, 1)
+        .await
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|r| match r.kind() {
+            RecordKind::RunConcluded { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+}
+
+/// **Only a plane that can drive a run judges it.**
+///
+/// A terminal holding neither the run's agent nor its policy records a
+/// decision; it does not compare its own empty policy with the run's and
+/// quarantine a run it could never have continued. The decision is buffered
+/// for the plane that holds the agent.
+#[tokio::test]
+async fn a_decision_from_a_plane_without_the_agent_does_not_quarantine_a_governed_run() {
+    let (f, run) = governed_waiting_run("INV-GOV-1").await;
+    let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+
+    let delivery = bare_terminal(&f.store)
+        .decide_task(
+            task.id,
+            &Decision::approve(by("alice"), "confirmed by phone"),
+            &officer(),
+        )
+        .await
+        .expect("the terminal records the decision");
+    assert_eq!(delivery, agentplane::core::Delivery::Buffered);
+    assert_ne!(
+        last_conclusion(&f.store, run).await.as_deref(),
+        Some("quarantined"),
+        "a plane that cannot drive the run judged it"
+    );
+
+    // The plane holding the agent and the policy continues it.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let resumed =
+        f.rt.replay(run, agentplane::runtime::Mode::Resume)
+            .await
+            .unwrap();
+    assert!(
+        matches!(resumed.status, RunStatus::Succeeded),
+        "got {:?}",
+        resumed.status
+    );
+}
+
+/// The same for a stop asked from the terminal: recorded, not driven, and not
+/// a quarantine.
+#[tokio::test]
+async fn a_stop_from_a_plane_without_the_agent_is_recorded_and_not_judged() {
+    let (f, run) = governed_waiting_run("INV-GOV-2").await;
+
+    let recorded = bare_terminal(&f.store)
+        .request_cancel(run, &by("alice"), "the dispute was withdrawn")
+        .await
+        .expect("the terminal records the stop");
+    assert!(recorded);
+    assert_ne!(
+        last_conclusion(&f.store, run).await.as_deref(),
+        Some("quarantined"),
+        "a plane that cannot drive the run judged it"
+    );
+
+    // The plane that can drive it observes the standing request.
+    let stopped =
+        f.rt.replay(run, agentplane::runtime::Mode::Resume)
+            .await
+            .unwrap();
+    assert!(
+        matches!(stopped.status, RunStatus::Cancelled { .. }),
+        "got {:?}",
+        stopped.status
+    );
+}
+
+/// A plane that does hold the agent, under a different policy, still refuses
+/// to continue the run under rules it was not admitted under.
+#[tokio::test]
+async fn a_plane_holding_the_agent_under_another_policy_still_quarantines() {
+    let (f, run) = governed_waiting_run("INV-GOV-3").await;
+    let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+
+    let drifted = Runtime::builder(f.store.clone() as Arc<dyn JournalStore>)
+        .cases(f.store.clone() as Arc<dyn CaseStore>)
+        .events(f.store.clone() as Arc<dyn EventStore>)
+        .tasks(f.store.clone() as Arc<dyn TaskStore>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    drifted
+        .decide_task(
+            task.id,
+            &Decision::approve(by("alice"), "confirmed by phone"),
+            &officer(),
+        )
+        .await
+        .expect("the refusal is journaled, not raised");
+    let concluded = last_conclusion(&f.store, run).await;
+    assert_eq!(concluded.as_deref(), Some("quarantined"));
+}
+
 /// An unanswered window names nobody, and does not borrow a person's shape.
 ///
 /// A reserved name in a field that otherwise holds people is a convention
@@ -294,7 +503,7 @@ async fn an_expired_window_is_not_recorded_as_somebody_deciding() {
 /// sweeper's answer against a task the sweeper never reached.
 #[tokio::test]
 async fn an_expiry_may_not_be_filed_as_a_persons_answer() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     f.rt.run_correlated(
         "demo.refund",
         Tainted::trusted(json!({})),
@@ -328,7 +537,7 @@ async fn an_expiry_may_not_be_filed_as_a_persons_answer() {
 /// Without an enforced exclusion, dual control is a naming convention.
 #[tokio::test]
 async fn the_proposer_may_not_approve_their_own_proposal() {
-    let mut skill = ProposesRefund::new(OnExpiry::Deny);
+    let mut skill = ProposesRefund::new(Expiry::Deny);
     skill.exclude = Some("alice");
     let f = fixture(skill);
 
@@ -368,7 +577,7 @@ async fn the_proposer_may_not_approve_their_own_proposal() {
 /// Role eligibility is enforced, and the refusal says which check failed.
 #[tokio::test]
 async fn a_reviewer_without_the_role_is_refused() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     f.rt.run_correlated(
         "demo.refund",
         Tainted::trusted(json!({})),
@@ -393,7 +602,7 @@ async fn a_reviewer_without_the_role_is_refused() {
 /// Two reviewers cannot both hold one task.
 #[tokio::test]
 async fn a_task_is_claimed_by_exactly_one_reviewer() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     f.rt.run_correlated(
         "demo.refund",
         Tainted::trusted(json!({})),
@@ -416,7 +625,7 @@ async fn a_task_is_claimed_by_exactly_one_reviewer() {
 /// The queue only shows work the claim would actually permit.
 #[tokio::test]
 async fn the_queue_respects_roles() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     f.rt.run_correlated(
         "demo.refund",
         Tainted::trusted(json!({})),
@@ -454,7 +663,7 @@ async fn the_queue_respects_roles() {
 /// collision look like correct deduplication.
 #[tokio::test]
 async fn two_runs_of_one_plan_do_not_share_one_task() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
 
     let a =
         f.rt.run_correlated(
@@ -511,7 +720,7 @@ async fn two_runs_of_one_plan_do_not_share_one_task() {
 /// moment.** The safe default refuses.
 #[tokio::test]
 async fn an_unanswered_task_denies_by_default() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     let out =
         f.rt.run_correlated(
             "demo.refund",
@@ -546,36 +755,12 @@ async fn an_unanswered_task_denies_by_default() {
     );
 }
 
-/// Acting unattended requires an explicit, separate opt-in.
-#[tokio::test]
-async fn proceeding_unattended_requires_explicit_consent() {
-    // `OnExpiry::Proceed` without `allow_unattended()`.
-    let f = fixture(ProposesRefund::new(OnExpiry::Proceed));
-    let out =
-        f.rt.run_correlated(
-            "demo.refund",
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[key("INV-9")],
-        )
-        .await
-        .unwrap();
-
-    match out.status {
-        RunStatus::Failed(msg) => assert!(
-            msg.contains("allow_unattended"),
-            "the refusal must name the missing opt-in, got: {msg}"
-        ),
-        other => panic!("unattended action must not be available by accident: {other:?}"),
-    }
-}
-
 /// With consent, an unanswered task proceeds — and the record says who did.
 #[tokio::test]
 async fn a_pre_authorised_task_proceeds_unattended() {
-    let mut skill = ProposesRefund::new(OnExpiry::Proceed);
-    skill.allow_unattended = true;
-    let f = fixture(skill);
+    // The consent is the variant's name: acting without a human cannot be
+    // declared any other way.
+    let f = fixture(ProposesRefund::new(Expiry::ProceedUnattended));
 
     let out =
         f.rt.run_correlated(
@@ -610,7 +795,9 @@ async fn a_pre_authorised_task_proceeds_unattended() {
 /// `deny`/`proceed` policies queued behind it silently stop firing.
 #[tokio::test]
 async fn an_escalating_task_is_escalated_once() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Escalate));
+    let f = fixture(ProposesRefund::new(Expiry::escalate_to([
+        "senior-compliance",
+    ])));
     f.rt.run_correlated(
         "demo.refund",
         Tainted::trusted(json!({})),
@@ -656,9 +843,9 @@ async fn an_escalating_task_is_escalated_once() {
     );
 }
 
-/// The runtime refuses an escalation that names nobody, in both task shapes.
+/// The runtime refuses an escalation that names nobody, and says which role is missing.
 ///
-/// `OnExpiry::Escalate` with an empty `escalate_to` is "widen the audience"
+/// `Expiry::Escalate` with no roles is "widen the audience"
 /// with no audience to add — a state flag wearing a control's name. The run
 /// fails at the declaration rather than the window closing on a promise the
 /// sweep cannot keep.
@@ -684,35 +871,7 @@ async fn an_escalation_naming_nobody_is_refused() {
                 "approval",
             )
             .role("ops")
-            .on_expiry(OnExpiry::Escalate);
-            let d = cx.task(&spec).await?;
-            Ok(Outcome::done(Tainted::trusted(json!(d.approved))))
-        }
-    }
-
-    // The converse shape: an escalation audience beside a policy that never
-    // escalates is a declaration nothing reads.
-    #[derive(Debug)]
-    struct AudienceWithoutEscalation;
-    #[async_trait::async_trait]
-    impl Skill for AudienceWithoutEscalation {
-        fn descriptor(&self) -> SkillDescriptor {
-            SkillDescriptor::new("audience-no-escalation").provides("demo.noesc")
-        }
-        async fn invoke(
-            &self,
-            cx: &mut StepCtx<'_>,
-            _input: Tainted<Value>,
-        ) -> Result<Outcome, SkillError> {
-            cx.deadline("approval", &DeadlineSpec::days(2), None)
-                .await?;
-            let spec = TaskSpec::new(
-                "noesc",
-                Justification::new(Tainted::trusted("x".to_owned()), json!({})),
-                "approval",
-            )
-            .role("ops")
-            .escalate_to("ops-lead");
+            .on_expiry(Expiry::Escalate { to: Vec::new() });
             let d = cx.task(&spec).await?;
             Ok(Outcome::done(Tainted::trusted(json!(d.approved))))
         }
@@ -724,7 +883,6 @@ async fn an_escalation_naming_nobody_is_refused() {
         .events(store.clone() as Arc<dyn EventStore>)
         .tasks(store.clone() as Arc<dyn TaskStore>)
         .skill(BareEscalation)
-        .skill(AudienceWithoutEscalation)
         .build();
 
     let out = rt
@@ -738,27 +896,10 @@ async fn an_escalation_naming_nobody_is_refused() {
         .unwrap();
     match out.status {
         RunStatus::Failed(msg) => assert!(
-            msg.contains("escalate_to"),
+            msg.contains("names no role"),
             "the refusal names the missing declaration: {msg}"
         ),
         other => panic!("an escalation naming nobody must fail the run: {other:?}"),
-    }
-
-    let out2 = rt
-        .run_correlated(
-            "demo.noesc",
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[key("INV-13")],
-        )
-        .await
-        .unwrap();
-    match out2.status {
-        RunStatus::Failed(msg) => assert!(
-            msg.contains("never escalates"),
-            "the refusal names the dead declaration: {msg}"
-        ),
-        other => panic!("an unread escalation audience must fail the run: {other:?}"),
     }
 }
 
@@ -900,7 +1041,7 @@ async fn a_met_obligation_is_not_breached() {
 /// A sweep on a healthy plane is silent — so a non-silent one means something.
 #[tokio::test]
 async fn a_quiet_plane_sweeps_quietly() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
     let report =
         f.rt.sweep(Timestamp::now_utc(), std::time::Duration::from_hours(8760))
             .await
@@ -916,7 +1057,7 @@ async fn tasks_without_a_task_store_are_refused() {
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
         .events(store.clone() as Arc<dyn EventStore>)
-        .skill(ProposesRefund::new(OnExpiry::Deny))
+        .skill(ProposesRefund::new(Expiry::Deny))
         .build();
 
     let out = rt
@@ -934,11 +1075,18 @@ async fn tasks_without_a_task_store_are_refused() {
     }
 }
 
-/// A second submission of the same decision is a duplicate, not a second answer.
+/// A second submission of a decision is not a second answer.
+///
+/// The worklist marks a task complete *after* its answer is delivered, so a
+/// failure between the two leaves a task its decider can submit again. The
+/// answer's event id is derived from the task, so the resubmission is a
+/// duplicate the run never consumes. It is the decider's own answer coming
+/// back, so it settles the task their first submission left pending — and
+/// anybody else's is refused as already answered.
 #[tokio::test]
-async fn a_resubmitted_decision_is_a_duplicate() {
-    let f = fixture(ProposesRefund::new(OnExpiry::Deny));
-    f.rt.run_correlated(
+async fn a_resubmitted_decision_is_not_a_second_answer() {
+    let (store, rt) = racing(TaskState::Completed);
+    rt.run_correlated(
         "demo.refund",
         Tainted::trusted(json!({})),
         "dispute",
@@ -946,13 +1094,169 @@ async fn a_resubmitted_decision_is_a_duplicate() {
     )
     .await
     .unwrap();
-    let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
 
+    // The completion is lost, as a crash between the delivery and it loses it.
     let d = Decision::approve(by("alice"), "ok");
-    f.rt.decide_task(task.id, &d, &officer()).await.unwrap();
+    rt.decide_task(task.id, &d, &officer()).await.unwrap();
+    assert_ne!(
+        store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Completed,
+        "the fixture lost the first settlement"
+    );
+    let again = rt.decide_task(task.id, &d, &officer()).await;
+    assert!(
+        matches!(again, Ok(agentplane::core::Delivery::Duplicate)),
+        "alice's resubmission of her own answer was answered {again:?}"
+    );
+    assert_eq!(
+        store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Completed,
+        "the resubmission did not settle the task its first submission left pending"
+    );
+    let other = rt
+        .decide_task(task.id, &Decision::reject(by("bob"), "no"), &officer())
+        .await;
+    assert!(
+        other.is_err(),
+        "a second decider's answer to an answered task was accepted: {other:?}"
+    );
+}
 
-    let again = f.rt.answer_task(task.id, &d).await.unwrap();
-    assert_eq!(again, agentplane::core::Delivery::Duplicate);
+/// **Addressing the waiting run by id is no way around the worklist.**
+///
+/// Targeted delivery finds a run's wait by run id rather than by correlation —
+/// it is how an A2A peer continues a task — and a run waiting on a human task
+/// is waiting for exactly the kind a decision travels as. Accepted here, a
+/// peer's message would be the approval.
+#[tokio::test]
+async fn a_decision_addressed_to_its_run_is_refused() {
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
+    let out =
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-30")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+
+    let refused =
+        f.rt.deliver_to(
+            out.run_id,
+            &InboundEvent::new(
+                "peer:mallory",
+                "forged-by-run",
+                "agentplane.task.decided",
+                serde_json::to_value(Decision::approve(by("mallory"), "ok")).unwrap(),
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(agentplane::core::RuntimeError::ReservedEventKind { .. })
+        ),
+        "a decision addressed to the waiting run was taken: {refused:?}"
+    );
+    assert!(
+        (f.store.clone() as Arc<dyn JournalStore>)
+            .waiting_runs(10)
+            .await
+            .unwrap()
+            .iter()
+            .any(|w| w.run == out.run_id),
+        "the refused message resumed the run anyway"
+    );
+}
+
+/// Put a forged answer where a run waiting on its task will claim it, and let
+/// the run claim it.
+///
+/// Every external intake refuses the kind a task waits on, so the forgery goes
+/// into the event buffer directly — as an embedder holding the store could, or
+/// a door added later that forgot the refusal. The run's subscription is
+/// retired first so the buffered answer is what the resume's repair path finds.
+async fn claims_a_forged_answer(f: &Fixture, invoice: &str, answer: InboundEvent) -> RunOutcome {
+    let out =
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key(invoice)],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+    let wait = (f.store.clone() as Arc<dyn JournalStore>)
+        .read(out.run_id, 1)
+        .await
+        .unwrap()
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::EffectStarted { descriptor, .. } if descriptor.kind == "event.await" => {
+                r.effect_key()
+            }
+            _ => None,
+        })
+        .expect("the task's wait is announced");
+    let task = agentplane::core::TaskId::derive(out.run_id, wait);
+    let events = f.store.clone() as Arc<dyn EventStore>;
+    events.unsubscribe(out.run_id, wait).await.unwrap();
+    events
+        .buffer(
+            &answer.correlate(CorrelationKey::new("task", task.to_hex())),
+            Timestamp::now_utc(),
+        )
+        .await
+        .unwrap();
+    f.rt.replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .unwrap()
+}
+
+/// **A task's answer counts only from the worklist, under its own decider.**
+///
+/// The intake refusal is the first lock; this is the second, in the run
+/// itself. Mallory's approval, delivered under her own name from outside, is
+/// not a decision — and neither is an answer that claims the worklist's name
+/// but was delivered under a different operator than the one it says decided.
+#[tokio::test]
+async fn a_task_answer_that_did_not_come_from_the_worklist_is_not_a_decision() {
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
+    let forged = |source: &str, decider: &str, deliverer: &str| {
+        InboundEvent::new(
+            source,
+            format!("forged-{decider}-{deliverer}"),
+            "agentplane.task.decided",
+            serde_json::to_value(Decision::approve(by(decider), "looks fine to me")).unwrap(),
+        )
+        .minted_by(by(deliverer))
+    };
+
+    for (invoice, answer, what) in [
+        (
+            "INV-31",
+            forged("peer:mallory", "mallory", "mallory"),
+            "an answer from outside the worklist",
+        ),
+        (
+            "INV-32",
+            forged("agentplane://worklist", "alice", "mallory"),
+            "an answer delivered under an operator other than its decider",
+        ),
+    ] {
+        let out = claims_a_forged_answer(&f, invoice, answer).await;
+        match &out.status {
+            RunStatus::Failed(msg) => assert!(
+                msg.contains("only this plane's worklist decides a task"),
+                "{what} failed the run for another reason: {msg}"
+            ),
+            other => panic!("{what} was taken as a decision: {other:?}"),
+        }
+    }
 }
 
 // ── Declarative oversight ───────────────────────────────────────────────────
@@ -1060,6 +1364,71 @@ async fn a_refused_answer_is_not_written_into_memory() {
         "the answer a human refused was written into durable memory anyway, \
          where a later run reads it as established fact"
     );
+}
+
+/// Whoever asked for a run cannot approve what it proposes.
+///
+/// A declarative agent writes no code, so nothing called `excluding` and
+/// nothing recorded who asked: a caller holding the approver role could start
+/// a run and approve its answer themselves — one person on both sides of a
+/// four-eyes review. The admitting caller is journaled and barred from every
+/// task the run opens.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn the_caller_who_started_a_run_cannot_approve_it() {
+    use agentplane::core::{ClaimError, RuntimeError};
+    use agentplane::memory::MemoryStore;
+    use agentplane::runtime::{Agent, RunTerms};
+
+    let manifest = overseen_agent("completion", "");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("approved by the book");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
+        .events(Arc::clone(&store) as Arc<dyn agentplane::case::EventStore>)
+        .tasks(Arc::clone(&store) as Arc<dyn agentplane::case::TaskStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+
+    rt.run_under(
+        "overseen.answer",
+        Tainted::trusted(json!({ "q": "x" })),
+        RunTerms::default()
+            .correlated("review", &[key("doc-bob")])
+            .admitted_by("bob"),
+    )
+    .await
+    .expect("the run suspends on the task");
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let refused = rt
+        .decide_task(
+            task.id,
+            &Decision::approve(by("bob"), "looks right to me"),
+            &officer(),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(RuntimeError::TaskClaim(ClaimError::Excluded { ref actor })) if actor == "bob"
+        ),
+        "the caller who started the run approved its answer: {refused:?}"
+    );
+
+    rt.decide_task(
+        task.id,
+        &Decision::approve(by("carol"), "a second pair of eyes"),
+        &officer(),
+    )
+    .await
+    .expect("anyone else with the role may decide");
 }
 
 /// A `tool-calling` agent reaches oversight too.
@@ -2471,7 +2840,7 @@ async fn a_task_proposal_is_sealed_in_the_worklist() {
         .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
         .events(Arc::clone(&store) as Arc<dyn EventStore>)
         .tasks(Arc::clone(&sealed) as Arc<dyn TaskStore>)
-        .skill(ProposesRefund::new(OnExpiry::Deny))
+        .skill(ProposesRefund::new(Expiry::Deny))
         .build();
 
     rt.run_correlated(
@@ -2535,7 +2904,7 @@ async fn the_approver_outlives_an_erasure_of_what_they_said() {
         .events(raw.clone() as Arc<dyn EventStore>)
         .tasks(raw.clone() as Arc<dyn TaskStore>)
         .keyring(keys.clone() as Arc<dyn agentplane::keyring::KeyRing>)
-        .skill(ProposesRefund::new(OnExpiry::Deny))
+        .skill(ProposesRefund::new(Expiry::Deny))
         .build();
 
     let out = rt
@@ -2596,5 +2965,590 @@ async fn the_approver_outlives_an_erasure_of_what_they_said() {
     assert!(
         !text.contains("the meter reading checks out"),
         "the erasure did not reach the reason the approver gave"
+    );
+}
+
+// ── An approval binds to what was proposed ──────────────────────────────────
+
+/// A task store whose rows are not what the run wrote: every task it opens has
+/// its proposed amount rewritten, as an edit in the database between proposal
+/// and decision would leave it.
+#[derive(Debug)]
+struct Tampered(Arc<RedbStore>, Value);
+
+#[async_trait::async_trait]
+impl TaskStore for Tampered {
+    async fn open(
+        &self,
+        task: &agentplane::core::Task,
+    ) -> Result<agentplane::core::Task, agentplane::core::StoreError> {
+        let mut edited = task.clone();
+        edited.justification.proposed_action = self.1.clone();
+        self.0.open(&edited).await
+    }
+    async fn task(
+        &self,
+        id: TaskId,
+    ) -> Result<Option<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.task(id).await
+    }
+    async fn claim(
+        &self,
+        id: TaskId,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<agentplane::core::Task, agentplane::core::ClaimError> {
+        self.0.claim(id, actor, roles).await
+    }
+    async fn release(&self, id: TaskId, actor: &str) -> Result<(), agentplane::core::ClaimError> {
+        self.0.release(id, actor).await
+    }
+    async fn take_over(
+        &self,
+        id: TaskId,
+        from: &str,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<agentplane::core::Task, agentplane::core::ClaimError> {
+        self.0.take_over(id, from, actor, roles).await
+    }
+    async fn set_state(
+        &self,
+        id: TaskId,
+        state: TaskState,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.0.set_state(id, state).await
+    }
+    async fn withdraw_run(
+        &self,
+        run: agentplane::core::RunId,
+        awaited: &[TaskId],
+    ) -> Result<usize, agentplane::core::StoreError> {
+        self.0.withdraw_run(run, awaited).await
+    }
+    async fn escalate(
+        &self,
+        id: TaskId,
+    ) -> Result<agentplane::core::Task, agentplane::core::StoreError> {
+        self.0.escalate(id).await
+    }
+    async fn queue(
+        &self,
+        roles: &[String],
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.queue(roles, limit).await
+    }
+    async fn for_case(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.for_case(case).await
+    }
+    async fn open_count(&self) -> Result<u64, agentplane::core::StoreError> {
+        self.0.open_count().await
+    }
+    async fn overdue(
+        &self,
+        now: agentplane::core::Timestamp,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.overdue(now, limit).await
+    }
+}
+
+/// A reviewer who approved €42 has not approved €4,200.
+///
+/// The run proposes one action and the reviewer reads another from the store;
+/// the decision comes back `approved` either way. Acting on it dispatches
+/// arguments no person saw — the approval-loop hijack, where what is reviewed
+/// and what is performed are two different rows. The approval names the
+/// digest of what the decider was shown, and the run refuses one that is not
+/// the task it proposed.
+#[tokio::test]
+async fn an_approval_of_an_edited_task_does_not_authorize_the_original() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(Arc::new(Tampered(
+            Arc::clone(&store),
+            json!({ "action": "refund", "amount_eur": 42 }),
+        )) as Arc<dyn TaskStore>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    let out = rt
+        .run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-LOOP")],
+        )
+        .await
+        .unwrap();
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    assert_eq!(
+        task.justification.proposed_action["amount_eur"], 42,
+        "the fixture must show the reviewer the edited row"
+    );
+    rt.decide_task(
+        task.id,
+        &Decision::approve(by("alice"), "a small refund, fine"),
+        &officer(),
+    )
+    .await
+    .expect("the decision itself is recorded");
+
+    let records = store.read(out.run_id, 1).await.unwrap();
+    let concluded = records.iter().find_map(|r| match r.kind() {
+        RecordKind::RunConcluded {
+            outcome, reason, ..
+        } => Some((outcome.clone(), reason.clone().unwrap_or_default())),
+        _ => None,
+    });
+    let (outcome, reason) = concluded.expect("the run must conclude rather than wait on");
+    assert_eq!(
+        outcome, "failed",
+        "the run acted on an approval of a task it never proposed"
+    );
+    assert!(
+        reason.contains("approval does not name the task this run proposed"),
+        "the run failed for some other reason: {reason}"
+    );
+}
+
+/// A proposal the deciding plane cannot open is not approvable there.
+///
+/// Two ways a plane meets one: a terminal holding no key ring reads a sealed
+/// row, and any plane reads a row whose case key an erasure destroyed. An
+/// approval recorded over either is an approval of arguments nobody was
+/// shown, so it is refused — in a class of its own, naming why — and the task
+/// stays open; a rejection, which refuses the unseen, still goes through.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn a_proposal_this_plane_cannot_open_is_not_approved() {
+    use agentplane::core::{RuntimeError, TenantId, Withheld};
+    use agentplane::keyring::KeyRing;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let ring = Arc::new(agentplane::testkit::MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let plane = |keys: Option<&Arc<dyn KeyRing>>| {
+        let builder = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+            .cases(store.clone() as Arc<dyn CaseStore>)
+            .events(store.clone() as Arc<dyn EventStore>)
+            .tasks(store.clone() as Arc<dyn TaskStore>)
+            .skill(ProposesRefund::new(Expiry::Deny));
+        match keys {
+            Some(keys) => builder.keyring(Arc::clone(keys)).build(),
+            None => builder.build(),
+        }
+    };
+    let sealed = plane(Some(&ring));
+    sealed
+        .run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-SEALED")],
+        )
+        .await
+        .unwrap();
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+
+    // A terminal: the same store, no ring.
+    let refused = plane(None)
+        .decide_task(
+            task.id,
+            &Decision::approve(by("alice"), "looks fine"),
+            &officer(),
+        )
+        .await
+        .expect_err("an approval of a proposal nobody could read was recorded");
+    assert!(
+        matches!(
+            refused,
+            RuntimeError::ProposalWithheld {
+                reason: Withheld::Sealed,
+                ..
+            }
+        ),
+        "{refused}"
+    );
+    assert_eq!(
+        store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Open,
+        "the refusal must leave the task for a surface that can show it"
+    );
+
+    // The case erased: even the plane holding the ring cannot show it now.
+    ring.destroy(
+        &agentplane::core::erasure_scope(
+            &TenantId::default(),
+            &task.case.expect("the task's case").to_string(),
+        ),
+        time::OffsetDateTime::now_utc(),
+        "erased on request",
+    )
+    .await
+    .expect("destroy");
+    let refused = sealed
+        .decide_task(
+            task.id,
+            &Decision::approve(by("alice"), "looks fine"),
+            &officer(),
+        )
+        .await
+        .expect_err("an approval of an erased proposal was recorded");
+    assert!(
+        matches!(
+            refused,
+            RuntimeError::ProposalWithheld {
+                reason: Withheld::Erased,
+                ..
+            }
+        ),
+        "{refused}"
+    );
+
+    // A rejection needs no proposal. Taken on a terminal — no ring, and no
+    // agent to resume the run with, so the answer is recorded and waits.
+    Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .build()
+        .decide_task(
+            task.id,
+            &Decision::reject(by("alice"), "cannot see it, so no"),
+            &officer(),
+        )
+        .await
+        .expect("a rejection of the unseen is safe and recorded");
+}
+
+/// **Clear arguments spelled like the sealed marker are approvable.**
+///
+/// Whether a proposal is withheld is the store's out-of-band answer, never
+/// the proposal's shape. Read from the shape, untrusted input could put
+/// `{"$sealed": "…"}` in a proposal's arguments and leave every reviewer
+/// unable to approve it, on every plane, ring or no ring.
+#[tokio::test]
+async fn an_argument_spelled_like_the_marker_is_approvable() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(Arc::new(Tampered(
+            Arc::clone(&store),
+            json!({ "$sealed": "AAECAwQFBgc=" }),
+        )) as Arc<dyn TaskStore>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-MARKER")],
+    )
+    .await
+    .unwrap();
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    assert_eq!(task.withheld, None, "nothing sealed this row");
+    rt.decide_task(
+        task.id,
+        &Decision::approve(by("alice"), "looks fine"),
+        &officer(),
+    )
+    .await
+    .expect("arguments spelled like the marker made the task unapprovable");
+}
+
+// ── A decision and an expiry race to settle one task ────────────────────────
+
+/// A task store whose first settlement to one state never lands, standing in
+/// for the settler that died between delivering its answer and writing the
+/// state. Later settlements land, as a retry's or a sweep's would.
+#[derive(Debug)]
+struct Interrupted(Arc<RedbStore>, TaskState, std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl TaskStore for Interrupted {
+    async fn open(
+        &self,
+        task: &agentplane::core::Task,
+    ) -> Result<agentplane::core::Task, agentplane::core::StoreError> {
+        self.0.open(task).await
+    }
+    async fn task(
+        &self,
+        id: TaskId,
+    ) -> Result<Option<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.task(id).await
+    }
+    async fn claim(
+        &self,
+        id: TaskId,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<agentplane::core::Task, agentplane::core::ClaimError> {
+        self.0.claim(id, actor, roles).await
+    }
+    async fn release(&self, id: TaskId, actor: &str) -> Result<(), agentplane::core::ClaimError> {
+        self.0.release(id, actor).await
+    }
+    async fn take_over(
+        &self,
+        id: TaskId,
+        from: &str,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<agentplane::core::Task, agentplane::core::ClaimError> {
+        self.0.take_over(id, from, actor, roles).await
+    }
+    async fn set_state(
+        &self,
+        id: TaskId,
+        state: TaskState,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        // The settler died between its answer and its settlement.
+        if state == self.1 && !self.2.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(true);
+        }
+        self.0.set_state(id, state).await
+    }
+    async fn withdraw_run(
+        &self,
+        run: agentplane::core::RunId,
+        awaited: &[TaskId],
+    ) -> Result<usize, agentplane::core::StoreError> {
+        self.0.withdraw_run(run, awaited).await
+    }
+    async fn escalate(
+        &self,
+        id: TaskId,
+    ) -> Result<agentplane::core::Task, agentplane::core::StoreError> {
+        self.0.escalate(id).await
+    }
+    async fn queue(
+        &self,
+        roles: &[String],
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.queue(roles, limit).await
+    }
+    async fn for_case(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.for_case(case).await
+    }
+    async fn open_count(&self) -> Result<u64, agentplane::core::StoreError> {
+        self.0.open_count().await
+    }
+    async fn overdue(
+        &self,
+        now: agentplane::core::Timestamp,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.overdue(now, limit).await
+    }
+}
+
+fn racing(drops: TaskState) -> (Arc<RedbStore>, Arc<Runtime>) {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(Arc::new(Interrupted(
+            Arc::clone(&store),
+            drops,
+            std::sync::atomic::AtomicBool::new(false),
+        )) as Arc<dyn TaskStore>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    (store, rt)
+}
+
+/// **An expiry that lost the race to a decision does not settle the task.**
+///
+/// The reviewer's approval reached the run first, and the reviewer has not yet
+/// written `completed`. The sweep's expiry is then a duplicate answer the run
+/// never consumed, and marking the task `expired` would leave the worklist
+/// saying the window lapsed over a run that acted on a person's approval.
+#[tokio::test]
+async fn an_expiry_that_lost_to_a_decision_does_not_settle_the_task() {
+    let (store, rt) = racing(TaskState::Completed);
+    let out = rt
+        .run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-RACE-A")],
+        )
+        .await
+        .unwrap();
+    let task = store.queue(&officer(), 10).await.unwrap()[0].clone();
+
+    let approve = Decision::approve(by("alice"), "the dispute is justified");
+    rt.decide_task(task.id, &approve, &officer()).await.unwrap();
+
+    let later = Timestamp::now_utc() + std::time::Duration::from_hours(720);
+    let report = rt
+        .sweep(later, std::time::Duration::from_hours(8760))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.tasks_expired, 0,
+        "the sweep counted an expiry the run never consumed"
+    );
+    assert_ne!(
+        store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Expired,
+        "the worklist says the window lapsed while run {} acted on alice's approval",
+        out.run_id
+    );
+}
+
+/// **A decision that lost the race to an expiry is refused, not recorded.**
+///
+/// The sweep's expiry reached the run first and has not yet written
+/// `expired`. The reviewer's claim still succeeds, and their answer is a
+/// duplicate the run never consumed: reporting it delivered, and writing
+/// `completed`, would leave the worklist naming a decider whose approval
+/// nothing acted on.
+#[tokio::test]
+async fn a_decision_that_lost_to_an_expiry_is_refused() {
+    let (store, rt) = racing(TaskState::Expired);
+    rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-RACE-B")],
+    )
+    .await
+    .unwrap();
+    let task = store.queue(&officer(), 10).await.unwrap()[0].clone();
+
+    let later = Timestamp::now_utc() + std::time::Duration::from_hours(720);
+    rt.sweep(later, std::time::Duration::from_hours(8760))
+        .await
+        .unwrap();
+
+    let approve = Decision::approve(by("alice"), "the dispute is justified");
+    match rt.decide_task(task.id, &approve, &officer()).await {
+        Err(agentplane::core::RuntimeError::TaskClaim(
+            agentplane::core::ClaimError::AlreadyAnswered { task: refused },
+        )) => assert_eq!(refused, task.id),
+        other => panic!(
+            "a decision the run never consumed was answered {other:?} — the reviewer is \
+             told their approval landed on a run that acted on the expiry"
+        ),
+    }
+    assert_ne!(
+        store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Completed,
+        "the worklist names alice as the decider of a task the expiry answered"
+    );
+}
+
+/// **A cancelled run's unanswered task is withdrawn.**
+///
+/// Nobody can answer a task whose run is sealed. Left open, it stays in the
+/// queue for a reviewer to spend a decision on, counts in the backlog, and its
+/// expiry is later delivered to a run that cannot consume it.
+#[tokio::test]
+async fn a_cancelled_runs_open_task_is_withdrawn() {
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
+    let out =
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-CANCEL")],
+        )
+        .await
+        .unwrap();
+    let task = f.store.queue(&officer(), 10).await.unwrap()[0].clone();
+
+    f.rt.request_cancel(out.run_id, &by("ops"), "the dispute was withdrawn")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        f.store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Withdrawn,
+        "a cancelled run's task is still offered for a decision no answer can reach"
+    );
+    assert!(f.store.queue(&officer(), 10).await.unwrap().is_empty());
+}
+
+/// **An expiry that meets an answer already given settles the task once.**
+///
+/// The reviewer's answer was delivered and its settlement lost. The sweep's
+/// expiry is then a duplicate; skipped without settling, the task stayed
+/// pending and overdue, and every tick wrote a fresh `TaskExpired` note for
+/// an expiry that never applied. The answer on the buffer names who gave it,
+/// so the sweep settles the task to that answer's state and says its own did
+/// not apply.
+#[tokio::test]
+async fn an_expiry_meeting_a_given_answer_settles_the_task_once() {
+    use agentplane::core::SweptAction;
+    let (store, rt) = racing(TaskState::Completed);
+    rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-RACE-C")],
+    )
+    .await
+    .unwrap();
+    let task = store.queue(&officer(), 10).await.unwrap()[0].clone();
+    rt.decide_task(
+        task.id,
+        &Decision::approve(by("alice"), "justified"),
+        &officer(),
+    )
+    .await
+    .unwrap();
+
+    let later = Timestamp::now_utc() + std::time::Duration::from_hours(720);
+    let mut expired_notes = 0;
+    let mut not_applied = 0;
+    for _ in 0..2 {
+        let report = rt
+            .sweep(later, std::time::Duration::from_hours(8760))
+            .await
+            .unwrap();
+        assert_eq!(report.tasks_expired, 0, "{report:?}");
+        if let Some(run) = report.record {
+            for record in store.read(run, 1).await.unwrap() {
+                if let RecordKind::Swept {
+                    subject, action, ..
+                } = record.kind()
+                    && *subject == task.id.to_hex()
+                {
+                    match action {
+                        SweptAction::TaskExpired => expired_notes += 1,
+                        SweptAction::NotApplied => not_applied += 1,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(
+        store.task(task.id).await.unwrap().unwrap().state,
+        TaskState::Completed,
+        "the task alice answered was left pending"
+    );
+    assert!(
+        expired_notes <= 1,
+        "the sweep wrote {expired_notes} expiry notes for an expiry that never applied"
+    );
+    assert_eq!(
+        not_applied, expired_notes,
+        "an expiry note stands uncorrected"
     );
 }

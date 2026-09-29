@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.44.0"
+version      = "0.45.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -187,7 +187,7 @@ tracing     = "0.1"
 # Some controls are quiet toward the caller and loud toward the operator — an
 # A2A decline names the determining policy in a `tracing` event and tells the
 # peer nothing. Without a subscriber installed, that half reaches nobody.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "env-filter"], optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "env-filter", "json"], optional = true }
 # The binary's argument parser. A flag lives on its subcommand's struct, so
 # passing a `serve` flag to `run` fails to parse rather than being accepted and
 # ignored. +9 crates on `cli`, +0 on the library; re-derive with `cargo tree
@@ -218,7 +218,7 @@ rmcp = { version = "3.1", default-features = false, features = ["client", "trans
 # extractors this surface never touches.
 axum = { version = "0.8.9", default-features = false, features = ["json", "http1", "tokio", "query"], optional = true }
 # `rustls` rather than the platform's TLS: one static binary is a design
-# commitment (P11), and linking OpenSSL puts a system dependency back in.
+# commitment, and linking OpenSSL puts a system dependency back in.
 # `rand_core` off: keys come from the deployment, and a signer that can mint its
 # own identity is a signer whose signatures mean nothing.
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "zeroize", "signature"], optional = true }

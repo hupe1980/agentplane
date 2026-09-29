@@ -58,9 +58,29 @@ struct Recorder {
     /// effect in hand — `gen_ai.operation.name` — is `record`ed rather than
     /// declared, and a recorder that drops `record` cannot see it at all.
     recorded: Arc<Mutex<Vec<String>>>,
+    /// Every field any event or span carried, as `field=value` — the whole of
+    /// what a log sink would have written.
+    fields: Arc<Mutex<Vec<String>>>,
+}
+
+/// Writes each visited field into a list, as `field=value`.
+struct Fields<'a>(&'a Mutex<Vec<String>>);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+        self.0.lock().unwrap().push(format!("{}={v:?}", f.name()));
+    }
+    fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+        self.0.lock().unwrap().push(format!("{}={v}", f.name()));
+    }
 }
 
 impl Recorder {
+    fn fields(&self) -> Vec<String> {
+        let mut all = self.fields.lock().unwrap().clone();
+        all.extend(self.recorded());
+        all
+    }
     fn recorded(&self) -> Vec<String> {
         self.recorded.lock().unwrap().clone()
     }
@@ -91,6 +111,7 @@ impl Subscriber for Recorder {
     }
     fn new_span(&self, attrs: &span::Attributes<'_>) -> span::Id {
         let name = attrs.metadata().name().to_owned();
+        attrs.record(&mut Fields(&self.fields));
         self.spans.lock().unwrap().push(name.clone());
         let parent = self.stack.lock().unwrap().last().map(|(_, n)| n.clone());
         self.tree.lock().unwrap().push((name, parent));
@@ -122,6 +143,7 @@ impl Subscriber for Recorder {
     }
     fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
     fn event(&self, event: &Event<'_>) {
+        event.record(&mut Fields(&self.fields));
         self.events
             .lock()
             .unwrap()
@@ -838,4 +860,284 @@ async fn an_ordinary_effect_carries_no_gen_ai_operation() {
             .any(|r| r.starts_with(telemetry::GEN_AI_OPERATION)),
         "a non-GenAI effect was labelled as one: {recorded:?}"
     );
+}
+
+// ── What a loud event may not carry ─────────────────────────────────────────
+
+/// A value only the caller's data could have put into a reason.
+const CANARY: &str = "CANARY-7f3a-alice@example.com";
+
+/// Fail the test if any field any event or span carried quotes the canary.
+fn assert_no_canary(rec: &Recorder, what: &str) {
+    let leaked: Vec<String> = rec
+        .fields()
+        .into_iter()
+        .filter(|f| f.contains(CANARY))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "{what}: a telemetry field quotes the reason's text, which the journal seals \
+         and an erasure destroys — a log line would outlive both: {leaked:?}"
+    );
+}
+
+/// An effect whose failure message quotes the caller's data, as a provider's
+/// refusal quotes the request it refused.
+#[derive(Debug, Clone)]
+struct Quoting {
+    kind: &'static str,
+    /// The message the call fails with, if it fails.
+    fails: Option<String>,
+    /// Fail mid-flight — in doubt — rather than with the peer's answer.
+    interrupted: bool,
+}
+
+#[async_trait::async_trait]
+impl Effect for Quoting {
+    type Output = Value;
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(self.kind, json!(null))
+    }
+    fn mutates(&self) -> bool {
+        true
+    }
+    fn recovery(&self) -> Recovery {
+        Recovery::RequiresOperator
+    }
+    fn retry(&self) -> RetryPolicy {
+        RetryPolicy::never()
+    }
+    async fn perform(&self) -> Result<Value, EffectError> {
+        match &self.fails {
+            None => Ok(json!({ "ok": true })),
+            Some(detail) if self.interrupted => Err(EffectError::Interrupted {
+                driver: "mail".into(),
+                detail: detail.clone(),
+            }),
+            Some(detail) => Err(EffectError::Performed(detail.clone())),
+        }
+    }
+}
+
+/// **A failed run's event names the run, not the reason.**
+///
+/// A skill's failure reason is its author's words over the caller's values,
+/// sealed in the journal under a key ring. The event carries the run, the class
+/// and a digest; the text stays where an erasure reaches it.
+#[tokio::test]
+async fn a_failed_runs_event_carries_a_digest_not_the_reason() {
+    #[derive(Debug)]
+    struct Refuses;
+    #[async_trait::async_trait]
+    impl Skill for Refuses {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("refuses").provides("demo.refuses")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::fail(format!("no account for {CANARY}")))
+        }
+    }
+    let rec = Recorder::default();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Refuses)
+        .build();
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt
+        .run("demo.refuses", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    drop(guard);
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(
+        rec.events().iter().any(|e| e == telemetry::RUN_FAILED),
+        "a failed run must still announce itself; got {:?}",
+        rec.events()
+    );
+    let digest = telemetry::reason_digest(&format!("no account for {CANARY}"));
+    assert!(
+        rec.fields()
+            .iter()
+            .any(|f| f == &format!("reason_digest={digest}")),
+        "the event carries no digest joining it to the reason the API returns: {:?}",
+        rec.fields()
+    );
+    assert_no_canary(&rec, "a failed run");
+}
+
+/// **An undecidable effect, its quarantine and its abandonment say nothing of
+/// what the provider wrote.**
+#[tokio::test]
+async fn an_undecidable_effects_events_carry_no_provider_text() {
+    #[derive(Debug)]
+    struct Sends;
+    #[async_trait::async_trait]
+    impl Skill for Sends {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("sends").provides("demo.sends")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let v = cx
+                .effect(Quoting {
+                    kind: "test.send",
+                    fails: Some(format!("connection reset while sending to {CANARY}")),
+                    interrupted: true,
+                })
+                .await?;
+            Ok(Outcome::done(v))
+        }
+    }
+    let rec = Recorder::default();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Sends)
+        .build();
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt
+        .run("demo.sends", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "{:?}",
+        out.status
+    );
+    rt.decide_quarantine(
+        out.run_id,
+        &operator("ada"),
+        &format!("called {CANARY}; nobody can say"),
+        agentplane::core::QuarantineDecision::Abandon,
+    )
+    .await
+    .unwrap();
+    drop(guard);
+
+    let events = rec.events();
+    for expected in [
+        telemetry::UNDECIDABLE,
+        telemetry::QUARANTINED,
+        telemetry::ABANDONED,
+    ] {
+        assert!(
+            events.iter().any(|e| e == expected),
+            "expected `{expected}`, got {events:?}"
+        );
+    }
+    assert!(
+        rec.fields().iter().any(|f| f == "error_type=undecidable"),
+        "the event names no class of fault: {:?}",
+        rec.fields()
+    );
+    assert_no_canary(&rec, "an undecidable effect");
+}
+
+/// **A compensation that failed says so, without the failure's words.**
+#[tokio::test]
+async fn a_failed_compensations_event_carries_no_error_text() {
+    use agentplane::core::{ArgSource, Compensation, PlanIR, PlanNode, StepId};
+
+    #[derive(Debug)]
+    struct Undoable {
+        name: &'static str,
+        fails: bool,
+    }
+    #[async_trait::async_trait]
+    impl Skill for Undoable {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new(self.name).provides(self.name)
+        }
+        fn compensation(&self) -> Compensation {
+            Compensation::Compensatable
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            if self.fails {
+                return Ok(Outcome::fail("the second step refused"));
+            }
+            let v = cx
+                .effect(Quoting {
+                    kind: "test.post",
+                    fails: None,
+                    interrupted: false,
+                })
+                .await?;
+            Ok(Outcome::done(v))
+        }
+        async fn compensate(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _output: &Tainted<Value>,
+        ) -> Result<(), SkillError> {
+            cx.effect(Quoting {
+                kind: "test.unpost",
+                fails: Some(format!("ledger refused reversal for {CANARY}")),
+                interrupted: false,
+            })
+            .await?;
+            Ok(())
+        }
+    }
+
+    let rec = Recorder::default();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(Undoable {
+            name: "post",
+            fails: false,
+        })
+        .skill(Undoable {
+            name: "check",
+            fails: true,
+        })
+        .build();
+    let plan = PlanIR::new(vec![
+        PlanNode::new(0, "post").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "check")
+            .arg("x", ArgSource::node(StepId(0)))
+            .terminal(),
+    ]);
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    drop(guard);
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(
+        rec.events()
+            .iter()
+            .any(|e| e == telemetry::COMPENSATION_FAILED),
+        "expected `{}`, got {:?}",
+        telemetry::COMPENSATION_FAILED,
+        rec.events()
+    );
+    assert_no_canary(&rec, "a failed compensation");
 }

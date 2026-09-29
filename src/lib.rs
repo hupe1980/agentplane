@@ -124,6 +124,22 @@ pub mod tools;
 /// [`StepCtx::rng`]: crate::runtime::StepCtx::rng
 pub use rand;
 
+/// The schema derive [`Tool`](crate::tools::Tool) requires of its arguments.
+///
+/// Re-exported for the reason [`rand`] is: `Tool` is bounded on this crate's
+/// `JsonSchema`, and one from a `schemars` of a different major version is a
+/// different trait with the same name. Without a `schemars` of your own, point
+/// the derive here:
+///
+/// ```
+/// #[derive(serde::Deserialize, agentplane::schemars::JsonSchema)]
+/// #[schemars(crate = "agentplane::schemars")]
+/// struct Lookup {
+///     id: String,
+/// }
+/// ```
+pub use schemars;
+
 #[cfg(any(feature = "redb", feature = "postgres"))]
 pub mod store;
 
@@ -227,16 +243,16 @@ pub use crate::runtime::{Runtime, StepCtx};
 ///
 /// A prelude earns its place by being *predictable*, so this one is chosen by a
 /// stated rule rather than by taste: **a name belongs here if a program that
-/// does nothing unusual needs it.** Measured, not guessed — every name below
-/// appears in a third or more of the crate's own examples, and the set is
-/// exactly what the getting-started program imports, which is why that program
-/// now opens with one line instead of five.
+/// does nothing unusual needs it.** The set is what the getting-started program
+/// imports — including its tool-calling step, since a skill that calls a tool
+/// is the ordinary case — which is why that program opens with one `use` line.
 ///
-/// The four groups are the four things any program touches: the skill you write
-/// (`Skill`, `SkillDescriptor`, `SkillError`, `Outcome`), the context it is
-/// handed (`StepCtx`), the labels its data carries (`Tainted`, `Trust`,
-/// `Sensitivity`), and the plane that runs it (`Runtime`, `RunStatus`, `Mode`,
-/// `JournalStore`, and the default store).
+/// The groups are the things any program touches: the skill you
+/// write (`Skill`, `SkillDescriptor`, `SkillError`, `Outcome`), the context it
+/// is handed (`StepCtx`), the labels its data carries (`Tainted`, `Trust`,
+/// `Sensitivity`), the tools it calls (`Tool`, `ToolBox`, `ToolId`), and the
+/// plane that runs it (`Runtime`, `RunStatus`, `Mode`, `JournalStore`, and the
+/// default store).
 ///
 /// # What is deliberately left out
 ///
@@ -255,6 +271,7 @@ pub mod prelude {
     };
     pub use crate::journal::JournalStore;
     pub use crate::runtime::{Mode, RunStatus, Runtime, StepCtx};
+    pub use crate::tools::{Tool, ToolBox, ToolId};
 
     /// The attribute every `impl Skill` needs, so writing one does not begin
     /// with adding a dependency.

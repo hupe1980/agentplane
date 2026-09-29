@@ -361,7 +361,7 @@ impl MemoryStore for RedbStore {
 
                 // Sliding retention starts at the write, not at the first
                 // touch. Initialized lazily, an item with a window and no
-                // fixed expiry was *immortal* until somebody touched it —
+                // fixed expiry would be *immortal* until somebody touched it —
                 // opt-in garbage that never collects. The write is itself an
                 // access, so the window opens here and each journaled touch
                 // slides it; a version written without the window drops the
@@ -678,7 +678,7 @@ impl MemoryStore for RedbStore {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn forget_cascading(&self, id: &str) -> Result<usize, StoreError> {
+    async fn forget_cascading(&self, id: &str) -> Result<crate::memory::Cascade, StoreError> {
         let tenant = self.tenant_name();
         let root = id.to_owned();
         self.with_db(move |db| {
@@ -796,16 +796,14 @@ impl MemoryStore for RedbStore {
                         .map_err(|e| be(&e))?
                         .is_some()
                     {
-                        return Err(StoreError::Backend(format!(
-                            "memory '{memory_id}' is under legal hold"
-                        )));
+                        return Err(StoreError::UnderLegalHold { id: memory_id });
                     }
                 }
 
-                // Counted per node that actually held state, so a tombstoned
+                // Named per node that actually held state, so a tombstoned
                 // intermediate the traversal passed through is not reported as
                 // an erasure it did not perform.
-                let mut erased = 0usize;
+                let mut erased = Vec::new();
                 for memory_id in &doomed {
                     let previous = current
                         .get((tenant.as_str(), memory_id.as_str()))
@@ -848,7 +846,13 @@ impl MemoryStore for RedbStore {
                         })
                         .collect::<Result<_, _>>()?;
                     if previous.is_some() || !versions.is_empty() {
-                        erased += 1;
+                        let highest = versions
+                            .iter()
+                            .copied()
+                            .chain(previous.as_ref().map(|(.., version)| *version))
+                            .max()
+                            .unwrap_or(0);
+                        erased.push((memory_id.clone(), highest));
                     }
                     for version in versions {
                         items
@@ -861,8 +865,8 @@ impl MemoryStore for RedbStore {
                 // that stay alive. Only the version row goes: the id keeps its
                 // current entry, its index row, its access window and — no
                 // tombstone — its future.
-                let mut partly: std::collections::BTreeSet<&str> =
-                    std::collections::BTreeSet::new();
+                let mut partly: std::collections::BTreeMap<&str, Vec<u64>> =
+                    std::collections::BTreeMap::new();
                 for (memory_id, version) in &doomed_versions {
                     if doomed.contains(memory_id) {
                         continue;
@@ -872,10 +876,17 @@ impl MemoryStore for RedbStore {
                         .map_err(|e| be(&e))?
                         .is_some()
                     {
-                        partly.insert(memory_id.as_str());
+                        partly.entry(memory_id.as_str()).or_default().push(*version);
                     }
                 }
-                erased += partly.len();
+                let trimmed: Vec<(String, Vec<u64>)> = partly
+                    .into_iter()
+                    .map(|(id, mut versions)| {
+                        versions.sort_unstable();
+                        versions.dedup();
+                        ((*id).to_owned(), versions)
+                    })
+                    .collect();
 
                 // Cascading erasure no longer needs repair lineage for any
                 // vertex — id or version — it removed. Delete the edges
@@ -913,7 +924,7 @@ impl MemoryStore for RedbStore {
                         ))
                         .map_err(|e| be(&e))?;
                 }
-                erased
+                crate::memory::Cascade { erased, trimmed }
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(removed)
@@ -933,9 +944,7 @@ impl MemoryStore for RedbStore {
                     .map_err(|e| be(&e))?
                     .is_some()
                 {
-                    return Err(StoreError::Backend(format!(
-                        "memory '{id}' is under legal hold"
-                    )));
+                    return Err(StoreError::UnderLegalHold { id });
                 }
                 let mut items = w.open_table(ITEMS).map_err(|e| be(&e))?;
                 let mut current = w.open_table(CURRENT).map_err(|e| be(&e))?;
@@ -1053,9 +1062,7 @@ impl MemoryStore for RedbStore {
                         .map_err(|e| be(&e))?
                         .is_some()
                     {
-                        return Err(StoreError::Backend(format!(
-                            "memory '{id}' is under legal hold"
-                        )));
+                        return Err(StoreError::UnderLegalHold { id: id.clone() });
                     }
                 }
                 for id in &ids {
@@ -1240,7 +1247,10 @@ impl MemoryStore for RedbStore {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn sweep_expired(&self, at: crate::core::Timestamp) -> Result<usize, StoreError> {
+    async fn sweep_expired(
+        &self,
+        at: crate::core::Timestamp,
+    ) -> Result<Vec<(String, u64)>, StoreError> {
         let tenant = self.tenant_name();
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -1301,10 +1311,10 @@ impl MemoryStore for RedbStore {
                         (left, right) => left.or(right),
                     };
                     if effective.is_some_and(|expires| expires <= at) {
-                        expired.push((id, subject, purpose, created));
+                        expired.push((id, subject, purpose, created, version));
                     }
                 }
-                for (id, subject, purpose, created) in &expired {
+                for (id, subject, purpose, created, _) in &expired {
                     by_subject
                         .remove((
                             tenant.as_str(),
@@ -1355,7 +1365,11 @@ impl MemoryStore for RedbStore {
                             .map_err(|e| be(&e))?;
                     }
                 }
-                expired.len()
+                // The current version is the highest: versions only grow.
+                expired
+                    .into_iter()
+                    .map(|(id, .., version)| (id, version))
+                    .collect::<Vec<_>>()
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(removed)

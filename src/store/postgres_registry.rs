@@ -23,9 +23,9 @@
 
 use async_trait::async_trait;
 
-use crate::core::{Attestation, Digest, KeyId, Signer, StoreError, Verifier};
+use crate::core::{Digest, KeyId, KeySignature, Signer, StoreError, Verifier};
 use crate::manifest::registry::{
-    PublishVerdict, attest_manifest, check_attestation, decide_publish, reparse, to_yaml,
+    PublishVerdict, check_signature, decide_publish, reparse, sign_manifest, to_yaml,
 };
 use crate::manifest::{Manifest, Registry, RegistryError};
 
@@ -39,15 +39,15 @@ fn pool_err(e: &impl std::fmt::Display) -> RegistryError {
     RegistryError::Backend(e.to_string())
 }
 
-/// The stored attestation, if the row carries one.
+/// The stored signature, if the row carries one.
 ///
 /// An empty key id is the absence: a signature cannot exist without one, so
 /// there is no sentinel here overlapping a value it might be confused with.
-fn stored_attestation(key_id: &str, signature: &str) -> Option<Attestation> {
+fn stored_signature(key_id: &str, signature: &str) -> Option<KeySignature> {
     if key_id.is_empty() {
         return None;
     }
-    Some(Attestation {
+    Some(KeySignature {
         key_id: key_id.to_owned(),
         // A signature that does not decode cannot verify, and an empty one
         // fails exactly as a wrong one does — `BadSignature` either way.
@@ -60,7 +60,7 @@ impl PostgresStore {
     async fn publish_row(
         &self,
         manifest: &Manifest,
-        attestation: Option<Attestation>,
+        signature: Option<KeySignature>,
     ) -> Result<Digest, RegistryError> {
         let name = manifest.metadata.name.clone();
         let version = manifest.metadata.version.clone();
@@ -70,7 +70,7 @@ impl PostgresStore {
             source,
         })?;
         let yaml = to_yaml(manifest)?;
-        let (key_id, signature) = attestation
+        let (key_id, signature_hex) = signature
             .as_ref()
             .map_or((String::new(), String::new()), |a| {
                 (a.key_id.clone(), hex::encode(&a.signature))
@@ -110,7 +110,7 @@ impl PostgresStore {
                 })?;
                 Some((
                     stored_digest,
-                    stored_attestation(&row.get::<_, String>(1), &row.get::<_, String>(2)),
+                    stored_signature(&row.get::<_, String>(1), &row.get::<_, String>(2)),
                 ))
             }
             None => None,
@@ -120,7 +120,7 @@ impl PostgresStore {
             &name,
             &version,
             digest,
-            attestation.as_ref(),
+            signature.as_ref(),
             stored.as_ref().map(|(d, a)| (*d, a.as_ref())),
         );
         // The refusal rolls back rather than committing nothing: an open
@@ -150,19 +150,19 @@ impl PostgresStore {
                         &digest.to_hex(),
                         &yaml,
                         &key_id,
-                        &signature,
+                        &signature_hex,
                     ],
                 )
                 .await
                 .map_err(|e| be(&e))?;
             }
-            // Only the attestation columns move; the content is identical by
+            // Only the signature columns move; the content is identical by
             // construction, which is what `decide_publish` established.
-            PublishVerdict::AdoptAttestation => {
+            PublishVerdict::AdoptSignature => {
                 tx.execute(
                     "UPDATE registry_manifests SET key_id = $4, signature = $5
                      WHERE tenant = $1 AND name = $2 AND version = $3",
-                    &[&tenant, &name, &version, &key_id, &signature],
+                    &[&tenant, &name, &version, &key_id, &signature_hex],
                 )
                 .await
                 .map_err(|e| be(&e))?;
@@ -178,7 +178,7 @@ impl PostgresStore {
         &self,
         name: &str,
         version: &str,
-    ) -> Result<(String, Option<Attestation>), RegistryError> {
+    ) -> Result<(String, Option<KeySignature>), RegistryError> {
         let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
         let row = client
             .query_opt(
@@ -194,7 +194,7 @@ impl PostgresStore {
             })?;
         Ok((
             row.get(0),
-            stored_attestation(&row.get::<_, String>(1), &row.get::<_, String>(2)),
+            stored_signature(&row.get::<_, String>(1), &row.get::<_, String>(2)),
         ))
     }
 }
@@ -210,8 +210,8 @@ impl Registry for PostgresStore {
         manifest: &Manifest,
         signer: &dyn Signer,
     ) -> Result<Digest, RegistryError> {
-        let (_, attestation) = attest_manifest(manifest, signer)?;
-        self.publish_row(manifest, Some(attestation)).await
+        let (_, signature) = sign_manifest(manifest, signer)?;
+        self.publish_row(manifest, Some(signature)).await
     }
 
     async fn resolve(&self, name: &str, version: &str) -> Result<Manifest, RegistryError> {
@@ -225,9 +225,9 @@ impl Registry for PostgresStore {
         version: &str,
         verifier: &dyn Verifier,
     ) -> Result<(Manifest, KeyId), RegistryError> {
-        let (yaml, attestation) = self.row(name, version).await?;
+        let (yaml, signature) = self.row(name, version).await?;
         let manifest = reparse(name, version, &yaml)?;
-        let key = check_attestation(name, version, &manifest, attestation.as_ref(), verifier)?;
+        let key = check_signature(name, version, &manifest, signature.as_ref(), verifier)?;
         Ok((manifest, key))
     }
 

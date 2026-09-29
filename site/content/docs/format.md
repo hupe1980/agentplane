@@ -93,7 +93,7 @@ canon(  {"b":1,"a":{"d":2,"c":3}}  )  =  {"a":{"c":3,"d":2},"b":1}
 
 ## 4. The record body {#record-body}
 
-A record body is a JSON object. Seven envelope members, then the payload
+A record body is a JSON object: the envelope members below, then the payload
 members of exactly one kind, **flattened into the same object**.
 
 | Member | Type | Presence |
@@ -112,8 +112,11 @@ members of exactly one kind, **flattened into the same object**.
 overwhelmingly common record costs no bytes and no hash input.
 
 **Unknown members are refused, in both directions.** A body carrying a member
-this reader does not know — at the top level or inside the payload — is an
-error, not a member to skip. That is the opposite of what a *message* format
+this reader does not know — at the top level, or inside any nested object whose
+shape the record vocabulary defines (a descriptor, a label, a spend, a
+principal, an operator, a correlation key, a suspension reason, an agent
+identity, and every other) — is an error, not a member to skip. The caller's own JSON a record carries verbatim (`input`, `output`,
+`args`, `plan`) is a value, not a shape, and holds whatever members it holds. That is the opposite of what a *message* format
 does, and deliberately: a record is **evidence**. Its members are the inputs to
 an authorization, retry or recovery verdict, so dropping one is reaching a
 conclusion over evidence the reader did not see. The same argument forbids
@@ -147,7 +150,7 @@ the writer's — a version, a library, a locale — every historical hash would
 move, and tamper evidence would be destroyed by an upgrade. Reading a record at
 a newer shape is a *view*; the chain is over history as written.
 
-## 6. Attestation {#attestation}
+## 6. Record signature {#signature}
 
 A record may carry a signature. It sits **beside** the hash, never inside the
 body — a signature inside the body would make the hash cover the signature that
@@ -281,6 +284,14 @@ Sealed bytes are rotation-immutable. The chain commits to the envelope, which
 carries the wrapped key inline, so re-wrapping is not expressible — the erasure
 scope is the rotation unit.
 
+This one envelope is what every sealed store keeps, not only record payloads.
+Each seals to associated data naming what the bytes belong to, so an envelope
+copied elsewhere fails to authenticate rather than opening as another row's
+data. A sealed blob's is `blob:<scope>:<digest hex>`; a sealed memory's is the
+canonical JSON array `["memory", tenant, id, version, subject, purpose]`, and a
+memory row's content is the sealed JSON payload above, with no plaintext digest
+beside it.
+
 ## 9. The export file {#export-file}
 
 JSON Lines, UTF-8, one object per line, in this order:
@@ -347,7 +358,7 @@ export carries it sealed.
 ### Record line {#record-line}
 
 ```json
-{"seq":2,"body":{…},"prev_hash":"<hex>","hash":"<hex>","attestation":null,"raw":"…"}
+{"seq":2,"body":{…},"prev_hash":"<hex>","hash":"<hex>","signature":null,"raw":"…"}
 ```
 
 | Member | Type | Presence |
@@ -356,11 +367,13 @@ export carries it sealed.
 | `body` | the parsed [record body](#record-body) | always |
 | `prev_hash` | digest hex | always |
 | `hash` | digest hex | always |
-| `attestation` | `{"key_id": "…", "signature": "<hex>"}` or `null` | always present, `null` when unsigned |
+| `signature` | `{"key_id": "…", "signature": "<hex>"}` or `null` | always present, `null` when unsigned |
 | `raw` | string | always |
 
-`attestation` is written as an explicit `null` rather than omitted, so a reader
-tells *unsigned* from *a field this export forgot*.
+`signature` is the plane's workload-key signature over the record, as
+[record signing](#signature) describes — a statement of who wrote it, not a hardware
+attestation of where. It is written as an explicit `null` rather than omitted,
+so a reader tells *unsigned* from *a field this export forgot*.
 
 `raw` is **the exact bytes the hash covers**, carried as a JSON string —
 canonical record bytes are UTF-8 JSON, so they escape and recover byte for
@@ -376,7 +389,9 @@ than trusting either alone.
 {"kind":"agentplane.export.case",
  "case":{"id":"case_<ulid>","kind":"…","status":"open","correlation":[…],
          "state":{…},"version":0,"opened_at":"<rfc3339>","runs":["run_<ulid>"]},
- "deadlines":[…],"blobs":["<hex>"]}
+ "deadlines":[…],"blobs":["<hex>"],
+ "hold":{"placed_at":"<rfc3339>","reason":"…",
+         "by":{"actor":"…","basis":"authenticated"}}}
 ```
 
 | Member | Type |
@@ -385,6 +400,12 @@ than trusting either alone.
 | `case` | the case: `id`, `kind`, `status`, `correlation`, `state`, `version`, `opened_at`, `runs` |
 | `deadlines` | the case's obligations, each with `case`, `name`, `resolved_at`, `calendar_digest`, `state` and optionally `warn_at` and `acknowledged` |
 | `blobs` | digest hex strings |
+| `hold` | `null`, or the legal hold on the matter: `placed_at`, `reason`, and `by` — the operator who placed it, as `actor` and `basis` (`authenticated`, `asserted` or `connected`) |
+
+`hold` is required. A restore places it again with its original instant, reason
+and operator; a reader that finds it missing or malformed reports a finding and a
+restore refuses the file, because a matter restored without its hold is one the
+next retention pass erases.
 
 `case.id` is the bare ULID — the same spelling a record body's `case` member
 carries, which is what makes the cross-layer check a string comparison.
@@ -435,20 +456,26 @@ An implementation that does the following has verified the file.
    *wrong*, and the report must say which. A `size` of 0 beside any root other
    than the empty root is a checkpoint describing a log that cannot exist.
 2. **Per record.** Recompute `SHA-256(prev_hash ‖ raw)` and compare with
-   `hash`. Then parse `raw` and compare the result with `body` — the two must
-   agree, or the file's readable half is saying something its hashed half does
-   not.
+   `hash` **before parsing `raw`**. Bytes that do not hash to their claim were
+   edited, whatever they parse as. Only bytes that do may make a parse failure
+   a *build skew* — a newer writer's shape — rather than damage. Then parse
+   `raw` and compare the result with `body` — the two must agree, or the
+   file's readable half is saying something its hashed half does not.
 3. **Per run.** `prev_hash` of the first record is 32 zero bytes; every later
    record's `prev_hash` is its predecessor's `hash`; `seq` is contiguous and
    ascending; and every record's own `body.run` is the run its block claims.
    That last one is not redundant: without it an export could file run B's
    records and B's leaf under A's id, and chain, seal and root would all verify
    B's bytes. Only the *label* lied, and the label is what a reader looks a run
-   up by.
-4. **Signatures**, where present: verify as [attestation](#attestation)
-   describes, against a key set the verifier holds. A record with no
-   attestation is unsigned, which is a state; a *strict* verification refuses
-   it, and stripping signatures must not be a way to pass.
+   up by. A `RunConcluded` record's `chain_head` must equal its own
+   `prev_hash` — the head the conclusion was drawn over is the head it sits
+   on, and a conclusion claiming another was composed against a different
+   history.
+4. **Signatures**, where present: verify the record line's `signature` as
+   [record signing](#signature) describes, against a key set the verifier holds. A
+   record with no signature is unsigned, which is a state; a *strict*
+   verification refuses it, and stripping signatures must not be a way to
+   pass. A verifier that does not check signatures must say so in its report.
 5. **The log.** For each sealed run, `seal` must equal the run's terminal
    `hash`. Then leaf-hash every `seal` in `index` order and compute the root as
    [the log](#merkle-log) describes.
@@ -478,6 +505,21 @@ An implementation that does the following has verified the file.
    ticket. A verifier given no such checkpoint has not checked for deletion and
    must report that it did not, rather than reporting a pass.
 
+   An outside checkpoint is an origin, a size and a root, and the size decides
+   what it can settle:
+
+   - **Of another origin, or larger than the file's header:** the file cannot
+     be part of that history. A finding.
+   - **At the header's size:** the roots must be equal; one tree of a given
+     size has one root, so unequal roots are two histories. A finding.
+   - **Smaller than the header, size `m`:** the file carries every leaf from
+     position 0, so it can rebuild the tree of its own first `m` leaves.
+     Compute that root over positions `0..m` and compare. A mismatch — or a
+     position missing below `m` — is a finding: a run inside the prefix was
+     removed, replaced or moved. A match anchors the prefix only; the report
+     must say that the leaves from `m` onward are held to the file's own
+     header.
+
    And a verifier MUST report, once, how many **open** runs the file carries —
    a run block with no `index` and no `seal`. The root proves nothing about
    one, so its chain was checked and records cut from its tail before the
@@ -500,8 +542,21 @@ An implementation that does the following has verified the file.
    finding.
 8. **The trailer.** No trailer means a prefix. A non-empty `unreadable` means
    the export is complete *as an artifact* and incomplete *as a history*, and
-   the two must not be reported the same way. The counts are a cheap
-   cross-check on the frame.
+   the two must not be reported the same way: a run the trailer names there is
+   unchecked, not tampered with. The counts hold the frame to the file:
+
+   - `runs_requested` is the number of run blocks;
+   - `runs_exported` is the number of run blocks carrying at least one record;
+   - `records` is the number of record lines, and `cases` the number of case
+     blocks.
+
+   A disagreement is a finding. **A run block with no records** is one only
+   when the trailer's `unreadable` does not name its run — no honest writer
+   produces one, because a run it cannot read is filed there instead — and it
+   is a finding whether or not the block is sealed: without this rule a sealed
+   run could be emptied of every record, with the counts adjusted, and still
+   verify, because an empty block has no terminal hash to compare with its
+   `seal`.
 
 ## 11. Conformance vectors {#vectors}
 
@@ -534,8 +589,8 @@ than to anybody's key:
 
 | Construction | Governed by |
 |---|---|
-| Record digests, the chain, effect keys | `canon`, on `RunAdmitted` |
-| The domain-separated digests below | `canon`, on `RunAdmitted` |
+| Record digests, the chain | `canon`, on `RunAdmitted` |
+| The domain-separated digests below, effect keys among them | `canon`, and each domain's own version |
 | Sealed envelopes | envelope byte 0 |
 | Export framing | the export header's `version` |
 | Merkle leaf, node and root | the checkpoint's `origin` |
@@ -552,8 +607,8 @@ stays checkable under the old one.
 **Signatures are agile three different ways**, and the differences are
 deliberate rather than accidental:
 
-- **By key**, for record attestations and checkpoint cosignatures. An
-  attestation names a `key_id` and *not* an algorithm, because an artifact that
+- **By key**, for record signatures and checkpoint cosignatures. A record
+  signature names a `key_id` and *not* an algorithm, because an artifact that
   declares its own is a downgrade waiting to be written; a verifier knows which
   algorithm each key it accepts carries.
 - **By a named scheme**, for webhook signatures: `v1,` *is* HMAC-SHA256, and a
@@ -564,15 +619,26 @@ deliberate rather than accidental:
 
 ### Domain-separated digests {#digest-domains}
 
-Two digests on records identify something other than bytes a reader holds: the
-policy that decided, and the calendar that resolved an instant. Each is
-domain-separated, and each domain carries its own version — so the enumeration
-below is what says a domain moved, since nothing dispatches on one.
+Three digests on records identify something other than bytes a reader holds:
+the effect a record belongs to, the policy that decided, and the calendar that
+resolved an instant. Each is domain-separated, and each domain carries its own
+version — so the enumeration below is what says a domain moved, since nothing
+dispatches on one.
 
 | On | Derivation |
 |---|---|
+| `effect_key`, on every effect record | `SHA-256( "agentplane.effect.key.v1" ‖ 0x00 ‖ step ‖ phase ‖ ordinal ‖ attempt ‖ len(kind) ‖ kind ‖ canon(args) )`, integers big-endian — `step`, `ordinal` and `attempt` as 4 bytes, `phase` as 1, `len(kind)` as 8 |
 | `RunAdmitted.policy_bundle` | `SHA-256( "agentplane.policy.bundle.v1" ‖ 0x00 ‖ canon(identity) )` |
 | `DeadlineRegistered.calendar_digest` | `SHA-256( "agentplane.calendar.wallclock.v1" )`, for the wall-clock ruleset |
+
+**Before the format freezes, a derivation changes without a version moving.**
+Every version here stays at 1 until the freeze, and a shape change is a hard
+cut, so a journal written by a build that derived keys differently carries
+keys this build does not derive. Nothing refuses such a journal —
+its records still verify, because a key is a value a record carries, not one a
+verifier recomputes — but resuming one diverges at its first recorded effect.
+The remedy is to recreate the run, not to resume it. After the freeze, a
+derivation that moves takes a new domain version, and this table names it.
 
 `identity` is a JSON object with `rules` and `evaluator` always present and
 `schema`, `entities` and `configuration` present only when the bundle has them:

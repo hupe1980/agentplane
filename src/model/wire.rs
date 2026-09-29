@@ -142,12 +142,12 @@ pub fn classify_transport(model: &ModelId, e: &reqwest::Error) -> ModelError {
     if e.is_connect() {
         return ModelError::Unreachable {
             model: model.clone(),
-            detail: format!("could not connect: {e}"),
+            detail: format!("could not connect: {}", crate::netguard::transport_text(e)),
         };
     }
     ModelError::Unavailable {
         model: model.clone(),
-        detail: e.to_string(),
+        detail: crate::netguard::transport_text(e),
     }
 }
 

@@ -288,6 +288,42 @@ async fn policy_can_refuse_a_release_before_the_label_is_improved() {
     assert_eq!(replay.status, out.status);
 }
 
+/// A plane with no policy engine refuses every release.
+///
+/// The structural gates hold on an ungoverned plane — taint, protected fields,
+/// sink and journal ceilings — and a release is the one call that lowers a
+/// label past them. Permitted for free, any skill could lift a value below a
+/// ceiling its manifest set, with nobody having decided it.
+#[tokio::test]
+async fn an_ungoverned_plane_refuses_a_release() {
+    let store = db();
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(ReleasesWithBasis("nobody decided this"))
+        .build()
+        .run("release-with-basis", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "a release succeeded with no policy engine: {:?}",
+        out.status
+    );
+    let records = store.read(out.run_id, 1).await.unwrap();
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record.kind(), RecordKind::Released { .. })),
+        "an ungoverned release was recorded as granted"
+    );
+    assert!(
+        records.iter().any(|record| matches!(
+            record.kind(),
+            RecordKind::PolicyDenied { action, .. } if action == "data:release"
+        )),
+        "the refusal must be on the record, so a replay reaches the same verdict"
+    );
+}
+
 #[derive(Debug)]
 struct ReleasesWithBasis(&'static str);
 
@@ -322,6 +358,7 @@ impl Skill for ReleasesWithBasis {
 async fn changing_release_evidence_is_replay_divergence() {
     let store = db();
     let first = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(std::sync::Arc::new(PermitsReleases))
         .skill(ReleasesWithBasis("matched settlement revision 1"))
         .build()
         .run("release-with-basis", Tainted::trusted(json!({})))
@@ -585,6 +622,8 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
                         policy_bundle: Some(Box::new(admitted)),
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
                     },
                 ),
                 Append::new(
@@ -604,11 +643,15 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
     store.release_lease(run, lease.epoch).await.unwrap();
 
     let world: World = Arc::default();
-    let err = runtime(&store, &world, Some(Arc::new(Refuses("nothing"))))
+    let refused = runtime(&store, &world, Some(Arc::new(Refuses("nothing"))))
         .replay(run, Mode::Resume)
         .await
-        .expect_err("bundle drift must stop resume before dispatch");
-    assert!(matches!(err, RuntimeError::PolicyBundleChanged { .. }));
+        .expect("a refused resume is journaled as the run's quarantine, not raised");
+    assert!(
+        matches!(&refused.status, RunStatus::Quarantined(reason)
+            if reason.contains("policy bundle changed")),
+        "bundle drift must stop resume before dispatch: {refused:?}"
+    );
     assert!(world.lock().unwrap().is_empty());
 
     // Offline verification does not compare or consult policy. This prefix may
@@ -883,6 +926,65 @@ async fn the_principal_is_stable_across_runs() {
         "the principal must be stable, not per-run: {distinct:?}"
     );
     let _ = RunId::generate();
+}
+
+/// Admission and every effect of the run are asked under one principal.
+///
+/// Under a delegation chain it is the chain's subject — the run's own chain,
+/// which a served surface supplies per request, not only the plane's. A rule
+/// `principal == X` must mean the same thing at `run:admit` as at
+/// `effect:perform`, or a deployment can say who may start a run and not who
+/// may make its calls.
+#[tokio::test]
+async fn admission_and_effects_are_asked_under_the_same_principal() {
+    use agentplane::core::{Delegation, Principal, Scope};
+    use agentplane::runtime::RunTerms;
+
+    #[derive(Debug, Default)]
+    struct Principals(Mutex<Vec<(String, String)>>);
+
+    impl PolicyEngine for Principals {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            self.0
+                .lock()
+                .unwrap()
+                .push((r.action.to_owned(), r.principal.to_owned()));
+            PolicyDecision::Permit
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            test_bundle(b"principals")
+        }
+    }
+
+    let store = db();
+    let world: World = Arc::default();
+    let engine = Arc::new(Principals::default());
+    // The plane has no chain of its own; the run carries its caller's.
+    let rita = Delegation::root(Principal::new("user:rita", Scope::of(["pay"])));
+    let out = runtime(&store, &world, Some(engine.clone()))
+        .run_under(
+            "pay",
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(rita),
+        )
+        .await
+        .expect("admitted")
+        .outcome()
+        .cloned()
+        .expect("fresh");
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+
+    let seen = engine.0.lock().unwrap().clone();
+    for action in [ACTION_ADMIT, ACTION_PERFORM] {
+        assert!(
+            seen.iter().any(|(a, _)| a == action),
+            "{action} was never asked: {seen:?}"
+        );
+    }
+    assert!(
+        seen.iter().all(|(_, principal)| principal == "user:rita"),
+        "every gate must ask under the run's chain subject: {seen:?}"
+    );
 }
 
 // ── Denial feedback as a side channel ───────────────────────────────────────
@@ -1651,12 +1753,11 @@ impl PolicyEngine for Captures {
 
 /// **A rule at an effect can name the revision that is acting.**
 ///
-/// Admission refuses to make the agent's `metadata.name` its principal — a name
-/// is whatever a manifest's author typed, so a rule granting authority to one
-/// grants it to any file claiming it — and tells rules to bind to
-/// `context.agent.digest` instead. At an effect that name *is* the principal, so
-/// without the declaration in the context the advice admission gives cannot be
-/// followed at the gate where the call actually goes out: a deployment could say
+/// No gate makes the agent's `metadata.name` its principal — a name is whatever
+/// a manifest's author typed, so a rule granting authority to one grants it to
+/// any file claiming it — and rules bind to `context.agent.digest` instead.
+/// Without the declaration in the effect's context that advice could be
+/// followed at admission and not at the gate where the call actually goes out: a deployment could say
 /// which revision may *start* and not which may reach a particular sink, and an
 /// escalation rule could not name the revision it trusts.
 ///
@@ -1755,5 +1856,26 @@ async fn an_ungoverned_effect_names_no_revision() {
             "a run no declaration governs was given an `agent` block at {action}, \
              so `context has agent` is true for a run nothing declared: {context}"
         );
+    }
+}
+
+/// Permits every request. A release is refused on a plane with no policy
+/// engine, and these tests are about what a permitted release does.
+#[derive(Debug)]
+struct PermitsReleases;
+
+impl agentplane::core::PolicyEngine for PermitsReleases {
+    fn authorize(
+        &self,
+        _: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"permits-releases"),
+            "test/permits-releases-v1",
+        )
     }
 }

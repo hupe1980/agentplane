@@ -1,7 +1,7 @@
 //! The shape most people mean by "an agent": a model choosing tools in a loop.
 //!
 //! ```sh
-//! cargo run --example tool_loop --features redb,testkit,manifest
+//! cargo run --example tool_loop --features redb,fake-model,manifest
 //! ```
 //!
 //! Every other example here drives an effect from *code*. This one hands the

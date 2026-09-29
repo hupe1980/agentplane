@@ -26,7 +26,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::case::{ClaimError, TaskStore};
-use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, TenantId, Timestamp};
+use crate::core::{CaseId, StoreError, Task, TaskId, TaskState, TenantId, Timestamp, Withheld};
 use crate::journal::payload;
 
 use super::KeyRing;
@@ -86,39 +86,66 @@ impl SealedTasks {
         format!("task:{tenant}:{id}")
     }
 
-    /// One task's sealed proposal and evidence, back in the clear.
+    /// One task's sealed proposal and evidence, back in the clear — or the
+    /// reason they are not.
+    ///
+    /// Only a row this decorator sealed is opened: the stored row says so
+    /// ([`Withheld::Sealed`]), and a value that merely looks like an envelope
+    /// is a value like any other. Opening replaces the stored reason with the
+    /// answer: nothing withheld, [`Withheld::Erased`] when the key was
+    /// destroyed, [`Withheld::Undecodable`] when the envelope opened (or was
+    /// not one) and did not decode. A damaged row reads as damage, not as an
+    /// erasure somebody asked for.
     ///
     /// # Errors
     ///
     /// Every key failure but an erasure. A proposal whose key was
     /// **destroyed** stays sealed — an erased matter must not make the queue
-    /// unreadable, and a reviewer seeing a sealed row knows the matter was
+    /// unreadable, and a reviewer seeing a withheld row is told the matter was
     /// erased. A ring that is unreachable must not produce that same row,
     /// because the reviewer would decide on a trail that is intact and
     /// temporarily unreadable while being shown one that is gone.
     async fn opened(&self, mut task: Task) -> Result<Task, StoreError> {
+        if task.withheld != Some(Withheld::Sealed) {
+            return Ok(task);
+        }
         let aad = Self::aad(&self.tenant, task.id);
-        let open = async |envelope: Vec<u8>| {
-            super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
-                .await
-                .map_err(|e| StoreError::Backend(e.to_string()))
+        let open = async |envelope: Option<Vec<u8>>| -> Result<Opening, StoreError> {
+            let Some(envelope) = envelope else {
+                return Ok(Opening::Undecodable);
+            };
+            Ok(
+                match super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
+                    .await
+                    .map_err(|e| StoreError::Backend(e.to_string()))?
+                {
+                    Some(plain) => Opening::Clear(plain),
+                    None => Opening::Erased,
+                },
+            )
         };
-        if let Some(envelope) = payload::unwrap(&task.justification.proposed_action)
-            && let Some(plain) = open(envelope).await?
-            && let Ok(value) = serde_json::from_slice(&plain)
-        {
-            task.justification.proposed_action = value;
+        let mut withheld = None;
+        match open(payload::unwrap(&task.justification.proposed_action)).await? {
+            Opening::Clear(plain) => match serde_json::from_slice(&plain) {
+                Ok(value) => task.justification.proposed_action = value,
+                Err(_) => withheld = Some(worse(withheld, Withheld::Undecodable)),
+            },
+            Opening::Erased => withheld = Some(worse(withheld, Withheld::Erased)),
+            Opening::Undecodable => withheld = Some(worse(withheld, Withheld::Undecodable)),
         }
         for item in &mut task.justification.evidence {
             // Each entry on its own, so one erased line does not take the rest
             // of the trail with it.
-            if let Some(envelope) = payload::unwrap_text(item.peek())
-                && let Some(plain) = open(envelope).await?
-                && let Ok(text) = String::from_utf8(plain)
-            {
-                *item = item.clone().map(|_| text);
+            match open(payload::unwrap_text(item.peek())).await? {
+                Opening::Clear(plain) => match String::from_utf8(plain) {
+                    Ok(text) => *item = item.clone().map(|_| text),
+                    Err(_) => withheld = Some(worse(withheld, Withheld::Undecodable)),
+                },
+                Opening::Erased => withheld = Some(worse(withheld, Withheld::Erased)),
+                Opening::Undecodable => withheld = Some(worse(withheld, Withheld::Undecodable)),
             }
         }
+        task.withheld = withheld;
         Ok(task)
     }
 
@@ -151,6 +178,7 @@ impl TaskStore for SealedTasks {
 
         let mut sealed = task.clone();
         sealed.justification.proposed_action = payload::wrap(&envelope);
+        sealed.withheld = Some(Withheld::Sealed);
         for item in &mut sealed.justification.evidence {
             let wrapped = super::envelope::seal(
                 self.keys.as_ref(),
@@ -199,8 +227,16 @@ impl TaskStore for SealedTasks {
         self.inner.release(id, actor).await
     }
 
-    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<(), StoreError> {
+    async fn set_state(&self, id: TaskId, state: TaskState) -> Result<bool, StoreError> {
         self.inner.set_state(id, state).await
+    }
+
+    async fn withdraw_run(
+        &self,
+        run: crate::core::RunId,
+        awaited: &[TaskId],
+    ) -> Result<usize, StoreError> {
+        self.inner.withdraw_run(run, awaited).await
     }
 
     async fn escalate(&self, id: TaskId) -> Result<Task, StoreError> {
@@ -225,5 +261,21 @@ impl TaskStore for SealedTasks {
     async fn overdue(&self, now: Timestamp, limit: usize) -> Result<Vec<Task>, StoreError> {
         let tasks = self.inner.overdue(now, limit).await?;
         self.opened_all(tasks).await
+    }
+}
+
+/// What trying to open one sealed field found.
+enum Opening {
+    Clear(Vec<u8>),
+    Erased,
+    Undecodable,
+}
+
+/// The reason a row reports when its fields disagree: damage outranks an
+/// erasure, because an erasure is an answer and damage is a question.
+const fn worse(so_far: Option<Withheld>, this: Withheld) -> Withheld {
+    match (so_far, this) {
+        (Some(Withheld::Undecodable), _) | (_, Withheld::Undecodable) => Withheld::Undecodable,
+        _ => this,
     }
 }

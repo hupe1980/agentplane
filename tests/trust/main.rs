@@ -15,7 +15,6 @@
 //! times. Five groups keep both costs reasonable rather than optimising one
 //! into the other.
 
-mod attestation;
 mod boundary;
 mod budgets;
 mod cedar;
@@ -30,4 +29,6 @@ mod observation;
 mod peers;
 mod planned;
 mod policy;
+mod policy_check;
+mod signature;
 mod witness;

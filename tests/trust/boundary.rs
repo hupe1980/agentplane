@@ -739,6 +739,7 @@ async fn releasing_is_the_only_label_improvement_and_it_is_journaled() {
     let world: World = Arc::default();
     let store = db();
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(std::sync::Arc::new(PermitsReleases))
         .skill(Reviewed {
             world: Arc::clone(&world),
         })
@@ -1064,6 +1065,7 @@ async fn a_release_for_one_destination_is_refused_at_another_sink() {
     let world: World = Arc::default();
     let store = db();
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(std::sync::Arc::new(PermitsReleases))
         .skill(Routed {
             world: Arc::clone(&world),
         })
@@ -1117,6 +1119,7 @@ async fn a_destination_scoped_release_replays_to_the_same_verdicts() {
     let store = db();
     let build = || {
         Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .policy(std::sync::Arc::new(PermitsReleases))
             .skill(Routed {
                 world: Arc::default(),
             })
@@ -1188,6 +1191,7 @@ async fn a_released_value_written_to_memory_keeps_its_base_trust() {
 
     let store = db();
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(std::sync::Arc::new(PermitsReleases))
         .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
         .skill(Remembers)
         .build()
@@ -1470,6 +1474,7 @@ async fn a_release_naming_a_field_the_value_lacks_is_refused() {
     async fn run(path: &'static str) -> RunStatus {
         let store = Arc::new(RedbStore::open_in_memory().unwrap());
         Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .policy(std::sync::Arc::new(PermitsReleases))
             .skill(ReleasesField(path))
             .build()
             .run("releases-field", Tainted::trusted(json!({})))
@@ -1488,5 +1493,26 @@ async fn a_release_naming_a_field_the_value_lacks_is_refused() {
             "the refusal does not say a release failed: {reason}"
         ),
         other => panic!("a release over a field the value lacks was accepted: {other:?}"),
+    }
+}
+
+/// Permits every request. A release is refused on a plane with no policy
+/// engine, and these tests are about what a permitted release does.
+#[derive(Debug)]
+struct PermitsReleases;
+
+impl agentplane::core::PolicyEngine for PermitsReleases {
+    fn authorize(
+        &self,
+        _: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"permits-releases"),
+            "test/permits-releases-v1",
+        )
     }
 }

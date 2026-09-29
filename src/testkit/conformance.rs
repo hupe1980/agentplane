@@ -264,7 +264,11 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     );
 
     assert_eq!(
-        store.forget_cascading("memory-a").await.expect("cascade"),
+        store
+            .forget_cascading("memory-a")
+            .await
+            .expect("cascade")
+            .len(),
         2
     );
     assert!(
@@ -323,7 +327,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         store
             .forget_cascading("chain-a")
             .await
-            .expect("cascade through the tombstone"),
+            .expect("cascade through the tombstone")
+            .len(),
         2,
         "the cascade must erase the root and the leaf — and count only what it \
          erased, not the tombstone it passed through"
@@ -352,7 +357,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         store
             .forget_cascading("chain-a")
             .await
-            .expect("cascading a second time is not an error"),
+            .expect("cascading a second time is not an error")
+            .len(),
         0,
         "a cascade over an already-erased id reported an erasure it did not \
          perform — the count is what an erasure request is answered with"
@@ -404,7 +410,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         store
             .sweep_expired(at(1_760_000_150))
             .await
-            .expect("expire the middle"),
+            .expect("expire the middle")
+            .len(),
         1,
         "exactly the middle link expires"
     );
@@ -412,7 +419,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         store
             .forget_cascading("exp-u")
             .await
-            .expect("cascade through the expired tombstone"),
+            .expect("cascade through the expired tombstone")
+            .len(),
         2,
         "the cascade must erase the root and the leaf, counting only what it \
          erased — not the expired tombstone it passed through"
@@ -512,15 +520,20 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .await
             .expect("read hold")
     );
+    let refused = store.forget("memory-expiring").await;
     assert!(
-        store.forget("memory-expiring").await.is_err(),
-        "ordinary erasure bypassed legal hold"
+        matches!(
+            refused,
+            Err(crate::core::StoreError::UnderLegalHold { ref id }) if id == "memory-expiring"
+        ),
+        "ordinary erasure bypassed legal hold, or refused it untyped: {refused:?}"
     );
     assert_eq!(
         store
             .sweep_expired(at(1_760_000_101))
             .await
-            .expect("held sweep"),
+            .expect("held sweep")
+            .len(),
         0,
         "expiry sweep bypassed legal hold"
     );
@@ -555,7 +568,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         store
             .sweep_expired(at(1_760_000_101))
             .await
-            .expect("expiry sweep"),
+            .expect("expiry sweep")
+            .len(),
         1
     );
     assert!(
@@ -575,8 +589,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
     );
 
     // Sliding retention, alone: the window opens at the write. Initialized
-    // lazily instead, an item with a window and no fixed expiry was immortal
-    // until its first touch — opt-in garbage that never collects.
+    // lazily instead, an item with a window and no fixed expiry would be
+    // immortal until its first touch — opt-in garbage that never collects.
     let mut fading = make(
         "memory-fading",
         "team-fading",
@@ -607,7 +621,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         store
             .sweep_expired(at(1_760_000_060))
             .await
-            .expect("sweep the untouched window"),
+            .expect("sweep the untouched window")
+            .len(),
         1,
         "the sweep must collect an untouched sliding-retention memory"
     );
@@ -671,7 +686,8 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         store
             .sweep_expired(at(1_760_000_200))
             .await
-            .expect("sweep at the ceiling"),
+            .expect("sweep at the ceiling")
+            .len(),
         1,
         "the sweep must erase at the ceiling even though the touched window \
          reaches past it"
@@ -781,14 +797,30 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         "a re-derived summary is no longer a live derivative of its old source"
     );
 
+    let cascade = store
+        .forget_cascading("roll-a")
+        .await
+        .expect("cascade from the superseded source");
     assert_eq!(
-        store
-            .forget_cascading("roll-a")
-            .await
-            .expect("cascade from the superseded source"),
+        cascade.len(),
         3,
         "the cascade must erase roll-a, roll-s's superseded v1 (counted once) \
          and roll-t, which was derived from exactly that version"
+    );
+    // Named with their versions: a sealing wrapper destroys exactly these
+    // keys, so a trim that named the id alone would leave v1's key standing
+    // or take v2's with it.
+    assert_eq!(
+        cascade.trimmed,
+        vec![("roll-s".to_owned(), vec![1])],
+        "the trim must name exactly the superseded version it removed"
+    );
+    let mut erased = cascade.erased.clone();
+    erased.sort();
+    assert_eq!(
+        erased,
+        vec![("roll-a".to_owned(), 1), ("roll-t".to_owned(), 1)],
+        "each id erased whole must carry the highest version it held"
     );
     assert!(
         store
@@ -907,7 +939,9 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
 /// that copy is allowed to die: shed at `unsubscribe` once the journal holds
 /// the delivered copy, and removed by `erase_payload` for rows nobody claimed
 /// or that dead-lettered. In every case the **row itself survives**, because
-/// dedup and dead-letter accounting are identity, not content.
+/// dedup and dead-letter accounting are identity, not content — and a row
+/// nobody had claimed leaves the claimable set as a dead letter with the
+/// reason `erased`, so no waiter is handed `null` as the counterparty's word.
 ///
 /// # Panics
 ///
@@ -997,7 +1031,11 @@ pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
          it was supposed to close"
     );
 
-    // ── An unclaimed payload is erasable, and dead-lettering still counts ──
+    // ── An erased unclaimed event is dead-lettered, never delivered ───────
+    //
+    // Nulling the payload and leaving the row claimable would hand the next
+    // waiter `null` as if the counterparty had sent it. Erasure takes the row
+    // out of the claimable set instead, and the dead-letter list says why.
     let unclaimed = event("B-1", json!({"pii": "unclaimed"}));
     assert!(store.buffer(&unclaimed, at(2_000)).await.expect("buffer"));
     assert!(
@@ -1007,30 +1045,51 @@ pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
             .expect("erase the unclaimed payload"),
         "the row exists, so the erasure must report having acted"
     );
+    let waiter = RunId::generate();
+    store
+        .subscribe(&sub(waiter, key(202), "B-1"), at(2_001))
+        .await
+        .expect("subscribe");
+    assert!(
+        store
+            .claim_for(&sub(waiter, key(202), "B-1"), at(2_002))
+            .await
+            .expect("claim")
+            .is_none(),
+        "an erased event was delivered to a waiter as data"
+    );
+    store.unsubscribe(waiter, key(202)).await.expect("clean up");
     assert_eq!(
         store
             .sweep_unclaimed(at(2_100), "aged out")
             .await
             .expect("sweep"),
-        1,
-        "an erased event still dead-letters — erasure removes content, never \
-         accounting"
+        0,
+        "the erased event was still live for the sweep"
     );
     let letters = store.dead_letters(10).await.expect("dead letters");
     let erased = letters
         .iter()
         .find(|letter| letter.event.id == "B-1")
-        .expect("the erased event is still listed");
+        .expect("the erased event is listed as a dead letter");
     assert_eq!(
         erased.event.payload,
         serde_json::Value::Null,
         "an erased unclaimed event still yielded its payload"
     );
-    assert_eq!(erased.reason, "aged out");
+    assert_eq!(
+        erased.reason, "erased",
+        "the dead letter does not say the message was erased"
+    );
     assert_eq!(
         erased.event.correlation,
         vec![CorrelationKey::new("order", "B-1")],
         "correlation keys are the identity the operator routes on, not content"
+    );
+    assert!(
+        !store.buffer(&unclaimed, at(2_200)).await.expect("replay"),
+        "erasure deleted the dedup row, so a replay of the erased message was \
+         accepted as new"
     );
 
     // ── A dead-lettered payload is erasable in place ───────────────────────
@@ -1093,6 +1152,8 @@ fn admitted_under(run: RunId, key: &str) -> Append {
             policy_bundle: None,
             canon: crate::core::canon::VERSION,
             idempotency_key: Some(key.to_owned()),
+            admitted_by: None,
+            served_unchained: false,
         },
     )
 }
@@ -1108,6 +1169,8 @@ fn admitted(run: RunId) -> Append {
             policy_bundle: None,
             canon: crate::core::canon::VERSION,
             idempotency_key: None,
+            admitted_by: None,
+            served_unchained: false,
         },
     )
 }
@@ -1185,7 +1248,7 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     a_sealed_run_refuses_appends(fresh, &mut r).await;
     a_stop_request_needs_no_lease(fresh, &mut r).await;
     the_first_asker_stays_on_the_record(fresh, &mut r).await;
-    an_attestation_survives_the_round_trip(fresh, &mut r).await;
+    a_signature_survives_the_round_trip(fresh, &mut r).await;
     the_log_only_grows(fresh, &mut r).await;
     a_released_lease_is_free_at_once(fresh, &mut r).await;
     a_lease_starts_past_every_epoch_the_history_records(fresh, &mut r).await;
@@ -1199,7 +1262,123 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     an_unkeyed_admission_claims_nothing(fresh, &mut r).await;
     retiring_a_key_frees_it_and_leaves_the_run(fresh, &mut r).await;
     the_waiting_listing_follows_the_last_record(fresh, &mut r).await;
+    one_producers_runs_are_listed_apart(fresh, &mut r).await;
     r
+}
+
+/// **One producer's runs are listed apart, and the listing follows activity.**
+///
+/// `recent_runs_from` is what a served listing reads so it costs the caller's
+/// own runs, not the tenant's. It must hold exactly the runs whose admission
+/// key names the source — not another producer's, not an unkeyed run — keep
+/// holding a run after later appends move it, and page with the same cursor as
+/// `recent_runs`.
+#[allow(clippy::too_many_lines)]
+async fn one_producers_runs_are_listed_apart(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let mine = "a2a/peer:conformance-a";
+    let admit = |run: RunId, source: &str, n: u32| {
+        admitted_under(run, &crate::core::origin_key(source, &format!("msg-{n}")))
+    };
+    let mut ours = Vec::new();
+    for n in 0..3u32 {
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        if store
+            .append(lease.epoch, vec![admit(run, mine, n)])
+            .await
+            .is_err()
+        {
+            r.record("source index", "the fixture could not write its runs");
+            return;
+        }
+        ours.push((run, lease.epoch));
+    }
+    // Past the index's whole-second stamp, so the later progress moves each
+    // run's row rather than rewriting it in place — the move is what a store
+    // that only ever adds rows gets wrong.
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    for (run, epoch) in &ours {
+        let progress = Append::new(
+            *run,
+            RecordKind::Note {
+                text: "later progress".into(),
+            },
+        );
+        if store.append(*epoch, vec![progress]).await.is_err() {
+            r.record("source index", "the fixture could not write its runs");
+            return;
+        }
+    }
+    let ours: Vec<RunId> = ours.into_iter().map(|(run, _)| run).collect();
+    for (n, source) in [(10u32, Some("a2a/peer:conformance-b")), (11, None)] {
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        let record = match source {
+            Some(source) => admit(run, source, n),
+            None => admitted(run),
+        };
+        if store.append(lease.epoch, vec![record]).await.is_err() {
+            r.record("source index", "the fixture could not write its runs");
+            return;
+        }
+    }
+
+    let whole = match store.recent_runs_from(mine, None, 100).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            r.record("source index", format!("recent_runs_from failed: {e}"));
+            return;
+        }
+    };
+    let mut listed: Vec<RunId> = whole.iter().map(|(run, _)| *run).collect();
+    let mut expected = ours.clone();
+    listed.sort_by_key(ToString::to_string);
+    expected.sort_by_key(ToString::to_string);
+    if listed != expected {
+        r.record(
+            "source index",
+            format!(
+                "recent_runs_from listed {} runs for a producer that admitted 3 — each \
+                 appearing once, and no other producer's or unkeyed run",
+                whole.len()
+            ),
+        );
+        return;
+    }
+    if whole
+        .windows(2)
+        .any(|w| (w[0].1, w[0].0.to_string()) < (w[1].1, w[1].0.to_string()))
+    {
+        r.record(
+            "source index",
+            "recent_runs_from is not ordered by (updated_at, run) descending".to_owned(),
+        );
+    }
+    let mut paged = Vec::new();
+    let mut cursor = None;
+    for _ in 0..4 {
+        let Ok(rows) = store.recent_runs_from(mine, cursor, 2).await else {
+            r.record("source index", "a cursored page failed".to_owned());
+            return;
+        };
+        if rows.is_empty() {
+            break;
+        }
+        cursor = rows.last().map(|(run, updated)| (*updated, *run));
+        paged.extend(rows);
+    }
+    if paged != whole {
+        r.record(
+            "source index",
+            "paging recent_runs_from two at a time did not reassemble it".to_owned(),
+        );
+    }
 }
 
 /// A run is listed as waiting while its **last** record is a suspension, and
@@ -2192,7 +2371,7 @@ async fn the_first_asker_stays_on_the_record(fresh: Factory<'_>, r: &mut Report)
 /// invisible until an auditor asks who wrote something and every record answers
 /// "nobody". A backend that hashes but silently discards authorship is worse
 /// than one that never claimed to keep it.
-async fn an_attestation_survives_the_round_trip(fresh: Factory<'_>, r: &mut Report) {
+async fn a_signature_survives_the_round_trip(fresh: Factory<'_>, r: &mut Report) {
     r.checked += 1;
     let store = fresh().await;
     let run = RunId::generate();
@@ -2202,34 +2381,34 @@ async fn an_attestation_survives_the_round_trip(fresh: Factory<'_>, r: &mut Repo
     };
 
     let Ok(written) = store.append(lease.epoch, vec![admitted(run)]).await else {
-        r.record("attestation", "append failed under a fresh lease");
+        r.record("signature", "append failed under a fresh lease");
         return;
     };
 
     // Only stores configured with a signer produce one. An unsigned store is a
     // legitimate configuration, so the check is conditional on the write having
-    // carried an attestation at all — what it must never do is *lose* one.
-    let Some(expected) = written.first().and_then(|w| w.attestation.clone()) else {
+    // carried a signature at all — what it must never do is *lose* one.
+    let Some(expected) = written.first().and_then(|w| w.signature.clone()) else {
         return;
     };
 
     match store.read(run, 1).await {
-        Ok(back) => match back.first().and_then(|b| b.attestation.clone()) {
+        Ok(back) => match back.first().and_then(|b| b.signature.clone()) {
             Some(got) if got == expected => {}
             Some(got) => r.record(
-                "attestation",
+                "signature",
                 format!(
                     "the signature read back is not the one written: wrote {:?}, read {:?}",
                     expected.key_id, got.key_id
                 ),
             ),
             None => r.record(
-                "attestation",
+                "signature",
                 "a signed record read back unsigned — the chain still verifies, and \
                  authorship is gone without anything reporting it",
             ),
         },
-        Err(e) => r.record("attestation", format!("read failed: {e}")),
+        Err(e) => r.record("signature", format!("read failed: {e}")),
     }
 }
 
@@ -3131,6 +3310,7 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
     store
         .issue(&StandingAuthority::new(
             "conformance-accumulate",
+            crate::authority::Holder::Tenant,
             "conformance",
             Spend::money(1_000),
         ))
@@ -3167,6 +3347,7 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
     store
         .issue(&StandingAuthority::new(
             "conformance-retry",
+            crate::authority::Holder::Tenant,
             "conformance",
             Spend::money(1_000),
         ))
@@ -3226,7 +3407,12 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
     );
 
     // ── Terms are immutable ─────────────────────────────────────────────────
-    let terms = StandingAuthority::new("conformance-terms", "conformance", Spend::money(500));
+    let terms = StandingAuthority::new(
+        "conformance-terms",
+        crate::authority::Holder::Tenant,
+        "conformance",
+        Spend::money(500),
+    );
     store.issue(&terms).await.expect("issue");
     store
         .issue(&terms)
@@ -3235,6 +3421,7 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
     let conflict = store
         .issue(&StandingAuthority::new(
             "conformance-terms",
+            crate::authority::Holder::Tenant,
             "conformance",
             Spend::money(999_999),
         ))
@@ -3248,8 +3435,13 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
     // ── Expiry is evaluated against the instant handed in ───────────────────
     store
         .issue(
-            &StandingAuthority::new("conformance-expiry", "conformance", Spend::money(500))
-                .expires_at(Timestamp::from_unix_timestamp(1_000).expect("representable")),
+            &StandingAuthority::new(
+                "conformance-expiry",
+                crate::authority::Holder::Tenant,
+                "conformance",
+                Spend::money(500),
+            )
+            .expires_at(Timestamp::from_unix_timestamp(1_000).expect("representable")),
         )
         .await
         .expect("issue");
@@ -3280,8 +3472,13 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
     // ── A draw ceiling bounds separately from a spend ceiling ───────────────
     store
         .issue(
-            &StandingAuthority::new("conformance-draws", "conformance", Spend::money(10_000))
-                .max_draws(1),
+            &StandingAuthority::new(
+                "conformance-draws",
+                crate::authority::Holder::Tenant,
+                "conformance",
+                Spend::money(10_000),
+            )
+            .max_draws(1),
         )
         .await
         .expect("issue");
@@ -3338,6 +3535,7 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
     store
         .issue(&StandingAuthority::new(
             "conformance-racing-retry",
+            crate::authority::Holder::Tenant,
             "conformance",
             Spend::money(500),
         ))

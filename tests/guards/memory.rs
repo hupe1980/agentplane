@@ -136,7 +136,11 @@ async fn every_redb_erasure_path_removes_access_expiry_residue() {
             1
         );
         assert_eq!(
-            store.sweep_expired(at(1_760_000_060)).await.expect("sweep"),
+            store
+                .sweep_expired(at(1_760_000_060))
+                .await
+                .expect("sweep")
+                .len(),
             1,
             "exactly the short-window id expires"
         );
@@ -207,7 +211,8 @@ async fn erase_subject_reaches_every_item_however_many() {
         encrypted
             .erase_subject("person-bulk", at(1_760_000_500), "erasure request")
             .await
-            .expect("erase the subject"),
+            .expect("erase the subject")
+            .reached,
         37
     );
     for i in 0..37 {
@@ -269,7 +274,7 @@ async fn a_destroyed_subject_key_reads_as_absence_not_an_error() {
     // The erasure that completed where it counts and failed at cleanup: the
     // key is destroyed, the ciphertext rows remain.
     ring.destroy(
-        &agentplane::keyring::scope(&tenant, "memory/person-gone"),
+        &agentplane::keyring::scope(&tenant, "memory-item/gone-1@1"),
         at(1_760_000_500),
         "erasure request",
     )
@@ -368,21 +373,25 @@ async fn memory_subject_erasure_makes_backup_ciphertext_unreadable() {
         .set_legal_hold("crypto-1", true)
         .await
         .expect("hold");
+    let refused = encrypted
+        .erase_subject("person-7", at(1_760_000_500), "erasure request")
+        .await;
     assert!(
-        encrypted
-            .erase_subject("person-7", at(1_760_000_500), "erasure request")
-            .await
-            .is_err(),
-        "legal hold did not block cryptographic erasure"
+        matches!(
+            refused,
+            Err(agentplane::core::StoreError::UnderLegalHold { ref id }) if id == "crypto-1"
+        ),
+        "legal hold did not block cryptographic erasure with a typed refusal: {refused:?}"
     );
     encrypted
         .set_legal_hold("crypto-1", false)
         .await
         .expect("release hold");
-    encrypted
+    let erased = encrypted
         .erase_subject("person-7", at(1_760_000_500), "erasure request")
         .await
         .expect("destroy subject key");
+    assert!(erased.is_complete(), "{erased:?}");
 
     let restored = EncryptedMemoryStore::new(
         Arc::clone(&backup) as Arc<dyn MemoryStore>,
@@ -584,7 +593,10 @@ impl MemoryStore for Counted {
     async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
         self.inner.derivatives(id).await
     }
-    async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
+    async fn forget_cascading(
+        &self,
+        id: &str,
+    ) -> Result<agentplane::memory::Cascade, agentplane::core::StoreError> {
         self.inner.forget_cascading(id).await
     }
     async fn set_legal_hold(
@@ -604,7 +616,10 @@ impl MemoryStore for Counted {
     ) -> Result<Vec<String>, agentplane::core::StoreError> {
         self.inner.legal_holds(after, limit).await
     }
-    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
+    async fn sweep_expired(
+        &self,
+        at: Timestamp,
+    ) -> Result<Vec<(String, u64)>, agentplane::core::StoreError> {
         self.sweeps
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.sweep_expired(at).await
@@ -676,7 +691,10 @@ impl MemoryStore for RejectsComposedCascade {
         )))
     }
 
-    async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
+    async fn forget_cascading(
+        &self,
+        id: &str,
+    ) -> Result<agentplane::memory::Cascade, agentplane::core::StoreError> {
         self.inner.forget_cascading(id).await
     }
     async fn set_legal_hold(
@@ -696,7 +714,10 @@ impl MemoryStore for RejectsComposedCascade {
     ) -> Result<Vec<String>, agentplane::core::StoreError> {
         self.inner.legal_holds(after, limit).await
     }
-    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
+    async fn sweep_expired(
+        &self,
+        at: Timestamp,
+    ) -> Result<Vec<(String, u64)>, agentplane::core::StoreError> {
         self.inner.sweep_expired(at).await
     }
     async fn touch(
@@ -1499,7 +1520,8 @@ async fn a_forgotten_id_cannot_be_reused_and_later_erasure_still_reaches_derivat
         store
             .forget_cascading("source")
             .await
-            .expect("erase corrected source later"),
+            .expect("erase corrected source later")
+            .len(),
         1,
         "the cascade must erase exactly the derivative — the root is already a \
          tombstone, and counting it would report an erasure this call did not \
@@ -1907,7 +1929,8 @@ async fn forgetting_a_source_can_reach_what_was_derived_from_it() {
     let removed = memories
         .forget_cascading("m-1")
         .await
-        .expect("forget cascading");
+        .expect("forget cascading")
+        .len();
     assert_eq!(removed, 2, "cascading forgot {removed} rather than 2");
     assert!(
         memories.version("summary-1", 1).await.expect("v").is_none(),
@@ -2480,10 +2503,11 @@ async fn the_encrypted_memory_store_takes_the_lifecycle_lock() {
         ))
         .await
         .expect("remember");
-    sealed
+    let erased = sealed
         .erase_subject("customer/7", at(1_760_000_100), "rtbf")
         .await
         .expect("erase");
+    assert!(erased.is_complete(), "{erased:?}");
 
     let events = coordinator.events.lock().unwrap().clone();
     let acquires: Vec<&String> = events.iter().filter(|e| *e != "release").collect();
@@ -2682,7 +2706,10 @@ impl MemoryStore for Rewrites {
     async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
         self.inner.derivatives(id).await
     }
-    async fn forget_cascading(&self, id: &str) -> Result<usize, agentplane::core::StoreError> {
+    async fn forget_cascading(
+        &self,
+        id: &str,
+    ) -> Result<agentplane::memory::Cascade, agentplane::core::StoreError> {
         self.inner.forget_cascading(id).await
     }
     async fn set_legal_hold(
@@ -2702,7 +2729,10 @@ impl MemoryStore for Rewrites {
     ) -> Result<Vec<String>, agentplane::core::StoreError> {
         self.inner.legal_holds(after, limit).await
     }
-    async fn sweep_expired(&self, at: Timestamp) -> Result<usize, agentplane::core::StoreError> {
+    async fn sweep_expired(
+        &self,
+        at: Timestamp,
+    ) -> Result<Vec<(String, u64)>, agentplane::core::StoreError> {
         self.inner.sweep_expired(at).await
     }
     async fn touch(
@@ -2815,4 +2845,462 @@ async fn the_sealed_memory_store_satisfies_the_memory_store_contract() {
         tenant,
     )) as Arc<dyn MemoryStore>;
     agentplane::testkit::conformance::memory(sealed).await;
+}
+
+/// Recalls with a cutoff the skill chose, far in the past.
+#[derive(Debug)]
+struct RecallsAsOfThePast;
+
+#[async_trait::async_trait]
+impl Skill for RecallsAsOfThePast {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("recalls-past").provides("recalls-past")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let mut query = Recall::about("acct-expired");
+        query.as_of = Some(at(1_000));
+        let found = cx.recall(query).await?;
+        let ids: Vec<String> = found.iter().map(|m| m.peek().id.clone()).collect();
+        Ok(Outcome::done(Tainted::trusted(json!({ "recalled": ids }))))
+    }
+}
+
+/// **A skill cannot recall a memory back from past its expiry.**
+///
+/// The recall cutoff is the lifecycle rule: an expired memory is gone for
+/// every reader, whether or not the sweep has run yet. A skill naming a cutoff
+/// in the past would otherwise read retention-expired content — the retention
+/// period becomes a suggestion any step can wind back.
+#[tokio::test]
+async fn a_recall_cutoff_in_the_past_does_not_resurrect_an_expired_memory() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let mut expired = item(
+        "m-expired",
+        "acct-expired",
+        json!({ "note": "retention lapsed" }),
+        Trust::Untrusted,
+    );
+    expired.created_at = at(500);
+    expired.expires_at = Some(at(2_000));
+    memories.remember(&expired).await.expect("remember");
+
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&memories))
+        .skill(RecallsAsOfThePast)
+        .build();
+    let out = rt
+        .run("recalls-past", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
+    assert_eq!(
+        out.output.as_ref().expect("output").peek()["recalled"],
+        json!([]),
+        "a caller-chosen past cutoff read a memory whose retention had lapsed"
+    );
+}
+
+/// A sealed memory store over a fresh tenant, with the raw store and the ring.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+fn sealed_memory(
+    tenant: &str,
+) -> (
+    Arc<RedbStore>,
+    Arc<agentplane::testkit::MemoryKeyRing>,
+    agentplane::keyring::EncryptedMemoryStore,
+) {
+    let tenant = TenantId::new(tenant).expect("tenant");
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone()),
+    );
+    let ring = Arc::new(agentplane::testkit::MemoryKeyRing::new());
+    let sealed = agentplane::keyring::EncryptedMemoryStore::new(
+        Arc::clone(&inner) as Arc<dyn MemoryStore>,
+        Arc::clone(&ring) as Arc<dyn agentplane::keyring::KeyRing>,
+        tenant,
+    );
+    (inner, ring, sealed)
+}
+
+/// **Forgetting one memory reaches its backups, and leaves the subject's
+/// others readable.**
+///
+/// Every item has its own key, so `forget`, the cascade and the expiry sweep
+/// each destroy exactly the keys of what they erased. A key per subject could
+/// be destroyed by none of them without taking the subject's other items along,
+/// and a backup taken before the forget kept opening.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn forgetting_one_memory_makes_its_backup_unreadable() {
+    let (inner, ring, sealed) = sealed_memory("forget-backup");
+    let backup = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("backup")
+            .for_tenant(TenantId::new("forget-backup").expect("tenant")),
+    );
+    let mut expiring = item("swept-1", "person-3", json!({"n": 3}), Trust::Untrusted);
+    expiring.expires_at = Some(at(1_760_000_100));
+    for memory in [
+        item("forgotten-1", "person-3", json!({"n": 1}), Trust::Untrusted),
+        item("kept-1", "person-3", json!({"n": 2}), Trust::Untrusted),
+        expiring,
+    ] {
+        sealed.remember(&memory).await.expect("remember");
+        let raw = inner
+            .version(&memory.id, 1)
+            .await
+            .expect("raw")
+            .expect("row");
+        backup.remember(&raw).await.expect("snapshot");
+    }
+
+    // A derivative, so the cascade has something to reach past its source.
+    sealed
+        .remember(&item(
+            "cascade-src",
+            "person-3",
+            json!({"n": 4}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("source");
+    let source = sealed
+        .version("cascade-src", 1)
+        .await
+        .expect("read")
+        .expect("source row");
+    let mut derived = item("cascade-der", "person-3", json!({"n": 5}), Trust::Untrusted);
+    derived.derived_from = vec![agentplane::memory::Selected {
+        id: source.id.clone(),
+        version: source.version,
+        digest: source.selection_digest(),
+    }];
+    sealed.remember(&derived).await.expect("derivative");
+    for id in ["cascade-src", "cascade-der"] {
+        let raw = inner.version(id, 1).await.expect("raw").expect("row");
+        backup.remember(&raw).await.expect("snapshot");
+    }
+
+    sealed.forget("forgotten-1").await.expect("forget");
+    assert_eq!(
+        sealed
+            .sweep_expired(at(1_760_000_200))
+            .await
+            .expect("sweep"),
+        vec![("swept-1".to_owned(), 1)]
+    );
+    assert_eq!(
+        sealed
+            .forget_cascading("cascade-src")
+            .await
+            .expect("cascade")
+            .erased
+            .len(),
+        2
+    );
+
+    let restored = agentplane::keyring::EncryptedMemoryStore::new(
+        backup as Arc<dyn MemoryStore>,
+        ring as Arc<dyn agentplane::keyring::KeyRing>,
+        TenantId::new("forget-backup").expect("tenant"),
+    );
+    for erased in ["forgotten-1", "swept-1", "cascade-src", "cascade-der"] {
+        assert!(
+            matches!(restored.version(erased, 1).await, Ok(None)),
+            "a backup still opens '{erased}' after it was erased"
+        );
+    }
+    assert_eq!(
+        restored
+            .version("kept-1", 1)
+            .await
+            .expect("read")
+            .expect("the subject's other memory survives")
+            .content,
+        json!({"n": 2})
+    );
+}
+
+/// **A trimmed version's backup stops opening; the current version's does not.**
+///
+/// A cascade that reaches an id through a superseded version removes that
+/// version and keeps the id current. With one key per id, that key had to
+/// survive — the current version needs it — so a backup taken before the
+/// cascade kept opening exactly the version the erasure claimed to remove.
+/// One key per version lets the trim destroy that version's key alone.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn a_trimmed_versions_backup_no_longer_opens() {
+    let (inner, ring, sealed) = sealed_memory("trim-backup");
+    let backup = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("backup")
+            .for_tenant(TenantId::new("trim-backup").expect("tenant")),
+    );
+    sealed
+        .remember(&item(
+            "poison",
+            "person-9",
+            json!({"n": 1}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("source");
+    let source = sealed
+        .version("poison", 1)
+        .await
+        .expect("read")
+        .expect("source row");
+    let mut absorbed = item("summary", "person-9", json!({"v": 1}), Trust::Untrusted);
+    absorbed.derived_from = vec![agentplane::memory::Selected {
+        id: source.id.clone(),
+        version: source.version,
+        digest: source.selection_digest(),
+    }];
+    sealed.remember(&absorbed).await.expect("summary v1");
+    let mut clean = item("summary", "person-9", json!({"v": 2}), Trust::Untrusted);
+    clean.created_at = at(1_760_000_001);
+    sealed.remember(&clean).await.expect("summary v2");
+    // The backup: the source and both summary versions, raw, as they sat
+    // before the cascade.
+    for (id, version) in [("poison", 1), ("summary", 1), ("summary", 2)] {
+        let raw = inner.version(id, version).await.expect("raw").expect("row");
+        backup.remember(&raw).await.expect("snapshot");
+    }
+
+    let cascade = sealed.forget_cascading("poison").await.expect("cascade");
+    assert_eq!(cascade.trimmed, vec![("summary".to_owned(), vec![1])]);
+
+    let restored = agentplane::keyring::EncryptedMemoryStore::new(
+        backup as Arc<dyn MemoryStore>,
+        ring as Arc<dyn agentplane::keyring::KeyRing>,
+        TenantId::new("trim-backup").expect("tenant"),
+    );
+    assert!(
+        matches!(restored.version("summary", 1).await, Ok(None)),
+        "a backup still opens the superseded version the cascade removed"
+    );
+    assert_eq!(
+        restored
+            .version("summary", 2)
+            .await
+            .expect("read")
+            .expect("the current version still opens")
+            .content,
+        json!({"v": 2})
+    );
+}
+
+/// **An erased subject can be written again.**
+///
+/// A subject is not a key scope: erasing it destroys the keys of the items it
+/// held, and a new item for the same subject is sealed under a key of its own.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn an_erased_subject_can_be_written_again() {
+    let (_inner, _ring, sealed) = sealed_memory("rewrite-subject");
+    sealed
+        .remember(&item(
+            "before",
+            "person-9",
+            json!({"n": 1}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("remember");
+    let erased = sealed
+        .erase_subject("person-9", at(1_760_000_500), "erasure request")
+        .await
+        .expect("erase");
+    assert!(erased.is_complete(), "{erased:?}");
+    sealed
+        .remember(&item(
+            "after",
+            "person-9",
+            json!({"n": 2}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("a subject erased once can be written to again");
+    assert_eq!(
+        sealed
+            .recall(&Recall::about("person-9"))
+            .await
+            .expect("recall")
+            .len(),
+        1
+    );
+}
+
+/// **A sealed memory opens only as the row it was sealed for.**
+///
+/// The envelope is bound to its id, version, subject and purpose. Copied into
+/// another row, it must fail to authenticate — never open as that row's
+/// content, which would let whoever can write rows re-attribute a memory.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn a_sealed_memory_moved_to_another_row_does_not_open() {
+    let (inner, _ring, sealed) = sealed_memory("moved-envelope");
+    sealed
+        .remember(&item(
+            "m-a",
+            "person-1",
+            json!({"secret": "a"}),
+            Trust::Untrusted,
+        ))
+        .await
+        .expect("remember");
+    let raw = inner.version("m-a", 1).await.expect("raw").expect("row");
+    assert!(
+        agentplane::journal::payload::is_sealed(&raw.content),
+        "the stored content is not the crate's sealed envelope: {}",
+        raw.content
+    );
+    let mut moved = raw.clone();
+    moved.id = "m-b".to_owned();
+    inner.remember(&moved).await.expect("plant the moved row");
+    let read = sealed.version("m-b", 1).await;
+    assert!(
+        read.is_err(),
+        "an envelope sealed for one memory opened as another: {read:?}"
+    );
+}
+
+/// Delegates everything, and fails the subject cleanup.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[derive(Debug)]
+struct FailsSubjectCleanup(Arc<dyn MemoryStore>);
+
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[async_trait::async_trait]
+impl MemoryStore for FailsSubjectCleanup {
+    fn tenant(&self) -> &str {
+        self.0.tenant()
+    }
+    async fn remember(&self, item: &MemoryItem) -> Result<u64, agentplane::core::StoreError> {
+        self.0.remember(item).await
+    }
+    async fn recall(
+        &self,
+        query: &Recall,
+    ) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
+        self.0.recall(query).await
+    }
+    async fn subject_ids(
+        &self,
+        subject: &str,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.0.subject_ids(subject).await
+    }
+    async fn version(
+        &self,
+        id: &str,
+        version: u64,
+    ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
+        self.0.version(id, version).await
+    }
+    async fn current(
+        &self,
+        id: &str,
+        as_of: Option<Timestamp>,
+    ) -> Result<Option<MemoryItem>, agentplane::core::StoreError> {
+        self.0.current(id, as_of).await
+    }
+    async fn forget(&self, id: &str) -> Result<(), agentplane::core::StoreError> {
+        self.0.forget(id).await
+    }
+    async fn forget_subject(&self, _subject: &str) -> Result<usize, agentplane::core::StoreError> {
+        Err(agentplane::core::StoreError::Backend(
+            "the memory store is read-only".to_owned(),
+        ))
+    }
+    async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, agentplane::core::StoreError> {
+        self.0.derivatives(id).await
+    }
+    async fn forget_cascading(
+        &self,
+        id: &str,
+    ) -> Result<agentplane::memory::Cascade, agentplane::core::StoreError> {
+        self.0.forget_cascading(id).await
+    }
+    async fn set_legal_hold(
+        &self,
+        id: &str,
+        held: bool,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.set_legal_hold(id, held).await
+    }
+    async fn legal_hold(&self, id: &str) -> Result<bool, agentplane::core::StoreError> {
+        self.0.legal_hold(id).await
+    }
+    async fn legal_holds(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, agentplane::core::StoreError> {
+        self.0.legal_holds(after, limit).await
+    }
+    async fn sweep_expired(
+        &self,
+        at: Timestamp,
+    ) -> Result<Vec<(String, u64)>, agentplane::core::StoreError> {
+        self.0.sweep_expired(at).await
+    }
+    async fn touch(
+        &self,
+        ids: &[String],
+        at: Timestamp,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.touch(ids, at).await
+    }
+}
+
+/// **A subject erasure whose cleanup failed says so.**
+///
+/// The keys are destroyed, so no copy opens; the live rows still hold
+/// ciphertext until the call is retried. Reported as a clean erasure, the
+/// request is closed over rows nobody will come back for.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn a_subject_erasure_whose_cleanup_failed_is_not_reported_clean() {
+    let tenant = TenantId::new("cleanup-fails").expect("tenant");
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone()),
+    ) as Arc<dyn MemoryStore>;
+    let sealed = agentplane::keyring::EncryptedMemoryStore::new(
+        Arc::new(FailsSubjectCleanup(inner)),
+        Arc::new(agentplane::testkit::MemoryKeyRing::new()),
+        tenant,
+    );
+    sealed
+        .remember(&item("c-1", "person-4", json!({"n": 1}), Trust::Untrusted))
+        .await
+        .expect("remember");
+    let erasure = sealed
+        .erase_subject("person-4", at(1_760_000_500), "erasure request")
+        .await
+        .expect("the keys were destroyed");
+    assert!(
+        !erasure.is_complete(),
+        "a cleanup failure after key destruction was reported as a clean erasure"
+    );
+    assert_eq!(erasure.reached, 1);
+    assert!(
+        sealed
+            .recall(&Recall::about("person-4"))
+            .await
+            .expect("recall")
+            .is_empty(),
+        "the erased memory still reads"
+    );
 }

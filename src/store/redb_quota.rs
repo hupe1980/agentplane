@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::core::{RunId, Spend, StoreError, Timestamp};
-use crate::quota::{Halt, HaltScope, QuotaError, QuotaSettlement, QuotaStore};
+use crate::quota::{
+    Halt, HaltScope, Held, QuotaError, QuotaSettlement, QuotaStore, RateCeiling, RateReservation,
+    SpendHold, TenantQuota,
+};
 
 use super::redb::{MAX_STR, RedbStore, be, begin_write};
 
@@ -25,13 +28,24 @@ const RUNNING: TableDefinition<(&str, &str), i64> = TableDefinition::new("quota_
 /// `(tenant, period) -> (tokens, minor_units)`.
 const SPENT: TableDefinition<(&str, &str), (u64, u64)> = TableDefinition::new("quota_spent");
 
-/// `(tenant, run, epoch) -> (period, tokens, minor_units, release_slot)`.
+/// `(tenant, run) -> (period, tokens, minor_units)`: what an open run still
+/// holds against a period.
+///
+/// Written beside the slot at admission, reduced by every pass settlement and
+/// removed by the one that concludes the run — each in the transaction that
+/// writes the receipt. A run holds one row whatever it spends in, so a resume
+/// in a later period moves the row rather than adding a second.
+type HoldRow<'a> = (&'a str, u64, u64);
+const RESERVED: TableDefinition<(&str, &str), HoldRow<'static>> =
+    TableDefinition::new("quota_reserved");
+
+/// `(tenant, run, epoch) -> (period, tokens, minor_units, release_slot, concludes)`.
 ///
 /// The receipt makes a lost acknowledgement retryable without charging twice.
 /// Empty `period` means this pass had no spend ceiling; period keys themselves
 /// are never empty.
 type SettlementKey<'a> = (&'a str, &'a str, u64);
-type SettlementReceipt<'a> = (&'a str, u64, u64, u8);
+type SettlementReceipt<'a> = (&'a str, u64, u64, u8, u8);
 const SETTLED: TableDefinition<SettlementKey<'static>, SettlementReceipt<'static>> =
     TableDefinition::new("quota_settled");
 
@@ -49,6 +63,18 @@ const SETTLED: TableDefinition<SettlementKey<'static>, SettlementReceipt<'static
 /// through.
 const HALTED: TableDefinition<(&str, &str), &str> = TableDefinition::new("quota_halted");
 
+/// `(tenant, grant, run, dispatch) -> reserved_at`: one row per dispatch of a
+/// rate-ceilinged tool.
+///
+/// The key is the idempotency: a retry and a recovered re-dispatch derive the
+/// same `(run, dispatch)` and find their own row. The count is the rows for
+/// `(tenant, grant)` inside the window.
+type RateKey<'a> = (&'a str, &'a str, &'a str, &'a str);
+const RATE: TableDefinition<RateKey<'static>, i64> = TableDefinition::new("quota_rate");
+
+// `reserve` is one write transaction deciding a slot and a spend hold
+// together, and splitting it would split the decision it exists to keep whole.
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl QuotaStore for RedbStore {
     fn tenant(&self) -> &str {
@@ -58,37 +84,43 @@ impl QuotaStore for RedbStore {
     async fn reserve(
         &self,
         run: RunId,
-        limit: Option<u32>,
+        quota: &TenantQuota,
+        hold: Option<&SpendHold>,
         at: Timestamp,
     ) -> Result<(), QuotaError> {
         let tenant = self.tenant_name();
         let run = run.to_string();
         let at = at.unix_timestamp();
+        let limit = quota.max_concurrent_runs;
+        let quota = *quota;
+        let hold = hold.cloned();
 
         // The refusal comes back as a **value**, not an error message. Packing
         // "at the ceiling" into a `StoreError` string would mean the caller
         // decides behaviour by matching on prose, and the first person to
         // reword that prose silently turns every refusal into an outage.
-        let taken: Result<(), u32> = self
+        let taken: Result<(), QuotaError> = self
             .with_db(move |db| {
-                // One write transaction for the count *and* the insert. redb
+                // One write transaction for the counts *and* the inserts. redb
                 // has a single writer, so this is atomic against every other
                 // admission on this store — the whole guarantee: a read followed
-                // by a write lets two admissions through one remaining slot.
+                // by a write lets two admissions through one remaining slot, or
+                // one remaining unit of the period.
                 let w = begin_write(db)?;
                 let outcome = {
                     let mut running = w.open_table(RUNNING).map_err(|e| be(&e))?;
+                    let mut reserved = w.open_table(RESERVED).map_err(|e| be(&e))?;
 
                     // Idempotent per run: a retried admission must not consume a
                     // second slot, nor fail against a ceiling it is already
                     // counted in.
-                    let held = running
+                    let slot_held = running
                         .get((tenant.as_str(), run.as_str()))
                         .map_err(|e| be(&e))?
                         .is_some();
 
                     let mut refused = None;
-                    if !held && let Some(limit) = limit {
+                    if !slot_held && let Some(limit) = limit {
                         // Ranged over this tenant, never `len()`: that counts
                         // every tenant's runs, so one busy tenant would throttle
                         // everybody else — a shared ceiling wearing a per-tenant
@@ -110,15 +142,71 @@ impl QuotaStore for RedbStore {
                             n += 1;
                         }
                         if n >= limit {
-                            refused = Some(n);
+                            refused = Some(QuotaError::TooManyRuns {
+                                tenant: tenant.clone(),
+                                running: n,
+                            });
                         }
                     }
-                    if let Some(n) = refused {
-                        Err(n)
+
+                    // The spend hold, decided in the same transaction as the
+                    // slot: settled plus everything already held in the period
+                    // plus this. A run already holding spend is a retried
+                    // admission and takes nothing more.
+                    let fresh_hold = match &hold {
+                        Some(hold)
+                            if reserved
+                                .get((tenant.as_str(), run.as_str()))
+                                .map_err(|e| be(&e))?
+                                .is_none() =>
+                        {
+                            Some(hold)
+                        }
+                        _ => None,
+                    };
+                    if refused.is_none()
+                        && let Some(hold) = fresh_hold
+                    {
+                        let settled = w
+                            .open_table(SPENT)
+                            .map_err(|e| be(&e))?
+                            .get((tenant.as_str(), hold.period.as_str()))
+                            .map_err(|e| be(&e))?
+                            .map_or((0, 0), |v| v.value());
+                        let outstanding = held_in(&reserved, &tenant, &hold.period)?;
+                        if let Err(e) = crate::quota::check_spend(
+                            &tenant,
+                            &hold.period,
+                            &quota,
+                            Spend {
+                                tokens: settled.0,
+                                minor_units: settled.1,
+                            },
+                            outstanding,
+                            hold.amount,
+                        ) {
+                            refused = Some(e);
+                        }
+                    }
+
+                    if let Some(refusal) = refused {
+                        Err(refusal)
                     } else {
                         running
                             .insert((tenant.as_str(), run.as_str()), at)
                             .map_err(|e| be(&e))?;
+                        if let Some(hold) = fresh_hold {
+                            reserved
+                                .insert(
+                                    (tenant.as_str(), run.as_str()),
+                                    (
+                                        hold.period.as_str(),
+                                        hold.amount.tokens,
+                                        hold.amount.minor_units,
+                                    ),
+                                )
+                                .map_err(|e| be(&e))?;
+                        }
                         Ok(())
                     }
                 };
@@ -127,10 +215,87 @@ impl QuotaStore for RedbStore {
             })
             .await?;
 
-        taken.map_err(|running| QuotaError::TooManyRuns {
-            tenant: self.tenant_name(),
-            running,
-        })
+        taken
+    }
+
+    async fn reserve_rate(&self, reservation: &RateReservation) -> Result<(), QuotaError> {
+        let tenant = self.tenant_name();
+        let reservation = reservation.clone();
+        let taken: Result<(), QuotaError> = self
+            .with_db(move |db| {
+                // One write transaction for the count and the insert: redb's
+                // single writer is the serialisation the ceiling needs.
+                let w = begin_write(db)?;
+                let outcome = {
+                    let mut rate = w.open_table(RATE).map_err(|e| be(&e))?;
+                    let grant = reservation.grant.as_str();
+                    let run = reservation.run.to_string();
+                    let dispatch = reservation.dispatch.to_hex();
+                    let held = rate
+                        .get((tenant.as_str(), grant, run.as_str(), dispatch.as_str()))
+                        .map_err(|e| be(&e))?
+                        .is_some();
+                    if held {
+                        Ok(())
+                    } else {
+                        let floor =
+                            crate::quota::rate_prune_floor(reservation.at, &reservation.ceilings);
+                        let (instants, stale) = rate_rows(&rate, &tenant, grant, floor)?;
+                        for key in &stale {
+                            rate.remove((tenant.as_str(), grant, key.0.as_str(), key.1.as_str()))
+                                .map_err(|e| be(&e))?;
+                        }
+                        let verdict = if reservation.exempt {
+                            Ok(())
+                        } else {
+                            crate::quota::check_rate(
+                                &tenant,
+                                grant,
+                                &reservation.ceilings,
+                                &instants,
+                                reservation.at,
+                            )
+                        };
+                        if verdict.is_ok() {
+                            rate.insert(
+                                (tenant.as_str(), grant, run.as_str(), dispatch.as_str()),
+                                reservation.at.unix_timestamp(),
+                            )
+                            .map_err(|e| be(&e))?;
+                        }
+                        verdict
+                    }
+                };
+                w.commit().map_err(|e| be(&e))?;
+                Ok(outcome)
+            })
+            .await?;
+        taken
+    }
+
+    async fn rate_room(
+        &self,
+        grant: &str,
+        ceilings: &[RateCeiling],
+        at: Timestamp,
+    ) -> Result<(), QuotaError> {
+        let tenant = self.tenant_name();
+        let grant = grant.to_owned();
+        let ceilings = ceilings.to_vec();
+        let answer: Result<(), QuotaError> = self
+            .with_db(move |db| {
+                let r = db.begin_read().map_err(|e| be(&e))?;
+                // Nothing has ever been reserved, so every window has room.
+                let Ok(rate) = r.open_table(RATE) else {
+                    return Ok(Ok(()));
+                };
+                let (instants, _) = rate_rows(&rate, &tenant, &grant, i64::MIN)?;
+                Ok(crate::quota::check_rate(
+                    &tenant, &grant, &ceilings, &instants, at,
+                ))
+            })
+            .await?;
+        answer
     }
 
     async fn set_halt(
@@ -235,9 +400,94 @@ impl QuotaStore for RedbStore {
                 running
                     .remove((tenant.as_str(), run.as_str()))
                     .map_err(|e| be(&e))?;
+                let mut reserved = w.open_table(RESERVED).map_err(|e| be(&e))?;
+                reserved
+                    .remove((tenant.as_str(), run.as_str()))
+                    .map_err(|e| be(&e))?;
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn carry(&self, run: RunId, period: &str) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let run = run.to_string();
+        let period = period.to_owned();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                let mut reserved = w.open_table(RESERVED).map_err(|e| be(&e))?;
+                let row = reserved
+                    .get((tenant.as_str(), run.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (p, tokens, minor) = v.value();
+                        (p.to_owned(), tokens, minor)
+                    });
+                if let Some((held_in, tokens, minor)) = row
+                    && held_in != period
+                {
+                    reserved
+                        .insert(
+                            (tenant.as_str(), run.as_str()),
+                            (period.as_str(), tokens, minor),
+                        )
+                        .map_err(|e| be(&e))?;
+                }
+            }
+            w.commit().map_err(|e| be(&e))
+        })
+        .await
+    }
+
+    async fn reservations(&self, limit: usize) -> Result<Vec<Held>, StoreError> {
+        let tenant = self.tenant_name();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(t) = r.open_table(RESERVED) else {
+                return Ok(Vec::new());
+            };
+            let mut out = Vec::new();
+            for e in t
+                .range((tenant.as_str(), "")..=(tenant.as_str(), MAX_STR))
+                .map_err(|e| be(&e))?
+            {
+                if out.len() >= limit {
+                    break;
+                }
+                let (k, v) = e.map_err(|e| be(&e))?;
+                let raw = k.value().1;
+                let (period, tokens, minor_units) = v.value();
+                // Damage, not absence, for the reason the slot listing gives:
+                // a skipped row is a hold nobody can find.
+                out.push(Held {
+                    run: RunId::parse(raw).map_err(|e| StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!("bad run id '{raw}' in the quota hold table: {e}"),
+                    })?,
+                    period: period.to_owned(),
+                    remaining: Spend {
+                        tokens,
+                        minor_units,
+                    },
+                });
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn reserved(&self, period: &str) -> Result<Spend, StoreError> {
+        let tenant = self.tenant_name();
+        let period = period.to_owned();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(t) = r.open_table(RESERVED) else {
+                return Ok(Spend::default());
+            };
+            held_in(&t, &tenant, &period)
         })
         .await
     }
@@ -254,6 +504,7 @@ impl QuotaStore for RedbStore {
                 settlement.spend.tokens,
                 settlement.spend.minor_units,
                 u8::from(settlement.release_slot),
+                u8::from(settlement.concludes),
             );
             let fresh = {
                 let mut settled = w.open_table(SETTLED).map_err(|e| be(&e))?;
@@ -261,12 +512,25 @@ impl QuotaStore for RedbStore {
                     .get((tenant.as_str(), run.as_str(), settlement.epoch))
                     .map_err(|e| be(&e))?
                     .map(|value| {
-                        let (period, tokens, minor_units, release_slot) = value.value();
-                        (period.to_owned(), tokens, minor_units, release_slot)
+                        let (period, tokens, minor_units, release_slot, concludes) = value.value();
+                        (
+                            period.to_owned(),
+                            tokens,
+                            minor_units,
+                            release_slot,
+                            concludes,
+                        )
                     });
                 match stored {
                     Some(stored)
-                        if stored != (period.to_owned(), receipt.1, receipt.2, receipt.3) =>
+                        if stored
+                            != (
+                                period.to_owned(),
+                                receipt.1,
+                                receipt.2,
+                                receipt.3,
+                                receipt.4,
+                            ) =>
                     {
                         return Err(StoreError::Corrupt {
                             seq: 0,
@@ -304,6 +568,35 @@ impl QuotaStore for RedbStore {
                         ),
                     )
                     .map_err(|e| be(&e))?;
+            }
+            // The pass's spend leaves the run's hold as it enters the settled
+            // total, so the period counts it once; the concluding pass gives
+            // back what the run never spent.
+            {
+                let mut reserved = w.open_table(RESERVED).map_err(|e| be(&e))?;
+                let row = reserved
+                    .get((tenant.as_str(), run.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (p, tokens, minor) = v.value();
+                        (p.to_owned(), tokens, minor)
+                    });
+                if settlement.concludes {
+                    reserved
+                        .remove((tenant.as_str(), run.as_str()))
+                        .map_err(|e| be(&e))?;
+                } else if let Some((held_in, tokens, minor)) = row {
+                    reserved
+                        .insert(
+                            (tenant.as_str(), run.as_str()),
+                            (
+                                held_in.as_str(),
+                                tokens.saturating_sub(settlement.spend.tokens),
+                                minor.saturating_sub(settlement.spend.minor_units),
+                            ),
+                        )
+                        .map_err(|e| be(&e))?;
+                }
             }
             if settlement.release_slot {
                 w.open_table(RUNNING)
@@ -388,4 +681,54 @@ impl QuotaStore for RedbStore {
         })
         .await
     }
+}
+
+/// What this tenant's open runs hold against `period`.
+fn held_in<T: ReadableTable<(&'static str, &'static str), HoldRow<'static>>>(
+    table: &T,
+    tenant: &str,
+    period: &str,
+) -> Result<Spend, StoreError> {
+    let mut total = Spend::default();
+    for e in table
+        .range((tenant, "")..=(tenant, MAX_STR))
+        .map_err(|e| be(&e))?
+    {
+        let (_, v) = e.map_err(|e| be(&e))?;
+        let (held_in, tokens, minor_units) = v.value();
+        if held_in == period {
+            total += Spend {
+                tokens,
+                minor_units,
+            };
+        }
+    }
+    Ok(total)
+}
+
+/// The reservation instants held for `(tenant, grant)`, and the `(run,
+/// dispatch)` of each row at or before `floor`, which no ceiling counts.
+type StaleRow = (String, String);
+fn rate_rows<T: ReadableTable<RateKey<'static>, i64>>(
+    table: &T,
+    tenant: &str,
+    grant: &str,
+    floor: i64,
+) -> Result<(Vec<i64>, Vec<StaleRow>), StoreError> {
+    let mut instants = Vec::new();
+    let mut stale = Vec::new();
+    for e in table
+        .range((tenant, grant, "", "")..=(tenant, grant, MAX_STR, MAX_STR))
+        .map_err(|e| be(&e))?
+    {
+        let (k, v) = e.map_err(|e| be(&e))?;
+        let at = v.value();
+        if at <= floor {
+            let (_, _, run, dispatch) = k.value();
+            stale.push((run.to_owned(), dispatch.to_owned()));
+        } else {
+            instants.push(at);
+        }
+    }
+    Ok((instants, stale))
 }

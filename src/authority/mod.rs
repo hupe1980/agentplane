@@ -3,7 +3,7 @@
 //!
 //! # The gap this fills
 //!
-//! Two ceilings existed and neither has this shape. A [`Budget`] bounds **one
+//! Two ceilings exist and neither has this shape. A [`Budget`] bounds **one
 //! run**; a [`TenantQuota`] bounds **one tenant over a billing period**. Both
 //! are resource controls — they answer *how much may this computation consume*.
 //!
@@ -101,6 +101,38 @@ impl std::fmt::Display for AuthorityId {
     }
 }
 
+/// On whose behalf an authority may be drawn.
+///
+/// Typed rather than a string, because the two kinds are different facts: a
+/// tenant-held authority is the deployment's own, and a subject-held one is a
+/// person's or a peer's. As a free-form string, a chain whose owner happened to
+/// be spelled `tenant:acme` would draw the tenant's mandates.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Holder {
+    /// The tenant the authority is stored under, drawn by runs this plane
+    /// started for itself with no delegation chain.
+    Tenant,
+    /// A delegation chain's owner, by principal id.
+    Subject(String),
+}
+
+impl Holder {
+    /// A subject-held authority.
+    pub fn subject(id: impl Into<String>) -> Self {
+        Self::Subject(id.into())
+    }
+}
+
+impl std::fmt::Display for Holder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tenant => f.write_str("the tenant"),
+            Self::Subject(id) => write!(f, "'{id}'"),
+        }
+    }
+}
+
 /// What somebody authorized, and how far it goes.
 ///
 /// Issued once and thereafter immutable: the ceiling a person agreed to must not
@@ -110,6 +142,15 @@ impl std::fmt::Display for AuthorityId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StandingAuthority {
     pub id: AuthorityId,
+    /// On whose behalf it may be drawn: the principal a run must act for.
+    ///
+    /// A run acting under a delegation chain holds as the chain's **owner**,
+    /// the person it descends from; a run the plane started for itself with
+    /// no chain holds as its tenant; a served caller that presented no chain
+    /// holds nothing — see [`holder_of`]. Without it, knowing an id would be
+    /// enough: any run in the tenant could spend a mandate somebody else
+    /// signed, and an id a peer supplied could name one.
+    pub holder: Holder,
     /// Why this exists, in the issuer's terms — an approval reference, a
     /// mandate id, a ticket.
     ///
@@ -135,11 +176,17 @@ pub struct StandingAuthority {
 }
 
 impl StandingAuthority {
-    /// Issue an authority for `ceiling`, stating why it exists.
+    /// Issue an authority for `ceiling` to `holder`, stating why it exists.
     #[must_use]
-    pub fn new(id: impl Into<String>, basis: impl Into<String>, ceiling: Spend) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        holder: Holder,
+        basis: impl Into<String>,
+        ceiling: Spend,
+    ) -> Self {
         Self {
             id: AuthorityId::new(id),
+            holder,
             basis: basis.into(),
             ceiling,
             max_draws: None,
@@ -165,13 +212,19 @@ impl StandingAuthority {
     ///
     /// # Errors
     ///
-    /// [`AuthorityError::Malformed`] for an empty id or basis, or a ceiling of
+    /// [`AuthorityError::Malformed`] for an empty id, holder or basis, or a ceiling of
     /// nothing. A zero ceiling is refused rather than treated as unlimited: the
     /// two readings are opposite, and a format that guesses between them is one
     /// whose meaning changes under you.
     pub fn validate(&self) -> Result<(), AuthorityError> {
         if self.id.as_str().trim().is_empty() {
             return Err(AuthorityError::Malformed("the authority has no id"));
+        }
+        if matches!(&self.holder, Holder::Subject(id) if id.trim().is_empty()) {
+            return Err(AuthorityError::Malformed(
+                "the authority names no holder — an authority anybody in the tenant may \
+                 draw on is one whose id is the only credential",
+            ));
         }
         if self.basis.trim().is_empty() {
             return Err(AuthorityError::Malformed(
@@ -186,6 +239,28 @@ impl StandingAuthority {
             ));
         }
         Ok(())
+    }
+}
+
+/// The holder a run draws as: its chain's owner, its tenant, or nobody.
+///
+/// The owner rather than the acting subject, because a chain narrows authority
+/// as it descends and never changes on whose behalf it acts — a sub-agent an
+/// owner's run commissioned spends the owner's mandate, and a peer's run
+/// spends only its own caller's.
+///
+/// `served_unchained` is a run admitted for a served caller that presented no
+/// chain. It holds nothing: the tenant's mandates are the deployment's, and a
+/// caller that named no owner is not the deployment.
+#[must_use]
+pub fn holder_of(
+    chain: Option<&crate::core::Delegation>,
+    served_unchained: bool,
+) -> Option<Holder> {
+    match chain {
+        Some(chain) => Some(Holder::Subject(chain.owner().id.clone())),
+        None if served_unchained => None,
+        None => Some(Holder::Tenant),
     }
 }
 
@@ -303,6 +378,22 @@ pub enum AuthorityError {
     Expired {
         authority: AuthorityId,
         expired_at: Timestamp,
+    },
+
+    /// The run drawing is not the one the authority was issued to.
+    ///
+    /// **Not retryable**, and distinct from [`Unknown`](Self::Unknown) because
+    /// the fix is different: the id is right and the caller is wrong.
+    #[error(
+        "standing authority '{authority}' is held by {holder}, and this run acts \
+         for {drawer}"
+    )]
+    NotHolder {
+        authority: AuthorityId,
+        holder: Holder,
+        /// Whom the drawing run acts for, or `nobody` for a served caller
+        /// that presented no chain.
+        drawer: String,
     },
 
     /// The declaration itself is not well formed.
@@ -488,7 +579,12 @@ mod tests {
     use super::*;
 
     fn sound() -> StandingAuthority {
-        StandingAuthority::new("mandate-42", "approval:SET-42", Spend::money(50_000))
+        StandingAuthority::new(
+            "mandate-42",
+            Holder::Tenant,
+            "approval:SET-42",
+            Spend::money(50_000),
+        )
     }
 
     /// Every rule `validate` enforces, each with the case it rejects.
@@ -503,6 +599,13 @@ mod tests {
         no_id.id = AuthorityId::new("  ");
         assert!(matches!(
             no_id.validate(),
+            Err(AuthorityError::Malformed(_))
+        ));
+
+        let mut no_holder = sound();
+        no_holder.holder = Holder::subject(" ");
+        assert!(matches!(
+            no_holder.validate(),
             Err(AuthorityError::Malformed(_))
         ));
 

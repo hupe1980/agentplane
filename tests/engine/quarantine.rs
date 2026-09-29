@@ -219,6 +219,37 @@ fn fixture() -> Fixture {
     }
 }
 
+/// The same plane under a tenant spend quota, so each run holds a reservation.
+fn fixture_under_a_spend_quota() -> Fixture {
+    use agentplane::quota::{QuotaStore, TenantQuota};
+    let calls = Arc::new(AtomicUsize::new(0));
+    let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .budget(
+            agentplane::core::Budget::unlimited()
+                .tokens(1_000)
+                .call_tokens(100),
+        )
+        .quota(
+            store.clone() as Arc<dyn QuotaStore>,
+            TenantQuota {
+                max_tokens_per_period: Some(100_000),
+                ..TenantQuota::default()
+            },
+        )
+        .skill(Booking(Arc::clone(&log)))
+        .skill(Paying(Arc::clone(&calls)))
+        .build();
+    Fixture {
+        store,
+        rt,
+        calls,
+        log,
+    }
+}
+
 /// book -> pay. The first step leaves something standing; the second cannot say
 /// whether it did.
 fn plan() -> PlanIR {
@@ -291,10 +322,18 @@ async fn attention_names_each_condition_and_what_it_could_not_check() {
         "a page that did not fill must not read as a floor"
     );
     assert!(
-        !quarantines.remedy.is_empty(),
+        !quarantines.remedy.cli.is_empty() && !quarantines.remedy.http.is_empty(),
         "a finding that reaches somebody without saying what they do about it is \
          delivery in name only"
     );
+    // Every verb the remedy names takes a run id, so the condition names the
+    // run: a count alone sends the operator to a second listing first.
+    assert_eq!(
+        quarantines.subjects,
+        vec![run.to_string()],
+        "the condition does not name the run its remedy acts on"
+    );
+    assert_eq!(quarantines.unlisted, 0);
 
     // And it stops being a condition when somebody answers it. A roll-up whose
     // level only rises is the oversight queue that floods, which retires the
@@ -862,6 +901,70 @@ async fn cancelling_a_quarantined_run_is_refused_and_names_the_two_verbs() {
     );
 }
 
+/// A closed run stays closed to a stop even when a record follows its
+/// conclusion. An abandonment whose seal a crash lost still accepts an answer
+/// to its doubt, and the run is no less concluded for it.
+#[tokio::test]
+async fn a_stop_after_an_abandoned_run_was_answered_is_refused() {
+    let f = fixture();
+    let run = quarantined(&f).await;
+    let key = f.rt.undecided(run).await.unwrap()[0].effect;
+    let store = f.store.clone() as Arc<dyn JournalStore>;
+
+    // The abandonment, written by a pass that died before sealing.
+    let lease = store
+        .acquire(run, "a-process-that-died", Duration::from_secs(30))
+        .await
+        .expect("lease");
+    let head = store.head(run).await.expect("head").hash;
+    store
+        .append(
+            lease.epoch,
+            vec![
+                Append::new(
+                    run,
+                    RecordKind::QuarantineDecided {
+                        decider: operator("ada"),
+                        reason: "written off".into(),
+                        decision: QuarantineDecision::Abandon,
+                    },
+                ),
+                Append::new(
+                    run,
+                    RecordKind::RunConcluded {
+                        outcome: "abandoned".into(),
+                        reason: None,
+                        exhaustion: None,
+                        live_spend: agentplane::core::Spend::ZERO,
+                        chain_head: head,
+                    },
+                ),
+            ],
+        )
+        .await
+        .expect("append");
+    store
+        .release_lease(run, lease.epoch)
+        .await
+        .expect("release");
+    f.rt.reconcile_effect(
+        run,
+        key,
+        Assertion::DidNotHappen,
+        &operator("ada"),
+        "the provider confirmed no charge was made",
+    )
+    .await
+    .expect("an answer after the ending is still recorded");
+
+    let refused = f.rt.request_cancel(run, &operator("bo"), "stop it").await;
+    assert!(
+        matches!(&refused, Err(RuntimeError::AlreadyConcluded { outcome, .. }) if outcome == "abandoned"),
+        "got {refused:?}"
+    );
+    assert!(f.rt.cancellation(run).await.unwrap().is_none());
+}
+
 // ── The doubt outlives the run ──────────────────────────────────────────────
 
 /// **The finding that no status can clear.**
@@ -1031,5 +1134,41 @@ async fn an_answered_run_replays_strictly() {
         f.calls.load(Ordering::SeqCst),
         before,
         "a strict pass performs nothing, including the call a person answered for"
+    );
+}
+
+/// **An abandoned quarantine gives back what it held against the period.**
+///
+/// A quarantine holds its reservation: it is open, and a reopen may yet spend
+/// it. Abandoning it ends the run by a conclusion no execution pass opened —
+/// nothing settles a pass — so the release has to come from the conclusion
+/// itself, or every abandoned run keeps a slice of its tenant's period forever.
+#[tokio::test]
+async fn an_abandoned_quarantine_gives_back_its_reservation() {
+    use agentplane::quota::QuotaStore;
+    let f = fixture_under_a_spend_quota();
+    let run = quarantined(&f).await;
+    let held = QuotaStore::reservations(f.store.as_ref(), 10)
+        .await
+        .expect("listing");
+    assert!(
+        held.iter().any(|h| h.run == run),
+        "a quarantined run is open and keeps its reservation: {held:?}"
+    );
+
+    f.rt.decide_quarantine(
+        run,
+        &operator("ada"),
+        "the provider has no record either way",
+        QuarantineDecision::Abandon,
+    )
+    .await
+    .expect("abandon");
+    let held = QuotaStore::reservations(f.store.as_ref(), 10)
+        .await
+        .expect("listing");
+    assert!(
+        held.is_empty(),
+        "the abandoned run still holds part of the period: {held:?}"
     );
 }

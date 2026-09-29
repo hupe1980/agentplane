@@ -469,7 +469,7 @@ impl DeliveryWorker {
             tracing::warn!(
                 task = %registration.config.task,
                 config = %registration.config.id,
-                url = %registration.config.url,
+                host = %crate::netguard::host_of(&registration.config.url),
                 attempts = attempts.saturating_add(1),
                 error = %failure.error,
                 "parking a push registration: {reason} — its cursor is kept, so \

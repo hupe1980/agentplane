@@ -157,9 +157,8 @@ impl Decoder {
             // wrong answer, it is a run that never returns. A loop that cannot
             // make progress is worth one comparison to rule out.
             //
-            // `cargo mutants` is what made this concrete: ten mutations of
-            // `split_line` were reported as timeouts rather than catches,
-            // because each one spun here forever.
+            // Without it, a mutation of `split_line` spins here forever and
+            // reads as a timeout rather than a catch.
             if rest.len() >= self.partial.len() {
                 break;
             }

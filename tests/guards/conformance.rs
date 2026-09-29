@@ -105,7 +105,7 @@ fn the_calendar_battery_rejects_one_that_approximates() {
 #[tokio::test]
 async fn redb_satisfies_the_journal_store_contract() {
     // Signing is switched on for the whole battery, not only for the check that
-    // is about it. Two reasons: the attestation round-trip check would otherwise
+    // is about it. Two reasons: the signature round-trip check would otherwise
     // skip itself against an unsigned store and report success having asserted
     // nothing, and running every other check against a signing store proves
     // signing does not disturb fencing, exactly-once, or chaining.
@@ -240,6 +240,14 @@ impl JournalStore for NoExactlyOnce {
     ) -> Result<Vec<(agentplane::core::RunId, u64)>, agentplane::core::StoreError> {
         self.inner.recent_runs(after, limit).await
     }
+    async fn recent_runs_from(
+        &self,
+        source: &str,
+        after: Option<(u64, agentplane::core::RunId)>,
+        limit: usize,
+    ) -> Result<Vec<(agentplane::core::RunId, u64)>, agentplane::core::StoreError> {
+        self.inner.recent_runs_from(source, after, limit).await
+    }
 
     async fn case_history(
         &self,
@@ -340,6 +348,13 @@ async fn redb_satisfies_the_case_layer_contracts() {
     cc::check_timers(&(Arc::clone(&store) as Arc<dyn TimerStore>), &mut report).await;
     cc::check_tasks(&(Arc::clone(&store) as Arc<dyn TaskStore>), &mut report).await;
     cc::check_batches(&(Arc::clone(&store) as Arc<dyn BatchStore>), &mut report).await;
+    cc::check_sealed_runs_waits(
+        &(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>),
+        &(Arc::clone(&store) as Arc<dyn TimerStore>),
+        &(Arc::clone(&store) as Arc<dyn EventStore>),
+        &mut report,
+    )
+    .await;
 
     // Two tenant handles onto the *same* database, because the tenancy check
     // is about one backend keeping two tenants apart — two databases would
@@ -517,7 +532,7 @@ async fn every_authenticator_satisfies_the_contract() {
     };
 
     let auth = TokenAuthenticator::new(vec![TokenEntry {
-        token: "s3cret-token-value-long-enough".to_owned(),
+        token: "s3cret-token-value-long-enough-0000".to_owned(),
         actor: "ada".to_owned(),
         roles: vec!["compliance-officer".to_owned()],
         tenant: None,
@@ -530,7 +545,10 @@ async fn every_authenticator_satisfies_the_contract() {
     conformance_auth::check(
         &auth,
         &Requests {
-            accepted: Some((bearer("s3cret-token-value-long-enough"), "ada".to_owned())),
+            accepted: Some((
+                bearer("s3cret-token-value-long-enough-0000"),
+                "ada".to_owned(),
+            )),
             // Both in the scheme this server speaks, both refused. A `Basic`
             // header would not belong here: *I cannot use what you sent* is a
             // different answer from *I used it and refused it*, and neither

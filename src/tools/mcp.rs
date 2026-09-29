@@ -1258,9 +1258,8 @@ impl ToolClient for McpClient {
             }
             CallToolResponse::InputRequired(_) => {
                 // The server may already have performed partial work before it
-                // asked. This is not a clean refusal. A future governed
-                // elicitation bridge must suspend outside this call rather than
-                // letting the server open an invisible human loop inside it.
+                // asked, so this is not a clean refusal. A human loop opened
+                // inside a tool call would be invisible to the journal.
                 return Err(ToolError::TimedOut {
                     tool: tool.clone(),
                     detail: "the MCP server requested elicitation, which this host does not advertise or answer inside a tool call"

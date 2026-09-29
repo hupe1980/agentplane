@@ -715,7 +715,10 @@ async fn release_is_journaled_with_its_evidence() {
         }
     }
 
-    let rt = Runtime::builder(store()).skill(Releases).build();
+    let rt = Runtime::builder(store())
+        .policy(std::sync::Arc::new(PermitsReleases))
+        .skill(Releases)
+        .build();
     let out = rt
         .run("demo.release", Tainted::trusted(json!({})))
         .await
@@ -883,7 +886,10 @@ async fn strict_replay_writes_nothing() {
     }
 
     let s = Arc::new(RedbStore::open_in_memory().unwrap());
-    let rt = Runtime::builder(s.clone()).skill(Releases).build();
+    let rt = Runtime::builder(s.clone())
+        .policy(std::sync::Arc::new(PermitsReleases))
+        .skill(Releases)
+        .build();
     let out = rt
         .run("demo.release", Tainted::trusted(json!({})))
         .await
@@ -998,6 +1004,8 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
                     policy_bundle: None,
                     canon: 999,
                     idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
                 },
             )],
         )
@@ -1031,4 +1039,25 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
     rt.replay(fresh.run_id, Mode::Strict)
         .await
         .expect("a run written by this build replays");
+}
+
+/// Permits every request. A release is refused on a plane with no policy
+/// engine, and these tests are about what a permitted release does.
+#[derive(Debug)]
+struct PermitsReleases;
+
+impl agentplane::core::PolicyEngine for PermitsReleases {
+    fn authorize(
+        &self,
+        _: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"permits-releases"),
+            "test/permits-releases-v1",
+        )
+    }
 }

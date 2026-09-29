@@ -8,7 +8,10 @@
 use async_trait::async_trait;
 
 use crate::core::{RunId, Spend, StoreError, Timestamp};
-use crate::quota::{Halt, HaltScope, QuotaError, QuotaSettlement, QuotaStore};
+use crate::quota::{
+    Halt, HaltScope, Held, QuotaError, QuotaSettlement, QuotaStore, RateCeiling, RateReservation,
+    SpendHold, TenantQuota,
+};
 
 use super::postgres::{PostgresStore, amount_of, be, pool_err, sql_amount};
 
@@ -18,12 +21,15 @@ impl QuotaStore for PostgresStore {
         crate::journal::JournalStore::tenant(self)
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn reserve(
         &self,
         run: RunId,
-        limit: Option<u32>,
+        quota: &TenantQuota,
+        hold: Option<&SpendHold>,
         at: Timestamp,
     ) -> Result<(), QuotaError> {
+        let unavailable = |e: &tokio_postgres::Error| QuotaError::Unavailable(be(e).to_string());
         let mut client = self
             .pool_ref()
             .get()
@@ -32,7 +38,7 @@ impl QuotaStore for PostgresStore {
         let tenant = self.tenant_name();
         let run = run.to_string();
 
-        let Some(limit) = limit else {
+        if quota.max_concurrent_runs.is_none() && hold.is_none() {
             // No ceiling: still record the run, so `running()` answers honestly
             // and a ceiling added later starts from the truth. No lock either —
             // there is no decision here for two admissions to disagree about.
@@ -44,95 +50,238 @@ impl QuotaStore for PostgresStore {
                     &[&tenant, &run, &at.unix_timestamp()],
                 )
                 .await
-                .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
+                .map_err(|e| unavailable(&e))?;
             return Ok(());
-        };
+        }
 
-        // The count and the insert decide together **under a per-tenant
-        // advisory lock**, because nothing weaker serialises them. This
-        // statement's earlier form ran without the lock, on a comment claiming
-        // the decision happened "inside the row lock the write takes" — and no
-        // such lock exists: two INSERTs of *different* rows lock nothing in
-        // common, each count subquery reads its own statement snapshot under
-        // READ COMMITTED, and two admissions racing for one remaining slot
-        // both passed `count < limit` and both landed. A ceiling that admits
-        // limit+k exactly under concurrent load is the catalogued
-        // yields-under-load shape, on the one control whose whole promise is
-        // surviving a second instance.
+        // The counts and the inserts decide together **under a per-tenant
+        // advisory lock**, because nothing weaker serialises them. Two INSERTs
+        // of *different* rows lock nothing in common, and each count reads its
+        // own statement snapshot under READ COMMITTED — so without the lock two
+        // admissions racing for the last slot, or the last units of a period,
+        // both pass and both land: a ceiling that yields under exactly the
+        // concurrent load it exists for.
         //
         // The lock is transaction-scoped and per tenant — admissions for one
         // tenant serialise, which is the semantic the ceiling requires; other
         // tenants' admissions do not wait. The length prefix keeps
         // `("acme", …)` from colliding with a tenant literally named
         // `"acme…"` under concatenation.
-        //
-        // `ON CONFLICT DO NOTHING` keeps a retried admission idempotent: the
-        // run already holds its slot, so re-reserving must neither take a
-        // second nor be refused against a ceiling it is already counted in.
-        let tx = client
-            .transaction()
-            .await
-            .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
+        let tx = client.transaction().await.map_err(|e| unavailable(&e))?;
         tx.query_one(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
             &[&format!("quota-admission:{}:{tenant}", tenant.len())],
         )
         .await
-        .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
-        let inserted = tx
-            .execute(
-                "INSERT INTO quota_running (tenant, run_id, admitted_at)
-                 SELECT $1, $2, $3
-                  WHERE (SELECT COUNT(*) FROM quota_running WHERE tenant = $1) < $4
-                     OR EXISTS (SELECT 1 FROM quota_running
-                                 WHERE tenant = $1 AND run_id = $2)
-                 ON CONFLICT (tenant, run_id) DO NOTHING",
-                &[&tenant, &run, &at.unix_timestamp(), &i64::from(limit)],
-            )
-            .await
-            .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
+        .map_err(|e| unavailable(&e))?;
 
-        if inserted == 1 {
-            tx.commit()
-                .await
-                .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
-            return Ok(());
-        }
-
-        // Nothing was written. Either the tenant is at its ceiling, or the run
-        // already held a slot and `DO NOTHING` fired — and those are opposite
-        // answers, so it is read back rather than assumed. Still inside the
-        // transaction, so the counts are the ones the decision was made from.
-        let held: i64 = tx
+        // Idempotent per run: a retried admission must neither take a second
+        // slot nor be refused against a ceiling it is already counted in.
+        let row = tx
             .query_one(
-                "SELECT COUNT(*) FROM quota_running WHERE tenant = $1 AND run_id = $2",
+                "SELECT EXISTS (SELECT 1 FROM quota_running WHERE tenant = $1 AND run_id = $2),
+                        EXISTS (SELECT 1 FROM quota_reserved WHERE tenant = $1 AND run_id = $2),
+                        (SELECT COUNT(*) FROM quota_running WHERE tenant = $1)",
                 &[&tenant, &run],
             )
             .await
-            .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?
-            .get(0);
-        if held > 0 {
-            tx.commit()
+            .map_err(|e| unavailable(&e))?;
+        let (slot_held, hold_held, running): (bool, bool, i64) =
+            (row.get(0), row.get(1), row.get(2));
+
+        if !slot_held
+            && let Some(limit) = quota.max_concurrent_runs
+            && running >= i64::from(limit)
+        {
+            tx.commit().await.map_err(|e| unavailable(&e))?;
+            return Err(QuotaError::TooManyRuns {
+                tenant,
+                running: u32::try_from(running).unwrap_or(u32::MAX),
+            });
+        }
+
+        if let Some(hold) = hold.filter(|_| !hold_held) {
+            // Settled and held in **one statement**, so both figures come from
+            // one snapshot: read apart, a settlement committing between them
+            // moves a pass's spend out of the holds after the settled total was
+            // read, and the period is undercounted by exactly that pass.
+            let figures = tx
+                .query_one(
+                    "SELECT COALESCE((SELECT tokens FROM quota_spent
+                                       WHERE tenant = $1 AND period = $2), 0),
+                            COALESCE((SELECT minor_units FROM quota_spent
+                                       WHERE tenant = $1 AND period = $2), 0),
+                            LEAST(9223372036854775807::numeric, COALESCE((
+                                SELECT SUM(tokens) FROM quota_reserved
+                                 WHERE tenant = $1 AND period = $2), 0))::bigint,
+                            LEAST(9223372036854775807::numeric, COALESCE((
+                                SELECT SUM(minor_units) FROM quota_reserved
+                                 WHERE tenant = $1 AND period = $2), 0))::bigint",
+                    &[&tenant, &hold.period],
+                )
                 .await
-                .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
+                .map_err(|e| unavailable(&e))?;
+            let settled = Spend {
+                tokens: amount_of(figures.get(0)),
+                minor_units: amount_of(figures.get(1)),
+            };
+            let outstanding = Spend {
+                tokens: amount_of(figures.get(2)),
+                minor_units: amount_of(figures.get(3)),
+            };
+            if let Err(refusal) = crate::quota::check_spend(
+                &tenant,
+                &hold.period,
+                quota,
+                settled,
+                outstanding,
+                hold.amount,
+            ) {
+                tx.commit().await.map_err(|e| unavailable(&e))?;
+                return Err(refusal);
+            }
+            tx.execute(
+                "INSERT INTO quota_reserved (tenant, run_id, period, tokens, minor_units)
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &tenant,
+                    &run,
+                    &hold.period,
+                    &sql_amount(hold.amount.tokens),
+                    &sql_amount(hold.amount.minor_units),
+                ],
+            )
+            .await
+            .map_err(|e| unavailable(&e))?;
+        }
+
+        tx.execute(
+            "INSERT INTO quota_running (tenant, run_id, admitted_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (tenant, run_id) DO NOTHING",
+            &[&tenant, &run, &at.unix_timestamp()],
+        )
+        .await
+        .map_err(|e| unavailable(&e))?;
+        tx.commit().await.map_err(|e| unavailable(&e))?;
+        Ok(())
+    }
+
+    async fn reserve_rate(&self, reservation: &RateReservation) -> Result<(), QuotaError> {
+        let unavailable = |e: &tokio_postgres::Error| QuotaError::Unavailable(be(e).to_string());
+        let mut client = self
+            .pool_ref()
+            .get()
+            .await
+            .map_err(|e| QuotaError::Unavailable(pool_err(&e).to_string()))?;
+        let tenant = self.tenant_name();
+        let grant = reservation.grant.as_str();
+        let run = reservation.run.to_string();
+        let dispatch = reservation.dispatch.to_hex();
+
+        // Serialised per `(tenant, grant)` under a transaction-scoped advisory
+        // lock, for the reason admission is: two inserts of different rows
+        // lock nothing in common, so without it two instances each count a
+        // window with one place left and both land. Seeded apart from the
+        // admission lock, and length-prefixed so no tenant and grant pair can
+        // spell another's.
+        let tx = client.transaction().await.map_err(|e| unavailable(&e))?;
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 1))",
+            &[&format!(
+                "quota-rate:{}:{tenant}:{}:{grant}",
+                tenant.len(),
+                grant.len()
+            )],
+        )
+        .await
+        .map_err(|e| unavailable(&e))?;
+
+        let held: bool = tx
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM quota_rate
+                                 WHERE tenant = $1 AND grant_ref = $2
+                                   AND run_id = $3 AND dispatch = $4)",
+                &[&tenant, &grant, &run, &dispatch],
+            )
+            .await
+            .map_err(|e| unavailable(&e))?
+            .get(0);
+        if held {
+            tx.commit().await.map_err(|e| unavailable(&e))?;
             return Ok(());
         }
 
-        let running: i64 = tx
-            .query_one(
-                "SELECT COUNT(*) FROM quota_running WHERE tenant = $1",
-                &[&tenant],
+        let floor = crate::quota::rate_prune_floor(reservation.at, &reservation.ceilings);
+        tx.execute(
+            "DELETE FROM quota_rate WHERE tenant = $1 AND grant_ref = $2 AND reserved_at <= $3",
+            &[&tenant, &grant, &floor],
+        )
+        .await
+        .map_err(|e| unavailable(&e))?;
+        let instants: Vec<i64> = tx
+            .query(
+                "SELECT reserved_at FROM quota_rate WHERE tenant = $1 AND grant_ref = $2",
+                &[&tenant, &grant],
             )
             .await
-            .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?
-            .get(0);
-        tx.commit()
+            .map_err(|e| unavailable(&e))?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        if !reservation.exempt
+            && let Err(refusal) = crate::quota::check_rate(
+                &tenant,
+                grant,
+                &reservation.ceilings,
+                &instants,
+                reservation.at,
+            )
+        {
+            tx.commit().await.map_err(|e| unavailable(&e))?;
+            return Err(refusal);
+        }
+        tx.execute(
+            "INSERT INTO quota_rate (tenant, grant_ref, run_id, dispatch, reserved_at)
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &tenant,
+                &grant,
+                &run,
+                &dispatch,
+                &reservation.at.unix_timestamp(),
+            ],
+        )
+        .await
+        .map_err(|e| unavailable(&e))?;
+        tx.commit().await.map_err(|e| unavailable(&e))?;
+        Ok(())
+    }
+
+    async fn rate_room(
+        &self,
+        grant: &str,
+        ceilings: &[RateCeiling],
+        at: Timestamp,
+    ) -> Result<(), QuotaError> {
+        let unavailable = |e: &tokio_postgres::Error| QuotaError::Unavailable(be(e).to_string());
+        let client = self
+            .pool_ref()
+            .get()
             .await
-            .map_err(|e| QuotaError::Unavailable(be(&e).to_string()))?;
-        Err(QuotaError::TooManyRuns {
-            tenant,
-            running: u32::try_from(running).unwrap_or(u32::MAX),
-        })
+            .map_err(|e| QuotaError::Unavailable(pool_err(&e).to_string()))?;
+        let tenant = self.tenant_name();
+        let instants: Vec<i64> = client
+            .query(
+                "SELECT reserved_at FROM quota_rate WHERE tenant = $1 AND grant_ref = $2",
+                &[&tenant, &grant],
+            )
+            .await
+            .map_err(|e| unavailable(&e))?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        crate::quota::check_rate(&tenant, grant, ceilings, &instants, at)
     }
 
     async fn set_halt(
@@ -228,15 +377,79 @@ impl QuotaStore for PostgresStore {
     }
 
     async fn release(&self, run: RunId) -> Result<(), StoreError> {
+        let mut client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        let (tenant, run) = (self.tenant_name(), run.to_string());
+        for statement in [
+            "DELETE FROM quota_running WHERE tenant = $1 AND run_id = $2",
+            "DELETE FROM quota_reserved WHERE tenant = $1 AND run_id = $2",
+        ] {
+            tx.execute(statement, &[&tenant, &run])
+                .await
+                .map_err(|e| be(&e))?;
+        }
+        tx.commit().await.map_err(|e| be(&e))
+    }
+
+    async fn carry(&self, run: RunId, period: &str) -> Result<(), StoreError> {
         let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
         client
             .execute(
-                "DELETE FROM quota_running WHERE tenant = $1 AND run_id = $2",
-                &[&self.tenant_name(), &run.to_string()],
+                "UPDATE quota_reserved SET period = $3
+                  WHERE tenant = $1 AND run_id = $2 AND period <> $3",
+                &[&self.tenant_name(), &run.to_string(), &period.to_owned()],
             )
             .await
             .map_err(|e| be(&e))?;
         Ok(())
+    }
+
+    async fn reservations(&self, limit: usize) -> Result<Vec<Held>, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT run_id, period, tokens, minor_units FROM quota_reserved
+                  WHERE tenant = $1 ORDER BY run_id ASC LIMIT $2",
+                &[
+                    &self.tenant_name(),
+                    &i64::try_from(limit).unwrap_or(i64::MAX),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        rows.into_iter()
+            .map(|row| {
+                let raw: String = row.get(0);
+                Ok(Held {
+                    run: RunId::parse(&raw).map_err(|e| StoreError::Corrupt {
+                        seq: 0,
+                        detail: format!("bad run id '{raw}' in the quota hold table: {e}"),
+                    })?,
+                    period: row.get(1),
+                    remaining: Spend {
+                        tokens: amount_of(row.get(2)),
+                        minor_units: amount_of(row.get(3)),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    async fn reserved(&self, period: &str) -> Result<Spend, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_one(
+                "SELECT LEAST(9223372036854775807::numeric, COALESCE(SUM(tokens), 0))::bigint,
+                        LEAST(9223372036854775807::numeric, COALESCE(SUM(minor_units), 0))::bigint
+                   FROM quota_reserved WHERE tenant = $1 AND period = $2",
+                &[&self.tenant_name(), &period.to_owned()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(Spend {
+            tokens: amount_of(row.get(0)),
+            minor_units: amount_of(row.get(1)),
+        })
     }
 
     async fn settle(&self, settlement: &QuotaSettlement) -> Result<(), StoreError> {
@@ -251,8 +464,8 @@ impl QuotaStore for PostgresStore {
         let inserted = tx
             .execute(
                 "INSERT INTO quota_settled
-                   (tenant, run_id, epoch, period, tokens, minor_units, release_slot)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7)
+                   (tenant, run_id, epoch, period, tokens, minor_units, release_slot, concludes)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                  ON CONFLICT (tenant, run_id, epoch) DO NOTHING",
                 &[
                     &tenant,
@@ -262,6 +475,7 @@ impl QuotaStore for PostgresStore {
                     &tokens,
                     &minor_units,
                     &settlement.release_slot,
+                    &settlement.concludes,
                 ],
             )
             .await
@@ -270,7 +484,7 @@ impl QuotaStore for PostgresStore {
         if inserted == 0 {
             let stored = tx
                 .query_one(
-                    "SELECT period, tokens, minor_units, release_slot
+                    "SELECT period, tokens, minor_units, release_slot, concludes
                        FROM quota_settled
                       WHERE tenant = $1 AND run_id = $2 AND epoch = $3",
                     &[&tenant, &run, &epoch],
@@ -280,7 +494,8 @@ impl QuotaStore for PostgresStore {
             let same = stored.get::<_, Option<String>>(0) == settlement.period
                 && stored.get::<_, i64>(1) == tokens
                 && stored.get::<_, i64>(2) == minor_units
-                && stored.get::<_, bool>(3) == settlement.release_slot;
+                && stored.get::<_, bool>(3) == settlement.release_slot
+                && stored.get::<_, bool>(4) == settlement.concludes;
             if !same {
                 return Err(StoreError::Corrupt {
                     seq: 0,
@@ -307,6 +522,27 @@ impl QuotaStore for PostgresStore {
                    minor_units = LEAST(9223372036854775807::numeric,
                                        quota_spent.minor_units::numeric + EXCLUDED.minor_units::numeric)::bigint",
                 &[&tenant, &period, &tokens, &minor_units],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        }
+        // The pass's spend leaves the run's hold as it enters the settled
+        // total, so the period counts it once; the concluding pass gives back
+        // what the run never spent.
+        if settlement.concludes {
+            tx.execute(
+                "DELETE FROM quota_reserved WHERE tenant = $1 AND run_id = $2",
+                &[&tenant, &run],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        } else {
+            tx.execute(
+                "UPDATE quota_reserved
+                    SET tokens = GREATEST(tokens - $3, 0),
+                        minor_units = GREATEST(minor_units - $4, 0)
+                  WHERE tenant = $1 AND run_id = $2",
+                &[&tenant, &run, &tokens, &minor_units],
             )
             .await
             .map_err(|e| be(&e))?;

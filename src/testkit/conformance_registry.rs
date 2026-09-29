@@ -16,7 +16,7 @@
 //!   attack, and making it look like one trains people to force;
 //! * **a pin is checked against recomputed content**, not against a stored
 //!   digest, or the check confirms only that the registry agrees with itself;
-//! * **an unsigned artifact may adopt its first attestation, and never change
+//! * **an unsigned artifact may adopt its first signature, and never change
 //!   publisher** — signing arriving later is ordinary, one identity being
 //!   silently replaced by another is not;
 //! * **verification recomputes the digest** from the manifest that came back,
@@ -221,7 +221,7 @@ async fn publisher(
     let published = manifest("conformance-a", "1.0.0", 1000);
     if let Err(e) = registry.publish_signed(&published, signer).await {
         report.record(
-            "an unsigned artifact adopts its first attestation",
+            "an unsigned artifact adopts its first signature",
             format!("signing an already-published identical artifact was refused: {e}"),
         );
     }

@@ -555,6 +555,28 @@ fn interpret(
         });
     }
 
+    // Completeness is an allowlist. `end_turn`, `stop_sequence` and
+    // `tool_use` are an answer; running out of room, out of context window,
+    // or a turn the provider paused mid-way is a typed truncation —
+    // `pause_turn` resumption is deliberately unsupported, since the paused
+    // content would have to be sent back verbatim. Any other reason, and no
+    // reason at all, ended without an answer: a denylist here would pass the
+    // next reason the provider adds as a whole one.
+    let truncated = match stop_reason.as_deref() {
+        Some("end_turn" | "stop_sequence" | "tool_use") => false,
+        Some("max_tokens" | "model_context_window_exceeded" | "pause_turn") => true,
+        other => {
+            return Err(ModelError::Unusable {
+                model: model.clone(),
+                usage,
+                detail: format!(
+                    "generation stopped: {}",
+                    other.unwrap_or("no stop_reason, so completeness is unknown")
+                ),
+            });
+        }
+    };
+
     // Emulated mode first, and the ordering matters: a forced tool call answers
     // with a `tool_use` block and **no text**, so an emptiness check ahead of
     // this would reject a call that worked perfectly.
@@ -612,16 +634,7 @@ fn interpret(
         text,
         model: served_model,
         usage,
-        // Every stop reason meaning "not a finished answer": out of room,
-        // out of context window, or a turn the provider paused mid-way.
-        // `pause_turn` resumption is deliberately unsupported — the paused
-        // content would have to be sent back verbatim, which is a
-        // continuation this driver only carries across tool turns — so the
-        // honest report is an unfinished answer, not a complete one.
-        truncated: matches!(
-            stop_reason.as_deref(),
-            Some("max_tokens" | "model_context_window_exceeded" | "pause_turn")
-        ),
+        truncated,
         stop_reason,
         continuation,
     })
@@ -651,6 +664,7 @@ impl Anthropic {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn body_with_max(
         &self,
         model: &ModelId,
@@ -749,6 +763,24 @@ impl Anthropic {
                     // and the model would either lose its tools or return prose
                     // where a schema was promised. Refused rather than merged,
                     // because merging means guessing which the caller wanted.
+                    // Extended thinking cannot be combined with a forced
+                    // `tool_choice`: the provider answers 400. Refused before
+                    // dispatch, so the declared effort is neither sent to be
+                    // rejected nor dropped to make the call go through.
+                    if let Some(effort) = reasoning_effort {
+                        return Err(ModelError::Refused {
+                            model: model.clone(),
+                            detail: format!(
+                                "model '{}' has no native structured output here, so a declared \
+                                 response schema is obtained by forcing a tool — and Anthropic \
+                                 does not allow thinking with a forced tool choice, so reasoning \
+                                 effort '{}' cannot be honoured. Use a model with native \
+                                 structured output, or drop the reasoning effort",
+                                model.model,
+                                effort.as_str()
+                            ),
+                        });
+                    }
                     if !tools.is_empty() {
                         return Err(ModelError::Refused {
                             model: model.clone(),
@@ -863,7 +895,9 @@ impl Anthropic {
                 Ok(chunk) => chunk,
                 // The case this file was written for: the connection died with
                 // an answer half-delivered.
-                Err(e) => return Err(severed(model, &acc, &e.to_string())),
+                Err(e) => {
+                    return Err(severed(model, &acc, &crate::netguard::transport_text(&e)));
+                }
             };
             // Charged before the chunk is kept: what the ceiling bounds is
             // what this process holds, not what it has already held. The
@@ -1024,7 +1058,6 @@ impl ModelProvider for Anthropic {
             "api_version": self.version,
             "schema_mode": schema_mode,
             "stream": self.stream,
-            "timeout_ms": self.timeout.as_millis(),
         })
     }
 

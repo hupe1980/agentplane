@@ -7,7 +7,7 @@
 //!
 //! The distinction is what the stand-in replaces.
 //! [`StubSigner`](crate::testkit::StubSigner) replaces a *control*: a build that
-//! can mint its own attestations proves nothing by producing one, so it must be
+//! can mint its own signatures proves nothing by producing one, so it must be
 //! impossible to link into a deployment. A model provider is not a control, it
 //! is the thing under governance — and the getting-started guide and every
 //! `examples/*.yaml` name `provider: fake`, which is what running a manifest
@@ -36,9 +36,8 @@
 //! one, so this one makes the refusals they all make: a provider-side media
 //! URL, an instruction hidden in the turn list, a continuation with no calls
 //! behind it, and a schema outside the subset constrained decoding accepts.
-//! The last is how this crate's own `planned` execution kind shipped a plan
-//! format the `OpenAI` driver refused outright — every test of it passed
-//! against a stand-in that would enforce any schema it was handed.
+//! The last is the one a stand-in most easily misses: a fake that enforces
+//! any schema it is handed passes a plan format every real driver refuses.
 //!
 //! It models **the strictest provider you might deploy against**, not any
 //! particular one. A per-driver profile would be a second copy of what the
@@ -87,9 +86,9 @@ pub struct Ask {
     /// What this turn was told about the tools the last turn asked for.
     ///
     /// Recorded because it is the only place a *refusal* reaches a model, and
-    /// without it no test can assert what the model was told — which is how a
-    /// loop handing back the precise policy message passed every test in the
-    /// suite. `PolicyError::for_model` existed, was tested, and had no callers.
+    /// without it no test can assert what the model was told, so a loop
+    /// handing back the precise policy message instead of
+    /// `PolicyError::for_model` would pass every test in the suite.
     pub exchanges: Vec<crate::model::ToolExchange>,
 }
 
@@ -372,6 +371,27 @@ fn echo(request: &Request<'_>) -> Completion {
         ),
         _ => (usage, false),
     };
+    // A tool loop's first turn asks for the first tool it was offered, with a
+    // value of that tool's argument schema; every later turn answers. An echo
+    // that never called a tool would let a tool-calling agent run end to end
+    // through a fake while its transport — an MCP server, a peer — was never
+    // reached, and the run would still succeed.
+    if let (Some(tool), []) = (request.tools.first(), request.exchanges) {
+        return Completion {
+            tool_calls: vec![crate::model::ToolCall {
+                id: "fake-call-1".to_owned(),
+                name: tool.name.clone(),
+                arguments: sample(&tool.parameters),
+            }],
+            text: String::new(),
+            model: None,
+            usage,
+            stop_reason: Some("tool_use".to_owned()),
+            truncated,
+            structured: None,
+            continuation: None,
+        };
+    }
     let stop_reason = Some(if truncated { "max_tokens" } else { "end_turn" }.to_owned());
     match request.schema {
         // A schema was asked for, so the answer must satisfy the *shape*
@@ -623,8 +643,8 @@ mod tests {
     /// complete and yield `Null` — while every real driver answers `Unusable`,
     /// because the answer is not JSON.
     ///
-    /// Both halves are asserted. The refusal, because that is the behaviour that
-    /// was missing; and the acceptance, because a fake that refused *every*
+    /// Both halves are asserted. The refusal, because that is the behaviour a
+    /// stand-in exists for; and the acceptance, because a fake that refused *every*
     /// schema-shaped answer would satisfy the first assertion while being just
     /// as wrong in the other direction.
     #[tokio::test]
@@ -840,12 +860,10 @@ mod tests {
     /// The refusal the real drivers make, made here — the whole reason a
     /// stand-in is worth having.
     ///
-    /// This is the check that was missing while `execution.kind: planned`
-    /// shipped a plan format the `OpenAI` driver refused outright: every test
-    /// of it ran against a fake that enforced any schema handed to it, so the
-    /// execution kind had never once been asked for from something that could
-    /// say no. The schema below is the shape that failed — an object a model
-    /// may add to — and the assertion is that offline is now enough to find it.
+    /// Without it, an execution kind tested only against this fake is never
+    /// asked for by something that could say no. The schema below — an
+    /// object a model may add to — is one the `OpenAI` driver refuses, and
+    /// the assertion is that offline is enough to find that.
     #[tokio::test]
     async fn a_schema_no_provider_could_enforce_is_refused_offline() {
         let open = json!({
