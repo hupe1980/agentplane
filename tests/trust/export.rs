@@ -664,10 +664,10 @@ async fn a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root() {
 
 /// **An edited record does not recompute to the hash it carries.**
 ///
-/// The chain is only evidence if somebody recomputes it. `verify` re-seals
-/// every record through the same function the store sealed with, so agreement
-/// is a statement about the bytes rather than about the file agreeing with
-/// itself.
+/// The chain is only evidence if somebody recomputes it. `verify` rehashes
+/// every record's wire bytes against the previous hash before it parses them,
+/// so agreement is a statement about the bytes rather than about the file
+/// agreeing with itself.
 #[tokio::test]
 async fn an_edited_record_fails_to_recompute() {
     let (store, run) = one_run().await;

@@ -8597,14 +8597,8 @@ pub struct Label {""",
         "verification trusts the hash a record carries instead of recomputing "
         "it, so an export edited after it was written verifies clean — the "
         "chain becomes a claim the file makes about itself",
-        """        raw_bytes.to_vec(),
-        pass.prev,
-        claimed,
-        signature,""",
-        """        raw_bytes.to_vec(),
-        pass.prev,
-        crate::core::Digest::chain(pass.prev, raw_bytes),
-        signature,""",
+        """    if crate::core::Digest::chain(pass.prev, raw_bytes) != claimed {""",
+        """    if claimed != claimed {""",
     ),
     "AnExportDropsAnUnreadableRun": (
         "src/export.rs",
