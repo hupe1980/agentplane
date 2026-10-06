@@ -2949,10 +2949,16 @@ fn every_recipe_ci_runs_is_in_the_local_gate() {
 #[test]
 fn every_command_ci_runs_itself_is_one_the_gate_runs() {
     /// Steps that legitimately have no local twin, with the reason.
-    const NOT_LOCAL: &[(&str, &str)] = &[(
-        "cargo check --all-features",
-        "the MSRV job, which pins a toolchain the local gate does not install",
-    )];
+    const NOT_LOCAL: &[(&str, &str)] = &[
+        (
+            "cargo check --all-features",
+            "the MSRV job, which pins a toolchain the local gate does not install",
+        ),
+        (
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+            "runner setup that lets Chrome's sandbox start, which checks nothing",
+        ),
+    ];
 
     // Whole commands, never substrings. `contains` would let the weaker
     // `zola check --skip-external-links` satisfy a CI step running `zola

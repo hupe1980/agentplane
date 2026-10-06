@@ -123,8 +123,15 @@ PROBE = """(() => {
 })()"""
 
 
-def main() -> int:
-    browser, url, run, profile, second = sys.argv[1:6]
+def launch(browser: str, profile: str, *flags: str) -> tuple[subprocess.Popen, str]:
+    """Start headless Chromium on `profile` and return it with its DevTools port.
+
+    The browser's stderr goes to `<profile>.log`, and a browser that exits or
+    opens no port is reported with its exit code and the end of that log: on
+    Linux a sandbox refused by the kernel exits at once and says so only there.
+    """
+    log_path = pathlib.Path(f"{profile}.log")
+    log = log_path.open("wb")
     chrome = subprocess.Popen(
         [
             browser,
@@ -134,19 +141,34 @@ def main() -> int:
             "--no-default-browser-check",
             f"--user-data-dir={profile}",
             "--remote-debugging-port=0",
+            *flags,
             "about:blank",
         ],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=log,
     )
+    log.close()
+    port_file = pathlib.Path(profile) / "DevToolsActivePort"
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    while not port_file.exists() or not port_file.read_text().strip():
+        status = chrome.poll()
+        if status is not None or time.monotonic() > deadline:
+            if status is None:
+                chrome.kill()
+                chrome.wait()
+            tail = log_path.read_text(errors="replace").strip().splitlines()[-15:]
+            said = "\n".join(f"    {line}" for line in tail) or "    (nothing)"
+            how = f"exited with {status}" if status is not None else f"opened no port in {TIMEOUT_SECONDS}s"
+            raise RuntimeError(f"the browser {how}; its stderr ends:\n{said}")
+        time.sleep(0.1)
+    return chrome, port_file.read_text().split()[0]
+
+
+def main() -> int:
+    browser, url, run, profile, second = sys.argv[1:6]
+    chrome, port = launch(browser, profile)
     try:
-        port_file = pathlib.Path(profile) / "DevToolsActivePort"
         deadline = time.monotonic() + TIMEOUT_SECONDS
-        while not port_file.exists() or not port_file.read_text().strip():
-            if time.monotonic() > deadline:
-                raise RuntimeError("the browser opened no DevTools port")
-            time.sleep(0.1)
-        port = port_file.read_text().split()[0]
         targets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list"))
         target = next(t for t in targets if t.get("type") == "page")
         page = Socket(target["webSocketDebuggerUrl"])

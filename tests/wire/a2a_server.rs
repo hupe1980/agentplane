@@ -2188,7 +2188,7 @@ async fn list_tasks_filters_context_and_uses_opaque_cursor_pages() {
     assert_eq!(page_one["result"]["totalSize"], 2);
     assert!(page_one["result"]["tasks"][0]["history"].is_array());
     let token = page_one["result"]["nextPageToken"].as_str().unwrap();
-    assert!(!token.is_empty());
+    assert_ne!(token, "");
 
     let mut next = list;
     next["pageToken"] = json!(token);

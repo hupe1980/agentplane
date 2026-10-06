@@ -1423,7 +1423,7 @@ async fn freshness_without_a_max_age_is_not_checked() {
         "{:?}",
         report.not_checked
     );
-    assert!(report.unwitnessed.is_empty());
+    assert_eq!(report.unwitnessed, []);
 
     let mut file = Vec::new();
     agentplane::export::to_jsonl(&journal, &crate::no_cases(), &[], &mut file)

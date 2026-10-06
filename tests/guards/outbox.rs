@@ -188,7 +188,7 @@ async fn a_receiver_that_was_down_catches_up_from_the_journal() {
     let failed = f.worker().run_once(10, 10).await.expect("a sweep");
     assert_eq!(failed.retries, 1);
     assert_eq!(failed.deliveries, 0);
-    assert!(f.transport.seen().is_empty());
+    assert_eq!(f.transport.seen(), []);
 
     // Backed off, so the same tick does nothing.
     assert_eq!(f.worker().run_once(10, 10).await.unwrap().registrations, 0);
@@ -865,7 +865,7 @@ async fn a_parked_registration_keeps_its_cursor_and_can_be_re_armed() {
 #[derive(Debug)]
 struct RefusesRegistration {
     inner: Arc<RedbStore>,
-    failures: std::sync::atomic::AtomicU32,
+    failures: std::sync::Mutex<u32>,
 }
 
 #[async_trait::async_trait]
@@ -875,12 +875,11 @@ impl PushStore for RefusesRegistration {
         config: &PushConfig,
         next_seq: agentplane::core::Seq,
     ) -> Result<(), agentplane::core::StoreError> {
-        use std::sync::atomic::Ordering;
-        if self
-            .failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        let failing = {
+            let mut left = self.failures.lock().unwrap();
+            left.checked_sub(1).map(|n| *left = n).is_some()
+        };
+        if failing {
             return Err(agentplane::core::StoreError::Backend(
                 "the push store is restarting".into(),
             ));
@@ -968,7 +967,7 @@ async fn a_resume_registers_the_destinations_its_admission_could_not() {
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let push = Arc::new(RefusesRegistration {
         inner: Arc::clone(&store),
-        failures: std::sync::atomic::AtomicU32::new(1),
+        failures: std::sync::Mutex::new(1),
     });
     let outbox = Arc::new(Outbox::new(
         push as Arc<dyn PushStore>,

@@ -2085,11 +2085,11 @@ async fn a_settled_run_releases_its_unspent_reservation() {
         "a run that finished having spent 100 of the 600 it reserved still holds \
          the rest, so the period fills with budget nobody will spend"
     );
-    assert!(
+    assert_eq!(
         QuotaStore::reservations(scoped.as_ref(), 10)
             .await
-            .expect("listing")
-            .is_empty()
+            .expect("listing"),
+        []
     );
 
     // Every resume settles the passes its history records again, and the
@@ -3049,5 +3049,5 @@ async fn a_lift_beaten_by_another_answers_not_removed() {
         .expect("a lift whose row is already gone is an answer")
         .expect("a halt was standing when it read");
     assert!(!lifted.removed, "another lift removed the row first");
-    assert!(rt.halts().await.expect("halts").is_empty());
+    assert_eq!(rt.halts().await.expect("halts"), []);
 }

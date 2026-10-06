@@ -41,7 +41,7 @@ fn tenant() -> TenantId {
 struct Payments {
     calls: AtomicUsize,
     lookups: AtomicUsize,
-    fail_first: AtomicUsize,
+    fail_first: std::sync::Mutex<usize>,
 }
 
 #[async_trait::async_trait]
@@ -57,11 +57,9 @@ impl ToolClient for Payments {
             return Ok(json!({ "found": true }));
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
-        if self
-            .fail_first
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        let mut left = self.fail_first.lock().unwrap();
+        if let Some(n) = left.checked_sub(1) {
+            *left = n;
             return Err(ToolError::Unreachable {
                 tool: tool.clone(),
                 detail: "injected".to_owned(),
@@ -779,7 +777,7 @@ spec:
 async fn a_retried_dispatch_reserves_once() {
     let store = scoped();
     let payments = Arc::new(Payments::default());
-    payments.fail_first.store(1, Ordering::SeqCst);
+    *payments.fail_first.lock().unwrap() = 1;
     let rt = plane(
         store.clone(),
         store.clone(),

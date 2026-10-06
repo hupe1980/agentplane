@@ -522,7 +522,7 @@ async fn a_foreign_origin_is_refused_before_authentication() {
         StatusCode::UNAUTHORIZED,
         "a request with no Origin did not reach authentication"
     );
-    assert!(runs(&plane).await.is_empty());
+    assert_eq!(runs(&plane).await, []);
 }
 
 /// Records every call it receives.

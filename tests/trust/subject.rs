@@ -490,7 +490,7 @@ async fn a_sink_is_named_by_kind_and_why_when_its_arguments_are_not_opened() {
     ));
     assert!(met(&blind, Class::UnopenedSink));
     assert!(met(&blind, Class::UnopenedRecall));
-    assert!(blind.recalls.is_empty());
+    assert_eq!(blind.recalls, []);
 
     let keyed = Trace::new(tenant.as_str())
         .with_keys(ring.as_ref())
@@ -526,7 +526,7 @@ async fn a_sink_is_named_by_kind_and_why_when_its_arguments_are_not_opened() {
         "an erased sink read as {:?}",
         erased.effects[0].sink
     );
-    assert!(erased.recalls.is_empty());
+    assert_eq!(erased.recalls, []);
 }
 
 // ── Data a run took in, through the real runtime ────────────────────────────
@@ -670,10 +670,10 @@ mod intake {
 
         let for_a = report(&store, "cust-17").await;
         assert_eq!(traced_runs(&for_a), vec![a.run_id], "{:#?}", for_a.effects);
-        assert!(for_a.items.is_empty());
+        assert_eq!(for_a.items, []);
         let for_b = report(&store, "cust-18").await;
         assert_eq!(traced_runs(&for_b), vec![b.run_id], "{:#?}", for_b.effects);
-        assert!(report(&store, "cust-19").await.effects.is_empty());
+        assert_eq!(report(&store, "cust-19").await.effects, []);
     }
 
     /// **The bound runs and their cases are listed**: the units a journal

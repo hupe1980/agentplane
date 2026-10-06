@@ -2896,7 +2896,7 @@ impl Runtime {
     /// lease is renewed without a fencing bump only when the holder is the same
     /// owner — so two instances sharing this string would each renew the other's
     /// lease and both write to one run. See
-    /// [`RuntimeBuilder::owner`](RuntimeBuilder::owner).
+    /// [`RuntimeBuilder::owner`].
     ///
     /// Public because "which instance holds this run" is a question an operator
     /// asks of a stuck system, and the answer is otherwise only in a store row.

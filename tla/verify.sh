@@ -75,7 +75,9 @@ fi
 run_tlc() {
     local dir="$1" cfg="$2" spec="$3"
     if (( USE_DOCKER )); then
-        docker run --rm \
+        # As the caller, so the `states/` and trace files TLC leaves in the
+        # mounted directory are the caller's to delete.
+        docker run --rm --user "$(id -u):$(id -g)" \
             -v "${dir}:/spec" -v "${CACHE_DIR}:/cache" -w /spec "$IMAGE" \
             java -XX:+UseParallelGC -cp /cache/tla2tools.jar tlc2.TLC \
                  -nowarning -config "$cfg" "$spec" 2>&1
@@ -90,7 +92,7 @@ prepare() {
     if [[ ! -f "${CACHE_DIR}/tla2tools.jar" ]]; then
         printf '%sfetching tla2tools.jar%s\n' "$DIM" "$OFF"
         if (( USE_DOCKER )); then
-            docker run --rm -v "${CACHE_DIR}:/cache" "$IMAGE" \
+            docker run --rm --user "$(id -u):$(id -g)" -v "${CACHE_DIR}:/cache" "$IMAGE" \
                 curl -sSLo /cache/tla2tools.jar "$TLA_URL"
         else
             curl -sSLo "${CACHE_DIR}/tla2tools.jar" "$TLA_URL"

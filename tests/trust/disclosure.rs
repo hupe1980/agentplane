@@ -641,13 +641,13 @@ async fn a_disclosure_is_recorded_with_the_digest_of_what_left() {
         .expect("list");
     assert_eq!(by_case, vec![act.clone()]);
     assert_eq!(by_run, vec![act]);
-    assert!(
+    assert_eq!(
         plane
             .register
             .disclosures(&[plane.b], &[plane.loose])
             .await
-            .expect("list")
-            .is_empty()
+            .expect("list"),
+        []
     );
 }
 

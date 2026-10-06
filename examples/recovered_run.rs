@@ -146,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 2. The store names the dead ────────────────────────────────────────
     // Immediately after the crash the lease still looks held — a dead owner is
     // indistinguishable from a slow one until the TTL bounds the doubt.
-    assert!(store.abandoned_runs(10).await?.is_empty());
+    assert_eq!(store.abandoned_runs(10).await?, []);
     println!("\n2. for one lease TTL, the dead look exactly like the busy…");
     tokio::time::sleep(Duration::from_millis(3200)).await;
 

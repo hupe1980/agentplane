@@ -446,12 +446,12 @@ async fn postgres_cryptographic_subject_erasure_completes() {
             .reached,
         3
     );
-    assert!(
+    assert_eq!(
         encrypted
             .recall(&Recall::about("person-7"))
             .await
-            .expect("recall after erasure")
-            .is_empty()
+            .expect("recall after erasure"),
+        []
     );
 }
 

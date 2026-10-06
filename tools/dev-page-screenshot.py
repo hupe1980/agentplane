@@ -14,7 +14,6 @@ import base64
 import importlib.util
 import json
 import pathlib
-import subprocess
 import sys
 import time
 import urllib.request
@@ -34,29 +33,9 @@ VIEWS = {
 def main() -> int:
     browser, url, profile, out = sys.argv[1:5]
     out_dir = pathlib.Path(out)
-    chrome = subprocess.Popen(
-        [
-            browser,
-            "--headless=new",
-            "--disable-gpu",
-            "--hide-scrollbars",
-            "--no-first-run",
-            "--no-default-browser-check",
-            f"--user-data-dir={profile}",
-            "--remote-debugging-port=0",
-            "about:blank",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    chrome, port = smoke.launch(browser, profile, "--hide-scrollbars")
     try:
-        port_file = pathlib.Path(profile) / "DevToolsActivePort"
         deadline = time.monotonic() + smoke.TIMEOUT_SECONDS
-        while not port_file.exists() or not port_file.read_text().strip():
-            if time.monotonic() > deadline:
-                raise RuntimeError("the browser opened no DevTools port")
-            time.sleep(0.1)
-        port = port_file.read_text().split()[0]
         targets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list"))
         page = smoke.Socket(next(t for t in targets if t.get("type") == "page")["webSocketDebuggerUrl"])
         page.send("Page.enable")

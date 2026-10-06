@@ -2788,7 +2788,7 @@ async fn a_resumed_atomic_member_consumes_its_recorded_denial() {
         "the premise of this test is a recorded denial: {:?}",
         out.status
     );
-    assert!(store.applied().is_empty());
+    assert_eq!(store.applied(), []);
     let before = world.entries();
 
     // The gate relents; the bundle identity resume admission checks does not.

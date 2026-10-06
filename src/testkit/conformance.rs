@@ -443,12 +443,9 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
             .expect("subject erasure"),
         1
     );
-    assert!(
-        store
-            .recall(&Recall::about("team-a"))
-            .await
-            .expect("empty")
-            .is_empty()
+    assert_eq!(
+        store.recall(&Recall::about("team-a")).await.expect("empty"),
+        []
     );
 
     let mut expiring = make(
@@ -923,12 +920,12 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
         vec!["order-new", "order-old", "order-trusted"],
         "subject_ids must name every current id of the subject"
     );
-    assert!(
+    assert_eq!(
         store
             .subject_ids("team-nobody")
             .await
-            .expect("empty subject")
-            .is_empty()
+            .expect("empty subject"),
+        Vec::<String>::new()
     );
 }
 

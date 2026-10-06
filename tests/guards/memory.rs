@@ -1716,12 +1716,12 @@ async fn forgetting_a_subject_removes_everything_about_it() {
         .expect("remember");
 
     assert_eq!(store.forget_subject("acct-7").await.expect("forget"), 2);
-    assert!(
+    assert_eq!(
         store
             .recall(&Recall::about("acct-7"))
             .await
-            .expect("recall")
-            .is_empty()
+            .expect("recall"),
+        []
     );
     assert_eq!(
         store

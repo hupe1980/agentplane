@@ -731,7 +731,7 @@ mod tests {
         let without = CloudEvent::new("1", "urn:a", "t")
             .expect("event")
             .into_inbound("peer:bus");
-        assert!(without.correlation.is_empty());
+        assert_eq!(without.correlation, []);
     }
     use serde_json::json;
 

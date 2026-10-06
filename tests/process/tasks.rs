@@ -3816,7 +3816,7 @@ async fn a_cancelled_runs_open_task_is_withdrawn() {
         TaskState::Withdrawn,
         "a cancelled run's task is still offered for a decision no answer can reach"
     );
-    assert!(f.store.queue(&officer(), 10).await.unwrap().is_empty());
+    assert_eq!(f.store.queue(&officer(), 10).await.unwrap(), []);
 }
 
 /// **An expiry that meets an answer already given settles the task once.**

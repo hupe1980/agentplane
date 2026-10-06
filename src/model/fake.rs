@@ -51,7 +51,7 @@
 //! A **tool's** schema is deliberately not refused, because no driver refuses
 //! one: they drop to unconstrained generation instead, which is a guarantee
 //! quietly lost rather than a call that fails. The stand-in loses it the same
-//! way. [`strict_schema_problem`](crate::model::strict_schema_problem) over
+//! way. [`strict_schema_problem`] over
 //! [`Ask::tools`](crate::model::fake::Ask::tools) is how a test asks whether
 //! its tools actually bind.
 //!

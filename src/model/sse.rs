@@ -364,7 +364,7 @@ mod tests {
     /// A comment alone must not dispatch an empty event.
     #[test]
     fn a_comment_alone_dispatches_nothing() {
-        assert!(all(&[": ping\n\n"]).is_empty());
+        assert_eq!(all(&[": ping\n\n"]), []);
     }
 
     #[test]
@@ -414,7 +414,7 @@ mod tests {
     /// interrupted call anyway.
     #[test]
     fn a_stream_ending_on_a_bare_cr_holds_it_back() {
-        assert!(all(&["data: b\r"]).is_empty());
+        assert_eq!(all(&["data: b\r"]), []);
     }
 
     /// A `\r` at a chunk boundary might be the front half of `\r\n`.
@@ -451,7 +451,7 @@ mod tests {
     /// An unterminated tail is not an event. It is half a line.
     #[test]
     fn an_incomplete_trailing_line_is_not_dispatched() {
-        assert!(all(&["event: message_start\ndata: {\"a\""]).is_empty());
+        assert_eq!(all(&["event: message_start\ndata: {\"a\""]), []);
     }
 
     #[test]

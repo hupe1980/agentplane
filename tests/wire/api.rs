@@ -4489,7 +4489,7 @@ async fn a_lift_by_an_unusable_caller_is_refused_and_lifts_nothing() {
     let (_, holds) = send(&router, get("/holds", Some("bob"))).await;
     assert_eq!(holds["holds"].as_array().map(Vec::len), Some(1), "{holds}");
     for outcome in ["halt-lifted", "hold-released"] {
-        assert!(store.runs_by_outcome(outcome, 10).await.unwrap().is_empty());
+        assert_eq!(store.runs_by_outcome(outcome, 10).await.unwrap(), []);
     }
 }
 

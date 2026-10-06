@@ -8544,8 +8544,8 @@ spec:
                 );
             });
         drop(plane);
-        assert!(lift_records(store, "halt-lifted").is_empty());
-        assert!(lift_records(store, "hold-released").is_empty());
+        assert_eq!(lift_records(store, "halt-lifted"), []);
+        assert_eq!(lift_records(store, "hold-released"), []);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9500,7 +9500,7 @@ spec:
                         .iter()
                         .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
                         .collect();
-                assert!(!printed.is_empty());
+                assert_ne!(printed, Vec::<serde_json::Value>::new());
                 assert_eq!(printed, served);
             });
     }

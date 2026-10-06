@@ -338,7 +338,7 @@ fn the_ready_set_is_deterministically_ordered() {
     assert_eq!(plan.ready(&done), vec![StepId(2)]);
 
     done.insert(StepId(2));
-    assert!(plan.ready(&done).is_empty());
+    assert_eq!(plan.ready(&done), []);
     assert!(plan.is_complete(&done));
 }
 

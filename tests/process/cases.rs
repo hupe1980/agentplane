@@ -562,7 +562,7 @@ async fn the_sweep_surfaces_due_and_approaching_obligations() {
         .set_deadline_state(case, "overdue", DeadlineState::Met)
         .await
         .unwrap();
-    assert!(store.due(now, 100).await.unwrap().is_empty());
+    assert_eq!(store.due(now, 100).await.unwrap(), []);
 }
 
 /// A run admitted with correlation keys against a runtime with no case store is

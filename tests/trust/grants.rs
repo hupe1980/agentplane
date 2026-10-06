@@ -321,7 +321,7 @@ async fn a_refused_call_is_not_reported_unused() {
         Mark::UnusedRefusalsNotAttributable
     );
     let proposal = report.digests[i].proposal.as_ref().unwrap();
-    assert!(proposal.removed.is_empty());
+    assert_eq!(proposal.removed, Vec::<String>::new());
     assert!(!report.has_unused());
 }
 
@@ -424,7 +424,7 @@ async fn every_args_dependent_figure_is_not_derivable_when_sealed() {
         Some(400),
         "bytes are clear on a sealed plane"
     );
-    assert!(row.proposal.as_ref().unwrap().removed.is_empty());
+    assert_eq!(row.proposal.as_ref().unwrap().removed, Vec::<String>::new());
     assert!(blind.to_string().contains("unused is not established"));
 
     let keyed = Grants::new(std::slice::from_ref(&a))

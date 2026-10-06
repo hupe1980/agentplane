@@ -257,7 +257,7 @@ pub struct Budget {
     ///
     /// Costs one journaled clock read per step boundary when set — see the
     /// module docs. Checked against
-    /// [`Consumed::elapsed_secs`](Consumed::elapsed_secs), which counts second
+    /// [`Consumed::elapsed_secs`], which counts second
     /// boundaries rather than measuring a duration and starts at zero, so a zero
     /// ceiling refuses the first step.
     #[serde(default, skip_serializing_if = "Option::is_none")]

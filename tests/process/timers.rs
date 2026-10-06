@@ -511,7 +511,7 @@ async fn an_abandoned_claim_is_reclaimed_rather_than_stranding_the_run() {
     assert_eq!(store.claim_due(at, 10).await.unwrap().len(), 1);
 
     // Immediately after, the claim still holds — no double-fire.
-    assert!(store.claim_due(at, 10).await.unwrap().is_empty());
+    assert_eq!(store.claim_due(at, 10).await.unwrap(), []);
 
     // Once the lease lapses, another sweep picks it up.
     let later = Timestamp::from_unix_timestamp(2_000 + 120).unwrap();

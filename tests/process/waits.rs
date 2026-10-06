@@ -137,7 +137,7 @@ async fn a_run_suspends_on_a_wait_and_resumes_on_delivery() {
     );
 
     // The subscription is consumed.
-    assert!(f.store.waiting(10).await.unwrap().is_empty());
+    assert_eq!(f.store.waiting(10).await.unwrap(), []);
 
     // The run reached its conclusion, and the obligation is satisfied.
     let records = f.store.read(out.run_id, 1).await.unwrap();
@@ -190,7 +190,7 @@ async fn an_event_arriving_before_the_wait_is_not_lost() {
         Some(json!({ "status": "early" })),
         "the run must receive the event that arrived early"
     );
-    assert!(f.store.waiting(10).await.unwrap().is_empty());
+    assert_eq!(f.store.waiting(10).await.unwrap(), []);
 }
 
 /// Retries are harmless: the same event id is delivered once.
@@ -489,7 +489,7 @@ async fn the_sweep_leaves_claimed_events_alone() {
 
     let retired = f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap();
     assert_eq!(retired, 0, "a consumed event is not garbage");
-    assert!(f.store.dead_letters(10).await.unwrap().is_empty());
+    assert_eq!(f.store.dead_letters(10).await.unwrap(), []);
 }
 
 // ── Journal integrity across suspension ─────────────────────────────────────

@@ -3196,7 +3196,7 @@ async fn an_erased_binding_names_nobody_and_leaves_no_subject_in_the_clear() {
         .report(&plain, store.as_ref(), SUBJECT, 100)
         .await
         .expect("report");
-    assert!(blind.effects.is_empty());
+    assert_eq!(blind.effects, []);
     assert!(met(&blind, Class::UnopenedBinding));
 
     keys.destroy(
@@ -3211,6 +3211,6 @@ async fn an_erased_binding_names_nobody_and_leaves_no_subject_in_the_clear() {
         .await
         .expect("report");
     assert!(after.effects.is_empty(), "{:#?}", after.effects);
-    assert!(after.bound.is_empty());
+    assert_eq!(after.bound, []);
     assert!(met(&after, Class::ErasedBinding), "{:#?}", after.coverage);
 }

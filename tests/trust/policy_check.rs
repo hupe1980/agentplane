@@ -538,7 +538,7 @@ async fn a_candidate_diff_is_against_the_recorded_outcome() {
             .collect::<Vec<_>>(),
         vec!["ledger.transfer"]
     );
-    assert!(diff.malformed_under_candidate.is_empty());
+    assert_eq!(diff.malformed_under_candidate, []);
     assert_eq!(report.candidate, Some(candidate.digest()));
     assert_eq!(report.verdict(), Verdict::Findings);
 
@@ -951,7 +951,7 @@ async fn a_sealed_and_an_erased_run_are_not_evaluable_for_their_own_reasons() {
         .await
         .unwrap();
     assert_eq!(keyed.runs[0].evaluated, 2, "{:?}", keyed.runs[0]);
-    assert!(reasons(&keyed, 0).is_empty());
+    assert_eq!(reasons(&keyed, 0), []);
     assert_eq!(
         reasons(&keyed, 1),
         vec![Unevaluable::Erased; 2],

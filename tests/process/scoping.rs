@@ -130,12 +130,12 @@ async fn a_correlation_binding_files_each_party_under_its_own_subject() {
 
     // The other customer's scope is empty, which is the property that makes an
     // erasure request answerable.
-    assert!(
+    assert_eq!(
         p.store
             .recall(&Recall::about("DE-2222"))
             .await
-            .expect("recall")
-            .is_empty()
+            .expect("recall"),
+        []
     );
     // And the binding text itself was never used as a key.
     assert!(
@@ -571,12 +571,12 @@ async fn a_quiet_answer_opens_no_task() {
         .await
         .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
-    assert!(
+    assert_eq!(
         p.store
             .queue(&["grid-operations".to_owned()], 10)
             .await
-            .expect("queue")
-            .is_empty()
+            .expect("queue"),
+        []
     );
 }
 

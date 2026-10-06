@@ -230,7 +230,7 @@ pub trait BlobStore: Send + Sync + Debug {
     ///
     /// **An expired address stays expired.** A store MUST refuse a write to an
     /// address it holds a tombstone for, with
-    /// [`BlobError::Expired`](BlobError::Expired). Content addressing makes
+    /// [`BlobError::Expired`]. Content addressing makes
     /// this the one rule that is not obvious: the address *is* the bytes, so a
     /// later write of the same bytes lands on the erased object and puts the
     /// data back — silently, under a tombstone that still says when and why it

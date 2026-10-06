@@ -841,12 +841,12 @@ mod shared {
                 .expect("a clean sweep")
                 .contains(&stranded)
         );
-        assert!(
+        assert_eq!(
             store
                 .runs_by_outcome("failed", 10)
                 .await
-                .expect("a clean listing")
-                .is_empty()
+                .expect("a clean listing"),
+            []
         );
 
         store

@@ -212,7 +212,7 @@ async fn a_lifted_halt_names_who_lifted_it() {
         nothing.is_none(),
         "nothing was standing, so nothing is recorded"
     );
-    assert!(sole_records(&runtime, "halt-lifted").await.is_empty());
+    assert_eq!(sole_records(&runtime, "halt-lifted").await, []);
 
     runtime
         .set_halt(
@@ -389,7 +389,7 @@ async fn a_released_hold_names_who_released_it() {
 struct RefusesAppends {
     inner: Arc<dyn JournalStore>,
     refuse: bool,
-    seals_to_fail: std::sync::atomic::AtomicUsize,
+    seals_to_fail: std::sync::Mutex<usize>,
 }
 
 #[async_trait::async_trait]
@@ -500,12 +500,11 @@ impl JournalStore for RefusesAppends {
         self.inner.waiting_runs(limit).await
     }
     async fn seal(&self, run: RunId, epoch: Epoch, outcome: &str) -> Result<Digest, StoreError> {
-        use std::sync::atomic::Ordering;
-        if self
-            .seals_to_fail
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        let failing = {
+            let mut left = self.seals_to_fail.lock().unwrap();
+            left.checked_sub(1).map(|n| *left = n).is_some()
+        };
+        if failing {
             return Err(StoreError::Backend(
                 "the process died before the seal".to_owned(),
             ));
@@ -555,7 +554,7 @@ async fn a_lift_whose_record_cannot_be_written_leaves_the_halt_standing() {
     let refusing = Arc::new(RefusesAppends {
         inner: Arc::clone(&store) as Arc<dyn JournalStore>,
         refuse: true,
-        seals_to_fail: std::sync::atomic::AtomicUsize::new(0),
+        seals_to_fail: std::sync::Mutex::new(0),
     });
     let runtime = Runtime::builder(refusing as Arc<dyn JournalStore>)
         .quota(
@@ -632,7 +631,7 @@ async fn a_lift_concluded_but_not_sealed_is_sealed_by_the_next_sweep() {
     let journal = Arc::new(RefusesAppends {
         inner: Arc::clone(&store) as Arc<dyn JournalStore>,
         refuse: false,
-        seals_to_fail: std::sync::atomic::AtomicUsize::new(1),
+        seals_to_fail: std::sync::Mutex::new(1),
     });
     let runtime = Runtime::builder(Arc::clone(&journal) as Arc<dyn JournalStore>)
         .quota(

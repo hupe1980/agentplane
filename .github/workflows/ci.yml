@@ -167,6 +167,9 @@ jobs:
       - uses: extractions/setup-just@v2
       - uses: browser-actions/setup-chrome@v1
         id: chrome
+      # Ubuntu 24.04 denies unprivileged user namespaces to unconfined
+      # binaries, and Chrome's sandbox needs one: without this it exits at once.
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: just dev-page-smoke
         env:
           CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}

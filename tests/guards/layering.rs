@@ -3435,6 +3435,19 @@ fn the_example_bundle_names_every_action_the_crate_asks_about() {
     }
 
     let bundle = read("examples/serve-policy.cedar");
+    // The block that claims to be the complete vocabulary: the comment lines
+    // from its heading to the first line that is not a comment. A rule naming
+    // an action elsewhere in the file does not make the claim true.
+    let vocabulary: String = bundle
+        .lines()
+        .skip_while(|l| !l.starts_with("// The complete vocabulary"))
+        .take_while(|l| l.starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_ne!(
+        vocabulary, "",
+        "examples/serve-policy.cedar has no `// The complete vocabulary` block"
+    );
     let mut expected = canonical(&read("src/api/mod.rs"), "api:");
     assert!(
         expected.len() > 20,
@@ -3452,11 +3465,10 @@ fn the_example_bundle_names_every_action_the_crate_asks_about() {
 
     for action in &expected {
         assert!(
-            bundle.contains(action.as_str()),
-            "`{action}` is asked by this crate and is named nowhere in \
-             examples/serve-policy.cedar — a bundle copied from that file denies \
-             it at the point of use, and the file's own comment claims to list \
-             the complete vocabulary"
+            vocabulary.contains(action.as_str()),
+            "`{action}` is asked by this crate and is missing from the complete \
+             vocabulary in examples/serve-policy.cedar — a bundle written from \
+             that list denies it at the point of use"
         );
     }
 
