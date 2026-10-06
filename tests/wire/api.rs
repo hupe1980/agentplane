@@ -17,6 +17,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use agentplane::api::openapi::{Body as Shape, ErrorClass, ROUTES, Route};
 use agentplane::api::{Api, ApiSetupError, AuthError, Authenticator, Caller, action};
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{
@@ -225,14 +226,113 @@ impl Fixture {
 
 // ── Request helpers ─────────────────────────────────────────────────────────
 
+/// Send a request, and hold its answer to the published document.
+///
+/// Every answer any test here receives is validated against the schema the
+/// `OpenAPI` document gives for its operation and status, so a member the
+/// schema lacks, a status the operation does not list, or a refusal that is
+/// not the documented error object fails whichever test provoked it.
 async fn send(router: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
+    let method = req.method().as_str().to_owned();
+    let path = req.uri().path().to_owned();
     let res = router.clone().oneshot(req).await.unwrap();
     let status = res.status();
     let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024)
         .await
         .unwrap();
+    if let Err(why) = conforms(&method, &path, status, &bytes) {
+        panic!("{method} {path} answered {status} off the document: {why}");
+    }
     let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, body)
+}
+
+// ── The published document ──────────────────────────────────────────────────
+
+fn document() -> &'static Value {
+    static DOCUMENT: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    DOCUMENT.get_or_init(agentplane::api::openapi::document)
+}
+
+/// The operation a request path is served by: the most specific template that
+/// matches, so `/runs/live` is not read as `/runs/{run}`.
+fn operation_for(method: &str, path: &str) -> Option<&'static Route> {
+    let matches = |template: &str| {
+        let (t, p): (Vec<&str>, Vec<&str>) =
+            (template.split('/').collect(), path.split('/').collect());
+        t.len() == p.len()
+            && t.iter()
+                .zip(&p)
+                .all(|(t, p)| t == p || (t.starts_with('{') && !p.is_empty()))
+    };
+    ROUTES
+        .iter()
+        .filter(|r| r.method.as_str().eq_ignore_ascii_case(method) && matches(r.path))
+        .min_by_key(|r| r.path.matches('{').count())
+}
+
+/// Whether an answer is the one the document describes.
+fn conforms(method: &str, path: &str, status: StatusCode, bytes: &[u8]) -> Result<(), String> {
+    let Some(route) = operation_for(method, path) else {
+        // Only the tests that probe a route the surface does not serve.
+        return if matches!(
+            status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            Ok(())
+        } else {
+            Err("no documented operation serves this request".to_owned())
+        };
+    };
+    let answer =
+        &document()["paths"][route.path][route.method.as_str()]["responses"][status.as_str()];
+    if answer.is_null() {
+        return Err(format!("{} does not list {status}", route.operation));
+    }
+    let Some(schema) = answer.pointer("/content/application~1json/schema") else {
+        return if bytes.is_empty() {
+            Ok(())
+        } else {
+            Err("the document gives this answer no body".to_owned())
+        };
+    };
+    let body: Value = serde_json::from_slice(bytes).map_err(|e| {
+        format!(
+            "the body is not JSON ({e}): {}",
+            String::from_utf8_lossy(bytes)
+        )
+    })?;
+    let validator = validator(schema);
+    let errors: Vec<String> = validator
+        .iter_errors(&body)
+        .map(|e| e.to_string())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{errors:?} in {body}"))
+    }
+}
+
+/// A validator for one schema of the document, its references resolved
+/// against the document's components.
+fn validator(schema: &Value) -> Arc<jsonschema::Validator> {
+    static CACHE: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, Arc<jsonschema::Validator>>>,
+    > = std::sync::OnceLock::new();
+    let key = schema.to_string();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(found) = cache.lock().unwrap().get(&key) {
+        return Arc::clone(found);
+    }
+    let root = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "components": document()["components"],
+        "allOf": [schema],
+    });
+    let built = Arc::new(jsonschema::validator_for(&root).expect("a documented schema compiles"));
+    cache.lock().unwrap().insert(key, Arc::clone(&built));
+    built
 }
 
 fn get(path: &str, actor: Option<&str>) -> Request<Body> {
@@ -270,7 +370,7 @@ async fn a_body_that_names_an_actor_is_refused_rather_than_ignored() {
     let task = f.pending_task().await;
     let router = f.router();
 
-    let (status, _) = send(
+    let (status, body) = send(
         &router,
         post(
             &format!("/tasks/{task}/decide"),
@@ -285,6 +385,10 @@ async fn a_body_that_names_an_actor_is_refused_rather_than_ignored() {
         StatusCode::UNPROCESSABLE_ENTITY,
         "a body carrying an actor was accepted; silently ignoring it is how an \
          integrator ends up believing they can impersonate"
+    );
+    assert!(
+        body["error"].as_str().is_some_and(|e| e.contains("actor")),
+        "the refusal does not say which member it refused: {body}"
     );
 
     // And nothing was decided.
@@ -783,40 +887,28 @@ async fn only_the_holder_can_release_a_claim() {
 
 // ── Both gates, on every route ──────────────────────────────────────────────
 
-/// The webhook routes, when this build serves them.
-///
-/// Empty without the feature, so the walks below extend **unconditionally**. A
-/// `#[cfg]` on the `extend` instead leaves the vector's `mut` unused in the
-/// build that omits it, and `-D warnings` then fails the one job that compiles
-/// exactly that combination — `just test-http`, which is a separate CI job and
-/// not part of `just ci`.
+/// The webhook routes. Every build serves them: one without the `push`
+/// feature gates them like any other and then answers 501.
 fn push_routes(actor: Option<&str>) -> Vec<Request<Body>> {
-    #[cfg(feature = "push")]
-    {
-        vec![
-            get("/push", actor),
-            post(
-                "/push/rearm",
-                actor,
-                &json!({ "run": "not-an-id", "id": "d" }),
-            ),
-        ]
-    }
-    #[cfg(not(feature = "push"))]
-    {
-        let _ = actor;
-        Vec::new()
-    }
+    vec![
+        get("/push", actor),
+        post(
+            "/push/rearm",
+            actor,
+            &json!({ "run": "not-an-id", "id": "d" }),
+        ),
+    ]
 }
 
 /// The preservation-register routes.
 ///
-/// Extracted for the reason `push_routes` is: the walks below are a list of
+/// Extracted so the walks below are a list of
 /// claims, and three more inline request literals in each of them pushes the
 /// test past the point where the claim is what a reader sees.
 fn hold_routes(actor: Option<&str>) -> Vec<Request<Body>> {
     vec![
         get("/holds", actor),
+        get("/holds?state=released", actor),
         post(
             "/holds",
             actor,
@@ -834,6 +926,7 @@ fn hold_routes(actor: Option<&str>) -> Vec<Request<Body>> {
 fn halt_routes(actor: Option<&str>) -> Vec<Request<Body>> {
     vec![
         get("/halts", actor),
+        get("/halts?state=lifted", actor),
         post(
             "/halts",
             actor,
@@ -1068,7 +1161,7 @@ fn the_surface_refuses_to_build_without_a_policy_engine() {
     );
 }
 
-/// Every route in the module is exercised by a test in this file.
+/// Every documented operation is exercised by a test in this file.
 ///
 /// The gate tests above are only as good as the list of routes they walk. A
 /// route added next year would be authenticated and authorized by construction —
@@ -1076,27 +1169,383 @@ fn the_surface_refuses_to_build_without_a_policy_engine() {
 /// "nothing proves it" is how the first ungated route gets written.
 #[test]
 fn every_route_is_walked_by_the_gate_tests() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/mod.rs"))
-        .expect("the api module");
     let here = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/wire/api.rs"))
         .expect("this file");
 
-    let mut found = 0;
-    for decl in src.split(".route(\"").skip(1) {
-        let path = decl.split('"').next().unwrap_or_default();
-        found += 1;
-        // `/tasks/{task}` in the source is `/tasks/not-an-id` in a request, so
+    for route in ROUTES {
+        // `/tasks/{task}` in the table is `/tasks/not-an-id` in a request, so
         // the comparison is on the fixed prefix rather than the whole path.
-        let prefix: String = path.split('{').next().unwrap_or_default().to_owned();
+        let prefix: String = route.path.split('{').next().unwrap_or_default().to_owned();
         assert!(
             here.contains(&format!("\"{prefix}")) || here.contains(&format!("(\"{prefix}")),
-            "route {path} is declared but no test in tests/wire/api.rs walks it"
+            "route {} is documented but no test in tests/wire/api.rs walks it",
+            route.path
         );
     }
     assert!(
-        found >= 9,
-        "found only {found} routes — this check read the wrong thing"
+        ROUTES.len() >= 9,
+        "found only {} routes — this check read the wrong thing",
+        ROUTES.len()
     );
+}
+
+// ── The document and the router are one table ───────────────────────────────
+
+/// A body each operation that takes one accepts, so a walk reaches the gate.
+///
+/// An operation with a body and no example here fails the walks that need
+/// one, so a route added to the table is added here too.
+fn example_body(operation: &str) -> Value {
+    let case = "case_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    match operation {
+        "cancel_run" => json!({ "reason": "stop" }),
+        "reopen_run" | "abandon_run" => json!({ "reason": "checked the provider" }),
+        "reconcile_effect" => json!({
+            "effect": "0".repeat(64),
+            "disposition": "did_not_happen",
+            "note": "the provider has no record",
+        }),
+        "take_over_task" => json!({ "from": "alice" }),
+        "decide_task" => json!({ "approved": true, "reason": "" }),
+        "acknowledge_obligation" => json!({ "case": case, "obligation": "ack" }),
+        "place_hold" => json!({ "case": case, "reason": "order" }),
+        "release_hold" => json!({ "case": case }),
+        "place_halt" => json!({ "scope": "tenant", "reason": "incident 42" }),
+        "lift_halt" => json!({ "scope": "tenant" }),
+        "deliver_event" => json!({ "id": "e", "kind": "k", "correlation": [], "payload": {} }),
+        "rearm_push" => json!({ "run": "not-an-id", "id": "d" }),
+        other => panic!("no example body for {other}"),
+    }
+}
+
+/// A request for one documented operation, its path parameters filled.
+fn request_for(route: &Route, actor: Option<&str>) -> Request<Body> {
+    let path = route
+        .path
+        .split('/')
+        .map(|segment| {
+            if segment.starts_with('{') {
+                "not-an-id"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    match (route.method.as_str(), route.body) {
+        ("get", _) => get(&path, actor),
+        (_, Some(_)) => post(&path, actor, &example_body(route.operation)),
+        _ => post(&path, actor, &json!({})),
+    }
+}
+
+/// **Every route the router serves is a documented operation, and nothing else.**
+///
+/// The router is built from the table the document is generated from, so the
+/// one way to serve an undocumented route is to add one beside the table. This
+/// reads the module for exactly that.
+#[test]
+fn every_routed_operation_is_documented_and_no_other() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/api/mod.rs"))
+        .expect("the api module");
+    let code: String = src
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let served: Vec<&str> = code
+        .split(".route(")
+        .skip(1)
+        .map(|call| call.split([',', ')']).next().unwrap_or_default().trim())
+        .collect();
+    assert_eq!(
+        served,
+        ["route.path"],
+        "a route is served beside the table the document is generated from"
+    );
+    for elsewhere in [".nest(", ".merge(", ".fallback(", ".route_service("] {
+        assert!(
+            !code.contains(elsewhere),
+            "the operator router is extended with {elsewhere} outside the table"
+        );
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut names = std::collections::BTreeSet::new();
+    for route in ROUTES {
+        assert!(
+            seen.insert((route.method.as_str(), route.path)),
+            "{} {} is in the table twice",
+            route.method.as_str(),
+            route.path
+        );
+        assert!(
+            names.insert(route.operation),
+            "{} is named twice",
+            route.operation
+        );
+        // The document is published, never served: an unauthenticated route
+        // would be the first exception to the gate, and a gated one is useless
+        // to a generator.
+        assert!(
+            !route.path.contains("openapi") && route.operation != "openapi",
+            "the operator API serves its own document at {}",
+            route.path
+        );
+        let documented = &document()["paths"][route.path][route.method.as_str()];
+        assert_eq!(
+            documented["operationId"],
+            route.operation,
+            "{} {} is not in the document",
+            route.method.as_str(),
+            route.path
+        );
+    }
+    let documented: usize = document()["paths"]
+        .as_object()
+        .expect("paths")
+        .values()
+        .map(|item| item.as_object().map_or(0, serde_json::Map::len))
+        .sum();
+    assert_eq!(
+        documented,
+        ROUTES.len(),
+        "the document lists an operation the table does not"
+    );
+}
+
+/// **The dispositions the document enumerates are the ones reconcile accepts.**
+///
+/// A client that validates against the document sends only the listed values;
+/// a value listed and refused, or accepted and unlisted, is a reconcile that
+/// cannot be written from the document.
+#[tokio::test]
+async fn the_documented_dispositions_are_the_ones_reconcile_accepts() {
+    let f = fixture();
+    let router = f.router();
+    let document = agentplane::api::openapi::document();
+    let listed: Vec<String> =
+        document["components"]["schemas"]["ReconcileRequest"]["properties"]["disposition"]["enum"]
+            .as_array()
+            .expect("the document enumerates the dispositions")
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect();
+    let refused = |body: &Value| {
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("'disposition' must be")
+    };
+    let run = agentplane::core::RunId::generate().to_string();
+    let reconcile = |disposition: &str| {
+        let mut body = json!({ "effect": "0".repeat(64), "disposition": disposition, "note": "n" });
+        if disposition == "landed" {
+            body["output"] = json!({ "ok": true });
+        }
+        post(&format!("/runs/{run}/reconcile"), Some("bob"), &body)
+    };
+    for disposition in &listed {
+        let (_, body) = send(&router, reconcile(disposition)).await;
+        assert!(
+            !refused(&body),
+            "{disposition} is listed and refused: {body}"
+        );
+    }
+    let (status, body) = send(&router, reconcile("maybe")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(refused(&body), "{body}");
+    assert_eq!(
+        listed.len(),
+        2,
+        "the handler accepts two dispositions: {listed:?}"
+    );
+}
+
+/// **Every documented operation is served, and asks the action it documents.**
+///
+/// Under a policy that refuses everything, a served route answers `403` — a
+/// `404` or `405` is a documented operation the router does not serve — and
+/// the action the policy was asked is the one the document names.
+#[tokio::test]
+async fn every_documented_operation_answers_through_the_router() {
+    let policy = Arc::new(Recording {
+        seen: Mutex::new(Vec::new()),
+        deny: true,
+    });
+    let f = fixture_with(&policy);
+    let router = f.router();
+
+    for route in ROUTES {
+        let request = request_for(route, Some("bob"));
+        let (status, body) = send(&router, request).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{} {} is documented and not served as documented: {body}",
+            route.method.as_str(),
+            route.path
+        );
+        let asked = policy.asked();
+        let (_, action, _) = asked.last().expect("the policy was asked");
+        assert_eq!(
+            action,
+            route.action,
+            "{} {} documents {} and asks {action}",
+            route.method.as_str(),
+            route.path,
+            route.action
+        );
+    }
+}
+
+/// **A refused body answers with the documented error object.**
+///
+/// axum's extractors refuse in plain text, with the statuses a client must tell
+/// apart: malformed JSON, a body not sent as JSON, a member the operation does
+/// not take. Each answers its own status and `{"error": "<sentence>"}`, the
+/// shape every other refusal takes.
+#[tokio::test]
+async fn a_refused_body_answers_with_the_documented_error() {
+    let f = fixture();
+    let router = f.router();
+    let raw = |route: &Route, content_type: &str, body: &str| {
+        let path = route
+            .path
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with('{') {
+                    "not-an-id"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        Request::builder()
+            .uri(path)
+            .method("POST")
+            .header("content-type", content_type)
+            .header("x-actor", "bob")
+            .body(Body::from(body.to_owned()))
+            .unwrap()
+    };
+    let error_only = |body: &Value| {
+        body.as_object().is_some_and(|o| {
+            o.len() == 1 && o["error"].as_str().is_some_and(|e| !e.trim().is_empty())
+        })
+    };
+
+    let mut walked = 0;
+    for route in ROUTES {
+        let Some(shape) = route.body else { continue };
+        let mut extra = example_body(route.operation);
+        extra["unexpected"] = json!(1);
+        let mut cases = vec![
+            (raw(route, "application/json", "{"), StatusCode::BAD_REQUEST),
+            (
+                raw(route, "application/json", &extra.to_string()),
+                if matches!(shape, Shape::Json(_)) {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+            ),
+        ];
+        if matches!(shape, Shape::Json(_)) {
+            cases.push((
+                raw(
+                    route,
+                    "text/plain",
+                    &example_body(route.operation).to_string(),
+                ),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ));
+        }
+        for (request, wanted) in cases {
+            let (status, body) = send(&router, request).await;
+            assert_eq!(status, wanted, "{}: {body}", route.operation);
+            assert!(
+                error_only(&body),
+                "{} refused without the error object: {body}",
+                route.operation
+            );
+            walked += 1;
+        }
+    }
+    assert!(
+        walked >= 30,
+        "walked only {walked} refusals — this check read the wrong thing"
+    );
+}
+
+/// **Every answer is the body the document gives its operation and status**,
+/// including the refusals only a particular plane can provoke: a store it was
+/// built without, and a decision naming a stale version.
+#[tokio::test]
+async fn a_response_validates_against_the_document() {
+    // The validator itself: a status an operation does not list is refused.
+    assert!(conforms("GET", "/tasks", StatusCode::IM_A_TEAPOT, b"{}").is_err());
+    assert!(
+        conforms(
+            "GET",
+            "/tasks",
+            StatusCode::OK,
+            br#"{"tasks": [], "truncated": false, "more": 1}"#
+        )
+        .is_err()
+    );
+
+    let f = fixture();
+    let task = f.pending_task().await;
+    let router = f.router();
+    let (status, view) = send(&router, get(&format!("/tasks/{task}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert!(view["digest"].is_string(), "{view}");
+    for request in [
+        get("/tasks", Some("bob")),
+        get("/runs?outcome=quarantined", Some("bob")),
+        get("/runs/waiting", Some("bob")),
+        get("/attention", Some("bob")),
+        get("/drill", Some("bob")),
+        get("/cases?status=open", Some("bob")),
+        get("/obligations", Some("bob")),
+        get("/holds", Some("bob")),
+        get("/dead-letters", Some("bob")),
+        post(&format!("/tasks/{task}/claim"), Some("bob"), &json!({})),
+        post(
+            &format!("/tasks/{task}/decide"),
+            Some("bob"),
+            &json!({ "approved": false, "reason": "no", "digest": Digest::of(b"stale").to_hex() }),
+        ),
+    ] {
+        let (status, body) = send(&router, request).await;
+        assert!(
+            status.is_success() || status == StatusCode::PRECONDITION_FAILED,
+            "{status}: {body}"
+        );
+    }
+
+    // A plane with no quota store answers 501 on the routes that need one.
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .build();
+    let bare = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
+    for route in ROUTES
+        .iter()
+        .filter(|r| r.errors.contains(&ErrorClass::NotWired))
+    {
+        let (status, body) = send(&bare, request_for(route, Some("bob"))).await;
+        assert!(
+            status == StatusCode::NOT_IMPLEMENTED || status == StatusCode::BAD_REQUEST,
+            "{}: {status} {body}",
+            route.operation
+        );
+    }
+    let (status, _) = send(&bare, get("/runs/live", Some("bob"))).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
 }
 
 // ── What an operator sees ───────────────────────────────────────────────────
@@ -1218,6 +1667,52 @@ async fn a_failed_runs_view_carries_the_reason_the_seal_records() {
         body["sealed"], false,
         "a resumable failed conclusion was reported as a closed journal: {body}"
     );
+}
+
+/// A failed run a resume retried to the same failure still reads as failed.
+///
+/// A plane on one backend has its quota ledger wired, so every resume opens
+/// a quota pass. A pass that wrote nothing must leave no marker behind the
+/// conclusion: the view reads the run's last record, and a marker there
+/// reports a failed run as still running.
+#[tokio::test]
+async fn a_failed_run_resumed_to_the_same_failure_still_reads_as_failed() {
+    #[derive(Debug)]
+    struct Refuses;
+
+    #[async_trait::async_trait]
+    impl Skill for Refuses {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("refuses").provides("demo.refusal")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::fail("the dependency is still down"))
+        }
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder_on(store)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .skill(Refuses)
+        .build();
+    let out = rt
+        .run("demo.refusal", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        rt.replay(out.run_id, agentplane::runtime::Mode::Resume)
+            .await
+            .unwrap();
+    }
+    let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
+
+    let (status, body) = send(&router, get(&format!("/runs/{}", out.run_id), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "failed", "{body}");
 }
 
 /// Exhaustion stays machine-readable through the operator surface.
@@ -1740,7 +2235,8 @@ async fn a_decision_posted_before_its_task_opens_is_not_buffered() {
     );
 }
 
-/// A store failure does not describe the store.
+/// A store failure does not describe the store, and a store this plane was
+/// built without is one answer on every route: 501, naming the store.
 #[tokio::test]
 async fn a_missing_store_does_not_describe_the_plane() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
@@ -1749,9 +2245,64 @@ async fn a_missing_store_does_not_describe_the_plane() {
         .build();
     let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
 
-    let (status, body) = send(&router, get("/tasks", Some("bob"))).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert_eq!(body["error"], "this plane has no task store");
+    let task = [
+        get("/tasks", Some("bob")),
+        post(
+            &format!("/tasks/{}/decide", "7".repeat(64)),
+            Some("bob"),
+            &json!({ "approved": true, "reason": "" }),
+        ),
+    ];
+    for request in task {
+        let route = request.uri().path().to_owned();
+        let (status, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{route}: {body}");
+        assert_eq!(body["error"], "this plane has no task store", "{route}");
+    }
+
+    let (status, body) = send(
+        &router,
+        post(
+            "/events",
+            Some("bob"),
+            &json!({ "id": "e", "kind": "k", "correlation": [], "payload": {} }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["error"], "this plane has no event store");
+
+    let quota = [
+        get("/halts", Some("bob")),
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "tenant", "reason": "incident 3" }),
+        ),
+        post("/halts/lift", Some("bob"), &json!({ "scope": "tenant" })),
+        get("/runs/live", Some("bob")),
+    ];
+    for request in quota {
+        let route = request.uri().path().to_owned();
+        let (status, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{route}: {body}");
+        assert_eq!(body["error"], "this plane has no quota store", "{route}");
+    }
+    // Built with the `push` feature or without it, the answer is the same.
+    let push = [
+        get("/push", Some("bob")),
+        post(
+            "/push/rearm",
+            Some("bob"),
+            &json!({ "run": agentplane::core::RunId::generate().to_string(), "id": "receiver-1" }),
+        ),
+    ];
+    for request in push {
+        let route = request.uri().path().to_owned();
+        let (status, body) = send(&router, request).await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{route}: {body}");
+        assert_eq!(body["error"], "this plane has no push store", "{route}");
+    }
 }
 
 /// An event store whose writes fail with a message naming its connection.
@@ -1808,8 +2359,9 @@ impl EventStore for LeakyEvents {
     async fn unsubscribe_run(
         &self,
         run: agentplane::core::RunId,
-    ) -> Result<usize, agentplane::core::StoreError> {
-        self.0.unsubscribe_run(run).await
+        unanswered: &[agentplane::core::EffectKey],
+    ) -> Result<agentplane::case::Retired, agentplane::core::StoreError> {
+        self.0.unsubscribe_run(run, unanswered).await
     }
     async fn park_wait(
         &self,
@@ -3248,6 +3800,14 @@ async fn unknown_fields_on_a_hold_or_an_event_are_refused() {
             json!({"case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "reason": "settled", "force": true}),
         ),
         (
+            "/holds/release",
+            json!({"case": "case_01ARZ3NDEKTSV4RRFFQ69G5FAV", "actor": "someone-else"}),
+        ),
+        (
+            "/halts/lift",
+            json!({"scope": "tenant", "basis": "authenticated"}),
+        ),
+        (
             "/events",
             json!({"id": "e-1", "kind": "k", "payload": {}, "corelation": []}),
         ),
@@ -3354,6 +3914,81 @@ async fn a_withheld_proposal_is_served_as_withheld() {
         !body.to_string().contains("$sealed"),
         "the envelope was served as a value: {body}"
     );
+}
+
+/// **The served digest is the version of the stored row**, not of the
+/// withheld view served beside it — so a rejection of a proposal this plane
+/// cannot open, naming the digest it was served, records.
+#[tokio::test]
+async fn a_served_digest_is_of_the_stored_row() {
+    let f = fixture();
+    let task = listed_task(
+        &f.store,
+        "Refund the disputed invoice",
+        json!({ "$sealed": "AAECAwQFBgc=" }),
+        Some(agentplane::core::Withheld::Sealed),
+    )
+    .await;
+    let stored = (f.store.clone() as Arc<dyn TaskStore>)
+        .task(agentplane::core::TaskId::parse(&task).unwrap())
+        .await
+        .unwrap()
+        .unwrap()
+        .justification
+        .digest()
+        .to_hex();
+    let router = f.router();
+
+    let (status, view) = send(&router, get(&format!("/tasks/{task}"), Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    assert_eq!(view["digest"], stored, "{view}");
+    let (status, list) = send(&router, get("/tasks", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list["tasks"][0]["digest"], stored, "{list}");
+
+    let (status, body) = send(
+        &router,
+        post(
+            &format!("/tasks/{task}/decide"),
+            Some("bob"),
+            &json!({ "approved": false, "reason": "cannot see it", "digest": view["digest"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// **A decision naming a version the row no longer holds is 412**, and the task
+/// is left open and unassigned; naming the served version records.
+#[tokio::test]
+async fn a_stale_digest_is_refused_with_412() {
+    let f = fixture();
+    let task = f.pending_task().await;
+    let router = f.router();
+    let decide = |digest: Value| {
+        post(
+            &format!("/tasks/{task}/decide"),
+            Some("bob"),
+            &json!({ "approved": false, "reason": "no", "digest": digest }),
+        )
+    };
+
+    let stale = agentplane::core::Digest::of(b"another version").to_hex();
+    let (status, body) = send(&router, decide(json!(stale))).await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{body}");
+    let found = (f.store.clone() as Arc<dyn TaskStore>)
+        .task(agentplane::core::TaskId::parse(&task).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        found.state.is_pending() && found.assignee.is_none(),
+        "{found:?}"
+    );
+
+    let (_, view) = send(&router, get(&format!("/tasks/{task}"), Some("bob"))).await;
+    let (status, body) = send(&router, decide(view["digest"].clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// **An approval of a withheld proposal is refused in a class of its own.**
@@ -3499,5 +4134,516 @@ async fn an_argument_spelled_like_the_sealed_marker_is_not_withheld() {
         body["rendering"]["proposed_action"],
         json!({ "$sealed": "AAECAwQFBgc=" }),
         "{body}"
+    );
+}
+
+/// The one record of the run `record` names, from `store`'s journal.
+async fn sole_record(store: &Arc<RedbStore>, record: &Value) -> agentplane::journal::Record {
+    let run =
+        agentplane::core::RunId::parse(record.as_str().expect("a record run")).expect("a run id");
+    let mut page = store
+        .read_page(run, 1, 1)
+        .await
+        .expect("a readable journal");
+    assert_eq!(page.len(), 1, "the run holds its record");
+    page.remove(0)
+}
+
+/// **A release and a lift name who made them, in the journal.**
+///
+/// Neither register keeps a row once its entry goes, so the record each act
+/// writes before the row goes is the account of who let a matter be swept or
+/// work start again — named from the credential, not from the body.
+#[tokio::test]
+async fn a_hold_release_and_a_halt_lift_name_who_made_them() {
+    use agentplane::case::CaseStore;
+
+    let f = fixture();
+    let cases = f.store.clone() as Arc<dyn CaseStore>;
+    let case = cases
+        .correlate_or_open(
+            "dispute",
+            &[CorrelationKey::new("document", "INV-WHO")],
+            agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap(),
+        )
+        .await
+        .unwrap()
+        .case_id();
+    let router = f.router();
+    let (status, _) = send(
+        &router,
+        post(
+            "/holds",
+            Some("bob"),
+            &json!({ "case": case.to_string(), "reason": "preservation order 7" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, released) = send(
+        &router,
+        post(
+            "/holds/release",
+            Some("carol"),
+            &json!({ "case": case.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{released}");
+    assert_eq!(released["lifted"], true, "{released}");
+    assert_eq!(released["removed"], true, "{released}");
+    assert_eq!(released["by"], "carol", "{released}");
+    assert_eq!(released["basis"], "authenticated", "{released}");
+    let record = sole_record(&f.store, &released["record"]).await;
+    assert_eq!(record.body.case, Some(case));
+    match record.kind() {
+        RecordKind::HoldReleased { by, placed_by, .. } => {
+            assert_eq!(by.actor(), "carol");
+            assert_eq!(by.basis().as_str(), "authenticated");
+            assert_eq!(placed_by.actor(), "bob");
+        }
+        other => panic!("a release run holds a release record, not {other:?}"),
+    }
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let halts = halt_router(
+        &store,
+        Arc::new(Recording::default()) as Arc<dyn PolicyEngine>,
+    );
+    let (status, _) = send(
+        &halts,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "tenant", "reason": "incident 9" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, lifted) = send(
+        &halts,
+        post("/halts/lift", Some("dave"), &json!({ "scope": "tenant" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{lifted}");
+    assert_eq!(lifted["was_standing"], true, "{lifted}");
+    assert_eq!(lifted["removed"], true, "{lifted}");
+    assert_eq!(lifted["by"], "dave", "{lifted}");
+    assert_eq!(lifted["basis"], "authenticated", "{lifted}");
+    let record = sole_record(&store, &lifted["record"]).await;
+    match record.kind() {
+        RecordKind::HaltLifted {
+            scope,
+            by,
+            reason,
+            thrown_by,
+            ..
+        } => {
+            assert_eq!(scope, "tenant");
+            assert_eq!(by.actor(), "dave");
+            assert_eq!(by.basis().as_str(), "authenticated");
+            assert_eq!(reason, "incident 9");
+            assert_eq!(thrown_by.actor(), "bob");
+        }
+        other => panic!("a lift run holds a lift record, not {other:?}"),
+    }
+
+    // A second lift finds nothing standing, writes nothing and says so.
+    let (status, again) = send(
+        &halts,
+        post("/halts/lift", Some("dave"), &json!({ "scope": "tenant" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["was_standing"], false, "{again}");
+    assert_eq!(again["removed"], false, "{again}");
+    assert!(again["record"].is_null(), "{again}");
+}
+
+/// A policy set that cannot evaluate anything, and says why in its own words.
+#[derive(Debug)]
+struct Unevaluable;
+
+impl PolicyEngine for Unevaluable {
+    fn authorize(&self, _request: &PolicyRequest<'_>) -> PolicyDecision {
+        PolicyDecision::Malformed {
+            reason: "policy `ops-secret-7` reads `context.clearance`, which is absent".to_owned(),
+        }
+    }
+    fn bundle(&self) -> PolicyBundleIdentity {
+        PolicyBundleIdentity::new(Digest::of(b"unevaluable"), "agentplane-test/unevaluable")
+    }
+}
+
+/// **A policy set that cannot evaluate says so in a sentence, not in its
+/// rules.** The engine's reason names policy ids and attributes — a map of
+/// the authorization vocabulary — and it belongs in the operator's log.
+#[tokio::test]
+async fn an_unevaluable_policy_set_is_a_fixed_sentence_to_the_caller() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let router = halt_router(&store, Arc::new(Unevaluable) as Arc<dyn PolicyEngine>);
+    let (status, body) = send(&router, get("/halts", Some("bob"))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let text = body.to_string();
+    assert!(
+        !text.contains("ops-secret-7") && !text.contains("clearance"),
+        "the engine's reason reached the caller: {text}"
+    );
+}
+
+/// A plane with both registers wired, at a page of `limit`.
+fn register_router(store: &Arc<RedbStore>, limit: usize) -> axum::Router {
+    use agentplane::quota::QuotaStore;
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .quota(
+            store.clone() as Arc<dyn QuotaStore>,
+            agentplane::quota::TenantQuota::default(),
+        )
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .build();
+    Api::new(rt, Arc::new(HeaderAuth))
+        .expect("the fixture wires a policy engine")
+        .limit(limit)
+        .router()
+}
+
+/// A matter correlated on `doc`, as its case id.
+async fn open_matter(store: &Arc<RedbStore>, doc: &str) -> String {
+    (store.clone() as Arc<dyn CaseStore>)
+        .correlate_or_open(
+            "dispute",
+            &[CorrelationKey::new("document", doc)],
+            agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap(),
+        )
+        .await
+        .unwrap()
+        .case_id()
+        .to_string()
+}
+
+/// **The listings say who, both for what stands now and for what was ended.**
+///
+/// A standing entry names who threw or placed it; `?state=lifted` and
+/// `?state=released` read the recorded lifts and releases back, newest first,
+/// each with its lifter and the control it ended.
+#[tokio::test]
+async fn the_halt_and_hold_listings_name_who_now_and_before() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let router = register_router(&store, 1);
+    let matters = [
+        open_matter(&store, "INV-L1").await,
+        open_matter(&store, "INV-L2").await,
+    ];
+
+    let (status, _) = send(
+        &router,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "agent:a", "reason": "first" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, standing) = send(&router, get("/halts", Some("bob"))).await;
+    assert_eq!(standing["halts"][0]["by"], "bob", "{standing}");
+    assert_eq!(standing["halts"][0]["basis"], "authenticated", "{standing}");
+    assert!(standing["halts"][0]["thrown_at"].is_i64(), "{standing}");
+
+    let (status, _) = send(
+        &router,
+        post("/halts/lift", Some("carol"), &json!({ "scope": "agent:a" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &router,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "agent:b", "reason": "second" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &router,
+        post("/halts/lift", Some("dave"), &json!({ "scope": "agent:b" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, history) = send(&router, get("/halts?state=lifted", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["halts"], json!([]), "{history}");
+    assert_eq!(
+        history["truncated"], true,
+        "a page of one over two lifts: {history}"
+    );
+    let newest = &history["lifted"][0];
+    assert_eq!(newest["scope"], "agent:b", "newest first: {history}");
+    assert_eq!(newest["by"], "dave", "{history}");
+    assert_eq!(newest["basis"], "authenticated", "{history}");
+    assert_eq!(newest["thrown_by"], "bob", "{history}");
+    assert_eq!(newest["reason"], "second", "{history}");
+
+    for (case, who) in matters.iter().zip(["carol", "dave"]) {
+        let (status, _) = send(
+            &router,
+            post(
+                "/holds",
+                Some("bob"),
+                &json!({ "case": case, "reason": "order" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, standing) = send(&router, get("/holds", Some("bob"))).await;
+        assert_eq!(standing["holds"][0]["by"], "bob", "{standing}");
+        assert_eq!(standing["holds"][0]["basis"], "authenticated", "{standing}");
+        let (status, _) = send(
+            &router,
+            post("/holds/release", Some(who), &json!({ "case": case })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, history) = send(&router, get("/holds?state=released", Some("bob"))).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["truncated"], true, "{history}");
+    let newest = &history["released"][0];
+    assert_eq!(
+        newest["case"],
+        matters[1].as_str(),
+        "newest first: {history}"
+    );
+    assert_eq!(newest["by"], "dave", "{history}");
+    assert_eq!(newest["placed_by"], "bob", "{history}");
+
+    let (_, case_view) = send(&router, get(&format!("/cases/{}", matters[1]), Some("bob"))).await;
+    assert!(
+        case_view["history"]
+            .as_array()
+            .is_some_and(|h| h.iter().any(|r| r.to_string().contains("HoldReleased"))),
+        "the release is in the matter's history: {case_view}"
+    );
+
+    for path in ["/halts?state=other", "/holds?state=lifted"] {
+        let (status, body) = send(&router, get(path, Some("bob"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+    }
+}
+
+/// **A lift by a caller no record can name lifts nothing.**
+///
+/// The name is the whole of the record; a credential that yields an empty
+/// actor is refused before the register is read, and the control stands.
+#[tokio::test]
+async fn a_lift_by_an_unusable_caller_is_refused_and_lifts_nothing() {
+    use agentplane::quota::QuotaStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let router = register_router(&store, 100);
+    let case = open_matter(&store, "INV-U").await;
+    let (status, _) = send(
+        &router,
+        post(
+            "/halts",
+            Some("bob"),
+            &json!({ "scope": "tenant", "reason": "r" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(
+        &router,
+        post(
+            "/holds",
+            Some("bob"),
+            &json!({ "case": case, "reason": "r" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    for req in [
+        post("/halts/lift", Some(" "), &json!({ "scope": "tenant" })),
+        post("/holds/release", Some(" "), &json!({ "case": case })),
+    ] {
+        let (status, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert!(
+            body.to_string().contains("cannot be recorded"),
+            "the documented sentence: {body}"
+        );
+    }
+    assert_eq!(
+        (store.clone() as Arc<dyn QuotaStore>)
+            .halts()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, holds) = send(&router, get("/holds", Some("bob"))).await;
+    assert_eq!(holds["holds"].as_array().map(Vec::len), Some(1), "{holds}");
+    for outcome in ["halt-lifted", "hold-released"] {
+        assert!(store.runs_by_outcome(outcome, 10).await.unwrap().is_empty());
+    }
+}
+
+/// A quota register whose conditional removal fails after the lift is recorded.
+#[derive(Debug)]
+struct RemovalFails(Arc<RedbStore>);
+
+#[async_trait::async_trait]
+impl agentplane::quota::QuotaStore for RemovalFails {
+    fn tenant(&self) -> &str {
+        agentplane::quota::QuotaStore::tenant(self.0.as_ref())
+    }
+    async fn reserve(
+        &self,
+        run: agentplane::RunId,
+        quota: &agentplane::quota::TenantQuota,
+        hold: Option<&agentplane::quota::SpendHold>,
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), agentplane::quota::QuotaError> {
+        self.0.reserve(run, quota, hold, at).await
+    }
+    async fn release(&self, run: agentplane::RunId) -> Result<(), agentplane::core::StoreError> {
+        agentplane::quota::QuotaStore::release(self.0.as_ref(), run).await
+    }
+    async fn carry(
+        &self,
+        run: agentplane::RunId,
+        period: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.carry(run, period).await
+    }
+    async fn reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::quota::Held>, agentplane::core::StoreError> {
+        self.0.reservations(limit).await
+    }
+    async fn reserved(
+        &self,
+        period: &str,
+    ) -> Result<agentplane::core::Spend, agentplane::core::StoreError> {
+        self.0.reserved(period).await
+    }
+    async fn set_halt(
+        &self,
+        scope: &agentplane::quota::HaltScope,
+        by: &agentplane::core::Operator,
+        at: agentplane::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.set_halt(scope, by, at, reason).await
+    }
+    async fn lift_halt(
+        &self,
+        scope: &agentplane::quota::HaltScope,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.0.lift_halt(scope).await
+    }
+    async fn lift_halt_if(
+        &self,
+        _: &agentplane::quota::Halt,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        Err(agentplane::core::StoreError::Backend(
+            "injected removal outage".to_owned(),
+        ))
+    }
+    async fn halts(&self) -> Result<Vec<agentplane::quota::Halt>, agentplane::core::StoreError> {
+        self.0.halts().await
+    }
+    async fn settle(
+        &self,
+        settlement: &agentplane::quota::QuotaSettlement,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.settle(settlement).await
+    }
+    async fn spent(
+        &self,
+        period: &str,
+    ) -> Result<agentplane::core::Spend, agentplane::core::StoreError> {
+        self.0.spent(period).await
+    }
+    async fn running(&self) -> Result<u32, agentplane::core::StoreError> {
+        self.0.running().await
+    }
+    async fn running_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::RunId>, agentplane::core::StoreError> {
+        self.0.running_runs(limit).await
+    }
+    async fn reserve_rate(
+        &self,
+        reservation: &agentplane::quota::RateReservation,
+    ) -> Result<(), agentplane::quota::QuotaError> {
+        self.0.reserve_rate(reservation).await
+    }
+    async fn rate_room(
+        &self,
+        grant: &str,
+        ceilings: &[agentplane::quota::RateCeiling],
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), agentplane::quota::QuotaError> {
+        self.0.rate_room(grant, ceilings, at).await
+    }
+}
+
+/// **A lift recorded over a row that stayed answers naming the record's run.**
+///
+/// The record is written before the row goes, so a removal that fails leaves a
+/// record of a lift that did not happen and a halt that still stands. Answered
+/// as a bare store failure, the operator retries and writes a second record
+/// with no way to find the first.
+#[tokio::test]
+async fn a_lift_whose_removal_fails_names_the_record_it_wrote() {
+    use agentplane::quota::QuotaStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    store
+        .set_halt(
+            &agentplane::quota::HaltScope::Tenant,
+            &agentplane::core::Operator::asserted("ops").unwrap(),
+            agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000).unwrap(),
+            "incident 47",
+        )
+        .await
+        .unwrap();
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .quota(
+            Arc::new(RemovalFails(store.clone())) as Arc<dyn QuotaStore>,
+            agentplane::quota::TenantQuota::default(),
+        )
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .build();
+    let router = Api::new(Arc::clone(&rt), Arc::new(HeaderAuth))
+        .expect("the fixture wires a policy engine")
+        .router();
+
+    let (status, body) = send(
+        &router,
+        post("/halts/lift", Some("bob"), &json!({ "scope": "tenant" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let lifts = rt.lifted_halts(10).await.expect("lifts");
+    assert_eq!(lifts.len(), 1, "the lift was recorded before the removal");
+    let run = lifts[0].body.run.to_string();
+    let said = body.to_string();
+    assert!(
+        said.contains(&run) && said.contains("still stands"),
+        "the answer does not name the record's run: {body}"
+    );
+    assert_eq!(
+        store.halts().await.unwrap().len(),
+        1,
+        "the halt was removed"
     );
 }

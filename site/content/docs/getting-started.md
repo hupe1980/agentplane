@@ -15,12 +15,12 @@ CI runs on every push — or from the crate's own compile-checked rustdoc. If on
 does not build, that is a bug worth reporting.
 
 **The order is deliberate.** Sections 2 and 3 are two doorways onto the same
-guarantees, and the first one needs no Rust at all. It comes first because it is
-the one the [compatibility promise](@/docs/status.md#what-the-freeze-promises)
-attaches to: what the freeze commits is the record, the export and the operator
-vocabulary — the evidence — rather than either doorway. Writing skills in Rust
-buys expressiveness and takes the ordinary pre-alpha risk on function
-signatures.
+guarantees, and the first one needs no Rust at all. It comes first because it
+needs nothing but a file; the
+[compatibility promise](@/docs/status.md#what-the-freeze-promises) attaches to
+the evidence both doorways produce — the record, the export and the operator
+vocabulary — not to either doorway. Writing skills in Rust buys expressiveness
+and takes the ordinary pre-alpha risk on function signatures.
 
 ---
 
@@ -179,19 +179,72 @@ base image ever gains one, that assumption fails loudly instead of drifting.
 ### Hosting it, still without Rust
 
 A manifest can also be **served** — the A2A 1.0 peer surface that passes the
-protocol project's own conformance kit, started from the same file:
+protocol project's own conformance kit, an MCP listener a framework calls tools
+on, and the operator API — started from the same file.
+
+#### From nothing to a governed call {#zero-to-governed}
+
+**Six commands** take a machine with `git`, `docker` and `uv` to a framework's
+tool call that the plane admitted, journaled and answered, with no model key.
+Each line is one command, run in order from an empty directory:
+
+```sh
+git clone --depth 1 https://github.com/hupe1980/agentplane
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/hupe1980/agentplane:full init --serve plane
+docker compose -f plane/compose.yaml up --wait
+export AGENTPLANE_TOKEN="$(cat plane/framework.token)"
+cd agentplane/examples/frameworks/pydantic-ai
+uv run --no-project --python 3.12 --with-requirements requirements.lock quickstart.py
+```
+
+The last two run any of the five quickstarts below; change the directory.
+`init --serve` writes seven files into `plane/`: the starter agent on the `fake`
+provider, the shipped policy, a token file with three freshly generated callers
+(`peer-1`, `framework-1`, `ops-1`), the framework caller's token alone, a
+generated Postgres password, the plane's connection string holding it
+(`store.env`), and a compose file that runs the plane against Postgres. The
+four secret files are mode 0600. It refuses if any of the seven exists, and
+removes what it wrote if it fails partway. Run it as the user the plane should
+run as: the container runs as the token file's owner, and `init --serve` refuses
+to write a plane that would run as root. The plane serves A2A on
+`127.0.0.1:8080`, MCP on `127.0.0.1:8081` and the operator API on
+`127.0.0.1:9090`; the token file is mounted as a secret, never passed in the
+environment, and no secret is on a command line. To serve other machines,
+publish `8080` and `8081` on an address they reach and set `--url` and
+`--mcp-allowed-host` to the names they use — the compose file says where.
+
+| Framework | Door | Quickstart |
+|---|---|---|
+| OpenAI Agents SDK | MCP — `MCPServerStreamableHttp` | `examples/frameworks/openai-agents/` |
+| LangGraph | MCP — `langchain-mcp-adapters` | `examples/frameworks/langgraph/` |
+| Pydantic AI | MCP — `MCPToolset` | `examples/frameworks/pydantic-ai/` |
+| Google ADK | MCP — `McpToolset`; A2A — `RemoteA2aAgent` | `examples/frameworks/google-adk/` |
+| Microsoft Agent Framework | MCP — `MCPStreamableHTTPTool`; A2A — `A2AAgent` | `examples/frameworks/microsoft-agent-framework/` |
+
+Each is one file that imports nothing of this project. `requirements.txt` pins
+its framework exactly; `requirements.lock` pins the whole dependency closure
+with hashes, which `uv pip install --require-hashes -r requirements.lock`
+checks — how CI installs every one before walking it against the `:full` image.
+With no `QUICKSTART_MODEL` set, each drives the framework's own MCP client
+without a model key; set it (with that provider's key) and the framework's
+model decides. The A2A half runs when `AGENTPLANE_PEER_TOKEN` holds the
+`peer-1` token. The plane governs the tool call, not the framework's loop.
+
+#### By hand
 
 ```sh
 # The shipped token file holds placeholders `serve` refuses: generate the tokens.
 sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
     -e "s/replace-me:ops-alice:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+    -e "s/replace-me:app-1:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
     examples/serve-tokens.yaml > tokens.yaml
 
 agentplane serve examples/served.yaml \
-  --url http://localhost:8080 \
+  --url http://localhost:8080/a2a \
   --policy examples/serve-policy.cedar \
   --tokens tokens.yaml \
   --operator-addr 127.0.0.1:9090 \
+  --mcp-addr 127.0.0.1:8081 \
   --store ./served.redb
 
 curl http://localhost:8080/.well-known/agent-card.json
@@ -214,14 +267,24 @@ The separation is enforced by **policy**, not by the port. In
 role the API ones, so a peer token that reaches the operator socket is still
 refused — the separate port is defence in depth rather than the control itself.
 
-**That file is a starting point, and it grants less than its name suggests.**
-It permits the verbs this quickstart uses, not the vocabulary: the incident
-verbs — `api:halt.place`, `api:run.abandon`, `api:effect.reconcile` — are
-listed in its comment and permitted by no rule, and neither is `data:release`,
-so a run that reaches a typed release is refused. Cedar denies what no rule
-permits, which is the right default and an opaque one: the caller is told only
-that it was declined. Before a deployment carries work, grant the verbs whoever
-is on call will need, and read [security](@/docs/security.md) for the release gate.
+`--mcp-addr` serves every agent in the file as MCP tools over Streamable HTTP,
+at `http://127.0.0.1:8081/mcp` — the URL and bearer header an agent framework
+in any language is configured with. Same token file, same policy, asked as
+`mcp:*` actions: the `app-1` line's `framework` role reaches them. A call is
+admitted as that caller, and its arguments arrive as untrusted data from
+`peer:app-1`. It needs the `mcp-server-http` feature, which the `:full` image
+has; [MCP, being served](@/docs/interop.md#mcp-being-served) has the rest.
+
+**What the shipped policy grants.** `peer` reaches the A2A actions a peer needs,
+`framework` the `mcp:*` caller actions, and `operator` the read and task verbs
+plus the on-call verbs — `api:halt.place`, `api:halt.lift`, `api:run.cancel`,
+`api:run.abandon`, `api:effect.reconcile`, `api:hold.place`, `api:hold.release`
+— so an incident is not the first time a verb is denied. It does not permit
+`data:release`, so a run that reaches a typed release is refused: which labels
+may leave is a deployment's decision, and the file carries the rule to
+uncomment beside the [release gate](@/docs/security.md#information-flow-labels)
+it controls. Cedar denies what no rule permits, and the caller is told only that
+it was declined.
 
 `--push-host <host>` (repeatable) turns on **A2A push notifications** to that
 exact host. Without one, push is not wired and the Agent Card advertises it as
@@ -270,12 +333,14 @@ Four things are refused rather than defaulted, and each refusal is the design:
 - **`--store`** — a served task's id is a promise it can be fetched again, and
   an in-memory journal breaks that promise at the next restart. `run` may
   journal to memory because it exits with its answer.
-- **A room** — `serve` hosts one agent, because A2A's card path is well-known
-  and singular, so a bundle would advertise one document and quietly not serve
-  the rest.
+- **A room** — A2A serves the file's one `topology.role: orchestrator`, and
+  refuses a room without exactly one, because A2A's card path is well-known and
+  singular. `--mcp-addr` serves every agent in it, or those `--mcp-agent`
+  names.
 
-`served.yaml` differs from `summariser.yaml` by one line, and it is the
-interesting one: `security.max_sensitivity_egress: internal`. A message from a
+`served.yaml` differs from `summariser.yaml` in two places. `spec.input` is the
+shape a caller is offered, which serving over MCP requires. The interesting one
+is `security.max_sensitivity_egress: internal`. A message from a
 peer arrives labelled `Internal` — it came from outside — while `--input` on
 your own command line arrives `Public`. Without that line the peer's text cannot
 reach the model, and the run fails with *sensitivity Internal exceeds sink
@@ -288,8 +353,8 @@ the flag. The `:full` image is built with them.
 
 This exact file uses the deterministic fake driver, so the first run needs
 **no API key and no network**. To go live, change the provider and model in the
-file (that intentionally changes its digest), install the `providers` feature,
-and export the matching key.
+file (that intentionally changes its digest) and export the matching key: the
+`cli` feature already carries every model provider, Bedrock included.
 
 A file may hold **several** manifests separated by `---`, exactly as
 Kubernetes packages resources — so a multi-agent room (an orchestrator
@@ -332,10 +397,13 @@ agentplane run examples/approval.yaml --input '{"ticket": "T-1"}' --store runs.r
 agentplane tasks  --store runs.redb                      # the worklist
 agentplane decide task_… approve --reason "checked" --actor ada --store runs.redb
 agentplane replay run_01… --manifest examples/approval.yaml --store runs.redb
+agentplane history run_01… --store runs.redb             # its journal, record by record
 ```
 
 A run that calls an A2A peer (`--peer`) also needs `--acting-as <subject>`: a
-peer call is made on somebody's behalf, and the flag names whose.
+peer call is made on somebody's behalf, and the flag names whose. `--peer`
+needs the `a2a` feature, and `--mcp` needs `mcp-stdio` →
+[which verb needs which feature](@/docs/operations.md#cli-features).
 
 Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 `GEMINI_API_KEY` — or `GOOGLE_API_KEY`), never from the file; Bedrock uses `AWS_REGION` and AWS's standard credential chain
@@ -347,6 +415,61 @@ TGI, vLLM, llama.cpp, or `https://router.huggingface.co/v1` with
 An agent's declaration must not change when its credential does. And only
 the providers the manifest *names* are registered — otherwise exporting the wrong
 variable would make the agent runnable on a model its declaration never named.
+
+### Trying it on a page {#trying-it-on-a-page}
+
+`redb` admits one writer process, so while something holds the store the
+verbs above are locked out of it. `agentplane dev` holds it and carries them:
+it builds the plane exactly as `run` does and serves one page for it.
+
+```sh
+agentplane dev examples/approval.yaml
+# http://127.0.0.1:53817/#t=…
+```
+
+<figure class="screenshot">
+<picture>
+<source srcset="../../dev-page-timeline-dark.png" media="(prefers-color-scheme: dark)">
+<img src="../../dev-page-timeline-light.png" alt="The dev page, showing the run list, one run with its status, spend and actions, and its journal as a timeline with call durations" width="1280" height="860" loading="lazy">
+</picture>
+<figcaption>A run of <code>examples/room.yaml</code> as a timeline, each call with its duration and the consultation linked to the sub-run that answered it.</figcaption>
+</figure>
+
+Open the printed URL. The page lists every run in the store with its status,
+and for the one you pick:
+
+- shows what its model is writing, as it writes it;
+- shows its journal as a timeline, filterable and expandable record by record,
+  or as the conversation its model calls held — hidden characters shown as
+  `\u{…}`, each call with its duration, each consultation linked to the
+  sub-run that answered it;
+- starts, cancels and re-runs runs (the input pre-filled from the agent's
+  declared schema), and delivers the event a run waits for;
+- decides tasks — a consultation's approval showing what the consulted agent
+  may do, a call's approval taking amended arguments;
+- strict-replays a run, or every run, against the file as it is now, and
+  exports the store beside the export's verification.
+
+<figure class="screenshot">
+<picture>
+<source srcset="../../dev-page-conversation-dark.png" media="(prefers-color-scheme: dark)">
+<img src="../../dev-page-conversation-light.png" alt="The dev page conversation view, showing the system prompt, the input, and the model calling the consulted agent" width="1280" height="860" loading="lazy">
+</picture>
+<figcaption>The same run as the conversation its model calls held.</figcaption>
+</figure>
+
+Saving the manifest rebuilds the plane; a file that does not parse leaves the
+running one in place and says why.
+
+It is for the agent's author on their own machine — not a deployment surface,
+not a reviewer page and not an editor. It listens on loopback only, behind a
+token minted per process; keeps its journal in memory, or in a `--scratch
+<dir>` it created and marked, following no symbolic link; and refuses any
+other store, a tenant other than
+`dev`, and `--mcp` or `--peer` without `--allow-live`, since an approval on the
+page then performs a real effect. It needs the `dev` feature, which no
+published image carries →
+[what the page refuses](@/docs/security.md#what-a-reviewer-is-shown).
 
 ## 3. Add the crate 📦 {#add-the-crate}
 
@@ -383,6 +506,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `mcp-stdio` | reach an MCP server by **running** it — the stdio child process most published servers are. What lets `agentplane run`/`serve` execute a declarative `tool-calling` agent with no Rust |
 | `mcp-http` | reach an MCP server over **streamable HTTP** — the transport remote servers speak |
 | `mcp-server` | the other direction: serve **this plane's agents as MCP tools** and their reviewed instructions as MCP prompts, so a host you do not run can call a governed agent |
+| `mcp-server-http` | the same catalogue over **Streamable HTTP**, behind the plane's tokens, policy and `Host`/`Origin` checks — what `serve --mcp-addr` offers an agent framework |
 | `a2a` | A2A peer transport — calling other agents |
 | `acp` | record what an agent you do **not** run reported doing: the Agent Client Protocol's session updates mapped onto observation records. Types only — the session stays with the editor that holds it |
 | `a2a-server` | being called: the public Agent Card and the A2A 1.0 JSON-RPC methods |
@@ -394,6 +518,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | `signing` | Ed25519 record signing |
 | `manifest` | declare an agent's grants and ceilings in a reviewable YAML file, and pin it by digest |
 | `cli` | the `agentplane` binary — run a declarative agent from a YAML file with no Rust at all |
+| `dev` | `agentplane dev`: a page on your own machine for trying an agent — loopback only, behind a per-process token, over a scratch store. In no published image |
 | `witness-http` | submit checkpoints to a real witness over C2SP `tlog-witness`, and read back what it holds — the half that gives the split-view guarantee a counterparty. Included in `cli`, because the deletion check needs a checkpoint from outside the store |
 | `opendal` | content-addressed blob storage on S3, GCS, Azure or a filesystem — where bytes too large for the journal go |
 | `keyring` | envelope encryption for payload bytes, and the cryptographic erasure it makes provable — destroying a key erases every copy, including backups |
@@ -653,7 +778,7 @@ model provider with no model behind it, so a test can exercise the whole path
 with no key and no network:
 
 ```rust
-use agentplane::testkit::FakeProvider;
+use agentplane::model::fake::FakeProvider;
 
 let provider = FakeProvider::new();
 provider.will_say("approved");
@@ -681,40 +806,51 @@ a buffer depends on, and the one an assertion on chunk *count* would miss.
 
 ## Where next 🧭 {#where-next}
 
-Pick the example for the question you have; none needs credentials or network:
+Every runnable example, by the question it answers. Run one with
+`cargo run --example <name>`, adding `--features` with the set in the third
+column; none of these needs credentials or network:
 
-| Question | Example |
-|---|---|
-| Does replay or crash recovery repeat calls? | `durable_pipeline` |
-| Who resumes a run whose *process* died holding it? | `recovered_run` |
-| What happens when a run hits its budget — and who un-pauses it? | `budget_pause` |
-| Can an operator stop a run and have it undone — or stop a whole tenant? | `operator_stop` |
-| How do long-lived cases, early events and human work fit? | `clearing_case` |
-| How are plans validated and provenance propagated? | `plan_graph` |
-| Can untrusted content accompany a trusted tool selector safely? | `governed_transfer` |
-| What happens after the third system in a transactionless workflow fails? | `saga_checkout` |
-| Can several calls take together, or not at all — including an email? | `effect_group` |
-| What stops a model that chooses its own tools? | `tool_loop` |
-| How does a person approve the exact call before it happens? | `approved_call` |
-| Can a prompt injection arrive and find no reader? | `planned_run` |
-| Does a replay call the model or spend again? | `model_run` |
-| How do governed media capabilities materialize without entering the journal? | `media_run` |
-| Can prompt, model, schema and ceilings be one digest-covered file? | `manifest_run` |
-| How does an MCP server sit beside a typed Rust tool? | `mcp_tools` |
-| What does a host see when it calls *this* plane over MCP? | `serve_mcp` |
-| How does an agent remember across runs without a storage backdoor? | `memory_run` |
-| Can one customer's approved budget span several runs, then be revoked? | `standing_authority` |
-| What does erasing a case actually erase — and what still verifies? | `sealed_run` |
-| What stops a retention pass from erasing a matter under a preservation order? | `retention_hold` |
-| How are separate agents and handoffs bounded? | `blog_room` |
-| What does another organisation's agent see when it calls this one? | `a2a_peer` |
-| How does an agent call another *plane's* agent, and whose chain does the peer see? | `peer_call` |
-| How do live tokens coexist with a journal that must replay exactly? | `streaming_run` |
+| Question | Example | `--features` |
+|---|---|---|
+| What is one skill, one run and one replay? | `hello_skill` | |
+| Does replay or crash recovery repeat calls? | `durable_pipeline` | |
+| Who resumes a run whose *process* died holding it? | `recovered_run` | |
+| What happens when a run hits its budget — and who un-pauses it? | `budget_pause` | |
+| Can an operator stop a run and have it undone — or stop a whole tenant? | `operator_stop` | |
+| What happens to a call nobody can account for? | `answered_doubt` | |
+| What does an operator alert on, and what reaches the collector? | `observability` | |
+| How do long-lived cases, early events and human work fit? | `clearing_case` | |
+| How are plans validated and provenance propagated? | `plan_graph` | |
+| Can untrusted content accompany a trusted tool selector safely? | `governed_transfer` | `manifest` |
+| What happens after the third system in a transactionless workflow fails? | `saga_checkout` | |
+| Can several calls take together, or not at all — including an email? | `effect_group` | |
+| How does one act over many items resume without settling any twice? | `batch_run` | |
+| What stops a model that chooses its own tools? | `tool_loop` | `fake-model,manifest` |
+| How does a person approve the exact call before it happens? | `approved_call` | `fake-model,manifest` |
+| Can a prompt injection arrive and find no reader? | `planned_run` | `fake-model,manifest` |
+| Does a replay call the model or spend again? | `model_run` | `fake-model` |
+| How do governed media capabilities materialize without entering the journal? | `media_run` | `fake-model,media` |
+| Can prompt, model, schema and ceilings be one digest-covered file? | `manifest_run` | `fake-model,manifest` |
+| How does an MCP server sit beside a typed Rust tool? | `mcp_tools` | `fake-model,manifest,mcp` |
+| What does a host see when it calls *this* plane over MCP? | `serve_mcp` | `mcp-server` |
+| How does an agent remember across runs without a storage backdoor? | `memory_run` | |
+| Can one customer's approved budget span several runs, then be revoked? | `standing_authority` | `fake-model` |
+| What does erasing a case actually erase — and what still verifies? | `sealed_run` | `testkit,keyring` |
+| What stops a retention pass from erasing a matter under a preservation order? | `retention_hold` | |
+| How are separate agents and handoffs bounded? | `blog_room` | `fake-model,manifest` |
+| What does another organisation's agent see when it calls this one? | `a2a_peer` | `a2a-server,manifest` |
+| How does an agent call another *plane's* agent, and whose chain does the peer see? | `peer_call` | `testkit,manifest,a2a,a2a-server` |
+| How do live tokens coexist with a journal that must replay exactly? | `streaming_run` | `fake-model` |
 
-The one exception is `camel_live`, which needs an `OPENAI_API_KEY` and spends
-real money: it runs `planned_run`'s shape against a privileged and a
-quarantined model, and checks at the wire which of them was shown the attack.
-`just camel-live` runs it from `.env`.
+These need something from outside, and none runs in CI:
+
+| What it shows | Example | `--features` | Needs |
+|---|---|---|---|
+| The `planned_run` shape against a privileged and a quarantined model, checking at the wire which was shown the attack; `just camel-live` runs it from `.env` | `camel_live` | `providers,manifest` | `OPENAI_API_KEY`, and spends money |
+| A governed run and a strict replay against a real `OpenAI` model | `openai_live` | `providers` | `OPENAI_API_KEY`, and spends money |
+| One Amazon Bedrock Converse call | `bedrock_live` | `bedrock` | `AGENTPLANE_LIVE=1`, `AWS_REGION`, `AGENTPLANE_BEDROCK_MODEL` and AWS credentials |
+| This plane's A2A surface, served for the official conformance kit; `just test-a2a-tck` drives it | `a2a_tck_live` | `a2a-server,manifest,testkit` | a checkout of `a2a-tck` |
+| What the gate costs, and which part dominates → [what the gate costs](@/docs/operations.md#what-the-gate-costs) | `gate_bench` | `cedar` | a `--release` build |
 
 | | |
 |---|---|

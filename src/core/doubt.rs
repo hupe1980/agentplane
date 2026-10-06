@@ -31,7 +31,7 @@ use super::{EffectKey, Phase, StepId};
 /// Two shapes, and an operator investigates them differently: one says the
 /// runtime never heard back, the other says it heard back and was told nothing
 /// useful.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Doubt {
     /// Announced, and no terminal record follows.
@@ -69,7 +69,8 @@ impl Doubt {
 /// Only **mutating** effects appear. A read that never came back is safe to
 /// repeat and nobody has to adjudicate it; the question here is exclusively
 /// *did this change the outside world*.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct Undecided {
     /// The effect, by the key an operator quotes back when they answer it.
     pub effect: EffectKey,

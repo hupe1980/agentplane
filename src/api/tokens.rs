@@ -73,6 +73,7 @@ const PUBLISHED_TOKENS: &[&str] = &[
     "another-long-random-string",
     "replace-me:peer-a:openssl-rand-hex-32",
     "replace-me:ops-alice:openssl-rand-hex-32",
+    "replace-me:app-1:openssl-rand-hex-32",
 ];
 
 /// Bearer tokens, each naming exactly one caller.

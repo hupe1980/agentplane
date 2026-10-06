@@ -68,7 +68,7 @@
 //!
 //! | Runtime | Cedar |
 //! |---|---|
-//! | `request.principal` | `Agent::"…"` |
+//! | `request.principal` | `Subject::"…"` — a chain subject or API caller; `Capability::"…"` — a chainless run's capability |
 //! | `request.action` | `Action::"effect:perform"` \| `Action::"run:admit"` |
 //! | `request.resource` | `Resource::"…"` — an effect kind or a capability |
 //! | `request.context` | the Cedar context record |
@@ -125,7 +125,7 @@ pub const CEDAR_LANGUAGE: &str = "4.5.0";
 /// This adapter's own revision, which covers everything Cedar's language
 /// version does not: entity mapping, schema-aware context parsing, which
 /// validation findings are fatal, and the set of extensions made available.
-const ADAPTER_REVISION: u32 = 4;
+const ADAPTER_REVISION: u32 = 5;
 
 /// Decision semantics recorded in every Cedar bundle identity.
 ///
@@ -153,7 +153,7 @@ pub fn evaluator_semantics() -> String {
 }
 
 const ADAPTER_CONFIGURATION: &[u8] =
-    b"principal=Agent;action=Action;resource=Resource;context=action-schema;rule-name=@id";
+    b"principal=Subject|Capability;action=Action;resource=Resource;context=action-schema;rule-name=@id";
 
 /// The annotation this adapter reads as a rule's name.
 ///
@@ -327,7 +327,7 @@ impl CedarEngine {
     /// Build the Cedar request, or say why the runtime's strings could not be
     /// expressed as entities.
     fn request(&self, r: &PolicyRequest<'_>) -> Result<Request, String> {
-        let principal = uid("Agent", r.principal)?;
+        let principal = uid(r.principal_kind.entity_type(), r.principal)?;
         let action = uid("Action", r.action)?;
         let resource = uid("Resource", r.resource)?;
         let mut removed = 0usize;

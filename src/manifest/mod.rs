@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 use crate::core::{Budget, Digest, Sensitivity, canon};
 
 mod binding;
-pub use binding::MemorySubject;
+pub use binding::{DataSubject, MemorySubject};
 
 mod error;
 pub use error::ManifestError;
@@ -283,6 +283,15 @@ pub struct Spec {
     /// What this agent reads from and writes to durable memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<Memory>,
+    /// Whose data a run of this agent takes in, read from the run.
+    ///
+    /// Each binding is resolved once per run into its `DataSubjectBound`
+    /// record, and every value derived from the run's input, events and case
+    /// state is attributed to it, so a subject's trace follows that data to
+    /// the effects it reached. A binding that resolves to nothing refuses the
+    /// run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_subjects: Vec<DataSubject>,
 }
 
 /// A declarative agent's two halves of durable memory: what it reads, and what
@@ -603,7 +612,57 @@ pub struct OversightDeadline {
     pub params: serde_json::Value,
 }
 
+/// Zero input admits no call at all — every prompt carries at least one token —
+/// and zero output admits no answer, so the role could never answer. Refused for
+/// the reason a zero budget ceiling is: it is a wiring mistake, not a limit.
+fn refuse_zero_ceilings(models: &Models) -> Result<(), ManifestError> {
+    for (field, m, ceiling) in [
+        (
+            "spec.models.privileged.max_input_tokens",
+            &models.privileged,
+            (|m: &ModelRef| m.max_input_tokens) as fn(&ModelRef) -> Option<u32>,
+        ),
+        (
+            "spec.models.quarantined.max_input_tokens",
+            &models.quarantined,
+            |m| m.max_input_tokens,
+        ),
+        (
+            "spec.models.privileged.max_tokens",
+            &models.privileged,
+            |m| m.max_tokens,
+        ),
+        (
+            "spec.models.quarantined.max_tokens",
+            &models.quarantined,
+            |m| m.max_tokens,
+        ),
+    ] {
+        if m.as_ref().and_then(ceiling) == Some(0) {
+            return Err(ManifestError::Unenforceable {
+                field,
+                detail: "a per-call token ceiling of zero fails every call the role \
+                         makes, since no prompt is empty and no answer is either — \
+                         raise it, or remove it",
+            });
+        }
+    }
+    Ok(())
+}
+
 impl OversightDeadline {
+    /// Refuse a count `n` that is not a positive integer: a deadline of zero or
+    /// fewer units is due, or overdue, the moment it is registered.
+    fn validate_count(&self, field: &str) -> Result<(), ManifestError> {
+        match self.params.get("n") {
+            Some(n) if n.as_i64().is_none_or(|n| n <= 0) => Err(ManifestError::Syntax(format!(
+                "{field}: '{}' counts {n} units; a deadline counts at least one",
+                self.name
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// The runtime shape, for registering the obligation.
     #[must_use]
     pub fn spec(&self) -> crate::core::DeadlineSpec {
@@ -780,6 +839,24 @@ pub enum ExecutionKind {
     /// return are hostile; choose `tool-calling` when the shape is the
     /// discovery.
     Planned,
+
+    /// Dispatch the one granted tool, with the run's input as its arguments.
+    ///
+    /// No model is declared or called: the caller — typically an agent
+    /// framework with a model of its own — chose the call, and this agent
+    /// governs it. The dispatch is a `planned` tool step's: the arguments are
+    /// held to the tool's declaration, and the grant, its protected fields,
+    /// the egress ceiling, the budget and the approval gate all apply; the
+    /// tool's result is the answer.
+    ///
+    /// `spec.input` binds, and is refused at parse unless every object in it
+    /// is closed (`additionalProperties: false`): the input is validated
+    /// against it, and then against the tool's declaration when there is
+    /// one, before any effect. Input a served caller supplies is untrusted, so a mutating
+    /// grant's authority-bearing fields need `allowed_sources` naming the
+    /// caller or a `one_of` menu — `require_trusted` refuses every served call.
+    /// Choose `planned` when the shape is a sequence.
+    Call,
 }
 
 impl ExecutionKind {
@@ -793,6 +870,7 @@ impl ExecutionKind {
             Self::Completion => "completion",
             Self::ToolCalling => "tool-calling",
             Self::Planned => "planned",
+            Self::Call => "call",
         }
     }
 }
@@ -1090,6 +1168,11 @@ pub struct Security {
     /// configured identity and against every delegating sink before dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_delegation_depth: Option<u8>,
+    /// Rules over a value's content, applied at admission, where an effect's
+    /// output arrives, and at sinks. They may refuse a value, raise its
+    /// sensitivity or redact it at a sink — never admit, trust or lower it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<crate::content::Content>,
 }
 
 /// What this agent offers, as capability strings.
@@ -1322,8 +1405,8 @@ pub struct ToolGrant {
     /// has room. A retry of one call spends once; an undo is counted and never
     /// refused.
     ///
-    /// Refused at parse: a zero count, a zero window or one longer than the
-    /// calendar, and a ceiling on an agent grant, which dispatches through
+    /// Refused at parse: a zero count, a zero window or one longer than 31
+    /// days (how long a store keeps the count), and a ceiling on an agent grant, which dispatches through
     /// `commission` where no rate is counted. Refused at build: a plane with no
     /// quota store to count in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1336,7 +1419,7 @@ pub struct ToolGrant {
 pub struct RateLimit {
     /// Calls admitted per window. At least one.
     pub count: u32,
-    /// The window, in seconds. At least one.
+    /// The window, in seconds. At least one, at most 31 days.
     pub window_seconds: u64,
 }
 
@@ -1713,6 +1796,7 @@ impl Manifest {
         self.validate_tool_grants()?;
         self.validate_rate_limits()?;
         self.validate_mutating_grants_can_fire()?;
+        self.validate_call()?;
         self.validate_agent_grants()?;
         self.validate_context_grants()?;
         self.validate_topology()?;
@@ -1721,6 +1805,9 @@ impl Manifest {
         self.validate_output()?;
         self.validate_declared_schemas()?;
         self.validate_memory()?;
+        if let Some(content) = &self.spec.security.content {
+            content.validate().map_err(ManifestError::Syntax)?;
+        }
         let mut tool_ids = std::collections::BTreeSet::new();
         for grant in &self.spec.tools {
             if grant.reference.trim().is_empty() {
@@ -1967,14 +2054,16 @@ impl Manifest {
                     grant.reference
                 )));
             }
-            if rate.window_seconds == 0 || rate.window_seconds > crate::core::MAX_WINDOW_SECONDS {
+            if rate.window_seconds == 0
+                || rate.window_seconds > crate::quota::MAX_RATE_WINDOW_SECONDS
+            {
                 return Err(ManifestError::Syntax(format!(
                     "spec.tools: '{}' declares a rate_limit window of {} seconds; a window \
-                     is at least one second and at most the {} seconds between the first \
-                     and last instant this runtime can name",
+                     is at least one second and at most {} (31 days), how long a store \
+                     keeps the count",
                     grant.reference,
                     rate.window_seconds,
-                    crate::core::MAX_WINDOW_SECONDS
+                    crate::quota::MAX_RATE_WINDOW_SECONDS
                 )));
             }
         }
@@ -2021,7 +2110,9 @@ impl Manifest {
     /// a question nobody asked.
     ///
     /// Together: `mutates: true` with no `protected_fields`, on a
-    /// `tool-calling` agent, is a grant that cannot fire. It reads to a
+    /// `tool-calling` agent, is a grant that cannot fire. A `call` agent's
+    /// arguments are its caller's input, which a served caller supplies
+    /// untrusted, so the same composition is refused there. It reads to a
     /// reviewer as *this specialist may dispatch, with a human in front of it*
     /// and is decoration — the same shape as a `quarantined` model nothing
     /// selects, found the same way, by running it rather than reading it. The
@@ -2042,7 +2133,10 @@ impl Manifest {
         let Some(execution) = &self.spec.execution else {
             return Ok(());
         };
-        if execution.kind != ExecutionKind::ToolCalling {
+        if !matches!(
+            execution.kind,
+            ExecutionKind::ToolCalling | ExecutionKind::Call
+        ) {
             return Ok(());
         }
         for grant in &self.spec.tools {
@@ -2051,6 +2145,22 @@ impl Manifest {
             // and the parser already refuses `mutates` on one.
             if grant.reference.starts_with("tool://agent/") {
                 continue;
+            }
+            if grant.mutates
+                && grant.protected_fields.is_empty()
+                && execution.kind == ExecutionKind::Call
+            {
+                return Err(ManifestError::Syntax(format!(
+                    "spec.tools: '{}' declares `mutates: true` with no `protected_fields`, \
+                     and this agent is `execution.kind: call`. A call's arguments are its \
+                     caller's input, and a served caller's input is untrusted, so a \
+                     mutating call with no field rules is refused by the taint gate on \
+                     every served run. Declare the authority-bearing arguments in \
+                     `protected_fields` — `allowed_sources` naming the caller \
+                     (`peer:<actor>`) or a `one_of` menu — or set `mutates: false` if the \
+                     call really does not change anything",
+                    grant.reference
+                )));
             }
             if grant.mutates && grant.protected_fields.is_empty() {
                 return Err(ManifestError::Syntax(format!(
@@ -2105,6 +2215,82 @@ impl Manifest {
                     grant.reference
                 )));
             }
+        }
+        Ok(())
+    }
+
+    /// A `call` agent is one grant and the input that fills it; a field a
+    /// `call` run would never read is refused rather than carried.
+    fn validate_call(&self) -> Result<(), ManifestError> {
+        if self.spec.execution.as_ref().map(|e| e.kind) != Some(ExecutionKind::Call) {
+            return Ok(());
+        }
+        if self.spec.tools.len() != 1 {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.tools",
+                detail: "a `call` agent dispatches exactly one grant with its input as the \
+                         arguments — none is nothing to call, and two is a choice nobody \
+                         makes. Grant one tool, or use `planned` for a sequence",
+            });
+        }
+        let Some(input) = &self.spec.input else {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.input",
+                detail: "a `call` agent's input is its tool's arguments, validated against \
+                         `spec.input` before anything is dispatched — declare the shape",
+            });
+        };
+        // The input *is* the arguments, so an open object is a caller adding
+        // arguments nobody reviewed — the rule a tool's declared `arguments`
+        // are held to, for the same reason.
+        if let Err(ManifestError::Syntax(detail)) =
+            Self::refuse_open_objects(&input.schema, "spec.input.schema")
+        {
+            let at = detail
+                .split(" declares")
+                .next()
+                .unwrap_or("spec.input.schema");
+            return Err(ManifestError::Syntax(format!(
+                "{at} declares an object without `additionalProperties: false`, and a \
+                 `call` agent's input is its tool's arguments — so a caller could send \
+                 arguments nobody reviewed. Close it, declaring every argument the call \
+                 may carry"
+            )));
+        }
+        if self.spec.models.is_some() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.models",
+                detail: "a `call` agent calls no model, so a declared one is read by \
+                         nothing — remove `spec.models`, or use `tool-calling` to let a \
+                         model choose the call",
+            });
+        }
+        if self.spec.memory.is_some() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.memory",
+                detail: "a `call` agent has no prompt to recall into and no model to form \
+                         memories with — remove `spec.memory`",
+            });
+        }
+        if self.spec.output.is_some() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.output",
+                detail: "a `call` agent answers with its tool's result, which no declared \
+                         output shape is applied to — remove `spec.output`",
+            });
+        }
+        if self
+            .spec
+            .oversight
+            .as_ref()
+            .is_some_and(|o| o.approval == Approval::Required)
+        {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.oversight.approval",
+                detail: "a `call` agent's answer exists only once its call has happened, so \
+                         approving the answer approves nothing — set `requires_approval: \
+                         true` on the grant and `approval: tools-only`",
+            });
         }
         Ok(())
     }
@@ -2312,6 +2498,8 @@ impl Manifest {
         if o.deadline.kind.trim().is_empty() {
             return Err(ManifestError::Empty("spec.oversight.deadline.kind"));
         }
+        o.deadline
+            .validate_count("spec.oversight.deadline.params.n")?;
         let gates_a_call = self.spec.tools.iter().any(|grant| grant.requires_approval);
         // `tools-only` with nothing asking for it gates nothing at all, and
         // reads in review as oversight that is present.
@@ -2431,13 +2619,13 @@ impl Manifest {
         // whole format refuses.
         if !matches!(
             self.spec.execution.as_ref().map(|e| e.kind),
-            Some(ExecutionKind::ToolCalling | ExecutionKind::Planned)
+            Some(ExecutionKind::ToolCalling | ExecutionKind::Planned | ExecutionKind::Call)
         ) {
             return Err(ManifestError::Unenforceable {
                 field: "spec.tools[].requires_approval",
-                detail: "per-call approval is applied by the `tool-calling` loop and the \
-                         `planned` executor; a hand-written skill chooses its own moment \
-                         to ask, and a `completion` agent calls no tools at all",
+                detail: "per-call approval is applied by the `tool-calling` loop, the \
+                         `planned` executor and a `call`; a hand-written skill chooses its \
+                         own moment to ask, and a `completion` agent calls no tools at all",
             });
         }
         Ok(())
@@ -2568,7 +2756,11 @@ impl Manifest {
         // and the builder is the backstop for that. What this adds is the
         // refusal arriving from `agentplane validate`, before a deploy, rather
         // than from whichever process first tried to assemble a plane.
-        if self.spec.execution.is_some()
+        if self
+            .spec
+            .execution
+            .as_ref()
+            .is_some_and(|e| e.kind != ExecutionKind::Call)
             && self
                 .spec
                 .models
@@ -2602,27 +2794,7 @@ impl Manifest {
             }
         }
 
-        // Zero input admits no call at all — every prompt carries at least
-        // one token — so the role could never answer. Refused for the reason
-        // a zero budget ceiling is: it is a wiring mistake, not a limit.
-        for (field, m) in [
-            (
-                "spec.models.privileged.max_input_tokens",
-                &models.privileged,
-            ),
-            (
-                "spec.models.quarantined.max_input_tokens",
-                &models.quarantined,
-            ),
-        ] {
-            if m.as_ref().and_then(|m| m.max_input_tokens) == Some(0) {
-                return Err(ManifestError::Unenforceable {
-                    field,
-                    detail: "a per-call input ceiling of zero fails every call the role \
-                             makes, since no prompt is empty — raise it, or remove it",
-                });
-            }
-        }
+        refuse_zero_ceilings(models)?;
 
         if let (Some(privileged), Some(quarantined)) = (&models.privileged, &models.quarantined)
             && privileged.provider == quarantined.provider
@@ -2718,6 +2890,8 @@ impl Manifest {
                     "spec.oversight.triage[].deadline.kind",
                 ));
             }
+            rule.deadline
+                .validate_count("spec.oversight.triage[].deadline.params.n")?;
             if !names.insert(rule.name.as_str()) {
                 return Err(ManifestError::Syntax(format!(
                     "spec.oversight.triage: two rules are both named '{}' — a worklist \
@@ -3152,6 +3326,26 @@ impl Manifest {
     #[must_use]
     pub fn input_schema(&self) -> Option<&serde_json::Value> {
         self.spec.input.as_ref().map(|i| &i.schema)
+    }
+
+    /// Whether a run of this agent may suspend, judged from the declaration.
+    ///
+    /// `is_peer` answers whether a grant's server is wired as an A2A peer,
+    /// which only the plane knows. True for oversight, a grant asking for
+    /// approval, an agent grant, a peer grant, and a coded skill (no
+    /// `spec.execution`), whose body this cannot see into. Conservative: a
+    /// false *true* withholds a tool from a host that cannot hold a task; a
+    /// false *false* is caught when the run suspends.
+    #[must_use]
+    pub fn may_suspend(&self, is_peer: impl Fn(&str) -> bool) -> bool {
+        self.spec.execution.is_none()
+            || self.spec.oversight.is_some()
+            || self.spec.tools.iter().any(|grant| {
+                grant.requires_approval
+                    || crate::tools::ToolId::parse(&grant.reference).is_none_or(|id| {
+                        id.server == crate::tools::AGENT_SERVER || is_peer(&id.server)
+                    })
+            })
     }
 
     /// The budget this manifest declares.

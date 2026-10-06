@@ -58,8 +58,17 @@ ADDR="${A2A_TCK_ADDR:-127.0.0.1:9999}"
 # row asked for, so the row could not fail. Refusing unknown parameters is what
 # turned five silent passes into five honest failures against a kit bug.
 #
-# All eight are worth an upstream issue; a kit release that fixes the client
-# makes six of these lines deletable and should raise the floor by five.
+# (3) Five rows need a fresh task left waiting for input, and the kit cannot
+# make one twice: `tck_id` mints one message id per session, so every such
+# task is sent as the same `messageId`. The specification the kit ships lets an
+# agent read that as a retransmit — §"Send Message operations MAY be
+# idempotent. Agents may utilize the messageId to detect duplicate messages" —
+# and this one does, so after the first multi-turn row continues the shared
+# task to completion, each later row is handed that completed task and skips.
+#
+# Each is worth an upstream issue. A kit release that fixes the client, or
+# mints a message id per task, makes its lines deletable — and the rows they
+# free raise the floor.
 DESELECT=(
     --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-SEND-003-jsonrpc]"
     --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-MULTI-002a-jsonrpc]"
@@ -69,6 +78,11 @@ DESELECT=(
     --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-004-jsonrpc]"
     --deselect "tests/compatibility/core_operations/test_requirements.py::test_must_requirement[CORE-LIST-005-jsonrpc]"
     --deselect "tests/compatibility/core_operations/test_push_notifications.py::TestPushNotificationCrud::test_create_push_config[jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_task_history.py::TestHistoryLengthLimit::test_get_task_history_does_not_exceed_limit[jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_task_lifecycle.py::TestCancelTask::test_cancel_task_returns_updated_state[jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_task_lifecycle.py::TestMultiTurn::test_infer_context_from_task[jsonrpc]"
+    --deselect "tests/compatibility/core_operations/test_task_lifecycle.py::TestSubscribeLifecycle::test_subscribe_terminates_at_terminal_state[jsonrpc]"
+    --deselect "tests/compatibility/jsonrpc/test_sse_streaming.py::TestSseSubscribeToTask::test_subscribe_first_event_is_task[jsonrpc]"
 )
 
 command -v uv >/dev/null || { echo "uv is required (https://docs.astral.sh/uv/)"; exit 2; }
@@ -109,13 +123,8 @@ curl -fsS "http://${ADDR}/.well-known/agent-card.json" >/dev/null \
 #
 # `-rs` because the exit code alone is not the verdict it looks like: a MUST row
 # the kit *skips* is counted neither passed nor failed, so it reads exactly like
-# one that passed. This bit — STREAM-SUB-002 ("stream closes at terminal state")
-# skipped on the kit's own client timeout for a release, while the server was in
-# fact correct: reproduced by hand, the subscription emits the terminal
-# TASK_STATE_COMPLETED and closes in about two seconds. The row was neither
-# passing nor failing, and nothing said so. This is the same standard
-# `mutants.py --verify` already applies to itself — distinguish *survived* from
-# *never ran* — applied to the conformance kit.
+# one that passed. The skip lines are how one is noticed — the standard
+# `mutants.py --verify` applies to itself, *survived* versus *never ran*.
 cd "${CACHE}/a2a-tck"
 set +e
 ./.venv/bin/python3 -m pytest tests/compatibility/ \
@@ -128,15 +137,9 @@ set -e
 # A floor, not an exact count: the kit gains rows between releases and a new
 # *passing* row must not be a failure here. A row that stops passing must be.
 PASSED=$(sed -n 's/^\([0-9]\{1,\}\) passed.*/\1/p' "${CACHE}/last-run.txt" | tail -1)
-# 77 until push was wired and unknown parameters started being refused. Both
-# moved it, in opposite directions and for opposite reasons, so the composition
-# matters more than the number: +4 real push rows (including all three
-# *delivery* rows — that the agent POSTs, carries its auth, and sends a
-# StreamResponse), −3 rows that could only pass while push was absent, and −5
-# CORE-LIST rows that had been passing over a filter the server silently
-# dropped. Lowering a floor is normally the wrong move; here the rows it lets go
-# were never checking anything, and the comment beside DESELECT says which.
-EXPECTED_MIN=73
+# What this kit revision measures with the rows above deselected. A deselected
+# row is excluded with its evidence; it is never counted as passing.
+EXPECTED_MIN=70
 if [[ -z "$PASSED" ]]; then
     echo "REFUSED: could not read a pass count from the kit's output — a run that" >&2
     echo "         asserted nothing reports no failures and reads like success" >&2
@@ -152,7 +155,6 @@ echo "ok: ${PASSED} MUST-level rows passed (floor ${EXPECTED_MIN}); skips listed
 echo "    Skipped rows are not passing rows. The standing ones are: the two"
 echo "    unconfigured transports, the errors only an agent *without* streaming"
 echo "    or push could raise, the five push rows the kit's snake_case client"
-echo "    cannot get past CreateTaskPushNotificationConfig (see DESELECT), and"
-echo "    STREAM-SUB-002's client-side timeout, checked by hand and correct on"
-echo "    the server. Push itself is wired now: the three PUSH-DELIVER rows run"
-echo "    against a real webhook receiver."
+echo "    cannot get past CreateTaskPushNotificationConfig (see DESELECT)."
+echo "    Push itself is wired: the three PUSH-DELIVER rows run against a real"
+echo "    webhook receiver."

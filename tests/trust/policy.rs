@@ -624,6 +624,7 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 ),
                 Append::new(
@@ -984,6 +985,51 @@ async fn admission_and_effects_are_asked_under_the_same_principal() {
     assert!(
         seen.iter().all(|(_, principal)| principal == "user:rita"),
         "every gate must ask under the run's chain subject: {seen:?}"
+    );
+}
+
+/// A rule naming a subject does not match a capability that shares its name.
+///
+/// A chainless run is asked under its capability and a chained run under its
+/// subject; with one entity type for both, a grant to the person `pay` would
+/// admit every chainless run of the capability `pay`.
+#[cfg(feature = "cedar")]
+#[tokio::test]
+async fn a_subject_rule_does_not_match_a_capability_of_the_same_name() {
+    use agentplane::core::{Delegation, Principal, Scope};
+    use agentplane::runtime::RunTerms;
+
+    let engine: Arc<dyn PolicyEngine> = Arc::new(
+        agentplane::policy::CedarEngine::new(
+            r#"permit(principal == Subject::"pay", action, resource);"#,
+        )
+        .unwrap(),
+    );
+    let store = db();
+    let world: World = Arc::default();
+    let rt = runtime(&store, &world, Some(Arc::clone(&engine)));
+
+    let chainless = rt.run("pay", Tainted::trusted(json!({}))).await;
+    assert!(
+        chainless.is_err(),
+        "a capability named `pay` was admitted by a rule for the subject `pay`"
+    );
+
+    let subject = Delegation::root(Principal::new("pay", Scope::of(["pay"])));
+    let chained = rt
+        .run_under(
+            "pay",
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(subject),
+        )
+        .await
+        .expect("the subject the rule names is admitted")
+        .outcome()
+        .cloned()
+        .expect("fresh");
+    assert!(
+        matches!(chained.status, RunStatus::Succeeded),
+        "{chained:?}"
     );
 }
 
@@ -1681,6 +1727,7 @@ fn the_action_predicates_separate_the_gates_and_claim_nothing_else() {
     let at = |action: &str| {
         let request = PolicyRequest {
             principal: "agent:triage",
+            principal_kind: agentplane::core::PrincipalKind::Subject,
             action,
             resource: "tool.call",
             context: &context,
@@ -1878,4 +1925,115 @@ impl agentplane::core::PolicyEngine for PermitsReleases {
             "test/permits-releases-v1",
         )
     }
+}
+
+// ── Undo is judged too ──────────────────────────────────────────────────────
+
+/// Charges, and refunds on compensation.
+#[derive(Debug)]
+struct Charges {
+    world: World,
+}
+
+#[async_trait::async_trait]
+impl Skill for Charges {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("charge").provides("charge")
+    }
+    fn compensation(&self) -> agentplane::core::Compensation {
+        agentplane::core::Compensation::Compensatable
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.effect(Touch {
+            kind: "ledger.charge",
+            world: Arc::clone(&self.world),
+        })
+        .await?;
+        Ok(Outcome::done(Tainted::trusted(json!({ "charged": true }))))
+    }
+    async fn compensate(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _out: &Tainted<Value>,
+    ) -> Result<(), SkillError> {
+        cx.effect(Touch {
+            kind: "ledger.refund",
+            world: Arc::clone(&self.world),
+        })
+        .await?;
+        Ok(())
+    }
+}
+
+/// Fails cleanly, so the run unwinds.
+#[derive(Debug)]
+struct Breaks;
+
+#[async_trait::async_trait]
+impl Skill for Breaks {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("break").provides("break")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _i: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::fail("the order was rejected"))
+    }
+}
+
+/// **A compensation's effects are authorized like any other.**
+///
+/// Undo is exempt from the run's budget — refusing to undo is how a run ends
+/// with a charged card and no order — but not from the policy. A compensation
+/// is code the agent runs against the world, and one that bypassed the gate
+/// would be a door to any effect the policy refuses. A refused undo cannot be
+/// finished and cannot be pretended away, so the run quarantines for a person
+/// to decide, with the refusal on the record.
+#[tokio::test]
+async fn a_compensation_the_policy_refuses_quarantines_instead_of_running() {
+    use agentplane::core::{ArgSource, Phase, PlanNode, StepId};
+
+    let store = db();
+    let world: World = Arc::default();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("policy")
+        .skill(Charges {
+            world: Arc::clone(&world),
+        })
+        .skill(Breaks)
+        .policy(Arc::new(Refuses("ledger.refund")))
+        .build();
+    let plan = PlanIR::new(vec![
+        PlanNode::new(0, "charge").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "break")
+            .arg("x", ArgSource::node(StepId(0)))
+            .terminal(),
+    ]);
+    let out = rt
+        .run_plan(plan, Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(out.status, RunStatus::Quarantined(_)),
+        "a refused undo must stop for a person, got {:?}",
+        out.status
+    );
+    assert_eq!(
+        *world.lock().unwrap(),
+        vec!["ledger.charge".to_string()],
+        "the refund the policy refuses reached the world"
+    );
+    let records = store.read(out.run_id, 1).await.unwrap();
+    assert!(
+        records.iter().any(|r| r.body.phase == Phase::Compensating
+            && matches!(r.kind(), RecordKind::PolicyDenied { resource, .. } if resource == "ledger.refund")),
+        "the refused undo is not on the record"
+    );
 }

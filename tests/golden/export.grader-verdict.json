@@ -1,0 +1,13 @@
+{
+  "kind": "agentplane.grader-verdict",
+  "version": 1,
+  "run": "run_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "last_seq": 2,
+  "last_hash": "c09824a660068fe10a54fdb7cb5e48455e21dd721ca21cf09edfd0358e115f1a",
+  "open": true,
+  "content": "cGFzcw==",
+  "signature": {
+    "key_id": "golden-grader",
+    "signature": "33d8fed222684ec2cda565d436ada7f40dceb09249f6df015ed1cefb593a519a4307306efdd092199a31286af267acfedb20cdb6208d54fc7fc8c7efc8b78e00"
+  }
+}

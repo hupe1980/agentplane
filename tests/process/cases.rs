@@ -940,6 +940,8 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
         transitions: Arc::clone(&transitions),
         escalation_fails: false,
         settles_on_due: std::sync::Mutex::default(),
+        attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
+        replaces_on_release: std::sync::Mutex::new(None),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&counted))
@@ -1700,7 +1702,19 @@ struct InstrumentedCases {
     /// Obligations a run meets — and whose case it then closes — between the
     /// sweep's `due` read and its writes.
     settles_on_due: std::sync::Mutex<Vec<(agentplane::core::CaseId, &'static str)>>,
+    /// The next `attach_run` kills the process: [`CRASH_AFTER_ATTACH`] once
+    /// the row has landed, [`CRASH_BEFORE_ATTACH`] before it does. With
+    /// [`ATTACH_FAILS`] it returns an error instead.
+    attach_crashes: std::sync::atomic::AtomicU8,
+    /// A hold the next conditional release places after releasing the
+    /// standing one — another release and a re-place inside its window.
+    replaces_on_release: std::sync::Mutex<Option<agentplane::core::LegalHold>>,
 }
+
+const NO_CRASH: u8 = 0;
+const CRASH_AFTER_ATTACH: u8 = 1;
+const CRASH_BEFORE_ATTACH: u8 = 2;
+const ATTACH_FAILS: u8 = 3;
 
 #[async_trait::async_trait]
 impl CaseStore for InstrumentedCases {
@@ -1716,6 +1730,18 @@ impl CaseStore for InstrumentedCases {
         case: agentplane::core::CaseId,
     ) -> Result<bool, agentplane::core::StoreError> {
         self.inner.release_hold(case).await
+    }
+    async fn release_hold_if(
+        &self,
+        case: agentplane::core::CaseId,
+        standing: &agentplane::core::LegalHold,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        let replacement = self.replaces_on_release.lock().expect("lock").take();
+        if let Some(replacement) = replacement {
+            self.inner.release_hold(case).await?;
+            self.inner.place_hold(case, &replacement).await?;
+        }
+        self.inner.release_hold_if(case, standing).await
     }
     async fn hold(
         &self,
@@ -1747,13 +1773,6 @@ impl CaseStore for InstrumentedCases {
     ) -> Result<Correlation, agentplane::core::StoreError> {
         self.inner.correlate_or_open(kind, keys, at).await
     }
-    async fn detach_run(
-        &self,
-        case: agentplane::core::CaseId,
-        run: agentplane::RunId,
-    ) -> Result<bool, agentplane::core::StoreError> {
-        self.inner.detach_run(case, run).await
-    }
     async fn case(
         &self,
         id: agentplane::core::CaseId,
@@ -1780,7 +1799,24 @@ impl CaseStore for InstrumentedCases {
         case: agentplane::core::CaseId,
         run: agentplane::core::RunId,
     ) -> Result<(), agentplane::core::StoreError> {
-        self.inner.attach_run(case, run).await
+        let crash = self
+            .attach_crashes
+            .swap(NO_CRASH, std::sync::atomic::Ordering::SeqCst);
+        assert_ne!(
+            crash, CRASH_BEFORE_ATTACH,
+            "the process died before attaching"
+        );
+        if crash == ATTACH_FAILS {
+            return Err(agentplane::core::StoreError::Backend(
+                "instrumented failure".to_owned(),
+            ));
+        }
+        self.inner.attach_run(case, run).await?;
+        assert_ne!(
+            crash, CRASH_AFTER_ATTACH,
+            "the process died after attaching"
+        );
+        Ok(())
     }
     async fn link_blob(
         &self,
@@ -1951,6 +1987,8 @@ async fn strict_replay_does_not_re_register_an_obligation() {
         transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         escalation_fails: false,
         settles_on_due: std::sync::Mutex::default(),
+        attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
+        replaces_on_release: std::sync::Mutex::new(None),
     });
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(cases)
@@ -2037,6 +2075,8 @@ async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding
         transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         escalation_fails: true,
         settles_on_due: std::sync::Mutex::default(),
+        attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
+        replaces_on_release: std::sync::Mutex::new(None),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&crashing))
@@ -2148,6 +2188,8 @@ async fn an_obligation_met_during_the_sweep_is_not_breached() {
         transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         escalation_fails: false,
         settles_on_due: std::sync::Mutex::new(vec![(met, "respond-by"), (warned, "respond-by")]),
+        attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
+        replaces_on_release: std::sync::Mutex::new(None),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(racing as Arc<dyn CaseStore>)
@@ -2338,5 +2380,159 @@ async fn a_breach_whose_notes_were_lost_is_noted_by_the_next_tick_once() {
     assert_eq!(
         notes, 1,
         "a breach the sweep applied was noted {notes} times across the ticks after the crash"
+    );
+}
+
+// ── A case lists exactly the runs that exist ────────────────────────────────
+
+/// Finishes at once.
+#[derive(Debug)]
+struct Answers;
+
+#[async_trait::async_trait]
+impl Skill for Answers {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("answers").provides("demo.answers")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, agentplane::core::SkillError> {
+        Ok(Outcome::done(input))
+    }
+}
+
+/// Admit a correlated run whose process dies inside `attach_run`, let its
+/// lease lapse, and sweep. Returns the case's runs and the runs with a
+/// journal.
+async fn crash_in_attach(when: u8) -> (Vec<agentplane::RunId>, Vec<agentplane::RunId>) {
+    use std::time::Duration;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::new(InstrumentedCases {
+        inner: Arc::clone(&store) as Arc<dyn CaseStore>,
+        registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        escalation_fails: false,
+        settles_on_due: std::sync::Mutex::default(),
+        attach_crashes: std::sync::atomic::AtomicU8::new(when),
+        replaces_on_release: std::sync::Mutex::new(None),
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases) as Arc<dyn CaseStore>)
+        .lease_ttl(Duration::from_secs(2))
+        .skill(Answers)
+        .build();
+
+    let admitting = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move {
+            rt.run_correlated(
+                "demo.answers",
+                Tainted::trusted(json!({})),
+                "matter",
+                &[key("matter", "M-1")],
+            )
+            .await
+        })
+    };
+    assert!(admitting.await.is_err(), "the admission was meant to die");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    rt.sweep(Timestamp::now_utc(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+
+    let case = store
+        .correlate(&[key("matter", "M-1")])
+        .await
+        .unwrap()
+        .expect("the case was opened");
+    let listed = store.case(case).await.unwrap().expect("the case").runs;
+    let mut journaled = Vec::new();
+    for run in &listed {
+        if !(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .read(*run, 1)
+            .await
+            .unwrap()
+            .is_empty()
+        {
+            journaled.push(*run);
+        }
+    }
+    (listed, journaled)
+}
+
+/// **A case never lists a run that does not exist.**
+///
+/// The process dies after the case row lands. Attached before the admission's
+/// append, the case would list a run no journal holds, and the sweep — which
+/// finds the lease over an empty journal — cannot tell which case to take it
+/// off. Attached after the append, the run exists and the sweep finishes it.
+#[tokio::test]
+async fn a_crash_while_attaching_leaves_no_run_the_journal_lacks() {
+    let (listed, journaled) = crash_in_attach(CRASH_AFTER_ATTACH).await;
+    assert_eq!(listed, journaled, "the case lists a run no journal holds");
+}
+
+/// **A case lists every run bound to it.**
+///
+/// The process dies after the admission's append and before the case row
+/// lands. The run exists and names its case; the recovery that resumes it
+/// attaches it, as every resume does.
+#[tokio::test]
+async fn a_crash_before_attaching_is_attached_by_the_recovery() {
+    let (listed, journaled) = crash_in_attach(CRASH_BEFORE_ATTACH).await;
+    assert_eq!(listed.len(), 1, "the recovered run is not on its case");
+    assert_eq!(listed, journaled);
+}
+
+/// **A run whose registration failed is concluded over the head it sits on.**
+///
+/// Its admission records are already durable, so the refusal concludes it in
+/// the chain; an audit reading that conclusion must find it sound.
+#[tokio::test]
+async fn a_refused_registration_concludes_over_its_own_head() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let cases = Arc::new(InstrumentedCases {
+        inner: Arc::clone(&store) as Arc<dyn CaseStore>,
+        registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        escalation_fails: false,
+        settles_on_due: std::sync::Mutex::default(),
+        attach_crashes: std::sync::atomic::AtomicU8::new(ATTACH_FAILS),
+        replaces_on_release: std::sync::Mutex::new(None),
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&cases) as Arc<dyn CaseStore>)
+        .skill(Answers)
+        .build();
+    rt.run_correlated(
+        "demo.answers",
+        Tainted::trusted(json!({})),
+        "matter",
+        &[key("matter", "M-1")],
+    )
+    .await
+    .expect_err("the registration was refused");
+
+    let journal = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let runs = journal.runs_by_id(None, 10).await.unwrap();
+    assert_eq!(runs.len(), 1, "the admission wrote no run");
+    let records = journal.read(runs[0], 1).await.unwrap();
+    assert!(
+        matches!(
+            records.last().map(agentplane::journal::Record::kind),
+            Some(agentplane::journal::RecordKind::RunConcluded { .. })
+        ),
+        "the refused run was left open"
+    );
+    let report = agentplane::audit::audit(&journal, &runs, &agentplane::audit::Evidence::default())
+        .await
+        .unwrap();
+    assert!(
+        report.sound.contains(&runs[0]),
+        "a run concluded after a refused registration audits as tampered: {:#?}",
+        report.findings
     );
 }

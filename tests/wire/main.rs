@@ -18,11 +18,14 @@
 mod a2a_interop;
 mod a2a_server;
 mod api;
+mod dev;
 mod drivers;
 mod mcp;
+mod mcp_http;
 mod mcp_server;
 mod media;
 mod model;
 mod outbox;
+mod token_exchange;
 mod tools;
 mod witness_http;

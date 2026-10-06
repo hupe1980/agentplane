@@ -376,6 +376,7 @@ async fn a_sealed_run_is_committed_to() {
 /// signatures leave with it. The only thing that notices is a commitment to the
 /// *set*, and only if a root was published before the deletion.
 #[tokio::test]
+#[cfg(feature = "testkit")]
 async fn deleting_a_run_breaks_the_published_root() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let runs = sealed_runs(&store, 6).await;
@@ -465,6 +466,7 @@ async fn an_unsealed_run_is_not_in_the_log() {
 /// after it down by one. That is unavoidable and harmless — it is what the
 /// consistency proof reports.
 #[tokio::test]
+#[cfg(feature = "testkit")]
 async fn a_new_run_is_appended_after_the_survivors() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let runs = sealed_runs(&store, 3).await;
@@ -591,6 +593,9 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
         fn is_shared(&self) -> bool {
             self.0.is_shared()
         }
+        fn seals(&self) -> bool {
+            self.0.seals()
+        }
         fn tenant(&self) -> &str {
             self.0.tenant()
         }
@@ -671,6 +676,13 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
 
         async fn count_by_outcome(&self, outcome: &str) -> Result<u64, StoreError> {
             self.0.count_by_outcome(outcome).await
+        }
+        async fn runs_by_id(
+            &self,
+            after: Option<RunId>,
+            limit: usize,
+        ) -> Result<Vec<RunId>, StoreError> {
+            self.0.runs_by_id(after, limit).await
         }
         async fn recent_runs(
             &self,
@@ -789,6 +801,7 @@ async fn a_sealing_record_claiming_a_foreign_head_is_a_finding() {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             ),
             Append::new(
@@ -850,6 +863,7 @@ async fn run_holding(
             idempotency_key: None,
             admitted_by: None,
             served_unchained: false,
+            plane_chain: false,
         },
     )];
     records.extend(body.into_iter().map(|k| Append::new(run, k)));
@@ -962,6 +976,7 @@ async fn a_sealed_run_with_an_unsettled_group_is_a_finding() {
 /// proves inclusion in the log *as it now stands*. With one, the same store
 /// fails.
 #[tokio::test]
+#[cfg(feature = "testkit")]
 async fn only_an_outside_checkpoint_detects_a_deletion() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let runs = sealed_runs(&store, 5).await;
@@ -1088,6 +1103,7 @@ async fn an_audit_with_a_key_checks_who_wrote_it() {
             anchors: &held,
             verifier: Some(&verifier),
             require_signatures: true,
+            freshness: None,
         },
     )
     .await
@@ -1109,6 +1125,7 @@ async fn an_audit_with_a_key_checks_who_wrote_it() {
             anchors: &held,
             verifier: Some(&wrong),
             require_signatures: true,
+            freshness: None,
         },
     )
     .await
@@ -1412,6 +1429,7 @@ async fn every_verified_run_is_warranted_or_reported_as_unadmitted() {
                 idempotency_key: None,
                 admitted_by: None,
                 served_unchained: false,
+                plane_chain: false,
             },
         )],
     )
@@ -1725,6 +1743,9 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
         fn is_shared(&self) -> bool {
             self.inner.is_shared()
         }
+        fn seals(&self) -> bool {
+            self.inner.seals()
+        }
         async fn read(&self, run: RunId, from: Seq) -> Result<Vec<Record>, StoreError> {
             self.inner.read(run, from).await
         }
@@ -1765,6 +1786,13 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
             limit: usize,
         ) -> Result<Vec<agentplane::journal::WaitingRun>, StoreError> {
             self.inner.waiting_runs(limit).await
+        }
+        async fn runs_by_id(
+            &self,
+            after: Option<RunId>,
+            limit: usize,
+        ) -> Result<Vec<RunId>, StoreError> {
+            self.inner.runs_by_id(after, limit).await
         }
         async fn recent_runs(
             &self,
@@ -1972,6 +2000,7 @@ async fn an_audit_report_carries_no_caller_payload() {
 /// that observer is who an investigator asks for the history the store no
 /// longer has.
 #[tokio::test]
+#[cfg(feature = "testkit")]
 async fn a_fork_is_caught_by_the_shorter_anchor_the_highest_would_have_hidden() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let runs = sealed_runs(&store, 5).await;
@@ -2085,4 +2114,26 @@ impl agentplane::core::PolicyEngine for PermitsReleases {
             "test/permits-releases-v1",
         )
     }
+}
+
+/// A small-order key is not trusted: under one, a signature verifies without
+/// anybody's secret, so trusting it would make every forged record "signed".
+#[test]
+fn a_small_order_key_is_not_trusted() {
+    // The identity point, encoded: y = 1, x = 0. Small order (1).
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    assert!(
+        Ed25519Verifier::new().trust("weak", &identity).is_err(),
+        "the identity point was trusted as a record key"
+    );
+    assert!(
+        Ed25519Verifier::new()
+            .trust(
+                "plane-a",
+                &Ed25519Signer::new("x", &PLANE_A).verifying_key()
+            )
+            .is_ok(),
+        "an ordinary key was refused"
+    );
 }

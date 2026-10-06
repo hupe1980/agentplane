@@ -12,6 +12,12 @@ correct, and that are hardest to convince yourself of by reading code:
 | [`Fencing.tla`](Fencing.tla) | Can a paused instance wake up after its run was taken over and still land a write? |
 | [`Authorization.tla`](Authorization.tla) | Can a replay re-open a decision policy already made, and is a refusal always on the record? |
 | [`Delegation.tla`](Delegation.tla) | Can authority grow as it is passed on, and is a chain read from storage trusted or re-checked? |
+| [`Quota.tla`](Quota.tla) | Can a period's admitted work settle past its ceiling — through suspended holds, crashes, recovery, a period boundary mid-pass or a resume in a later period — and does one tenant's ceiling ever refuse another's work? |
+| [`RateWindow.tla`](RateWindow.tla) | Does a rate ceiling hold over every window ending now, with a retry spending once and two runs' identical calls each spending? |
+| [`SinkGate.tla`](SinkGate.tla) | Is every value judged where it is sent live — a resume's live tail included — and is a recorded verdict read back on replay rather than judged again under an edited configuration? |
+| [`KeyLifecycle.tla`](KeyLifecycle.tla) | Is an outage ever reported as an erasure, does a rotation drop a version still admitted, and can a destroyed scope be written into again? |
+| [`Delivery.tla`](Delivery.tla) | Is each inbound message journaled once, by the one wait that took it — through crashes between store and match, a run concluding first, a second turn on one key, and a message sent to one run by name — and is a timer's wake recorded at most once? |
+| [`TaskDelivery.tla`](TaskDelivery.tla) | Does a human task's answer reach its run at most once, never after its conclusion, and is a decider told the truth when the run concluded first? |
 | [`Equivocation.tla`](Equivocation.tla) | An operator shows two histories of one log. Which reader still sees it — and which way of combining several witnesses' answers stops seeing it? |
 
 These check the **design**. The implementation is checked against deliberately
@@ -30,21 +36,31 @@ them is checked too:
 | Spec | Result | State space |
 |---|---|---|
 | `EffectProtocol` | verified | 113 distinct states |
-| `RetrySafety` | verified | 493 distinct states |
+| `RetrySafety` | verified | 30265 distinct states |
 | `Saga` | verified | 63 distinct states |
 | `EffectGroup` | verified | 110 distinct states |
 | `Fencing` | verified | 231 distinct states |
 | `Authorization` | verified | 32 distinct states |
 | `Delegation` | verified | 9510 distinct states |
 | `Equivocation` | verified | 7086 distinct states |
+| `Quota` | verified | 333716 distinct states |
+| `RateWindow` | verified | 196 distinct states |
+| `SinkGate` | verified | 190 distinct states |
+| `KeyLifecycle` | verified | 408 distinct states |
+| `Delivery` | verified | 62676 distinct states |
+| `TaskDelivery` | verified | 32 distinct states |
 
 The counts are TLC's `distinct states found`, and the command below is what
 derives them — if a number here disagrees with what it prints, the number
 here is the one that is wrong:
 
 ```sh
-tla/verify.sh          # Docker; no local Java needed
+tla/verify.sh              # Docker; no local Java needed
+tla/verify.sh --only Quota  # one spec and its mutants
 ```
+
+Every `.tla` here is checked: there is no list to add a new spec to, and one
+without a `.cfg` fails the run.
 
 ## Why the mutants matter more than the specs
 
@@ -89,6 +105,47 @@ specific invariant written for it (see [`mutations.py`](mutations.py)):
 | A chain loaded from storage is trusted rather than re-checked | `Delegation` | `RehydratedChainsAreWellFormed` |
 | Policy is re-evaluated while replaying a recorded run | `Authorization` | `ReplayNeverConsultsPolicy` |
 | A run stops on a denial without recording it | `Authorization` | `DenialIsDurable` |
+| The effect protocol is checked without the fairness its termination needs | `EffectProtocol` | `Terminates` (property) |
+| The slot count skips a crashed or sealed run still holding its row | `Quota` | `AdmissionsWithinCeiling` |
+| A recorded pass is settled again without checking its receipt | `Quota` | `PassSettledOnce` |
+| A pass is settled into the current period, not the one it started in | `Quota` | `SpendInAdmittedPeriod` |
+| The slot count is shared between tenants | `Quota` | `TenantsIndependent` |
+| Admission checks settled spend and ignores outstanding holds | `Quota` | `PeriodSpendWithinCeiling` |
+| A resume does not carry its remainder into the period it resumes in | `Quota` | `CarriedHoldFollowsTheResume` |
+| A resumed pass writes its marker before it has written anything | `Quota` | `NoMarkerNoSettlement` |
+| A resume waits for a free slot | `Quota` | `SuspendedRunsResume` (property) |
+| The sweep never releases a sealed run's slot | `Quota` | `SealedSlotEventuallyReleased` (property) |
+| The count is a fixed bucket rather than the window ending now | `RateWindow` | `RateWithinWindow` |
+| The reservation is keyed by the attempt, not the dispatch | `RateWindow` | `RetrySpendsOnce` |
+| The reservation is keyed by the call, so two runs share a row | `RateWindow` | `EveryDispatchCounted` |
+| A failed call's reservation is refunded | `RateWindow` | `RowsNeverRefunded` |
+| A full window makes the dispatch wait rather than refuse | `RateWindow` | `EveryDispatchAnswered` (property) |
+| The gate is skipped for the whole of a resumed pass | `SinkGate` | `NoSinkWithoutCoveringRelease` |
+| A replay re-judges a recorded refusal against the current configuration | `SinkGate` | `ReplayReproducesRefusal` |
+| A replay sends a recorded send again | `SinkGate` | `SentOnce` |
+| A refused send leaves the run stuck at that step | `SinkGate` | `EverySendIsDecided` (property) |
+| An outage is answered as a destroyed scope | `KeyLifecycle` | `OutageIsNotErasure` |
+| A rotation stops admitting the versions before it | `KeyLifecycle` | `NamedVersionAdmitted` |
+| A second destruction rewrites the first one's reason | `KeyLifecycle` | `ErasureIdempotent` |
+| A destroyed scope still hands out a data key | `KeyLifecycle` | `NoWriteIntoErasedScope` |
+| A read abandons its payload on the first outage | `KeyLifecycle` | `OutageEventuallyAnswered` (property) |
+| A wait recovers any claim of its run, consumed or not | `Delivery` | `ConsumedExactlyOnce` |
+| A wait already holding a claim takes another, which its retirement sheds | `Delivery` | `EveryMessageReachesAWaiter` (property) |
+| A message for a run not waiting is buffered for whoever waits | `Delivery` | `TargetedReachesOnlyItsRun` |
+| A closed run's unconsumed addressed message is offered to another run | `Delivery` | `TargetedReachesOnlyItsRun` |
+| A delivery journals an answer for a run whose conclusion is durable | `Delivery` | `NoAnswerAfterConclusion` |
+| A targeted delivery claims a message it never stored | `Delivery` | `DurableBeforeMatch` |
+| The dedup key is the id alone, so another producer's message is a duplicate | `Delivery` | `CollidingIdsAreDistinct` |
+| The matching path ignores a wait's named sender | `Delivery` | `SenderFilterHolds` |
+| A re-fired timer records its wake again | `Delivery` | `OneWakePerTimer` |
+| A timer wakes a run whose conclusion is durable | `Delivery` | `NoWakeAfterConclusion` |
+| A counterparty's retry is answered from the dedup and never matched | `Delivery` | `EveryMessageReachesAWaiter` (property) |
+| A closed run's unconsumed message stays claimed for it | `Delivery` | `EveryMessageReachesAWaiter` (property) |
+| A decision is journaled for a run whose conclusion is durable | `TaskDelivery` | `NoDecisionReachesAConcludedRun` |
+| A second answer to the task is journaled as another decision | `TaskDelivery` | `OneDecisionPerTask` |
+| A decision that lost to the run's conclusion is reported as delivered | `TaskDelivery` | `DeciderToldTheTruth` |
+| A settlement moves a task that is no longer pending | `TaskDelivery` | `WithdrawnStaysWithdrawn` |
+| A concluded run's pending task is never withdrawn | `TaskDelivery` | `NoTaskOutlivesItsRun` (property) |
 
 Tripping the top-level `Safety` conjunction is not accepted: that shows only
 that *something* broke. Each generated config names one invariant so a mutation
@@ -365,6 +422,27 @@ assumptions explicitly rather than leaving them implied:
   (`Rehydrate \/ RejectRehydrate` — one of the two is enabled in every stored
   state) and checks `EveryChainIsJudged`: a chain that is built is eventually
   stored and then accepted or refused, however storage is tampered with.
+
+- `Quota` assumes weak fairness on `Resume`, on a sealed run's own slot
+  release and on the sweep, and checks `SuspendedRunsResume` and
+  `SealedSlotEventuallyReleased`. A deployment that schedules no sweep keeps a
+  dead instance's sealed slot; the property says what the sweep is for.
+- `RateWindow` assumes weak fairness on `Reserve` and checks
+  `EveryDispatchAnswered`: a dispatch is sent or refused, never left waiting
+  for room. Time is not assumed to advance.
+
+- `SinkGate` assumes weak fairness on `Send` and checks `EverySendIsDecided`.
+- `KeyLifecycle` assumes weak fairness on `Restore` and strong fairness on
+  opening while the key ring answers — a ring that keeps failing could
+  otherwise catch every attempt down — and checks `OutageEventuallyAnswered`.
+- `Delivery` assumes the plane's own steps are weakly fair and that a
+  counterparty retries a delivery that got no answer, and checks
+  `EveryMessageReachesAWaiter`. Nothing is assumed to send or conclude.
+- `TaskDelivery` assumes weak fairness on answering a held claim and on the
+  withdrawal, and checks `NoTaskOutlivesItsRun`.
+
+A row marked *(property)* drops or bends what a liveness claim rests on and
+must make TLC report a temporal violation.
 
 The fairness conjuncts are scheduling assumptions about the runtime, not
 correctness claims; the comments beside each `Spec` say exactly what is being

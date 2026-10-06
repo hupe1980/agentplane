@@ -422,6 +422,7 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
         store.as_ref(),
         #[cfg(feature = "keyring")]
         None,
+        None,
         &tenant,
         case,
         ts(9_000),
@@ -430,7 +431,7 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
     .await
     .expect("erase");
     assert_eq!(
-        erased, 1,
+        erased.blobs, 1,
         "the run's blob was not linked, so nothing was erased"
     );
 
@@ -558,6 +559,7 @@ async fn erasing_a_case_leaves_other_cases_alone() {
         cases.as_ref(),
         #[cfg(feature = "keyring")]
         None,
+        None,
         &tenant,
         mine,
         ts(500),
@@ -566,9 +568,10 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     .await
     .expect("erase");
     assert_eq!(
-        n, 2,
+        n.blobs, 2,
         "the erasure walked a list that is not this case's own — it expired \
-         {n} artifacts where the matter holds two"
+         {} artifacts where the matter holds two",
+        n.blobs
     );
 
     for (label, digest) in [("a", a), ("b", b)] {
@@ -722,6 +725,7 @@ async fn a_tenant_cannot_read_another_tenants_run_even_holding_its_id() {
                 idempotency_key: None,
                 admitted_by: None,
                 served_unchained: false,
+                plane_chain: false,
             },
         )],
     )
@@ -828,6 +832,7 @@ async fn one_tenants_event_does_not_resume_another_tenants_run() {
         phase: Phase::Forward,
         kind: "ack.received".to_owned(),
         correlation: vec![CorrelationKey::new("document", "DOC-1")],
+        from: None,
     };
     globex.subscribe(&sub, ts(1)).await.expect("globex waits");
 
@@ -1484,6 +1489,7 @@ async fn a_legal_hold_stops_the_retention_sweep_and_lifting_it_lets_the_sweep_th
         #[cfg(feature = "keyring")]
         keys: None,
         tenant: &tenant,
+        disclosures: None,
     };
     let report = agentplane::retention::retain(&stores, ts(1_000), ts(20), "retention")
         .await
@@ -1584,6 +1590,7 @@ async fn erasing_a_held_case_directly_is_refused_before_anything_is_destroyed() 
         cases.as_ref(),
         #[cfg(feature = "keyring")]
         None,
+        None,
         &tenant,
         held,
         ts(20),
@@ -1644,6 +1651,7 @@ async fn erasing_a_case_that_is_still_open_is_refused() {
         cases.as_ref(),
         #[cfg(feature = "keyring")]
         None,
+        None,
         &tenant,
         case,
         ts(500),
@@ -1664,6 +1672,7 @@ async fn erasing_a_case_that_is_still_open_is_refused() {
         Some(blobs.as_ref()),
         cases.as_ref(),
         #[cfg(feature = "keyring")]
+        None,
         None,
         &tenant,
         case,
@@ -1698,6 +1707,7 @@ async fn erasing_an_unknown_case_is_not_found() {
         store.as_ref(),
         #[cfg(feature = "keyring")]
         None,
+        None,
         &tenant,
         unknown,
         ts(9_000),
@@ -1707,5 +1717,89 @@ async fn erasing_an_unknown_case_is_not_found() {
     assert!(
         matches!(outcome, Err(EraseError::Store(StoreError::NotFound(ref id))) if id == &unknown.to_string()),
         "an erasure of a case this plane never held reported {outcome:?}"
+    );
+}
+
+/// **A hold's release survives the erasure it permitted.**
+///
+/// Releasing a hold is the instruction that lets an erasure reach the matter,
+/// so the record of it is the erasure's authorization and has to outlive the
+/// matter: it is stamped with the case, carries names and instants only, and
+/// is still in the matter's history — naming the releaser — after the case's
+/// key is destroyed.
+#[cfg(all(feature = "redb", feature = "keyring"))]
+#[tokio::test]
+async fn a_release_record_survives_the_erasure_it_authorized() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, LegalHold, TenantId};
+    use agentplane::journal::{JournalStore, RecordKind};
+    use agentplane::keyring::KeyRing;
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let ring = Arc::new(agentplane::testkit::MemoryKeyRing::new());
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+    let rt = agentplane::runtime::Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .blobs(Arc::clone(&blobs))
+        .keyring(Arc::clone(&ring) as Arc<dyn KeyRing>)
+        .build();
+    let case = store
+        .correlate_or_open("claim", &[CorrelationKey::new("claim", "CLM-R")], ts(1))
+        .await
+        .expect("open")
+        .case_id();
+    store
+        .place_hold(
+            case,
+            &LegalHold {
+                placed_at: ts(2),
+                reason: "preservation order 2026-115".to_owned(),
+                by: operator("bob"),
+            },
+        )
+        .await
+        .expect("place hold");
+    let run = rt
+        .release_hold(
+            case,
+            &agentplane::core::Operator::authenticated("carol").expect("an operator"),
+            ts(3),
+        )
+        .await
+        .expect("the release is recorded")
+        .expect("a hold was standing")
+        .record;
+
+    store.close(case).await.expect("close");
+    agentplane::blob::erase_case(
+        Some(blobs.as_ref()),
+        store.as_ref(),
+        Some(ring.as_ref() as &dyn KeyRing),
+        None,
+        &TenantId::default(),
+        case,
+        ts(500),
+        "art-17 request",
+    )
+    .await
+    .expect("erase");
+
+    let history = rt.journal().case_history(case, 100).await.expect("history");
+    let release = history
+        .iter()
+        .find(|r| r.body.run == run)
+        .expect("the release is in the erased matter's history");
+    match release.kind() {
+        RecordKind::HoldReleased { by, placed_by, .. } => {
+            assert_eq!(by.actor(), "carol");
+            assert_eq!(placed_by.actor(), "bob");
+        }
+        other => panic!("a release run holds a release record, not {other:?}"),
+    }
+    assert!(
+        !serde_json::to_string(release.kind())
+            .expect("serializes")
+            .contains("preservation order"),
+        "the hold's reason travelled into a record that outlives the matter"
     );
 }

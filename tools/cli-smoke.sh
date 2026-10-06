@@ -132,6 +132,15 @@ echo "$out" | grep -q 'a2a-server' || {
     echo "FAIL: the refusal does not name the missing feature: $out"; exit 1; }
 echo "ok: refused, naming the feature to rebuild with"
 
+echo "── a build without the operator API says where its document is ──"
+rc=0
+out="$("${BIN[@]}" openapi 2>&1 >/dev/null)" || rc=$?
+[ "$rc" = 2 ] || {
+    echo "FAIL: a build without http answered openapi with exit $rc, not 2"; exit 1; }
+echo "$out" | grep -q '`http`' || {
+    echo "FAIL: the refusal does not name the missing feature: $out"; exit 1; }
+echo "ok: refused with exit 2, naming the feature"
+
 echo "── --mcp in a build without the transport names the feature ──"
 # `cli` does not pull in `mcp-stdio`, so this smoke test runs the exact build a
 # reader meets the flag in. Ignoring the flag would be worse than refusing it:
@@ -292,6 +301,33 @@ if "${BIN[@]}" verify "$jdir/cut.jsonl" >/dev/null 2>&1; then
 fi
 echo "ok: a truncated export is refused on its missing frame"
 
+echo "── one matter leaves as a package, and the register names it ──"
+# A disclosure of one run: both readers verify it leaf by leaf, the register
+# lists it, and an unknown matter is refused before anything is written.
+run_id="$(python3 -c 'import json,sys
+for l in open(sys.argv[1]):
+    d = json.loads(l)
+    if d.get("kind") == "agentplane.export.run":
+        print(d["run"]); break' "$jdir/history.jsonl")"
+"${BIN[@]}" export --store "$jdir/j.redb" --run "$run_id" --to "Regulator R" \
+    --actor "dpo@example" >"$jdir/package.jsonl" 2>"$jdir/package.err" || {
+    echo "FAIL: a disclosure of one run was refused:"; sed 's/^/    /' "$jdir/package.err"; exit 1; }
+head -1 "$jdir/package.jsonl" | grep -q '"kind":"agentplane.disclosure"' || {
+    echo "FAIL: a package does not say it is one"; exit 1; }
+"${BIN[@]}" verify "$jdir/package.jsonl" >/dev/null 2>&1 || {
+    echo "FAIL: the package does not verify"; exit 1; }
+python3 "$ROOT/tools/verify_export.py" "$jdir/package.jsonl" >/dev/null || {
+    echo "FAIL: the second reader refuses the package"; exit 1; }
+"${BIN[@]}" disclosures --store "$jdir/j.redb" --run "$run_id" 2>/dev/null \
+    | grep -q 'Regulator R' || {
+    echo "FAIL: the register does not list the disclosure"; exit 1; }
+status=0
+"${BIN[@]}" export --store "$jdir/j.redb" --case case_01ARZ3NDEKTSV4RRFFQ69G5FAV --to R \
+    --actor a --output "$jdir/unknown.jsonl" >/dev/null 2>&1 || status=$?
+[ "$status" -eq 2 ] && [ ! -e "$jdir/unknown.jsonl" ] || {
+    echo "FAIL: an unknown case exited $status or left a file behind"; exit 1; }
+echo "ok: a package verifies in both readers, is registered, and an unknown matter is refused"
+
 echo "── a store rebuilds from an export, and proves it ──"
 "${BIN[@]}" restore "$jdir/history.jsonl" --store "$jdir/restored.redb" >"$jdir/restore.json" 2>"$jdir/restore.err" || {
     echo "FAIL: restoring an export exited non-zero:"
@@ -311,6 +347,34 @@ echo "ok: the rebuilt store reports the same checkpoint"
 "${BIN[@]}" verify "$jdir/again.jsonl" >/dev/null 2>&1 || {
     echo "FAIL: a restored store exported something that does not verify"; exit 1; }
 echo "ok: and what it exports verifies"
+
+echo "── grants reads an export and a manifest, and opens no store ──"
+set +e
+"${BIN[@]}" grants --from "$jdir/history.jsonl" --manifest "$YAML" \
+    --propose "$jdir/proposals" >"$jdir/grants.txt" 2>&1
+code=$?
+set -e
+case $code in
+    0 | 1 | 5) ;;
+    *) echo "FAIL: grants exited $code"; cat "$jdir/grants.txt"; exit 1 ;;
+esac
+head -1 "$jdir/grants.txt" | grep -q '^window:' || {
+    echo "FAIL: grants did not state its window first"; exit 1; }
+for f in "$jdir"/proposals/*.yaml; do
+    [ -e "$f" ] || continue
+    "${BIN[@]}" validate "$f" >/dev/null 2>&1 || {
+        echo "FAIL: a proposed manifest does not validate: $f"; exit 1; }
+done
+echo "ok: grants reported its window and every proposal validates"
+
+echo "── subject reports where a subject's data went, and changes nothing ──"
+"${BIN[@]}" subject nobody --store "$jdir/j.redb" >"$jdir/subject.txt" 2>&1 || {
+    echo "FAIL: subject exited non-zero"; cat "$jdir/subject.txt"; exit 1; }
+grep -q '^coverage' "$jdir/subject.txt" || {
+    echo "FAIL: subject printed no coverage list"; exit 1; }
+grep -q '^runs whose intake is bound' "$jdir/subject.txt" || {
+    echo "FAIL: subject printed no bound runs"; exit 1; }
+echo "ok: subject printed its coverage list and its bound runs"
 
 echo "── policy check re-derives an export's verdicts, and says what it could not ──"
 # The slim build names the feature rather than letting the parser say the verb
@@ -358,7 +422,7 @@ echo "── a flag belonging to another verb does not parse ──"
 # `run` silently accepted `--push-host`, `--url`, `--tokens` and friends and did
 # nothing with them. One of those is a security control, which makes it shape 1
 # at the command line — a declaration that does nothing.
-for bad in --push-host --url --operator-addr --tokens; do
+for bad in --push-host --url --operator-addr --mcp-addr --tokens; do
     if "${BIN[@]}" run "$YAML" --input '{}' "$bad" x >/dev/null 2>&1; then
         echo "FAIL: \`run\` accepted the serve-only flag $bad"; exit 1
     fi
@@ -379,6 +443,21 @@ if "${BIN[@]}" verify "$jdir/history.jsonl" --key not-a-pair >/dev/null 2>&1; th
     echo "FAIL: \`verify\` accepted a --key with no <key-id>=<hex> shape"; exit 1
 fi
 echo "ok: the audit verbs' evidence flags belong to the audit verbs"
+
+# The signed reference artifacts, under the fixed test keys published beside
+# them: every record signature and the cosigned note's witness are checked.
+golden=tests/golden
+gkeys=($(cat "$golden/keys.txt"))
+"${BIN[@]}" verify "$golden/export.signed.jsonl" "${gkeys[0]}" "${gkeys[1]}" \
+    --checkpoint "$golden/checkpoint.cosigned.note" "${gkeys[2]}" "${gkeys[3]}" \
+    >"$jdir/signed.json" 2>"$jdir/signed.err" || {
+    echo "FAIL: the signed reference export did not verify under its keys:"
+    sed 's/^/    /' "$jdir/signed.err"; exit 1; }
+grep -q 'golden-witness' "$jdir/signed.json" || {
+    echo "FAIL: \`verify --checkpoint <note> --witness-key\` named no witness"; exit 1; }
+grep -q 'no public key was supplied' "$jdir/signed.json" && {
+    echo "FAIL: \`verify --key\` said no key was supplied"; exit 1; }
+echo "ok: verify checks record signatures and a cosigned note file"
 echo "ok: each verb takes only its own flags"
 
 echo "── --strict belongs to replay, not run ──"
@@ -663,8 +742,10 @@ status() { set +e; "$@" >/dev/null 2>&1; echo $?; set -e; }
     echo "FAIL: a missing annotation is not a finding (1)"; exit 1; }
 [ "$(status "${BIN[@]}" quarantine some-run --store "$jdir/j.redb" --actor a --reason x --decision sideways)" = "2" ] || {
     echo "FAIL: a refused argument is not a usage error (2)"; exit 1; }
-[ "$(status "${BIN[@]}" halt --lift --store "$jdir/j.redb")" = "1" ] || {
+[ "$(status "${BIN[@]}" halt --lift --store "$jdir/j.redb" --actor ops)" = "1" ] || {
     echo "FAIL: a lift that found nothing standing exited as a success"; exit 1; }
+[ "$(status "${BIN[@]}" halt --lift --store "$jdir/j.redb")" = "2" ] || {
+    echo "FAIL: a lift naming nobody is not a usage error (2)"; exit 1; }
 [ "$(status "${BIN[@]}" export --store /nonexistent/agentplane/j.redb)" = "4" ] || {
     echo "FAIL: a store that cannot be opened is not an operational error (4)"; exit 1; }
 set +e

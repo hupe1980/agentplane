@@ -2968,13 +2968,87 @@ async fn the_approver_outlives_an_erasure_of_what_they_said() {
     );
 }
 
+/// **Who asked for a run survives the erasure of what they asked for.** The
+/// four-eyes exclusion reads `RunAdmitted.admitted_by` on every task the run
+/// opens, so it stays clear while the input beside it is sealed and erased.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn the_initiator_outlives_an_erasure() {
+    use agentplane::core::TenantId;
+    use agentplane::runtime::RunTerms;
+
+    let raw = Arc::new(RedbStore::open_in_memory().unwrap());
+    let keys = Arc::new(agentplane::testkit::MemoryKeyRing::default());
+    let tenant = TenantId::default();
+    let rt = Runtime::builder(raw.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant.clone())
+        .cases(raw.clone() as Arc<dyn CaseStore>)
+        .events(raw.clone() as Arc<dyn EventStore>)
+        .tasks(raw.clone() as Arc<dyn TaskStore>)
+        .keyring(keys.clone() as Arc<dyn agentplane::keyring::KeyRing>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+
+    let run = rt
+        .run_under(
+            "demo.refund",
+            Tainted::trusted(json!({ "secret": "the customer's account" })),
+            RunTerms::default()
+                .correlated("dispute", &[key("INV-10")])
+                .admitted_by("carol"),
+        )
+        .await
+        .unwrap()
+        .run_id();
+    let task = rt
+        .tasks()
+        .unwrap()
+        .queue(&officer(), 10)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    let ring: Arc<dyn agentplane::keyring::KeyRing> = keys.clone();
+    ring.destroy(
+        &agentplane::keyring::scope(&tenant, &task.case.unwrap().to_string()),
+        agentplane::core::Timestamp::from_unix_timestamp(1_800_000_000).unwrap(),
+        "retention",
+    )
+    .await
+    .unwrap();
+
+    let after = rt.store().read(run, 1).await.unwrap();
+    rt.store().verify(run).await.expect("chain intact");
+    let admitted_by = after
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::RunAdmitted { admitted_by, .. } => Some(admitted_by.clone()),
+            _ => None,
+        })
+        .expect("the run was admitted");
+    assert_eq!(admitted_by.as_deref(), Some("carol"));
+    assert!(
+        !format!("{after:?}").contains("the customer's account"),
+        "the erasure did not reach the input"
+    );
+}
+
 // ── An approval binds to what was proposed ──────────────────────────────────
 
 /// A task store whose rows are not what the run wrote: every task it opens has
 /// its proposed amount rewritten, as an edit in the database between proposal
-/// and decision would leave it.
+/// and decision would leave it — or, with [`Edit::AtRead`], every read of a
+/// task sees the rewrite while a claim returns the stored row, as a row edited
+/// between a decider's read and their claim would.
 #[derive(Debug)]
-struct Tampered(Arc<RedbStore>, Value);
+struct Tampered(Arc<RedbStore>, Value, Edit);
+
+#[derive(Debug, PartialEq)]
+enum Edit {
+    AtOpen,
+    AtRead,
+}
 
 #[async_trait::async_trait]
 impl TaskStore for Tampered {
@@ -2983,14 +3057,22 @@ impl TaskStore for Tampered {
         task: &agentplane::core::Task,
     ) -> Result<agentplane::core::Task, agentplane::core::StoreError> {
         let mut edited = task.clone();
-        edited.justification.proposed_action = self.1.clone();
+        if self.2 == Edit::AtOpen {
+            edited.justification.proposed_action = self.1.clone();
+        }
         self.0.open(&edited).await
     }
     async fn task(
         &self,
         id: TaskId,
     ) -> Result<Option<agentplane::core::Task>, agentplane::core::StoreError> {
-        self.0.task(id).await
+        let mut row = self.0.task(id).await?;
+        if self.2 == Edit::AtRead
+            && let Some(row) = row.as_mut()
+        {
+            row.justification.proposed_action = self.1.clone();
+        }
+        Ok(row)
     }
     async fn claim(
         &self,
@@ -3074,6 +3156,7 @@ async fn an_approval_of_an_edited_task_does_not_authorize_the_original() {
         .tasks(Arc::new(Tampered(
             Arc::clone(&store),
             json!({ "action": "refund", "amount_eur": 42 }),
+            Edit::AtOpen,
         )) as Arc<dyn TaskStore>)
         .skill(ProposesRefund::new(Expiry::Deny))
         .build();
@@ -3116,6 +3199,125 @@ async fn an_approval_of_an_edited_task_does_not_authorize_the_original() {
         reason.contains("approval does not name the task this run proposed"),
         "the run failed for some other reason: {reason}"
     );
+}
+
+/// **A decision naming a version of the task that is not the row's is refused,
+/// and leaves nothing behind.** Compared before the claim, so an escalated
+/// task stays escalated rather than being claimed and released open.
+#[tokio::test]
+async fn a_stale_digest_is_refused_and_nothing_is_recorded() {
+    use agentplane::core::{Digest, RuntimeError};
+
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
+    let out =
+        f.rt.run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-STALE")],
+        )
+        .await
+        .unwrap();
+    let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let before = f.store.read(out.run_id, 1).await.unwrap().len();
+    let stale = Digest::of(b"another version");
+
+    for escalated in [false, true] {
+        if escalated {
+            f.store.escalate(task.id).await.unwrap();
+        }
+        let row = f.store.task(task.id).await.unwrap().unwrap();
+        for decision in [
+            Decision::approve(by("alice"), "fine"),
+            Decision::reject(by("alice"), "no"),
+        ] {
+            let refused =
+                f.rt.decide_task_at(task.id, &decision, &row.candidate_roles, Some(stale))
+                    .await;
+            assert!(
+                matches!(refused, Err(RuntimeError::TaskChanged { .. })),
+                "a decision on a version the row no longer holds was not refused: {refused:?}"
+            );
+            let after = f.store.task(task.id).await.unwrap().unwrap();
+            assert_eq!(
+                (after.state, after.assignee.as_deref()),
+                (row.state, row.assignee.as_deref()),
+                "a refused decision moved the task"
+            );
+        }
+    }
+    assert_eq!(
+        f.store.read(out.run_id, 1).await.unwrap().len(),
+        before,
+        "a refused decision reached the journal"
+    );
+
+    let row = f.store.task(task.id).await.unwrap().unwrap();
+    f.rt.decide_task_at(
+        task.id,
+        &Decision::reject(by("alice"), "no"),
+        &row.candidate_roles,
+        Some(row.justification.digest()),
+    )
+    .await
+    .expect("a decision naming the row's own version is recorded");
+}
+
+/// **A row that changes between the decider's read and their claim is refused,
+/// and the claim this call took is released** — while a claim the decider
+/// already held is left with them.
+#[tokio::test]
+async fn a_row_changed_under_the_claim_is_refused_and_released() {
+    use agentplane::core::RuntimeError;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(Arc::new(Tampered(
+            Arc::clone(&store),
+            json!({ "action": "refund", "amount_eur": 42 }),
+            Edit::AtRead,
+        )) as Arc<dyn TaskStore>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    let out = rt
+        .run_correlated(
+            "demo.refund",
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-RACE")],
+        )
+        .await
+        .unwrap();
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let read = rt.tasks().unwrap().task(task.id).await.unwrap().unwrap();
+    let before = store.read(out.run_id, 1).await.unwrap().len();
+
+    for held in [false, true] {
+        if held {
+            store.claim(task.id, "alice", &officer()).await.unwrap();
+        }
+        let refused = rt
+            .decide_task_at(
+                task.id,
+                &Decision::reject(by("alice"), "no"),
+                &officer(),
+                Some(read.justification.digest()),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(RuntimeError::TaskChanged { .. })),
+            "a decision on a row that changed under its claim was recorded: {refused:?}"
+        );
+        let after = store.task(task.id).await.unwrap().unwrap();
+        assert_eq!(
+            after.assignee.as_deref(),
+            held.then_some("alice"),
+            "the claim was not left as it was before the decision"
+        );
+    }
+    assert_eq!(store.read(out.run_id, 1).await.unwrap().len(), before);
 }
 
 /// A proposal the deciding plane cannot open is not approvable there.
@@ -3242,6 +3444,7 @@ async fn an_argument_spelled_like_the_marker_is_approvable() {
         .tasks(Arc::new(Tampered(
             Arc::clone(&store),
             json!({ "$sealed": "AAECAwQFBgc=" }),
+            Edit::AtOpen,
         )) as Arc<dyn TaskStore>)
         .skill(ProposesRefund::new(Expiry::Deny))
         .build();
@@ -3353,6 +3556,138 @@ impl TaskStore for Interrupted {
         limit: usize,
     ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
         self.0.overdue(now, limit).await
+    }
+}
+
+/// A task store whose claim is followed, before the answer lands, by the
+/// run concluding: the task withdrawn and the run's waits retired.
+#[derive(Debug)]
+struct WithdrawnAfterClaim(Arc<RedbStore>);
+
+#[async_trait::async_trait]
+impl TaskStore for WithdrawnAfterClaim {
+    async fn open(
+        &self,
+        task: &agentplane::core::Task,
+    ) -> Result<agentplane::core::Task, agentplane::core::StoreError> {
+        self.0.open(task).await
+    }
+    async fn task(
+        &self,
+        id: TaskId,
+    ) -> Result<Option<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.task(id).await
+    }
+    async fn claim(
+        &self,
+        id: TaskId,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<agentplane::core::Task, agentplane::core::ClaimError> {
+        // The decider's claim lands; then the run concludes, withdrawing the
+        // task and retiring its waits, before the answer is delivered.
+        let claimed = self.0.claim(id, actor, roles).await?;
+        self.0
+            .withdraw_run(claimed.run, &[id])
+            .await
+            .expect("withdraw");
+        EventStore::unsubscribe_run(self.0.as_ref(), claimed.run, &[])
+            .await
+            .expect("retire the waits");
+        Ok(claimed)
+    }
+    async fn release(&self, id: TaskId, actor: &str) -> Result<(), agentplane::core::ClaimError> {
+        self.0.release(id, actor).await
+    }
+    async fn take_over(
+        &self,
+        id: TaskId,
+        from: &str,
+        actor: &str,
+        roles: &[String],
+    ) -> Result<agentplane::core::Task, agentplane::core::ClaimError> {
+        self.0.take_over(id, from, actor, roles).await
+    }
+    async fn set_state(
+        &self,
+        id: TaskId,
+        state: TaskState,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.0.set_state(id, state).await
+    }
+    async fn withdraw_run(
+        &self,
+        run: agentplane::core::RunId,
+        awaited: &[TaskId],
+    ) -> Result<usize, agentplane::core::StoreError> {
+        self.0.withdraw_run(run, awaited).await
+    }
+    async fn escalate(
+        &self,
+        id: TaskId,
+    ) -> Result<agentplane::core::Task, agentplane::core::StoreError> {
+        self.0.escalate(id).await
+    }
+    async fn queue(
+        &self,
+        roles: &[String],
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.queue(roles, limit).await
+    }
+    async fn for_case(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.for_case(case).await
+    }
+    async fn open_count(&self) -> Result<u64, agentplane::core::StoreError> {
+        self.0.open_count().await
+    }
+    async fn overdue(
+        &self,
+        now: agentplane::core::Timestamp,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::Task>, agentplane::core::StoreError> {
+        self.0.overdue(now, limit).await
+    }
+}
+
+/// **A decision that lost to the run's conclusion is refused, not reported
+/// delivered.** The decider's claim landed; the run then concluded and
+/// withdrew the task; the answer found no waiting run. Telling the decider
+/// it was recorded would leave them believing an approval reached a run that
+/// never saw it.
+#[tokio::test]
+async fn a_decision_that_lost_to_the_runs_conclusion_is_refused() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(Arc::new(WithdrawnAfterClaim(Arc::clone(&store))) as Arc<dyn TaskStore>)
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-LOST")],
+    )
+    .await
+    .unwrap();
+    let task = store.queue(&officer(), 10).await.unwrap()[0].clone();
+    match rt
+        .decide_task(
+            task.id,
+            &Decision::approve(by("alice"), "justified"),
+            &officer(),
+        )
+        .await
+    {
+        Err(agentplane::core::RuntimeError::TaskClaim(
+            agentplane::core::ClaimError::NotPending { task: refused, .. },
+        )) => assert_eq!(refused, task.id),
+        other => panic!("a decision no run received was reported as {other:?}"),
     }
 }
 
@@ -3550,5 +3885,142 @@ async fn an_expiry_meeting_a_given_answer_settles_the_task_once() {
     assert_eq!(
         not_applied, expired_notes,
         "an expiry note stands uncorrected"
+    );
+}
+
+/// **The person a run acts for cannot approve it either.**
+///
+/// A served caller admits the run for somebody: the admitting identity is the
+/// peer service, while the chain names the person at its root and the
+/// workload acting for them. Barring only the admitter lets the owner — or the
+/// workload acting as them — decide their own task, one party on both sides of
+/// the review.
+#[tokio::test]
+async fn the_person_a_run_acts_for_cannot_approve_it() {
+    use agentplane::core::{ClaimError, Delegation, Principal, RuntimeError, Scope};
+    use agentplane::runtime::RunTerms;
+
+    let f = fixture(ProposesRefund::new(Expiry::Deny));
+    let chain = Delegation::root(Principal::new("user:alice", Scope::root()))
+        .delegate(Principal::new("svc:billing", Scope::root()))
+        .expect("a narrower link");
+    f.rt.run_under(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        RunTerms::default()
+            .correlated("dispute", &[key("INV-77")])
+            .acting_as(chain)
+            .admitted_by("peer:front-office"),
+    )
+    .await
+    .expect("the run suspends on the task");
+
+    let task = f.store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    for party in ["peer:front-office", "user:alice", "svc:billing"] {
+        let refused =
+            f.rt.decide_task(
+                task.id,
+                &Decision::approve(by(party), "fine by me"),
+                &officer(),
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(RuntimeError::TaskClaim(ClaimError::Excluded { ref actor })) if actor == party
+            ),
+            "{party} decided a task of a run acting for them: {refused:?}"
+        );
+    }
+    f.rt.decide_task(
+        task.id,
+        &Decision::approve(by("carol"), "a second pair of eyes"),
+        &officer(),
+    )
+    .await
+    .expect("anyone else with the role may decide");
+}
+
+/// **The plane's own principals may approve a run the embedder started.**
+///
+/// A run the embedder starts acts under the plane's own chain, and nobody on
+/// that chain asked for it: barring them would stop the operator whose
+/// identity is the plane's root from approving any of the plane's tasks.
+#[tokio::test]
+async fn the_planes_own_principal_may_approve_a_run_the_embedder_started() {
+    use agentplane::core::{Delegation, Principal, Scope};
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .acting_as(Delegation::root(Principal::new("ops:root", Scope::root())))
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    rt.run_correlated(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        "dispute",
+        &[key("INV-78")],
+    )
+    .await
+    .expect("the run suspends on the task");
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    rt.decide_task(
+        task.id,
+        &Decision::approve(by("ops:root"), "the plane's operator reviews it"),
+        &officer(),
+    )
+    .await
+    .expect("the plane's own principal did not ask for the run");
+}
+
+/// **A caller presenting the plane's own chain is still the one who asked.**
+///
+/// Whether a run acts as the plane is recorded at admission. A served caller
+/// whose chain happens to equal the plane's is a caller, and the person at its
+/// root may not approve the run they asked for.
+#[tokio::test]
+async fn a_caller_presenting_the_planes_chain_cannot_approve_its_run() {
+    use agentplane::core::{ClaimError, Delegation, Principal, RuntimeError, Scope};
+    use agentplane::runtime::RunTerms;
+
+    let own = Delegation::root(Principal::new("ops:root", Scope::root()));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .acting_as(own.clone())
+        .skill(ProposesRefund::new(Expiry::Deny))
+        .build();
+    rt.run_under(
+        "demo.refund",
+        Tainted::trusted(json!({})),
+        RunTerms::default()
+            .correlated("dispute", &[key("INV-79")])
+            .acting_as(own)
+            .admitted_by("peer:front-office"),
+    )
+    .await
+    .expect("the run suspends on the task");
+
+    let task = store.queue(&officer(), 10).await.unwrap().pop().unwrap();
+    let refused = rt
+        .decide_task(
+            task.id,
+            &Decision::approve(by("ops:root"), "my own request"),
+            &officer(),
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(RuntimeError::TaskClaim(ClaimError::Excluded { ref actor })) if actor == "ops:root"
+        ),
+        "the person a caller's run acts for decided it because their chain equals the plane's: \
+         {refused:?}"
     );
 }

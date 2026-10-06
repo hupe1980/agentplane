@@ -71,7 +71,6 @@ pub(crate) fn wrap(envelope: &[u8]) -> Value {
 }
 
 /// The envelope inside a sealed payload, if this is one.
-#[cfg(feature = "keyring")]
 pub(crate) fn unwrap(value: &Value) -> Option<Vec<u8>> {
     if !is_sealed(value) {
         return None;
@@ -87,10 +86,26 @@ pub(crate) fn wrap_text(envelope: &[u8]) -> String {
 }
 
 /// The envelope inside a sealed text field, if this is one.
-#[cfg(feature = "keyring")]
 pub(crate) fn unwrap_text(text: &str) -> Option<Vec<u8>> {
     let encoded = text.strip_prefix(SEALED)?.strip_prefix(':')?;
     crate::core::b64::decode(encoded)
+}
+
+/// The tenant an envelope's wrapped key names, read from its header without
+/// opening anything.
+///
+/// Builds without the `keyring` feature need it too: a restore must refuse a
+/// sealed history put back under a tenant its ciphertext does not name, and
+/// the binary that restores carries no key ring. The layout is the one
+/// `keyring::envelope` writes: a version byte, a big-endian `u32` length, then
+/// the wrapped key as JSON whose `scope` is `{tenant}/{unit}`.
+pub(crate) fn sealed_tenant(envelope: &[u8]) -> Option<String> {
+    let (_, rest) = envelope.split_first()?;
+    let (len, rest) = rest.split_first_chunk::<4>()?;
+    let wrapped = rest.get(..usize::try_from(u32::from_be_bytes(*len)).ok()?)?;
+    let key: Value = serde_json::from_slice(wrapped).ok()?;
+    let (tenant, _) = key.get("scope")?.as_str()?.split_once('/')?;
+    Some(tenant.to_owned())
 }
 
 /// One sealable field of a record, by the shape its schema gives it.
@@ -148,6 +163,7 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             admitted_by: _,
             // Clear: which holder a run draws as is control-plane.
             served_unchained: _,
+            plane_chain: _,
         } => vec![SealedField::Value(input)],
         // The frozen plan is sealed because it can *embed* the caller's data,
         // not merely reference it: a `planned` agent's planner reads the
@@ -172,6 +188,12 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             // stay answerable after *what left* is destroyed. Sealing it would
             // make the volume signal vanish with the payload it measures.
             outbound_bytes: _,
+            // Clear: rule ids are the deployment's declaration, not caller
+            // data.
+            content_rules: _,
+            // Clear: an audience and a principal id, both already clear on
+            // the run's chain — never the credential.
+            credential: _,
         } => {
             // Named field by field, like the record around it: a field added
             // to the descriptor must be decided here, not pass as clear.
@@ -189,6 +211,11 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             by: _,
             spend: _,
             declared: _,
+            // Clear: rule ids, a level and a pointer whose matched keys are
+            // masked — the deployment's declaration, not caller data.
+            content: _,
+            // Clear: a duration, which identifies nobody.
+            elapsed_ms: _,
         } => vec![SealedField::Value(output)],
         // A reconciled effect's recovered result is the same object an
         // `EffectDone.output` is — caller data a probe happened to fetch —
@@ -249,6 +276,7 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             spend: _,
             disposition: _,
             permanent: _,
+            elapsed_ms: _,
         } => vec![SealedField::Text(error)],
         // Reasoning recorded beside the effects it explains — model output
         // over the caller's data, and nothing routes on it.
@@ -264,6 +292,22 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             session: _,
             reported: _,
         } => detail.as_mut().map(SealedField::Text).into_iter().collect(),
+
+        // A data subject identifies a person, and erasing the run's data must
+        // take it with it. Where it was read from and whether that was trusted
+        // name a binding, not a person, and stay clear.
+        K::DataSubjectBound { bindings } => bindings
+            .iter_mut()
+            .map(|bound| {
+                let super::BoundSubject {
+                    index: _,
+                    binding: _,
+                    trusted: _,
+                    subject,
+                } = bound;
+                SealedField::Text(subject)
+            })
+            .collect(),
 
         // A conclusion's reason is the same free text `EffectFailed.error` is —
         // a provider or tool's refusal, quoting the request it refused — lifted
@@ -357,6 +401,24 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             actor: _,
             roles: _,
             reason: _,
+        }
+        // An operator's own instruction about a control: the scope and the
+        // ended stop's reason are the plane's, not a caller's data.
+        | K::HaltLifted {
+            scope: _,
+            by: _,
+            at: _,
+            reason: _,
+            thrown_by: _,
+            thrown_at: _,
+        }
+        // Names and instants only, so the erasure a hold's release permits leaves
+        // its authorization readable.
+        | K::HoldReleased {
+            by: _,
+            at: _,
+            placed_by: _,
+            placed_at: _,
         }
         | K::Swept {
             subject: _,

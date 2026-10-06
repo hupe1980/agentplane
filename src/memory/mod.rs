@@ -56,6 +56,9 @@ use serde_json::Value;
 
 use crate::core::{Digest, Label, Sensitivity, SourceId, StoreError, Timestamp, Trust};
 
+mod indexed;
+pub use indexed::IndexedMemoryStore;
+
 /// One remembered thing.
 ///
 /// The fields beyond `content` are not bookkeeping. Each answers a question that
@@ -434,6 +437,21 @@ pub struct IndexIdentity {
 pub struct Embedding {
     pub vector: Vec<f32>,
     pub revision: String,
+    /// What the service reported the call consumed, priced by
+    /// [`Embedder::pricing`] — what the call counts against a run's ceilings.
+    #[serde(default)]
+    pub usage: crate::model::Usage,
+}
+
+/// One embedding call's answer: the vector, and what the service reported
+/// consuming for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedded {
+    pub vector: Vec<f32>,
+    /// Input tokens as the service reported them; zero where it reports none.
+    /// Money is left at zero — the runtime prices it from
+    /// [`Embedder::pricing`].
+    pub usage: crate::model::Usage,
 }
 
 /// A semantic query as the journal records it.
@@ -532,6 +550,33 @@ pub trait SemanticRetriever: Send + Sync + Debug {
     fn index(&self) -> IndexIdentity;
 
     async fn search(&self, query: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError>;
+
+    /// Drop what an erasure removed from the durable store.
+    ///
+    /// Required, because an index is a copy: an embedding left behind a
+    /// forgotten item is reconstructible content, and a soft delete that only
+    /// hides it from search leaves it in the graph. Called by
+    /// [`IndexedMemoryStore`] after every erasure verb, and by the runtime's
+    /// sweep; an error here is reported as a failed erasure, never as success.
+    ///
+    /// Idempotent: forgetting what the index does not hold is not an error.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] when the index could not be told.
+    async fn forget(&self, forgotten: &Forgotten) -> Result<(), StoreError>;
+}
+
+/// What an erasure removed, in the terms an index drops it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Forgotten {
+    /// Every version of these ids.
+    Ids(Vec<String>),
+    /// Exactly these superseded versions of ids that stay current.
+    Versions(Vec<(String, Vec<u64>)>),
+    /// Everything indexed under this subject.
+    Subject(String),
 }
 
 /// Turns text into a vector.
@@ -580,7 +625,16 @@ pub trait Embedder: Send + Sync + Debug {
     ///
     /// [`StoreError::Backend`] when the service cannot be reached or answers
     /// with something that is not a vector.
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, StoreError>;
+    async fn embed(&self, text: &str) -> Result<Embedded, StoreError>;
+
+    /// What this service's tokens cost, when the deployment stated it.
+    ///
+    /// `None` reports no money, so a plane whose budget or any agent's
+    /// declaration carries a money ceiling refuses an unpriced embedder at
+    /// build: its calls would never count against the ceiling.
+    fn pricing(&self) -> Option<crate::model::Pricing> {
+        None
+    }
 }
 
 /// One immutable vector record for [`InMemorySemanticRetriever`].
@@ -593,16 +647,34 @@ pub struct SemanticVector {
 }
 
 /// Deterministic exact cosine retriever for tests and small corpora.
+///
+/// Clones share one index, so a clone handed to the runtime sees what another
+/// forgets.
 #[derive(Debug, Clone)]
 pub struct InMemorySemanticRetriever {
     index: IndexIdentity,
-    vectors: Vec<SemanticVector>,
+    vectors: std::sync::Arc<std::sync::RwLock<Vec<SemanticVector>>>,
 }
 
 impl InMemorySemanticRetriever {
     #[must_use]
     pub fn new(index: IndexIdentity, vectors: Vec<SemanticVector>) -> Self {
-        Self { index, vectors }
+        Self {
+            index,
+            vectors: std::sync::Arc::new(std::sync::RwLock::new(vectors)),
+        }
+    }
+
+    /// How many vectors the index holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.vectors.read().map_or(0, |v| v.len())
+    }
+
+    /// Whether the index holds no vector.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -618,8 +690,12 @@ impl SemanticRetriever for InMemorySemanticRetriever {
 
     async fn search(&self, query: &SemanticQuery) -> Result<Vec<SemanticHit>, StoreError> {
         validate_vector(&query.embedding)?;
+        let vectors = self
+            .vectors
+            .read()
+            .map_err(|_| StoreError::Backend("the in-memory index is poisoned".to_owned()))?;
         let mut hits = Vec::new();
-        for candidate in &self.vectors {
+        for candidate in vectors.iter() {
             if candidate.subject != query.subject
                 || query
                     .purpose
@@ -672,6 +748,21 @@ impl SemanticRetriever for InMemorySemanticRetriever {
         });
         hits.truncate(query.limit);
         Ok(hits)
+    }
+
+    async fn forget(&self, forgotten: &Forgotten) -> Result<(), StoreError> {
+        let mut vectors = self
+            .vectors
+            .write()
+            .map_err(|_| StoreError::Backend("the in-memory index is poisoned".to_owned()))?;
+        vectors.retain(|v| match forgotten {
+            Forgotten::Ids(ids) => !ids.contains(&v.selected.id),
+            Forgotten::Versions(versions) => !versions
+                .iter()
+                .any(|(id, gone)| *id == v.selected.id && gone.contains(&v.selected.version)),
+            Forgotten::Subject(subject) => v.subject != *subject,
+        });
+        Ok(())
     }
 }
 
@@ -827,6 +918,24 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// `build`, which is why this is a question a store can be asked rather
     /// than a fact an operator has to remember.
     fn erasure_is_distributed(&self) -> Option<bool> {
+        None
+    }
+
+    /// Whether this store seals payloads, and so runs a subject erasure of its
+    /// own beneath any wrapper the plane adds.
+    ///
+    /// No default: a decorator that does not seal delegates, and one that
+    /// answered `false` over a sealed store would have the plane wrap an index
+    /// above the seal, where a person's erasure never reaches it.
+    fn seals(&self) -> bool;
+
+    /// The semantic index every erasure through this handle reaches — a
+    /// sealing layer's own subject erasure included.
+    ///
+    /// `None`, the default, is a store that tells no index anything. The
+    /// runtime asks it at `build` when a semantic index is wired, and refuses a
+    /// sealed store whose subject erasure would miss that index.
+    fn erasure_index(&self) -> Option<std::sync::Arc<dyn SemanticRetriever>> {
         None
     }
 

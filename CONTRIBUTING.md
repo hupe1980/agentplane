@@ -140,6 +140,13 @@ actually has the feature that they do not. No check catches this: whether an
 entry describes this release's work or the last one's is not a question a test
 can ask, which makes writing it beside the change the only control there is.
 
+## 📦 Releases
+
+Breaking changes ride a release train: they are batched into the next release
+rather than shipped one at a time. Every **BREAKING** entry in `CHANGELOG.md`
+says what a dependent has to do. Until the format freezes, a hard cut is allowed
+and preferred to a compatibility shim.
+
 ## 🚫 Things that will be pushed back on
 
 **Reading the clock, RNG, or generating an id directly.** These are denied
@@ -191,7 +198,7 @@ anchor* — the check the prose most often gets wrong.
 
 | | |
 |---|---|
-| 🧠 | [Concepts](site/content/docs/concepts.md) — read this first; it is short |
+| 🧠 | [Concepts](site/content/docs/concepts.md) — read this first |
 | 🏗️ | [Architecture](site/content/docs/architecture.md) — how each mechanism works |
 | 🔐 | [Security model](site/content/docs/security.md) — the trust boundary and its limits |
 | 📋 | [Status](site/content/docs/status.md) — what will move, and what is deliberately not built |

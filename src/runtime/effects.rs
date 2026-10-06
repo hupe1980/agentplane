@@ -458,15 +458,24 @@ impl Effect for Embed {
         // caller, so the space a vector lives in is a fact about the wiring
         // and never a claim. `IndexIdentity` is where the cost of a claim is
         // written down.
-        let vector = self
+        let crate::memory::Embedded { vector, mut usage } =
+            self.embedder
+                .embed(&self.text)
+                .await
+                .map_err(|error| EffectError::Other(error.to_string()))?;
+        usage.minor_units = self
             .embedder
-            .embed(&self.text)
-            .await
-            .map_err(|error| EffectError::Other(error.to_string()))?;
+            .pricing()
+            .map_or(0, |pricing| pricing.price(&usage));
         Ok(crate::memory::Embedding {
             vector,
             revision: self.embedder.revision(),
+            usage,
         })
+    }
+
+    fn spend(&self, output: &Self::Output) -> crate::core::Spend {
+        output.usage.spend()
     }
 }
 

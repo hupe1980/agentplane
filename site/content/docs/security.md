@@ -192,7 +192,7 @@ reads as exhaustive and is not is how a deployment sizes its risk wrongly.
 | A2A peers | the peer client | the card URL, before it is fetched |
 | Push webhooks, governed media, Agent Card discovery | [`netguard`](https://docs.rs/agentplane/latest/agentplane/netguard/), which also judges the resolved **addresses** | the URL being dereferenced |
 | **Tool calls — MCP, typed tools, anything else** | the **plane**, from `RuntimeBuilder::egress(..)` | the transport declares it: `ToolClient::destination` |
-| A witness, a Vault key ring | **nobody**, deliberately | the URL is deployment configuration and reaches no caller-supplied string |
+| A witness, a Vault key ring, a token endpoint | **nobody**, deliberately | the URL is deployment configuration and reaches no caller-supplied string |
 | Bedrock | **nobody**, and it says so | the SDK will not disclose its endpoint |
 
 Whoever judges the host, **every outbound client in this crate is built by one
@@ -270,7 +270,7 @@ Card discovery: paths where this crate dereferences a URL it was handed, and
 where the URL can be attacker-influenced — a card URL, an image link in a
 document. Those need DNS pinning, redirect revalidation and a public-address
 check, because the string arrived from somewhere. A deployment's own endpoints
-— a model gateway, a Vault cluster, a witness — are judged by the host
+— a model gateway, a Vault cluster, a witness, a token endpoint — are judged by the host
 allowlist instead, because resolving inward is often the point: an in-cluster
 gateway has no public address, and refusing it leaves an operator running a
 sidecar that terminates TLS and forwards in clear.
@@ -406,6 +406,17 @@ fires.
 The fixtures are held to the same rule: a step that writes to a ledger returns
 *that it wrote*, not the ledger's response — which is the real pattern anyway:
 data may set parameters, not choose control flow.
+
+### What a served caller supplies
+
+An A2A message's input and an MCP tool call's arguments arrive **untrusted and
+`Internal`**, from `peer:<actor>` — the authenticated caller, one spelling for
+both doors. A protected field a caller may fill names it in `allowed_sources`
+or carries a `one_of` menu; `require_trusted` refuses every served value and
+passes only the operator's own `--input`. The MCP listener refuses a disallowed
+`Host`, or a present and unlisted `Origin`, with `403` before it reads a
+credential, and answers every unusable credential with one `401`
+([MCP, being served](@/docs/interop.md#mcp-being-served)).
 
 ### Quarantining a parse
 
@@ -651,32 +662,15 @@ is **not** trusted: a rule guarded with `context has label` does not match, and
 an unguarded read is an evaluation error, which refuses the call —
 [below](#the-authorization-context).
 
-### Where a content classifier hangs, and where it does not
+### Why content is not judged on the policy seam
 
-The policy seam looks like the place: a `sink` request already carries the
-outbound value's fields in `context.args` and its label in `context.label`, so
-scanning here is one line of work. It is the wrong place, for reasons that are
-the seam's own contract rather than a matter of taste.
-
-`authorize` must be **total and pure** — no I/O, no clock, no randomness —
-because an engine that can fail open under load is not an authorization layer.
-A model call or a scanning service is exactly the I/O that forbids. And only
-**denials** are journaled: a replayed effect never reaches the gate, so a value
-a classifier *passed* leaves no trace of having been examined. That inverts the
-claim this whole page is about.
-
-**Put the inspection behind an effect, and let it produce a label.** An
-inspection is an observation of the outside world, so it crosses the effect
-protocol like every other one: its verdict is journaled, and a replay reads that
-verdict back instead of re-running a classifier over a value it can no longer
-reproduce. What the verdict yields is a sensitivity, a trust or a provenance
-entry — and the structural gates above then decide exactly. A heuristic may
-*describe* a value; only a rule may refuse one.
-
-That division is also what a false positive costs. Behind an effect it raises a
-label, the sink gate refuses on it, and the journal holds both the classifier's
-verdict and the refusal — so an operator can see which of the two was wrong. On
-the policy seam it stops the run with a rule name and no evidence at all.
+A `sink` request already carries the outbound value in `context.args`, so
+scanning there looks like one line of work. It is the wrong place: `authorize`
+must be **total and pure**, and a classifier is I/O; and only denials are
+journaled, so a value a scan *passed* would leave no trace of having been
+examined. Content is judged by [content rules](#content-rules) instead, at the
+boundaries the plane already owns, with every verdict on the record. A
+heuristic may *describe* a value; only a declared rule may refuse one.
 
 ### A decision somebody else can check
 
@@ -875,10 +869,16 @@ not help. Here is what a request actually looks like.
 
 | | |
 |---|---|
-| principal | `Agent::"<the acting agent>"` |
+| principal | `Subject::"<id>"` — the delegation chain's subject, or the authenticated API caller; `Capability::"<name>"` — the capability, for a run acting under no chain |
 | action | `Action::"effect:perform"`, `Action::"run:admit"`, `Action::"data:release"` |
-| resource | `Resource::"<effect kind>"` — `tool.call`, `model.complete`, `clock.now`, `memory.recall`… |
+| resource | `effect:perform`: `Resource::"<effect kind>"` — `tool.call`, `model.complete`, `clock.now`, `memory.recall`…; `run:admit`: the capability asked for; `data:release`: `information_flow.label` |
 | context | the record below |
+
+**A schema names both principal types.** Give every action's `appliesTo`
+`"principalTypes": ["Subject", "Capability"]`. A run acting under no chain asks
+as a `Capability`, and a schema that lists only `Subject` makes each of its
+requests malformed — refused as a defect, for every effect of every chainless
+run.
 
 **All three are asked, and an action no rule mentions is denied.** That is the
 correct default and an invisible one: the caller is told only that it was
@@ -889,23 +889,50 @@ and then refuses every typed release. The bundle shipped at
 `examples/serve-policy.cedar` denies it deliberately, and says so where the rule
 would go.
 
-At **`effect:perform`**:
+At **every gate**:
+
+```text
+always present
+  context.tenant            string
+
+conditional — guard with `context has …` before reading
+  context.agent             record    only where a declaration governs the run — see below
+  context.owner             string    only where the run acts under a delegation chain
+  context.subject           string    ditto
+  context.delegation_depth  long      ditto
+  context.scope             list      ditto — the chain's effective scope patterns
+```
+
+At **`effect:perform`**, beside those:
 
 ```text
 always present
   context.run               string    the run id
   context.step              long
-  context.tenant            string
   context.mutates           bool      whether this effect changes the world — its own
                                       claim, widened by a grant declaring it mutating
   context.args              record    the effect's own descriptor arguments
 
 conditional — guard with `context has …` before reading
   context.label             record    sinks only — see below
-  context.owner             string    only where the run acts under a delegation chain
-  context.subject           string    ditto
-  context.delegation_depth  long      ditto
-  context.scope             list      ditto — the chain's effective scope patterns
+```
+
+At **`data:release`**, beside those:
+
+```text
+always present
+  context.run               string    the run id
+  context.step              long
+  context.release           record    { scope: { trust, sensitivity? }, basis, destination,
+                                        fields, evidence } — the typed release asked for
+  context.label             record    the value's label before the release
+```
+
+At **`run:admit`**, beside those — asked once, before the run exists:
+
+```text
+always present
+  context.input             any       the admission input
 ```
 
 **The conditional half is not optional reading.** Cedar evaluates *every* rule
@@ -955,8 +982,17 @@ context.label.trust         "trusted" | "untrusted"
 context.label.sensitivity   "public" | "internal" | "confidential" | "secret"
 ```
 
-It is present only on `sink`, the only call that has a labelled value to bind —
-so a rule reading it needs `context has label` like any other conditional
+A label's `data_subjects` — which runs' bound data subjects the value was
+influenced by — is never in it, and never in a label an effect's arguments
+embed either: `task.open` carries its justification's fields with their
+labels under `context.args`, and the request builder strips `data_subjects`
+from every label it finds there, so `policy check` re-derives the same
+request. It is attribution for
+[the subject report](@/docs/erasure.md#where-a-subjects-data-went), and no gate
+reads it.
+
+At `effect:perform` it is present only on `sink`, the only call that has a
+labelled value to bind — so a rule reading it needs `context has label` like any other conditional
 attribute. **Absent is not "trusted", and it is not "the rule quietly does not
 match" either**: an unguarded read errors, and an unevaluable rule refuses the
 call whatever it would have decided. Guarded, a rule requiring a source simply
@@ -967,8 +1003,7 @@ For `tool.call`, `context.args` carries `{ server, tool, arguments }` — which 
 what lets a rule speak about one server without speaking about every tool on it.
 
 The governing declaration arrives under `context.agent`, at **every** gate a
-declared agent reaches — `run:admit`, `effect:perform` and `data:release` (asked
-on the resource `information_flow.label`):
+declared agent reaches — `run:admit`, `effect:perform` and `data:release`:
 
 ```text
 context.agent.name       the declared name — for reading, never for granting
@@ -996,11 +1031,14 @@ never to `name`, for the reason in the section below.
 ```cedar
 // A read-only auditor. Nothing else, and nobody else.
 permit(
-    principal == Agent::"agent:auditor",
+    principal == Subject::"agent:auditor",
     action == Action::"effect:perform",
     resource == Resource::"tool.call"
 ) when { !context.mutates };
 ```
+
+A chainless run of a capability asks as `Capability::"…"`, so this rule does
+not admit one; name it with a second `principal ==` rule.
 
 ```cedar
 // The whole-value taint gate. Read the warning under it before shipping this.
@@ -1172,6 +1210,12 @@ Rules that need to bind to an exact revision bind to `context.agent.digest`. The
 digest is content-addressed and covers the prompt, the model grants and the
 ceilings, so an edited agent is a different agent — where a name-based rule would
 go on permitting it after its limits were widened.
+
+A caller that reviewed one revision can pin it per run instead:
+`RunTerms::expect_declaration(digest)`, or `agentplane run --expect-digest`,
+refuses admission when another revision — or no declaration — governs the
+capability, naming both digests, before policy is asked and with nothing
+recorded.
 
 ### Erasure, keys and tenancy
 
@@ -1666,14 +1710,108 @@ error, and repeating the call is the only other option.
 `EffectError::Performed` is how a transport says *the peer performed the
 operation and it failed*; `Rejected` means nothing was applied.
 
-## Content guardrails
+## Content rules {#content-rules}
 
-This crate ships no content classifier, for the reason it ships no policy
-evaluator and no tracing exporter: a deployment that needs one already has a
-better one than this project would write, administered where its compliance
-people can see it.
+A label is set by whoever produced the value, so an access key in a tool
+result, tag characters in an inbound message or a card number in a prompt pass
+every label gate when their producer called them `internal`. Content rules are
+the deployment's own statement about content, declared in the manifest and
+applied at three boundaries:
 
-What it does is **pass the deployment's own through**, and own everything
+```yaml
+spec:
+  security:
+    content:
+      rules:
+        - id: aws-key
+          match: {pattern: '\bAKIA[0-9A-Z]{16}\b'}
+          at: {sources: [tool.call, model.complete]}
+          then: {classify: secret}
+        - id: tag-smuggling
+          match: {invisible: true}
+          at: {admission: true, sources: [event.await]}
+          then: refuse
+        - id: card
+          match: {pattern: '\b\d(?:[ -]?\d){12,18}\b', luhn: true}
+          fields: [/messages]
+          at: {sinks: [model.complete]}
+          then: {redact: '[card]'}
+```
+
+A rule may **refuse** a value, **raise** its sensitivity (`classify` joins,
+never lowers) or, at a sink, **redact** it. There is no `allow`, `warn` or
+`flag`, and no verdict that trusts or lowers anything, so the worst a wrong rule
+does is fail to refuse. The [manifest reference](@/docs/manifest.md) has the
+block field by field.
+
+- **At admission** a refusal leaves no record, as an admission policy denial
+  does, and the caller is told the rule and where it matched. A classification
+  is the input's recorded label.
+- **Where an output arrives** — a model or tool call, a recall, an awaited
+  event, whether the step claims it or the plane delivers it to a suspended run
+  — the verdict is written beside the output on `EffectDone.content`. A raised
+  level is the value's label from then on; a refusal keeps the value from the
+  step, which is told `REFUSED`, never from the journal. A replay reads the
+  verdict back and evaluates nothing.
+- **At a sink** a refusal is a sink gate like the egress ceiling: judged where
+  dispatch is live, recorded as `PolicyDenied` with the never-asked action
+  `effect:content`, told to a model loop as `REFUSED`, and counted toward
+  [`max_denials`](#what-max-denials-counts). A redaction changes what is sent,
+  so it applies in every mode: the effect key, the record and every replay are
+  over the redacted bytes, and the label is unchanged. An effect that cannot
+  take new arguments is refused rather than sent whole, and so is a redact
+  rule matching an object key — redaction rewrites strings, never the shape.
+
+No record, error or log line carries matched text. A refusal names the rule
+and a JSON pointer, and writes an object key any rule matches as `*`.
+
+**What a rule proves is narrow:** rule R refused, raised or redacted values
+whose strings, after Unicode NFC, matched P at boundary B. Homoglyphs, base64
+and other encodings, and a value split across two fields evade a pattern; the
+test corpus pins those cases as passing, so the gap is stated rather than
+forgotten. A planted refused string can stop a run at a source, which is what
+failing closed costs; the remedy is the rule's `at` and `fields`. A stream
+observer has seen a completion before a source rule judges it, as the journal
+records it, and a probe's reconciled answer is not judged. Patterns run on the
+linear-time engine — no backreferences, no look-around — and one it refuses is
+a parse error naming the rule.
+
+`agentplane content check <manifest> --at sink:model.complete < value.json`
+runs the runtime's own evaluator over a value, so a rule can be tried before it
+is deployed.
+
+### A classifier brings categories; the manifest decides
+
+Some content is not pattern-shaped. A deployment registers a
+`ContentChecker` — a classifier it runs, named and versioned — and declares
+what its categories do:
+
+```rust
+let plane = Runtime::builder(store).content_checker(llama_guard).build();
+```
+
+```yaml
+      checks:
+        - id: guard
+          checker: llama-guard-4
+          at: {sinks: [model.complete], sources: [model.complete]}
+          on: {S1: refuse, S7: {classify: confidential}}
+```
+
+The checker describes; the table decides. Each check is its own journaled
+`content.check` effect — authorized as `effect:perform` on `content.check`,
+refused by its sink gate when the value is above the checker's own ceiling
+(sending text to a classifier is egress), metered, and read back on replay
+without calling anything. A category the table does not name is recorded and
+changes nothing; there is no score threshold. A checker that errors, times out
+or reports a category it never declared refuses the value — there is no
+fallback setting — and a check naming an unregistered checker, or mapping a
+category it does not declare, refuses the build.
+
+### A provider's own guardrail
+
+This crate ships no classifier, for the reason it ships no policy evaluator: a
+deployment that needs one already has a better one. What it does is **pass the deployment's own through**, and own everything
 around it. On Bedrock:
 
 ```rust
@@ -1746,9 +1884,29 @@ arguments, not a withheld proposal.
 
 What is bound stays what was stored: an approval names the digest of the
 justification its decider claimed, and the run refuses one that is not the
-task it proposed. A client that shows the structured `justification` to a
-person instead of the rendering shows invisible characters as nothing — that
-choice is the client's.
+task it proposed. Every task is served with that `digest`, and a decision may
+name it back; a row that changed since is refused with nothing recorded
+→ [deciding on a version](@/docs/operations.md#deciding-on-a-version). That
+proves the client held the current version of the row, not what it displayed.
+A client that shows the structured `justification` to a person instead of the
+rendering shows invisible characters as nothing, and one that renders a task
+shows agent-supplied text — `has_untrusted_prose`, the per-item labels — as
+untrusted; both choices are the client's.
+
+**The plane serves no reviewer page to a deployment.** Rendering is the
+client's, and a representation attack lands wherever rendering happens.
+`agentplane dev` serves a page, but only to an agent's author on their own
+machine: loopback only, behind a token minted per process and carried in the
+URL fragment, over memory or a scratch store it created, under a content
+security policy that requires Trusted Types and names no policy for them. Every
+string reaches that page as text, tasks are shown from the rendering above,
+a run's records with the same escaping `agentplane history` prints,
+and a headless browser loads it over hostile records in the release gate. It
+refuses a `postgres://` store, a store it did not mark, a symbolic link in
+place of the scratch directory or its store, a tenant other than
+`dev`, and `--mcp` or `--peer` without `--allow-live`. It is built only with
+the `dev` feature, which no published image enables
+→ [trying it on a page](@/docs/getting-started.md#trying-it-on-a-page).
 
 ## What is not covered
 
@@ -1808,6 +1966,18 @@ If a preview fails at run time the task opens anyway and says so in the
 evidence: refusing the call because its preview was unavailable would turn a
 read-only convenience into a second thing that can stop a payment.
 
+**An approval of a consultation shows, and binds, the agent it hands work
+to.** A task over a `tool://agent/<capability>` grant carries
+`Justification.reach`: the consulted agent's name, version and digest, each of
+its grants (mutates, requires approval, consults another agent or a peer), its
+budgets and its delegation ceiling — one level deep, read from the plane's
+registry once and journaled, shown on every surface, and inside the digest the
+decision names. The consultation is pinned to the revision it showed, so a
+callee redeployed before it runs is refused, naming both revisions, and a
+replay never re-reads the plane. A coded skill gets the same through
+`cx.reach` and `cx.commission_pinned`. A peer's reach is not shown: this plane
+holds its grant, not its authority.
+
 **A decision's amendment is the call, not advice.** A reviewer who approves
 with an `amendment` has answered with the arguments that may run, and the
 runtime dispatches exactly those. The substitute is a different value with a
@@ -1855,7 +2025,7 @@ wrongly:
 | **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. This runtime does not claim to sandbox native code: untrusted executables belong behind a governed MCP/A2A/tool boundary and an OS process or container boundary |
 | **An operator who holds the signing key** | Signatures bind authorship, not existence. Whoever controls the workload identity can produce a perfectly signed alternative history |
 | **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, and `HttpWitness` speaks C2SP `tlog-witness` — the [wire and its outcomes](@/docs/journal.md#the-audit-an-outsider-runs). What is absent is not code but a **counterparty**: until a second party runs a witness for your log, a witness you host yourself does not protect auditors from you |
-| **Revocation** | A delegation is valid until it expires; the policy gate consults no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead, and an operator withdraws a credential with a halt scoped to its subject, which pauses the runs acting for it → [the emergency stop](@/docs/operations.md#the-emergency-stop) |
+| **Revocation** | A delegation is valid until it expires; the policy gate consults no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead, and an operator withdraws a credential with a halt naming its principal, which pauses every run with that principal anywhere on its chain → [the emergency stop](@/docs/operations.md#the-emergency-stop) |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |
 | **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL; the Bedrock driver takes no `Egress`, because the AWS SDK will not disclose the endpoint it dialled. What stands in its place is the deployment's own network policy |

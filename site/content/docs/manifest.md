@@ -177,7 +177,7 @@ reaches.
 
 | Field | Default | Notes |
 |---|---|---|
-| `kind` | **required** | `completion`, `tool-calling` or `planned`. |
+| `kind` | **required** | `completion`, `tool-calling`, `planned` or `call`. |
 | `max_turns` | `8` | The loop's turn ceiling, and a `planned` agent's step ceiling. A ceiling, not a suggestion: a budget also stops a runaway loop, but only *after* paying for every turn. |
 
 `kind` is a closed enum on purpose. A configuration format whose behaviours are
@@ -216,6 +216,30 @@ declared schema and a runtime-injected `have_enough_information` bit whose
 `false` fails the step. The trade: a plan cannot react to what it discovers.
 Choose `planned` when the task's shape is known up front and the data is
 hostile; `tool-calling` when the shape is the discovery.
+
+**`call`** — dispatch the one granted tool with the run's input as its
+arguments, and answer with its result. No model is declared or called: this is
+the kind an agent framework with a model of its own routes a tool call through,
+so the plane governs the effect rather than running a second agent. The
+dispatch is a `planned` step's — the arguments held to the tool's declaration
+(the catalogue's, else the grant's `arguments`), the grant, its protected
+fields, the egress ceiling, the budget, and the approval gate when the grant
+asks for one. `spec.input` binds, and is the caller's half of the same shape:
+input that does not validate against it, or against the tool's declaration,
+fails the run before any effect. Refused at parse: not exactly one grant, no
+`spec.input`, a `spec.input` with an object lacking `additionalProperties:
+false` (the input *is* the arguments, so an open object lets a caller send ones
+nobody reviewed), a `spec.models`, `spec.memory` or `spec.output` block
+(nothing in a `call` would read them), `oversight.approval: required` (the
+answer exists only once the call has happened — gate the grant instead), and a
+mutating grant with no
+`protected_fields` carrying a trust, source or value rule.
+
+A served caller's input is **untrusted** and labelled `Internal`, from
+`peer:<actor>`. So a field marked `require_trusted` refuses every served call
+and passes only for the operator's own `--input`; a field a caller may fill
+names that caller in `allowed_sources` (`["peer:app-1"]`) or carries a `one_of`
+menu; and the grant declares `max_sensitivity: internal` to receive it at all.
 
 A `tool-calling` or `planned` agent granting a tool with no `description` is
 refused at parse: a bare name makes the model guess, and the guess is refused
@@ -329,6 +353,32 @@ confidence.
 | `max_sensitivity_egress` | none — each sink's own ceiling binds, which for `model.complete` is `public` | `public`, `internal`, `confidential`, `secret`. Combined with each sink's own ceiling at dispatch; the **stricter** wins. |
 | `max_sensitivity_journaled` | unbounded | The highest sensitivity an argument may reach an effect **whose arguments the journal records** — *may this be written down forever*, where egress asks *may this leave*. Refused at dispatch, before anything is recorded; `.keyring(..)` is the *seal it* answer → [erasure and keys](@/docs/erasure.md). |
 | `max_delegation_depth` | role-dependent | Checked against the configured identity *and* against every delegating sink, including in-plane `commission`. |
+| `content` | none | Rules over a value's content, and uses of a registered checker → below, and [what they prove](@/docs/security.md#content-rules). |
+
+### `spec.security.content` {#content}
+
+`rules` are deterministic; `checks` hand a value to a registered checker and
+map the categories it reports. Ids are unique across both, and are what a
+refusal names.
+
+| Rule field | Notes |
+|---|---|
+| `id` | Required. |
+| `match` | Exactly one of `pattern` (a regular expression on the linear-time engine; `luhn: true` keeps only matches whose digits pass the Luhn check), `contains` (literal substrings; `case: fold` ignores case) or `invisible: true` (the code points that render as nothing). |
+| `at` | Any of `admission: true`; `sources` — `model.complete`, `tool.call`, `event.await`, `memory.recall`; `sinks` — `model.complete`, `tool.call`, `media.fetch`. A kind at a position it does not occupy is refused. |
+| `fields` | JSON pointers narrowing which subtrees are read. Absent reads the whole value. |
+| `then` | `refuse`, `{classify: <sensitivity>}` or, at sinks only, `{redact: <token>}`. |
+
+| Check field | Notes |
+|---|---|
+| `id` | Required. |
+| `checker` | The name a checker was registered under with `RuntimeBuilder::content_checker`. An unregistered one refuses the build. |
+| `at` | `sinks`, and `sources: [model.complete, tool.call]`: a check runs as an effect of the step. Never `admission`. |
+| `on` | From the checker's declared categories to `refuse` or `{classify: <sensitivity>}`. A category the checker does not declare refuses the build. |
+
+Every string leaf and object key is read after Unicode NFC. Anything outside
+these shapes — `warn`, `flag`, `allow`, a score, a second matcher — is refused
+at parse, naming the rule.
 
 ## `spec.capabilities`
 
@@ -400,7 +450,7 @@ what distinguishes it from one whose model wiring somebody forgot.
 Input is not — it is whatever the conversation has grown to — so
 `max_input_tokens` is held against the input the provider reports: a call that
 sent more **fails**, billed as reported, and its answer is not handed on. `0`
-is refused, since no prompt is empty.
+is refused for either ceiling, since no prompt is empty and no answer is either.
 
 Together they state what one call through the role can cost: `max_input_tokens`
 plus the output ceiling (`max_tokens`, or the default every call is sent with)
@@ -545,7 +595,7 @@ exactly like one that replans without bound.
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
 | `description` | none | What the model is told. Required by a `tool-calling` or `planned` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
 | `arguments` | derived | JSON Schema. Omit it for a typed `Tool`: the schema comes from the Rust argument type, and stating it twice is refused because a second copy can only drift. |
-| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` and a kind that calls tools (`tool-calling` or `planned`); refused without either. See [approve with an amendment](#amendment). |
+| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` and a kind that calls tools (`tool-calling`, `planned` or `call`); refused without either. See [approve with an amendment](#amendment). |
 | `protected_fields` | none | See below. |
 | `rate_limit` | none | `{ count, window_seconds }`: at most `count` calls in any `window_seconds`, across every run of the tenant. See [rate ceilings](#rate-limit). |
 
@@ -597,8 +647,9 @@ instant is each instance's clock, so a window across instances inherits their
 skew. A ceiling on another agent's plane counts only where that plane's
 declarations are held.
 
-Refused at parse: a zero `count`, a zero `window_seconds` or one longer than the
-calendar, and a ceiling on an `agent` grant. Refused at build: a plane with no
+Refused at parse: a zero `count`, a zero `window_seconds` or one longer than 31
+days (2678400 seconds, how long a store keeps each call's row, whatever the
+window of the declaration that recorded it), and a ceiling on an `agent` grant. Refused at build: a plane with no
 quota store.
 
 ### `protected_fields`
@@ -649,6 +700,31 @@ field unconstrained. A source rule names the **concrete** source an effect's
 output carries: `tool://server/name`, `model:{provider}/{model}`,
 `agent/{capability}`, or an operator identity of your own.
 
+### Which grants went unused {#unused-grants}
+
+`agentplane grants --from <export> --manifest <file> [--manifest …] [--propose
+<dir>] [--json]` reads one export and the manifests its runs name by digest,
+and nothing else. Per digest it lists each tool grant with the runs and calls
+(distinct effect keys) that exercised it, the menu values chosen and never
+chosen, and the observed outbound bytes per run against `max_egress_bytes` as
+headroom. It states its window and whether the export was complete first, and
+*unused* means unused in that window. Runs under a digest no `--manifest`
+matches, and code-tier runs, are rows of their own.
+
+A grant is named only where a call's arguments were readable. On a sealed
+export the terminal opens nothing, so every grant with no readable use is *not
+established*, menus are *not derivable*, and the sealed and erased counts stand
+beside the grant table. The library's `grants::Grants::with_keys` opens sealed
+arguments while the keys stand. A refusal names no grant, so a digest with
+refused tool calls marks an uncalled grant *unused, refusals not attributable*.
+
+`--propose` writes `<dir>/<digest>.yaml`: the manifest with whole *unused*
+grants removed, one at a time, each kept if validation refuses the result. It
+never adds a grant, changes a kept one, or touches a budget, and it is never
+applied, signed or published — a person reviews it and publishes a new
+revision. The verb exits `1` when a grant is unused, `5` when the export was
+incomplete or some calls could not be read.
+
 ## `spec.context`
 
 Exact MCP context reads, separate from action-granting tools. They remain
@@ -694,7 +770,7 @@ because two artifacts stating one decision must agree.
 
 | Field | Notes |
 |---|---|
-| `schema` | JSON Schema, digest-covered. The shape a **caller** must send. Optional; `schema: {}` is refused for the same reason it is on `spec.output` — it permits anything while looking answered. |
+| `schema` | JSON Schema, digest-covered. The shape a **caller** must send. Optional, except for `execution.kind: call`, where it is the call's arguments, must be closed (`additionalProperties: false` on every object), and every input is validated against it; `schema: {}` is refused for the same reason it is on `spec.output` — it permits anything while looking answered. |
 
 The mirror of `spec.output`, for a caller the result contract never had to
 consider: **a model composing the arguments.** Calling `run_under` from your own
@@ -741,7 +817,7 @@ human is in the loop when none is.
 |---|---|---|
 | `approval` | **required** | `required` gates every answer; `tools-only` gates only the grants that set `requires_approval`; `none` gates nothing and leaves the deciding to `triage`. See below |
 | `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
-| `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name. `kind` and `params` reach the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says. |
+| `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name. `kind` and `params` reach the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says; a count `n` that is not a positive integer is refused at parse. |
 | `on_expiry` | deny | What happens when the window closes. `deny` refuses the answer. `escalate` widens the audience and keeps waiting: the `escalate_to` roles join the reviewers, the stale claim is cleared, and the task leaves the expiry scan — it is answered by a person or answered never. `proceed` acts unattended. |
 | `escalate_to` | — | Roles added to the audience when a task escalates. **Required by `on_expiry: escalate`**, because widening is escalation's one enforceable meaning; refused beside any other policy. `escalate` also needs bounded audiences: an empty `approvers` already means *anyone*, which no list can widen. |
 | `allow_unattended` | `false` | Explicit consent required for `on_expiry: proceed`, so acting with no human is a greppable decision somebody made rather than an enum variant they picked off a list. |
@@ -972,6 +1048,40 @@ one, and on the privileged model otherwise — see `spec.models` above for why.
 Write the `instruction` extraction-only, with fabrication refused: *record
 stable facts stated in the source; do not infer addresses, dates or
 identifiers that are not literally present*.
+
+## `spec.data_subjects` {#data-subjects}
+
+Whose data a run takes in. Each entry is `$input/<pointer>` or `$case` from the
+[memory-subject grammar](#binding-the-subject-to-the-party-a-run-is-about),
+resolved once per run into its `DataSubjectBound` journal record; every value
+derived from the run's input, its inbound events and its case-state reads is
+then attributed to it, and `agentplane subject` follows that data to the
+effects it reached ([erasure](@/docs/erasure.md#where-a-subjects-data-went)).
+
+```yaml
+data_subjects: ["$input/customer/id"]
+```
+
+* **A literal is refused at parse.** It would attribute every run's data to one
+  party.
+* **`$correlation/<namespace>` is refused at parse.** A correlation key is
+  readable by design in `CaseBound`, `RunSuspended` and the case store, so a
+  subject read from one would be sealed in one record and left in the clear in
+  the others, and an erasure would leave it behind. Read the identifier from
+  the input with `$input/<pointer>`, and correlate on a key that is not
+  personal data.
+* **`$case` resolves to the case id**, which identifies nobody.
+* **A binding that cannot resolve refuses the run** before anything is
+  journaled, naming the binding.
+* **`$input` may name an untrusted field**, unlike a memory subject. A data
+  subject attributes and decides nothing — no gate and no policy context reads
+  it — so a value naming the wrong party produces a false listing, not a write
+  into another party's pile. The report marks such a binding *asserted by
+  untrusted input*.
+
+The resolved subject is sealed with the run, so a key ring is what lets a report
+match it and an erasure of the run's case takes it with it. A hand-wired run
+names its subjects with `RunTerms::subject`.
 
 ## What is deliberately not in the format
 

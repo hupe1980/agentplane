@@ -337,9 +337,10 @@ pub trait BlobStore: Send + Sync + Debug {
 /// reaches exactly this case's copies — [`ScopedBlobs`] carries the argument
 /// for why the erasure unit leads the address.
 ///
-/// Returns how many blobs were expired. Zero is an ordinary answer: a case that
-/// stored nothing has nothing to forget, and reporting that as an error would
-/// make the caller special-case the common path.
+/// Returns how many blobs were expired, and every disclosure of the case or
+/// its runs that `disclosures` holds. Zero blobs is an ordinary answer: a case
+/// that stored nothing has nothing to forget, and reporting that as an error
+/// would make the caller special-case the common path.
 ///
 /// What this does **not** touch is the journal. Records are append-only by
 /// design, so personal data written into one cannot be removed — keep it out of
@@ -359,15 +360,17 @@ pub trait BlobStore: Send + Sync + Debug {
 /// [`EraseError::Store`] carrying [`StoreError::NotFound`](crate::core::StoreError::NotFound)
 /// if the case does not exist, and an error if the case's blob list cannot be
 /// read or a blob cannot be expired.
+#[allow(clippy::too_many_arguments)]
 pub async fn erase_case(
     blobs: Option<&dyn BlobStore>,
     cases: &dyn crate::case::CaseStore,
     #[cfg(feature = "keyring")] keyring: Option<&dyn crate::keyring::KeyRing>,
+    disclosures: Option<&dyn crate::disclosure::DisclosureRegister>,
     tenant: &crate::core::TenantId,
     case: crate::core::CaseId,
     at: crate::core::Timestamp,
     reason: &str,
-) -> Result<usize, EraseError> {
+) -> Result<Erased, EraseError> {
     // **Before anything is destroyed, and before any tombstone is written.**
     // The order is the whole guarantee: a hold checked after the first
     // `expire` would leave a half-erased matter that the hold says must be
@@ -394,12 +397,16 @@ pub async fn erase_case(
             case.to_string(),
         )));
     }
+    let runs = found.as_ref().map(|c| c.runs.clone()).unwrap_or_default();
     if let Some(open) = found.filter(|c| c.status != crate::core::CaseStatus::Closed) {
         return Err(EraseError::CaseStillOpen {
             case: case.to_string(),
             status: format!("{:?}", open.status).to_lowercase(),
         });
     }
+    // Read before anything is destroyed, so a register that cannot answer
+    // leaves the matter whole rather than erased with its copies unnamed.
+    let copies = copies_of(disclosures, &[case], &runs).await?;
 
     let digests = cases.blobs_of(case).await?;
     let scope = crate::core::erasure_scope(tenant, &case.to_string());
@@ -430,7 +437,41 @@ pub async fn erase_case(
             .await
             .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))?;
     }
-    Ok(n)
+    Ok(Erased { blobs: n, copies })
+}
+
+/// What an erasure did, and the copies outside the plane it did not reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Erased {
+    /// Blob references tombstoned.
+    pub blobs: usize,
+    /// One sentence per disclosure of what was erased, each saying what the
+    /// erasure does to that copy and that the name comes from the operator's
+    /// register — an unchained row, so an empty list does not show that
+    /// nothing was disclosed.
+    pub copies: Vec<String>,
+}
+
+/// The copies `disclosures` names for `cases` or `runs`, as an erasure reports
+/// them; with no register, the one sentence saying none was consulted.
+async fn copies_of(
+    disclosures: Option<&dyn crate::disclosure::DisclosureRegister>,
+    cases: &[crate::core::CaseId],
+    runs: &[crate::core::RunId],
+) -> Result<Vec<String>, EraseError> {
+    let Some(register) = disclosures else {
+        return Ok(vec![
+            "no disclosure register was consulted, so no copy made outside the plane is \
+             named here"
+                .to_owned(),
+        ]);
+    };
+    Ok(register
+        .disclosures(cases, runs)
+        .await?
+        .iter()
+        .map(crate::disclosure::Disclosure::after_erasure)
+        .collect())
 }
 
 /// Destroy the erasure scope of a run that belongs to no case.
@@ -468,15 +509,18 @@ pub async fn erase_case(
 #[cfg(feature = "keyring")]
 pub async fn erase_run(
     keyring: &dyn crate::keyring::KeyRing,
+    disclosures: Option<&dyn crate::disclosure::DisclosureRegister>,
     tenant: &crate::core::TenantId,
     run: crate::core::RunId,
     at: crate::core::Timestamp,
     reason: &str,
-) -> Result<(), EraseError> {
+) -> Result<Vec<String>, EraseError> {
+    let copies = copies_of(disclosures, &[], &[run]).await?;
     keyring
         .destroy(&crate::keyring::scope(tenant, &run.to_string()), at, reason)
         .await
-        .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))
+        .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))?;
+    Ok(copies)
 }
 
 /// Re-state a blob failure in the vocabulary a step is refused in.

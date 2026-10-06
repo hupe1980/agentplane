@@ -30,6 +30,7 @@ one builder call:
 | Data | Where it lands | Erasable without `.keyring(..)` | with it |
 |---|---|---|---|
 | Run input | journal — `RunAdmitted.input` | **no**, verbatim | sealed, per-case scope |
+| Data subjects a run binds | journal — `DataSubjectBound.subject`; labels carry only `{run, index}` references to it | **no**, verbatim | sealed, per-case scope |
 | **Model prompts** | journal — inside `EffectStarted.descriptor.args`, because the prompt is part of effect identity | **no**, verbatim | sealed, per-case scope |
 | **Tool call arguments** | journal — same field, same reason | **no**, verbatim | sealed, per-case scope |
 | Effect outputs — completions, tool results | journal — `EffectDone.output`, and a reconciliation probe's `EffectReconciled.output`, which is the same data | **no**, verbatim | sealed, per-case scope |
@@ -38,6 +39,7 @@ one builder call:
 | Inbound event payloads — a counterparty's message body | journal (the awaited effect's output) **and** the event store | **no** | sealed in both; the buffer's copy is its own unit, keyed `(source, id)` |
 | Human task proposals — `Justification.proposed_action`, the exact thing a reviewer is shown, and `evidence`, the trail behind it | journal (the task effect) **and** the task store | **no** | sealed in both; the task's `summary` stays readable so a queue stays usable, and every entry keeps its trust label so a reviewer still knows who wrote a line whose words are gone |
 | Memory item content | `MemoryStore` | **yes** — `forget`, `forget_cascading`, expiry sweep, in the live store | unreadable everywhere with an explicit `EncryptedMemoryStore` wrap: each item version has its own key, destroyed by the verb that erases it — **not** covered by `.keyring(..)`, see below |
+| Semantic-index vectors, derived from memory content | the `SemanticRetriever`'s index | **yes** — every memory erasure verb tells the index what it removed (`SemanticRetriever::forget`), through `IndexedMemoryStore` | a key ring does not reach them: an embedding is computed from plaintext, and a vector hidden from search but left in the index is reconstructible content |
 | Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone, in the live store only | unreadable everywhere, backups included |
 | Correlation keys, deadline names, task summaries, statuses | case / task store | no, and deliberately — they are what the store is asked questions *about* | unchanged: still readable |
 | Admission keys — a message's `source`/`id` | journal — `RunAdmitted.idempotency_key` — **and** the `run_admission` index | no, and deliberately: the index is looked up by a value the caller holds in the clear, and sealing it would leave a store that cannot refuse a redelivery | unchanged: still readable |
@@ -87,13 +89,45 @@ enumerated:
 | A document, a free-text prompt, any long unpredictable bytes | hidden: too many candidates to try |
 | A yes/no, an amount, a date, a status, a name from a known list | **recoverable** by trying every candidate |
 
-Two such digests are written by the runtime and stay in the clear by design:
-the **effect key**, derived from the effect kind and its canonical arguments,
-and a `Released` record's **`value`** digest. An effect whose arguments are one
-small value — `{"approved": true}`, an amount — leaves that value recoverable
-from its key. When such a value must be erasable, pass an opaque identifier the
-tool resolves instead of the value. A blob does not help: a blob is addressed by
-the digest of its plaintext.
+This concerns sealed planes: on an unsealed one nothing is erased, and the
+arguments sit verbatim beside their key.
+
+Where the runtime leaves such a digest, by record kind:
+
+| Record kind | Clear digest | Survives the erasure of |
+|---|---|---|
+| `EffectStarted`, `EffectDone`, `EffectFailed`, `EffectReconciled`, `PolicyDenied`, `BudgetRefused`, `BudgetReadmitted` | the record's **effect key**, over the effect kind and its canonical arguments; step, phase and attempt are clear beside it, and the ordinal is small | the arguments — and, for a `memory.remember` effect, whose arguments carry the item's content digest, `forget`, `erase_subject` and `sweep_expired` too |
+| `Released` | **`value`**, over the canonical released value, and the effect key, whose arguments embed it; both are copied into the audit report and every export | the released value |
+
+`RunAdmitted` (`idempotency_key`), `CaseBound` (`correlation`) and
+`RunSuspended` (the correlation keys it waits on, including a task's) carry
+values clear by design rather than digests: they are the keys the stores are
+asked questions about, so a business key that is personal data is a key
+chosen badly. `RunAdmitted` (`governed_by`, `policy_bundle`),
+`DeadlineRegistered` (`calendar_digest`) and `RunConcluded` (`chain_head`)
+carry digests over nothing erasable — the deployment's declarations, a
+calendar, and a chain over ciphertext, as every record's hashes are.
+`QuotaPassStarted`, `PlanFrozen`, `StepStarted`, `StepFinished`,
+`DeadlineTransition`, `Note`, `AuthorityWithheld`, `AuthorityRestored`,
+`IdentityBound`, `DataSubjectBound`, `GroupOpened`, `GroupSettled`, `QuarantineDecided`,
+`StepCompensated`, `RunCancelled`, `BreakGlass`, `HaltLifted`, `HoldReleased`,
+`Swept` and `Observed` carry no digest.
+
+Outside the journal:
+
+| Digest | Where it is clear | Survives the erasure of |
+|---|---|---|
+| dispatch identity | a callee's deduplication key, and the A2A message id derived from it — the callee's copy | the arguments |
+| provenance claim | the signed claim a peer receives, carrying the arguments' digest — the peer's copy | the arguments |
+| reason digest | every loud event in the deployment's logs, unkeyed and truncated | a failure, quarantine or compensation reason the journal seals |
+| blob content digest | the case's blob rows, the blob's tombstone, the backing address derived from it, and the key of any effect whose arguments carry it | the blob's bytes |
+| selection digest | a `Selected` in a semantic retriever's index, where the deployment keeps one | the memory item's content |
+
+An effect whose arguments are one small value — `{"approved": true}`, an
+amount — leaves that value recoverable from its key. When such a value must be
+erasable, pass an opaque identifier the tool resolves instead of the value.
+Moving it into a blob or a memory does not help: both leave a digest of their
+content in the clear. Otherwise, accept the value as retained.
 
 **Declare the ceiling and the runtime enforces it.** `spec.security.max_sensitivity_journaled`
 refuses, at dispatch, any argument more sensitive than a deployment is willing
@@ -168,13 +202,37 @@ destroys the keys of every version it held; a cascade that reaches only a
 superseded version (a rolling summary whose v1 absorbed the erased source)
 destroys exactly that version's key, so a backup taken before the cascade no
 longer opens it while the current version stays readable. `Cascade.trimmed`
-names each such id with the versions it lost. A subject is not a key scope —
+names each such id with the versions it lost. The sweep and a cascade erase
+rows before keys, so a key the ring refuses is owed and destroyed by the next
+erasure verb, which fails while it cannot; the debt is held in the process. A
+subject is not a key scope —
 erasing one destroys the keys of the items it held and leaves the subject
 writable under new ids. Wrap it where you can see the deployment:
 
 ```rust
 let memories = EncryptedMemoryStore::new(inner, Arc::clone(&keys), tenant.clone());
 Runtime::builder(store).memory(Arc::new(memories)).keyring(keys).build()
+```
+
+**A semantic index is erased with the memory it was built from.** Key
+destruction cannot reach it — an embedding is computed from plaintext — so every
+erasure verb of `IndexedMemoryStore` tells the `SemanticRetriever` what it
+removed, and an index that could not be told fails the erasure rather than
+letting it report success. What it missed is kept and delivered by the next
+erasure verb, the expiry sweep included, because retrying a cascade or a sweep
+finds the rows already gone; the debt is held in the process, so a restart
+before that loses it. `semantic_memory(..)` wraps the plane's memory in
+it, which covers the expiry sweep; erasures made on your own handle reach the
+index only through the wrapper. `erase_subject` is the sealed store's own verb
+and runs beneath anything the plane wraps around it, so the wrapper goes inside
+the seal, over the same retriever `semantic_memory(..)` is given — and `build`
+refuses a sealed store whose subject erasure would miss the index
+(`BuildError::SealedMemoryMissesIndex`), and a store already wrapped over a
+different retriever (`BuildError::MemoryIndexedElsewhere`):
+
+```rust
+let indexed = IndexedMemoryStore::new(inner, Arc::clone(&retriever));
+let memories = EncryptedMemoryStore::new(Arc::new(indexed), Arc::clone(&keys), tenant.clone());
 ```
 
 ### Erasing on more than one instance
@@ -330,6 +388,53 @@ key and takes the journal copies with it — or keeps the data out, which is wha
 
 ---
 
+## Where a subject's data went, before erasing it {#where-a-subjects-data-went}
+
+`agentplane subject <subject> --store … [--tenant …] [--limit N] [--json]`
+answers the question that comes before an erasure. It selects the subject's
+memory items exactly as an erasure does — every id the store holds for the
+subject, expired or not — and the runs whose `DataSubjectBound` names the
+subject, with their cases: the units `erase_run` and `erase_case` act on. It
+lists each outbound effect whose label names one of those items in its
+provenance, or one of those bindings in its `data_subjects`: run, case, effect
+key, kind, sink and bytes. A value is reported as *influenced by* an item or a
+bound run's intake, never as *containing* it. It also lists the recall records
+that read an item, trusted or not, when their output can be read.
+
+A run binds its subjects from its agent's
+[`spec.data_subjects`](@/docs/manifest.md#data-subjects) or `RunTerms::subject`,
+and the binding follows its input, its inbound events and its case-state reads
+to every effect they reach — into a commissioned run, too. The subject is
+sealed with the run, so an erased binding names nobody and its
+`DataSubjectBound` keeps no identifier in the clear. That is a claim about the
+binding, not about every place the identifier may also sit: a data subject is
+never read from a correlation key, because the key stays readable in every
+case record by design (above), and a deployment that also correlates on the
+identifier leaves it there whatever the binding says. A reference the runtime
+did not attach is a claim it cannot check: an embedder or a batch that admits a
+run with a `Tainted` input whose label already names references is believed,
+since no record says which run those references came from.
+
+The report is a read. It appends no record, writes no memory, and takes no
+operator. It is evidence for whoever asks, not a statement that any access
+obligation is met.
+
+What it cannot see is printed first, on every report, with each class marked
+when this report met one: a run that binds no data subject; a sealed binding
+with no key ring; an erased binding; data about the subject from a tool, model
+or peer, traced only once joined with what a bound run took in; a trusted item, whose recall leaves no source in any label; recall
+records that could not be opened; forgotten and swept ids; sinks whose
+arguments were not opened, named by kind only; the trace being per item rather
+than per version; a coded step that passes a value on without joining its
+inputs' labels; and runs past the limit or unreadable, which also exit `5`.
+
+The terminal carries no key ring, so on a sealed plane it names a tool call's
+sink by its kind and lists no recall and no bound run. The library's
+`subject::Trace::with_keys` opens all three while the keys stand; a destroyed key is reported as erased, and any
+other ring failure fails the report rather than reading as an erasure.
+
+---
+
 ## Retention on a window, and what it cannot reach
 
 `erase_case` and `erase_run` erase one unit. Retention is the same act on a
@@ -374,6 +479,29 @@ every tombstone and key destruction, so a later read says *expired, on this
 date, for this reason* rather than *missing* — which is the distinction the
 recovery drill's verdict is built on.
 
+### A disclosed copy {#a-disclosed-copy}
+
+A [disclosure package](@/docs/operations.md#disclosing-one-matter) is a copy
+outside the plane, and no erasure reaches it. What an erasure can do is name
+it: `erase_case` and `erase_run` return, and a retention pass reports in
+`disclosed`, one line per disclosure of what was erased — who received it,
+when, who sent it, and what the erasure does to that copy:
+
+- **from an unsealed plane:** a plaintext copy this erasure cannot reach;
+- **a copy carrying sealed payloads:** those sealed under the erased key
+  become unopenable; anything that travelled unsealed — another case's
+  payloads in the same package among them — and the fields the journal keeps
+  in the clear stay readable in it. Whether a copy is sealed is recorded per
+  package, not per case.
+
+A retention pass walks cases, so a case-less run's disclosures are named by
+`erase_run`, not by the pass. The names come from the plane's **disclosure
+register**, a row per disclosure in the store beside the holds — not a record
+on any chain. Whoever administers that store can edit or delete a row, so a
+line names what the operator recorded, and an empty list does not show that
+nothing left the plane. Without a register wired, the result says none was
+consulted.
+
 ### A legal hold is the one thing that stops a pass {#a-legal-hold-stops-a-pass}
 
 A retention pass is automatic: it runs on a window nobody re-reads, and a matter
@@ -390,8 +518,11 @@ agentplane hold --store ./journal.redb \
 # Each row carries who placed it and whether a credential or a terminal said so.
 agentplane hold list --store ./journal.redb
 
-# Release it. The next pass erases the matter normally.
-agentplane hold --store ./journal.redb --case case_01JD... --lift
+# Release it, under a name. The next pass erases the matter normally.
+agentplane hold --store ./journal.redb --case case_01JD... --lift --actor compliance-dana
+
+# Every recorded release, newest first.
+agentplane hold list --store ./journal.redb --released
 ```
 
 ```rust
@@ -410,6 +541,18 @@ key. Over HTTP it is `GET`/`POST /holds` and `POST /holds/release`, under
 are separate, so whoever
 may authorise destruction is a grant you hand out separately from whoever may
 prevent it.
+
+**A release is recorded, and survives the erasure it permits.** Before the row
+goes, the release is written to the journal as the one `HoldReleased` record of
+a sealed run of its own, outcome `hold-released`, stamped with the case: who
+released it and on what basis — the authenticated caller over the API, `--actor`
+as asserted at a terminal, where it is required — when, and who had placed the
+hold and when. It carries no hold reason, which is free text about the matter;
+names and instants only, so it is still readable in the matter's history after
+the erasure destroys the case's key. Only the hold the record names is
+removed: one re-placed between the read and the removal stays standing, and the
+release fails naming the record's run. `GET /holds?state=released` and
+`hold list --released` read the releases back, newest first.
 
 **A held case reads as held, not as failed.** `RetentionReport::held` is its own
 field beside `failures`, and a hold does not make `is_complete()` false — a
@@ -485,7 +628,7 @@ Every pass returns a coverage list beside its count, for the same reason
     "governed memory is erased by item and by subject, never by case — including memory a declaration keyed to `$case` or `$correlation/<namespace>`…",
     "an inbound event is its own erasure unit: the event buffer's copy, and every backup of it, is erased by `SealedEvents::erase_event`…",
     "media fetched under a named external retention policy belongs to that policy's unit, not the case…",
-    "semantic-index vectors are derived from memory content and live in the retriever's index; nothing here removes them…"
+    "semantic-index vectors are derived from memory content and erased with it, by the memory erasure verbs through `IndexedMemoryStore`…"
   ]
 }
 ```

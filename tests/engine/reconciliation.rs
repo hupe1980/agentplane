@@ -397,6 +397,7 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 ),
                 Append::new(
@@ -424,6 +425,8 @@ async fn a_crash_orphan_is_resolved_by_the_probe_rather_than_escalated() {
                         backoff_ms: 0,
                         outbound_label: None,
                         outbound_bytes: None,
+                        content_rules: None,
+                        credential: None,
                     },
                 )
                 .step(StepId(0))
@@ -482,6 +485,7 @@ async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 ),
                 Append::new(
@@ -508,6 +512,8 @@ async fn strict_replay_of_an_orphan_neither_performs_nor_probes_nor_writes() {
                         backoff_ms: 0,
                         outbound_label: None,
                         outbound_bytes: None,
+                        content_rules: None,
+                        credential: None,
                     },
                 )
                 .step(StepId(0))

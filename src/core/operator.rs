@@ -36,7 +36,19 @@ use serde::{Deserialize, Serialize};
 /// withdrawn by a verified signal from the party that issued it is none of
 /// these — and it stays absent until something produces one, because a variant
 /// nothing constructs reads as a capability this runtime has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Basis {
     /// An authenticator verified a credential and this is the actor it named.
@@ -144,15 +156,18 @@ pub enum OperatorError {
 /// record with nobody attached. A type that documents an invariant while
 /// deriving `Deserialize` enforces it on the rare path and not on the ones an
 /// attacker or a damaged row takes.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(try_from = "OperatorWire")]
+#[schemars(deny_unknown_fields)]
 pub struct Operator {
     actor: String,
     basis: Basis,
 }
 
 /// The wire shape, carrying no invariant.
-#[derive(Deserialize)]
+#[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct OperatorWire {
     actor: String,

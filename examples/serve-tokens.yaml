@@ -3,9 +3,9 @@
 # a decision recorded against nobody is not a decision anybody can answer for.
 #
 # The roles are not grants. They are an input to the policy set, which is what
-# decides — `serve-policy.cedar` gives `peer` the A2A actions and `operator` the
-# API ones, so neither token can do the other's work even if it reaches the
-# other's port.
+# decides — `serve-policy.cedar` gives `peer` the A2A actions, `framework` the
+# MCP ones and `operator` the API ones, so no token can do another's work even
+# if it reaches that port.
 #
 # `scope` is a grant, and it is the caller's own: every run peer-a starts is
 # admitted under a chain rooted at `peer-a` with exactly this authority, and
@@ -14,11 +14,12 @@
 # and the caller has no chain of its own: its runs are bounded by the plane's
 # chain and hold none of its authority.
 #
-# The two values below are placeholders, and `serve` refuses to start on them —
-# as it refuses any token shorter than 32 bytes. Generate real ones:
+# The values below are placeholders, and `serve` refuses to start on them — as
+# it refuses any token shorter than 32 bytes. Generate real ones:
 #
 #   sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
 #       -e "s/replace-me:ops-alice:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+#       -e "s/replace-me:app-1:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
 #       examples/serve-tokens.yaml > tokens.yaml
 #
 # and mount the result as a secret.
@@ -30,3 +31,9 @@
 - token: "replace-me:ops-alice:openssl-rand-hex-32"
   actor: ops-alice
   roles: [operator]
+
+# An agent framework calling the served tools over `--mcp-addr`. No `scope`:
+# its runs act under no chain of their own.
+- token: "replace-me:app-1:openssl-rand-hex-32"
+  actor: app-1
+  roles: [framework]

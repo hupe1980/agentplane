@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.45.0"
+version      = "0.46.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -26,6 +26,10 @@ include = [
     "/examples/*.yaml",
     "/examples/*.cedar",
     "/src/bin/*.rs",
+    # The dev page's shell, script and stylesheet, which `api::dev` embeds.
+    "/src/api/dev/index.html",
+    "/src/api/dev/app.js",
+    "/src/api/dev/app.css",
     "/README.md",
     "/CHANGELOG.md",
     "/LICENSE-MIT",
@@ -51,7 +55,7 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # The agent declaration: tool grants, budgets, egress ceiling, injection
 # pattern. Off by default — the runtime is usable wired by builder calls; the
 # manifest is what makes those declarations reviewable.
-manifest = ["dep:serde_yaml_ng", "dep:jsonschema"]
+manifest = ["dep:serde_yaml_ng", "dep:jsonschema", "dep:regex", "dep:unicode-normalization"]
 # Everything the `agentplane` binary needs. `signing` and `witness-http` are
 # here for the audit verbs, for one reason: an `audit`/`verify` that could not
 # check a signature, or could not fetch an anchoring checkpoint from a witness,
@@ -99,7 +103,12 @@ mcp-stdio = ["mcp", "rmcp/transport-child-process"]
 # Serve this plane's agents *as* MCP tools and their instructions as prompts.
 # Needs the manifest: what a catalogue offers is the declaration, never a
 # second list beside it.
-mcp-server = ["mcp", "manifest", "rmcp/server", "rmcp/transport-io"]
+mcp-server = ["mcp", "manifest", "rmcp/server", "rmcp/transport-io", "dep:http"]
+# The same catalogue over Streamable HTTP, behind this plane's authenticator,
+# policy and `Host`/`Origin` checks — the door an agent framework in another
+# language walks through. Separate because it costs rmcp's HTTP server stack,
+# which an embedder serving over stdio should not pay for.
+mcp-server-http = ["mcp-server", "http", "rmcp/transport-streamable-http-server"]
 # Reach an MCP server over streamable HTTP — the transport remote servers
 # speak. Separate for the same reason as `mcp-stdio`: it costs a reqwest
 # stack an embedder bringing their own transport should not pay for.
@@ -108,11 +117,18 @@ mcp-http = ["mcp", "rmcp/transport-streamable-http-client-reqwest"]
 # and `rt-multi-thread` are the listener — the base tokio features are short of
 # a server by exactly that.
 http = ["dep:axum", "tokio/net", "tokio/rt-multi-thread"]
+# `agentplane dev`: a page for trying an agent on the author's own machine —
+# loopback only, behind a per-process token, over a store this mode created.
+# No container image enables it, because it starts runs over HTTP. `tower` is
+# already in the graph through `axum`; the page calls the operator router
+# through it.
+dev = ["cli", "http", "dep:tower"]
 # Submitting checkpoints to a real witness — the half that gives the split-view
 # guarantee a counterparty. `signing` is not optional: a cosignature nobody
 # verifies is not evidence, and verifying one needs the primitive.
 witness-http = ["dep:reqwest", "signing"]
-# A2A transport: the JSON-RPC client. See `mcp` for why this is a wire and not
+# A2A transport: the JSON-RPC client, and the RFC 8693 token-exchange client a
+# peer's credential source can use. See `mcp` for why this is a wire and not
 # the seam.
 a2a = ["dep:reqwest"]
 # Mapping the Agent Client Protocol's session updates onto observation records.
@@ -196,6 +212,10 @@ clap = { version = "4", default-features = false, features = ["derive", "std", "
 redb        = { version = "4", optional = true }
 # The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
 serde_yaml_ng = { version = "0.10", optional = true }
+# Content rules: the linear-time engine (no backreferences, no look-around), so
+# a declared pattern cannot make a gate's cost depend on its input's shape.
+regex = { version = "1", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
 # `default-features = false`: the defaults pull in a long list of service
 # backends. An embedder picks the one they use; `services-fs` is the only one
 # that makes sense to assume.
@@ -213,10 +233,15 @@ tokio-postgres = { version = "0.7.18", optional = true, features = [
 ] }
 deadpool-postgres = { version = "0.14.1", optional = true }
 rmcp = { version = "3.1", default-features = false, features = ["client", "transport-io"], optional = true }
+# The request type rmcp's HTTP server puts on a served request, read by
+# `mcp-server` to refuse one that arrives over HTTP with no caller — whoever
+# mounted the catalogue. Already in the graph wherever that server is.
+http = { version = "1", optional = true }
 # `query` for `?outcome=…` on the run list. Kept to the four features that
 # are actually used: axum's default set pulls in a router's worth of
 # extractors this surface never touches.
 axum = { version = "0.8.9", default-features = false, features = ["json", "http1", "tokio", "query"], optional = true }
+tower = { version = "0.5.3", default-features = false, features = ["util"], optional = true }
 # `rustls` rather than the platform's TLS: one static binary is a design
 # commitment, and linking OpenSSL puts a system dependency back in.
 # `rand_core` off: keys come from the deployment, and a signer that can mint its
@@ -272,6 +297,10 @@ a2a-server-lf = { version = "0.4.1", default-features = false }
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 http = "1"
+# The operator API's wire suite validates every body it receives against the
+# published OpenAPI document, in the `http,redb` build too, where the library's
+# own copy (behind `manifest`) is absent. Same version as the library's.
+jsonschema = { version = "0.56.0", default-features = false }
 rmcp = { version = "3.1", default-features = false, features = ["server", "transport-io", "macros"] }
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio = { version = "1", features = ["full"] }

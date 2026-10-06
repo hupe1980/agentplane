@@ -1516,3 +1516,64 @@ impl agentplane::core::PolicyEngine for PermitsReleases {
         )
     }
 }
+
+/// Sinks its input into a field allowed only from `sender:acme`.
+#[derive(Debug)]
+struct ForwardsToAcmeField {
+    world: World,
+}
+
+#[async_trait::async_trait]
+impl Skill for ForwardsToAcmeField {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("forward").provides("forward")
+    }
+    async fn invoke(&self, cx: &mut StepCtx<'_>, i: Tainted<Value>) -> Result<Outcome, SkillError> {
+        let mut sink = ProtectedSink::new(
+            Arc::clone(&self.world),
+            i.peek().clone(),
+            "tool://crm/upsert",
+            "crm.upsert",
+        );
+        sink.protected = vec![agentplane::core::ProtectedField::from_sources(
+            "/recipient",
+            [SourceId::new("sender:acme")],
+        )];
+        Ok(Outcome::done(cx.sink(sink, &i).await?))
+    }
+}
+
+/// **A subject binding moves no gate.** A field allowed only from
+/// `sender:acme` takes a value from `sender:acme` whether or not the run binds
+/// a data subject — the reference rides beside the provenance, never in it.
+#[tokio::test]
+async fn an_allowed_sources_field_answers_the_same_for_a_subject_bound_value() {
+    for subject in [None, Some("cust-17")] {
+        let world = World::default();
+        let store = db();
+        let runtime = Runtime::builder(store as Arc<dyn JournalStore>)
+            .skill(ForwardsToAcmeField {
+                world: Arc::clone(&world),
+            })
+            .build();
+        let input = Tainted::from_source(
+            json!({ "recipient": "acct-9" }),
+            SourceId::new("sender:acme"),
+        );
+        let terms = subject.map_or_else(agentplane::runtime::RunTerms::default, |s| {
+            agentplane::runtime::RunTerms::default().subject(s)
+        });
+        let admission = runtime
+            .run_under("forward", input, terms)
+            .await
+            .expect("admitted");
+        let out = admission.outcome().expect("a fresh run");
+        assert_eq!(
+            out.status,
+            RunStatus::Succeeded,
+            "with subject {subject:?} the gate answered {:?}",
+            out.status
+        );
+        assert_eq!(world.lock().unwrap().as_slice(), ["crm.upsert"]);
+    }
+}

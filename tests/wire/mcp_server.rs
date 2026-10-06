@@ -171,37 +171,204 @@ async fn connect(server: McpServer) -> rmcp::service::RunningService<rmcp::RoleC
         .expect("client initialises")
 }
 
-/// **An older revision is refused, not quietly served.**
-///
-/// The SDK's own `ProtocolVersion::LATEST` is `2025-11-25`, so a client built
-/// on the defaults asks for a revision this plane is not written against. What
-/// it must not get is a working session: that revision has no Tasks extension,
-/// so a run that suspends for an approval would have no way to say so — the
-/// long-running call would simply behave synchronously and no error would name
-/// the cause. That is the downgrade this crate refuses as a *client*, and it is
-/// refused here from the other side, with the supported set in the error so the
-/// operator on the far end can read what happened.
+/// **A revision older than the ones this plane speaks is refused, not
+/// quietly served** — with the supported set in the error, so the far end can
+/// tell an unsupported version from an outage.
 #[tokio::test]
 async fn an_older_revision_is_refused_rather_than_negotiated_down() {
+    #[derive(Debug, Clone, Default)]
+    struct Old;
+    impl rmcp::ClientHandler for Old {
+        fn get_info(&self) -> rmcp::model::ClientConfig {
+            let mut info = rmcp::model::ClientConfig::default();
+            info.protocol_version = ProtocolVersion::V_2025_06_18;
+            info
+        }
+    }
+
     let manifest = Manifest::parse(AGENT).expect("a valid manifest");
     let server = McpServer::new(plane(), &[manifest]).expect("served");
     let (client_side, ()) = pipe(server);
     let (cr, cw) = tokio::io::split(client_side);
 
-    let refused = ().serve((cr, cw)).await;
+    let refused = Old.serve((cr, cw)).await;
     let Err(error) = refused else {
-        panic!(
-            "a client asking for {} was served — a suspension has no expression on that \
-             revision, so the session would work right up to the first governed wait",
-            ProtocolVersion::LATEST
-        );
+        panic!("a client asking for 2025-06-18 was served");
     };
     let said = error.to_string();
     assert!(
-        said.contains("2026-07-28"),
-        "the refusal does not name the revision this plane speaks, so the far end \
+        said.contains("2026-07-28") && said.contains("2025-11-25"),
+        "the refusal does not name the revisions this plane speaks, so the far end \
          cannot tell an unsupported version from an outage: {said}"
     );
+}
+
+const LOOKUP: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: lookup, version: "1.0.0" }
+spec:
+  identity: { role: Look up a customer record. }
+  capabilities: { provides: [crm.lookup] }
+  input:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id: { type: string }
+  tools:
+    - ref: tool://crm/lookup
+      mutates: false
+      # A served host's arguments arrive `Internal`: they came from outside.
+      max_sensitivity: internal
+  execution: { kind: call }
+  budgets: {}
+"#;
+
+/// Answers every call with its arguments.
+#[derive(Debug)]
+struct Echo;
+
+#[async_trait::async_trait]
+impl agentplane::tools::ToolClient for Echo {
+    async fn call(
+        &self,
+        _tool: &agentplane::tools::ToolId,
+        arguments: &Value,
+        _p: Option<&agentplane::core::Provenance>,
+    ) -> Result<Value, agentplane::tools::ToolError> {
+        Ok(json!({ "found": arguments }))
+    }
+
+    fn destination(&self, _tool: &agentplane::tools::ToolId) -> agentplane::tools::Destination {
+        agentplane::tools::Destination::Local
+    }
+}
+
+/// A coded agent (which may suspend: nothing can see into it) beside a `call`
+/// agent (which cannot).
+fn mixed_plane() -> (Arc<Runtime>, Vec<Manifest>) {
+    let lookup = Manifest::parse(LOOKUP).expect("lookup");
+    let auditor = Manifest::parse(AGENT).expect("auditor");
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn JournalStore>;
+    let plane = Runtime::builder(store)
+        .owner("mcp")
+        .policy(Arc::new(Permit))
+        .tools(
+            Arc::new(agentplane::tools::ToolCatalog::from_manifest(&lookup)),
+            Arc::new(Echo) as Arc<dyn agentplane::tools::ToolClient>,
+        )
+        .agent(agentplane::runtime::Agent::new(&lookup))
+        .skill(Auditor)
+        .build();
+    (plane, vec![lookup, auditor])
+}
+
+/// **A host that cannot hold a task is offered only what never needs one.**
+///
+/// A `2025-11-25` host, and a `2026-07-28` host that does not declare the
+/// Tasks extension, are both served — and both see the `call` tool and not
+/// the agent that may wait on a person or a timer. Calling that one by name is
+/// refused before anything is admitted, naming what the host lacks.
+#[tokio::test]
+async fn a_host_without_tasks_is_offered_only_tools_that_cannot_suspend() {
+    use rmcp::service::{ClientLifecycleMode, ClientServiceExt};
+
+    #[derive(Debug, Clone, Default)]
+    struct NoTasks;
+    impl rmcp::ClientHandler for NoTasks {
+        fn get_info(&self) -> rmcp::model::ClientConfig {
+            let mut info = rmcp::model::ClientConfig::default();
+            info.protocol_version = ProtocolVersion::V_2026_07_28;
+            info
+        }
+    }
+
+    let (plane, manifests) = mixed_plane();
+    let server = McpServer::new(Arc::clone(&plane), &manifests).expect("served");
+
+    let (legacy_side, ()) = pipe(server.clone());
+    let (cr, cw) = tokio::io::split(legacy_side);
+    let legacy = ().serve((cr, cw)).await.expect("a 2025-11-25 host is served");
+    assert_eq!(
+        legacy.peer_info().expect("server info").protocol_version,
+        ProtocolVersion::V_2025_11_25,
+        "the handshake did not settle on the host's revision"
+    );
+
+    let (modern_side, ()) = pipe(server);
+    let (cr, cw) = tokio::io::split(modern_side);
+    let modern = NoTasks
+        .serve_with_lifecycle(
+            (cr, cw),
+            ClientLifecycleMode::Discover {
+                preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            },
+        )
+        .await
+        .expect("a host without the extension is served");
+
+    for (host, label) in [(legacy.peer(), "2025-11-25"), (modern.peer(), "no tasks")] {
+        let names: Vec<String> = host
+            .list_all_tools()
+            .await
+            .expect("tools/list")
+            .into_iter()
+            .map(|t| t.name.into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["crm.lookup".to_owned()],
+            "{label}: a tool that may suspend was offered to a host that cannot hold a task"
+        );
+        let answer = host
+            .call_tool(
+                CallToolRequestParams::new("crm.lookup")
+                    .with_arguments(json!({ "id": "C-7" }).as_object().cloned().expect("object")),
+            )
+            .await
+            .expect("the call tool answers");
+        assert_eq!(
+            answer.structured_content,
+            Some(json!({ "found": { "id": "C-7" } })),
+            "{label}"
+        );
+        let before = plane
+            .journal()
+            .recent_runs(None, 10)
+            .await
+            .expect("index")
+            .len();
+        let refused = host
+            .call_tool(
+                CallToolRequestParams::new("audit.anomaly-detection").with_arguments(
+                    json!({ "ledger": "GL" })
+                        .as_object()
+                        .cloned()
+                        .expect("object"),
+                ),
+            )
+            .await;
+        let said = format!("{refused:?}");
+        assert!(
+            refused.is_err() && said.contains("io.modelcontextprotocol/tasks"),
+            "{label}: calling a may-suspend tool by name was not refused naming the \
+             extension: {said}"
+        );
+        assert_eq!(
+            plane
+                .journal()
+                .recent_runs(None, 10)
+                .await
+                .expect("index")
+                .len(),
+            before,
+            "{label}: the refused call admitted a run"
+        );
+    }
+    legacy.cancel().await.expect("shutdown");
+    modern.cancel().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -858,5 +1025,63 @@ async fn every_cacheable_result_refuses_a_shared_cache_and_a_freshness_window() 
         );
     }
 
+    client.cancel().await.expect("shutdown");
+}
+
+/// Answers two capabilities, so one agent serves two tools.
+#[derive(Debug)]
+struct TwoHats;
+
+#[async_trait::async_trait]
+impl Skill for TwoHats {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("two-hats")
+            .provides("audit.anomaly-detection")
+            .provides("audit.reconcile")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::done(input))
+    }
+}
+
+/// **One prompt per agent**, however many capabilities it serves — as one
+/// resource per agent. The instruction is the agent's, and listing it once per
+/// tool offers a host the same reviewed text under one name twice.
+#[tokio::test]
+async fn an_agent_serving_two_capabilities_is_one_prompt() {
+    let two = AGENT.replace(
+        "provides: [audit.anomaly-detection]",
+        "provides: [audit.anomaly-detection, audit.reconcile]",
+    );
+    let manifest = Manifest::parse(&two).expect("a valid manifest");
+    let store = Arc::new(RedbStore::open_in_memory().expect("store")) as Arc<dyn JournalStore>;
+    let plane = Runtime::builder(store)
+        .owner("mcp")
+        .policy(Arc::new(Permit))
+        .skill(TwoHats)
+        .build();
+    let server = McpServer::new(plane, &[manifest]).expect("served");
+    let client = connect(server).await;
+
+    let tools = client
+        .list_tools(Option::default())
+        .await
+        .expect("tools/list");
+    assert_eq!(tools.tools.len(), 2, "the fixture serves two tools");
+    let prompts = client
+        .list_prompts(Option::default())
+        .await
+        .expect("prompts/list");
+    let names: Vec<_> = prompts.prompts.iter().map(|p| p.name.clone()).collect();
+    assert_eq!(
+        names,
+        vec!["pattern-compliance-auditor".to_owned()],
+        "an agent was listed once per capability"
+    );
     client.cancel().await.expect("shutdown");
 }

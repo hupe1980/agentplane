@@ -171,7 +171,11 @@ pub struct StandingAuthority {
     ///
     /// Evaluated against the run's **journaled** clock, never an ambient one, so
     /// a replay reaches the same verdict as the live run did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
     pub expires_at: Option<Timestamp>,
 }
 
@@ -284,24 +288,22 @@ impl AuthorityState {
     /// What is left, floored at zero on both axes.
     #[must_use]
     pub fn remaining(&self) -> Spend {
-        Spend {
-            tokens: self
-                .authority
-                .ceiling
-                .tokens
-                .saturating_sub(self.drawn.tokens),
-            minor_units: self
-                .authority
-                .ceiling
-                .minor_units
-                .saturating_sub(self.drawn.minor_units),
-        }
+        left(self.authority.ceiling, self.drawn)
+    }
+}
+
+/// What `ceiling` leaves after `drawn`, per axis, never below zero.
+fn left(ceiling: Spend, drawn: Spend) -> Spend {
+    Spend {
+        tokens: ceiling.tokens.saturating_sub(drawn.tokens),
+        minor_units: ceiling.minor_units.saturating_sub(drawn.minor_units),
     }
 }
 
 /// Why an authority was withdrawn, and when.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Revocation {
+    #[serde(with = "time::serde::rfc3339")]
     pub at: Timestamp,
     /// Required, for the same reason a halt's reason is: the next person to look
     /// is somebody else, and *why* is the whole question.
@@ -554,13 +556,7 @@ pub fn permits(
         });
     }
 
-    let remaining = Spend {
-        tokens: authority.ceiling.tokens.saturating_sub(drawn.tokens),
-        minor_units: authority
-            .ceiling
-            .minor_units
-            .saturating_sub(drawn.minor_units),
-    };
+    let remaining = left(authority.ceiling, drawn);
     // Both axes, and either one exceeding refuses the whole draw. A draw that
     // took the money and declined the tokens would leave the caller having spent
     // something it was told it had not.

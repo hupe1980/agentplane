@@ -19,6 +19,7 @@ mod admission;
 mod batches;
 mod cases;
 mod plans;
+mod reach;
 mod replanning;
 mod scoping;
 mod tasks;

@@ -340,6 +340,9 @@ impl QuotaStore for Doctored {
     async fn lift_halt(&self, scope: &HaltScope) -> Result<bool, StoreError> {
         self.inner.lift_halt(scope).await
     }
+    async fn lift_halt_if(&self, standing: &Halt) -> Result<bool, StoreError> {
+        self.inner.lift_halt_if(standing).await
+    }
     async fn halts(&self) -> Result<Vec<Halt>, StoreError> {
         self.inner.halts().await
     }

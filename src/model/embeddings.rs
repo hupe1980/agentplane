@@ -25,7 +25,7 @@
 #[cfg(feature = "providers")]
 use crate::core::Secret;
 use crate::core::StoreError;
-use crate::memory::Embedder;
+use crate::memory::{Embedded, Embedder};
 
 /// One embedding component, as `f32`.
 ///
@@ -70,6 +70,7 @@ pub struct OpenAiEmbedder {
     input_type: Option<String>,
     egress: Option<crate::core::Egress>,
     timeout: std::time::Duration,
+    pricing: Option<super::Pricing>,
 }
 
 #[cfg(feature = "providers")]
@@ -99,6 +100,7 @@ impl OpenAiEmbedder {
             input_type: None,
             egress: None,
             timeout: Self::DEFAULT_TIMEOUT,
+            pricing: None,
         })
     }
 
@@ -170,6 +172,14 @@ impl OpenAiEmbedder {
         self
     }
 
+    /// What this model's input tokens cost, so its calls count against a
+    /// money ceiling.
+    #[must_use]
+    pub const fn pricing(mut self, pricing: super::Pricing) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
     fn check_egress(&self) -> Result<(), StoreError> {
         let Some(egress) = &self.egress else {
             return Ok(());
@@ -187,6 +197,42 @@ impl OpenAiEmbedder {
 #[derive(serde::Deserialize)]
 struct EmbeddingsReply {
     data: Vec<EmbeddingDatum>,
+    #[serde(default)]
+    usage: Option<EmbeddingsUsage>,
+}
+
+#[cfg(feature = "providers")]
+#[derive(serde::Deserialize)]
+struct EmbeddingsUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u64>,
+}
+
+/// An embedding call's usage: input tokens only, since nothing is generated.
+///
+/// A reply that reports no count is refused when the embedder is priced: a
+/// zero would make the call free against a money ceiling, the outcome
+/// [`UnpricedEmbedder`](crate::runtime::BuildError::UnpricedEmbedder) exists to
+/// prevent. Unpriced, the count is informational and reads as zero.
+fn metered(
+    tokens: Option<u64>,
+    pricing: Option<super::Pricing>,
+    driver: &str,
+) -> Result<super::Usage, StoreError> {
+    let input_tokens = match (tokens, pricing) {
+        (Some(tokens), _) => tokens,
+        (None, None) => 0,
+        (None, Some(_)) => {
+            return Err(StoreError::Backend(format!(
+                "{driver}: the reply reports no input tokens, so a priced embedder cannot \
+                 say what the call cost; a zero would let it pass a money ceiling for free"
+            )));
+        }
+    };
+    Ok(super::Usage {
+        input_tokens,
+        ..super::Usage::default()
+    })
 }
 
 #[cfg(feature = "providers")]
@@ -218,7 +264,11 @@ impl Embedder for OpenAiEmbedder {
         revision
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, StoreError> {
+    fn pricing(&self) -> Option<super::Pricing> {
+        self.pricing
+    }
+
+    async fn embed(&self, text: &str) -> Result<Embedded, StoreError> {
         self.check_egress()?;
 
         let mut body = serde_json::json!({ "model": self.model, "input": text });
@@ -280,7 +330,14 @@ impl Embedder for OpenAiEmbedder {
                 "{url}: the embedding carries a component that is not a finite number"
             )));
         }
-        Ok(vector)
+        Ok(Embedded {
+            vector,
+            usage: metered(
+                reply.usage.and_then(|u| u.prompt_tokens),
+                self.pricing,
+                &url,
+            )?,
+        })
     }
 }
 
@@ -351,6 +408,22 @@ fn bedrock_body(
     }
 }
 
+/// The input tokens a Bedrock embedding reply reports.
+///
+/// Titan's body carries `inputTextTokenCount`. Cohere's Bedrock body carries
+/// no count — its `meta.billed_units` belongs to Cohere's own API, not to
+/// Bedrock's passthrough — and `InvokeModel` documents no token header, so a
+/// Cohere reply has none.
+#[cfg(feature = "bedrock")]
+fn bedrock_input_tokens(dialect: EmbeddingDialect, parsed: &serde_json::Value) -> Option<u64> {
+    match dialect {
+        EmbeddingDialect::Titan => parsed
+            .get("inputTextTokenCount")
+            .and_then(serde_json::Value::as_u64),
+        EmbeddingDialect::Cohere => None,
+    }
+}
+
 /// Embeddings through Amazon Bedrock's `InvokeModel`.
 ///
 /// # Why this exists beside the `OpenAI`-compatible one
@@ -369,6 +442,7 @@ pub struct BedrockEmbedder {
     region: String,
     dialect: EmbeddingDialect,
     dimensions: Option<u32>,
+    pricing: Option<super::Pricing>,
 }
 
 #[cfg(feature = "bedrock")]
@@ -436,6 +510,7 @@ impl BedrockEmbedder {
             region,
             dialect,
             dimensions: None,
+            pricing: None,
         })
     }
 
@@ -447,6 +522,17 @@ impl BedrockEmbedder {
     #[must_use]
     pub const fn dimensions(mut self, dimensions: u32) -> Self {
         self.dimensions = Some(dimensions);
+        self
+    }
+
+    /// What this model's input tokens cost, so its calls count against a
+    /// money ceiling.
+    ///
+    /// Only Titan reports its input tokens on Bedrock, so a priced Cohere
+    /// embedder refuses every call rather than reporting it free.
+    #[must_use]
+    pub const fn pricing(mut self, pricing: super::Pricing) -> Self {
+        self.pricing = Some(pricing);
         self
     }
 }
@@ -466,7 +552,11 @@ impl Embedder for BedrockEmbedder {
             .map_or_else(|| base.clone(), |d| format!("{base}@{d}"))
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, StoreError> {
+    fn pricing(&self) -> Option<super::Pricing> {
+        self.pricing
+    }
+
+    async fn embed(&self, text: &str) -> Result<Embedded, StoreError> {
         let body = bedrock_body(self.dialect, text, self.dimensions)?;
 
         let reply = self
@@ -519,7 +609,14 @@ impl Embedder for BedrockEmbedder {
                 "bedrock embeddings: the vector is empty or not all numbers".to_owned(),
             ));
         }
-        Ok(vector)
+        Ok(Embedded {
+            vector,
+            usage: metered(
+                bedrock_input_tokens(self.dialect, &parsed),
+                self.pricing,
+                "bedrock embeddings",
+            )?,
+        })
     }
 }
 
@@ -552,6 +649,7 @@ pub struct GeminiEmbedder {
     dimensions: Option<u32>,
     egress: Option<crate::core::Egress>,
     timeout: std::time::Duration,
+    pricing: Option<super::Pricing>,
 }
 
 #[cfg(feature = "providers")]
@@ -576,6 +674,7 @@ impl GeminiEmbedder {
             dimensions: None,
             egress: None,
             timeout: OpenAiEmbedder::DEFAULT_TIMEOUT,
+            pricing: None,
         })
     }
 
@@ -623,6 +722,14 @@ impl GeminiEmbedder {
         self.timeout = timeout;
         self
     }
+
+    /// What this model's input tokens cost, so its calls count against a
+    /// money ceiling.
+    #[must_use]
+    pub const fn pricing(mut self, pricing: super::Pricing) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
 }
 
 #[cfg(feature = "providers")]
@@ -634,7 +741,11 @@ impl Embedder for GeminiEmbedder {
             .map_or_else(|| base.clone(), |d| format!("{base}@{d}"))
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, StoreError> {
+    fn pricing(&self) -> Option<super::Pricing> {
+        self.pricing
+    }
+
+    async fn embed(&self, text: &str) -> Result<Embedded, StoreError> {
         if let Some(egress) = &self.egress {
             let host = reqwest::Url::parse(&self.base)
                 .ok()
@@ -728,7 +839,13 @@ impl Embedder for GeminiEmbedder {
                 *v /= norm;
             }
         }
-        Ok(vector)
+        let tokens = parsed
+            .pointer("/usageMetadata/promptTokenCount")
+            .and_then(serde_json::Value::as_u64);
+        Ok(Embedded {
+            vector,
+            usage: metered(tokens, self.pricing, &url)?,
+        })
     }
 }
 
@@ -843,17 +960,55 @@ mod bedrock_reply_tests {
     /// Each dialect reads the shape its vendor answers with.
     #[tokio::test]
     async fn each_dialect_reads_its_own_reply() {
-        let titan = embedder(EmbeddingDialect::Titan, r#"{"embedding":[0.25,-0.5,0.75]}"#)
-            .embed("refund policy")
-            .await
-            .expect("titan reply");
-        assert_eq!(titan, vec![0.25, -0.5, 0.75]);
+        let titan = embedder(
+            EmbeddingDialect::Titan,
+            r#"{"embedding":[0.25,-0.5,0.75],"inputTextTokenCount":3}"#,
+        )
+        .embed("refund policy")
+        .await
+        .expect("titan reply");
+        assert_eq!(titan.vector, vec![0.25, -0.5, 0.75]);
+        assert_eq!(
+            titan.usage.input_tokens, 3,
+            "Titan reports its input tokens"
+        );
 
-        let cohere = embedder(EmbeddingDialect::Cohere, r#"{"embeddings":[[1.0,0.0]]}"#)
+        let cohere = embedder(
+            EmbeddingDialect::Cohere,
+            r#"{"id":"r-1","response_type":"embeddings_floats","embeddings":[[1.0,0.0]],"texts":["refund policy"]}"#,
+        )
+        .embed("refund policy")
+        .await
+        .expect("cohere reply");
+        assert_eq!(cohere.vector, vec![1.0, 0.0]);
+    }
+
+    /// A priced embedder whose reply reports no input tokens is refused, not
+    /// metered as free. Bedrock's Cohere body carries no count; Titan's does.
+    #[tokio::test]
+    async fn a_priced_reply_without_a_token_count_is_refused() {
+        let price = crate::model::Pricing {
+            input: 1,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+        };
+        let refused = embedder(EmbeddingDialect::Cohere, r#"{"embeddings":[[1.0,0.0]]}"#)
+            .pricing(price)
             .embed("refund policy")
             .await
-            .expect("cohere reply");
-        assert_eq!(cohere, vec![1.0, 0.0]);
+            .expect_err("a priced call with no token count was metered as free");
+        assert!(refused.to_string().contains("no input tokens"), "{refused}");
+
+        let titan = embedder(
+            EmbeddingDialect::Titan,
+            r#"{"embedding":[1.0],"inputTextTokenCount":3}"#,
+        )
+        .pricing(price)
+        .embed("refund policy")
+        .await
+        .expect("Titan reports its tokens");
+        assert_eq!(titan.usage.input_tokens, 3);
     }
 
     /// Every reply this driver cannot honestly read is refused.

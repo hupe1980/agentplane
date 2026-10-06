@@ -16,7 +16,8 @@ use async_trait::async_trait;
 
 use crate::core::{Digest, Epoch, RunId, StoreError, TenantId};
 use crate::journal::{
-    Append, Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease, Record, payload,
+    Append, AtomicJournal, AtomicTx, AtomicWork, Cancellation, Checkpoint, Head, Inclusion,
+    JournalStore, Lease, Record, payload,
 };
 
 use super::KeyRing;
@@ -125,63 +126,25 @@ impl JournalStore for SealedJournal {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
+    fn seals(&self) -> bool {
+        true
+    }
 
     fn tenant(&self) -> &str {
         self.inner.tenant()
     }
 
     async fn append(&self, epoch: Epoch, batch: Vec<Append>) -> Result<Vec<Record>, StoreError> {
-        let mut sealed = Vec::with_capacity(batch.len());
-        for mut entry in batch {
-            let scope = self.scope_for(entry.run, entry.case);
-            let aad = self.aad(entry.run, &entry.kind, entry.effect_key);
-            for field in payload::payloads(&mut entry.kind) {
-                match field {
-                    payload::SealedField::Value(field) => {
-                        // Canonical bytes: the same reason every other digest
-                        // input in this crate is canonical, and here it also
-                        // means a payload seals identically however the map
-                        // was built.
-                        let plain = crate::core::canon::to_bytes(&*field).map_err(|e| {
-                            StoreError::Backend(format!("a payload would not serialise: {e}"))
-                        })?;
-                        let envelope = super::envelope::seal(
-                            self.keys.as_ref(),
-                            &scope,
-                            aad.as_bytes(),
-                            &plain,
-                        )
-                        .await
-                        .map_err(|e| sealing(&e))?;
-                        *field = payload::wrap(&envelope);
-                    }
-                    // A text field seals over its UTF-8 bytes and is replaced
-                    // by a marked string rather than an object, because the
-                    // field's wire type is a string and the record must
-                    // serialise with the same shape sealed or clear.
-                    payload::SealedField::Text(field) => {
-                        let envelope = super::envelope::seal(
-                            self.keys.as_ref(),
-                            &scope,
-                            aad.as_bytes(),
-                            field.as_bytes(),
-                        )
-                        .await
-                        .map_err(|e| sealing(&e))?;
-                        *field = payload::wrap_text(&envelope);
-                    }
-                }
-            }
-            sealed.push(entry);
-        }
+        let (sealed, plain) = self.seal_batch(batch).await?;
         // The inner store hashes what it is given, so the chain commits to the
         // ciphertext — which is what lets an auditor with no keys verify the
         // history of a run whose payloads have been erased.
         let written = self.inner.append(epoch, sealed).await?;
-        // Handed back opened, so a caller cannot tell it wrote through a
-        // sealed store — the runtime reads its own `EffectDone` output back on
-        // the same values it just wrote.
-        self.open_all(written).await
+        self.reopened(written, plain).await
+    }
+
+    fn atomic(&self) -> Option<&dyn AtomicJournal> {
+        self.inner.atomic().map(|_| self as &dyn AtomicJournal)
     }
 
     async fn read(&self, run: RunId, from: crate::core::Seq) -> Result<Vec<Record>, StoreError> {
@@ -267,6 +230,13 @@ impl JournalStore for SealedJournal {
         self.inner.forget_admissions(older_than).await
     }
 
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        self.inner.runs_by_id(after, limit).await
+    }
     async fn recent_runs(
         &self,
         after: Option<(u64, RunId)>,
@@ -303,6 +273,21 @@ impl JournalStore for SealedJournal {
         self.inner.inclusion_proof(run).await
     }
 
+    async fn inclusion_proof_at(
+        &self,
+        run: RunId,
+        size: u64,
+    ) -> Result<Option<Inclusion>, StoreError> {
+        self.inner.inclusion_proof_at(run, size).await
+    }
+
+    async fn log_positions(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<Option<(u64, crate::core::Digest)>>, StoreError> {
+        self.inner.log_positions(runs).await
+    }
+
     async fn request_cancel(
         &self,
         run: RunId,
@@ -317,7 +302,148 @@ impl JournalStore for SealedJournal {
     }
 }
 
+/// The group's work, with every record it hands the store sealed first, so
+/// plaintext never crosses into the inner transaction.
+struct SealingWork<'a> {
+    journal: &'a SealedJournal,
+    work: &'a dyn AtomicWork,
+    plain: std::sync::Mutex<Vec<crate::journal::RecordKind>>,
+}
+
+#[async_trait]
+impl AtomicWork for SealingWork<'_> {
+    async fn run(&self, tx: &dyn AtomicTx) -> Result<Vec<Append>, crate::core::EffectError> {
+        let batch = self.work.run(tx).await?;
+        let (sealed, plain) = self.journal.seal_batch(batch).await.map_err(|e| {
+            crate::core::EffectError::Unavailable {
+                driver: "keyring".to_owned(),
+                detail: e.to_string(),
+            }
+        })?;
+        *self
+            .plain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = plain;
+        Ok(sealed)
+    }
+}
+
+#[async_trait]
+impl AtomicJournal for SealedJournal {
+    async fn append_atomic(
+        &self,
+        run: RunId,
+        epoch: Epoch,
+        work: &dyn AtomicWork,
+    ) -> Result<Vec<Record>, StoreError> {
+        let Some(inner) = self.inner.atomic() else {
+            return Err(StoreError::Backend(
+                "the sealed store has no transaction a resource can join".to_owned(),
+            ));
+        };
+        let sealing = SealingWork {
+            journal: self,
+            work,
+            plain: std::sync::Mutex::new(Vec::new()),
+        };
+        let written = inner.append_atomic(run, epoch, &sealing).await?;
+        let plain = sealing
+            .plain
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.reopened(written, plain).await
+    }
+}
+
 impl SealedJournal {
+    /// Seal every payload in `batch`, handing back the plaintext kinds beside
+    /// the sealed appends.
+    async fn seal_batch(
+        &self,
+        batch: Vec<Append>,
+    ) -> Result<(Vec<Append>, Vec<crate::journal::RecordKind>), StoreError> {
+        let mut sealed = Vec::with_capacity(batch.len());
+        let mut plain = Vec::with_capacity(batch.len());
+        for mut entry in batch {
+            // Written bytes are stored as they stand, so a payload in them
+            // would land in this store as whatever the bytes carry — plaintext,
+            // in a store whose every other record is sealed — and sealing it
+            // would change the bytes their hash covers. Neither is a write
+            // this journal can make.
+            if entry.written().is_some() {
+                return Err(StoreError::Backend(
+                    "a sealed journal cannot store written bytes: stored as they stand, \
+                     their payloads would sit unsealed in a store that seals every payload, \
+                     and sealed they would no longer hash as written — restore into the \
+                     unwrapped store"
+                        .to_owned(),
+                ));
+            }
+            plain.push(entry.kind.clone());
+            let scope = self.scope_for(entry.run, entry.case);
+            let aad = self.aad(entry.run, &entry.kind, entry.effect_key);
+            for field in payload::payloads(&mut entry.kind) {
+                match field {
+                    payload::SealedField::Value(field) => {
+                        // Canonical bytes: the same reason every other digest
+                        // input in this crate is canonical, and here it also
+                        // means a payload seals identically however the map
+                        // was built.
+                        let plain = crate::core::canon::to_bytes(&*field).map_err(|e| {
+                            StoreError::Backend(format!("a payload would not serialise: {e}"))
+                        })?;
+                        let envelope = super::envelope::seal(
+                            self.keys.as_ref(),
+                            &scope,
+                            aad.as_bytes(),
+                            &plain,
+                        )
+                        .await
+                        .map_err(|e| sealing(&e))?;
+                        *field = payload::wrap(&envelope);
+                    }
+                    // A text field seals over its UTF-8 bytes and is replaced
+                    // by a marked string rather than an object, because the
+                    // field's wire type is a string and the record must
+                    // serialise with the same shape sealed or clear.
+                    payload::SealedField::Text(field) => {
+                        let envelope = super::envelope::seal(
+                            self.keys.as_ref(),
+                            &scope,
+                            aad.as_bytes(),
+                            field.as_bytes(),
+                        )
+                        .await
+                        .map_err(|e| sealing(&e))?;
+                        *field = payload::wrap_text(&envelope);
+                    }
+                }
+            }
+            sealed.push(entry);
+        }
+        Ok((sealed, plain))
+    }
+
+    /// What was just written, handed back with the plaintext it was given.
+    ///
+    /// A caller cannot tell it wrote through a sealed store, and the write is
+    /// never re-opened: once committed, a key service failing is not a reason
+    /// to report the write as failed.
+    async fn reopened(
+        &self,
+        written: Vec<Record>,
+        plain: Vec<crate::journal::RecordKind>,
+    ) -> Result<Vec<Record>, StoreError> {
+        if written.len() != plain.len() {
+            return self.open_all(written).await;
+        }
+        Ok(written
+            .into_iter()
+            .zip(plain)
+            .map(|(record, kind)| record.with_opened_kind(kind))
+            .collect())
+    }
+
     /// Open every sealed payload, leaving the record's bytes and hashes alone.
     ///
     /// A **read-time view**, exactly as upcasting is: `raw`, `hash` and
@@ -436,10 +562,12 @@ pub(crate) async fn open_payloads(
                     .map_err(|e| StoreError::Backend(e.to_string()))?
                 {
                     Some(plain) => {
-                        if let Ok(text) = String::from_utf8(plain) {
-                            *field = text;
-                            found.opened += 1;
-                        }
+                        *field = String::from_utf8(plain).map_err(|e| {
+                            StoreError::Backend(format!(
+                                "a sealed text payload opened to bytes that are not UTF-8: {e}"
+                            ))
+                        })?;
+                        found.opened += 1;
                     }
                     None => found.erased += 1,
                 }
@@ -447,4 +575,34 @@ pub(crate) async fn open_payloads(
         }
     }
     Ok(found)
+}
+
+#[cfg(all(test, feature = "testkit"))]
+mod tests {
+    use super::{journal_aad, open_payloads, payload};
+    use crate::core::RunId;
+    use crate::journal::RecordKind;
+
+    /// A text field whose plaintext is not UTF-8 is an error, not a payload
+    /// left sealed and counted as neither opened nor erased.
+    #[tokio::test]
+    async fn a_text_payload_that_opens_to_non_utf8_is_an_error() {
+        let keys = crate::testkit::MemoryKeyRing::default();
+        let run = RunId::generate();
+        let probe = RecordKind::Note {
+            text: String::new(),
+        };
+        let aad = journal_aad("t", run, &probe, None);
+        let envelope = super::super::envelope::seal(&keys, "t/run", aad.as_bytes(), &[0xff, 0xfe])
+            .await
+            .expect("seal");
+        let mut kind = RecordKind::Note {
+            text: payload::wrap_text(&envelope),
+        };
+        let opened = open_payloads(&keys, "t", run, None, &mut kind).await;
+        assert!(
+            opened.is_err(),
+            "non-UTF-8 plaintext was left sealed and reported as {opened:?}"
+        );
+    }
 }

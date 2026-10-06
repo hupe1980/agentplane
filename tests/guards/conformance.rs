@@ -121,6 +121,29 @@ async fn redb_satisfies_the_journal_store_contract() {
     .await;
 
     report.assert_conforms("RedbStore");
+
+    let older = conformance::check_upcasting(
+        &|upcaster| {
+            Box::pin(async move {
+                Arc::new(
+                    RedbStore::open_in_memory()
+                        .expect("in-memory store")
+                        .upcasting_with(upcaster),
+                ) as Arc<dyn JournalStore>
+            })
+        },
+        &older_export(),
+    )
+    .await;
+    older.assert_conforms("RedbStore under an upcaster");
+}
+
+/// The frozen export, one record shape older than this build writes.
+fn older_export() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/export.jsonl");
+    agentplane::testkit::older_shape::older_shape(
+        &std::fs::read_to_string(path).expect("tests/golden/export.jsonl"),
+    )
 }
 
 /// The battery must be able to fail.
@@ -166,6 +189,9 @@ struct NoExactlyOnce {
 impl JournalStore for NoExactlyOnce {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
+    }
+    fn seals(&self) -> bool {
+        self.inner.seals()
     }
 
     async fn append(
@@ -233,6 +259,13 @@ impl JournalStore for NoExactlyOnce {
         self.inner.waiting_runs(limit).await
     }
 
+    async fn runs_by_id(
+        &self,
+        after: Option<agentplane::core::RunId>,
+        limit: usize,
+    ) -> Result<Vec<agentplane::core::RunId>, agentplane::core::StoreError> {
+        self.inner.runs_by_id(after, limit).await
+    }
     async fn recent_runs(
         &self,
         after: Option<(u64, agentplane::core::RunId)>,
@@ -621,6 +654,46 @@ async fn the_auth_battery_rejects_an_oracle() {
             .any(|v| v.invariant == "a presented credential is rejected, not missing"),
         "the battery accepted an authenticator that reports a refused \
          credential as an absent one: {:?}",
+        report.violations
+    );
+}
+
+/// The battery records an authenticator that panics on a malformed header,
+/// rather than unwinding with it.
+#[cfg(feature = "http")]
+#[tokio::test]
+async fn the_auth_battery_records_a_panicking_authenticator() {
+    use agentplane::api::{AuthError, Authenticator, Caller};
+    use agentplane::testkit::conformance::Report;
+    use agentplane::testkit::conformance_auth::{self, Requests};
+    use axum::http::HeaderMap;
+
+    /// Splits `Bearer <token>` and indexes the token that is not there.
+    #[derive(Debug)]
+    struct Splits;
+
+    #[async_trait::async_trait]
+    impl Authenticator for Splits {
+        async fn authenticate(&self, headers: &HeaderMap) -> Result<Caller, AuthError> {
+            let Some(value) = headers.get("authorization") else {
+                return Err(AuthError::Missing);
+            };
+            let parts: Vec<&str> = value.to_str().unwrap_or_default().split(' ').collect();
+            if parts[1].is_empty() {
+                return Err(AuthError::Rejected);
+            }
+            Err(AuthError::Rejected)
+        }
+    }
+
+    let mut report = Report::default();
+    conformance_auth::check(&Splits, &Requests::default(), &mut report).await;
+    assert!(
+        report
+            .violations
+            .iter()
+            .any(|v| v.invariant == "a malformed credential is refused"),
+        "an authenticator that panics on `Bearer` passed the battery: {:?}",
         report.violations
     );
 }

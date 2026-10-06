@@ -85,9 +85,11 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
   # test does what the file tells a reader to: generate the two tokens.
   PEER_TOKEN="$(openssl rand -hex 32)"
   OPS_TOKEN="$(openssl rand -hex 32)"
+  APP_TOKEN="$(openssl rand -hex 32)"
   secrets="$(mktemp -d -t agentplane-tokens-XXXX)"
   sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$PEER_TOKEN/" \
       -e "s/replace-me:ops-alice:openssl-rand-hex-32/$OPS_TOKEN/" \
+      -e "s/replace-me:app-1:openssl-rand-hex-32/$APP_TOKEN/" \
       "$ROOT/examples/serve-tokens.yaml" >"$secrets/tokens.yaml"
   # `mktemp -d` is 0700 and owned by the runner; the image runs as another,
   # non-root user, who must be able to enter the directory to read the file.
@@ -95,12 +97,15 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
   chmod 0644 "$secrets/tokens.yaml"
   # No `--rm`: a server that exits at startup must leave its logs behind for
   # the refusal below to print. The trap removes the container either way.
-  cid=$(docker run -d -p 18080:8080 -p 19090:9090 -v "$ROOT/examples:/work:ro" \
+  mcp_flags=()
+  [[ "$FEATURES" == *mcp-server-http* ]] &&
+    mcp_flags=(--mcp-addr 0.0.0.0:8081 --mcp-allowed-host localhost:18081)
+  cid=$(docker run -d -p 18080:8080 -p 19090:9090 -p 18081:8081 -v "$ROOT/examples:/work:ro" \
           -v "$secrets:/secrets:ro" "$IMAGE" \
-          serve /work/served.yaml --addr 0.0.0.0:8080 --url http://localhost:18080 \
+          serve /work/served.yaml --addr 0.0.0.0:8080 --url http://localhost:18080/a2a \
           --policy /work/serve-policy.cedar --tokens /secrets/tokens.yaml \
           --operator-addr 0.0.0.0:9090 --push-host hooks.example.com \
-          --store /tmp/served.redb)
+          ${mcp_flags[@]+"${mcp_flags[@]}"} --store /tmp/served.redb)
   # `--store` needs a writable path, so this one is deliberately *not*
   # `--read-only`: a served task's id is a promise it can be fetched again, and
   # the CLI refuses an in-memory journal for exactly that reason.
@@ -155,6 +160,32 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
               -H 'a2a-version: 1.0' -H "authorization: Bearer $PEER_TOKEN" -d "$reg")
   grep -q 'does not permit webhooks' <<<"$refused" || {
     echo "REFUSED: a webhook to an ungranted host was accepted: $refused"; exit 1; }
+
+  # The MCP door a framework walks through: refused without a token, and one
+  # authenticated `tools/call` in a `2025-11-25` session — the revision most
+  # framework SDKs negotiate.
+  if [[ "$FEATURES" == *mcp-server-http* ]]; then
+    mcp="http://localhost:18081/mcp"
+    hdr=(-H 'content-type: application/json' -H 'accept: application/json, text/event-stream')
+    init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}'
+    anon=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$mcp" "${hdr[@]}" -d "$init")
+    [ "$anon" = "401" ] || {
+      echo "REFUSED: an unauthenticated MCP request answered $anon"; docker logs "$cid"; exit 1; }
+    opened=$(curl -s -D - -o /dev/null -X POST "$mcp" "${hdr[@]}" \
+               -H "authorization: Bearer $APP_TOKEN" -d "$init")
+    sid=$(grep -i '^mcp-session-id:' <<<"$opened" | cut -d' ' -f2 | tr -d '\r')
+    [ -n "$sid" ] || { echo "REFUSED: no MCP session was opened: $opened"; docker logs "$cid"; exit 1; }
+    session=(-H "authorization: Bearer $APP_TOKEN" -H "mcp-session-id: $sid"
+             -H 'mcp-protocol-version: 2025-11-25')
+    curl -s -o /dev/null -X POST "$mcp" "${hdr[@]}" "${session[@]}" \
+      -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+    called=$(curl -s -X POST "$mcp" "${hdr[@]}" "${session[@]}" \
+               -H 'mcp-method: tools/call' -H 'mcp-name: support.summarise' \
+               -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"support.summarise","arguments":{"text":"printer on fire"}}}')
+    grep -q '"structuredContent"' <<<"$called" || {
+      echo "REFUSED: the MCP tool call did not complete: $called"; docker logs "$cid"; exit 1; }
+    echo "    refused an unauthenticated MCP request and completed an authorized tools/call"
+  fi
 
   docker rm -f "$cid" >/dev/null 2>&1 || true
   rm -rf "$secrets"

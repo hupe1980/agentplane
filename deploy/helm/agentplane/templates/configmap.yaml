@@ -1,0 +1,12 @@
+{{- include "agentplane.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agentplane.fullname" . }}
+  labels:
+    {{- include "agentplane.labels" . | nindent 4 }}
+data:
+  agent.yaml: |
+    {{- .Values.manifest | nindent 4 }}
+  policy.cedar: |
+    {{- .Values.policy | nindent 4 }}

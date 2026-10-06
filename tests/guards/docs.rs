@@ -212,6 +212,65 @@ fn the_release_workflow_selects_the_published_package_by_name() {
     );
 }
 
+/// **No published image's feature set enables `dev`.**
+///
+/// `dev` serves a page that starts runs over HTTP, which must exist in no
+/// deployment. An image is built from `default` plus the `FEATURES` its
+/// build names: the release matrix, `just`'s `FULL_FEATURES` and the
+/// Dockerfile's own default. Each closure is computed over the table, so a
+/// feature that pulls `dev` in is caught as surely as `dev` named outright.
+#[test]
+fn no_published_image_enables_dev() {
+    let graph = feature_graph(&read("Cargo.toml"));
+    assert!(
+        graph.contains_key("dev") && graph.contains_key("default"),
+        "the [features] scan found no `dev` or `default` — this guard is inert"
+    );
+    let closure = |sets: &str| {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut todo: Vec<String> = sets
+            .split(',')
+            .map(|f| f.trim().to_owned())
+            .filter(|f| !f.is_empty())
+            .chain(std::iter::once("default".to_owned()))
+            .collect();
+        while let Some(next) = todo.pop() {
+            if seen.insert(next.clone()) {
+                todo.extend(graph.get(&next).into_iter().flatten().cloned());
+            }
+        }
+        seen
+    };
+    let mut sets: Vec<(String, String)> = Vec::new();
+    for line in read(".github/workflows/release.yml").lines() {
+        if let Some(features) = line.trim().strip_prefix("features: ") {
+            sets.push(("release.yml".to_owned(), features.to_owned()));
+        }
+    }
+    for line in read("justfile").lines() {
+        if let Some(features) = line.strip_prefix("FULL_FEATURES := ") {
+            sets.push(("justfile".to_owned(), features.trim_matches('"').to_owned()));
+        }
+    }
+    for line in read("Dockerfile").lines() {
+        if let Some(features) = line.trim().strip_prefix("ARG FEATURES=") {
+            sets.push(("Dockerfile".to_owned(), features.to_owned()));
+        }
+    }
+    let found = |file: &str| sets.iter().filter(|(f, _)| f == file).count();
+    assert!(
+        found("release.yml") >= 2 && found("justfile") == 1 && found("Dockerfile") == 1,
+        "the image feature sets were not all found ({sets:?}) — this guard is inert"
+    );
+    for (file, features) in &sets {
+        assert!(
+            !closure(features).contains("dev"),
+            "{file} builds an image with `{features}`, which enables `dev`: a page that \
+             starts runs over HTTP would ship in a published image"
+        );
+    }
+}
+
 /// **Nothing a release ships pulls `testkit` in.**
 ///
 /// `testkit` carries fault injection, a signer that mints its own signatures,
@@ -314,21 +373,8 @@ fn no_shipped_feature_enables_testkit() {
     );
 }
 
-/// Every `cargo run --example …` command in the README actually runs.
-///
-/// The examples' `required-features` live in Cargo.toml, and a README line
-/// that omits one fails with an error the reader blames on themselves — which
-/// happened: a quickstart command drifted when an example gained a feature.
-///
-/// The default feature set counts as present, because `--features` adds to it.
-///
-/// What this does not check: that the example does what the comment beside it
-/// says, or commands on the site (the site embeds and runs its own snippets).
-#[test]
-fn every_readme_example_command_names_the_features_it_needs() {
-    let manifest = read("Cargo.toml");
-    let readme = read("README.md");
-
+/// Every `[[example]]` Cargo.toml declares, with its required features.
+fn example_features(manifest: &str) -> std::collections::BTreeMap<String, Vec<String>> {
     // `[[example]]` blocks: name plus required-features.
     let mut required: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
@@ -356,43 +402,160 @@ fn every_readme_example_command_names_the_features_it_needs() {
             required.insert(name, features);
         }
     }
+
+    required
+}
+
+/// The `[features]` table: what each feature enables.
+fn feature_graph(manifest: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let table = manifest
+        .split("[features]")
+        .nth(1)
+        .and_then(|rest| rest.split("\n[").next())
+        .expect("Cargo.toml has a [features] table");
+    let mut graph: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for line in table.lines() {
+        let Some((name, rest)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let enables = rest
+            .trim()
+            .trim_matches(['[', ']'])
+            .split(',')
+            .map(|e| e.trim().trim_matches('"').to_owned())
+            .filter(|e| !e.is_empty() && !e.contains(':'))
+            .collect();
+        graph.insert(name.trim().to_owned(), enables);
+    }
+    graph
+}
+
+/// The README, every guide page and every example source, in a stable order.
+fn example_sources() -> Vec<String> {
+    let mut sources = vec!["README.md".to_owned()];
+    for dir in ["site/content/docs", "examples"] {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir);
+        let mut files: Vec<String> = std::fs::read_dir(&root)
+            .unwrap_or_else(|e| panic!("read {dir}: {e}"))
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| {
+                Path::new(n)
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("md") || x.eq_ignore_ascii_case("rs"))
+            })
+            .map(|n| format!("{dir}/{n}"))
+            .collect();
+        files.sort();
+        sources.extend(files);
+    }
+
+    sources
+}
+
+/// Every `cargo run --example …` command a reader is shown actually runs.
+///
+/// The examples' `required-features` live in Cargo.toml, and a command that
+/// omits one fails with an error the reader blames on themselves. Commands are
+/// read from the README, every guide page and every example's header, and the
+/// guide's example index (`| … | `name` | `f1,f2` |`) is held to the same rule.
+///
+/// The default feature set counts as present, and a listed feature counts with
+/// everything it enables. What this does not check: that the example does what
+/// the text beside it says.
+#[test]
+fn every_example_command_names_the_features_it_needs() {
+    let manifest = read("Cargo.toml");
+    let required = example_features(&manifest);
     assert!(
         required.len() > 10,
         "the [[example]] scan found only {required:?} — Cargo.toml moved and \
          this guard is now inert"
     );
+    // The `[features]` graph, so `--features cli` counts as everything `cli` enables.
+    let graph = feature_graph(&manifest);
+    let enabled = |listed: &[&str]| {
+        let mut seen: std::collections::BTreeSet<String> =
+            listed.iter().map(|f| (*f).to_owned()).collect();
+        seen.insert("redb".to_owned());
+        let mut todo: Vec<String> = seen.iter().cloned().collect();
+        while let Some(next) = todo.pop() {
+            for e in graph.get(&next).into_iter().flatten() {
+                if seen.insert(e.clone()) {
+                    todo.push(e.clone());
+                }
+            }
+        }
+        seen
+    };
 
-    let default_features = ["redb"];
+    let sources = example_sources();
+
     let mut commands = 0usize;
     let mut broken = Vec::new();
-    for line in readme.lines() {
-        let Some(rest) = line.trim().strip_prefix("cargo run --example ") else {
-            continue;
-        };
+    let mut check = |source: &str, example: &str, listed: &[&str]| {
         commands += 1;
-        let mut words = rest.split_whitespace();
-        let example = words.next().unwrap_or_default();
-        let listed: Vec<&str> = match words.next() {
-            Some("--features") => words.next().unwrap_or_default().split(',').collect(),
-            _ => Vec::new(),
-        };
         let Some(needs) = required.get(example) else {
-            broken.push(format!("`{example}` is not an example Cargo.toml declares"));
-            continue;
+            broken.push(format!(
+                "{source}: `{example}` is not an example Cargo.toml declares"
+            ));
+            return;
         };
-        for need in needs {
-            if !default_features.contains(&need.as_str()) && !listed.contains(&need.as_str()) {
-                broken.push(format!(
-                    "`cargo run --example {example}` needs feature `{need}` \
-                     and the README command does not pass it"
-                ));
+        let have = enabled(listed);
+        for need in needs.iter().filter(|n| !have.contains(*n)) {
+            broken.push(format!(
+                "{source}: example `{example}` needs feature `{need}` and the text does not pass it"
+            ));
+        }
+    };
+    let bare = |w: &str| w.trim_matches(['`', '"', '.', ',', ')', '\\']).to_owned();
+    for source in &sources {
+        let text = read(source);
+        // Joined, so a command wrapped across two lines reads as one.
+        let joined: String = text
+            .lines()
+            .map(|l| {
+                l.trim()
+                    .trim_start_matches("//!")
+                    .trim_start_matches("//")
+                    .trim()
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut rest = joined.as_str();
+        while let Some(at) = rest.find("cargo run --example ") {
+            rest = &rest[at + "cargo run --example ".len()..];
+            let mut words = rest.split_whitespace();
+            let example = bare(words.next().unwrap_or_default());
+            if example.starts_with('<') {
+                continue;
+            }
+            let features = match words.next() {
+                Some("--features") => bare(words.next().unwrap_or_default()),
+                _ => String::new(),
+            };
+            let listed: Vec<&str> = features.split(',').collect();
+            check(source, &example, &listed);
+        }
+        if source.ends_with("getting-started.md") {
+            // The example index: `| question | `name` | `f1,f2` |`.
+            for line in text.lines().filter(|l| l.starts_with('|')) {
+                let cells: Vec<&str> = line.trim_matches('|').split('|').map(str::trim).collect();
+                if let [_, name, features] = cells[..]
+                    && let Some(name) = name.strip_prefix('`').and_then(|n| n.strip_suffix('`'))
+                    && required.contains_key(name)
+                {
+                    let listed: Vec<&str> = features.trim_matches('`').split(',').collect();
+                    check(source, name, &listed);
+                }
             }
         }
     }
     assert!(
-        commands > 5,
-        "the README scan found only {commands} `cargo run --example` commands \
-         — the quickstart moved and this guard is now inert"
+        commands > 20,
+        "the scan found only {commands} example commands — the guides moved and \
+         this guard is now inert"
     );
     assert!(broken.is_empty(), "{}", broken.join("\n"));
 }
@@ -432,12 +595,13 @@ fn every_embedded_file_is_packaged() {
         "the `include` scan found only {globs:?} — Cargo.toml moved and this guard is now inert"
     );
 
-    // `/a/**/*.rs` and `/a/*.yaml` are the only shapes this crate uses; an
+    // `/a/**/*.rs`, `/a/*.yaml` and `/a/*.cedar` are the only shapes this crate uses; an
     // unrecognised one is reported rather than silently treated as matching.
     let matches = |path: &str| {
         globs.iter().any(|g| {
             g.strip_suffix(".rs")
                 .or_else(|| g.strip_suffix(".yaml"))
+                .or_else(|| g.strip_suffix(".cedar"))
                 .map_or(g == path, |_| {
                     let (dir, ext) = g.rsplit_once('/').expect("a glob has a directory");
                     let ext = ext.trim_start_matches('*');
@@ -1698,12 +1862,17 @@ fn every_tabulated_manifest_field_exists() {
     // across files — `triage.rs` holds the rule and condition shapes — and a
     // scan of one file reports every field in the others as documented-but-
     // nonexistent, which is a guard failing for its own reason.
-    let source: String =
-        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/manifest"))
-            .iter()
-            .map(|f| std::fs::read_to_string(f).expect("read a manifest module file"))
-            .collect::<Vec<_>>()
-            .join("\n");
+    // `src/content` too: the content rules' declaration lives beside their
+    // evaluator, and is still a block of the manifest.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source: String = walk(&root.join("src/manifest"))
+        .into_iter()
+        .chain(walk(&root.join("src/content")))
+        .collect::<Vec<_>>()
+        .iter()
+        .map(|f| std::fs::read_to_string(f).expect("read a manifest module file"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let mut real: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for line in source.lines() {
@@ -2378,6 +2547,129 @@ fn the_readme_names_every_specification_the_tree_holds() {
     }
 }
 
+/// The top-level `context.<key>` names in the first `text` block after
+/// `marker` in the security page's authorization-context section.
+fn documented_context_keys(section: &str, marker: &str) -> std::collections::BTreeSet<String> {
+    let text = section
+        .split(marker)
+        .nth(1)
+        .unwrap_or_else(|| panic!("the section has no `{marker}` block"))
+        .split("```text")
+        .nth(1)
+        .expect("a text block follows the marker")
+        .split("```")
+        .next()
+        .unwrap();
+    text.split("context.")
+        .skip(1)
+        .map(|rest| {
+            rest.chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        })
+        .collect()
+}
+
+/// **The security page's authorization context is the one each gate asks with.**
+///
+/// The keys are read off the builders every runtime gate calls, with a chain
+/// and a declaration present so every conditional key is emitted. A key a
+/// builder emits must be named in its gate's block or the every-gate block,
+/// and a key a block names must be one its gate (or, for the every-gate
+/// block, every gate) actually carries — a rule written from this page
+/// against an absent attribute errors and refuses the call.
+#[test]
+fn the_security_page_documents_every_runtime_gate_s_context() {
+    use agentplane::core::{
+        Delegation, Digest, Label, Principal, Release, ReleaseScope, RunId, Scope, StepId,
+    };
+    use agentplane::journal::AgentIdentity;
+    use agentplane::policy::requests::{self, Acting};
+    use std::collections::BTreeSet;
+
+    let page = read("site/content/docs/security.md");
+    let section = page
+        .split("### The authorization context")
+        .nth(1)
+        .expect("security.md has the authorization context section")
+        .split("\n### ")
+        .next()
+        .unwrap();
+    let block = |marker: &str| documented_context_keys(section, marker);
+
+    let identity = AgentIdentity {
+        name: "a".into(),
+        version: "1".into(),
+        digest: Digest::of(b"a"),
+        publisher: None,
+    };
+    let chain = Delegation::root(Principal::new("alice", Scope::root()));
+    let acting = Acting {
+        tenant: "t",
+        capability: "demo.cap",
+        agent: Some(&identity),
+        chain: Some(&chain),
+    };
+    let (run, step, label) = (RunId::generate(), StepId(0), Label::trusted());
+    let keys = |request: requests::GatedRequest| -> BTreeSet<String> {
+        request
+            .context
+            .as_object()
+            .expect("a context is an object")
+            .keys()
+            .cloned()
+            .collect()
+    };
+    let gates = [
+        (
+            "At **`effect:perform`**",
+            keys(requests::effect(
+                &acting,
+                run,
+                step,
+                "tool.call",
+                &serde_json::json!({}),
+                true,
+                Some(&label),
+            )),
+        ),
+        (
+            "At **`data:release`**",
+            keys(requests::release(
+                &acting,
+                run,
+                step,
+                &Release::whole(ReleaseScope::trust(), "reviewed", "tool.call", ["ticket"]),
+                &label,
+            )),
+        ),
+        (
+            "At **`run:admit`**",
+            keys(requests::admission(&acting, &serde_json::json!({}))),
+        ),
+    ];
+
+    let every = block("At **every gate**");
+    assert!(every.contains("tenant") && every.contains("agent"));
+    for (marker, emitted) in &gates {
+        let own = block(marker);
+        for key in emitted {
+            assert!(
+                own.contains(key) || every.contains(key),
+                "{marker} asks with `context.{key}` and the security page does not \
+                 name it — a rule author cannot know the attribute exists"
+            );
+        }
+        for key in own.iter().chain(&every) {
+            assert!(
+                emitted.contains(key),
+                "the security page names `context.{key}` for {marker}, and that \
+                 gate never carries it — a rule reading it errors on every request"
+            );
+        }
+    }
+}
+
 /// **Every event the runtime promises is named on the operations page.**
 ///
 /// The table is headed *"Every failure P7 exists to surface has its own event
@@ -2561,8 +2853,16 @@ fn every_recipe_ci_runs_is_in_the_local_gate() {
             "specs",
             "its own job: TLA+ model checking, minutes per spec",
         ),
+        (
+            "dev-page-smoke",
+            "needs a Chromium; in `ci-full` and its own job",
+        ),
         ("test-postgres", "needs a PostgreSQL container"),
         ("test-vault", "needs a Vault container"),
+        (
+            "frameworks",
+            "needs Docker, PyPI and an image build: every framework quickstart",
+        ),
     ];
 
     let justfile = read("justfile");
@@ -2919,6 +3219,47 @@ fn record_kinds() -> Vec<String> {
     kinds
 }
 
+/// **The erasure guide places every record kind against the digests an
+/// erasure leaves.** A kind the section does not name is one an operator
+/// deciding what to seal cannot account for; each store phrase is a surface
+/// outside the journal that keeps a digest of erased content in the clear.
+#[test]
+fn every_record_kind_is_placed_in_the_erasure_digest_statement() {
+    const STORES: [&str; 5] = [
+        "dispatch identity",
+        "provenance claim",
+        "reason digest",
+        "blob content digest",
+        "selection digest",
+    ];
+    let page = read("site/content/docs/erasure.md");
+    let rest = page
+        .split("### A digest is not erasure")
+        .nth(1)
+        .expect("the erasure guide has the digest section");
+    let end = rest
+        .match_indices("\n## ")
+        .chain(rest.match_indices("\n### "))
+        .map(|(i, _)| i)
+        .min()
+        .unwrap_or(rest.len());
+    let section = &rest[..end];
+    assert!(section.len() > 200, "the section slice is empty");
+    for kind in record_kinds() {
+        assert!(
+            section.contains(&format!("`{kind}`")),
+            "the erasure guide's digest statement does not place `{kind}` — the page \
+             must say whether it carries a clear digest an erasure does not reach"
+        );
+    }
+    for store in STORES {
+        assert!(
+            section.contains(store),
+            "the erasure guide's digest statement no longer names the {store}"
+        );
+    }
+}
+
 /// The published format specification names every record kind that exists.
 ///
 /// The one document an outside implementation reads. A kind missing from it is
@@ -3097,6 +3438,37 @@ fn the_second_implementation_is_run_and_stays_independent() {
              of the first one"
         );
     }
+}
+
+/// The second reader names the same sealing outcomes this crate seals under.
+///
+/// It keeps its own list, because it reads no Rust; this test holds the copy
+/// to the crate's, so an outcome added here cannot leave a package's stripped
+/// leaf unnoticed by the second reader.
+#[test]
+fn the_second_reader_seals_under_the_crates_outcomes() {
+    let verifier = read("tools/verify_export.py");
+    let line = verifier
+        .lines()
+        .find(|l| l.starts_with("SEALED_OUTCOMES = {"))
+        .expect("tools/verify_export.py names its SEALED_OUTCOMES");
+    let python: std::collections::BTreeSet<&str> = line
+        .split('{')
+        .nth(1)
+        .and_then(|rest| rest.split('}').next())
+        .expect("a set literal")
+        .split(',')
+        .map(|item| item.trim().trim_matches('"'))
+        .filter(|item| !item.is_empty())
+        .collect();
+    let rust: std::collections::BTreeSet<&str> = agentplane::runtime::SEALED_OUTCOMES
+        .iter()
+        .copied()
+        .collect();
+    assert_eq!(
+        python, rust,
+        "the second reader's SEALED_OUTCOMES is not the crate's runtime::SEALED_OUTCOMES"
+    );
 }
 
 /// **The changelog's newest entry is this version, and a released version is
@@ -3282,31 +3654,26 @@ fn every_documented_command_line_uses_flags_the_cli_has() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let cli = std::fs::read_to_string(root.join("src/bin/agentplane.rs")).expect("the cli");
 
-    // `Verb::Retain(RetainArgs)` → which struct carries a verb's flags.
-    let mut verb_args: std::collections::BTreeMap<String, String> =
-        std::collections::BTreeMap::new();
-    for line in cli.lines().map(str::trim) {
-        if let Some((name, rest)) = line.split_once('(') {
-            let name = name.trim();
-            let ty = rest
-                .trim_end_matches("),")
-                .replace("Box<", "")
-                .replace('>', "");
-            if !name.is_empty()
-                && name.chars().next().is_some_and(char::is_uppercase)
-                && name.chars().all(char::is_alphanumeric)
-                && ty.ends_with("Args")
-            {
-                verb_args.insert(kebab(name), ty);
-            }
-        }
-    }
+    let verb_args = command_args(&cli);
     assert!(
         verb_args.len() > 8,
         "only {} verbs were parsed out of the CLI — its shape moved and this \
          guard is now inert",
         verb_args.len()
     );
+    // Two parents share the subcommand name `list`, and each takes flags the
+    // other does not: a key by the name alone would accept either's flags on
+    // both.
+    for (path, flag, other) in [
+        ("halt list", "--lifted", "--released"),
+        ("hold list", "--released", "--lifted"),
+    ] {
+        let flags = flags_of(&cli, verb_args.get(path).expect(path), 0);
+        assert!(
+            flags.contains(flag) && !flags.contains(other),
+            "`{path}` resolved to the wrong arguments: {flags:?}"
+        );
+    }
 
     let mut pages: Vec<std::path::PathBuf> = walk(&root.join("site/content/docs"))
         .into_iter()
@@ -3338,7 +3705,7 @@ fn every_documented_command_line_uses_flags_the_cli_has() {
                 .split_whitespace()
                 .nth(1)
                 .filter(|w| !w.starts_with('-'))
-                .and_then(|w| verb_args.get(w))
+                .and_then(|w| verb_args.get(&format!("{verb} {w}")))
             {
                 have.extend(flags_of(&cli, sub, 0));
             }
@@ -3361,6 +3728,69 @@ fn every_documented_command_line_uses_flags_the_cli_has() {
     );
 }
 
+/// Which struct carries each command's flags, keyed by its full path:
+/// `Verb::Halt(HaltArgs)` → `halt`, and `HaltListing::List(HaltListArgs)`
+/// under `HaltArgs`'s subcommand field → `halt list`.
+fn command_args(cli: &str) -> std::collections::BTreeMap<String, String> {
+    // Every enum's `Variant(SomethingArgs)` arms, by enum.
+    let mut arms: std::collections::BTreeMap<&str, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    let mut within = None;
+    for line in cli.lines() {
+        if let Some(name) = line
+            .strip_prefix("enum ")
+            .and_then(|r| r.strip_suffix(" {"))
+        {
+            within = Some(name);
+            continue;
+        }
+        if line == "}" {
+            within = None;
+            continue;
+        }
+        let Some(enum_name) = within else {
+            continue;
+        };
+        if let Some((name, rest)) = line.trim().split_once('(') {
+            let ty = rest
+                .trim_end_matches("),")
+                .replace("Box<", "")
+                .replace('>', "");
+            if name.chars().next().is_some_and(char::is_uppercase)
+                && name.chars().all(char::is_alphanumeric)
+                && ty.ends_with("Args")
+            {
+                arms.entry(enum_name).or_default().push((kebab(name), ty));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (verb, ty) in arms.get("Verb").into_iter().flatten() {
+        out.insert(verb.clone(), ty.clone());
+        let Some(at) = cli.find(&format!("struct {ty} {{")) else {
+            continue;
+        };
+        let body = &cli[at..];
+        let body = &body[..body.find("\n}").unwrap_or(body.len())];
+        let mut lines = body.lines().map(str::trim);
+        while let Some(line) = lines.next() {
+            if line != "#[command(subcommand)]" {
+                continue;
+            }
+            let Some(field) = lines.next() else { break };
+            let sub_enum = field
+                .split_once(':')
+                .map(|(_, t)| t.trim().trim_end_matches(','))
+                .map(|t| t.trim_start_matches("Option<").trim_end_matches('>'))
+                .unwrap_or_default();
+            for (sub, sub_ty) in arms.get(sub_enum).into_iter().flatten() {
+                out.insert(format!("{verb} {sub}"), sub_ty.clone());
+            }
+        }
+    }
+    out
+}
+
 /// `Run` → `run`, for a verb name.
 fn kebab(variant: &str) -> String {
     let mut out = String::new();
@@ -3376,4 +3806,202 @@ fn kebab(variant: &str) -> String {
 /// `older_than_days` → `older-than-days`, clap's default long-flag spelling.
 fn kebab_field(field: &str) -> String {
     field.replace('_', "-")
+}
+
+/// **The stated length of the zero-to-governed path is the block it states.**
+///
+/// The getting-started page publishes how many commands take a machine to a
+/// framework's governed call, and which programs that machine needs, beside
+/// the block that holds them; a command added to the block and not to the
+/// sentence, or a program the block runs that the sentence does not name, is a
+/// published claim nothing re-derives.
+#[test]
+fn the_zero_to_governed_count_is_the_block_it_counts() {
+    let page = read("site/content/docs/getting-started.md");
+    let section = page
+        .split("{#zero-to-governed}")
+        .nth(1)
+        .expect("getting-started has a heading anchored #zero-to-governed");
+    let (prose, rest) = section
+        .split_once("```sh\n")
+        .expect("the zero-to-governed section holds a fenced sh block");
+    let block = rest.split("```").next().expect("the block closes");
+    let commands = block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .count();
+    let stated = prose
+        .split("**")
+        .find_map(|bold| bold.strip_suffix(" commands"))
+        .expect("the section states its count as **<n> commands**");
+    let words = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    ];
+    let stated = stated.parse::<usize>().ok().or_else(|| {
+        words
+            .iter()
+            .position(|w| w.eq_ignore_ascii_case(stated))
+            .map(|i| i + 1)
+    });
+    assert_eq!(
+        stated,
+        Some(commands),
+        "getting-started states the zero-to-governed path as {stated:?} commands \
+         and its block holds {commands}"
+    );
+    let unnamed: Vec<&str> = block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|program| !["cd", "export"].contains(program))
+        .filter(|program| !prose.contains(&format!("`{program}`")))
+        .collect();
+    assert!(
+        unnamed.is_empty(),
+        "the zero-to-governed block runs {unnamed:?}, which the sentence stating \
+         what the machine needs does not name"
+    );
+}
+
+/// **Every framework quickstart is wire-level, short, pinned, and runs keyless.**
+///
+/// A quickstart that imports a package of this project is an integration
+/// library to maintain, one over forty lines is not a quickstart, one holding a
+/// token literal publishes a credential, and an unpinned requirement is a walk
+/// CI ran against a version nobody installs next week. A requirement missing
+/// from the hashed lock is one the lock does not cover, and a variable read
+/// without a default other than the token is a step the published block does
+/// not take.
+#[test]
+fn every_framework_quickstart_is_wire_level_and_short() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/frameworks");
+    let mut read_any = 0;
+    let mut bad = Vec::new();
+    for entry in std::fs::read_dir(&root).expect("examples/frameworks exists") {
+        let dir = entry.expect("a readable entry").path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let Ok(script) = std::fs::read_to_string(dir.join("quickstart.py")) else {
+            bad.push(format!("{name}: no quickstart.py"));
+            continue;
+        };
+        read_any += 1;
+        if script.lines().count() > 40 {
+            bad.push(format!("{name}: {} lines", script.lines().count()));
+        }
+        let imports_plane = script.lines().map(str::trim).any(|l| {
+            let module = l
+                .strip_prefix("import ")
+                .or_else(|| l.strip_prefix("from "))
+                .unwrap_or("");
+            module.split(['.', ' ', ',']).next() == Some("agentplane")
+        });
+        if imports_plane {
+            bad.push(format!("{name}: imports agentplane"));
+        }
+        let hex_run = script
+            .split(|c: char| !c.is_ascii_hexdigit())
+            .any(|run| run.len() >= 32);
+        if hex_run {
+            bad.push(format!("{name}: holds a 32+ hex-digit literal"));
+        }
+        for required in script.split("os.environ[").skip(1) {
+            let var = required.split(']').next().unwrap_or_default();
+            if var.trim_matches(['"', '\'']) != "AGENTPLANE_TOKEN" {
+                bad.push(format!("{name}: reads os.environ[{var}] with no default"));
+            }
+        }
+        let lock = std::fs::read_to_string(dir.join("requirements.lock")).unwrap_or_default();
+        let pinned: Vec<&str> = lock
+            .lines()
+            .filter(|l| !l.starts_with([' ', '#']))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        if lock.is_empty() {
+            bad.push(format!("{name}: no requirements.lock"));
+        } else if !lock
+            .lines()
+            .any(|l| l.trim_start().starts_with("--hash=sha256:"))
+        {
+            bad.push(format!("{name}: requirements.lock carries no hashes"));
+        }
+        match std::fs::read_to_string(dir.join("requirements.txt")) {
+            Ok(reqs) => {
+                for line in reqs.lines().map(str::trim) {
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    let Some((package, version)) = line.split_once("==") else {
+                        bad.push(format!("{name}: `{line}` is not pinned with =="));
+                        continue;
+                    };
+                    // PEP 503 names, extras dropped: the lock pins a package, not its extras.
+                    let normal = |p: &str| {
+                        let name = p.split('[').next().unwrap_or_default();
+                        name.to_ascii_lowercase().replace(['_', '.'], "-")
+                    };
+                    let locked = (normal(package), version);
+                    let lock_pins = |p: &&str| {
+                        p.split_once("==")
+                            .is_some_and(|(n, v)| (normal(n), v) == locked)
+                    };
+                    if !pinned.iter().any(lock_pins) {
+                        bad.push(format!("{name}: requirements.lock does not pin `{line}`"));
+                    }
+                }
+            }
+            Err(_) => bad.push(format!("{name}: no requirements.txt")),
+        }
+    }
+    assert!(
+        read_any >= 5,
+        "only {read_any} quickstarts were read — examples/frameworks moved and \
+         this guard is now inert"
+    );
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// **The operations guide's endpoint table lists exactly the documented routes.**
+///
+/// The table keeps the question each route answers; the `OpenAPI` document is
+/// where each route's shape lives. Both name the routes, so this holds the
+/// table's route column to the table the router and the document are built
+/// from, in both directions.
+#[cfg(feature = "http")]
+#[test]
+fn the_operator_routes_table_is_the_documented_route_list() {
+    use agentplane::api::openapi::ROUTES;
+
+    let page = read("site/content/docs/operations.md");
+    let table = page
+        .split_once("### What the endpoints are for")
+        .expect("the operations guide has its endpoint table")
+        .1;
+    let listed: std::collections::BTreeSet<String> = table
+        .lines()
+        .skip_while(|line| !line.starts_with('|'))
+        .take_while(|line| line.starts_with('|'))
+        .filter_map(|row| {
+            let cell = row.split('|').nth(1)?.trim().trim_matches('`');
+            let (method, path) = cell.split_once(' ')?;
+            matches!(method, "GET" | "POST").then(|| {
+                let path = path.split('?').next().unwrap_or(path);
+                format!("{method} {path}")
+            })
+        })
+        .collect();
+    let documented: std::collections::BTreeSet<String> = ROUTES
+        .iter()
+        .map(|r| format!("{} {}", r.method.as_str().to_uppercase(), r.path))
+        .collect();
+
+    assert!(!listed.is_empty(), "read no rows from the endpoint table");
+    assert_eq!(
+        listed, documented,
+        "the operations guide's endpoint table and the documented routes disagree"
+    );
 }

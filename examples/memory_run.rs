@@ -77,11 +77,17 @@ impl Embedder for ExampleEmbedder {
         REVISION.to_owned()
     }
 
-    async fn embed(&self, text: &str) -> Result<Vec<f32>, agentplane::core::StoreError> {
-        Ok(if text.contains("language") {
-            vec![1.0, 0.0]
-        } else {
-            vec![0.0, 1.0]
+    async fn embed(
+        &self,
+        text: &str,
+    ) -> Result<agentplane::memory::Embedded, agentplane::core::StoreError> {
+        Ok(agentplane::memory::Embedded {
+            vector: if text.contains("language") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            },
+            usage: agentplane::model::Usage::default(),
         })
     }
 }

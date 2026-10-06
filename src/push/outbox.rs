@@ -337,16 +337,18 @@ impl Outbox {
 
     /// Register every destination against a run, from its first record on.
     ///
-    /// Called by the runtime at admission. Idempotent: [`PushStore::put`]
-    /// preserves an existing cursor, so a re-admitted or resumed run does not
-    /// rewind a receiver that has already acknowledged part of the history.
+    /// Called by the runtime at admission and by every resume that executes.
+    /// Idempotent: [`PushStore::put`] preserves an existing cursor, so a
+    /// resumed run does not rewind a receiver that has already acknowledged
+    /// part of the history.
     ///
     /// # Errors
     ///
-    /// [`StoreError`] if the push store cannot be written. Admission fails, which
-    /// is the correct direction: a run that started without its destinations
-    /// registered would produce a history nothing is watching, and the events it
-    /// missed are unrecoverable without a scan nobody schedules.
+    /// [`StoreError`] if the push store cannot be written. The admission or
+    /// resume fails, which is the correct direction: a run executing without
+    /// its destinations registered would produce a history nothing is
+    /// watching, and the events it missed are unrecoverable without a scan
+    /// nobody schedules.
     pub async fn open(&self, run: RunId) -> Result<(), StoreError> {
         for destination in &self.destinations {
             // Sequence 1: the run's first record. A destination registered at

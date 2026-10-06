@@ -47,7 +47,7 @@ pub const SOURCE_WORKLIST: &str = "agentplane://worklist";
 /// to arbitrate and the epoch never moves. It is named rather than spelled `1`
 /// three times, because a literal repeated across a fence is how two of them
 /// come to disagree.
-const SWEEP_EPOCH: crate::core::Epoch = 1;
+const SWEEP_EPOCH: crate::core::Epoch = super::LEASE_FREE_EPOCH;
 
 /// The outcome a sweep run is sealed with.
 ///
@@ -350,6 +350,18 @@ pub struct SweepReport {
     /// here is one stuck run rather than many — but it is stuck, nothing else
     /// will unstick it, and the reason is in the log of the tick that failed.
     pub recovery_failures: usize,
+    /// Admission slots given back for runs that were sealed while still
+    /// holding one — sealed by a plane with no quota store, which cannot
+    /// release this plane's ledger.
+    pub slots_released: usize,
+    /// Runs written without a lease — an operator act, a sweep's record, an
+    /// observed session — whose conclusion was written and whose seal was
+    /// not, sealed by this tick.
+    ///
+    /// Each is a writer that died between its last two calls. Until the seal,
+    /// a history lists the run under its outcome while the audit finds it in
+    /// no log.
+    pub seals_finished: usize,
     /// Which sweeps came back **full**, and therefore may not have seen
     /// everything that was waiting.
     pub saturated: Saturation,
@@ -456,6 +468,8 @@ impl SweepReport {
             && self.wake_failures == 0
             && self.runs_recovered == 0
             && self.recovery_failures == 0
+            && self.slots_released == 0
+            && self.seals_finished == 0
             // Gathering evidence is activity, and a shortfall or an integrity
             // refusal most of all. A tick that submitted nothing — no
             // witnesses, or a log that has not grown — leaves all three at
@@ -475,9 +489,8 @@ impl Runtime {
     ///
     /// Nothing happens without witnesses configured. With them, a round is
     /// skipped when the log has not grown since the last round that met the
-    /// declared quorum — the alternative is re-submitting an unchanged
-    /// checkpoint on every tick, which every witness answers and none of which
-    /// tells anybody anything.
+    /// declared quorum and the declared interval, if any, has not passed since
+    /// that round.
     ///
     /// A witness failing is never an error here. It is what the counts on
     /// [`SweepReport`] carry, so a shortfall reaches
@@ -488,18 +501,33 @@ impl Runtime {
     ///
     /// Only if the **store** cannot answer with a checkpoint or build a
     /// consistency proof.
-    async fn cosign_checkpoint(&self, report: &mut SweepReport) -> Result<(), RuntimeError> {
+    async fn cosign_checkpoint(
+        &self,
+        now: Timestamp,
+        report: &mut SweepReport,
+    ) -> Result<(), RuntimeError> {
         use std::sync::atomic::Ordering;
 
         let Some(witnessing) = self.witnessing() else {
             return Ok(());
         };
         let checkpoint = self.store().checkpoint().await?;
-        // Equality only: an unchanged log needs no new evidence, while a log
-        // reporting a *smaller* size than what was already cosigned is
-        // precisely the submission a witness must be given the chance to
-        // refuse — so it is not skipped.
-        if checkpoint.size == witnessing.submitted.load(Ordering::Relaxed) {
+        // Equality only: a log reporting a *smaller* size than what was
+        // already cosigned is precisely the submission a witness must be given
+        // the chance to refuse — so it is not skipped. An unchanged log is
+        // re-submitted once the declared interval has passed, so the witness
+        // signs a fresh timestamp over it.
+        let last_met = *witnessing
+            .last_met
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let within_interval = match (witnessing.interval, last_met) {
+            (Some(interval), Some(last)) => now - last < interval,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        let unchanged = checkpoint.size == witnessing.submitted.load(Ordering::Relaxed);
+        if unchanged && (checkpoint.size == 0 || within_interval) {
             return Ok(());
         }
         let outcome = crate::journal::cosign_quorum(
@@ -529,6 +557,10 @@ impl Runtime {
             witnessing
                 .submitted
                 .store(checkpoint.size, Ordering::Relaxed);
+            *witnessing
+                .last_met
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(now);
         }
         Ok(())
     }
@@ -560,6 +592,8 @@ impl Runtime {
             // Recovery first: an abandoned run may be one step from meeting a
             // deadline the pass below would otherwise breach.
             self.recover_abandoned(&mut report, &mut ledger).await?;
+            report.slots_released = self.release_sealed_slots(RECOVERY_BATCH).await?;
+            report.seals_finished = self.seal_unsealed_conclusions(RECOVERY_BATCH).await?;
             report.warned += self.sweep_deadlines(now, &mut report, &mut ledger).await?;
             self.sweep_tasks(now, &mut report, &mut ledger).await?;
 
@@ -590,7 +624,7 @@ impl Runtime {
             // any other phase depends on, and it is the one phase whose
             // counterparty is somebody else's server. A witness that is slow
             // must not delay a breach or a recovery.
-            self.cosign_checkpoint(&mut report).await?;
+            self.cosign_checkpoint(now, &mut report).await?;
             Ok(())
         }
         .await;
@@ -848,17 +882,20 @@ impl Runtime {
         // makes that a second *resume*, not a second record: an append here
         // would put a duplicate wake in the chain, and the journal is the one
         // place a retry must never show up twice.
-        let already_recorded = self
+        let history = self
             .store()
             .read(timer.run, 1)
             .await
-            .map_err(RuntimeError::from_store)?
-            .iter()
-            .any(|record| {
-                record.effect_key() == Some(timer.effect)
-                    && matches!(record.kind(), RecordKind::EffectDone { .. })
-            });
-        if !already_recorded {
+            .map_err(RuntimeError::from_store)?;
+        let already_recorded = history.iter().any(|record| {
+            record.effect_key() == Some(timer.effect)
+                && matches!(record.kind(), RecordKind::EffectDone { .. })
+        });
+        // A run whose conclusion is durable wakes for nothing: a wake after
+        // `RunConcluded` leaves a run its seal refuses. The resume below
+        // finishes it — seals it and retires its timers — instead.
+        let closed = super::executor::resume_is_closed(&history).is_some();
+        if !already_recorded && !closed {
             let mut record = Append::new(
                 timer.run,
                 RecordKind::EffectDone {
@@ -875,6 +912,9 @@ impl Runtime {
                     // The runtime's own instant, chosen and journaled here —
                     // one of the few values that crosses no trust boundary.
                     declared: crate::core::DeclaredOutput::trusted(),
+                    // A timer's instant is no rule's to judge.
+                    content: None,
+                    elapsed_ms: None,
                 },
             )
             .effect(timer.effect)
@@ -1271,6 +1311,25 @@ impl Runtime {
         decision: &Decision,
         roles: &[String],
     ) -> Result<crate::core::Delivery, RuntimeError> {
+        self.decide_task_at(id, decision, roles, None).await
+    }
+
+    /// [`decide_task`](Self::decide_task), refused unless the task row is
+    /// still the version `expected` names.
+    ///
+    /// `expected` is [`Justification::digest`](crate::core::Justification::digest)
+    /// of the row as the caller read it. A row that changed since — before the
+    /// claim, or between the read and the claim — is refused as
+    /// [`RuntimeError::TaskChanged`]: nothing is recorded, and a claim this
+    /// call took is released. It proves the caller held the current version
+    /// of the row, not what any screen displayed. `None` compares nothing.
+    pub async fn decide_task_at(
+        &self,
+        id: crate::core::TaskId,
+        decision: &Decision,
+        roles: &[String],
+        expected: Option<crate::core::Digest>,
+    ) -> Result<crate::core::Delivery, RuntimeError> {
         let tasks = self
             .tasks()
             .ok_or_else(|| RuntimeError::PlanContract("this runtime has no task store".into()))?;
@@ -1299,17 +1358,41 @@ impl Runtime {
         // proposal's shape: clear arguments spelled like an envelope are
         // arguments, and reading the shape let untrusted input make a task
         // nobody could approve.
+        let current = if decision.approved || expected.is_some() {
+            tasks.task(id).await.map_err(RuntimeError::from_store)?
+        } else {
+            None
+        };
         if decision.approved
-            && let Some(task) = tasks.task(id).await.map_err(RuntimeError::from_store)?
-            && let Some(reason) = task.withheld
+            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)
         {
             return Err(RuntimeError::ProposalWithheld {
                 task: id.to_string(),
                 reason,
             });
         }
+        // Before the claim, so a refused decision leaves the row as it was:
+        // a claim and its release would reopen an escalated task.
+        if let Some(row) = &current
+            && is_stale(expected, row)
+        {
+            return Err(RuntimeError::TaskChanged {
+                task: id.to_string(),
+            });
+        }
 
         let claimed = tasks.claim(id, by.actor(), roles).await?;
+        if is_stale(expected, &claimed) {
+            let held = current
+                .as_ref()
+                .is_some_and(|row| row.assignee.as_deref() == Some(by.actor()));
+            if !held && let Err(error) = tasks.release(id, by.actor()).await {
+                tracing::warn!(task = %id, %error, "could not release the claim of a refused decision");
+            }
+            return Err(RuntimeError::TaskChanged {
+                task: id.to_string(),
+            });
+        }
 
         // Bound to what the store holds as this person decides. The run
         // compares it with the task it proposed, so a row edited in between
@@ -1343,12 +1426,30 @@ impl Runtime {
                 crate::core::ClaimError::AlreadyAnswered { task: id },
             ));
         }
-        tasks
+        let settled = tasks
             .set_state(id, TaskState::Completed)
             .await
             .map_err(RuntimeError::from_store)?;
+        // The task left `Pending` after the claim — the run concluded and
+        // withdrew it. A decision no waiting run received is not one, and the
+        // decider is told so rather than shown success.
+        if !settled && !matches!(delivery, crate::core::Delivery::Resumed { .. }) {
+            let state = tasks
+                .task(id)
+                .await
+                .map_err(RuntimeError::from_store)?
+                .map_or(TaskState::Withdrawn, |task| task.state);
+            return Err(RuntimeError::TaskClaim(
+                crate::core::ClaimError::NotPending { task: id, state },
+            ));
+        }
         Ok(delivery)
     }
+}
+
+/// Whether a decision named a version of the task that is not `row`'s.
+fn is_stale(expected: Option<crate::core::Digest>, row: &crate::core::Task) -> bool {
+    expected.is_some_and(|digest| digest != row.justification.digest())
 }
 
 /// The id of the one event that answers a task: derived from the task, so a

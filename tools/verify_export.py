@@ -11,14 +11,26 @@ belongs in the specification instead.
 
     python3 tools/verify_export.py tests/golden/export.jsonl
     python3 tools/verify_export.py export.jsonl 42:<root-hex> [checkpoint.json …]
+    python3 tools/verify_export.py export.jsonl --key KEY_ID=<64 hex> …
+    python3 tools/verify_export.py export.jsonl checkpoint.note --witness-key NAME=<base64> \
+        --max-checkpoint-age 86400
+    python3 tools/verify_export.py export.jsonl --grader-verdict v.json --grader-key ID=<hex>
 
 Each argument after the file is a checkpoint from outside it — `SIZE:ROOT`,
-`ORIGIN:SIZE:ROOT`, or a JSON file holding `{"origin", "size", "root"}` — and
-the file is held to every one. A cosigned note is not read here: this reader
-checks no signatures of any kind, and says so in its output.
+`ORIGIN:SIZE:ROOT`, a JSON file holding `{"origin", "size", "root"}`, or a
+cosigned `signed-note` file — and the file is held to every one. The auditor
+supplies three disjoint sets of trusted Ed25519 public keys: `--key` for record
+signatures (with any, an unsigned record is a finding), `--witness-key` for
+the cosignatures on a note anchor, `--grader-key` for a grader verdict's
+signature. `--max-checkpoint-age SECS` judges each witness key's latest
+verified time against this machine's clock (`--now RFC3339` replaces the clock).
+What a run did not check — a signature without its key, an anchor nobody
+cosigned, freshness without a maximum age — is named in its output.
 
-Exit 0 when the file verifies, 1 when it does not, 2 when the file could not be
-read at all. Findings are printed one per line.
+Exit 0 when the file verifies, 1 when it does not, 2 when the command line is
+malformed, 4 when a file could not be read at all, 6 when it is under a `canon`
+this reader does not implement and so cannot be verified here — the statuses
+`agentplane verify` uses for the same answers. Findings are printed one per line.
 
 Standard library only, deliberately: an auditor should be able to run this on a
 machine with nothing installed.
@@ -26,8 +38,12 @@ machine with nothing installed.
 
 from __future__ import annotations
 
+import base64
+import datetime
 import hashlib
 import json
+import os
+import re
 import sys
 
 # ── Section 1: versioning ──────────────────────────────────────────────────
@@ -36,10 +52,16 @@ EXPORT_VERSION = 1
 CANON_VERSION = 1
 
 HEADER_KIND = "agentplane.export"
+PACKAGE_KIND = "agentplane.disclosure"
 RUN_KIND = "agentplane.export.run"
 CASE_KIND = "agentplane.export.case"
 TRAILER_KIND = "agentplane.export.end"
-FRAMING = {HEADER_KIND, RUN_KIND, CASE_KIND, TRAILER_KIND}
+FRAMING = {HEADER_KIND, PACKAGE_KIND, RUN_KIND, CASE_KIND, TRAILER_KIND}
+
+# The conclusions that seal a run into the log (the specification's sealing
+# outcomes). A package places every sealed run it carries, so a run whose last
+# conclusion is one of these and whose block carries no leaf had it removed.
+SEALED_OUTCOMES = {"succeeded", "cancelled", "abandoned", "swept", "broke-glass", "halt-lifted", "hold-released", "observed"}
 
 # The members each framing line is specified to carry. A later writer may add
 # one; this reader passes over it and says so, because a verdict is only as wide
@@ -49,6 +71,7 @@ FRAMING = {HEADER_KIND, RUN_KIND, CASE_KIND, TRAILER_KIND}
 # other answer, and for the reason its members are covered by a hash.
 FRAMING_MEMBERS = {
     HEADER_KIND: {"kind", "version", "checkpoint", "canon"},
+    PACKAGE_KIND: {"kind", "version", "checkpoint", "canon", "selection"},
     RUN_KIND: {"kind", "run", "index", "seal"},
     CASE_KIND: {"kind", "case", "deadlines", "blobs", "hold"},
     TRAILER_KIND: {
@@ -99,6 +122,141 @@ def merkle_root(leaves: list[bytes]) -> bytes:
     return node_hash(merkle_root(leaves[:k]), merkle_root(leaves[k:]))
 
 
+def path_proves(leaf: bytes, index: int, size: int, path: list[bytes], root: bytes) -> bool:
+    """Whether `path` (siblings, leaf-upwards) proves `leaf` at `index` in the
+    tree of `size` leaves whose root is `root` — the inclusion check of
+    RFC 9162 §2.1.3.2, over this format's leaf and node hashes."""
+    if index >= size:
+        return False
+    fn, sn, r = index, size - 1, leaf
+    for p in path:
+        if sn == 0:
+            return False
+        if fn & 1 or fn == sn:
+            r = node_hash(p, r)
+            if not fn & 1:
+                while not fn & 1 and fn != 0:
+                    fn >>= 1
+                    sn >>= 1
+        else:
+            r = node_hash(r, p)
+        fn >>= 1
+        sn >>= 1
+    return sn == 0 and r == root
+
+
+# ── Sections 6 and 7: Ed25519 verification, RFC 8032 §5.1 ─────────────────
+# Written from the normative prose of RFC 8032 §5.1 (5.1.2 encoding, 5.1.3
+# decoding, 5.1.4 point addition, 5.1.7 verification), not from the
+# illustrative code in its §6. Verification only: this reader never signs and
+# never makes a key. Strict where the RFC leaves room: S must be below L, the
+# public key must be a canonical encoding, the equation is the cofactorless
+# one, and the recomputed R is compared as an encoding with the signature's R
+# bytes — so a non-canonical R never verifies. Not constant-time; it handles
+# only public data.
+
+ED_P = 2**255 - 19
+ED_L = 2**252 + 27742317777372353535851937790883648493
+ED_D = (-121665 * pow(121666, ED_P - 2, ED_P)) % ED_P
+# sqrt(-1) mod p, used by the decoding's second square-root case.
+ED_SQRT_M1 = pow(2, (ED_P - 1) // 4, ED_P)
+
+
+def _ed_inv(x: int) -> int:
+    return pow(x, ED_P - 2, ED_P)
+
+
+# A point is (X, Y, Z, T) in extended homogeneous coordinates (§5.1.4):
+# x = X/Z, y = Y/Z, x*y = T/Z.
+ED_IDENTITY = (0, 1, 1, 0)
+
+
+def _ed_add(p1: tuple, p2: tuple) -> tuple:
+    """Point addition, §5.1.4; complete, so it also doubles."""
+    x1, y1, z1, t1 = p1
+    x2, y2, z2, t2 = p2
+    a = (y1 - x1) * (y2 - x2) % ED_P
+    b = (y1 + x1) * (y2 + x2) % ED_P
+    c = t1 * 2 * ED_D * t2 % ED_P
+    d = z1 * 2 * z2 % ED_P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % ED_P, g * h % ED_P, f * g % ED_P, e * h % ED_P)
+
+
+def _ed_neg(point: tuple) -> tuple:
+    x, y, z, t = point
+    return ((-x) % ED_P, y, z, (-t) % ED_P)
+
+
+def _ed_mul(scalar: int, point: tuple) -> tuple:
+    """[scalar]point by double-and-add."""
+    result = ED_IDENTITY
+    while scalar > 0:
+        if scalar & 1:
+            result = _ed_add(result, point)
+        point = _ed_add(point, point)
+        scalar >>= 1
+    return result
+
+
+def _ed_encode(point: tuple) -> bytes:
+    """§5.1.2: y little-endian in 32 bytes, the top bit holding x's low bit."""
+    x, y, z, _ = point
+    zi = _ed_inv(z)
+    x, y = x * zi % ED_P, y * zi % ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_decode(encoded: bytes) -> tuple | None:
+    """§5.1.3, refusing every non-canonical encoding: y ≥ p, and x = 0 with
+    the sign bit set. None for anything that is not a point."""
+    if len(encoded) != 32:
+        return None
+    value = int.from_bytes(encoded, "little")
+    sign = value >> 255
+    y = value & ((1 << 255) - 1)
+    if y >= ED_P:
+        return None
+    u = (y * y - 1) % ED_P
+    v = (ED_D * y * y + 1) % ED_P
+    x = u * pow(v, 3, ED_P) * pow(u * pow(v, 7, ED_P), (ED_P - 5) // 8, ED_P) % ED_P
+    vxx = v * x * x % ED_P
+    if vxx == (-u) % ED_P:
+        x = x * ED_SQRT_M1 % ED_P
+    elif vxx != u:
+        return None
+    if x == 0 and sign == 1:
+        return None
+    if x & 1 != sign:
+        x = ED_P - x
+    return (x, y, 1, x * y % ED_P)
+
+
+# The base point B of §5.1: y = 4/5, x even.
+ED_BASE = _ed_decode((4 * _ed_inv(5) % ED_P).to_bytes(32, "little"))
+
+
+def ed25519_verify(public: bytes, message: bytes, signature: bytes) -> bool:
+    """§5.1.7, cofactorless: [S]B = R + [k]A, checked as encodings.
+
+    False — never an exception — for a key that is not 32 bytes, a signature
+    that is not 64, S ≥ L, a key that is not a canonical point encoding, and a
+    signature that does not verify."""
+    if not isinstance(public, bytes) or not isinstance(signature, bytes):
+        return False
+    if len(public) != 32 or len(signature) != 64:
+        return False
+    r_bytes, s = signature[:32], int.from_bytes(signature[32:], "little")
+    if s >= ED_L:
+        return False
+    a = _ed_decode(public)
+    if a is None:
+        return False
+    k = int.from_bytes(hashlib.sha512(r_bytes + public + message).digest(), "little") % ED_L
+    check = _ed_add(_ed_mul(s, ED_BASE), _ed_neg(_ed_mul(k, a)))
+    return _ed_encode(check) == r_bytes
+
+
 # ── The verifier ───────────────────────────────────────────────────────────
 
 class Report:
@@ -107,11 +265,47 @@ class Report:
         self.records = 0
         self.runs = 0
         self.cases = 0
-        self.unverifiable = False
+        self.unverifiable: str | None = None
         self.unchecked: list[str] = []
+        # Record signatures that verified under a supplied key.
+        self.signatures = 0
+        # What each note anchor's cosignatures established.
+        self.anchors: list[str] = []
+        # Freshness findings: about the witnesses, not the file, so a sidecar's
+        # binding is not judged by them.
+        self.stale: list[str] = []
+        # Per run block: whether it declared a seal, and its record hashes by seq.
+        self.blocks: dict[str, dict] = {}
 
     def note(self, text: str) -> None:
         self.findings.append(text)
+
+
+# A signature travels as lowercase hex, exactly 128 characters; a key on the
+# command line as 64 hex characters of either case, as `agentplane` takes it.
+SIGNATURE_HEX = re.compile(r"[0-9a-f]{128}")
+KEY_HEX = re.compile(r"[0-9a-fA-F]{64}")
+
+
+def signature_bytes(encoded: object) -> bytes | None:
+    """A signature's 64 bytes from its hex, or None for any other spelling —
+    whitespace, a separator, upper case or a wrong length included."""
+    if not isinstance(encoded, str) or not SIGNATURE_HEX.fullmatch(encoded):
+        return None
+    return bytes.fromhex(encoded)
+
+
+def b64_canonical(text: str) -> bytes | None:
+    """RFC 4648 base64 in its one canonical spelling, or None: the standard
+    alphabet, padded, and with zero trailing bits — so two spellings never
+    decode to one value."""
+    try:
+        decoded = base64.b64decode(text, validate=True)
+    except ValueError:
+        return None
+    if base64.b64encode(decoded).decode("ascii") != text:
+        return None
+    return decoded
 
 
 def unhex(value: object, what: str, report: Report) -> bytes | None:
@@ -126,12 +320,23 @@ def unhex(value: object, what: str, report: Report) -> bytes | None:
 
 
 class Anchor:
-    """A checkpoint from outside the file: an origin (optional), a size, a root."""
+    """A checkpoint from outside the file: an origin (optional), a size, a root.
+
+    An anchor read from a signed note also carries the note's body and its
+    signature lines; `cosigned` is filled with each supplied witness key whose
+    line verified, and its signed time, and nothing else.
+    """
 
     def __init__(self, size: int, root: bytes, origin: str | None = None) -> None:
         self.size = size
         self.root = root
         self.origin = origin
+        self.source: str | None = None
+        self.body: bytes | None = None
+        # (name, key id ‖ payload) per signature line, as the note carries them.
+        self.lines: list[tuple[str, bytes]] = []
+        # (name, time) per line that verified under a supplied witness key.
+        self.cosigned: list[tuple[str, int]] = []
 
     def __str__(self) -> str:
         where = f"'{self.origin}' " if self.origin is not None else ""
@@ -142,6 +347,37 @@ class Anchor:
 # block. A hold with an empty reason or actor preserves a matter nobody can
 # account for.
 BASES = {"authenticated", "asserted", "connected"}
+
+
+RFC3339 = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?([Zz]|[+-](\d{2}):(\d{2}))"
+)
+
+
+def is_rfc3339(text: str) -> bool:
+    """Whether `text` is an RFC 3339 date-time naming a real instant."""
+    match = RFC3339.fullmatch(text)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    if match.group(9) is not None and (int(match.group(9)) > 23 or int(match.group(10)) > 59):
+        return False
+    try:
+        datetime.datetime(year, month, day, hour, minute, second)
+    except ValueError:
+        return False
+    return True
+
+
+def same(a: object, b: object) -> bool:
+    """JSON equality that tells `1`, `1.0` and `true` apart, as the wire does."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(same(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same(x, y) for x, y in zip(a, b))
+    return a == b
 
 
 def hold_problem(block: dict) -> str | None:
@@ -160,6 +396,8 @@ def hold_problem(block: dict) -> str | None:
         return "the legal hold is malformed: it needs exactly placed_at, reason and by"
     if not isinstance(hold["placed_at"], str) or not isinstance(hold["reason"], str):
         return "the legal hold is malformed: placed_at and reason are strings"
+    if not is_rfc3339(hold["placed_at"]):
+        return "the legal hold is malformed: placed_at is not an RFC 3339 instant"
     by = hold["by"]
     if (
         not isinstance(by, dict)
@@ -172,17 +410,214 @@ def hold_problem(block: dict) -> str | None:
     return None
 
 
-def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
+# ── Section 6: record signatures ───────────────────────────────────────────
+RECORD_DOMAIN = b"io.github.hupe1980.agentplane/record/v1"
+
+
+def record_signing_input(chain_hash: bytes) -> bytes:
+    """What a record's Ed25519 signature covers: SHA-256(domain ‖ 0x00 ‖ hash)."""
+    return sha256(RECORD_DOMAIN + b"\x00" + chain_hash)
+
+
+def check_record_signature(
+    line: dict, claimed: bytes, run: object, keys: dict[str, bytes], report: Report
+) -> None:
+    """One record line's signature under the key its `key_id` names. Called
+    only when the auditor supplied keys, so unsigned is a finding here."""
+    where = f"run {run}: record {line.get('seq')}'s signature"
+    signed = line.get("signature")
+    if signed is None:
+        report.note(f"{where} is absent, inside a verification that required one")
+        return
+    if not isinstance(signed, dict) or set(signed) != {"key_id", "signature"}:
+        report.note(f"{where} is not a {{key_id, signature}} object: {signed!r}")
+        return
+    key_id, encoded = signed["key_id"], signed["signature"]
+    signature = signature_bytes(encoded)
+    if signature is None:
+        report.note(f"{where} by {key_id!r} is not 128 lowercase hex characters")
+        return
+    public = keys.get(key_id) if isinstance(key_id, str) else None
+    if public is None:
+        report.note(f"{where} is under key {key_id!r}, which was not supplied")
+        return
+    if not ed25519_verify(public, record_signing_input(claimed), signature):
+        report.note(f"{where} by {key_id!r} does not verify")
+        return
+    report.signatures += 1
+
+
+# ── Section 7: cosignatures and freshness ──────────────────────────────────
+# A witness's cosignature over a checkpoint note, per the Cosignature section.
+COSIGNER_KEY_TYPE = 0x04
+COSIGNATURE_PAYLOAD = 72
+LARGEST_TIMESTAMP = 2**63 - 1
+
+
+def cosigner_key_id(name: str, public: bytes) -> bytes:
+    """SHA-256(name ‖ 0x0A ‖ 0x04 ‖ public key), first four bytes."""
+    return sha256(name.encode("utf-8") + b"\n" + bytes([COSIGNER_KEY_TYPE]) + public)[:4]
+
+
+def cosignature_message(timestamp: int, body: bytes) -> bytes:
+    """What a cosignature signs: the header, the time line, then the note body."""
+    return b"cosignature/v1\ntime " + str(timestamp).encode("ascii") + b"\n" + body
+
+
+# A witness key as the reader holds it: by name *and* key id, as the Rust
+# reader matches a line, so two keys published under one name are two keys.
+Witnesses = dict[tuple[str, bytes], bytes]
+
+
+def witness_entry(name: str, public: bytes) -> tuple[tuple[str, bytes], bytes]:
+    return (name, cosigner_key_id(name, public)), public
+
+
+def cosignature_time(name: str, decoded: bytes, body: bytes, witnesses: Witnesses) -> int | str:
+    """The signed time of one note line when it is a cosignature by a supplied
+    witness key: its name and key id both match that key, its payload is one,
+    its timestamp is neither 0 nor above 2^63−1, and the signature verifies.
+    Otherwise the reason it is not one."""
+    public = witnesses.get((name, decoded[:4]))
+    if public is None:
+        return f"{name}: no supplied --witness-key has this name and key id"
+    if len(decoded) != 4 + COSIGNATURE_PAYLOAD:
+        return f"{name}: the payload is {len(decoded) - 4} bytes, not {COSIGNATURE_PAYLOAD}"
+    timestamp = int.from_bytes(decoded[4:12], "big")
+    if timestamp == 0:
+        return f"{name}: the timestamp is 0, which a cosignature must not carry"
+    if timestamp > LARGEST_TIMESTAMP:
+        return f"{name}: the timestamp {timestamp} is above 2^63-1"
+    if not ed25519_verify(public, cosignature_message(timestamp, body), decoded[12:]):
+        return f"{name}: the signature does not verify"
+    return timestamp
+
+
+def utc(timestamp: int) -> str:
+    """A verified time as UTC, or as plain seconds when it is past what a
+    calendar date can spell — a far-future time is still a signed one."""
+    try:
+        moment = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return f"{timestamp} seconds after the epoch"
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def check_cosignatures(
+    anchors: list[Anchor], witnesses: Witnesses, report: Report
+) -> None:
+    """Fill each note anchor's `cosigned`, and say per anchor what it is."""
+    notes = [anchor for anchor in anchors if anchor.body is not None]
+    if not notes:
+        if anchors:
+            report.unchecked.append(
+                "cosignatures — no anchor was a cosigned note, so every anchor is a "
+                "checkpoint whoever supplied it could have produced"
+            )
+        return
+    if not witnesses:
+        report.unchecked.append(
+            f"cosignatures — no --witness-key was given, so who cosigned the "
+            f"{len(notes)} note anchor(s) is not checked, and each is a checkpoint "
+            "whoever supplied it could have produced"
+        )
+        return
+    for anchor in notes:
+        reasons = []
+        for name, decoded in anchor.lines:
+            timestamp = cosignature_time(name, decoded, anchor.body, witnesses)
+            if isinstance(timestamp, str):
+                reasons.append(timestamp)
+            else:
+                anchor.cosigned.append((name, timestamp))
+        if anchor.cosigned:
+            for name, timestamp in anchor.cosigned:
+                report.anchors.append(
+                    f"the checkpoint {anchor.source} is cosigned by {name} at {utc(timestamp)}"
+                )
+        else:
+            report.anchors.append(
+                f"the checkpoint {anchor.source} is not cosigned — none of its "
+                f"{len(anchor.lines)} signature line(s) verifies under a supplied "
+                f"--witness-key ({'; '.join(reasons)}), so it is a checkpoint whoever "
+                "supplied it could have produced"
+            )
+
+
+def judge_freshness(
+    anchors: list[Anchor], max_age: int | None, now: int, report: Report
+) -> None:
+    """Per witness key, its latest verified time against `now`. Keys are never
+    compared with each other, and a time whose cosignature did not verify is an
+    unauthenticated number, so it is never judged."""
+    latest: dict[str, tuple[int, str | None]] = {}
+    for anchor in anchors:
+        for name, timestamp in anchor.cosigned:
+            if name not in latest or timestamp > latest[name][0]:
+                latest[name] = (timestamp, anchor.source)
+    if max_age is None:
+        if latest:
+            report.unchecked.append(
+                "freshness — the anchors carry verified witness times and no "
+                "--max-checkpoint-age was given, so how long each witness has gone "
+                "without seeing this log was not judged"
+            )
+        return
+    if not latest:
+        report.unchecked.append(
+            "freshness — a maximum age was given and no anchor carries a verified "
+            "witness time, so there is no signed time to judge"
+        )
+        return
+    unsigned = [str(a.source or a) for a in anchors if not a.cosigned]
+    if unsigned:
+        report.unchecked.append(
+            f"freshness — {', '.join(unsigned)} carry no verified witness time and "
+            "were not judged"
+        )
+    for name, (timestamp, source) in sorted(latest.items()):
+        age, ahead = now - timestamp, timestamp - now
+        if ahead > max_age:
+            report.stale.append(
+                f"witness {name}'s latest verified time {utc(timestamp)} (the checkpoint "
+                f"{source}) is {ahead} s ahead of this reader's clock, more than the "
+                f"maximum of {max_age} s"
+            )
+        elif age > max_age:
+            report.stale.append(
+                f"witness {name} is stale: its latest verified time {utc(timestamp)} (the "
+                f"checkpoint {source}) is {age} s old, more than the maximum of "
+                f"{max_age} s — a suffix removed since then is not detectable"
+            )
+
+
+def verify(
+    lines: list[str],
+    anchors: list[Anchor] | None = None,
+    keys: dict[str, bytes] | None = None,
+    witnesses: Witnesses | None = None,
+    max_age: int | None = None,
+    now: int | None = None,
+) -> Report:
     report = Report()
     anchors = anchors or []
-    # Section 10, step 4: this reader implements no signature scheme, so every
-    # verdict it gives is about integrity and never about authorship.
-    report.unchecked.append(
-        "signatures — this reader checks no record signature and no cosignature, so "
-        "nothing here says who wrote the file"
+    keys = keys or {}
+    # Section 10, step 4: a verifier that does not check signatures says so.
+    if not keys:
+        report.unchecked.append(
+            "record signatures — no --key was given, so who signed the records is not "
+            "checked"
+        )
+    check_cosignatures(anchors, witnesses or {}, report)
+    judge_freshness(
+        anchors,
+        max_age,
+        int(datetime.datetime.now(datetime.timezone.utc).timestamp()) if now is None else now,
+        report,
     )
 
     open_runs = 0
+    package = False
     parsed: list[dict] = []
     for number, line in enumerate(lines, 1):
         if not line.strip():
@@ -195,7 +630,16 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
         if not isinstance(value, dict):
             report.note(f"line {number} is not a JSON object")
             return report
+        try:
+            json.dumps(value, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            report.note(f"line {number} is not JSON: it escapes a lone surrogate")
+            return report
+        if not parsed and value.get("kind") == PACKAGE_KIND:
+            package = True
         known = FRAMING_MEMBERS.get(value.get("kind"))
+        if package and value.get("kind") == RUN_KIND:
+            known = FRAMING_MEMBERS[RUN_KIND] | {"proof"}
         if known is not None:
             unknown = sorted(set(value) - known)
             if unknown:
@@ -212,8 +656,8 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
 
     # ── step 1: the header ────────────────────────────────────────────────
     header = parsed[0]
-    if header.get("kind") != HEADER_KIND:
-        report.note(f"the first line is not a {HEADER_KIND} header")
+    if header.get("kind") not in (HEADER_KIND, PACKAGE_KIND):
+        report.note(f"the first line is not a {HEADER_KIND} or {PACKAGE_KIND} header")
         return report
     if header.get("version") != EXPORT_VERSION:
         report.note(
@@ -221,13 +665,13 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
             f"implements ({EXPORT_VERSION})"
         )
         return report
-    if header.get("canon") != CANON_VERSION:
-        report.note(
-            f"canon {header.get('canon')!r} is not the rule this reader "
-            f"implements ({CANON_VERSION}) — every digest below is UNVERIFIABLE "
-            "rather than wrong"
+    if not same(header.get("canon"), CANON_VERSION):
+        # Not a finding: the rule names the digest algorithm, so nothing below
+        # can be recomputed here and nothing below is known to be wrong.
+        report.unverifiable = (
+            f"unknown canon — {header.get('canon')!r} is not the rule this reader "
+            f"implements ({CANON_VERSION}), so no digest in the file can be recomputed"
         )
-        report.unverifiable = True
         return report
 
     checkpoint = header.get("checkpoint")
@@ -241,6 +685,18 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
         return report
     if log_size == 0 and claimed_root is not None and claimed_root != empty_root():
         report.note("a size-0 checkpoint claims a root the empty log cannot have")
+    selected_cases: list = []
+    if package:
+        selection = header.get("selection")
+        if (
+            not isinstance(selection, dict)
+            or set(selection) != {"cases", "runs"}
+            or not all(isinstance(selection[k], list) for k in ("cases", "runs"))
+            or not (selection["cases"] or selection["runs"])
+        ):
+            report.note("the package header names no case and no run")
+        else:
+            selected_cases = selection["cases"]
 
     # ── the body of the file ──────────────────────────────────────────────
     current_run: str | None = None
@@ -248,8 +704,12 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
     last_seq: int | None = None
     terminal: dict[str, bytes] = {}
     placed: dict[int, tuple[str, bytes]] = {}
+    # A package's path per run, as hex strings; checked in step 5.
+    paths: dict[str, object] = {}
     stamped: set[str] = set()
     carried: set[str] = set()
+    # Each run's last conclusion outcome, for the package's placement rule.
+    concluded: dict[str, object] = {}
     trailer: dict | None = None
     # [run, records under its block], one entry per run block in file order.
     blocks: list[list] = []
@@ -263,8 +723,17 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
             prev_hash = ZERO
             last_seq = None
             report.runs += 1
+            if str(current_run) in report.blocks:
+                report.note(
+                    f"run {current_run}: the file carries it in two blocks, so neither "
+                    "is the run's one history"
+                )
             blocks.append([str(current_run), 0])
             index, seal = value.get("index"), value.get("seal")
+            report.blocks[str(current_run)] = {
+                "sealed": index is not None and seal is not None,
+                "hashes": {},
+            }
             if index is None and seal is None:
                 # An open run: not in the log, and that is a state rather than
                 # a gap. It is counted, because the root proves nothing about
@@ -274,13 +743,16 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
                 continue
             if not isinstance(index, int) or seal is None:
                 report.note(f"run {current_run}: a placed run needs both index and seal")
+                report.blocks[str(current_run)]["sealed"] = False
                 continue
             digest = unhex(seal, f"run {current_run}'s seal", report)
             if digest is None:
+                report.blocks[str(current_run)]["sealed"] = False
                 continue
             if index in placed:
                 report.note(f"log index {index} is claimed by two runs")
             placed[index] = (str(current_run), digest)
+            paths[str(current_run)] = value.get("proof")
             continue
 
         if kind == CASE_KIND:
@@ -298,6 +770,12 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
 
         if kind == TRAILER_KIND:
             trailer = value
+            continue
+
+        if kind in (HEADER_KIND, PACKAGE_KIND):
+            # The first line alone names the checkpoint and the rules: a later
+            # header would re-choose them for every run after it.
+            report.note(f"a {kind!r} header appears past the first line and was ignored")
             continue
 
         if kind in FRAMING:
@@ -334,13 +812,22 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
             )
         head_before = prev_hash
         prev_hash = claimed
+        if keys:
+            check_record_signature(value, claimed, current_run, keys, report)
 
         try:
             wire = json.loads(raw)
         except json.JSONDecodeError as error:
             report.note(f"run {current_run}: a record's wire bytes do not parse: {error}")
             continue
-        if value.get("body") != wire:
+        # The format's `raw` is canonical bytes: bytes that hash to their claim
+        # and that no writer under this canon produces are a finding, and the
+        # reference reader refuses to restore them.
+        if canonical(wire) != raw:
+            report.note(
+                f"run {current_run}: record {wire.get('seq')}'s wire bytes are not canonical"
+            )
+        if not same(value.get("body"), wire):
             report.note(
                 f"run {current_run}: record {value.get('seq')}'s readable body does "
                 "not match its wire bytes"
@@ -350,18 +837,24 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
         if not isinstance(seq, int):
             report.note(f"run {current_run}: a record has no integer seq")
         else:
+            if last_seq is None and seq != 1:
+                report.note(f"run {current_run}: its first record is seq {seq}, not 1")
             if last_seq is not None and seq != last_seq + 1:
                 report.note(
                     f"run {current_run}: seq jumps from {last_seq} to {seq} — the "
                     "record between them is missing"
                 )
             last_seq = seq
+            if str(current_run) in report.blocks:
+                report.blocks[str(current_run)]["hashes"][seq] = claimed.hex()
         if wire.get("run") != current_run:
             report.note(
                 f"run {current_run}: a record's own body names run {wire.get('run')!r}"
             )
         # Step 3: a conclusion names the head it was drawn over, which is the
         # head it sits on.
+        if wire.get("kind") == "RunConcluded" and current_run is not None:
+            concluded[str(current_run)] = wire.get("outcome")
         if wire.get("kind") == "RunConcluded" and wire.get("chain_head") != head_before.hex():
             report.note(
                 f"run {current_run}: the sealing record's chain_head is not the head it "
@@ -381,7 +874,39 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
 
     positions = sorted(placed)
     against = claimed_root
-    if positions != list(range(len(positions))):
+    if package:
+        # A package's leaves are not the log: each is proved by its own path
+        # against the header, and the undisclosed ones are not a deletion.
+        for index, (run, seal) in sorted(placed.items()):
+            path = paths.get(run)
+            hashes = (
+                [unhex(h, f"run {run}'s path", report) for h in path]
+                if isinstance(path, list)
+                else None
+            )
+            if (
+                hashes is None
+                or any(h is None for h in hashes)
+                or claimed_root is None
+                or not path_proves(leaf_hash(seal), index, log_size, hashes, claimed_root)
+            ):
+                report.note(
+                    f"run {run}: its path does not prove its leaf against the header's "
+                    "checkpoint"
+                )
+        leafed = {run for run, _ in placed.values()}
+        for run, outcome in concluded.items():
+            if outcome in SEALED_OUTCOMES and run not in leafed:
+                report.note(
+                    f"run {run}: it concluded under an outcome that seals and its block "
+                    "carries no leaf — a package places every sealed run it carries"
+                )
+        report.unchecked.append(
+            f"the rest of the log — this file is a disclosure package: the log holds "
+            f"{log_size} sealed run(s) and the package proves {len(placed)} of them; "
+            "nothing about the others is in the file or was checked"
+        )
+    elif positions != list(range(len(positions))):
         # Not a root mismatch: a tree over duplicated or out-of-range positions
         # compares garbage and reports the wrong defect.
         report.note(
@@ -414,7 +939,30 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
         )
 
     # ── step 6: the root, against a checkpoint from somewhere else ────────
-    if not anchors:
+    if package:
+        if not anchors:
+            report.unchecked.append(
+                "the header's checkpoint — no external checkpoint was supplied, so each "
+                "path was proved against the file's own header"
+            )
+        for anchor in anchors:
+            if anchor.origin is not None and anchor.origin != origin:
+                report.note(
+                    f"the checkpoint {anchor} names a log other than this package's "
+                    f"'{origin}'"
+                )
+            elif anchor.size != log_size:
+                report.unchecked.append(
+                    f"the checkpoint {anchor} is not at the package's size {log_size}; a "
+                    "package carries no consistency proof, so the two were not compared"
+                )
+            elif claimed_root is not None and anchor.root != claimed_root:
+                report.note(
+                    f"this package's header names a different root than the checkpoint "
+                    f"{anchor} — one tree of a given size has one root"
+                )
+        anchors = []
+    elif not anchors:
         report.unchecked.append(
             "deletion — no external checkpoint was supplied, so the root could only "
             "be rebuilt and compared against this file's own header. That proves the "
@@ -454,6 +1002,10 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
     # ── step 7: cross-layer ───────────────────────────────────────────────
     for case in sorted(stamped - carried):
         report.note(f"a record names case {case}, which this file does not carry")
+    # A package proves inclusion, never completeness; a matter its own header
+    # names and its case layer omits is the one omission the file can show.
+    for case in sorted(set(map(str, selected_cases)) - carried):
+        report.note(f"the package's selection names case {case}, which it does not carry")
 
     # ── step 8: the trailer ───────────────────────────────────────────────
     if trailer is None:
@@ -478,22 +1030,22 @@ def verify(lines: list[str], anchors: list[Anchor] | None = None) -> Report:
                     "declare it unreadable — its records were removed"
                 )
         exported = sum(1 for _, count in blocks if count > 0)
-        if trailer.get("runs_requested") != len(blocks):
+        if not same(trailer.get("runs_requested"), len(blocks)):
             report.note(
                 f"the trailer claims {trailer.get('runs_requested')} run(s) requested "
                 f"and the file holds {len(blocks)} run block(s)"
             )
-        if trailer.get("runs_exported") != exported:
+        if not same(trailer.get("runs_exported"), exported):
             report.note(
                 f"the trailer claims {trailer.get('runs_exported')} run(s) exported and "
                 f"the file holds records for {exported}"
             )
-        if trailer.get("records") != report.records:
+        if not same(trailer.get("records"), report.records):
             report.note(
                 f"the trailer claims {trailer.get('records')} records and the file "
                 f"holds {report.records}"
             )
-        if trailer.get("cases") != report.cases:
+        if not same(trailer.get("cases"), report.cases):
             report.note(
                 f"the trailer claims {trailer.get('cases')} cases and the file holds "
                 f"{report.cases}"
@@ -727,6 +1279,40 @@ def _damaged(lines: list[dict]) -> list[tuple[str, list[dict], str]]:
 
     cases.append(("a file cut short", copy.deepcopy(lines)[:-1], "this file is a prefix"))
 
+    surrogate = copy.deepcopy(lines)
+    surrogate[first_record]["body"]["note"] = "\ud800"
+    cases.append(("a lone surrogate", surrogate, "lone surrogate"))
+
+    retyped = copy.deepcopy(lines)
+    retyped[first_record]["body"]["seq"] = float(retyped[first_record]["body"]["seq"])
+    cases.append(("a body integer retyped as a float", retyped, "does not match its wire bytes"))
+
+    # The file's last record, re-hashed so its own link holds: one with a
+    # successor would also break the next link, which is not what this asks.
+    respelled = copy.deepcopy(lines)
+    last = record_indexes()[-1]
+    raw = respelled[last]["raw"]
+    spelled = raw.replace(",", ", ", 1)
+    respelled[last]["raw"] = spelled
+    respelled[last]["hash"] = sha256(
+        bytes.fromhex(respelled[last]["prev_hash"]) + spelled.encode("utf-8")
+    ).hex()
+    cases.append(("a record spelled non-canonically", respelled, "not canonical"))
+
+    renumbered = copy.deepcopy(lines)
+    for i in record_indexes():
+        wire = json.loads(renumbered[i]["raw"])
+        wire["seq"] += 1
+        renumbered[i]["raw"] = canonical(wire)
+        renumbered[i]["body"] = wire
+    cases.append(("a run whose first seq is not 1", renumbered, "not 1"))
+
+    undated = copy.deepcopy(lines)
+    for line in undated:
+        if line.get("kind") == CASE_KIND and line.get("hold"):
+            line["hold"]["placed_at"] = "last tuesday"
+    cases.append(("a hold placed at no instant", undated, "not an RFC 3339 instant"))
+
     # A sealed run emptied of every record, with the trailer's counts adjusted
     # to match: no terminal hash is left to hold against the seal, so only the
     # empty-block rule sees it.
@@ -800,7 +1386,434 @@ def _bounded(lines: list[dict]) -> list[tuple[str, list[dict], str]]:
     return [("a framing member from a later writer", ahead, "attestation_bundle")]
 
 
-def self_test(lines: list[str]) -> int:
+def _older_shape(lines: list[dict]) -> list[dict]:
+    """The reference file as a build one record shape older wrote it: each
+    `StepStarted` at version 0 with `skill` named `name`, and every hash, seal
+    and root re-derived. Hashes cover the bytes as written, so it must verify."""
+    import copy
+
+    older = copy.deepcopy(lines)
+    prev, block = ZERO, None
+    for line in older:
+        if line.get("kind") == RUN_KIND:
+            prev, block = ZERO, line
+            continue
+        if "kind" in line:
+            continue
+        wire = json.loads(line["raw"])
+        if wire.get("kind") == "StepStarted":
+            wire["name"] = wire.pop("skill")
+            wire["v"] = 0
+        if wire.get("kind") == "RunConcluded":
+            wire["chain_head"] = prev.hex()
+        raw = canonical(wire)
+        digest = sha256(prev + raw.encode())
+        line.update(body=wire, prev_hash=prev.hex(), hash=digest.hex(), raw=raw)
+        prev = digest
+        if block is not None and "seal" in block:
+            block["seal"] = digest.hex()
+    seals = sorted(
+        (l["index"], bytes.fromhex(l["seal"])) for l in older if l.get("kind") == RUN_KIND and "seal" in l
+    )
+    older[0]["checkpoint"]["root"] = merkle_root([leaf_hash(s) for _, s in seals]).hex()
+    return older
+
+
+# RFC 8032 §7.1, the five Ed25519 vectors: (name, public key, message, signature),
+# copied as published.
+RFC8032_VECTORS = [
+    (
+        "TEST 1",
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "",
+        (
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+            "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+        ),
+    ),
+    (
+        "TEST 2",
+        "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "72",
+        (
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+            "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+        ),
+    ),
+    (
+        "TEST 3",
+        "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+        "af82",
+        (
+            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+            "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"
+        ),
+    ),
+    (
+        "TEST 1024",
+        "278117fc144c72340f67d0f2316e8386ceffbf2b2428c9c51fef7c597f1d426e",
+        (
+            "08b8b2b733424243760fe426a4b54908632110a66c2f6591eabd3345e3e4eb98"
+            "fa6e264bf09efe12ee50f8f54e9f77b1e355f6c50544e23fb1433ddf73be84d8"
+            "79de7c0046dc4996d9e773f4bc9efe5738829adb26c81b37c93a1b270b20329d"
+            "658675fc6ea534e0810a4432826bf58c941efb65d57a338bbd2e26640f89ffbc"
+            "1a858efcb8550ee3a5e1998bd177e93a7363c344fe6b199ee5d02e82d522c4fe"
+            "ba15452f80288a821a579116ec6dad2b3b310da903401aa62100ab5d1a36553e"
+            "06203b33890cc9b832f79ef80560ccb9a39ce767967ed628c6ad573cb116dbef"
+            "efd75499da96bd68a8a97b928a8bbc103b6621fcde2beca1231d206be6cd9ec7"
+            "aff6f6c94fcd7204ed3455c68c83f4a41da4af2b74ef5c53f1d8ac70bdcb7ed1"
+            "85ce81bd84359d44254d95629e9855a94a7c1958d1f8ada5d0532ed8a5aa3fb2"
+            "d17ba70eb6248e594e1a2297acbbb39d502f1a8c6eb6f1ce22b3de1a1f40cc24"
+            "554119a831a9aad6079cad88425de6bde1a9187ebb6092cf67bf2b13fd65f270"
+            "88d78b7e883c8759d2c4f5c65adb7553878ad575f9fad878e80a0c9ba63bcbcc"
+            "2732e69485bbc9c90bfbd62481d9089beccf80cfe2df16a2cf65bd92dd597b07"
+            "07e0917af48bbb75fed413d238f5555a7a569d80c3414a8d0859dc65a46128ba"
+            "b27af87a71314f318c782b23ebfe808b82b0ce26401d2e22f04d83d1255dc51a"
+            "ddd3b75a2b1ae0784504df543af8969be3ea7082ff7fc9888c144da2af58429e"
+            "c96031dbcad3dad9af0dcbaaaf268cb8fcffead94f3c7ca495e056a9b47acdb7"
+            "51fb73e666c6c655ade8297297d07ad1ba5e43f1bca32301651339e22904cc8c"
+            "42f58c30c04aafdb038dda0847dd988dcda6f3bfd15c4b4c4525004aa06eeff8"
+            "ca61783aacec57fb3d1f92b0fe2fd1a85f6724517b65e614ad6808d6f6ee34df"
+            "f7310fdc82aebfd904b01e1dc54b2927094b2db68d6f903b68401adebf5a7e08"
+            "d78ff4ef5d63653a65040cf9bfd4aca7984a74d37145986780fc0b16ac451649"
+            "de6188a7dbdf191f64b5fc5e2ab47b57f7f7276cd419c17a3ca8e1b939ae49e4"
+            "88acba6b965610b5480109c8b17b80e1b7b750dfc7598d5d5011fd2dcc5600a3"
+            "2ef5b52a1ecc820e308aa342721aac0943bf6686b64b2579376504ccc493d97e"
+            "6aed3fb0f9cd71a43dd497f01f17c0e2cb3797aa2a2f256656168e6c496afc5f"
+            "b93246f6b1116398a346f1a641f3b041e989f7914f90cc2c7fff357876e506b5"
+            "0d334ba77c225bc307ba537152f3f1610e4eafe595f6d9d90d11faa933a15ef1"
+            "369546868a7f3a45a96768d40fd9d03412c091c6315cf4fde7cb68606937380d"
+            "b2eaaa707b4c4185c32eddcdd306705e4dc1ffc872eeee475a64dfac86aba41c"
+            "0618983f8741c5ef68d3a101e8a3b8cac60c905c15fc910840b94c00a0b9d0"
+        ),
+        (
+            "0aab4c900501b3e24d7cdf4663326a3a87df5e4843b2cbdb67cbf6e460fec350"
+            "aa5371b1508f9f4528ecea23c436d94b5e8fcd4f681e30a6ac00a9704a188a03"
+        ),
+    ),
+    (
+        "TEST SHA(abc)",
+        "ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
+        (
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+            "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        ),
+        (
+            "dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b589"
+            "09351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704"
+        ),
+    ),
+]
+
+
+def _flip(data: bytes, bit: int) -> bytes:
+    out = bytearray(data)
+    out[bit // 8] ^= 1 << (bit % 8)
+    return bytes(out)
+
+
+def _ed25519_cases() -> int:
+    """The verifier against RFC 8032 §7.1, then the strictness rules; the
+    number of cases not answered as expected."""
+    import time
+
+    failures = 0
+
+    def expect(name: str, got: bool, want: bool) -> None:
+        nonlocal failures
+        if got is want:
+            print(f"ok   {name}")
+        else:
+            print(f"MISS {name}: verified {got}, expected {want}")
+            failures += 1
+
+    for name, public, message, signature in RFC8032_VECTORS:
+        a, m, s = bytes.fromhex(public), bytes.fromhex(message), bytes.fromhex(signature)
+        expect(f"Ed25519 {name} verifies", ed25519_verify(a, m, s), True)
+        expect(f"Ed25519 {name}, one signature bit flipped", ed25519_verify(a, m, _flip(s, 300)), False)
+        expect(f"Ed25519 {name}, one key bit flipped", ed25519_verify(_flip(a, 9), m, s), False)
+        flipped = _flip(m, 3) if m else b"\x01"
+        expect(f"Ed25519 {name}, one message bit flipped", ed25519_verify(a, flipped, s), False)
+
+    _, public, message, signature = RFC8032_VECTORS[0]
+    a, m, s = bytes.fromhex(public), bytes.fromhex(message), bytes.fromhex(signature)
+    s_plus_l = s[:32] + (int.from_bytes(s[32:], "little") + ED_L).to_bytes(32, "little")
+    expect("Ed25519 S + L (a non-canonical S)", ed25519_verify(a, m, s_plus_l), False)
+    # y = p is a second spelling of y = 0, which is a point; only the encoding
+    # is non-canonical.
+    expect("Ed25519 an R with y = p", ed25519_verify(a, m, ED_P.to_bytes(32, "little") + s[32:]), False)
+    expect("Ed25519 a key with y = p", ed25519_verify(ED_P.to_bytes(32, "little"), m, s), False)
+    # Each strictness rule against a signature that verifies but for that rule:
+    # with s = 0 and the identity as key, [S]B − [k]A is the identity, whose
+    # canonical encoding is 01 00…; a second spelling of a point is refused
+    # only by the rule under test.
+    identity = (1).to_bytes(32, "little")
+    zero_s = bytes(32)
+    expect("Ed25519 the identity key with the identity R verifies", ed25519_verify(identity, m, identity + zero_s), True)
+    noncanonical = (ED_P + 1).to_bytes(32, "little")
+    expect("Ed25519 a key spelled y = p + 1", ed25519_verify(noncanonical, m, identity + zero_s), False)
+    negative_zero = ((1 << 255) | 1).to_bytes(32, "little")
+    expect("Ed25519 a key with x = 0 and the sign bit set", ed25519_verify(negative_zero, m, identity + zero_s), False)
+    expect("Ed25519 an R spelled y = p + 1", ed25519_verify(identity, m, noncanonical + zero_s), False)
+    expect("Ed25519 a 31-byte key", ed25519_verify(a[:31], m, s), False)
+    expect("Ed25519 a 63-byte signature", ed25519_verify(a, m, s[:63]), False)
+    expect("Ed25519 a 65-byte signature", ed25519_verify(a, m, s + b"\x00"), False)
+
+    rounds = 20
+    started = time.perf_counter()
+    for _ in range(rounds):
+        ed25519_verify(a, m, s)
+    elapsed = (time.perf_counter() - started) / rounds
+    print(f"     Ed25519: {1 / elapsed:.0f} verifications per second ({elapsed * 1000:.1f} ms each)")
+    return failures
+
+
+def _signed_cases(directory: str) -> int:
+    """Record signatures over the signed reference export beside the unsigned
+    one, under the keys published with it: clean, then damaged one way per
+    rule. Only damage made without signing — this reader never signs."""
+    import copy
+
+    try:
+        with open(os.path.join(directory, "export.signed.jsonl"), encoding="utf-8") as handle:
+            signed = handle.readlines()
+        with open(os.path.join(directory, "keys.txt"), encoding="utf-8") as handle:
+            flags = handle.read().split()
+    except OSError as error:
+        print(f"MISS the signed reference artifacts: {error}")
+        return 1
+    keys = {}
+    for flag, value in zip(flags[::2], flags[1::2]):
+        if flag == "--key":
+            key = parse_key(value)
+            if isinstance(key, str):
+                print(f"MISS the published record key: {key}")
+                return 1
+            keys[key[0]] = key[1]
+
+    failures = 0
+    clean = verify(signed, keys=keys)
+    records = sum(1 for line in signed if '"raw"' in line)
+    if clean.findings or clean.signatures != records or records == 0:
+        print(f"MISS the signed reference export: {clean.signatures} of {records} "
+              f"signatures verified; {clean.findings}")
+        return 1
+    print(f"ok   the signed reference export: {clean.signatures} record signatures verified")
+    if not any("record signatures" in n for n in verify(signed).unchecked):
+        print("MISS no --key: nothing said record signatures were not checked")
+        failures += 1
+
+    parsed = [json.loads(line) for line in signed if line.strip()]
+    at = {line["seq"]: i for i, line in enumerate(parsed) if "raw" in line}
+    run = json.loads(parsed[at[2]]["raw"])["run"]
+
+    def damaged(seq: int, change) -> list[dict]:
+        lines = copy.deepcopy(parsed)
+        change(lines[at[seq]], lines)
+        return lines
+
+    def flip(line: dict, _lines: list[dict]) -> None:
+        raw = bytearray(bytes.fromhex(line["signature"]["signature"]))
+        raw[10] ^= 1
+        line["signature"]["signature"] = raw.hex()
+
+    def swap(line: dict, lines: list[dict]) -> None:
+        other = lines[at[2]]
+        line["signature"], other["signature"] = other["signature"], line["signature"]
+
+    def strip(line: dict, _lines: list[dict]) -> None:
+        line["signature"] = None
+
+    def rename(line: dict, _lines: list[dict]) -> None:
+        line["signature"]["key_id"] = "golden-nobody"
+
+    def plus_l(line: dict, _lines: list[dict]) -> None:
+        raw = bytes.fromhex(line["signature"]["signature"])
+        s = int.from_bytes(raw[32:], "little") + ED_L
+        line["signature"]["signature"] = (raw[:32] + s.to_bytes(32, "little")).hex()
+
+    for name, seq, change in [
+        ("a record signature with one byte flipped", 2, flip),
+        ("two records' signatures swapped", 1, swap),
+        ("a record signature set to null under a key", 2, strip),
+        ("a record signature under a key id nobody supplied", 2, rename),
+        ("a record signature with S + L in place of S", 2, plus_l),
+    ]:
+        report = verify([json.dumps(line) for line in damaged(seq, change)], keys=keys)
+        named = f"run {run}: record {seq}'s signature"
+        if any(named in finding for finding in report.findings):
+            print(f"ok   {name}")
+        else:
+            print(f"MISS {name}: nothing named {named!r}; got {report.findings}")
+            failures += 1
+    failures += _cosigned_cases(directory, signed, flags)
+    failures += _graded_cases(directory, clean, flags)
+    return failures
+
+
+def _flag_values(flags: list[str], wanted: str) -> list[str]:
+    return [value for flag, value in zip(flags[::2], flags[1::2]) if flag == wanted]
+
+
+# Cosignature lines the published golden witness key signed over the reference
+# note body at time 0 and at time 2^63 — times the format refuses — so the
+# self-test can show each time rule refusing a signature that otherwise verifies.
+BOUND_AT_ZERO = "3mBVAwAAAAAAAAAACbeOg0Ihk7uDP6nWr3x0Fq4xPbKigtF45xaQvqh+9w2/Mgbvt2BWrzesrDKLorzMHAWFQwowQpx14aJKVw7BCQ=="
+BOUND_PAST_LARGEST = "3mBVA4AAAAAAAAAA8tBzxb5/ug+c9kN9QsJorbfTj2TOYnJFbqoh50LsB8kJb96oRSTqS1nVJkuGBnU646+6p0VDIS0m70VibqBBDA=="
+
+
+def _cosigned_cases(directory: str, signed: list[str], flags: list[str]) -> int:
+    """Cosignatures and freshness over the cosigned reference note, under the
+    witness key published with it: clean, then each way a line stops being a
+    cosignature, then the age rule against a fixed clock."""
+    path = os.path.join(directory, "checkpoint.cosigned.note")
+    try:
+        with open(path, encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except OSError as error:
+        print(f"MISS the cosigned reference note: {error}")
+        return 1
+    witnesses = {}
+    for value in _flag_values(flags, "--witness-key"):
+        key = parse_witness_key(value)
+        if isinstance(key, str):
+            print(f"MISS the published witness key: {key}")
+            return 1
+        witnesses.update([witness_entry(*key)])
+
+    def checked(note: str, **extra) -> Report | str:
+        anchor = parse_note(path, note)
+        if isinstance(anchor, str):
+            return anchor
+        return verify(signed, [anchor], witnesses=witnesses, **extra)
+
+    failures = 0
+    report = checked(text)
+    if isinstance(report, str) or report.findings or not any(
+        "is cosigned by" in line for line in report.anchors
+    ):
+        print(f"MISS the cosigned reference note: {report}")
+        return 1
+    print("ok   the cosigned reference note names its witness")
+    reference = parse_note(path, text)
+    body, (name, clean) = reference.body.decode("utf-8")[:-1], reference.lines[0]
+    at = int.from_bytes(clean[4:12], "big")
+
+    def note(body: str, name: str, decoded: bytes) -> str:
+        return f"{body}\n\n— {name} {base64.b64encode(decoded).decode('ascii')}\n"
+
+    def changed(index: slice, value: bytes) -> bytes:
+        decoded = bytearray(clean)
+        decoded[index] = value
+        return bytes(decoded)
+
+    for case, damaged in [
+        ("a cosignature byte flipped", note(body, name, changed(slice(22, 23), bytes([clean[22] ^ 1])))),
+        ("the payload's timestamp edited", note(body, name, changed(slice(11, 12), bytes([clean[11] ^ 1])))),
+        ("a note body line edited", note(body.replace("agentplane\n", "agentplanf\n", 1), name, clean)),
+        ("the key id changed with the name kept", note(body, name, changed(slice(0, 1), bytes([clean[0] ^ 1])))),
+        ("the name changed with the key id kept", note(body, name[:-1] + "z", clean)),
+        ("a cosignature payload of 71 bytes", note(body, name, clean[:-1])),
+        ("a zero cosignature timestamp", note(body, name, changed(slice(4, 12), bytes(8)))),
+    ]:
+        report = checked(damaged)
+        if not isinstance(report, str) and any("is not cosigned" in a for a in report.anchors) and not any(
+            "is cosigned by" in a for a in report.anchors
+        ):
+            print(f"ok   {case}")
+        else:
+            print(f"MISS {case}: the line was honoured; got {report if isinstance(report, str) else report.anchors}")
+            failures += 1
+
+    # Lines the published witness key genuinely signed, over the reference body,
+    # at the two times the format refuses: each verifies but for its time rule.
+    signed_body = (body + "\n").encode("utf-8")
+    for case, encoded, expected in [
+        ("a signed cosignature at time 0", BOUND_AT_ZERO, "the timestamp is 0"),
+        ("a signed cosignature at time 2^63", BOUND_PAST_LARGEST, "above 2^63-1"),
+    ]:
+        refusal = cosignature_time(name, base64.b64decode(encoded), signed_body, witnesses)
+        if isinstance(refusal, str) and expected in refusal:
+            print(f"ok   {case}")
+        else:
+            print(f"MISS {case}: got {refusal!r}, expected {expected!r}")
+            failures += 1
+
+    for case, now, expected in [
+        ("a witness older than the maximum age", at + 120, "s old"),
+        ("a witness ahead of the reader's clock", at - 120, "s ahead"),
+    ]:
+        report = checked(text, max_age=60, now=now)
+        if not isinstance(report, str) and any(name in s and expected in s for s in report.stale):
+            print(f"ok   {case}")
+        else:
+            print(f"MISS {case}: nothing reported {expected!r}")
+            failures += 1
+    report = checked(text, max_age=60, now=at + 30)
+    if isinstance(report, str) or report.stale:
+        print(f"MISS a witness within the maximum age: {report if isinstance(report, str) else report.stale}")
+        failures += 1
+    else:
+        print("ok   a witness within the maximum age")
+    unverified = note(body, name, changed(slice(22, 23), bytes([clean[22] ^ 1])))
+    report = checked(unverified, max_age=60, now=at + 120)
+    if not isinstance(report, str) and not report.stale and any(
+        "no anchor carries a verified" in n for n in report.unchecked
+    ):
+        print("ok   a time whose cosignature does not verify is not judged")
+    else:
+        print("MISS a time whose cosignature does not verify was judged")
+        failures += 1
+    return failures
+
+
+def _graded_cases(directory: str, clean: Report, flags: list[str]) -> int:
+    """Grader-verdict signatures over the signed reference sidecar, under the
+    grader key published with it: clean, then damage made without signing."""
+    try:
+        with open(os.path.join(directory, "export.grader-verdict.json"), encoding="utf-8") as handle:
+            sidecar = json.load(handle)
+    except (OSError, ValueError) as error:
+        print(f"MISS the signed reference sidecar: {error}")
+        return 1
+    graders = {}
+    for value in _flag_values(flags, "--grader-key"):
+        key = parse_key(value)
+        if isinstance(key, str):
+            print(f"MISS the published grader key: {key}")
+            return 1
+        graders[key[0]] = key[1]
+
+    failures = 0
+    component, reason = check_sidecar(json.dumps(sidecar), clean, graders)
+    if component is None and "signed by grader key" in reason:
+        print("ok   the signed reference sidecar holds under its grader key")
+    else:
+        print(f"MISS the signed reference sidecar: {component!r} ({reason})")
+        failures += 1
+    component, reason = check_sidecar(json.dumps(sidecar), clean)
+    if component is None and "not checked" in reason:
+        print("ok   no --grader-key: the sidecar's signature is said to be not checked")
+    else:
+        print(f"MISS no --grader-key: {component!r} ({reason})")
+        failures += 1
+    unsigned = {k: v for k, v in sidecar.items() if k != "signature"}
+    for case, damaged in [
+        ("a signed sidecar's content swapped", dict(sidecar, content="ZmFpbA==")),
+        ("a sidecar's signature removed under a grader key", unsigned),
+    ]:
+        component, reason = check_sidecar(json.dumps(damaged), clean, graders)
+        if component == "signature":
+            print(f"ok   {case}")
+        else:
+            print(f"MISS {case}: expected 'signature', got {component!r} ({reason})")
+            failures += 1
+    return failures
+
+
+def self_test(lines: list[str], directory: str = ".") -> int:
+    import copy
+
     clean = verify(lines)
     if clean.findings:
         print("the reference file does not verify, so nothing below means anything:")
@@ -827,6 +1840,20 @@ def self_test(lines: list[str]) -> int:
         else:
             print(f"MISS {name}: nothing said it passed over {expected!r}")
             failures += 1
+    older = verify([json.dumps(line) for line in _older_shape(parsed)])
+    if older.findings:
+        print(f"MISS a record at an older shape: reported {older.findings}")
+        failures += 1
+    else:
+        print("ok   a record at an older shape verifies by its hash")
+    foreign = copy.deepcopy(parsed)
+    foreign[0]["canon"] = 999
+    report = verify([json.dumps(line) for line in foreign])
+    if report.findings or report.unverifiable is None:
+        print(f"MISS an unknown canon: {report.findings or 'nothing said it was unverifiable'}")
+        failures += 1
+    else:
+        print("ok   an unknown canon is unverifiable, not damage")
     for name, anchor, expected in _anchored(parsed):
         report = verify(lines, [anchor])
         if any(expected in finding for finding in report.findings):
@@ -850,8 +1877,148 @@ def self_test(lines: list[str]) -> int:
     else:
         print("ok   an anchor the file matches, whole and as a prefix")
 
+    # Grader-verdict sidecars, built over the reference file's first run.
+    run, block = next(iter(clean.blocks.items()))
+    hashes = block["hashes"]
+    first, last = min(hashes), max(hashes)
+    base = {
+        "kind": SIDECAR_KIND,
+        "version": SIDECAR_VERSION,
+        "run": run,
+        "last_seq": first,
+        "last_hash": hashes[first],
+        "open": True,
+        "content": "cGFzcw==",
+    }
+    sealed = dict(base, last_seq=last, last_hash=hashes[last], open=not block["sealed"])
+    for name, sidecar, expected in [
+        ("a sidecar over a prefix", base, None),
+        ("a sidecar over the whole run", sealed, None),
+        ("a sidecar over an edited prefix", dict(base, last_hash="00" * 32), "last_hash"),
+        ("a sidecar past the last record", dict(base, last_seq=last + 1), "last_seq"),
+        ("a prefix claimed sealed", dict(base, open=False), "open"),
+        ("a sidecar naming no run here", dict(base, run="run_00000000000000000000000000"), "run"),
+        ("a sidecar with an unknown member", dict(base, grade="A"), "format"),
+        ("a sidecar whose content is not base64", dict(base, content="!"), "format"),
+    ]:
+        component, reason = check_sidecar(json.dumps(sidecar), clean)
+        if component == expected:
+            print(f"ok   {name}")
+        else:
+            print(f"MISS {name}: expected {expected!r}, got {component!r} ({reason})")
+            failures += 1
+    broken = copy.deepcopy(parsed)
+    for line in broken:
+        if line.get("kind") not in FRAMING and line.get("raw") and json.loads(line["raw"]).get("run") == run:
+            line["hash"] = "00" * 32
+            break
+    component, _ = check_sidecar(json.dumps(base), verify([json.dumps(line) for line in broken]))
+    if component == "soundness":
+        print("ok   a sidecar over a run that does not verify")
+    else:
+        print(f"MISS a sidecar over a run that does not verify: got {component!r}")
+        failures += 1
+
+    failures += _ed25519_cases()
+    failures += _signed_cases(directory)
+
     print(f"{failures} case(s) not reported" if failures else "every case reported")
     return 1 if failures else 0
+
+
+# ── Grader-verdict sidecars ────────────────────────────────────────────────
+SIDECAR_KIND = "agentplane.grader-verdict"
+SIDECAR_VERSION = 1
+SIDECAR_MEMBERS = {"kind", "version", "run", "last_seq", "last_hash", "open", "content", "signature"}
+
+
+GRADER_DOMAIN = b"io.github.hupe1980.agentplane/grader-verdict/v1"
+
+
+def sidecar_signing_input(sidecar: dict) -> bytes:
+    """SHA-256(domain ‖ 0x00 ‖ SHA-256(canonical(sidecar without signature)))."""
+    unsigned = {k: v for k, v in sidecar.items() if k != "signature"}
+    return sha256(GRADER_DOMAIN + b"\x00" + sha256(canonical(unsigned).encode("utf-8")))
+
+
+def check_sidecar(
+    raw: str, report: Report, graders: dict[str, bytes] | None = None
+) -> tuple[str | None, str]:
+    """`(component, reason)`: the part of the sidecar that does not hold, or
+    `(None, what it binds)`. With grader keys, an unsigned sidecar or one whose
+    signature does not verify under the key its `key_id` names is refused
+    naming `signature`; without, the signature is said not to be checked."""
+    try:
+        sidecar = json.loads(raw)
+    except json.JSONDecodeError as error:
+        return "format", f"not JSON: {error}"
+    if not isinstance(sidecar, dict):
+        return "format", "not a JSON object"
+    unknown = sorted(set(sidecar) - SIDECAR_MEMBERS)
+    if unknown:
+        return "format", f"carries {', '.join(unknown)}, which the format does not define"
+    if sidecar.get("kind") != SIDECAR_KIND:
+        return "format", f"kind is {sidecar.get('kind')!r}, not {SIDECAR_KIND!r}"
+    if not same(sidecar.get("version"), SIDECAR_VERSION):
+        return "format", f"version {sidecar.get('version')!r} is not {SIDECAR_VERSION}"
+    run, last_seq, last_hash, still_open = (
+        sidecar.get("run"),
+        sidecar.get("last_seq"),
+        sidecar.get("last_hash"),
+        sidecar.get("open"),
+    )
+    content = sidecar.get("content")
+    if (
+        not isinstance(run, str)
+        or type(last_seq) is not int
+        or not isinstance(last_hash, str)
+        or type(still_open) is not bool
+        or not isinstance(content, str)
+    ):
+        return "format", "run, last_seq, last_hash, open or content has the wrong type"
+    try:
+        decoded = base64.b64decode(content, validate=True)
+    except ValueError:
+        return "format", "content is not base64"
+    if base64.b64encode(decoded).decode("ascii") != content:
+        return "format", "content is not canonical base64"
+    if "signature" in sidecar and not isinstance(sidecar["signature"], dict):
+        return "format", "signature is not an object"
+
+    block = report.blocks.get(run)
+    if block is None:
+        return "run", f"the export carries no run {run}"
+    # A finding about this run, or one about the file as a whole, means the
+    # prefix is not known to be what was written.
+    if any(f"run {run}" in finding or not finding.startswith("run ") for finding in report.findings):
+        return "soundness", f"run {run} does not verify in this export, so the binding binds nothing"
+    hashes = block["hashes"]
+    if last_seq not in hashes:
+        return "last_seq", f"run {run} has no record at seq {last_seq}"
+    if hashes[last_seq] != last_hash.lower():
+        return "last_hash", f"the record at seq {last_seq} of run {run} is not the one the verdict was bound to"
+    last = max(hashes) if hashes else 0
+    if not still_open and not (block["sealed"] and last == last_seq):
+        return "open", f"the sidecar claims run {run} sealed at seq {last_seq}, and the export does not"
+    binds = f"binds records 1..={last_seq} of run {run} ({last - last_seq} record(s) past it)"
+    if not graders:
+        return None, (
+            f"{binds}; no --grader-key was given, so who signed the verdict is not checked"
+        )
+    signed = sidecar.get("signature")
+    if signed is None:
+        return "signature", "the sidecar is unsigned and a grader key was supplied"
+    key_id, encoded = signed.get("key_id"), signed.get("signature")
+    signature = signature_bytes(encoded) or b""
+    public = graders.get(key_id) if isinstance(key_id, str) else None
+    if public is None:
+        return "signature", f"the signature is under grader key {key_id!r}, which was not supplied"
+    if not ed25519_verify(public, sidecar_signing_input(sidecar), signature):
+        return "signature", f"the signature does not verify under grader key {key_id!r}"
+    return None, (
+        f"{binds}, signed by grader key {key_id!r} — not what the grader saw, and not "
+        "whether the verdict is right"
+    )
 
 
 def parse_anchor(spec: str) -> Anchor | str:
@@ -860,14 +2027,18 @@ def parse_anchor(spec: str) -> Anchor | str:
     A bare root is refused: a root without its size names no tree, and reading
     it as the file's own size would hold the file to a claim nobody made.
     """
-    import os
-
     if os.path.isfile(spec):
         try:
-            with open(spec, encoding="utf-8") as handle:
-                value = json.load(handle)
+            with open(spec, encoding="utf-8", newline="") as handle:
+                text = handle.read()
+        except (OSError, ValueError) as error:
+            return f"{spec}: not a checkpoint file ({error})"
+        if not text.lstrip().startswith("{"):
+            return parse_note(spec, text)
+        try:
+            value = json.loads(text)
             origin, size, root = value.get("origin"), value["size"], value["root"]
-        except (OSError, ValueError, KeyError, AttributeError) as error:
+        except (ValueError, KeyError, AttributeError) as error:
             return f"{spec}: not a checkpoint file ({error})"
     else:
         parts = spec.rsplit(":", 2)
@@ -884,7 +2055,130 @@ def parse_anchor(spec: str) -> Anchor | str:
         return f"{spec!r}: the size is not an integer or the root is not hex"
     if size < 0 or len(digest) != 32:
         return f"{spec!r}: a size is non-negative and a root is 32 bytes"
-    return Anchor(size, digest, origin)
+    anchor = Anchor(size, digest, origin)
+    anchor.source = spec
+    return anchor
+
+
+SIZE_LINE = re.compile(r"0|[1-9][0-9]*")
+
+
+# What `signed-note` and the Rust reader refuse in a body and in a key name:
+# a control character other than a body's newlines, and — in a name — any
+# whitespace or an em dash, which the signature line uses as structure. The
+# whitespace set is Unicode's White_Space property, which Rust's
+# `char::is_whitespace` tests; Python's `str.isspace` is a different set.
+EM_DASH = "\u2014"
+UNICODE_WHITESPACE = frozenset(
+    "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def _is_control(c: str) -> bool:
+    """Unicode general category Cc, which Rust's `char::is_control` tests."""
+    return ord(c) < 0x20 or 0x7F <= ord(c) <= 0x9F
+
+
+def note_text_refusal(text: str) -> str | None:
+    """Why a note body is not one, or None: empty, no trailing newline, a blank
+    line inside it, or a control character other than newline."""
+    if not text:
+        return "the body is empty"
+    if not text.endswith("\n"):
+        return "the body does not end in a newline"
+    if "\n\n" in text.rstrip("\n"):
+        return "the body contains a blank line"
+    for c in text:
+        if c != "\n" and _is_control(c):
+            return f"the body contains the control character {ord(c):#04x}"
+    return None
+
+
+def note_name_refusal(name: str) -> str | None:
+    """Why a key name is not one, or None: empty, or carrying whitespace, a
+    control character or an em dash."""
+    if not name:
+        return "a key name is empty"
+    for c in name:
+        if c in UNICODE_WHITESPACE or _is_control(c) or c == EM_DASH:
+            return f"a key name contains {c!r}"
+    return None
+
+
+def parse_note(spec: str, text: str) -> Anchor | str:
+    """A cosigned checkpoint: the checkpoint note body, one blank line, then one
+    `— NAME BASE64` line per signature (the Checkpoint and Cosignature sections)."""
+    body, blank, signatures = text.partition("\n\n")
+    if not blank or not signatures.endswith("\n"):
+        return f"{spec}: not a signed note — a body, a blank line, then signature lines"
+    body += "\n"
+    refusal = note_text_refusal(body)
+    if refusal is not None:
+        return f"{spec}: not a signed note — {refusal}"
+    head = body.split("\n")
+    if len(head) < 4 or not head[0] or not SIZE_LINE.fullmatch(head[1]):
+        return f"{spec}: the note body is not origin, canonical decimal size, root"
+    root = b64_canonical(head[2]) or b""
+    if len(root) != 32:
+        return f"{spec}: the note's root is not 32 bytes of canonical base64"
+    anchor = Anchor(int(head[1]), root, head[0])
+    anchor.source = spec
+    anchor.body = body.encode("utf-8")
+    for line in signatures[:-1].split("\n"):
+        name, _, encoded = line.removeprefix(EM_DASH + " ").partition(" ")
+        decoded = b64_canonical(encoded) or b""
+        if not line.startswith(EM_DASH + " ") or len(decoded) < 5:
+            return f"{spec}: {line!r} is not a signature line"
+        refusal = note_name_refusal(name)
+        if refusal is not None:
+            return f"{spec}: {line!r} is not a signature line — {refusal}"
+        anchor.lines.append((name, decoded))
+    return anchor
+
+
+def key_refusal(public: bytes) -> str | None:
+    """Why 32 bytes are not an Ed25519 public key this reader trusts, or None:
+    not the canonical encoding of a curve point, or a point of small order — a
+    weak key, under which a signature can verify without anyone's secret."""
+    point = _ed_decode(public)
+    if point is None:
+        return "not the canonical encoding of an Ed25519 curve point"
+    x, y, z, _ = _ed_mul(8, point)
+    if x == 0 and y == z:
+        return "a small-order (weak) Ed25519 key, which proves no signer"
+    return None
+
+
+def parse_witness_key(spec: str | None) -> tuple[str, bytes] | str:
+    """`NAME=BASE64` — a witness name and its 32-byte Ed25519 public key."""
+    if spec is None or "=" not in spec:
+        return f"--witness-key takes NAME=<base64 Ed25519 public key>, got {spec!r}"
+    name, encoded = spec.split("=", 1)
+    public = b64_canonical(encoded)
+    if public is None:
+        return f"--witness-key {name}: not canonical base64"
+    if not name or len(public) != 32:
+        return f"--witness-key {name}: an Ed25519 public key is 32 bytes, this is {len(public)}"
+    refusal = key_refusal(public)
+    if refusal is not None:
+        return f"--witness-key {name}: {refusal}"
+    return name, public
+
+
+def parse_key(spec: str | None) -> tuple[str, bytes] | str:
+    """`KEY_ID=HEX` — a key id and a 32-byte Ed25519 public key — or why not.
+    The id ends at the first `=`, as `agentplane` reads it."""
+    if spec is None or "=" not in spec:
+        return f"--key takes KEY_ID=<64 hex characters>, got {spec!r}"
+    key_id, encoded = spec.split("=", 1)
+    if not key_id or not KEY_HEX.fullmatch(encoded):
+        return f"--key {key_id}: an Ed25519 public key is 64 hex characters"
+    public = bytes.fromhex(encoded)
+    refusal = key_refusal(public)
+    if refusal is not None:
+        return f"--key {key_id}: {refusal}"
+    return key_id, public
 
 
 def main(argv: list[str]) -> int:
@@ -893,29 +2187,74 @@ def main(argv: list[str]) -> int:
             return canon_check(argv[1])
         except OSError as error:
             print(f"cannot read {argv[1]}: {error}", file=sys.stderr)
-            return 2
+            return 4
     if len(argv) == 3 and argv[2] == "--self-test":
         try:
             with open(argv[1], encoding="utf-8") as handle:
-                return self_test(handle.readlines())
+                return self_test(handle.readlines(), os.path.dirname(argv[1]) or ".")
         except OSError as error:
             print(f"cannot read {argv[1]}: {error}", file=sys.stderr)
-            return 2
+            return 4
     if len(argv) < 2 or argv[1].startswith("-"):
         print(
-            f"usage: {argv[0]} <export.jsonl> [SIZE:ROOT | ORIGIN:SIZE:ROOT | checkpoint.json]…\n"
+            f"usage: {argv[0]} <export.jsonl> [SIZE:ROOT | ORIGIN:SIZE:ROOT | checkpoint.json]… "
+            f"[--grader-verdict FILE]… [--key KEY_ID=HEX]…\n"
             f"       {argv[0]} <export.jsonl> --self-test\n"
             f"       {argv[0]} <records.jsonl> --canon-check",
             file=sys.stderr,
         )
         print(
             "  each checkpoint is one from outside the file — one an earlier audit\n"
-            "  printed, or one a witness cosigned. Without one, deletion is unchecked.",
+            "  printed, or one a witness cosigned. Without one, deletion is unchecked.\n"
+            "  each --key is a record-signing Ed25519 public key, as 64 hex characters,\n"
+            "  under the key id its records name. Without one, signatures are unchecked.",
             file=sys.stderr,
         )
         return 2
     anchors = []
-    for spec in argv[2:]:
+    sidecars: list[str] = []
+    keys: dict[str, bytes] = {}
+    witnesses: Witnesses = {}
+    graders: dict[str, bytes] = {}
+    max_age: int | None = None
+    now: int | None = None
+    specs = iter(argv[2:])
+    for spec in specs:
+        if spec in ("--key", "--grader-key"):
+            key = parse_key(next(specs, None))
+            if isinstance(key, str):
+                print(key.replace("--key", spec), file=sys.stderr)
+                return 2
+            (keys if spec == "--key" else graders)[key[0]] = key[1]
+            continue
+        if spec == "--witness-key":
+            witness = parse_witness_key(next(specs, None))
+            if isinstance(witness, str):
+                print(witness, file=sys.stderr)
+                return 2
+            witnesses.update([witness_entry(*witness)])
+            continue
+        if spec == "--max-checkpoint-age":
+            value = next(specs, None)
+            if value is None or not SIZE_LINE.fullmatch(value):
+                print(f"--max-checkpoint-age takes whole seconds, got {value!r}", file=sys.stderr)
+                return 2
+            max_age = int(value)
+            continue
+        if spec == "--now":
+            value = next(specs, None)
+            if value is None or not is_rfc3339(value):
+                print(f"--now takes an RFC 3339 instant, got {value!r}", file=sys.stderr)
+                return 2
+            now = int(datetime.datetime.fromisoformat(value.upper().replace("Z", "+00:00")).timestamp())
+            continue
+        if spec == "--grader-verdict":
+            path = next(specs, None)
+            if path is None:
+                print("--grader-verdict needs a file", file=sys.stderr)
+                return 2
+            sidecars.append(path)
+            continue
         anchor = parse_anchor(spec)
         if isinstance(anchor, str):
             print(anchor, file=sys.stderr)
@@ -926,18 +2265,46 @@ def main(argv: list[str]) -> int:
             lines = handle.readlines()
     except OSError as error:
         print(f"cannot read {argv[1]}: {error}", file=sys.stderr)
+        return 4
+
+    if graders and not sidecars:
+        print("--grader-key was given with no --grader-verdict to use it against", file=sys.stderr)
+        return 2
+    if witnesses and not any(anchor.body is not None for anchor in anchors):
+        print("--witness-key was given with no signed-note anchor to use it against", file=sys.stderr)
         return 2
 
-    report = verify(lines, anchors)
-    for finding in report.findings:
+    report = verify(lines, anchors, keys, witnesses, max_age, now)
+    for finding in report.findings + report.stale:
         print(f"finding: {finding}")
+    if report.unverifiable is not None and not report.findings:
+        print(f"unverifiable: {report.unverifiable}")
+        return 6
+    refused = 0
+    for path in sidecars:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = handle.read()
+        except OSError as error:
+            print(f"cannot read {path}: {error}", file=sys.stderr)
+            return 4
+        component, reason = check_sidecar(raw, report, graders)
+        if component is None:
+            print(f"grader verdict {path}: holds — {reason}")
+        else:
+            refused += 1
+            print(f"grader verdict {path}: refused ({component}) — {reason}")
+    if keys:
+        print(f"{report.signatures} record signatures verified")
+    for line in report.anchors:
+        print(f"anchor: {line}")
     for unchecked in report.unchecked:
         print(f"not checked: {unchecked}")
     print(
         f"{report.runs} runs, {report.records} records, {report.cases} cases, "
-        f"{len(report.findings)} findings"
+        f"{len(report.findings) + len(report.stale)} findings"
     )
-    return 1 if report.findings else 0
+    return 1 if report.findings or report.stale or refused else 0
 
 
 if __name__ == "__main__":

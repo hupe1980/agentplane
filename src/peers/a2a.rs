@@ -427,10 +427,11 @@ impl A2aClient {
         {
             return Err(PeerError::Refused {
                 peer: peer.clone(),
+                // The host, never the URL: a path or query can carry a
+                // credential, and this sentence reaches logs and records.
                 detail: format!(
-                    "the peer endpoint '{}' is not https — a bearer credential and the \
-                     run's payload must not cross the network in cleartext",
-                    self.endpoint.url
+                    "the peer endpoint on '{host}' is not https — a bearer credential and \
+                     the run's payload must not cross the network in cleartext"
                 ),
             });
         }

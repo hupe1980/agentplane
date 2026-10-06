@@ -119,7 +119,7 @@ at once and then waits for four:
 
 | On the signal | Waited for, under one grace period |
 | --- | --- |
-| Both listeners stop accepting | Requests already being served, including the runs a blocking `message/send` is awaiting |
+| Every listener stops accepting | Requests already being served, including the runs a blocking `message/send` is awaiting |
 | **Admission closes** — `Runtime::drain` | Runs this process put on a background task of its own |
 | | The sweep, the drill and push delivery, each finishing the tick it is in |
 | | Open subscriptions, which end at once rather than being waited out |
@@ -183,6 +183,47 @@ lifecycle:
 There is no readiness route to flip, for the reason there is no `/health` at
 all — see [the operator surface](#the-operator-surface). A draining instance
 closes its listeners, so any probe that connects already fails.
+
+## Deploying a plane {#deploying}
+
+Two artifacts run the same plane; both start from the files
+`agentplane init --serve` writes ([getting started](@/docs/getting-started.md#zero-to-governed)).
+
+**Compose** (`compose.yaml`, written beside the others) runs the `:full` image
+of the version that wrote it against Postgres. The plane starts once Postgres
+answers its health check, as the user that owns the 0600 token file — never
+root, which `init --serve` refuses — with a read-only root filesystem; the
+manifest and policy are mounted read-only and the token file as a compose
+secret, never an environment variable. Every port is published on the host's
+loopback only: A2A on `127.0.0.1:8080`, MCP on `127.0.0.1:8081`, the operator
+API on `127.0.0.1:9090`. To serve other machines, publish `8080` and `8081` on
+an address they reach, set `--url` to the public A2A endpoint, and add a
+`--mcp-allowed-host` line for every name callers use to reach the MCP port.
+Postgres requires a password `init --serve` generated (`postgres.password`,
+0600, read through `POSTGRES_PASSWORD_FILE`); the plane reads its connection
+string from `store.env` (0600) as `AGENTPLANE_STORE`, so no secret is on a
+command line. The network Postgres sits on is internal, but on Linux the host
+has an address on every bridge network, so the password — not the network — is
+what keeps a local process out.
+
+**The Helm chart** (`deploy/helm/agentplane/`, not published to a chart
+repository) takes the manifest and policy as `--set-file` values, the token file
+only as an existing Secret, and a Postgres connection string as an existing
+Secret too (`storeSecret.existingSecret`), read into the pod's environment
+rather than its args; a `store` value holding a password is refused. The pod
+runs non-root and read-only with every capability dropped; A2A and MCP share one
+Service and the operator listener has its own `ClusterIP` Service. Rendering
+fails for more than one replica without a Postgres store, since a redb file
+admits one writer, and the grace period is the drain plus ten seconds. With more
+than one replica the shared Service sets `sessionAffinity: ClientIP`, because a
+`2025-11-25` MCP session lives in the memory of the pod that opened it and any
+other pod answers it `404`; behind an ingress that hides client addresses,
+route on the `Mcp-Session-Id` header instead. A changed manifest or policy rolls
+the Deployment: the chart reconciles nothing, because an upgrade is a rollout.
+`serve` reads the token file and the store once, at start, and never reloads
+them: a rotated Secret rolls the pod on the next `helm upgrade` (the chart
+hashes both Secrets as the cluster holds them), and otherwise needs
+`kubectl rollout restart`.
 
 ## Two backends, one contract
 
@@ -378,7 +419,8 @@ budget on this hardware, not one run's. A single-node plane running agents that
 call models will never notice. A plane running many concurrent runs of cheap
 effects will, and that is the signal to move to `PostgreSQL`, which is also the
 answer for more than one instance. It is a flag, not a rewrite: every verb takes
-`--store postgres://…` beside `--tenant`, including `serve`.
+`--store postgres://…` beside `--tenant`, including `serve`, in a build with
+`postgres` → [which verb needs which feature](#cli-features).
 
 **Replay is not the same cost, by a wide margin.** It performs nothing and reads
 history back — 2000× faster on disk. That matters more than it looks: a
@@ -410,6 +452,7 @@ dead-lettering, and finally timers:
 | A task's window closed | The declared `on_expiry` is applied |
 | An event nobody claimed aged out | Dead-lettered with a reason |
 | A sleeping run's instant arrived | The run is woken; reported as `timers_fired` |
+| A run with no lease — a lift, a release, a break-glass, an observed session, a sweep's own — concluded but its seal died | The run is sealed; reported as `seals_finished`. Nothing it did is retried — `halt list` and `hold list` say what stands |
 | A wake was recorded but the resume died | Reported as `wake_failures`; the lease lapses and the recovery pass picks the run up on a later tick |
 | The log grew since the last anchored checkpoint | It is submitted to the deployment's witnesses; reported as `cosignatures`, `witness_shortfall` and `witness_integrity` |
 
@@ -460,7 +503,9 @@ one precise question: which leases expired while still naming an owner. That is
 the set of runs somebody was executing when their process stopped, and the
 sweep resumes each one: takeover bumps the epoch, the store fences the dead
 owner's next append, and replay reads completed effects back rather than
-redoing them. `cargo run --example recovered_run` walks the whole thing on two
+redoing them. A run whose last record is already its conclusion died between
+concluding and handing the lease back; the sweep finishes that — seals it or
+releases the lease — and never retries the work, whatever the outcome was. `cargo run --example recovered_run` walks the whole thing on two
 in-process instances: one dies mid-run, the other's sweep finds it by its
 lapsed lease and finishes it, no stage repeated.
 
@@ -848,6 +893,41 @@ truncated file is framed exactly like a complete one: raise `--limit`, narrow
 `--outcome`, or pass `--allow-partial` to write it anyway, which still exits
 `5`. See [exit statuses](#exit-statuses).
 
+### Disclosing one matter {#disclosing-one-matter}
+
+A request for one matter is answered with a **package**, not the whole export:
+
+```sh
+agentplane export --store ./journal.redb --case case_<ulid> \
+  --to "Supervisory authority, ref 2026-114" --actor dpo@example > matter.jsonl
+agentplane disclosures --store ./journal.redb --case case_<ulid>
+```
+
+The package carries the runs the case holds now (`--run` adds single runs), each
+sealed one with its inclusion path, and only the cases those runs belong to;
+[the format page](@/docs/format.md#package) has its shape and how both readers
+verify it. The recipient checks it against a checkpoint obtained from you some
+other way: at the package's size it is compared by root, at another size it is
+reported *not compared*. `restore`, `replay --strict --from`, `policy check`
+and `grants` refuse a package by name.
+
+Before a byte reaches the destination the disclosure is recorded — recipient,
+runs, sealed or not, checkpoint, package digest, actor — so a later
+[erasure](@/docs/erasure.md#a-disclosed-copy) names the copy. If the record
+cannot be written nothing is delivered. An unknown case or run, an `--output`
+that is a directory, or one whose directory does not exist exits `2` with
+nothing recorded. The package is staged as `.<name>.dsc_<ulid>.partial`
+beside `--output`, synced, and renamed into place once recorded; a process
+killed in between leaves that file, which nothing reads and you may delete.
+Once recorded the act stays recorded: a package written to a standard output
+that closes early is reported as recorded and not delivered.
+
+Each case travels as its whole block — state, deadlines, blob digests, hold
+reason, and the ids of every run it holds, including runs the package does not
+carry. A package proves the inclusion of what it carries, never that it carries
+everything the matter holds. The register is a row in the store, like a hold: `disclosures`
+lists it and says so.
+
 ### Re-deriving the policy verdicts {#policy-check}
 
 `policy check` reads an export and a policy bundle — the same `--bundle` loader
@@ -931,6 +1011,19 @@ observation the journal never recorded, and a model call made to explore an
 edit is a fresh `run`. A *resume* under a different declaration is still
 quarantined before anything replays.
 
+### One run's timeline {#history}
+
+`agentplane history <run> --store <file|postgres://…>` prints a run's journal
+in sequence order, one line per record: sequence, kind, step, and the
+record's payload. `--from <seq>` starts later. Every line passes through the
+escaping a reviewer's rendering uses, so a bidirectional override or an
+escape sequence in a recorded string is printed as `\u{…}` rather than
+reaching the terminal. `--json` prints each record as `GET
+/runs/{run}/history` serves it; it is machine output, and JSON escapes only
+U+0000–U+001F, so DEL, the C1 controls and the bidirectional and invisible
+characters print as they are — read the text form on a terminal. A run the
+store does not hold exits `1`, whatever `--from` names.
+
 ### The command line's exit statuses {#exit-statuses}
 
 One table for every verb, printed at the foot of `agentplane --help`, because a
@@ -939,11 +1032,12 @@ scheduler reads the status and nothing else:
 | Status | Means |
 |---|---|
 | `0` | Done, and the answer is yes. |
-| `1` | A finding or a negative answer: a failed run, an audit, verify or `policy check` finding, a strict replay that diverged, `attention` finding something, a `halt --lift` / `hold --lift` / `rearm` that found nothing standing, a `decide` approval of a proposal the terminal cannot show, an invalid manifest under `validate`. |
+| `1` | A finding or a negative answer: a failed run, an audit, verify, `drill` or `policy check` finding, a grant `grants` found unused, a strict replay that diverged, `attention` finding something, a `content check` a rule would refuse, a `halt --lift` / `hold --lift` / `rearm` that found nothing standing, a `decide` approval of a proposal the terminal cannot show or naming a `--digest` the task no longer holds, an invalid manifest under `validate`, a `history` of a run the store does not hold. |
 | `2` | Usage: the command as typed cannot be carried out — a flag, argument or input this binary refuses. `clap`'s own parse errors use it too. |
 | `3` | A `run` or a resuming `replay` stopped to wait, for a person, a timer or an event. A strict replay of a waiting run that reproduces the wait is verified, `0`. |
 | `4` | Operational: a store, a witness, the network or a file could not be used. |
-| `5` | Partial: `--limit` truncated what was read, `policy check` could evaluate nothing, or a strict replay met a run it could not replay (and none diverged). |
+| `5` | Partial: `--limit` truncated what was read — `audit`, `export`, `tasks`, `waiting`, `halt list --lifted` and `hold list --released`, each of which also prints `truncated` — `policy check` could evaluate nothing, `grants` met an incomplete export or calls it could not read, `subject` had its scan cut or met a run it could not read, or a strict replay met a run it could not replay (and none diverged). |
+| `6` | Unverifiable: `verify` or `restore` met an export under a `canon` this build does not implement — not damage, and not an outage; a build implementing that rule can read it. |
 
 A finding and an outage are different pages, which is the reason for the split.
 
@@ -955,6 +1049,24 @@ with `--json`; so does `policy check`, whose report is long enough that a
 person reads the summary and a pipeline reads the JSON. Everything else goes to
 stderr. `serve --log-format json` (`AGENTPLANE_LOG_FORMAT`) writes one JSON object per log line for a collector,
 and `agentplane --version` names the features the binary was built with.
+
+### Which verb needs which feature {#cli-features}
+
+`--features cli` builds every verb against a redb file, with every model
+provider and the fake one. What reaches further is one feature away, and a
+build without it refuses with exit `2` and names the flag to reinstall with.
+The `:full` image carries all of these; `:slim` carries only `cli`.
+
+| You run | Install with |
+|---|---|
+| any verb with `--store postgres://…` | `--features cli,postgres` |
+| `run --mcp …` | `--features cli,mcp-stdio` |
+| `run --peer …` | `--features cli,a2a` |
+| `serve`, and its `--operator-addr` | `--features cli,a2a-server,cedar` |
+| `serve --mcp-addr`, `init --serve` | `--features cli,a2a-server,cedar,mcp-server-http` |
+| `policy check` | `--features cli,cedar` |
+| `rearm` | a build with `push`, which `a2a-server` includes; the verb is absent otherwise |
+| `dev` | `--features dev`; no published image carries it, and the verb is absent otherwise |
 
 ### What no audit can answer: the runs that never started
 
@@ -1020,7 +1132,7 @@ from the grounds. Beside the report is an `anchor` object:
 | Field | Says |
 |---|---|
 | `obtained_from` | a witness's prefix, or a file |
-| `cosigned_by` | the witness keys whose signature over that checkpoint verified — empty for a file, which carries none to check |
+| `cosigned_by` | the witness keys whose signature over that checkpoint verified — for a file, those of a cosigned note checked under `--witness-key`; empty for any other file, which carries none to check |
 | `unreached` | witnesses asked that gave no anchor, and why |
 | `split_view` | witnesses that disagree, which fails the command |
 
@@ -1034,6 +1146,30 @@ different roots is the event witnessing exists to detect, and the one an
 operator auditing their own plane cannot find alone: every other check compares
 the store against something the store produced. Witnesses at *different* sizes
 are not a split view — they observed at different times.
+
+**How fresh the anchor is.** A witness signs a timestamp with every
+cosignature. `audit --max-checkpoint-age SECS` judges each witness key's latest
+signed time against the auditor's own clock: older than the bound — or ahead of
+it by more — is a finding; without the flag, freshness is listed as not
+checked, and `verify` never judges it. A gap bounds *when* records could have
+been cut without a witness noticing, not *whether* they were. A plane keeps the
+times fresh by declaring `serve --witness-submit URL --witness-key NAME=KEY
+--log-key NAME=PATH --witness-interval SECS`: the sweeper re-submits an
+unchanged checkpoint once the interval passes, an interval shorter than
+`--sweep-every` is refused, and one with no witness is refused at build. The
+second reader checks the same cosignatures on a note anchor under its own
+`--witness-key NAME=BASE64`, and judges freshness under `--max-checkpoint-age
+SECS` (with `--now RFC3339` for a fixed clock) by the same rule; a time whose
+cosignature did not verify is an unauthenticated number, and neither reader
+judges it.
+
+**A grader's verdict, bound to what it judged.** `agentplane bind <export>
+--run R [--last-seq N] --content FILE --out SIDECAR` writes an unsigned
+[sidecar](@/docs/format.md#grader-verdict) binding opaque verdict bytes to
+records `1..=N` of a run; the grader signs it with its own key.
+`verify --grader-verdict SIDECAR --grader-key ID=HEX` reports each one bound,
+refused or not checked, and a refused one fails the command. It proves which
+records the verdict names and who signed it — not what the grader saw.
 
 `restore` rebuilds a journal from an export and proves it by one comparison:
 **equal Merkle roots at equal size**. That is a far stronger statement than "the
@@ -1065,7 +1201,13 @@ its `hash` must cover its `raw` bytes and the chain before it, and its `v`
 must be the version this build writes. A file failing either is refused whole,
 with the store untouched — `append` re-derives every hash from what it is
 handed and stamps this build's version, so replaying such a line would rebuild
-a history the export never committed to.
+a history the export never committed to. A target that seals payloads as it
+writes (a journal wrapped by the keyring) is refused the same way: sealed
+payloads are restored as the ciphertext they are, so restore into the unwrapped
+store and open it with the ring. A failure after the first write — the store
+refusing a write, or a rebuilt hash missing the file's — leaves a partial store
+that a retry refuses as already holding the run: discard it and restore into a
+fresh one.
 
 It replays the ordinary `append` path rather than writing rows, and that is the
 safety argument: `append` maintains six derived indexes — case, exactly-once,
@@ -1632,27 +1774,33 @@ plan for.
 ### Serving it
 
 Embedders wire `Api` into their own process; the `agentplane` binary's `serve`
-verb does the same wiring from flags, hosting exactly one manifest per process.
+verb does the same wiring from flags, hosting one manifest or one room file per
+process.
 
-**Two listeners, because there are two audiences.** The peer surface binds to
-`--addr`; the operator surface this section documents is opt-in beside it on
-`--operator-addr`, so a network policy can treat *another agent calling in* and
-*a person deciding a task* differently rather than trusting one port with both.
+**A listener per audience.** The peer surface binds to `--addr`; the operator
+surface this section documents is opt-in beside it on `--operator-addr`, and the
+MCP surface agent frameworks call on `--mcp-addr`. A network policy can then
+treat *another agent calling in*, *a framework calling a tool* and *a person
+deciding a task* differently rather than trusting one port with all three.
 
 | Flag | Default | What it decides | Env |
 |---|---|---|---|
 | `--store` | **required** | Where the journal lives on disk. | `AGENTPLANE_STORE` |
 | `--addr` | `127.0.0.1:8080` | The peer surface. Loopback until you say otherwise. | `AGENTPLANE_ADDR` |
 | `--operator-addr` | off | The worklist, task decisions and `GET /runs?outcome=quarantined`, on their own listener. | `AGENTPLANE_OPERATOR_ADDR` |
+| `--mcp-addr` | off | Every agent in the file as MCP tools at `/mcp`, on its own listener — see [MCP, being served](@/docs/interop.md#mcp-being-served). | `AGENTPLANE_MCP_ADDR` |
+| `--mcp-allowed-host` | loopback | A `Host` the MCP listener answers. Required for a non-loopback `--mcp-addr`. Repeatable. | — |
+| `--mcp-allowed-origin` | none | A browser `Origin` the MCP listener accepts; any other present `Origin` is `403`. Repeatable. | — |
+| `--mcp-agent` | every agent | An agent, by `metadata.name`, to serve on `--mcp-addr`; the others are left off. Without it every agent is served and each must declare `spec.input`. Repeatable. | — |
 | `--policy` | **no default** | The Cedar policy set. No default, because a permissive engine and no engine are the same behaviour and only one of them looks governed. | `AGENTPLANE_POLICY` |
 | `--tokens` | **no default** | The bearer tokens this plane accepts, each optionally carrying the `scope` and `not_after` of the chain that caller's runs act under. A token under 32 bytes, or one published in this project's examples, is refused at load. | `AGENTPLANE_TOKENS` |
 | `--log-format` | `text` | `json` writes one JSON object per log line. | `AGENTPLANE_LOG_FORMAT` |
-| `--url` | none | Where callers reach this plane. Goes on the Agent Card, so it is the public URL rather than what you bind. | `AGENTPLANE_URL` |
+| `--url` | none | The A2A endpoint callers reach this plane at — `/a2a` under the public address. Goes on the Agent Card, so it is the public URL rather than what you bind; refused unless it ends in `/a2a`. | `AGENTPLANE_URL` |
 | `--sweep-every` | 30s | How often deadlines, task expiry, dead letters and due timers are swept. `0` runs the sweep from your own scheduler instead. | `AGENTPLANE_SWEEP_EVERY` |
 | `--drill-every` | off | How often the recovery rehearsal runs — see [disaster recovery](#disaster-recovery). | `AGENTPLANE_DRILL_EVERY` |
 | `--drain-secs` | 25s | Bounds the stop — see [stopping an instance](#stopping-an-instance). | `AGENTPLANE_DRAIN_SECS` |
 | `--mcp NAME=COMMAND` | none | An MCP server to run and wire under `NAME`. Repeatable. | — |
-| `--peer NAME=URL` | none | An A2A peer the manifest grants under `tool://NAME/…`; its token comes from `AGENTPLANE_PEER_TOKEN_<NAME>` (upper-cased, `.` and `-` as `_`) rather than the command line. Two names that meet in one variable — `a.b` and `a-b` — are refused at boot. Needs the `a2a` feature. | — |
+| `--peer NAME=URL` | none | An A2A peer the manifest grants under `tool://NAME/…`, called with the token in `AGENTPLANE_PEER_TOKEN_<NAME>` (`.` and `-` as `_`; two names sharing a variable are refused). The token names nobody → [peers](@/docs/interop.md#obtaining-the-credential). Needs `a2a`. | — |
 | `--push-host` | none | Permits A2A push notifications to that exact host. Repeatable. Without one, push is not wired and the Agent Card advertises it as absent rather than claiming a capability nothing serves. | — |
 
 The three repeatable flags take no environment variable; everything else does,
@@ -1675,6 +1823,7 @@ pub struct DecisionRequest {   // no `actor`. no `roles`.
     pub approved: bool,
     pub reason: String,
     pub amendment: Value,
+    pub digest: Option<Digest>,   // the task version decided on
 }
 ```
 
@@ -1781,7 +1930,10 @@ code, and cannot fall out of step with a surface added later.
 Budgets bound one run. They do not bound a tenant: a caller that can start runs
 can start a thousand, each perfectly within its own ceiling, and the compute and
 the model bill are somebody else's problem. `RuntimeBuilder::quota` sets a
-tenant's limits and points at the store that accounts them.
+tenant's limits and points at the store that accounts them. A plane built with
+`Runtime::builder_on` or `builder_with` already has the backend's quota store
+with no ceilings, so halts and rate ceilings hold without this call; `.quota`
+states the limits.
 
 ```rust
 .quota(store.clone() as Arc<dyn QuotaStore>, TenantQuota {
@@ -1859,7 +2011,10 @@ by the previous unlimited configuration.
 
 Settlement is crash-safe rather than best-effort. Before a pass can dispatch an
 effect, `QuotaPassStarted` records its period and whether it owns the admission
-slot. At the end, `QuotaStore::settle` writes an exact `(run, epoch)` receipt,
+slot. Admission writes it with the run's first records; a resume writes it with
+the first record the resume itself appends, so a resume that appends nothing —
+one reaching the conclusion the run already holds — leaves no marker, and a
+marker is never a run's last record. At the end, `QuotaStore::settle` writes an exact `(run, epoch)` receipt,
 accrues that pass's spend, reduces the run's hold by it (releasing the rest when
 the pass concludes the run), and releases its slot in one store transaction. A
 lost acknowledgement repeats the same receipt and charges nothing twice; a
@@ -1874,6 +2029,12 @@ the quota receipt is idempotent application. The protocol tolerates failure on
 either side of the call and converges after a transient outage. It cannot make
 progress through a permanent partition or survive independent destructive loss
 of one backend while claiming the other is complete.
+
+A plane with no quota store resumes a run only when none of its passes accrued
+spend to a period, and refuses one that did, since that spend would go unbilled.
+It cannot give back the concurrency slot of an admission whose process died
+mid-pass; the sweep of a plane with the quota store releases it once the run is
+sealed, and counts it in `SweepReport::slots_released`.
 
 `RuntimeBuilder` starts at `Budget::unlimited()`, so a Rust deployment that sets
 a tenant spend ceiling has to give its runs a ceiling and a per-call bound too —
@@ -1910,9 +2071,9 @@ record of everything that ever ran.
 ### A tool's rate ceiling {#rate-ceiling}
 
 A grant's [`rate_limit`](@/docs/manifest.md#rate-limit) is counted in the same
-quota store, per tenant per tool, so it needs one wired: a plane whose
-declarations state a ceiling and whose builder wired no quota store is refused
-at build. Each dispatch of a ceilinged tool costs one store transaction; an
+quota store, per tenant per tool, so it needs one wired: a plane built from
+the journal alone (`Runtime::builder`) whose declarations state a ceiling and
+that was given no quota store is refused at build. Each dispatch of a ceilinged tool costs one store transaction; an
 unceilinged tool pays nothing. An unreachable store refuses the call, as it
 refuses admission.
 
@@ -1949,16 +2110,21 @@ several agents is exactly what a multi-document manifest and
 | `HaltScope::Tenant` | everything this tenant would start | the plane is the incident |
 | `HaltScope::agent("payments-clerk")` | every revision of one declared name | *this agent is misbehaving and I do not yet know since when* |
 | `HaltScope::revision(digest)` | one exact reviewed revision | a bad deploy — a fix published as a new version runs while the broken one stays stopped |
-| `HaltScope::subject("alice")` | everything acting **for** one delegation subject, **including runs already in flight** | the incident is a *credential*, not a workload: a laptop lost, a service account that turned out to be shared, somebody who has left |
+| `HaltScope::subject("alice")` | everything acting **for** one principal, wherever it stands on a run's delegation chain, **including runs already in flight** | the incident is a *credential*, not a workload: a laptop lost, a service account that turned out to be shared, somebody who has left |
 
-The first three ask *what is running*; the last asks *who it runs for*. That
-subject is the chain the **run** was admitted under — on a served plane, the
-caller's, not the operator's — so withdrawing `alice` stops the work `alice`
-asked for and leaves everyone else's alone.
+The first three ask *what is running*; the last asks *who it runs for*. That is
+read from the chain the **run** was admitted under — on a served plane, the
+caller's, not the operator's — and matches any link on it: the person at the
+root, each workload it was delegated through, and the one acting. Authority
+flows down the chain, so withdrawing `alice` stops the work `alice` asked for,
+including what a service is doing on her behalf, and leaves everyone else's
+alone.
 
 **It is the only scope that reaches work already running, and it pauses.** A run
-under a withdrawn credential stops at its next step boundary as `withheld`; its
-completed work stands, and after the lift a `replay` continues it. It is not unwound —
+under a withdrawn credential stops at its next step boundary as `withheld` — or
+sooner, at its next call to a peer that is told who asked, which reads the
+halts before presenting a credential and drops any it holds for the withdrawn
+subject. Its completed work stands, and after the lift a `replay` continues it. It is not unwound —
 reversing correct work because a credential lapsed is a second incident. To
 reverse it, cancel it.
 
@@ -1970,11 +2136,15 @@ last word.
 agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' \
                  --reason "incident 42: looping" --actor ops-carol
 agentplane halt list --store ./journal.redb      # what is stopped right now
-agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --lift
+agentplane halt  --store ./journal.redb --scope 'agent:payments-clerk' --lift \
+                 --actor ops-dave
+agentplane halt list --store ./journal.redb --lifted   # who lifted what, newest first
 ```
 
 `--scope` takes `tenant`, `agent:<metadata.name>`, `revision:<manifest digest>`
-or `subject:<delegation subject>` — the forms `HaltScope::parse` accepts, and
+or `subject:<principal on the chain>` — which stops every run with that
+principal anywhere on its delegation chain: the person at the root, a workload
+they delegated through, or the one acting. Those are the forms `HaltScope::parse` accepts, and
 the refusal you get for a typo lists them.
 
 **`--actor` is required to throw one, and the row says it was *asserted*.** The
@@ -1987,10 +2157,21 @@ open the store. Both are legitimate — the second is how an incident is handled
 when the plane itself is the problem — and the row keeps them apart so a reader
 two years on is not left guessing which they are looking at.
 
-Lifting names nobody, because the row goes. What that costs is stated rather
-than papered over: **who lifted a stop is not retained.** Where the stop reached
-a run — the `subject:` scope, the one that does — the run's own journal holds
-both halves, with the operator from the halt on `AuthorityWithheld`.
+**A lift is recorded, and `--actor` is required for it too.** Before the row
+goes, the lift is written to the journal as the one `HaltLifted` record of a
+sealed run of its own, outcome `halt-lifted`: who lifted it and on what basis,
+when, and the whole stop it ended — scope, reason, who threw it and when. A lift
+that cannot be recorded does not happen. The record attests the instruction and
+the row as read, not that the removal succeeded; `halt list` is the answer to
+what is in force. Only the halt the record names is removed: one re-thrown
+between the read and the removal stays standing, and the lift fails naming the
+record's run, as it does when the removal itself fails (a `500` over the API).
+The answer's `removed` is `false` when another lift removed the row first.
+`halt list --lifted` (a page of `--limit`, default 100) and
+`GET /halts?state=lifted` read the lifts back, newest first, and the runs travel in an export like any other
+sealed run. Where the stop reached a run — the `subject:` scope, the one that
+does — the run's own journal also holds both halves, with the operator from the
+halt on `AuthorityWithheld`.
 
 Those commands open the store, and `redb` admits one writer **process** — so
 against the file an `agentplane serve` is holding they fail, saying so in those
@@ -2012,7 +2193,9 @@ agentplane halt --store "$DATABASE_URL" --tenant acme \
 Throwing the stop and lifting it are **separate capabilities** —
 `api:halt.place` and `api:halt.lift`. Granting somebody the power to stop the
 plane says nothing about who may start it again, and one grant covering both
-would make that distinction unwritable.
+would make that distinction unwritable. A lift over the API is recorded under
+the authenticated caller, and its answer names the lifter and the run holding
+the record; a lift at the terminal is recorded under `--actor`, as asserted.
 
 **A halt closes the door; it does not empty the room.** Runs already executing
 carry on, deliberately: cutting them mid-saga leaves reversals unrun and turns
@@ -2056,6 +2239,7 @@ happened is not an outcome of the item, and the next pass admits them again.
 `--reason` is required to halt and refused to lift: the next person to look will
 be somebody else, possibly at three in the morning, and *why* is the whole
 question, while a lift needs no justification because it restores the default.
+*Who* is asked of both.
 
 #### What a workload-scoped halt does not stop
 
@@ -2093,6 +2277,25 @@ whether a run id exists by comparing a `400` against a `404`.
 
 ### What the endpoints are for
 
+Each route's shape — its parameters, body, every status it can answer and the
+body of each, and the `api:` action it asks the policy — is in the
+[OpenAPI 3.1 document](/agentplane/openapi.json), which `agentplane openapi` also prints
+(a build with the `http` feature). It describes the operator API only: the A2A
+surface is described by its Agent Card and protocol, the MCP server by its tool
+listing. No operation takes a tenant; it comes from the credential. Every
+refusal is `{"error": "<sentence>"}`, including a body the API could not read.
+Every build serves every operation the document lists; a plane built without
+the store or feature an operation needs answers it `501` after the usual gate.
+The document is [outside the compatibility promise](@/docs/status.md):
+generate a client per version.
+
+A standard-library Python client generated from it is kept in the repository
+at `clients/python/agentplane_operator.py`: one method per operation, the
+parsed answer returned, `OperatorError` (status and sentence) raised for every
+refusal and for every redirect, which it never follows: a followed redirect
+turns a `POST` into a `GET` and carries the token to whatever host it names.
+Copy the file; it calls operator routes and runs no agent code.
+
 | Route | The question it answers |
 |---|---|
 | `GET /runs?outcome=…` | What ended this way and has not been cleared? Newest first; defaults to `quarantined`. The matching gauge is `agentplane.runs.quarantined` — alert on that, open this |
@@ -2118,9 +2321,12 @@ whether a run id exists by comparing a `400` against a `404`.
 | `POST /runs/{run}/abandon` | Nobody will ever establish what happened; close it where it stands |
 | `POST /events` | This message arrived; wake whoever wanted it |
 | `GET /dead-letters` | Which messages arrived and reached nobody — the keys they were filed under, so the mismatch is visible |
-| `GET /halts` | What is stopped right now, and why |
+| `GET /halts` | What is stopped right now, why, and who threw it. `?state=lifted`: the recorded lifts, newest first |
 | `POST /halts` | Stop work at this scope starting — the emergency stop, reachable while the plane it stops is running |
-| `POST /halts/lift` | Let it start again. A **separate** capability from throwing it |
+| `POST /halts/lift` | Let it start again, recorded under the caller. A **separate** capability from throwing it |
+| `GET /holds` | What are we still keeping against erasure, and on whose instruction? Oldest hold first. `?state=released`: the recorded releases, newest first → [legal holds](@/docs/erasure.md#a-legal-hold-stops-a-pass) |
+| `POST /holds` | Preserve this matter against every erasure verb. Idempotent: the response names the hold in force, which a second placement does not replace |
+| `POST /holds/release` | Lift it, recorded under the caller, so the next retention pass reaches the matter |
 | `GET /push` | Which webhook receivers a delivery worker gave up on, and what they said last |
 | `POST /push/rearm` | That one is fixed — resume at the record it never acknowledged |
 
@@ -2194,6 +2400,17 @@ neither `justification` nor `rendering` carries a proposal or evidence at all,
 never the envelope. Approving it is refused with `422` and the reason, before
 anything is claimed or recorded; rejecting it still records
 → [what a reviewer is shown](@/docs/security.md#what-a-reviewer-is-shown).
+
+#### Deciding on a version {#deciding-on-a-version}
+
+Every task view — `GET /tasks`, `GET /tasks/{task}`, the claim answers and
+`agentplane tasks` — carries `digest`, the version of the stored row (not of
+the served `justification`, which withholds what the plane cannot open). A
+decision may name it: `"digest"` in the decide body, `--digest` on `agentplane
+decide`. A row that changed since is refused before anything is claimed or
+recorded — `412`, or exit `1` naming the `tasks --show` that re-reads it — and
+if it changes between the read and the claim, the claim taken is released.
+Naming no digest compares nothing.
 
 ### No authenticator is shipped
 
@@ -2468,6 +2685,7 @@ during an incident:
 | Timers, event subscriptions, worklist rows | **Resuming the run.** Replay reaches the announced wait, finds no terminal record, and re-arms from the journal. `RestoreReport::awaiting` names every run the file carried; `agentplane waiting` names what the plane is waiting on now, and keeps naming it until somebody resumes it |
 | Leases | Nothing: a first lease starts one past the highest epoch the run's own journal records, so a fencing token cannot go backwards across a restore |
 | Webhook delivery cursors | Re-registration, then `POST /push/rearm`. A cursor is how far a receiver got and nothing journals it |
+| **Standing authority** | Issuing it again (`AuthorityStore::issue`). A recreated store holds none, and a draw on an authority it does not hold is refused as `AuthorityError::Unknown` |
 | Record signatures | The restoring store attests as its own signer. Hashes and the Merkle root are unaffected; authorship is not |
 | Activity timestamps | Nothing — the index is rebuilt, the original instants are not |
 | **Blob bytes** | Restoring the object store. The file carries each case's blob *digests*, which is what keeps erasure reachable, and never the objects |

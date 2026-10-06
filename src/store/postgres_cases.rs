@@ -224,6 +224,13 @@ CREATE TABLE IF NOT EXISTS inbound_events (
     received_at BIGINT  NOT NULL,
     claimed_by  TEXT,
     claimed_at  BIGINT,
+    -- The wait a standing claim was made for, until that wait's unsubscribe
+    -- consumes it. A wait recovers only its own standing claim, and retiring a
+    -- wait sheds only what it consumed.
+    claimed_for TEXT,
+    -- Delivered to one run by name: that run's alone, dead-lettered rather
+    -- than offered to another run when its addressee concludes unconsumed.
+    targeted    BOOLEAN NOT NULL DEFAULT FALSE,
     dead        BOOLEAN NOT NULL DEFAULT FALSE,
     dead_reason TEXT,
     PRIMARY KEY (tenant, event_id)
@@ -283,6 +290,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     parked_at  BIGINT,
     PRIMARY KEY (tenant, run_id, effect_key, namespace, value)
 );
+-- The one event source this wait accepts; NULL accepts any.
+ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS from_source TEXT;
 
 -- The match path's read: who is waiting on this kind and key. The primary key
 -- leads with the run for targeted delivery; this serves the arriving event,
@@ -312,10 +321,13 @@ CREATE TABLE IF NOT EXISTS timers (
     case_id    TEXT,
     step       BIGINT NOT NULL,
     phase      TEXT   NOT NULL,
-    fire_at    BIGINT NOT NULL,
-    claimed_at BIGINT,
+    fire_at    BIGINT NOT NULL CHECK (fire_at >= 0),
+    claimed_at BIGINT CHECK (claimed_at >= 0),
     PRIMARY KEY (tenant, run_id, effect_key)
 );
+-- The due sweep's read, soonest first: a tick walks the due rows rather than
+-- every timer the tenant holds.
+CREATE INDEX IF NOT EXISTS timers_due ON timers (tenant, fire_at);
 
 CREATE TABLE IF NOT EXISTS tasks (
     tenant          TEXT   NOT NULL,
@@ -944,20 +956,6 @@ impl CaseStore for PostgresStore {
         )))
     }
 
-    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError> {
-        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        // The seq is deliberately left spent: `attach_run` allocates MAX+1, so
-        // a removed position is never handed out again. See `detach_run`.
-        let removed = client
-            .execute(
-                "DELETE FROM case_runs WHERE tenant = $1 AND case_id = $2 AND run_id = $3",
-                &[&self.tenant_name(), &case.to_string(), &run.to_string()],
-            )
-            .await
-            .map_err(|e| be(&e))?;
-        Ok(removed > 0)
-    }
-
     async fn link_blob(
         &self,
         case: CaseId,
@@ -1565,6 +1563,43 @@ impl CaseStore for PostgresStore {
         Ok(removed == 1)
     }
 
+    async fn release_hold_if(
+        &self,
+        case: CaseId,
+        standing: &LegalHold,
+    ) -> Result<bool, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let exists = client
+            .query_opt(
+                "SELECT 1 FROM cases WHERE tenant = $1 AND case_id = $2",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if exists.is_none() {
+            return Err(StoreError::NotFound(case.to_string()));
+        }
+        // The compare is the statement's own predicate, so a hold placed
+        // after the caller read the old one fails it and stays.
+        let removed = client
+            .execute(
+                "DELETE FROM case_legal_holds
+                  WHERE tenant = $1 AND case_id = $2 AND placed_at = $3
+                    AND reason = $4 AND by_actor = $5 AND by_basis = $6",
+                &[
+                    &self.tenant_name(),
+                    &case.to_string(),
+                    &standing.placed_at.unix_timestamp(),
+                    &standing.reason,
+                    &standing.by.actor(),
+                    &standing.by.basis().as_str(),
+                ],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(removed == 1)
+    }
+
     async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let row = client
@@ -1886,8 +1921,8 @@ impl EventStore for PostgresStore {
             tx.execute(
                 "INSERT INTO subscriptions
                        (run_id, effect_key, case_id, step, phase, event_kind,
-                        namespace, value, created_at, tenant)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                        namespace, value, created_at, tenant, from_source)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                      ON CONFLICT DO NOTHING",
                 &[
                     &sub.run.to_string(),
@@ -1900,6 +1935,7 @@ impl EventStore for PostgresStore {
                     &k.value,
                     &at.unix_timestamp(),
                     &self.tenant_name(),
+                    &sub.from,
                 ],
             )
             .await
@@ -1916,35 +1952,47 @@ impl EventStore for PostgresStore {
     ) -> Result<Option<BufferedEvent>, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         for k in &sub.correlation {
-            // One statement. The claim predicate and the write are evaluated
-            // together, so two waiters cannot both come away with the row —
-            // there is no window because there is no second statement.
+            // One statement. The claim predicate, the write and the wait's
+            // parking are evaluated together, so two waiters cannot both come
+            // away with the row and the wait takes no second message.
             //
-            // `claimed_by IS NULL` — or already claimed **by this very run**.
-            // The second arm is crash recovery, the same idempotence
-            // `deliver_to` grants a retried targeted delivery: `match_waiter`
+            // Unclaimed — or claimed **for this very wait** and not yet
+            // consumed. The second arm is crash recovery: `match_waiter`
             // claims durably and the run resumes in a separate step, so a
-            // crash between the two leaves an event claimed for a run that
-            // never saw it. Without the arm the resumed wait re-subscribes,
-            // finds nothing — its own event filtered out by its own claim —
-            // and sleeps until its deadline breaches. Single delivery is
-            // untouched: only the claiming run can re-claim.
+            // crash between the two leaves an event claimed for a wait that
+            // never saw it. Scoped to the wait and to a standing claim, so a
+            // message the run already journaled is never handed to its next
+            // wait on the same key.
             let row = client
                 .query_opt(
-                    "UPDATE inbound_events SET claimed_by = $1, claimed_at = $2
-                      WHERE tenant = $6 AND event_id = (
-                          SELECT e.event_id FROM inbound_events e
-                            JOIN inbound_correlation c
-                              ON c.tenant = e.tenant AND c.event_id = e.event_id
-                           WHERE e.tenant = $6 AND e.kind = $3
-                             AND c.namespace = $4 AND c.value = $5
-                             AND (e.claimed_by IS NULL OR e.claimed_by = $1)
-                             AND NOT e.dead AND NOT e.erased
-                           ORDER BY e.received_at ASC
-                           FOR UPDATE SKIP LOCKED
-                           LIMIT 1)
-                  RETURNING bare_id, kind, payload, received_at, source, event_id, \
-                            by_actor, by_basis",
+                    "WITH claimed AS (
+                       UPDATE inbound_events SET claimed_by = $1, claimed_at = $2,
+                                                 claimed_for = $8
+                        WHERE tenant = $6 AND event_id = (
+                            SELECT e.event_id FROM inbound_events e
+                              JOIN inbound_correlation c
+                                ON c.tenant = e.tenant AND c.event_id = e.event_id
+                             WHERE e.tenant = $6 AND e.kind = $3
+                               AND c.namespace = $4 AND c.value = $5
+                               AND ($7::TEXT IS NULL OR e.source = $7)
+                               AND ((e.claimed_by IS NULL
+                                     AND NOT EXISTS (
+                                         SELECT 1 FROM subscriptions p
+                                          WHERE p.tenant = $6 AND p.run_id = $1
+                                            AND p.effect_key = $8
+                                            AND p.parked_at IS NOT NULL))
+                                    OR (e.claimed_by = $1 AND e.claimed_for = $8))
+                               AND NOT e.dead AND NOT e.erased
+                             ORDER BY e.received_at ASC
+                             FOR UPDATE SKIP LOCKED
+                             LIMIT 1)
+                    RETURNING bare_id, kind, payload, received_at, source, event_id,
+                              by_actor, by_basis),
+                     parked AS (
+                       UPDATE subscriptions SET parked_at = $2
+                        WHERE tenant = $6 AND run_id = $1 AND effect_key = $8
+                          AND EXISTS (SELECT 1 FROM claimed))
+                   SELECT * FROM claimed",
                     &[
                         &sub.run.to_string(),
                         &at.unix_timestamp(),
@@ -1952,6 +2000,8 @@ impl EventStore for PostgresStore {
                         &k.namespace,
                         &k.value,
                         &self.tenant_name(),
+                        &sub.from,
+                        &sub.effect.to_hex(),
                     ],
                 )
                 .await
@@ -1990,9 +2040,11 @@ impl EventStore for PostgresStore {
             // for it would be claimed for a satisfied wait and never consumed.
             let Some(row) = tx
                 .query_opt(
-                    "SELECT run_id, effect_key, case_id, step, phase FROM subscriptions
+                    "SELECT run_id, effect_key, case_id, step, phase, from_source
+                       FROM subscriptions
                       WHERE tenant = $4 AND event_kind = $1
                         AND namespace = $2 AND value = $3
+                        AND (from_source IS NULL OR from_source = $5)
                         AND parked_at IS NULL
                         AND NOT EXISTS (
                               SELECT 1 FROM run_seal s
@@ -2000,7 +2052,13 @@ impl EventStore for PostgresStore {
                                  AND s.run_id = subscriptions.run_id)
                       ORDER BY created_at ASC LIMIT 1
                       FOR UPDATE OF subscriptions",
-                    &[&event.kind, &k.namespace, &k.value, &self.tenant_name()],
+                    &[
+                        &event.kind,
+                        &k.namespace,
+                        &k.value,
+                        &self.tenant_name(),
+                        &event.source,
+                    ],
                 )
                 .await
                 .map_err(|e| be(&e))?
@@ -2008,12 +2066,14 @@ impl EventStore for PostgresStore {
                 continue;
             };
             let run: String = row.get(0);
+            let effect: String = row.get(1);
 
             // Claiming the event in the same transaction is what stops one
             // message resuming two runs.
             let claimed = tx
                 .execute(
-                    "UPDATE inbound_events SET claimed_by = $2, claimed_at = $3
+                    "UPDATE inbound_events SET claimed_by = $2, claimed_at = $3,
+                                              claimed_for = $5
                       WHERE tenant = $4 AND event_id = $1
                         AND claimed_by IS NULL AND NOT dead",
                     &[
@@ -2021,6 +2081,7 @@ impl EventStore for PostgresStore {
                         &run,
                         &at.unix_timestamp(),
                         &self.tenant_name(),
+                        &effect,
                     ],
                 )
                 .await
@@ -2030,24 +2091,16 @@ impl EventStore for PostgresStore {
                 return Ok(None);
             }
 
-            let effect: String = row.get(1);
             let case: Option<String> = row.get(2);
             let step: i64 = row.get(3);
             let phase: String = row.get(4);
-            // The claim retires the subscription, in the same transaction —
-            // the same rule the redb backend holds and for the same reason:
-            // left registered until the run's own unsubscribe, it matched a
-            // *second* event, sequentially, which was then claimed for a run
-            // whose wait the first already satisfied — parked under a claim
-            // nobody consumes, invisible to dead-lettering. The resumed wait
-            // re-subscribes idempotently and recovers its own claimed event
-            // through the crash-recovery arm. `deliver_to` deliberately does
-            // not retire, because its retry path rebuilds `Matched` from
-            // these rows.
+            // The claim parks the subscription, in the same transaction: a
+            // parked wait is matched no second event, and a crash before the
+            // resume leaves a pair the redelivery pass finds and finishes.
             tx.execute(
-                "DELETE FROM subscriptions
+                "UPDATE subscriptions SET parked_at = $4
                   WHERE tenant = $1 AND run_id = $2 AND effect_key = $3",
-                &[&self.tenant_name(), &run, &effect],
+                &[&self.tenant_name(), &run, &effect, &at.unix_timestamp()],
             )
             .await
             .map_err(|e| be(&e))?;
@@ -2064,6 +2117,7 @@ impl EventStore for PostgresStore {
                 phase: phase_from(&phase)?,
                 kind: event.kind.clone(),
                 correlation: event.correlation.clone(),
+                from: row.get(5),
             }));
         }
         tx.commit().await.map_err(|e| be(&e))?;
@@ -2081,15 +2135,24 @@ impl EventStore for PostgresStore {
         let tenant = self.tenant_name();
         let event_id = event.dedup_key();
 
-        let existing_claim: Option<Option<String>> = tx
+        // A message this run already holds claimed resumes the wait it was
+        // claimed for, while that claim stands — a retry after a crash between
+        // claim and resume. Consumed, or claimed by another run, it is a
+        // duplicate. A new message goes to a wait holding no undelivered one.
+        let existing_claim: Option<(Option<String>, Option<String>)> = tx
             .query_opt(
-                "SELECT claimed_by FROM inbound_events
+                "SELECT claimed_by, claimed_for FROM inbound_events
                   WHERE tenant = $1 AND event_id = $2 FOR UPDATE",
                 &[&tenant, &event_id],
             )
             .await
             .map_err(|e| be(&e))?
-            .map(|row| row.get(0));
+            .map(|row| (row.get(0), row.get(1)));
+        let target_text = target.to_string();
+        let claimed_for: Option<String> = match &existing_claim {
+            Some((Some(by), Some(effect))) if *by == target_text => Some(effect.clone()),
+            _ => None,
+        };
 
         // Lock this run's candidate subscription rows. Two continuations for
         // one task then serialize before either can insert its event.
@@ -2104,25 +2167,39 @@ impl EventStore for PostgresStore {
         // key wins on both.
         let rows = tx
             .query(
-                "SELECT effect_key, case_id, step, phase, namespace, value
+                "SELECT effect_key, case_id, step, phase, namespace, value, from_source,
+                        parked_at
                    FROM subscriptions
                   WHERE tenant = $1 AND run_id = $2 AND event_kind = $3
+                    AND (from_source IS NULL OR from_source = $4)
                   ORDER BY effect_key ASC
                   FOR UPDATE",
-                &[&tenant, &target.to_string(), &event.kind],
+                &[&tenant, &target.to_string(), &event.kind, &event.source],
             )
             .await
             .map_err(|e| be(&e))?;
         let Some(selected) = rows.iter().find(|row| {
+            let effect: String = row.get(0);
             let namespace: String = row.get(4);
             let value: String = row.get(5);
-            event
-                .correlation
-                .iter()
-                .any(|key| key.namespace == namespace && key.value == value)
+            let parked: Option<i64> = row.get(7);
+            let eligible = match (&existing_claim, &claimed_for) {
+                (Some(_), Some(claimed)) => *claimed == effect,
+                (Some(_), None) => false,
+                (None, _) => parked.is_none(),
+            };
+            eligible
+                && event
+                    .correlation
+                    .iter()
+                    .any(|key| key.namespace == namespace && key.value == value)
         }) else {
             tx.commit().await.map_err(|e| be(&e))?;
-            return Ok(TargetedDelivery::NotWaiting);
+            return Ok(if existing_claim.is_some() {
+                TargetedDelivery::Duplicate
+            } else {
+                TargetedDelivery::NotWaiting
+            });
         };
 
         let effect: String = selected.get(0);
@@ -2144,25 +2221,22 @@ impl EventStore for PostgresStore {
                 .filter(|row| row.get::<_, String>(0) == effect)
                 .map(|row| CorrelationKey::new(row.get::<_, String>(4), row.get::<_, String>(5)))
                 .collect(),
+            from: selected.get(6),
         };
 
-        if let Some(claimed_by) = existing_claim {
+        if existing_claim.is_some() {
+            // Selected only as the wait its standing claim was made for.
             tx.commit().await.map_err(|e| be(&e))?;
-            return Ok(
-                if claimed_by.as_deref() == Some(target.to_string().as_str()) {
-                    TargetedDelivery::Matched(subscription)
-                } else {
-                    TargetedDelivery::Duplicate
-                },
-            );
+            return Ok(TargetedDelivery::Matched(subscription));
         }
 
         let inserted = tx
             .execute(
                 "INSERT INTO inbound_events
                    (event_id, source, bare_id, kind, payload, received_at,
-                    claimed_by, claimed_at, tenant, by_actor, by_basis)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8, $9, $10)
+                    claimed_by, claimed_at, tenant, by_actor, by_basis, claimed_for,
+                    targeted)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8, $9, $10, $11, TRUE)
                  ON CONFLICT (tenant, event_id) DO NOTHING",
                 &[
                     &event_id,
@@ -2175,23 +2249,26 @@ impl EventStore for PostgresStore {
                     &tenant,
                     &event.by.as_ref().map(|o| o.actor().to_owned()),
                     &event.by.as_ref().map(|o| o.basis().as_str().to_owned()),
+                    &effect,
                 ],
             )
             .await
             .map_err(|e| be(&e))?;
         if inserted == 0 {
-            let claimed_by: Option<String> = tx
+            // Inserted by a concurrent delivery between the read above and
+            // this write: the same rule, read again.
+            let row = tx
                 .query_one(
-                    "SELECT claimed_by FROM inbound_events
+                    "SELECT claimed_by, claimed_for FROM inbound_events
                       WHERE tenant = $1 AND event_id = $2",
                     &[&tenant, &event_id],
                 )
                 .await
-                .map_err(|e| be(&e))?
-                .get(0);
+                .map_err(|e| be(&e))?;
+            let (by, wait): (Option<String>, Option<String>) = (row.get(0), row.get(1));
             tx.commit().await.map_err(|e| be(&e))?;
             return Ok(
-                if claimed_by.as_deref() == Some(target.to_string().as_str()) {
+                if by.as_deref() == Some(target_text.as_str()) && wait.as_deref() == Some(&effect) {
                     TargetedDelivery::Matched(subscription)
                 } else {
                     TargetedDelivery::Duplicate
@@ -2231,25 +2308,30 @@ impl EventStore for PostgresStore {
             )
             .await
             .map_err(|e| be(&e))?;
-        // The run's unsubscribe is the store's signal that delivery was
-        // journaled, so the buffer's copy of every payload this run claimed is
-        // shed here. The row keeps its `(source, id)` identity, claim and
-        // dead-letter fields: dedup and accounting need those, and only the
-        // content was ever the erasure concern. Stripping at the *claim*
+        // A wait's unsubscribe is the store's signal that its delivery was
+        // journaled, so the buffer's copy of what this wait consumed is shed
+        // here — only this wait's: another wait of the run may hold a message
+        // not yet journaled. The row keeps its `(source, id)` identity, claim
+        // and dead-letter fields: dedup and accounting need those, and only
+        // the content was ever the erasure concern. Stripping at the *claim*
         // instead would lose the payload for a run that crashed between claim
         // and resume, whose recovery re-reads it from the buffer.
         client
             .execute(
-                "UPDATE inbound_events SET payload = 'null'
-                  WHERE tenant = $1 AND claimed_by = $2",
-                &[&self.tenant_name(), &run.to_string()],
+                "UPDATE inbound_events SET payload = 'null', claimed_for = NULL
+                  WHERE tenant = $1 AND claimed_by = $2 AND claimed_for = $3",
+                &[&self.tenant_name(), &run.to_string(), &effect.to_hex()],
             )
             .await
             .map_err(|e| be(&e))?;
         Ok(())
     }
 
-    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
+    async fn unsubscribe_run(
+        &self,
+        run: RunId,
+        unanswered: &[EffectKey],
+    ) -> Result<crate::case::Retired, StoreError> {
         let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let tx = client.transaction().await.map_err(|e| be(&e))?;
         let retired = tx
@@ -2260,9 +2342,41 @@ impl EventStore for PostgresStore {
             )
             .await
             .map_err(|e| be(&e))?;
-        // The same shedding `unsubscribe` does, for the same reason.
+        // A message claimed for a wait the run never answered reached nobody:
+        // back to the buffer, unclaimed, with its payload.
+        let unanswered: Vec<String> = unanswered.iter().map(|effect| effect.to_hex()).collect();
+        let released = tx
+            .query(
+                "UPDATE inbound_events
+                    SET claimed_by = NULL, claimed_at = NULL, claimed_for = NULL
+                  WHERE tenant = $1 AND claimed_by = $2 AND claimed_for = ANY($3)
+                    AND NOT dead AND NOT targeted
+              RETURNING bare_id, kind, payload, received_at, source, event_id,
+                        by_actor, by_basis",
+                &[&self.tenant_name(), &run.to_string(), &unanswered],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        // One addressed to this run is its alone: dead-lettered, never offered
+        // to another run waiting on the same key.
         tx.execute(
-            "UPDATE inbound_events SET payload = 'null'
+            "UPDATE inbound_events
+                SET claimed_by = NULL, claimed_at = NULL, claimed_for = NULL,
+                    dead = TRUE, dead_reason = $4
+              WHERE tenant = $1 AND claimed_by = $2 AND claimed_for = ANY($3)
+                AND NOT dead AND targeted",
+            &[
+                &self.tenant_name(),
+                &run.to_string(),
+                &unanswered,
+                &crate::case::ADDRESSEE_CONCLUDED_REASON,
+            ],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        // The same shedding `unsubscribe` does, for every other wait of the run.
+        tx.execute(
+            "UPDATE inbound_events SET payload = 'null', claimed_for = NULL
               WHERE tenant = $1 AND claimed_by = $2",
             &[&self.tenant_name(), &run.to_string()],
         )
@@ -2271,7 +2385,18 @@ impl EventStore for PostgresStore {
         tx.commit().await.map_err(|e| be(&e))?;
         let waits: std::collections::BTreeSet<String> =
             retired.iter().map(|row| row.get(0)).collect();
-        Ok(waits.len())
+        let mut events = Vec::with_capacity(released.len());
+        for row in &released {
+            events.push(
+                buffered_from(row, &client, &self.tenant_name())
+                    .await?
+                    .event,
+            );
+        }
+        Ok(crate::case::Retired {
+            waits: waits.len(),
+            released: events,
+        })
     }
 
     async fn park_wait(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
@@ -2281,8 +2406,8 @@ impl EventStore for PostgresStore {
             tx.execute(
                 "INSERT INTO subscriptions
                        (run_id, effect_key, case_id, step, phase, event_kind,
-                        namespace, value, created_at, tenant, parked_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9)
+                        namespace, value, created_at, tenant, parked_at, from_source)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $9, $11)
                      ON CONFLICT (tenant, run_id, effect_key, namespace, value)
                      DO UPDATE SET parked_at = EXCLUDED.parked_at",
                 &[
@@ -2296,6 +2421,7 @@ impl EventStore for PostgresStore {
                     &k.value,
                     &at.unix_timestamp(),
                     &self.tenant_name(),
+                    &sub.from,
                 ],
             )
             .await
@@ -2327,7 +2453,7 @@ impl EventStore for PostgresStore {
             retired.iter().map(|row| row.get(0)).collect();
         for run in &sealed {
             tx.execute(
-                "UPDATE inbound_events SET payload = 'null'
+                "UPDATE inbound_events SET payload = 'null', claimed_for = NULL
                   WHERE tenant = $1 AND claimed_by = $2",
                 &[&self.tenant_name(), run],
             )
@@ -2340,7 +2466,8 @@ impl EventStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT run_id, effect_key, MIN(case_id), MIN(step), MIN(phase),
-                        MIN(event_kind), array_agg(namespace), array_agg(value)
+                        MIN(event_kind), array_agg(namespace), array_agg(value),
+                        MIN(from_source)
                    FROM subscriptions
                   WHERE tenant = $2 AND parked_at IS NOT NULL
                   GROUP BY run_id, effect_key
@@ -2377,6 +2504,7 @@ impl EventStore for PostgresStore {
                     .zip(values)
                     .map(|(ns, value)| CorrelationKey::new(ns, value))
                     .collect(),
+                from: row.get(8),
             });
         }
         Ok(out)
@@ -2389,7 +2517,7 @@ impl EventStore for PostgresStore {
         let tx = client.transaction().await.map_err(|e| be(&e))?;
         let Some(row) = tx
             .query_opt(
-                "SELECT claimed_by, payload <> 'null' FROM inbound_events
+                "SELECT claimed_by, claimed_for IS NOT NULL FROM inbound_events
                   WHERE tenant = $1 AND event_id = $2 FOR UPDATE",
                 &[&tenant, &key],
             )
@@ -2400,23 +2528,23 @@ impl EventStore for PostgresStore {
             return Ok(false);
         };
         let claimed_by: Option<String> = row.get(0);
-        let holds_payload: bool = row.get(1);
-        // Undelivered: nobody claimed it, or a run claimed it and has not yet
-        // journaled it — the delivered payload is shed at the run's
-        // unsubscribe, so a claimed row still holding one never reached the
-        // run's journal. Either way it leaves the claimable set as a dead
+        let standing: bool = row.get(1);
+        // Undelivered: nobody claimed it, or a wait claimed it and has not
+        // yet journaled it — the claim stands until that wait's unsubscribe
+        // consumes it. Either way it leaves the claimable set as a dead
         // letter, in this write, so no recovery hands the run the emptied row;
         // the claim is released and the claimant's wait is unparked, so the
         // wait stays open for its deadline to bound. A delivered row keeps its
         // claim and its accounting. Every right-hand side reads the row as it
         // was before the update.
-        let undelivered = claimed_by.is_none() || holds_payload;
+        let undelivered = claimed_by.is_none() || standing;
         tx.execute(
             "UPDATE inbound_events SET payload = 'null', erased = TRUE,
                     dead = dead OR $3,
                     dead_reason = CASE WHEN $3 AND NOT dead THEN $4 ELSE dead_reason END,
                     claimed_by = CASE WHEN $3 THEN NULL ELSE claimed_by END,
-                    claimed_at = CASE WHEN $3 THEN NULL ELSE claimed_at END
+                    claimed_at = CASE WHEN $3 THEN NULL ELSE claimed_at END,
+                    claimed_for = NULL
               WHERE tenant = $1 AND event_id = $2",
             &[&tenant, &key, &undelivered, &crate::case::ERASED_REASON],
         )
@@ -2570,7 +2698,8 @@ impl EventStore for PostgresStore {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
         let rows = client
             .query(
-                "SELECT run_id, effect_key, case_id, step, phase, event_kind, namespace, value
+                "SELECT run_id, effect_key, case_id, step, phase, event_kind, namespace, value,
+                        from_source
                    FROM subscriptions WHERE tenant = $2
                   ORDER BY created_at ASC LIMIT $1",
                 &[
@@ -2601,6 +2730,7 @@ impl EventStore for PostgresStore {
                     row.get::<_, String>(6),
                     row.get::<_, String>(7),
                 )],
+                from: row.get(8),
             });
         }
         Ok(out)

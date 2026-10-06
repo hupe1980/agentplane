@@ -422,12 +422,69 @@ pub struct Justification {
     /// the label is what tells them apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<crate::core::Tainted<String>>,
+    /// What the agent a proposed consultation would hand work to may do, as
+    /// its registered declaration says — derived by the runtime, never
+    /// written by the party under review.
+    ///
+    /// Inside the justification so its digest covers it: an approval of a
+    /// consultation is an approval of this callee, and a callee whose
+    /// declaration changed since is a different digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach: Option<Reach>,
+}
+
+/// What a consulted agent may do: the reach a reviewer approves along with
+/// the hand-off.
+///
+/// One level. The agents and peers the callee may consult in turn are named
+/// among its grants; their own reach is theirs to show where their runs ask.
+/// What the declaration *permits*, never what the callee is expected to do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reach {
+    /// The capability the call consults.
+    pub capability: String,
+    /// The declaration governing the agent that answers it — absent when none
+    /// does, and then nothing about its reach can be stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<DeclaredReach>,
+}
+
+/// A callee's declaration, as much of it as bounds what the callee may do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeclaredReach {
+    pub agent: String,
+    pub version: String,
+    /// The revision this approval covers.
+    pub digest: Digest,
+    /// Everything the callee may call.
+    pub grants: Vec<ReachGrant>,
+    /// Its declared ceilings, as written.
+    pub budgets: Value,
+    /// How many further hops its own runs may delegate, when it says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_delegation_depth: Option<u8>,
+}
+
+/// One thing a callee may call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReachGrant {
+    /// The reference granted, as `tool://server/name`.
+    pub reference: String,
+    pub mutates: bool,
+    /// Whether the callee's own run asks a person before each call.
+    pub requires_approval: bool,
+    /// Another agent or a peer, consulted in turn: named, its reach not shown.
+    pub consults: bool,
 }
 
 impl Justification {
-    /// The digest of exactly what a reviewer is shown.
+    /// The version of the stored task row: a digest over its justification.
     ///
-    /// An approval names this, so a task edited in the store between the run
+    /// Served beside every task, and a decision may name it back as a
+    /// precondition. An approval is stamped with it, so a task edited in the store between the run
     /// proposing it and a person deciding it is an approval of something the
     /// run never proposed — and is refused where the run reads the answer.
     #[must_use]
@@ -451,6 +508,7 @@ impl Justification {
             confidence: None,
             cost: None,
             evidence: Vec::new(),
+            reach: None,
         }
     }
 
@@ -591,7 +649,7 @@ pub struct Task {
 /// The reason is carried out of band, by the store decorator that sealed the
 /// row and the one that tried to open it, so an argument value can never
 /// spell it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Withheld {
     /// Sealed at rest, and whoever read the row holds no key ring to open it.
@@ -643,8 +701,9 @@ impl std::fmt::Display for Withheld {
 /// has its hidden code points escaped in place (see [`escaped`](Self::escaped));
 /// every word mixing scripts is listed in [`mixed_script`](Self::mixed_script)
 /// and left as written. Nothing is cut: a value is shown whole.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[non_exhaustive]
+#[schemars(deny_unknown_fields)]
 pub struct Rendering {
     /// Why the proposal cannot be shown, when it cannot — and then
     /// `proposed_action` is null and `evidence` empty rather than an envelope
@@ -652,11 +711,18 @@ pub struct Rendering {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub withheld: Option<Withheld>,
     pub summary: String,
+    #[schemars(extend("x-agentplane-holds" = "The action under review, as the proposing run wrote it; null when the proposal is withheld."))]
     pub proposed_action: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
+    /// What the agent a consultation would hand work to may do, when the task
+    /// proposes one. Shown even when the proposal is withheld: it is the
+    /// plane's own declaration, not the caller's data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-agentplane-holds" = "The consulted agent's reach: its capability and, when a declaration governs it, the agent, version, digest, grants (reference, mutates, requires_approval, consults), budgets and max_delegation_depth."))]
+    pub reach: Option<Value>,
     /// Whether any text above had a code point escaped because it renders as
     /// nothing or reorders what surrounds it.
     pub escaped: bool,
@@ -666,8 +732,9 @@ pub struct Rendering {
 }
 
 /// One word mixing alphabets, flagged beside the text it appears in.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[non_exhaustive]
+#[schemars(deny_unknown_fields)]
 pub struct MixedScript {
     /// Where: `summary`, `cost`, `evidence/<n>`, or `proposed_action` and the
     /// path to the string inside it.
@@ -747,12 +814,19 @@ impl Task {
                     .collect(),
             )
         };
+        let reach = j.reach.as_ref().map(|reach| {
+            r.value(
+                "reach",
+                &serde_json::to_value(reach).expect("a reach serializes"),
+            )
+        });
         Rendering {
             withheld: self.withheld,
             summary,
             proposed_action,
             cost,
             evidence,
+            reach,
             escaped: r.escaped,
             mixed_script: r.mixed_script,
         }
@@ -885,8 +959,8 @@ pub struct Decision {
     /// reviewer's own trusted value. On a rejection it is recorded advice.
     #[serde(default)]
     pub amendment: Value,
-    /// What the decider was shown: [`Justification::digest`] of the task as
-    /// the store held it when the decision was recorded.
+    /// [`Justification::digest`] of the task row as the store held it when
+    /// the decision was recorded.
     ///
     /// Stamped by the runtime, never by the caller. A person's approval binds
     /// to it, and the run refuses one whose digest is not that of the task it

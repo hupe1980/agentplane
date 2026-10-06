@@ -860,3 +860,142 @@ async fn a_parked_registration_keeps_its_cursor_and_can_be_re_armed() {
     );
     assert_eq!(f.transport.seen().len(), 1);
 }
+
+/// A push store whose next `n` registrations fail.
+#[derive(Debug)]
+struct RefusesRegistration {
+    inner: Arc<RedbStore>,
+    failures: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl PushStore for RefusesRegistration {
+    async fn put(
+        &self,
+        config: &PushConfig,
+        next_seq: agentplane::core::Seq,
+    ) -> Result<(), agentplane::core::StoreError> {
+        use std::sync::atomic::Ordering;
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(agentplane::core::StoreError::Backend(
+                "the push store is restarting".into(),
+            ));
+        }
+        self.inner.put(config, next_seq).await
+    }
+    async fn get(
+        &self,
+        task: agentplane::core::RunId,
+        id: &str,
+    ) -> Result<Option<PushConfig>, agentplane::core::StoreError> {
+        self.inner.get(task, id).await
+    }
+    async fn list(
+        &self,
+        task: agentplane::core::RunId,
+    ) -> Result<Vec<PushConfig>, agentplane::core::StoreError> {
+        self.inner.list(task).await
+    }
+    async fn due(
+        &self,
+        at: u64,
+        limit: usize,
+    ) -> Result<Vec<agentplane::push::PushRegistration>, agentplane::core::StoreError> {
+        self.inner.due(at, limit).await
+    }
+    async fn advance(
+        &self,
+        task: agentplane::core::RunId,
+        id: &str,
+        next_seq: agentplane::core::Seq,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.advance(task, id, next_seq).await
+    }
+    async fn retry(
+        &self,
+        task: agentplane::core::RunId,
+        id: &str,
+        next_attempt_at: u64,
+        error: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.retry(task, id, next_attempt_at, error).await
+    }
+    async fn park(
+        &self,
+        task: agentplane::core::RunId,
+        id: &str,
+        error: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.park(task, id, error).await
+    }
+    async fn parked(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::push::PushRegistration>, agentplane::core::StoreError> {
+        self.inner.parked(limit).await
+    }
+    async fn unpark(
+        &self,
+        task: agentplane::core::RunId,
+        id: &str,
+        at: u64,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.unpark(task, id, at).await
+    }
+    async fn delete(
+        &self,
+        task: agentplane::core::RunId,
+        id: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.delete(task, id).await
+    }
+}
+
+/// **A resumed run is watched, whatever its admission managed.**
+///
+/// An admission whose registration failed is concluded `failed`, and a failed
+/// run is resumable — a batch's next pass resumes exactly this one. The
+/// resume executes the run, so it registers the destinations first; without
+/// that the run does all its work with nothing watching it.
+#[tokio::test]
+async fn a_resume_registers_the_destinations_its_admission_could_not() {
+    use agentplane::runtime::{Mode, RunStatus};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let push = Arc::new(RefusesRegistration {
+        inner: Arc::clone(&store),
+        failures: std::sync::atomic::AtomicU32::new(1),
+    });
+    let outbox = Arc::new(Outbox::new(
+        push as Arc<dyn PushStore>,
+        vec![Destination::new("bus", "https://bus.internal/events")],
+    ));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(Answers)
+        .outbox(outbox)
+        .try_build()
+        .expect("a coherent plane");
+
+    rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        .await
+        .expect_err("an admission whose registration failed is refused");
+    let run = *store
+        .runs_by_outcome("failed", 10)
+        .await
+        .unwrap()
+        .first()
+        .expect("the half-admitted run is concluded failed");
+
+    let out = rt.replay(run, Mode::Resume).await.expect("the resume runs");
+    assert_eq!(out.status, RunStatus::Succeeded);
+    let registered = store.list(run).await.expect("registrations");
+    assert_eq!(
+        registered.len(),
+        1,
+        "the resumed run executed with no destination registered"
+    );
+}

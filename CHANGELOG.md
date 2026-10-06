@@ -16,6 +16,374 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.46.0] — unreleased
+
+### Added
+
+- **A peer can be told who asked.** `PeerGrant::with_source` presents each
+  call, task read and cancel with a credential for the run's owner, checked
+  for audience and subject; a run acting for nobody is refused.
+  `EffectStarted.credential` records which kind went out, and a `subject:`
+  halt now pauses a run at its next such call. **BREAKING:** the
+  `TokenExchange` and `CredentialSource` methods take the subject;
+  `PeerTaskCall`/`PeerTaskCancel::prepare` take an `Asker`;
+  `prepare_with_credential` and `Fixed` are removed. Record change: hard cut.
+- **An approval of a consultation shows the agent it hands work to.**
+  `Justification::reach` states the consulted agent's revision, grants,
+  budgets and delegation ceiling, read once and journaled (`agent.reach`) and
+  inside the task digest; the consultation is pinned to that revision, so a
+  callee redeployed since is refused, naming both. Coded skills get
+  `StepCtx::reach` and `StepCtx::commission_pinned`. The stored
+  justification gains an optional field (hard cut).
+- **A plane can follow every model call's live output.**
+  `RuntimeBuilder::observe_model_streams` takes a `RunStreamObserver`, which
+  receives each call's text deltas and usage with its run — declarative agents'
+  calls included. Advisory and live-only, as `ModelCall::streaming_to` is.
+- **An effect's outcome records how long the call took** (`EffectDone` and
+  `EffectFailed` gain `elapsed_ms`). Record change: hard cut, versions stay 1.
+- **A consultation names the run that answered it.** The journaled output of
+  an `agent.commission` effect carries the sub-run's id (`run`).
+- **`peers::TokenEndpoint`** (`a2a`): RFC 8693 token exchange against the
+  deployment's issuer, naming the run's owner as subject and the plane as
+  actor. HTTPS only; an issuer's 4xx refusal is final, never retried.
+- **Content rules (`spec.security.content`).** Deterministic `pattern`,
+  `contains` and `invisible` rules at admission, sources and sinks that
+  `refuse`, `classify` or (at a sink) `redact`, plus `checks` handed to a
+  `ContentChecker` (`RuntimeBuilder::content_checker`). `agentplane content
+  check` runs them offline. A sink refusal is a `PolicyDenied` under
+  `effect:content`. Record change (hard cut): `EffectStarted.content_rules`,
+  `EffectDone.content`. → [security](https://hupe1980.github.io/agentplane/docs/security/#content-rules)
+- **A subject's trace follows the data a run took in.** `spec.data_subjects`
+  (`$input/<pointer>` or `$case`) or `RunTerms::subject` binds a run's
+  subjects into a sealed `DataSubjectBound` record, and values derived from
+  its input, events and case state carry `Label::data_subjects`.
+  `agentplane subject` lists what it touched; an unresolvable binding refuses
+  the run (`SubjectUnbound`). Record change: hard cut.
+- **One matter can leave the plane without the rest.** `agentplane export
+  --case/--run --to --actor` writes a disclosure package that both readers
+  verify leaf by leaf; the act is recorded first, erasure and retention name
+  each copy, and `agentplane disclosures` lists them. A package proves
+  inclusion, not completeness, and restore, replay, `policy check` and
+  `grants` refuse one. Export format change: hard cut.
+- **A page for trying an agent.** `agentplane dev <manifest>` serves one
+  loopback page, behind a per-process token, to start, follow, cancel and
+  re-run runs; watch the model write; read a run as a timeline or a
+  conversation, with call durations and spend; deliver events; decide tasks;
+  strict-replay and export. Saving the file rebuilds the plane. It runs only
+  over memory or a `--scratch` directory it created. Feature `dev`.
+- **One run's journal in the terminal.** `agentplane history <run> --store …`
+  prints each record escaped, and exits `1` for a run the store does not hold
+  whatever `--from` names; `--json` prints the history route's records, where
+  JSON escapes only U+0000–U+001F (`journal::view::record_view`,
+  `core::visible::escape`).
+- **A decision can name the version of the task it was made against.** Every
+  task view and `agentplane tasks` serve `digest`, the stored row's version; a
+  decide body's `digest` or `decide --digest` refuses a row that changed since,
+  with nothing recorded (`412`, exit `1`, `RuntimeError::TaskChanged`,
+  `Runtime::decide_task_at`).
+- **A checkpoint says how fresh it is.** `audit --max-checkpoint-age` judges
+  each witness key's signed cosignature time against the auditor's clock, and
+  `serve --witness-submit … --witness-interval` re-submits an unchanged
+  checkpoint so an idle plane stays fresh (`Cosignature::timestamp`).
+- **An outside verdict can be bound to the records it judged.** `agentplane
+  bind` writes a grader-verdict sidecar over `(run, last_seq, last_hash,
+  open)`; `verify --grader-verdict` and `tools/verify_export.py` refuse one
+  whose prefix no longer matches (`grader_verdict`).
+- **The second reader checks who signed.** `tools/verify_export.py` verifies
+  record signatures (`--key`), witness cosignatures (`--witness-key`) and
+  grader-verdict signatures (`--grader-key`), and judges checkpoint freshness
+  (`--max-checkpoint-age`). **BREAKING:** both readers refuse a small-order
+  Ed25519 key.
+- **An admission can pin the declaration revision.**
+  `RunTerms::expect_declaration` and `run --expect-digest` refuse, before policy
+  and with nothing recorded, when another revision or no declaration governs
+  the capability (`RuntimeError::DeclarationPinMismatch`).
+- **Where a subject's data went.** `agentplane subject <subject>` and
+  `subject::Trace` list the outbound effects whose clear label provenance names
+  the subject's memory items, and the recalls that read them, read-only, beside
+  a coverage list naming every class of flow the report cannot trace.
+- **Which grants an agent never used.** `agentplane grants --from <export>
+  --manifest <file>` and `grants::Grants` mark each tool grant used, unused or
+  not established (sealed or erased calls), report menus and egress headroom,
+  and with `--propose` write a manifest with whole unused grants removed.
+- **An agent framework reaches the plane over MCP.** `serve --mcp-addr`
+  serves the file's agents as MCP tools over Streamable HTTP at `/mcp`, under
+  `--tokens` and `--policy` (`mcp:*` actions) with `Host`/`Origin` checks;
+  each call is admitted as the token's actor, and a session belongs to its
+  creator. Feature `mcp-server-http`; library `tools::serve_http::McpHttp`.
+- **BREAKING: `execution.kind: call`** dispatches the one granted tool with the
+  input as its arguments, with no model. The input is validated against
+  `spec.input` — which must be closed (`additionalProperties: false`) — and
+  against the tool's declaration, as a planned step's arguments are.
+  `ExecutionKind` gains `Call`.
+- **BREAKING: served MCP speaks `2025-11-25` too, per extension.** A host
+  without the Tasks extension, on either revision, is offered only tools whose
+  runs cannot suspend (`Manifest::may_suspend`); older revisions are refused.
+- **`serve` takes a room file.** A2A serves its one `topology.role:
+  orchestrator`, refusing a room without exactly one.
+- **`agentplane init --serve <DIR>`** writes a plane ready to run: starter
+  agent, shipped policy, generated tokens and Postgres password (`0600`),
+  `store.env` and a loopback-only `compose.yaml`. It refuses to overwrite,
+  cleans up after a partial failure, and the plane refuses to run as root.
+  Needs the `:full` features.
+- **Framework quickstarts** for the OpenAI Agents SDK, LangGraph, Pydantic AI,
+  Google ADK and Microsoft Agent Framework (`examples/frameworks/`), each with
+  a hash-pinned `requirements.lock`. `just frameworks` runs them against the
+  `:full` image, on every push to `main` and before a release image is
+  signed.
+- **A Helm chart** in `deploy/helm/agentplane/`: non-root, read-only, the
+  operator listener on its own `ClusterIP` Service, the Postgres connection
+  string from a Secret (`storeSecret.existingSecret`, as `AGENTPLANE_STORE`),
+  `sessionAffinity: ClientIP` with more than one replica (MCP sessions are
+  per-pod), a pod rolled when either Secret changes on upgrade, and render
+  failures for more than one replica without a Postgres store and for a `store`
+  value holding a password. Not published.
+- **BREAKING: the shipped `serve-policy.cedar` grants more.** `operator` gains
+  the on-call verbs (`api:halt.place`, `api:halt.lift`, `api:run.abandon`,
+  `api:effect.reconcile`, `api:hold.place`, `api:hold.release`) and the reads
+  beside them (`api:run.history`, `api:halt.list`, `api:run.live`,
+  `api:run.waiting`, `api:attention`); `framework` gains `mcp:prompt.read` and
+  `mcp:resource.read`. Lifting a legal hold goes to the same role; the bundle's
+  header says how to give it to another. Re-read a copy you rely on to deny
+  them.
+- **The operator API has an OpenAPI 3.1 document**, generated from the
+  router: published as `openapi.json` on the guide site and printed by
+  `agentplane openapi`. It is outside the compatibility promise. A build
+  without `push` answers `/push` routes with 501.
+- **A generated Python operator client**, `clients/python/agentplane_operator.py`:
+  standard library only, one method per operation, `OperatorError` on every
+  refusal and on every redirect, which it never follows. Copy it; regenerate
+  with `tools/gen_operator_client.py`.
+- **Every shipped reader reads through an upcaster.** Both stores
+  (`upcasting_with`), `export::verify_with` and `export::from_jsonl_with`
+  default to `journal::current_upcaster()`; `verify` reads a record's version
+  from its bytes before it believes a failed parse, and a version no upcaster
+  reaches is a skew, never an edit. Record bytes that hash to their claim and
+  are not canonical are a `verify` finding, and `restore` refuses them;
+  `tools/verify_export.py` reports them too.
+- **A restore keeps the bytes each record was written with**
+  (`Append::restored`, `Record::seal_at`), so a chain restored across a shape
+  change hashes as the exported one. **BREAKING:** `ExportedRecord::body` is an
+  `export::DisplayBody`; build an `Append` with `Append::new`; an external
+  `JournalStore` must store `Append::written()` bytes unchanged
+  (`testkit::conformance::check_upcasting`).
+- **The upgrade across a shape change is rehearsed in-tree** over an export one
+  record shape older (`testkit::older_shape`). The upgrading guide states
+  readers before writers, when the rollback window closes, and that standing
+  authority is re-issued after a restore.
+
+### Changed
+
+- **BREAKING: an erasure takes the disclosure register.** `blob::erase_case`
+  and `blob::erase_run` take `Option<&dyn DisclosureRegister>` and return the
+  copies they name (`blob::Erased`, `Vec<String>`); `retention::Stores` and
+  `runtime::Stores` gain `disclosures`, and `FullBackend` requires the register.
+  `JournalStore::inclusion_proof_at` proves at a past size.
+- **BREAKING: a body the operator API cannot read answers the documented
+  error object.** Malformed JSON, a wrong content type, an unknown member, or an
+  undecodable path or query answered axum's plain text; it is now
+  `{"error": "<sentence>"}` with the same status. Every answer is a named,
+  schema-derived type; no member moved. `Api::router` is built from
+  `api::openapi::ROUTES`.
+- **BREAKING (record change): lifting a halt and releasing a hold name who
+  did it.** Each is journaled first, as the sealed run of a new record kind
+  (`HaltLifted`, `HoldReleased`). `Runtime::lift_halt` takes the operator and
+  returns `ControlLifted`; `Runtime::release_hold`, `lifted_halts` and
+  `released_holds` are new. A control re-placed in between stays and the lift
+  fails (`RuntimeError::ControlStands`). `--lift` requires `--actor`;
+  `halt list --lifted` and `hold list --released` read the history. A sweep
+  seals a lease-free run a crash left unsealed.
+### Assurance
+
+- **Every protocol the release bar names is model-checked or answered by a
+  written decision.** New TLA+ models: `Quota`, `RateWindow`, `SinkGate`,
+  `KeyLifecycle`, `Delivery`, `TaskDelivery`. `tla/verify.sh` discovers every
+  spec and checks liveness mutants (`--self-test`, `--only`).
+- **The erasure guide places every record kind and store** against the clear
+  digests an erasure does not reach, with the remedies. A test recovers an
+  erased low-entropy value from an export's effect key and release digest; a
+  guard fails on a record kind the page does not place.
+- **The security guide lists the context of every gate** — `run:admit`,
+  `data:release` and the keys all three share — held to the request builders by
+  a guard.
+- **`RunAdmitted.admitted_by` is held clear through an erasure**, by a test
+  that erases a run's case and reads the initiator back.
+
+### Security
+
+- **A halt thrown with `agentplane halt` stops `serve`, `run` and `replay`.**
+  Every plane the binary builds comes from one helper that wires the quota
+  store. Before, those verbs built planes without it: halts were never read,
+  the halt and live-run routes answered 500, and a tool `rate_limit` refused to build.
+- **BREAKING: `FullBackend` requires `QuotaStore`, and `Stores` carries
+  `quotas`.** `builder_on`/`builder_with` wire it with no ceilings, so a
+  library-built plane obeys halts, subject withdrawals and rate ceilings
+  without `.quota(..)`; `.quota(store, limits)` is needed only to state
+  limits. A plane with no quota store resumes a run unless one of its passes accrued spend to a period; an
+  admission slot it cannot give back is released by the ledger's own plane
+  once the run is sealed (`SweepReport::slots_released`).
+- **BREAKING: an A2A continuation is authorized on the kind it delivers.** A
+  message with `taskId` asks `a2a:event.deliver` on the awaited event's kind as
+  well as `a2a:task.continue`, so the kind rules `POST /events` enforces hold on
+  both doors. The example bundle grants it on no kind, with a commented
+  per-kind rule to copy.
+- **A2A push registrations are bounded:** at most 10 per task and an id of at
+  most 128 bytes (`INVALID_PARAMS`); re-registering a held id still replaces it.
+- **BREAKING: A2A answers a refused credential with HTTP 401** and
+  `WWW-Authenticate: Bearer`, not HTTP 200 with `-32600` — including a valid
+  credential for a tenant the endpoint does not serve, refused in the same
+  sentence as any other so it does not say the token is valid elsewhere.
+- **The operator API no longer echoes an unevaluable policy set's reason**;
+  the 500 carries a fixed sentence and the reason stays in the operator's log.
+  A plaintext-peer refusal names the host, not the URL.
+- **BREAKING: a compensation or group reversal is checked against the
+  declaration and the policy**; only the budget exempts it. A refused undo
+  fails its compensation and the run quarantines.
+- **The person a run acts for cannot decide its tasks.** Beside the admitting
+  caller, four-eyes bars the root and acting subject of a caller's chain; a run
+  admitted as the plane (`RunAdmitted.plane_chain`) bars neither, even when a
+  caller presents an equal chain.
+- **BREAKING: a `subject:` halt matches any principal on a run's chain**, so
+  withdrawing a person stops what a delegate does for them, at admission and
+  in flight.
+- **A2A `GetTask` and `CancelTask` authenticate before reading the task id**;
+  a malformed id no longer earns an unauthenticated caller `TASK_NOT_FOUND`.
+- **A sealed export is refused by a tenant its envelopes do not name.** Its
+  ciphertext opened for nobody there, and `erase_case` destroyed a key that
+  wrapped none of it while reporting success.
+- **BREAKING: a policy principal is typed.** `PolicyRequest.principal_kind`
+  says whether it is a chain subject or API caller (Cedar `Subject::"…"`) or a
+  chainless run's capability (`Capability::"…"`); `Agent::"…"` is gone, so a
+  rule for the person `alice` no longer admits a capability named `alice`.
+  The evaluator is `agentplane-adapter/5`, and every bundle digest moves:
+  drain open runs before upgrading, and rewrite `Agent::` rules.
+- **BREAKING: a wait can name its sender.** `AwaitSpec::from(source)` and
+  `Subscription.from` hold every delivery path to that `InboundEvent.source`,
+  which for an event over the API or A2A is `peer:<actor>`. Postgres adds the
+  column at open; a redb store written by an older build refuses to open —
+  recreate it and restore from an export.
+- **BREAKING: erasure reaches the semantic index.** `SemanticRetriever::forget`
+  is required; `IndexedMemoryStore` tells it after every erasure verb, owing the
+  next verb what it could not. A sealed store (new required `MemoryStore::seals`)
+  holds the index beneath the seal, or `build` refuses it.
+- **BREAKING: a `Release` or `ReleaseScope` is validated on deserialization**:
+  one read from a journal, wire or file is refused when its scope improves
+  nothing, its basis or destination is blank, its field scope is empty or not
+  JSON Pointers, or it names no evidence — as the constructors refuse.
+
+### Fixed
+
+- **BREAKING (store schema): a message is consumed once, by the one wait that
+  claimed it.** A run's second wait on a key was handed its first message
+  again as `null`; a retried targeted message could be a second turn; and
+  retiring one wait shed every claim its run held. A claim now names its
+  wait. redb and Postgres event tables change: recreate the store.
+- **A delivery to a run whose conclusion is durable journals nothing.** A
+  message or timer arriving between a run's conclusion and its seal left the
+  run unsealable; it now finishes the run. `EventStore::unsubscribe_run`
+  takes the unanswered waits and returns their claims for the next waiter,
+  dead-lettering any addressed to that run.
+- **A counterparty's retry offers a message a crash left unmatched**, instead
+  of being answered `Duplicate` from the dedup alone.
+- **A decision that lost to its run's conclusion is refused**
+  (`ClaimError::NotPending`) instead of reported delivered.
+- **The key-ring battery runs against `MemoryKeyRing`**, and holds that a
+  second destruction leaves the first one's account standing.
+- **BREAKING: `serve --url` is the A2A endpoint**, `/a2a` under the public
+  address: the card advertises it as the interface URL, and the guides'
+  bare-host form sent every card-following client to a path that answers 404.
+  `serve` now refuses a `--url` that does not end in `/a2a`, naming the URL to
+  pass.
+
+- **BREAKING: embeddings are metered.** `Embedder::embed` returns `Embedded`
+  with the service's reported usage (the OpenAI wire, Titan, Gemini), which
+  counts against the run's ceilings; `.pricing(..)` prices it, and a money
+  ceiling beside an unpriced embedder is refused at build. A priced embedder
+  whose reply reports no input tokens refuses the call rather than metering it
+  free — Cohere on Bedrock reports none, so a priced Cohere embedder refuses
+  every call.
+- **BREAKING: rate rows are kept 31 days, whatever the window.** A narrower
+  declaration no longer prunes a wider one's count; `rate_limit` windows above
+  31 days are refused at parse, and a `RateCeiling` built in code with a window
+  of zero or above 31 days is refused at reservation
+  (`QuotaError::UncountableRate`).
+- **Zero or negative deadline counts are refused** by `WallClock` and at parse.
+- **BREAKING: `Quorum::tally` takes `(lens, verdict)` pairs** and refuses an
+  unknown or repeated lens; `core::QuorumOutcome` is `PanelOutcome`.
+- **A Gemini stream refused at the intake ceiling reports the usage** its
+  chunks carried; a result answers under the provider's call id. SSE decoding
+  is linear in the bytes received: a line arriving over many chunks is
+  searched once, and invalid UTF-8 is replaced in one pass.
+- **`models.<role>.max_tokens: 0` is refused at parse.**
+- **BREAKING: standing-authority `expires_at` and revocation `at` serialize as
+  RFC 3339**, which changes the stored authority rows: recreate the store and
+  re-issue standing authority.
+- **The authenticator battery records a panic** and probes `Bearer` with no
+  token, as its doc claimed.
+- **`tasks` and `waiting` exit 5 when `--limit` cut the listing short**, and
+  both print `truncated`, as the exit-status table says.
+- **A store the plane was built without is 501 on every operator route** —
+  halts, live runs and push re-arm answered 500 or 409, and a task decision or
+  an event delivery answered 409.
+- **MCP task ids over stdio are documented as bearer capabilities**: no host
+  is authenticated on a pipe and a task outlives its session.
+- **A stop on a resumed run unwinds with the recorded outputs, in reverse
+  completion order.** The cancellation and withdrawal checks wait for the
+  resume's frontier, so replayed steps refill what the unwind reads; a ready
+  set holding recorded and new steps replays the recorded ones first.
+- **Recovery finishes a concluded run instead of resuming it**, with or
+  without a quota store: it seals or releases the lease. A compensated run no
+  longer fails recovery every lease period.
+- **A resume registers the run first** — its case membership and outbox
+  destinations — so an admission that failed or died partway is watched once
+  it runs. **BREAKING:** case attachment follows the admission append, and
+  `CaseStore::detach_run` is removed; a registration refused after the append
+  concludes the run `failed`.
+- **A plane with no case store refuses to resume a case-bound run**
+  (`RuntimeError::NoCaseStore`), whose records would otherwise sit outside the
+  case erasure reaches. A stop or a delivered answer on such a plane is
+  recorded and left to a plane with one, as with no provider.
+- **A successor plan the build cannot read refuses the resume** instead of
+  being skipped, which shifted every later replan.
+- **A no-op resume under a quota appends nothing.** A resume's quota pass
+  marker rides its first append, so a resume reaching the conclusion the run
+  holds writes neither a marker nor a second conclusion, and the run's last
+  record stays its conclusion. When that append is a conclusion, the marker
+  goes just before it, so the conclusion names the head it sits on.
+- **BREAKING: `restore` refuses a store already holding any run in the file**,
+  or one that seals as it writes (new required `JournalStore::seals`), before
+  writing, and checks every rebuilt record's hash against the file's; a
+  retried partial restore appended open runs a second time.
+- **The in-flight walk pages by run id** (**BREAKING:** new
+  `JournalStore::runs_by_id`), so a run appending mid-walk is still exported.
+- **Export reads log positions in one pass** (`JournalStore::log_positions`,
+  defaulted) instead of rereading the whole log per run.
+- **A sealed Postgres journal lends its transaction**, sealing the group's
+  records inside it; every atomic group on a sealed plane was refused.
+- **A sealed append hands back the plaintext it was given** rather than
+  re-opening its own ciphertext, so a KMS failure after commit no longer
+  reports a committed write as failed. A sealed text payload that opens to
+  non-UTF-8 is an error, not a silent sealed field.
+- **BREAKING: `export::to_jsonl` takes the case store**, and records naming
+  cases in a file with no case block are a finding, as in the second reader.
+- **BREAKING: an export under an unknown `canon` is unverifiable**: both
+  readers stop at the header (`VerifyReport::unverifiable`), and `restore`
+  refuses it before opening the store; `verify`, `restore` and
+  `tools/verify_export.py` exit 6, `restore` only for a header of this format
+  version. Before, Rust rehashed with SHA-256.
+- **Both backends refuse to seal a run whose last record is not its
+  conclusion**; an empty run sealed the zero digest into the log.
+- **`tools/verify_export.py`** refuses a lone surrogate, compares bodies type
+  for type, requires the first `seq` to be 1 and `placed_at` to be RFC 3339,
+  and exits 4 for a file it cannot read, as `agentplane verify` does; the Rust
+  reader refuses a hold with an unknown member.
+- **A key the ring refuses after an expiry, cascade or `forget_subject` erased
+  its rows is owed** by `EncryptedMemoryStore` and destroyed by its next
+  erasure verb, which fails while it cannot; a retry found nothing to erase and
+  the key survived.
+- **Postgres timers** carry `CHECK (>= 0)` and a `(tenant, fire_at)` index.
+- **`RedbStore::tamper_for_test` and `delete_run_for_test` need `testkit`.**
+
 ## [0.45.0] — 2026-09-29
 
 ### Security

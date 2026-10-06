@@ -312,6 +312,9 @@ impl JournalStore for Faulty {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
+    fn seals(&self) -> bool {
+        self.inner.seals()
+    }
 
     /// The wrapped store's atomic capability, passed through undamaged.
     ///
@@ -432,6 +435,13 @@ impl JournalStore for Faulty {
         self.inner.count_by_outcome(outcome).await
     }
 
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        self.inner.runs_by_id(after, limit).await
+    }
     async fn recent_runs(
         &self,
         after: Option<(u64, RunId)>,
@@ -517,6 +527,17 @@ impl JournalStore for Faulty {
         self.inner.inclusion_proof(run).await
     }
 
+    async fn inclusion_proof_at(
+        &self,
+        run: RunId,
+        size: u64,
+    ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
+        if self.schedule.leafless.contains(&run) {
+            return Ok(None);
+        }
+        self.inner.inclusion_proof_at(run, size).await
+    }
+
     // Stop requests pass through unfaulted. The schedule injects faults on
     // *appends*, because that is where a lost commit changes what the runtime
     // may conclude; a dropped stop request is an operator retrying a click.
@@ -568,6 +589,9 @@ mod tests {
         fn is_shared(&self) -> bool {
             true
         }
+        fn seals(&self) -> bool {
+            false
+        }
         fn atomic(&self) -> Option<&dyn crate::journal::AtomicJournal> {
             Some(self)
         }
@@ -597,6 +621,9 @@ mod tests {
             unreachable!("the test reads capabilities only")
         }
         async fn forget_admissions(&self, _: crate::core::Timestamp) -> Result<usize, StoreError> {
+            unreachable!("the test reads capabilities only")
+        }
+        async fn runs_by_id(&self, _: Option<RunId>, _: usize) -> Result<Vec<RunId>, StoreError> {
             unreachable!("the test reads capabilities only")
         }
         async fn recent_runs(

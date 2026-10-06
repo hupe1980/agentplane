@@ -268,7 +268,9 @@ async fn a_halt_mid_batch_stops_the_pass_without_failing_the_items() {
         "a halted plane performed work"
     );
 
-    rt.lift_halt(&HaltScope::Tenant).await.expect("lift");
+    rt.lift_halt(&HaltScope::Tenant, &operator("ops"), test_instant())
+        .await
+        .expect("lift");
     let report = rt
         .run_batch(id, &spec)
         .await

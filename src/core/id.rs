@@ -242,6 +242,24 @@ macro_rules! ulid_newtype {
                 write!(f, "{self}")
             }
         }
+
+        /// The written form: the prefix, an underscore, and a ULID.
+        impl schemars::JsonSchema for $name {
+            fn inline_schema() -> bool {
+                true
+            }
+
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($name).into()
+            }
+
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({
+                    "type": "string",
+                    "pattern": concat!("^", $prefix, "_[0-9A-HJKMNP-TV-Z]{26}$"),
+                })
+            }
+        }
     };
 }
 
@@ -269,7 +287,19 @@ ulid_newtype!(
 );
 
 /// Position of a step within a plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct StepId(pub u32);
 
@@ -355,6 +385,21 @@ impl Serialize for Digest {
     }
 }
 
+/// Lowercase hex, 64 digits.
+impl schemars::JsonSchema for Digest {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Digest".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({ "type": "string", "pattern": "^[0-9a-f]{64}$" })
+    }
+}
+
 impl<'de> Deserialize<'de> for Digest {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -375,7 +420,9 @@ impl<'de> Deserialize<'de> for Digest {
 ///
 /// Skills never construct these: the runtime derives the key from the effect's
 /// descriptor plus its position, so a skill cannot forge or collide one.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(transparent)]
 pub struct EffectKey(Digest);
 
@@ -385,7 +432,19 @@ pub struct EffectKey(Digest);
 /// and once again in reverse when a later step fails and the saga unwinds. The
 /// two are different work with different effects, and the journal has to be
 /// able to tell them apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
     /// Doing the work.

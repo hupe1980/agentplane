@@ -441,8 +441,10 @@ fn the_peer_is_part_of_the_effect_identity() {
 
 // ── Credentials never reach the journal ─────────────────────────────────────
 
-use agentplane::core::Timestamp;
-use agentplane::peers::{Cached, CredentialError, CredentialSource, Fixed, TokenExchange};
+use agentplane::core::{CredentialBinding, Timestamp};
+use agentplane::journal::RecordKind;
+use agentplane::peers::{Asker, Cached, CredentialError, CredentialSource, TokenExchange};
+use agentplane::quota::{HaltScope, QuotaStore, TenantQuota};
 use std::time::Duration;
 
 fn ts(secs: i64) -> Timestamp {
@@ -451,30 +453,69 @@ fn ts(secs: i64) -> Timestamp {
 
 const SECRET: &str = "tok_supersecret_do_not_journal";
 
-#[derive(Debug)]
+/// The plane's own credential for a subject-bound peer.
+const PLANE_TOKEN: &str = "tok_the_planes_own";
+
+fn alice() -> Delegation {
+    Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])))
+}
+
+fn bob() -> Delegation {
+    Delegation::root(Principal::new("user:bob", Scope::of(["audit.*"])))
+}
+
+/// A token endpoint that records what it was asked for.
+#[derive(Debug, Default)]
 struct Issuer {
-    exchanges: Mutex<usize>,
+    /// Every exchange, as (audience, subject).
+    asked: Mutex<Vec<(String, String)>>,
     expires_at: Option<Timestamp>,
     /// Hand back a token bound to *this* audience, whatever was asked for.
     misbind_to: Option<PeerId>,
+    /// Hand back a token naming *this* subject, whatever was asked for.
+    misname_as: Option<String>,
+    /// Refuse every exchange as unreachable.
+    down: bool,
 }
 
 impl Issuer {
     fn new(expires_at: Option<Timestamp>) -> Arc<Self> {
         Arc::new(Self {
-            exchanges: Mutex::new(0),
             expires_at,
-            misbind_to: None,
+            ..Self::default()
         })
     }
+
+    fn exchanges(&self) -> usize {
+        self.asked.lock().unwrap().len()
+    }
+}
+
+/// The token an issuer mints for `subject`.
+fn token_for(subject: &str) -> String {
+    format!("{SECRET}:{subject}")
 }
 
 #[async_trait::async_trait]
 impl TokenExchange for Issuer {
-    async fn exchange(&self, audience: &PeerId) -> Result<PeerCredential, CredentialError> {
-        *self.exchanges.lock().unwrap() += 1;
+    async fn exchange(
+        &self,
+        audience: &PeerId,
+        subject: &str,
+    ) -> Result<PeerCredential, CredentialError> {
+        self.asked
+            .lock()
+            .unwrap()
+            .push((audience.to_string(), subject.to_owned()));
+        if self.down {
+            return Err(CredentialError::Unavailable {
+                audience: audience.clone(),
+                detail: "connection refused".into(),
+            });
+        }
         let bound_to = self.misbind_to.clone().unwrap_or_else(|| audience.clone());
-        let mut c = PeerCredential::for_audience(bound_to, SECRET);
+        let named = self.misname_as.as_deref().unwrap_or(subject);
+        let mut c = PeerCredential::for_subject(bound_to, named, token_for(named));
         if let Some(at) = self.expires_at {
             c = c.expiring_at(at);
         }
@@ -482,45 +523,162 @@ impl TokenExchange for Issuer {
     }
 }
 
-#[derive(Debug)]
-struct Calls {
-    registry: PeerRegistry,
-    client: Arc<Spy>,
-    source: Arc<dyn CredentialSource>,
+/// A reviewer told who each call is for, holding the plane's own credential
+/// beside its source.
+fn subject_bound(issuer: &Arc<Issuer>) -> PeerRegistry {
+    PeerRegistry::new().allow(
+        reviewer(),
+        PeerGrant::new(Scope::of(["audit.*"]))
+            .read_only()
+            .with_credential(
+                &reviewer(),
+                PeerCredential::for_audience(reviewer(), PLANE_TOKEN),
+            )
+            .with_source(Arc::new(Cached::new(
+                Arc::clone(issuer) as Arc<dyn TokenExchange>
+            ))),
+    )
 }
 
-#[async_trait::async_trait]
-impl Skill for Calls {
-    fn descriptor(&self) -> SkillDescriptor {
-        SkillDescriptor::new("review").provides("review")
+/// A plane wired to `registry`, acting for `user:hupe` as its own chain.
+fn wired(registry: PeerRegistry, spy: &Arc<Spy>, skill: impl Skill + 'static) -> Arc<Runtime> {
+    let store = store();
+    Runtime::builder(store)
+        .owner("peers")
+        .acting_as(owner())
+        .peers(registry, Arc::clone(spy) as Arc<dyn PeerClient>)
+        .skill(skill)
+        .build()
+}
+
+async fn run_for(
+    rt: &Runtime,
+    capability: &str,
+    chain: Delegation,
+) -> agentplane::runtime::RunOutcome {
+    rt.run_under(
+        capability,
+        Tainted::trusted(json!({ "invoice": "INV-1" })),
+        RunTerms::default().acting_as(chain),
+    )
+    .await
+    .expect("admitted")
+    .outcome()
+    .cloned()
+    .expect("fresh")
+}
+
+/// What each hop's announcement recorded about its credential.
+async fn bindings(rt: &Runtime, run: agentplane::core::RunId) -> Vec<Option<CredentialBinding>> {
+    rt.journal()
+        .read(run, 1)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::EffectStarted {
+                descriptor,
+                credential,
+                ..
+            } if descriptor.kind.starts_with("a2a.") => Some(credential.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn sent_tokens(spy: &Spy) -> Vec<Option<String>> {
+    spy.sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|s| s.1.clone())
+        .collect()
+}
+
+/// **The peer sees who each call is for.** Two runs acting for different
+/// people call one peer; the token endpoint is asked twice, once per person,
+/// both times for that peer, and each call presents its own person's token.
+#[tokio::test]
+async fn a_peer_credential_names_the_run_s_subject() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Issuer::new(Some(ts(i64::from(u32::MAX))));
+    let rt = wired(subject_bound(&issuer), &spy, AsksReviewer);
+
+    for chain in [alice(), bob()] {
+        let out = run_for(&rt, "audit.review", chain).await;
+        assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
     }
-    async fn invoke(
-        &self,
-        cx: &mut StepCtx<'_>,
-        _i: Tainted<Value>,
-    ) -> Result<Outcome, SkillError> {
-        let credential = self
-            .source
-            .credential(&reviewer(), ts(1_000))
-            .await
-            .map_err(|e| SkillError::Other(e.to_string()))?;
 
-        let call = PeerCall::prepare_with_credential(
-            &self.registry,
-            Arc::clone(&self.client) as Arc<dyn PeerClient>,
-            &auditor(),
+    assert_eq!(
+        issuer.asked.lock().unwrap().as_slice(),
+        &[
+            ("reviewer.example".to_owned(), "user:alice".to_owned()),
+            ("reviewer.example".to_owned(), "user:bob".to_owned()),
+        ],
+        "each exchange must name the run's owner and the peer as audience"
+    );
+    assert_eq!(
+        sent_tokens(&spy),
+        vec![Some(token_for("user:alice")), Some(token_for("user:bob"))],
+    );
+}
+
+/// **The binding is on the record, and the token is not.** A subject-bound
+/// hop's announcement names its subject and audience; a hop to a peer holding
+/// only a static credential says it named nobody; and no byte of any token is
+/// anywhere in the journal.
+#[tokio::test]
+async fn a_subject_bound_hop_records_its_subject_and_audience() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Issuer::new(None);
+    let rt = wired(subject_bound(&issuer), &spy, AsksReviewer);
+    let out = run_for(&rt, "audit.review", alice()).await;
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+    assert_eq!(
+        bindings(&rt, out.run_id).await,
+        vec![Some(CredentialBinding::Subject {
+            audience: "reviewer.example".into(),
+            subject: "user:alice".into(),
+        })],
+    );
+
+    let static_spy = Arc::new(Spy::default());
+    let static_rt = wired(
+        PeerRegistry::new().allow(
             reviewer(),
-            "audit.check",
-            json!({ "invoice": "INV-1" }),
-            Some(credential),
-        )
-        .map_err(|e| SkillError::Other(e.to_string()))?;
+            PeerGrant::new(Scope::of(["audit.*"])).with_credential(
+                &reviewer(),
+                PeerCredential::for_audience(reviewer(), SECRET),
+            ),
+        ),
+        &static_spy,
+        AsksReviewer,
+    );
+    let unbound = run_for(&static_rt, "audit.review", alice()).await;
+    assert!(
+        matches!(unbound.status, RunStatus::Succeeded),
+        "{unbound:?}"
+    );
+    assert_eq!(
+        bindings(&static_rt, unbound.run_id).await,
+        vec![Some(CredentialBinding::Unbound {
+            audience: "reviewer.example".into(),
+        })],
+        "a static credential names nobody, and the record must say so"
+    );
 
-        // The payload is what reaches the peer, so it is bound at the sink.
-        let out = cx
-            .sink(call, &Tainted::trusted(json!({ "invoice": "INV-1" })))
-            .await?;
-        Ok(Outcome::done(out))
+    for (rt, run) in [(&rt, out.run_id), (&static_rt, unbound.run_id)] {
+        for r in &rt.journal().read(run, 1).await.unwrap() {
+            let raw = String::from_utf8_lossy(r.raw());
+            assert!(
+                !raw.contains(SECRET),
+                "a bearer token reached record {} ({}). The journal is permanent \
+                 and hash-chained: this secret could never be redacted, only \
+                 discovered.",
+                r.seq(),
+                r.kind().kind_str()
+            );
+        }
     }
 }
 
@@ -530,41 +688,26 @@ impl Skill for Calls {
 /// append-only, hash-chained and permanent: a bearer token written into an
 /// `EffectDone` record cannot be redacted later, because the record's hash covers
 /// it and the chain would break. So the check is not "did we remember to omit
-/// it" — it is a scan of every byte the run wrote.
+/// it" — it is a scan of every byte the run wrote, after a hop that obtained a
+/// credential for its subject.
 #[tokio::test]
 async fn a_credential_is_presented_to_the_peer_and_never_written_to_the_journal() {
-    let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let spy = Arc::new(Spy::default());
-    let issuer = Issuer::new(Some(ts(9_999)));
-
-    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
-        .skill(Calls {
-            registry: PeerRegistry::new()
-                .allow(reviewer(), PeerGrant::new(Scope::of(["audit.check"]))),
-            client: Arc::clone(&spy),
-            source: Arc::new(Cached::new(issuer as Arc<dyn TokenExchange>)),
-        })
-        .build()
-        .run("review", Tainted::trusted(json!({})))
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(out.status, RunStatus::Succeeded),
-        "{:?}",
-        out.status
-    );
+    let issuer = Issuer::new(Some(ts(i64::from(u32::MAX))));
+    let rt = wired(subject_bound(&issuer), &spy, AsksReviewer);
+    let out = run_for(&rt, "audit.review", alice()).await;
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
 
     // It really was presented.
     assert_eq!(
-        spy.sent.lock().unwrap()[0].1.as_deref(),
-        Some(SECRET),
+        sent_tokens(&spy),
+        vec![Some(token_for("user:alice"))],
         "the peer must actually receive the credential, or this test proves \
          nothing about keeping it out of the journal"
     );
 
     // And it is nowhere in the record.
-    let records = store.read(out.run_id, 1).await.unwrap();
+    let records = rt.journal().read(out.run_id, 1).await.unwrap();
     assert!(!records.is_empty(), "the run wrote a journal");
     for r in &records {
         let raw = String::from_utf8_lossy(r.raw());
@@ -576,6 +719,328 @@ async fn a_credential_is_presented_to_the_peer_and_never_written_to_the_journal(
             r.kind().kind_str()
         );
     }
+}
+
+/// **A replay reaches no token endpoint.** The credential is obtained when
+/// the call is performed, which a replay never does.
+#[tokio::test]
+async fn replay_calls_no_token_endpoint() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Issuer::new(None);
+    let rt = wired(subject_bound(&issuer), &spy, AsksReviewer);
+    let out = run_for(&rt, "audit.review", alice()).await;
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+    assert_eq!(issuer.exchanges(), 1);
+
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replays");
+    assert!(
+        matches!(replayed.status, RunStatus::Succeeded),
+        "{replayed:?}"
+    );
+    assert_eq!(
+        issuer.exchanges(),
+        1,
+        "a strict replay asked the token endpoint for a credential"
+    );
+    assert_eq!(spy.sent.lock().unwrap().len(), 1);
+}
+
+/// **An issuer that names somebody else is not taken at its word.** The
+/// credential is refused before anything leaves, as one for another audience
+/// is.
+#[tokio::test]
+async fn a_credential_for_another_subject_is_refused_before_the_call() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Arc::new(Issuer {
+        misname_as: Some("user:mallory".into()),
+        ..Issuer::default()
+    });
+    let rt = wired(subject_bound(&issuer), &spy, AsksReviewer);
+    let out = run_for(&rt, "audit.review", alice()).await;
+    assert!(
+        matches!(&out.status, RunStatus::Failed(reason)
+            if reason.contains("'user:mallory'") && reason.contains("'user:alice'")),
+        "{out:?}"
+    );
+    assert!(
+        spy.sent.lock().unwrap().is_empty(),
+        "a credential naming somebody else was presented"
+    );
+}
+
+/// **An issuer outage is a refusal, not doubt.** Nothing was sent, so the
+/// call failed cleanly rather than leaving the run in doubt about a call
+/// that never left.
+#[tokio::test]
+async fn an_issuer_outage_fails_the_call_without_doubt() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Arc::new(Issuer {
+        down: true,
+        ..Issuer::default()
+    });
+    // Mutating and operator-resolved, so a call in doubt would quarantine.
+    let registry = PeerRegistry::new().allow(
+        reviewer(),
+        PeerGrant::new(Scope::of(["audit.*"])).with_source(Arc::new(Cached::new(
+            Arc::clone(&issuer) as Arc<dyn TokenExchange>,
+        ))),
+    );
+    let rt = wired(registry, &spy, AsksReviewer);
+    let out = run_for(&rt, "audit.review", alice()).await;
+    assert!(
+        matches!(&out.status, RunStatus::Failed(reason) if reason.contains("connection refused")),
+        "an outage before the call is not a call in doubt: {out:?}"
+    );
+    let failed: Vec<Disposition> = rt
+        .journal()
+        .read(out.run_id, 1)
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|r| match r.kind() {
+            RecordKind::EffectFailed { disposition, .. } => Some(*disposition),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed, vec![Disposition::DidNotHappen]);
+    assert!(spy.sent.lock().unwrap().is_empty(), "nothing may have left");
+}
+
+/// A skill that asks the reviewer, then polls a task there.
+#[derive(Debug)]
+struct AsksThenPolls;
+
+#[async_trait::async_trait]
+impl Skill for AsksThenPolls {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("audit.poll").provides("audit.poll")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        if cx.acting_as().is_some() {
+            cx.call_peer(&reviewer(), "audit.check", &input).await?;
+        }
+        let snapshot = cx
+            .peer_task(PeerTask {
+                peer: reviewer(),
+                id: "remote-task-42".to_owned(),
+                context_id: None,
+            })
+            .await?;
+        Ok(Outcome::done(snapshot.map(|s| {
+            serde_json::to_value(s).expect("task snapshot serializes")
+        })))
+    }
+}
+
+/// **A task read presents the same person's credential as its call.** The
+/// read reaches the same peer, and a read under the plane's credential would
+/// tell the peer nobody asked.
+#[tokio::test]
+async fn a_remote_task_poll_names_the_same_subject_as_its_call() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Issuer::new(None);
+    let rt = wired(subject_bound(&issuer), &spy, AsksThenPolls);
+    let out = run_for(&rt, "audit.poll", alice()).await;
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+    assert_eq!(sent_tokens(&spy), vec![Some(token_for("user:alice"))]);
+    assert_eq!(
+        spy.task_reads.lock().unwrap()[0].2.as_deref(),
+        Some(token_for("user:alice").as_str()),
+        "the task read did not present the run's owner's credential"
+    );
+    assert_eq!(
+        issuer.exchanges(),
+        1,
+        "the read reuses the call's credential"
+    );
+}
+
+/// **A run that acts for nobody is refused a subject-bound peer** — never
+/// served with the credential held beside the source. A served caller that
+/// presented no chain acts under none, whatever the plane's own chain is.
+#[tokio::test]
+async fn a_chainless_served_run_is_refused_a_subject_bound_peer() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Issuer::new(None);
+    let rt = wired(subject_bound(&issuer), &spy, AsksThenPolls);
+    let out = rt
+        .run_under(
+            "audit.poll",
+            Tainted::trusted(json!({})),
+            RunTerms::default().served(None),
+        )
+        .await
+        .expect("admitted")
+        .outcome()
+        .cloned()
+        .expect("fresh");
+    assert!(
+        matches!(&out.status, RunStatus::Failed(reason) if reason.contains("acts for nobody")),
+        "{out:?}"
+    );
+    assert!(
+        spy.task_reads.lock().unwrap().is_empty(),
+        "a run acting for nobody reached the peer under the plane's credential"
+    );
+    assert_eq!(issuer.exchanges(), 0);
+}
+
+/// **A run admitted as the plane presents the plane's own credential,** and
+/// the record says the plane asked — never a credential naming the plane's
+/// owner as if that person had.
+#[tokio::test]
+async fn a_run_admitted_as_the_plane_presents_no_subject_bound_credential() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Issuer::new(None);
+    let rt = wired(subject_bound(&issuer), &spy, AsksReviewer);
+    let out = rt
+        .run("audit.review", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+    assert_eq!(issuer.exchanges(), 0, "the plane's owner was exchanged for");
+    assert_eq!(sent_tokens(&spy), vec![Some(PLANE_TOKEN.to_owned())]);
+    assert_eq!(
+        bindings(&rt, out.run_id).await,
+        vec![Some(CredentialBinding::Plane {
+            audience: "reviewer.example".into(),
+        })],
+    );
+
+    // Without a credential of its own for the peer, the plane's run is
+    // refused rather than served one naming its owner.
+    let bare = Arc::new(Spy::default());
+    let rt = wired(
+        PeerRegistry::new().allow(
+            reviewer(),
+            PeerGrant::new(Scope::of(["audit.*"]))
+                .with_source(Arc::new(Cached::new(
+                    Arc::clone(&issuer) as Arc<dyn TokenExchange>
+                ))),
+        ),
+        &bare,
+        AsksReviewer,
+    );
+    let refused = rt
+        .run("audit.review", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    assert!(
+        matches!(&refused.status, RunStatus::Failed(reason) if reason.contains("plane's own")),
+        "{refused:?}"
+    );
+    assert!(bare.sent.lock().unwrap().is_empty());
+    assert_eq!(issuer.exchanges(), 0);
+}
+
+/// Asks the reviewer, withdraws its own owner once, and asks again.
+#[derive(Debug)]
+struct AsksAcrossAWithdrawal(Arc<dyn QuotaStore>, std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl Skill for AsksAcrossAWithdrawal {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("audit.twice").provides("audit.twice")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.call_peer(&reviewer(), "audit.check", &input).await?;
+        // Thrown once, from inside the step, so the second hop is in a step
+        // that began before the halt.
+        if !self.1.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.0
+                .set_halt(
+                    &HaltScope::subject("user:alice"),
+                    &agentplane::core::Operator::asserted("ops").expect("operator"),
+                    ts(1_700_000_000),
+                    "credential withdrawn: laptop lost",
+                )
+                .await
+                .expect("withdraw mid-step");
+        }
+        let answer = cx.call_peer(&reviewer(), "audit.check", &input).await?;
+        Ok(Outcome::done(answer))
+    }
+}
+
+/// **A withdrawn owner's credential is not presented — not even one already
+/// held, inside a step begun before the halt.** The hop is refused before it
+/// is announced, the held credential is dropped, and the run is paused as a
+/// withdrawal at a step boundary pauses it. Lifted, the run continues and the
+/// hop exchanges afresh; a strict replay then reads the continuation.
+#[tokio::test]
+async fn a_withdrawn_subjects_credential_is_not_presented() {
+    let spy = Arc::new(Spy::default());
+    let issuer = Issuer::new(None);
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .owner("peers")
+        .quota(
+            Arc::clone(&store) as Arc<dyn QuotaStore>,
+            TenantQuota::default(),
+        )
+        .peers(
+            subject_bound(&issuer),
+            Arc::clone(&spy) as Arc<dyn PeerClient>,
+        )
+        .skill(AsksAcrossAWithdrawal(
+            Arc::clone(&store) as Arc<dyn QuotaStore>,
+            std::sync::atomic::AtomicBool::new(false),
+        ))
+        .build();
+    let out = run_for(&rt, "audit.twice", alice()).await;
+
+    match &out.status {
+        RunStatus::Withheld { subject, reason } => {
+            assert_eq!(subject, "user:alice");
+            assert!(reason.contains("laptop lost"), "{reason}");
+        }
+        other => panic!("a withdrawn owner's credential went on being presented: {other:?}"),
+    }
+    assert_eq!(
+        spy.sent.lock().unwrap().len(),
+        1,
+        "the hop after the halt reached the peer"
+    );
+    assert_eq!(issuer.exchanges(), 1, "the refused hop exchanged");
+    assert_eq!(
+        bindings(&rt, out.run_id).await.len(),
+        1,
+        "the refused hop was announced"
+    );
+
+    rt.lift_halt(
+        &HaltScope::subject("user:alice"),
+        &agentplane::core::Operator::asserted("ops").expect("operator"),
+        ts(1_700_000_100),
+    )
+    .await
+    .expect("lift");
+    let resumed = rt.replay(out.run_id, Mode::Resume).await.expect("resumes");
+    assert!(
+        matches!(resumed.status, RunStatus::Succeeded),
+        "{resumed:?}"
+    );
+    assert_eq!(spy.sent.lock().unwrap().len(), 2);
+    assert_eq!(
+        issuer.exchanges(),
+        2,
+        "the withdrawn owner's credential was still held after the halt"
+    );
+
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replays");
+    assert!(
+        matches!(replayed.status, RunStatus::Succeeded),
+        "a strict replay stopped at the superseded withholding: {replayed:?}"
+    );
+    assert_eq!(spy.sent.lock().unwrap().len(), 2);
 }
 
 #[derive(Debug)]
@@ -603,6 +1068,7 @@ impl Skill for PollsRemoteTask {
                 id: "remote-task-42".to_owned(),
                 context_id: Some("matter-1".to_owned()),
             },
+            Asker::Nobody,
         )
         .map_err(|error| SkillError::Other(error.to_string()))?;
         let snapshot = cx.effect(call).await?;
@@ -633,6 +1099,7 @@ async fn a_remote_task_poll_is_journaled_and_replay_does_not_poll_again() {
             id: "trust-probe".to_owned(),
             context_id: None,
         },
+        Asker::Nobody,
     )
     .unwrap();
     assert_eq!(trust_probe.trust(), Trust::Untrusted);
@@ -666,7 +1133,7 @@ async fn a_remote_task_poll_is_journaled_and_replay_does_not_poll_again() {
     );
 }
 
-// ── Freshness ───────────────────────────────────────────────────────────────
+// ── Freshness and the cache ─────────────────────────────────────────────────
 
 /// A credential that expires inside the skew margin is refreshed, not sent.
 ///
@@ -680,7 +1147,7 @@ async fn a_credential_expiring_within_the_margin_is_replaced() {
         Cached::new(Arc::clone(&issuer) as Arc<dyn TokenExchange>).skew(Duration::from_mins(1));
 
     let err = cached
-        .credential(&reviewer(), ts(1_000))
+        .credential(&reviewer(), "user:alice", ts(1_000))
         .await
         .expect_err("30s of life left, 60s of margin");
     assert!(matches!(err, CredentialError::Stale { .. }), "got {err:?}");
@@ -694,15 +1161,52 @@ async fn a_live_credential_is_cached() {
 
     for _ in 0..3 {
         cached
-            .credential(&reviewer(), ts(1_000))
+            .credential(&reviewer(), "user:alice", ts(1_000))
             .await
             .expect("usable");
     }
     assert_eq!(
-        *issuer.exchanges.lock().unwrap(),
+        issuer.exchanges(),
         1,
         "a token endpoint is not free, and re-exchanging per call is how one gets \
          rate-limited at the worst moment"
+    );
+}
+
+/// **The cache never lends one person's credential to another.** Interleaved
+/// requests for two subjects at one audience each get their own, and each is
+/// still reused for its own subject.
+#[tokio::test]
+async fn a_cached_credential_is_never_lent_to_another_subject() {
+    let issuer = Issuer::new(Some(ts(9_999)));
+    let cached = Cached::new(Arc::clone(&issuer) as Arc<dyn TokenExchange>);
+
+    for subject in ["user:alice", "user:bob", "user:alice", "user:bob"] {
+        let c = cached
+            .credential(&reviewer(), subject, ts(1_000))
+            .await
+            .expect("usable");
+        assert_eq!(
+            c.subject(),
+            Some(subject),
+            "a credential obtained for one person was presented for another"
+        );
+    }
+    assert_eq!(issuer.exchanges(), 2, "one exchange per person");
+
+    cached.forget("user:alice");
+    cached
+        .credential(&reviewer(), "user:bob", ts(1_000))
+        .await
+        .expect("usable");
+    cached
+        .credential(&reviewer(), "user:alice", ts(1_000))
+        .await
+        .expect("usable");
+    assert_eq!(
+        issuer.exchanges(),
+        3,
+        "forgetting one person dropped exactly their credential"
     );
 }
 
@@ -710,14 +1214,14 @@ async fn a_live_credential_is_cached() {
 #[tokio::test]
 async fn a_token_bound_to_the_wrong_audience_is_refused() {
     let issuer = Arc::new(Issuer {
-        exchanges: Mutex::new(0),
         expires_at: Some(ts(9_999)),
         misbind_to: Some(settlement()),
+        ..Issuer::default()
     });
     let cached = Cached::new(issuer as Arc<dyn TokenExchange>);
 
     let err = cached
-        .credential(&reviewer(), ts(1_000))
+        .credential(&reviewer(), "user:alice", ts(1_000))
         .await
         .expect_err("the issuer bound it to settlement");
     assert!(
@@ -725,17 +1229,6 @@ async fn a_token_bound_to_the_wrong_audience_is_refused() {
         "an issuer that ignores the resource indicator hands back a token the \
          peer can spend elsewhere: {err:?}"
     );
-}
-
-/// A fixed credential still respects the binding.
-#[tokio::test]
-async fn a_fixed_source_will_not_hand_over_another_peers_credential() {
-    let fixed = Fixed::new(PeerCredential::for_audience(settlement(), SECRET));
-    let err = fixed
-        .credential(&reviewer(), ts(1_000))
-        .await
-        .expect_err("bound to settlement");
-    assert!(matches!(err, CredentialError::WrongAudience { .. }));
 }
 
 /// A credential with no stated expiry is usable.

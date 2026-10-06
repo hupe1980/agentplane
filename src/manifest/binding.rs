@@ -196,6 +196,96 @@ impl<'de> Deserialize<'de> for MemorySubject {
     }
 }
 
+/// A data-subject binding as a manifest declares it: whose data a run takes
+/// in.
+///
+/// The memory-subject grammar without the literal — a constant would
+/// attribute every run's intake to one party — and without `$correlation`: a
+/// correlation key is clear by design in `CaseBound`, `RunSuspended` and the
+/// case store, so a subject read from one would be sealed in one record and
+/// left in the clear in three, and an erasure would leave the identifier
+/// behind. A party's identifier is read from the input instead. Unlike a
+/// memory subject, an
+/// `$input` binding may read an untrusted field: it attributes and decides
+/// nothing, so a value naming the wrong party produces a false listing, never
+/// a write into another party's pile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataSubject(MemorySubject);
+
+impl DataSubject {
+    /// Parse the manifest spelling.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the spelling, for a literal or any spelling
+    /// [`MemorySubject::parse`] refuses.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match MemorySubject::parse(raw)? {
+            MemorySubject::Literal(_) => Err(format!(
+                "'{raw}' is a literal, and a data subject is read from the run — \
+                 '$input/<pointer>' or '$case'. A constant would attribute every run's \
+                 data to one party"
+            )),
+            MemorySubject::Correlation(_) => Err(format!(
+                "'{raw}' reads a correlation key, which every case record holds in the \
+                 clear, so the subject could not be sealed or erased — bind it with \
+                 '$input/<pointer>' and correlate on an opaque key"
+            )),
+            bound => Ok(Self(bound)),
+        }
+    }
+
+    /// The binding as the run's `DataSubjectBound` record names it.
+    #[must_use]
+    pub fn binding(&self) -> crate::journal::SubjectBinding {
+        use crate::journal::SubjectBinding;
+        match &self.0 {
+            MemorySubject::Input(pointer) => SubjectBinding::Input {
+                pointer: pointer.clone(),
+            },
+            // `parse` refuses a literal and a correlation key, so the last two
+            // patterns name no value.
+            MemorySubject::Case | MemorySubject::Correlation(_) | MemorySubject::Literal(_) => {
+                SubjectBinding::Case
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for DataSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Serialize for DataSubject {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DataSubject {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(D::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for DataSubject {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "DataSubject".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": "^\\$(case|input(/.*)?)$",
+            "description": "Whose data a run takes in: `$input/<RFC 6901 pointer>` \
+                            or `$case`. A literal and a correlation key are refused."
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

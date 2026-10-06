@@ -272,7 +272,7 @@ fn plane(
 async fn export(store: &Arc<RedbStore>, runs: &[RunId]) -> Vec<u8> {
     let journal = Arc::clone(store) as Arc<dyn JournalStore>;
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&journal, None, runs, &mut out)
+    agentplane::export::to_jsonl(&journal, &crate::no_cases(), runs, &mut out)
         .await
         .expect("export");
     out
@@ -616,6 +616,7 @@ fn admitted(run: RunId, input: Value) -> Append {
             idempotency_key: None,
             admitted_by: None,
             served_unchained: false,
+            plane_chain: false,
         },
     )
 }
@@ -637,6 +638,8 @@ fn started(run: RunId, step: u32, phase: Phase, ordinal: u32, kind: &str, args: 
             backoff_ms: 0,
             outbound_label: None,
             outbound_bytes: None,
+            content_rules: None,
+            credential: None,
         },
     )
     .step(StepId(step))
@@ -786,6 +789,15 @@ async fn a_manifest_or_sink_refusal_is_not_judged() {
             Append::new(
                 run,
                 RecordKind::PolicyDenied {
+                    reason: "content rule 'codename' refused the value at '/q'".into(),
+                    action: agentplane::core::ACTION_CONTENT.into(),
+                    resource: "model.complete".into(),
+                },
+            )
+            .step(StepId(0)),
+            Append::new(
+                run,
+                RecordKind::PolicyDenied {
                     reason: "rule `no-transfer` forbids it".into(),
                     action: ACTION_PERFORM.into(),
                     resource: "ledger.transfer".into(),
@@ -904,6 +916,7 @@ async fn a_sealed_and_an_erased_run_are_not_evaluable_for_their_own_reasons() {
     }
     agentplane::blob::erase_run(
         ring.as_ref(),
+        None,
         &tenant,
         runs[1],
         Timestamp::from_unix_timestamp(1_760_000_000).unwrap(),
@@ -913,7 +926,7 @@ async fn a_sealed_and_an_erased_run_are_not_evaluable_for_their_own_reasons() {
     .unwrap();
 
     let mut file = Vec::new();
-    agentplane::export::to_jsonl(&journal, None, &runs, &mut file)
+    agentplane::export::to_jsonl(&journal, &crate::no_cases(), &runs, &mut file)
         .await
         .unwrap();
 

@@ -293,7 +293,9 @@ async fn halt_the_front_door() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    one.lift_halt(&HaltScope::Tenant).await?;
+    // Lifting is recorded too: the journal names who let the work start again.
+    one.lift_halt(&HaltScope::Tenant, &operator("ops-dave"), test_instant())
+        .await?;
     let lifted = two.run("desk.ack", Tainted::trusted(json!({}))).await?;
     println!(
         "   lifted     → instance two admits again ({})",

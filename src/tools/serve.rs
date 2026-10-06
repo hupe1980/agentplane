@@ -88,14 +88,108 @@ pub enum ServeError {
     /// holding a chain of its own never builds for itself.
     #[error("the policy set cannot evaluate a run a host admits: {problems}")]
     PolicyUnevaluable { problems: String },
+    /// Protected-resource metadata was asked for naming no authorization
+    /// server, which the specification forbids and no client can act on.
+    #[error(
+        "protected-resource metadata must name at least one authorization server whose \
+         tokens this plane verifies"
+    )]
+    NoAuthorizationServer,
 }
 
-/// The `source` every admission this surface makes is keyed under.
+/// The `source` an unauthenticated (stdio) admission is keyed under.
 ///
 /// What makes a run this surface's: `tasks/get` and `tasks/cancel` act only on
-/// runs whose admission key carries it, so a task id is not a handle on
-/// whatever the plane happens to be running.
+/// runs whose admission key carries the asker's source, so a task id is not a
+/// handle on whatever the plane happens to be running. An authenticated
+/// caller's source is `mcp/peer:<actor>` instead.
 const ADMISSION_SOURCE: &str = "mcp/client";
+
+/// Prefixed to an authenticated caller's provenance source to make its
+/// admission source — this surface's own namespace, as A2A has `a2a/`.
+const CALLER_NAMESPACE: &str = "mcp/";
+
+/// Actions this surface asks the policy engine about, for an authenticated
+/// caller. Over stdio there is no principal to ask about.
+pub mod action {
+    pub const TOOL_LIST: &str = "mcp:tool.list";
+    /// Asked on the tool's name.
+    pub const TOOL_CALL: &str = "mcp:tool.call";
+    pub const TASK_READ: &str = "mcp:task.read";
+    pub const TASK_CANCEL: &str = "mcp:task.cancel";
+    /// `prompts/list` and `prompts/get`.
+    pub const PROMPT_READ: &str = "mcp:prompt.read";
+    /// `resources/list` and `resources/read`.
+    pub const RESOURCE_READ: &str = "mcp:resource.read";
+
+    /// Every action this surface can ask about, so a deployment can enumerate
+    /// what it must write rules for.
+    pub const ALL: &[&str] = &[
+        TOOL_LIST,
+        TOOL_CALL,
+        TASK_READ,
+        TASK_CANCEL,
+        PROMPT_READ,
+        RESOURCE_READ,
+    ];
+}
+
+/// Whether `engine` can evaluate every request this surface puts to an
+/// authenticated caller — one probe per [`action::ALL`] verb, in the context
+/// each is asked under.
+#[must_use]
+pub fn policy_problems(engine: &dyn crate::core::PolicyEngine) -> Vec<String> {
+    let caller = Authenticated {
+        actor: "preflight".to_owned(),
+        source: "peer:preflight".to_owned(),
+        roles: vec!["preflight".to_owned()],
+        tenant: "preflight".to_owned(),
+        acting_as: None,
+    };
+    let context = caller.context();
+    let requests: Vec<crate::core::PolicyRequest<'_>> = action::ALL
+        .iter()
+        .map(|action| crate::core::PolicyRequest {
+            principal: &caller.actor,
+            principal_kind: crate::core::PrincipalKind::Subject,
+            action,
+            resource: "preflight.resource",
+            context: &context,
+        })
+        .collect();
+    engine.preflight(&requests)
+}
+
+/// An authenticated caller, as this surface needs it.
+#[derive(Debug, Clone)]
+struct Authenticated {
+    actor: String,
+    /// The provenance source this caller's data enters under — the one
+    /// spelling every door shares, so a protected field naming a caller
+    /// matches whichever door the value came through.
+    source: String,
+    roles: Vec<String>,
+    tenant: String,
+    acting_as: Option<crate::core::Delegation>,
+}
+
+impl Authenticated {
+    /// What a rule on this surface can key on — the shape A2A asks under.
+    fn context(&self) -> serde_json::Value {
+        serde_json::json!({ "roles": self.roles, "peer": self.actor, "tenant": self.tenant })
+    }
+}
+
+/// Who a request is from, as far as this surface can say.
+#[derive(Debug, Clone)]
+struct Asker {
+    /// The admission key's source — and the owner `our_run` compares.
+    admission: String,
+    /// What the call's input is labelled as coming from.
+    input: String,
+    /// `None` over stdio, where no principal is authenticated.
+    caller: Option<Authenticated>,
+}
 
 /// The request `_meta` key a host sets to make a retried `tools/call` one run.
 ///
@@ -105,10 +199,11 @@ const ADMISSION_SOURCE: &str = "mcp/client";
 /// names the call here; the same value answers with the run it already
 /// admitted.
 ///
-/// **Within the session that sent it.** This surface authenticates no host, so
-/// the session is the only thing that says whose key it is; a key honoured
-/// across sessions would hand one host another's run for the price of
-/// guessing its key. A host that reconnects before retrying makes a new call.
+/// **Scoped to whoever is asking.** Served over HTTP, the authenticated caller
+/// owns the key on any request or session; another caller's same key is
+/// another run. Over stdio no host is authenticated, so the session is the
+/// only thing that says whose key it is, and a host that reconnects before
+/// retrying makes a new call.
 pub const IDEMPOTENCY_META_KEY: &str = "io.agentplane/idempotencyKey";
 
 /// One agent, as this catalogue offers it.
@@ -127,6 +222,9 @@ struct Served {
     /// The declaration itself, as the canonical JSON its digest covers.
     document: String,
     digest: Option<String>,
+    /// Whether a run of this agent may suspend, so whether a host that cannot
+    /// hold a task may be offered it.
+    may_suspend: bool,
 }
 
 /// This plane, as an MCP server.
@@ -145,6 +243,9 @@ pub struct McpServer {
     /// copied the id would key two hosts' calls into one run — the second
     /// host handed the first one's output.
     session: String,
+    /// Set when served behind an authenticator: a request that arrives with
+    /// no caller is then refused rather than served as an anonymous host.
+    authenticated: bool,
 }
 
 impl Clone for McpServer {
@@ -153,6 +254,7 @@ impl Clone for McpServer {
             runtime: Arc::clone(&self.runtime),
             served: self.served.clone(),
             session: RunId::generate().to_string(),
+            authenticated: self.authenticated,
         }
     }
 }
@@ -222,6 +324,7 @@ impl McpServer {
                     input_schema: Arc::new(object(schema)),
                     output_schema: manifest.output_schema().map(|s| Arc::new(object(s))),
                     prompt: prompt.clone(),
+                    may_suspend: manifest.may_suspend(|server| runtime.wires_peer(server)),
                 });
             }
         }
@@ -229,17 +332,104 @@ impl McpServer {
             runtime,
             served,
             session: RunId::generate().to_string(),
+            authenticated: false,
         })
+    }
+
+    /// Refuse every request that arrives without an authenticated caller.
+    #[cfg(feature = "mcp-server-http")]
+    pub(crate) fn authenticated(mut self) -> Self {
+        self.authenticated = true;
+        self
+    }
+
+    /// Who is asking: the authenticated caller the HTTP layer put on the
+    /// request, or — over stdio — the anonymous host of this session.
+    ///
+    /// A request that arrived over HTTP with no caller is refused, whoever
+    /// mounted the catalogue: the anonymous host is the one process at the
+    /// other end of a pipe, and a socket has no such single party.
+    fn asker(&self, context: &RequestContext<RoleServer>) -> Result<Asker, McpError> {
+        if let Some(caller) = authenticated_caller(context) {
+            return Ok(Asker {
+                admission: format!("{CALLER_NAMESPACE}{}", caller.source),
+                input: caller.source.clone(),
+                caller: Some(caller),
+            });
+        }
+        let over_http = context.extensions.get::<http::request::Parts>().is_some();
+        if self.authenticated || over_http {
+            return Err(McpError::invalid_request(
+                "this request was not authenticated",
+                None,
+            ));
+        }
+        Ok(Asker {
+            admission: ADMISSION_SOURCE.to_owned(),
+            input: "mcp://client".to_owned(),
+            caller: None,
+        })
+    }
+
+    /// Ask the policy engine whether this caller may take `action` on
+    /// `resource`. Over stdio there is no caller to ask about, and the runtime's
+    /// own gates still run underneath.
+    fn gate(&self, asker: &Asker, action: &str, resource: &str) -> Result<(), McpError> {
+        let Some(caller) = asker.caller.as_ref() else {
+            return Ok(());
+        };
+        let Some(policy) = self.runtime.policy() else {
+            return Err(McpError::invalid_request(
+                "this request was not permitted",
+                None,
+            ));
+        };
+        let context = caller.context();
+        match policy.authorize(&crate::core::PolicyRequest {
+            principal: &caller.actor,
+            principal_kind: crate::core::PrincipalKind::Subject,
+            action,
+            resource,
+            context: &context,
+        }) {
+            crate::core::PolicyDecision::Permit => Ok(()),
+            // The reason stays operator-side: a Cedar denial names the
+            // policies that fired, which is a probe-able map for a caller.
+            crate::core::PolicyDecision::Deny { reason }
+            | crate::core::PolicyDecision::Malformed { reason } => {
+                tracing::warn!(
+                    target: "agentplane::mcp",
+                    action,
+                    resource,
+                    reason,
+                    "MCP request denied by policy"
+                );
+                Err(McpError::invalid_request(
+                    "this request was not permitted",
+                    None,
+                ))
+            }
+        }
+    }
+
+    /// The plane this catalogue admits into.
+    #[cfg(feature = "mcp-server-http")]
+    pub(crate) fn runtime(&self) -> &Arc<Runtime> {
+        &self.runtime
     }
 
     fn find(&self, name: &str) -> Option<&Served> {
         self.served.iter().find(|s| s.capability == name)
     }
 
-    /// The admission key for one call: the host's own, when it named one, or
-    /// the request id — either one scoped to this session.
+    /// The admission key for one call to one tool, under the asker's source:
+    /// the host's own key, when it named one, or the request id. A request id is unique
+    /// only within a session, so it is always scoped to this one; a named key
+    /// is scoped to the session only when no caller is authenticated.
     fn admission_key(
         &self,
+        asker: &Asker,
+        capability: &str,
         request: &CallToolRequestParams,
         context: &RequestContext<RoleServer>,
     ) -> String {
@@ -250,19 +440,32 @@ impl McpServer {
             .or_else(|| context.meta.get(IDEMPOTENCY_META_KEY))
             .and_then(serde_json::Value::as_str)
             .filter(|key| !key.trim().is_empty());
-        let id = named.map_or_else(
-            || format!("request:{}/{}", self.session, context.id),
-            |key| format!("host:{}/{key}", self.session),
-        );
-        crate::core::origin_key(ADMISSION_SOURCE, &id)
+        let id = match named {
+            None => format!("request:{}/{}", self.session, context.id),
+            Some(key) if asker.caller.is_some() => format!("host:{key}"),
+            Some(key) => format!("host:{}/{key}", self.session),
+        };
+        // The tool is part of the key, length-prefixed, so one key sent to two
+        // tools is two calls — never the second answered with the first's run.
+        let id = crate::core::origin_key(capability, &id);
+        crate::core::origin_key(&asker.admission, &id)
     }
 
-    /// The run a task id names, if this surface admitted it.
+    /// The run a task id names, if this asker admitted it.
     ///
-    /// A run another surface admitted — a peer's A2A task, the embedder's own
-    /// — answers exactly as one that does not exist.
+    /// A run another surface or another caller admitted — a peer's A2A task,
+    /// the embedder's own — answers exactly as one that does not exist.
+    ///
+    /// **Over stdio, not bound to the admitting session.** No host is
+    /// authenticated there, and a task outlives its session by design — a
+    /// host polls after a reconnect or a restart — so a session binding would
+    /// strand every task that survived one. The task id is a bearer
+    /// capability: a run id's eighty random bits are what stand between one
+    /// host and another's task. Served over HTTP, the run belongs to the
+    /// caller whose key admitted it.
     async fn our_run(
         &self,
+        asker: &Asker,
         task_id: &str,
     ) -> Result<(RunId, Vec<crate::journal::Record>), McpError> {
         let run =
@@ -276,12 +479,56 @@ impl McpServer {
         if records
             .first()
             .and_then(crate::journal::Record::admission_source)
-            != Some(ADMISSION_SOURCE)
+            != Some(asker.admission.as_str())
         {
             return Err(McpError::invalid_params("no such task", None));
         }
         Ok((run, records))
     }
+}
+
+/// The caller the HTTP layer authenticated and put on this request.
+#[cfg(feature = "mcp-server-http")]
+fn authenticated_caller(context: &RequestContext<RoleServer>) -> Option<Authenticated> {
+    let caller = context
+        .extensions
+        .get::<axum::http::request::Parts>()?
+        .extensions
+        .get::<crate::api::Caller>()?;
+    Some(Authenticated {
+        actor: caller.actor.clone(),
+        source: crate::api::peer_source(&caller.actor),
+        roles: caller.roles.clone(),
+        tenant: caller.tenant.as_str().to_owned(),
+        acting_as: caller.acting_as.clone(),
+    })
+}
+
+/// No HTTP layer in this build, so no request carries a caller.
+#[cfg(not(feature = "mcp-server-http"))]
+fn authenticated_caller(_context: &RequestContext<RoleServer>) -> Option<Authenticated> {
+    None
+}
+
+/// Whether this host can hold a task: it negotiated the revision that carries
+/// the Tasks extension and declared the extension. A `2025-11-25` session
+/// never can — that revision's experimental tasks are a different shape.
+fn host_has_tasks(context: &RequestContext<RoleServer>) -> bool {
+    context.protocol_version() == Some(crate::tools::MCP_REVISION)
+        && context
+            .client_capabilities()
+            .is_some_and(|c| c.supports_tasks())
+}
+
+/// What a call answers when its run is waiting and the host cannot hold a
+/// task: an error naming the run, never a success and never a failure — the
+/// run has concluded neither way, and stays listed among the waiting runs.
+fn waiting_without_tasks(run: RunId) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(format!(
+        "run {run} is waiting on this plane and has not concluded; this host did not \
+         negotiate the {} extension, so the call cannot be handed back as a task",
+        rmcp::model::TASKS_EXTENSION_ID
+    ))])
 }
 
 /// A fault on this plane's side, told to the host in one fixed sentence —
@@ -310,6 +557,11 @@ fn finished(
             other.as_str()
         ))]),
     }
+}
+
+/// The one answer a declined call gets: the reason stays operator-side.
+fn declined() -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text("this agent declined the request")])
 }
 
 /// The URI an agent's declaration is served at.
@@ -362,27 +614,22 @@ fn object(schema: &serde_json::Value) -> rmcp::model::JsonObject {
 }
 
 impl ServerHandler for McpServer {
-    /// **Only the revision this server implements.**
+    /// **The revisions this crate speaks, as a client does — one constant.**
     ///
-    /// The SDK's `ProtocolVersion::LATEST` is an *older* revision than the one
-    /// this plane is written against, so a server that left this to the default
-    /// would advertise every version the SDK knows and negotiate down to
-    /// whatever a client offered — silently, with nothing failing. That is the
-    /// same downgrade this crate guards against as a client, arriving from the
-    /// other side.
+    /// The SDK's default would advertise every version it knows and negotiate
+    /// down to whatever a client offered, silently. The promise is per
+    /// extension: a host on `2025-11-25`, or one that does not declare the
+    /// Tasks extension, is offered only the tools whose runs can never suspend.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Owned(vec![crate::tools::MCP_REVISION])
+        Cow::Owned(crate::tools::McpClient::SPOKEN_REVISIONS.to_vec())
     }
 
     /// **Refuse an unsupported revision here, rather than on the next call.**
     ///
-    /// A client opening with the legacy `initialize` handshake negotiates in
-    /// this method; the SDK's default would answer with this server's own
-    /// version and let the session continue, and the refusal would then arrive
-    /// on the *first real request* — as a protocol error about a version, long
-    /// after the handshake a reader would look at. Refusing at the handshake
-    /// puts the failure where its cause is, and names the revision this plane
-    /// speaks so the far end can act on it.
+    /// The SDK's default would answer with this server's own version and let
+    /// the session continue, so the refusal would arrive on the first real
+    /// request, long after the handshake a reader would look at. Refused here,
+    /// naming the revisions this plane speaks.
     fn initialize(
         &self,
         request: rmcp::model::InitializeRequestParams,
@@ -390,8 +637,16 @@ impl ServerHandler for McpServer {
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         let supported = self.supported_protocol_versions();
         std::future::ready(if supported.contains(&request.protocol_version) {
+            let mut info = self.get_info();
+            info.protocol_version = request.protocol_version.clone();
+            // The extension is declared only on the revision that carries it.
+            if info.protocol_version != crate::tools::MCP_REVISION
+                && let Some(extensions) = info.capabilities.extensions.as_mut()
+            {
+                extensions.remove(rmcp::model::TASKS_EXTENSION_ID);
+            }
             context.peer.set_peer_info(request);
-            Ok(self.get_info())
+            Ok(info)
         } else {
             Err(McpError::unsupported_protocol_version(
                 request.protocol_version,
@@ -410,8 +665,7 @@ impl ServerHandler for McpServer {
                 .enable_prompts()
                 .enable_resources()
                 // The Tasks extension, because a governed suspension has no
-                // other expression on this wire — and refusing revisions that
-                // lack it is only honest if this one declares it.
+                // other expression on this wire.
                 .enable_tasks()
                 .build(),
         )
@@ -428,26 +682,34 @@ impl ServerHandler for McpServer {
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(ListToolsResult {
-            tools: self
-                .served
-                .iter()
-                .map(|s| {
-                    let mut tool = Tool::new_with_raw(
-                        Cow::Owned(s.capability.clone()),
-                        s.description.clone().map(Cow::Owned),
-                        Arc::clone(&s.input_schema),
-                    );
-                    tool.title = Some(s.agent.clone());
-                    tool.output_schema.clone_from(&s.output_schema);
-                    tool
-                })
-                .collect(),
-            ttl_ms: Some(CACHE_TTL_MS),
-            cache_scope: Some(CACHE_SCOPE),
-            ..ListToolsResult::default()
+        let asked = self
+            .asker(&context)
+            .and_then(|asker| self.gate(&asker, action::TOOL_LIST, "catalogue"));
+        // A host that cannot hold a task is offered only what never needs one.
+        let tasks = host_has_tasks(&context);
+        std::future::ready(asked.map(|()| {
+            ListToolsResult {
+                tools: self
+                    .served
+                    .iter()
+                    .filter(|s| tasks || !s.may_suspend)
+                    .map(|s| {
+                        let mut tool = Tool::new_with_raw(
+                            Cow::Owned(s.capability.clone()),
+                            s.description.clone().map(Cow::Owned),
+                            Arc::clone(&s.input_schema),
+                        );
+                        tool.title = Some(s.agent.clone());
+                        tool.output_schema.clone_from(&s.output_schema);
+                        tool
+                    })
+                    .collect(),
+                ttl_ms: Some(CACHE_TTL_MS),
+                cache_scope: Some(CACHE_SCOPE),
+                ..ListToolsResult::default()
+            }
         }))
     }
 
@@ -456,25 +718,48 @@ impl ServerHandler for McpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
+        let asker = self.asker(&context)?;
+        if self.gate(&asker, action::TOOL_CALL, &request.name).is_err() {
+            return Ok(declined().into());
+        }
         let Some(served) = self.find(&request.name) else {
             return Err(McpError::invalid_params(
                 format!("no agent provides '{}'", request.name),
                 None,
             ));
         };
+        let tasks = host_has_tasks(&context);
+        if served.may_suspend && !tasks {
+            return Err(McpError::invalid_params(
+                format!(
+                    "'{}' may wait on a person or a timer, and this host did not negotiate \
+                     the {} extension (MCP {}) that carries a waiting call back as a task",
+                    request.name,
+                    rmcp::model::TASKS_EXTENSION_ID,
+                    crate::tools::MCP_REVISION
+                ),
+                None,
+            ));
+        }
 
-        // Untrusted, and named for what composed it. A model's arguments get
+        // Untrusted, and named for who composed it. A caller's arguments get
         // the same admission any other caller's input gets, which is why the
         // sink gates downstream are not decorative.
-        let key = self.admission_key(&request, &context);
+        let key = self.admission_key(&asker, &served.capability, &request, &context);
         let input = Tainted::from_source(
             serde_json::Value::Object(request.arguments.unwrap_or_default()),
-            SourceId::new("mcp://client"),
+            SourceId::new(asker.input.clone()),
         );
-        // Keyed, so a host's retry of one call is one run; and acting under no
-        // chain, because a host on this surface presents none and the plane's
-        // own is for the runs its embedder starts.
-        let terms = RunTerms::default().once(&key).served(None);
+        // Keyed, so a retry of one call is one run; and acting under the
+        // caller's own chain or none — never the plane's, which is for the
+        // runs its embedder starts.
+        let terms = match &asker.caller {
+            Some(caller) => RunTerms::default()
+                .once(&key)
+                .served(caller.acting_as.clone())
+                .admitted_by(&caller.actor),
+            None => RunTerms::default().once(&key).served(None),
+        };
         let admission = match self
             .runtime
             .run_under(&served.capability, input, terms)
@@ -484,10 +769,7 @@ impl ServerHandler for McpServer {
             // The agent declining is an answer, not an outage, and its reason
             // stays on the operator's side.
             Err(RuntimeError::PolicyDenied(_) | RuntimeError::Delegation(_)) => {
-                return Ok(CallToolResult::error(vec![ContentBlock::text(
-                    "this agent declined the request",
-                )])
-                .into());
+                return Ok(declined().into());
             }
             Err(e) => return Err(internal("admitting a tool call", &e)),
         };
@@ -505,6 +787,7 @@ impl ServerHandler for McpServer {
             Admission::Fresh(outcome) | Admission::Replayed(outcome) => outcome,
             // The same call is executing right now, here or on another
             // instance: a task the host can poll, never a failure it retries.
+            Admission::InFlight(run) if !tasks => return Ok(waiting_without_tasks(run).into()),
             Admission::InFlight(run) => {
                 let now = protocol_now();
                 return Ok(CreateTaskResult::new(
@@ -516,6 +799,7 @@ impl ServerHandler for McpServer {
         };
 
         Ok(match outcome.status {
+            RunStatus::Suspended(_) if !tasks => waiting_without_tasks(outcome.run_id).into(),
             // A suspension is a task, and the id is the run's own — never a
             // generated handle. See `get_task` for what that buys.
             RunStatus::Suspended(ref why) => {
@@ -533,22 +817,31 @@ impl ServerHandler for McpServer {
     fn list_prompts(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
-        std::future::ready(Ok(ListPromptsResult {
-            prompts: self
-                .served
-                .iter()
-                .filter(|s| s.prompt.is_some())
-                // **No arguments, deliberately.** A declared argument is a
-                // string spliced into reviewed text, and the digest then covers
-                // bytes nobody approved. The instruction is served as it was
-                // reviewed or not at all.
-                .map(|s| Prompt::new(s.agent.clone(), s.description.clone(), None))
-                .collect(),
-            ttl_ms: Some(CACHE_TTL_MS),
-            cache_scope: Some(CACHE_SCOPE),
-            ..ListPromptsResult::default()
+        let asked = self
+            .asker(&context)
+            .and_then(|asker| self.gate(&asker, action::PROMPT_READ, "catalogue"));
+        // One prompt per agent, as one resource per agent: the instruction
+        // is the agent's, however many capabilities it serves.
+        let mut listed = std::collections::BTreeSet::new();
+        std::future::ready(asked.map(|()| {
+            ListPromptsResult {
+                prompts: self
+                    .served
+                    .iter()
+                    .filter(|s| s.prompt.is_some())
+                    .filter(|s| listed.insert(s.agent.clone()))
+                    // **No arguments, deliberately.** A declared argument is a
+                    // string spliced into reviewed text, and the digest then covers
+                    // bytes nobody approved. The instruction is served as it was
+                    // reviewed or not at all.
+                    .map(|s| Prompt::new(s.agent.clone(), s.description.clone(), None))
+                    .collect(),
+                ttl_ms: Some(CACHE_TTL_MS),
+                cache_scope: Some(CACHE_SCOPE),
+                ..ListPromptsResult::default()
+            }
         }))
     }
 
@@ -574,34 +867,45 @@ impl ServerHandler for McpServer {
     fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
+        let asked = self
+            .asker(&context)
+            .and_then(|asker| self.gate(&asker, action::RESOURCE_READ, "catalogue"));
         let mut seen = std::collections::BTreeSet::new();
-        std::future::ready(Ok(ListResourcesResult {
-            resources: self
-                .served
-                .iter()
-                .filter(|s| seen.insert(s.agent.clone()))
-                .map(|s| {
-                    let resource = Resource::new(manifest_uri(&s.agent), s.agent.clone())
-                        .with_mime_type("application/json");
-                    match &s.description {
-                        Some(role) => resource.with_description(role.clone()),
-                        None => resource,
-                    }
-                })
-                .collect(),
-            ttl_ms: Some(CACHE_TTL_MS),
-            cache_scope: Some(CACHE_SCOPE),
-            ..ListResourcesResult::default()
+        std::future::ready(asked.map(|()| {
+            ListResourcesResult {
+                resources: self
+                    .served
+                    .iter()
+                    .filter(|s| seen.insert(s.agent.clone()))
+                    .map(|s| {
+                        let resource = Resource::new(manifest_uri(&s.agent), s.agent.clone())
+                            .with_mime_type("application/json");
+                        match &s.description {
+                            Some(role) => resource.with_description(role.clone()),
+                            None => resource,
+                        }
+                    })
+                    .collect(),
+                ttl_ms: Some(CACHE_TTL_MS),
+                cache_scope: Some(CACHE_SCOPE),
+                ..ListResourcesResult::default()
+            }
         }))
     }
 
     fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
+        if let Err(refused) = self
+            .asker(&context)
+            .and_then(|asker| self.gate(&asker, action::RESOURCE_READ, &request.uri))
+        {
+            return std::future::ready(Err(refused));
+        }
         std::future::ready(
             self.served
                 .iter()
@@ -645,9 +949,11 @@ impl ServerHandler for McpServer {
     async fn get_task(
         &self,
         request: GetTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        let (run, records) = self.our_run(&request.task_id).await?;
+        let asker = self.asker(&context)?;
+        let (run, records) = self.our_run(&asker, &request.task_id).await?;
+        self.gate(&asker, action::TASK_READ, &request.task_id)?;
 
         // A run with records and no conclusion is still working. `None` here is
         // *in flight*, not *unknown*: the records exist, so the run does.
@@ -699,20 +1005,22 @@ impl ServerHandler for McpServer {
     async fn cancel_task(
         &self,
         request: CancelTaskParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        let (run, _) = self.our_run(&request.task_id).await?;
+        let asker = self.asker(&context)?;
+        let (run, _) = self.our_run(&asker, &request.task_id).await?;
+        self.gate(&asker, action::TASK_CANCEL, &request.task_id)?;
+        // An authenticated caller is named as such. Over stdio the actor is the
+        // *channel*: a host is identified by the connection this runtime
+        // accepted and nothing else, so a reader is not told a credential
+        // named anybody.
+        let operator = match &asker.caller {
+            Some(caller) => crate::core::Operator::authenticated(caller.actor.clone()),
+            None => crate::core::Operator::connected("mcp://client"),
+        }
+        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
         self.runtime
-            // The actor is the *channel*, not a person: an MCP host cancelling
-            // the task it started is identified by the connection this runtime
-            // accepted and by nothing else. Recorded as `Connected` so a reader
-            // is not told a credential named anybody.
-            .request_cancel(
-                run,
-                &crate::core::Operator::connected("mcp://client")
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?,
-                "cancelled by the calling host",
-            )
+            .request_cancel(run, &operator, "cancelled by the calling host")
             .await
             .map(|_| ())
             .map_err(|e| match e {
@@ -724,9 +1032,13 @@ impl ServerHandler for McpServer {
     fn get_prompt(
         &self,
         request: GetPromptRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + Send + '_ {
-        std::future::ready(self.prompt_for(request))
+        std::future::ready(
+            self.asker(&context)
+                .and_then(|asker| self.gate(&asker, action::PROMPT_READ, &request.name))
+                .and_then(|()| self.prompt_for(request)),
+        )
     }
 }
 
@@ -755,5 +1067,27 @@ impl McpServer {
         let mut result = GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)]);
         result.description.clone_from(&served.description);
         Ok(result.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A waiting run is never reported as an outcome to a host that cannot
+    /// hold a task**: the answer is an error naming the run, so the host
+    /// neither retries a call that is underway nor reports one that has not
+    /// happened.
+    #[test]
+    fn a_suspension_for_a_host_without_tasks_is_an_error_naming_the_run() {
+        let run = RunId::generate();
+        let answer = waiting_without_tasks(run);
+        assert_eq!(answer.is_error, Some(true), "a waiting run read as success");
+        assert!(answer.structured_content.is_none(), "{answer:?}");
+        let said = serde_json::to_string(&answer.content).expect("content");
+        assert!(
+            said.contains(&run.to_string()) && said.contains("waiting"),
+            "the answer does not name the run and that it is waiting: {said}"
+        );
     }
 }

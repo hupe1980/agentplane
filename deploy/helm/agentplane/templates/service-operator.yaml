@@ -1,0 +1,16 @@
+# The operator listener halts, cancels and reconciles. Its own Service, always
+# ClusterIP: reaching it from outside the cluster is a decision made elsewhere.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agentplane.fullname" . }}-operator
+  labels:
+    {{- include "agentplane.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "agentplane.selector" . | nindent 4 }}
+  ports:
+    - name: operator
+      port: 9090
+      targetPort: operator

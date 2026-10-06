@@ -1041,44 +1041,66 @@ fn a_witness_client_with_no_keys_is_not_a_witness_client() {
 ///
 /// So: seal three runs, submit the checkpoint to a witness, delete a run,
 /// then audit against what the *witness* holds.
+/// A run admitted, concluded and sealed.
+#[cfg(feature = "testkit")]
+async fn sealed_run(store: &agentplane::store::RedbStore) -> agentplane::RunId {
+    use agentplane::journal::{Append, JournalStore, RecordKind};
+
+    let run = agentplane::RunId::generate();
+    let lease = store
+        .acquire(run, "w", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    store
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "witnessed".into(),
+                    governed_by: None,
+                    input_label: agentplane::core::Label::trusted(),
+                    input: serde_json::Value::Null,
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                    plane_chain: false,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+    let head = store.head(run).await.expect("head");
+    let concluded = RecordKind::RunConcluded {
+        outcome: "succeeded".into(),
+        reason: None,
+        exhaustion: None,
+        live_spend: agentplane::core::Spend::default(),
+        chain_head: head.hash,
+    };
+    store
+        .append(lease.epoch, vec![Append::new(run, concluded)])
+        .await
+        .expect("conclude");
+    store
+        .seal(run, lease.epoch, "succeeded")
+        .await
+        .expect("seal");
+    run
+}
+
 #[tokio::test]
+#[cfg(feature = "testkit")]
 async fn a_deleted_run_is_caught_by_the_anchor_a_witness_holds() {
-    use agentplane::journal::{Append, JournalStore, RecordKind, WitnessReader};
+    use agentplane::journal::{JournalStore, WitnessReader};
 
     let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
     let journal: Arc<dyn JournalStore> = store.clone();
     let mut runs = Vec::new();
     for _ in 0..3 {
-        let run = agentplane::RunId::generate();
-        let lease = store
-            .acquire(run, "w", std::time::Duration::from_mins(1))
-            .await
-            .expect("lease");
-        store
-            .append(
-                lease.epoch,
-                vec![Append::new(
-                    run,
-                    RecordKind::RunAdmitted {
-                        capability: "witnessed".into(),
-                        governed_by: None,
-                        input_label: agentplane::core::Label::trusted(),
-                        input: serde_json::Value::Null,
-                        policy_bundle: None,
-                        canon: agentplane::core::canon::VERSION,
-                        idempotency_key: None,
-                        admitted_by: None,
-                        served_unchained: false,
-                    },
-                )],
-            )
-            .await
-            .expect("append");
-        store
-            .seal(run, lease.epoch, "succeeded")
-            .await
-            .expect("seal");
-        runs.push(run);
+        runs.push(sealed_run(&store).await);
     }
 
     let witness = Arc::new(SigningWitness::new("witness-1", 7));

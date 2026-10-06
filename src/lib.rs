@@ -29,22 +29,22 @@
 //! └──────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Three layers enforce it, because convention is not enforcement:
+//! Two layers enforce it, because convention is not enforcement:
 //!
-//! 1. **Lint gating** — `clippy.toml` denies `SystemTime::now`, `rand::random`,
-//!    `Ulid::new` and friends crate-wide.
+//! 1. **Lint gating** — `clippy.toml` denies `SystemTime::now`, `Instant::now`,
+//!    `OffsetDateTime::now_utc`, `rand::random`, `rand::rng` and
+//!    `Ulid::generate` crate-wide. It covers this crate, not a skill compiled
+//!    in yours.
 //! 2. **Effect-key verification** — on replay, a recomputed key that differs
 //!    from the journaled one quarantines the run rather than diverging silently
 //!    ([`core::StepError::NonDeterminism`]).
-//! 3. **Storage constraints** — the journal's unique index makes "an effect is
-//!    started at most once per run" a database invariant, not a code path.
 //!
 //! ## Example
 //!
-//! ```no_run
+//! ```
 //! use agentplane::core::{Outcome, Skill, SkillDescriptor, Tainted};
 //! use agentplane::journal::JournalStore;
-//! use agentplane::runtime::{Mode, Runtime, StepCtx};
+//! use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 //! use std::sync::Arc;
 //!
 //! #[derive(Debug)]
@@ -73,7 +73,9 @@
 //! # async fn run(store: Arc<dyn JournalStore>) -> Result<(), Box<dyn std::error::Error>> {
 //! // With the default features, `agentplane::store::RedbStore` is one.
 //! let runtime = Runtime::builder(store).skill(Greet).build();
-//! let outcome = runtime.run("greet", Tainted::trusted(serde_json::json!({"name": "world"}))).await?;
+//! // Runs are asked for by capability — what the skill `provides`.
+//! let outcome = runtime.run("demo.greet", Tainted::trusted(serde_json::json!({"name": "world"}))).await?;
+//! assert!(matches!(outcome.status, RunStatus::Succeeded), "{:?}", outcome.status);
 //!
 //! // Replaying re-executes the deterministic zone and reads every effect back
 //! // from the journal. No clock is read; no tool is called twice. `Strict`
@@ -81,6 +83,13 @@
 //! runtime.replay(outcome.run_id, Mode::Strict).await?;
 //! # Ok(())
 //! # }
+//! # #[cfg(feature = "redb")]
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! #     let store = Arc::new(agentplane::store::RedbStore::open_in_memory()?);
+//! #     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(run(store))
+//! # }
+//! # #[cfg(not(feature = "redb"))]
+//! # fn main() {}
 //! ```
 
 #[cfg(feature = "http")]
@@ -90,9 +99,15 @@ pub mod authority;
 pub mod batch;
 pub mod blob;
 pub mod case;
+#[cfg(feature = "manifest")]
+pub mod content;
 pub mod core;
+pub mod disclosure;
 pub mod drill;
 pub mod export;
+pub mod grader_verdict;
+#[cfg(feature = "manifest")]
+pub mod grants;
 pub mod journal;
 #[cfg(feature = "keyring")]
 pub mod keyring;
@@ -112,6 +127,7 @@ pub mod push;
 pub mod quota;
 pub mod retention;
 pub mod runtime;
+pub mod subject;
 pub mod tools;
 
 /// The random-number traits [`StepCtx::rng`] hands back.

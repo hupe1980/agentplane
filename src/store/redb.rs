@@ -206,6 +206,9 @@ pub struct RedbStore {
     /// was supposed to remove. A filter that can be forgotten is not isolation,
     /// and the query that forgets it looks exactly like working software.
     tenant: crate::core::TenantId,
+    /// What every read lifts a stored record through. The bytes and their
+    /// hash are never touched; only the body this build reads is.
+    upcaster: Arc<dyn crate::journal::Upcaster>,
 }
 
 impl RedbStore {
@@ -277,6 +280,7 @@ impl RedbStore {
             signer: None,
             origin: "agentplane".to_owned(),
             tenant: crate::core::TenantId::default(),
+            upcaster: crate::journal::current_upcaster(),
         })
     }
 
@@ -360,6 +364,17 @@ impl RedbStore {
         self
     }
 
+    /// Read records through this upcaster instead of the one this build ships.
+    ///
+    /// The default is [`current_upcaster`](crate::journal::current_upcaster),
+    /// which is what a deployment wants; another is for a reader that must
+    /// lift shapes this build's own does not.
+    #[must_use]
+    pub fn upcasting_with(mut self, upcaster: Arc<dyn crate::journal::Upcaster>) -> Self {
+        self.upcaster = upcaster;
+        self
+    }
+
     /// Run a closure against the database on the blocking pool.
     ///
     /// redb is synchronous and a commit fsyncs; doing that on the async
@@ -403,18 +418,20 @@ impl RedbStore {
         .await
     }
 
-    /// Where a run sits in the log, and its leaf value.
+    /// Where each run sits in the log, and its leaf value, from one walk.
     ///
     /// The position is the run's index in seal order, counted while iterating —
     /// dense by construction, because the tree is built from the same walk.
-    async fn log_position(&self, run: RunId) -> Result<Option<(usize, Digest)>, StoreError> {
-        let key = self.run_key(run);
+    async fn positions(&self, runs: &[RunId]) -> Result<Vec<Option<(u64, Digest)>>, StoreError> {
+        let keys: Vec<String> = runs.iter().map(|&run| self.run_key(run)).collect();
         let tenant = self.tenant.clone();
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let log = r.open_table(SEAL_LOG).map_err(|e| be(&e))?;
             let seals = r.open_table(RUN_SEAL).map_err(|e| be(&e))?;
-            let mut rank = 0usize;
+            let mut wanted: std::collections::HashMap<&str, Option<(u64, Digest)>> =
+                keys.iter().map(|k| (k.as_str(), None)).collect();
+            let mut rank = 0u64;
             for entry in log
                 .range((tenant.as_str(), 0)..=(tenant.as_str(), u64::MAX))
                 .map_err(|e| be(&e))?
@@ -423,13 +440,13 @@ impl RedbStore {
                 let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {
                     continue;
                 };
-                if run_id.value() == key {
+                if let Some(slot) = wanted.get_mut(run_id.value()) {
                     let (_, head, _) = seal.value();
-                    return Ok(Some((rank, digest(head)?)));
+                    *slot = Some((rank, digest(head)?));
                 }
                 rank += 1;
             }
-            Ok(None)
+            Ok(keys.iter().map(|k| wanted[k.as_str()]).collect())
         })
         .await
     }
@@ -444,6 +461,7 @@ impl RedbStore {
     ///
     /// If the write fails.
     #[doc(hidden)]
+    #[cfg(feature = "testkit")]
     pub async fn tamper_for_test(
         &self,
         run: RunId,
@@ -462,7 +480,7 @@ impl RedbStore {
                 if let Some(bytes) = existing {
                     let row = Row::decode(&bytes)?;
                     let tampered = Row { body, ..row };
-                    t.insert((key.as_str(), seq), tampered.encode().as_slice())
+                    t.insert((key.as_str(), seq), tampered.encode()?.as_slice())
                         .map_err(|e| be(&e))?;
                 }
             }
@@ -482,6 +500,7 @@ impl RedbStore {
     ///
     /// If the write fails.
     #[doc(hidden)]
+    #[cfg(feature = "testkit")]
     pub async fn delete_run_for_test(&self, run: RunId) -> Result<(), StoreError> {
         let key = self.run_key(run);
         self.with_db(move |db| {
@@ -524,7 +543,7 @@ struct Row {
 }
 
 impl Row {
-    fn encode(&self) -> Vec<u8> {
+    fn encode(&self) -> Result<Vec<u8>, StoreError> {
         let mut out = Vec::with_capacity(self.body.len() + 96);
         out.extend_from_slice(&self.prev_hash);
         out.extend_from_slice(&self.hash);
@@ -534,13 +553,13 @@ impl Row {
         match (&self.key_id, &self.signature) {
             (Some(k), Some(s)) => {
                 out.push(1);
-                push_bytes(&mut out, k.as_bytes());
-                push_bytes(&mut out, s);
+                push_bytes(&mut out, k.as_bytes())?;
+                push_bytes(&mut out, s)?;
             }
             _ => out.push(0),
         }
-        push_bytes(&mut out, &self.body);
-        out
+        push_bytes(&mut out, &self.body)?;
+        Ok(out)
     }
 
     fn decode(raw: &[u8]) -> Result<Self, StoreError> {
@@ -590,12 +609,13 @@ impl Row {
         })
     }
 
-    fn into_record(self) -> Result<Record, StoreError> {
+    fn into_record(self, upcaster: &dyn crate::journal::Upcaster) -> Result<Record, StoreError> {
         let signature = self
             .key_id
             .zip(self.signature)
             .map(|(key_id, signature)| crate::core::KeySignature { key_id, signature });
-        Record::from_stored_signed(
+        Record::from_stored_with(
+            upcaster,
             self.body,
             Digest::from_bytes(self.prev_hash),
             Digest::from_bytes(self.hash),
@@ -604,14 +624,19 @@ impl Row {
     }
 }
 
-fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+fn push_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), StoreError> {
     // A record is refused above `MAX_RECORD_BYTES`, so no field can reach 4 GiB
-    // — but the cast is checked anyway rather than assumed, because a silent
-    // wrap here would write a length prefix that disagrees with the payload and
-    // corrupt every record after it.
-    let len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    // — but the cast is checked anyway rather than assumed, because a length
+    // prefix that disagrees with the payload corrupts every record after it.
+    let len = u32::try_from(bytes.len()).map_err(|_| {
+        StoreError::Backend(format!(
+            "a row field of {} bytes has no u32 length",
+            bytes.len()
+        ))
+    })?;
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn take_bytes(raw: &[u8], at: usize) -> Option<(Vec<u8>, usize)> {
@@ -735,6 +760,23 @@ fn lease_expiry(now: u64, ttl: Duration) -> Result<u64, StoreError> {
     })
 }
 
+/// Refuse to seal a run whose last record is not its conclusion.
+///
+/// A seal is a leaf in the log: sealing an empty run commits the zero digest,
+/// and sealing a run mid-flight freezes a history that never ended.
+fn refuse_unconcluded(run: &str, last: Option<&[u8]>) -> Result<(), StoreError> {
+    let kind = last
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .and_then(|body| body.get("kind").and_then(|k| k.as_str().map(str::to_owned)));
+    if kind.as_deref() == Some("RunConcluded") {
+        return Ok(());
+    }
+    Err(StoreError::Backend(format!(
+        "run {run} cannot be sealed: its last record is {} rather than its conclusion",
+        kind.as_deref().unwrap_or("absent")
+    )))
+}
+
 /// The last record of a run, or genesis.
 fn head_of(
     t: &impl ReadableTable<(&'static str, u64), &'static [u8]>,
@@ -777,7 +819,11 @@ where
 /// rebuilt history, and a pre-disaster instance still holding such a lease is
 /// fenced by the runbook rather than by this: the old deployment must not reach
 /// the restored store.
-fn epoch_after_history(w: &redb::WriteTransaction, run: &str) -> Result<Epoch, StoreError> {
+fn epoch_after_history(
+    w: &redb::WriteTransaction,
+    run: &str,
+    upcaster: &dyn crate::journal::Upcaster,
+) -> Result<Epoch, StoreError> {
     let t = w.open_table(JOURNAL).map_err(|e| be(&e))?;
     let last = t
         .range((run, 0u64)..=(run, u64::MAX))
@@ -787,7 +833,7 @@ fn epoch_after_history(w: &redb::WriteTransaction, run: &str) -> Result<Epoch, S
         None => Ok(1),
         Some(entry) => {
             let (_, v) = entry.map_err(|e| be(&e))?;
-            Ok(Row::decode(v.value())?.into_record()?.body.epoch + 1)
+            Ok(Row::decode(v.value())?.into_record(upcaster)?.body.epoch + 1)
         }
     }
 }
@@ -799,6 +845,9 @@ impl JournalStore for RedbStore {
     /// table key and fencing race-free here — and it is why a plane that needs
     /// two instances needs `PostgreSQL` instead.
     fn is_shared(&self) -> bool {
+        false
+    }
+    fn seals(&self) -> bool {
         false
     }
 
@@ -821,6 +870,7 @@ impl JournalStore for RedbStore {
         let key = self.run_key(run);
         let run_id = run.to_string();
         let tenant = self.tenant_name();
+        let upcaster = Arc::clone(&self.upcaster);
 
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -873,8 +923,9 @@ impl JournalStore for RedbStore {
                 let mut admitted_from: Option<String> = None;
 
                 for append in batch {
-                    let effect_key = append.effect_key.map(EffectKey::to_hex);
-                    let body = append.into_body(head.seq + 1, epoch);
+                    let (body, written) =
+                        append.into_parts(head.seq + 1, epoch, upcaster.as_ref())?;
+                    let effect_key = body.effect_key.map(EffectKey::to_hex);
                     let is_start =
                         matches!(body.kind, crate::journal::RecordKind::EffectStarted { .. });
                     let (conclusion, claimed) = match &body.kind {
@@ -894,7 +945,7 @@ impl JournalStore for RedbStore {
                         crate::journal::RecordKind::RunSuspended { reason } => Some(reason.clone()),
                         _ => None,
                     };
-                    let record = Record::seal_signed(body, head.hash, signer.as_deref())?;
+                    let record = Record::seal_at(body, written, head.hash, signer.as_deref())?;
                     let seq = record.seq();
 
                     // Exactly-once. The key is the constraint: a prior value
@@ -919,7 +970,7 @@ impl JournalStore for RedbStore {
                         signature: record.signature.as_ref().map(|a| a.signature.clone()),
                     };
                     journal
-                        .insert((key.as_str(), seq), row.encode().as_slice())
+                        .insert((key.as_str(), seq), row.encode()?.as_slice())
                         .map_err(|e| be(&e))?;
                     // Written in the same transaction as the row it points at,
                     // so the index cannot outlive or precede its record.
@@ -1095,6 +1146,7 @@ impl JournalStore for RedbStore {
         limit: usize,
     ) -> Result<Vec<Record>, StoreError> {
         let key = self.run_key(run);
+        let upcaster = Arc::clone(&self.upcaster);
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let t = r.open_table(JOURNAL).map_err(|e| be(&e))?;
@@ -1105,7 +1157,7 @@ impl JournalStore for RedbStore {
                 .take(limit)
             {
                 let (_, v) = entry.map_err(|e| be(&e))?;
-                out.push(Row::decode(v.value())?.into_record()?);
+                out.push(Row::decode(v.value())?.into_record(upcaster.as_ref())?);
             }
             Ok(out)
         })
@@ -1119,6 +1171,7 @@ impl JournalStore for RedbStore {
     ) -> Result<Vec<Record>, StoreError> {
         let tenant = self.tenant_name();
         let case = case.to_string();
+        let upcaster = Arc::clone(&self.upcaster);
         self.with_db(move |db| {
             let r = db.begin_read().map_err(|e| be(&e))?;
             let idx = r.open_table(JOURNAL_BY_CASE).map_err(|e| be(&e))?;
@@ -1139,7 +1192,7 @@ impl JournalStore for RedbStore {
                 // The index carries the ordering; the row carries the bytes. A
                 // record has one home, so the two cannot disagree about it.
                 if let Some(v) = j.get((run, seq)).map_err(|e| be(&e))? {
-                    out.push(Row::decode(v.value())?.into_record()?);
+                    out.push(Row::decode(v.value())?.into_record(upcaster.as_ref())?);
                 }
             }
             Ok(out)
@@ -1161,6 +1214,7 @@ impl JournalStore for RedbStore {
         let key = self.run_key(run);
         let owner = owner.to_owned();
         let owner_out = owner.clone();
+        let upcaster = Arc::clone(&self.upcaster);
         let epoch = self
             .with_db(move |db| {
                 let w = begin_write(db)?;
@@ -1181,7 +1235,7 @@ impl JournalStore for RedbStore {
                         // restore leaves behind. The journal is the evidence
                         // that did survive, and every record in it carries the
                         // epoch it was written under.
-                        None => epoch_after_history(&w, key.as_str())?,
+                        None => epoch_after_history(&w, key.as_str(), upcaster.as_ref())?,
                         // Expired or released: claim and fence whoever held
                         // it, **including this caller**. Checked before any
                         // ownership test on purpose — a lease that has lapsed
@@ -1420,6 +1474,15 @@ impl JournalStore for RedbStore {
 
                 let head = {
                     let journal = w.open_table(JOURNAL).map_err(|e| be(&e))?;
+                    let last = journal
+                        .range((key.as_str(), 0u64)..=(key.as_str(), u64::MAX))
+                        .map_err(|e| be(&e))?
+                        .next_back()
+                        .transpose()
+                        .map_err(|e| be(&e))?
+                        .map(|(_, row)| Row::decode(row.value()))
+                        .transpose()?;
+                    refuse_unconcluded(&key, last.as_ref().map(|row| row.body.as_slice()))?;
                     head_of(&journal, &key)?
                 };
 
@@ -1668,6 +1731,43 @@ impl JournalStore for RedbStore {
         .await
     }
 
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        use std::ops::Bound;
+        let tenant = self.tenant_name();
+        let prefix = format!("{tenant}/");
+        let start = after.map(|run| format!("{prefix}{run}"));
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let Ok(last) = r.open_table(RUN_LAST_ACTIVITY) else {
+                return Ok(Vec::new());
+            };
+            // Strictly after the cursor, so the run last served is not served twice.
+            let from = match &start {
+                Some(key) => Bound::Excluded((tenant.as_str(), key.as_str())),
+                None => Bound::Included((tenant.as_str(), "")),
+            };
+            last.range((from, Bound::Included((tenant.as_str(), MAX_STR))))
+                .map_err(|e| be(&e))?
+                .filter_map(|entry| match entry {
+                    Ok((key, _)) => {
+                        let (_, stored) = key.value();
+                        stored
+                            .strip_prefix(prefix.as_str())
+                            .and_then(|id| RunId::parse(id).ok())
+                            .map(Ok)
+                    }
+                    Err(error) => Some(Err(be(&error))),
+                })
+                .take(limit)
+                .collect()
+        })
+        .await
+    }
+
     async fn recent_runs_from(
         &self,
         source: &str,
@@ -1743,15 +1843,54 @@ impl JournalStore for RedbStore {
         run: RunId,
     ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
         let leaves = self.log_leaves().await?;
-        let Some((index, seal)) = self.log_position(run).await? else {
+        let Some((index, seal)) = self.positions(&[run]).await?.pop().flatten() else {
             return Ok(None);
         };
         Ok(Some(crate::journal::Inclusion {
-            index: index as u64,
+            index,
             size: leaves.len() as u64,
             seal,
-            proof: crate::core::merkle::inclusion_proof(&leaves, index),
+            proof: crate::core::merkle::inclusion_proof(
+                &leaves,
+                usize::try_from(index).unwrap_or(usize::MAX),
+            ),
         }))
+    }
+
+    async fn inclusion_proof_at(
+        &self,
+        run: RunId,
+        size: u64,
+    ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
+        let leaves = self.log_leaves().await?;
+        let prefix = usize::try_from(size)
+            .ok()
+            .and_then(|size| leaves.get(..size))
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "asked to prove at size {size} and the log holds {} leaves",
+                    leaves.len()
+                ))
+            })?;
+        let Some((index, seal)) = self.positions(&[run]).await?.pop().flatten() else {
+            return Ok(None);
+        };
+        let Some(at) = usize::try_from(index).ok().filter(|&at| at < prefix.len()) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::journal::Inclusion {
+            index,
+            size,
+            seal,
+            proof: crate::core::merkle::inclusion_proof(prefix, at),
+        }))
+    }
+
+    async fn log_positions(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<Option<(u64, Digest)>>, StoreError> {
+        self.positions(runs).await
     }
 
     async fn request_cancel(
@@ -1822,6 +1961,7 @@ mod tests {
             signature: signed.then(|| vec![3; 64]),
         }
         .encode()
+        .expect("encodes")
     }
 
     /// The signature flag is a boolean byte: any other value is a damaged

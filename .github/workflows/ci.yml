@@ -115,6 +115,29 @@ jobs:
         env:
           MUTANTS_SHARD: ${{ matrix.shard }}/10
 
+  # Every framework quickstart walked against the `:full` image built from this
+  # commit, through the published commands, and the Helm chart rendered.
+  # Needs Docker and PyPI, so it runs on `main` rather than in `just ci`; the
+  # runner masks every generated secret. It runs third-party code, so it holds
+  # read-only contents and nothing else.
+  frameworks:
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: extractions/setup-just@v2
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.18.4
+      - run: just frameworks
+
   # Two passes: the first checks the design, the second checks the check. A
   # spec whose invariants cannot be violated proves nothing, so each is re-run
   # against deliberately broken copies of itself.
@@ -128,6 +151,25 @@ jobs:
           java-version: "21"
       - uses: extractions/setup-just@v2
       - run: just specs
+
+  # The dev page loaded in headless Chrome over hostile records; `just ci-full`
+  # runs the same recipe.
+  dev-page-smoke:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v2
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+      - run: just dev-page-smoke
+        env:
+          CHROMIUM: ${{ steps.chrome.outputs.chrome-path }}
 
   msrv:
     runs-on: ubuntu-latest

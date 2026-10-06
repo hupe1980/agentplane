@@ -49,6 +49,7 @@ pub mod conformance_registry;
 pub mod faults;
 #[cfg(feature = "keyring")]
 pub mod memory_keyring;
+pub mod older_shape;
 mod shared_journal;
 pub use shared_journal::SharedJournal;
 mod staged_atomic;

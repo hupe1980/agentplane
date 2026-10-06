@@ -112,6 +112,10 @@ enum LogFormat {
     Json,
 }
 
+#[cfg(feature = "dev")]
+#[path = "agentplane/dev.rs"]
+mod dev;
+
 /// The exit statuses, one table for every verb.
 ///
 /// A scheduler reads the status and nothing else, so each number means one
@@ -134,16 +138,24 @@ mod exit {
     /// The answer is incomplete: a `--limit` truncated what was read, or a
     /// strict replay met a run it could not replay.
     pub const PARTIAL: u8 = 5;
+    /// An export under a canon this build does not implement: `verify` cannot
+    /// check it and `restore` cannot rebuild it, and neither is damage.
+    pub const UNVERIFIABLE: u8 = 6;
 }
 
 /// The same table, as `--help` prints it.
 const EXIT_STATUS_HELP: &str = "Exit status:
   0  ok
-  1  a finding or a negative answer (a failed run, an audit finding, needs attention)
+  1  a finding or a negative answer (a failed run, an audit or drill finding, an
+     unused grant, needs attention)
   2  usage: the command as typed cannot be carried out
   3  a run is suspended, waiting for a person, a timer or an event
   4  operational: a store, witness, network or file could not be used
-  5  partial: --limit truncated the answer, or a strict replay could not replay a run";
+  5  partial: --limit truncated the answer, a strict replay could not replay a run,
+     policy check evaluated nothing, grants met an incomplete export or unreadable
+     calls, or subject a cut scan or an unreadable run
+  6  unverifiable: verify or restore met an export under a canon this build does not
+     implement";
 
 /// Why a verb could not answer, which decides its exit status.
 ///
@@ -184,6 +196,16 @@ fn usage(message: impl Into<String>) -> Fault {
     Fault::Usage(message.into())
 }
 
+/// A refused admission, as the exit status reports it: an input the agent
+/// cannot read its data subject from is the command as typed, and every other
+/// refusal is the plane's.
+fn admission_fault(e: agentplane::core::RuntimeError) -> Fault {
+    match e {
+        e @ agentplane::core::RuntimeError::SubjectUnbound { .. } => usage(e.to_string()),
+        e => e.to_string().into(),
+    }
+}
+
 /// What `--version` prints: the version and the features compiled in.
 ///
 /// A binary's feature set decides which verbs, stores and drivers exist, and
@@ -210,6 +232,7 @@ fn compiled_features() -> Vec<&'static str> {
         ("bedrock", cfg!(feature = "bedrock")),
         ("cedar", cfg!(feature = "cedar")),
         ("cli", cfg!(feature = "cli")),
+        ("dev", cfg!(feature = "dev")),
         ("fake-model", cfg!(feature = "fake-model")),
         ("http", cfg!(feature = "http")),
         ("keyring", cfg!(feature = "keyring")),
@@ -275,16 +298,28 @@ enum Verb {
     Validate(ValidateArgs),
     /// Print the manifest format as a JSON Schema, for editors and CI linters.
     Schema,
+    /// Print the operator API's published description, for client generators.
+    Openapi,
     /// Print the identity a registry pins.
     Digest(DigestArgs),
     /// Check a journal's history and print what could not be checked.
     Audit(AuditArgs),
     /// Write a journal's records out as JSON Lines.
     Export(ExportArgs),
+    /// List what left the plane about a case or a run: the disclosure register.
+    Disclosures(DisclosuresArgs),
     /// Recompute an export and check it against its own checkpoint.
     Verify(VerifyArgs),
+    /// Bind a grader's verdict to the records it judged, as an unsigned sidecar.
+    Bind(BindArgs),
     /// Re-derive an export's policy verdicts, or measure a candidate bundle.
     Policy(PolicyArgs),
+    /// Try a manifest's content rules on a value, offline.
+    Content(ContentArgs),
+    /// Report the tool grants an export shows no run used, with a narrower proposal.
+    Grants(GrantsArgs),
+    /// Report where a subject's data went, and what the report cannot trace.
+    Subject(SubjectArgs),
     /// Rebuild a store from an export, and prove it by its own checkpoint.
     Restore(RestoreArgs),
     /// Walk the case layer and tell erasure from loss, against the live stores.
@@ -316,6 +351,11 @@ enum Verb {
     Rearm(RearmArgs),
     /// Stop a run and unwind what it did.
     Cancel(CancelArgs),
+    /// Print one run's journal as a timeline, record by record.
+    History(HistoryArgs),
+    /// Serve a page on this machine for trying an agent.
+    #[cfg(feature = "dev")]
+    Dev(DevArgs),
 }
 
 /// The operator behind a verb a terminal carries.
@@ -402,6 +442,72 @@ enum Verdict {
     Reject,
 }
 
+/// One run's journal, as a timeline.
+#[derive(clap::Args, Debug)]
+struct HistoryArgs {
+    /// The run.
+    run: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// Start at this sequence number rather than the run's first record.
+    #[arg(long, value_name = "SEQ")]
+    from: Option<u64>,
+
+    /// One JSON object per record, in the shape the operator API's history
+    /// route serves. Machine output: JSON escapes only U+0000–U+001F, so DEL,
+    /// the C1 controls and the bidirectional and invisible characters print
+    /// raw; read the text form on a terminal.
+    #[arg(long)]
+    json: bool,
+}
+
+/// A page on this machine for trying an agent.
+#[cfg(feature = "dev")]
+#[derive(clap::Args, Debug)]
+struct DevArgs {
+    /// The manifest, or a `---`-separated file of them. Saving it rebuilds the
+    /// plane over the same store.
+    manifest: String,
+
+    /// The loopback port to listen on; `0` picks a free one. The page is
+    /// never bound anywhere but loopback.
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+
+    /// Keep the journal in a redb file in this directory: an empty one, which
+    /// this mode marks as its own, or one it marked before. Defaults to
+    /// memory, which keeps nothing.
+    #[arg(long, value_name = "DIR")]
+    scratch: Option<String>,
+
+    /// Refused unless `dev`, the only tenant a dev plane runs as — so a
+    /// deployment's tenant in the environment is a refusal, not a plane.
+    #[arg(long, env = "AGENTPLANE_TENANT")]
+    tenant: Option<String>,
+
+    /// Run an MCP server as a child process and reach it as `tool://NAME/...`.
+    /// Needs `--allow-live`.
+    #[arg(long, value_name = "NAME=COMMAND")]
+    mcp: Vec<String>,
+
+    /// Reach an A2A peer at URL as `tool://NAME/...`. Needs `--allow-live` and
+    /// `--acting-as`.
+    #[arg(long, value_name = "NAME=URL", requires = "acting_as")]
+    peer: Vec<String>,
+
+    /// Say that the systems `--mcp` and `--peer` reach are yours to act on: an
+    /// approval on the page performs a real effect through them. The page
+    /// names every such transport for the whole session.
+    #[arg(long)]
+    allow_live: bool,
+
+    /// Who the page's runs act on behalf of, as with `run`.
+    #[arg(long, value_name = "SUBJECT")]
+    acting_as: Option<String>,
+}
+
 /// The worklist, as a verb.
 #[derive(clap::Args, Debug)]
 struct TasksArgs {
@@ -446,6 +552,12 @@ struct DecideArgs {
     /// and four-eyes against them, exactly as the HTTP route does.
     #[arg(long = "role")]
     roles: Vec<String>,
+
+    /// The version of the task this decision was made against, as `tasks`
+    /// prints it. A task that changed since is refused, exit 1, with nothing
+    /// recorded.
+    #[arg(long, value_name = "HEX")]
+    digest: Option<String>,
 
     #[command(flatten)]
     who: ActingAs,
@@ -539,18 +651,50 @@ struct RetentionPlanArgs {
     older_than_days: u32,
 }
 
-/// A listing, for the verbs whose default act changes something.
+/// The hold listing, for a verb whose default act changes something.
 #[derive(clap::Subcommand, Debug)]
-enum Listing {
-    /// List every one standing on this tenant.
-    List(ListArgs),
+enum HoldListing {
+    /// List every hold standing on this tenant, or every recorded release.
+    List(HoldListArgs),
 }
 
 #[derive(clap::Args, Debug)]
-struct ListArgs {
+struct HoldListArgs {
     /// The store, and whose to read.
     #[command(flatten)]
     at: StoreRef,
+
+    /// List the recorded releases instead, newest first: who released each
+    /// hold, when, and who had placed it.
+    #[arg(long)]
+    released: bool,
+
+    /// How many releases to list with `--released`, newest first.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+}
+
+/// The halt listing, for a verb whose default act changes something.
+#[derive(clap::Subcommand, Debug)]
+enum HaltListing {
+    /// List every halt standing on this tenant, or every recorded lift.
+    List(HaltListArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct HaltListArgs {
+    /// The store, and whose to read.
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// List the recorded lifts instead, newest first: who lifted each halt,
+    /// when, and the halt it ended.
+    #[arg(long)]
+    lifted: bool,
+
+    /// How many lifts to list with `--lifted`, newest first.
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
 }
 
 /// Preservation, as a verb.
@@ -564,7 +708,7 @@ struct ListArgs {
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct HoldArgs {
     #[command(subcommand)]
-    list: Option<Listing>,
+    list: Option<HoldListing>,
 
     /// The store holding the case layer, and whose.
     #[command(flatten)]
@@ -579,39 +723,43 @@ struct HoldArgs {
     #[arg(long)]
     reason: Option<String>,
 
-    /// Who is placing it. Required to place one.
+    /// Who is placing or releasing it. Required either way.
     ///
     /// Recorded as **asserted**: nothing here verified it, and what it proves
     /// is that whoever ran this command could open the store. The operator API
     /// records the same field from the credential its authenticator checked,
-    /// and the row says which of the two it was.
+    /// and the row or the release record says which of the two it was.
     #[arg(long)]
     actor: Option<String>,
 
-    /// Lift the hold instead of placing it.
-    #[arg(long, conflicts_with_all = ["reason", "actor"])]
+    /// Release the hold instead of placing it. The release is journaled under
+    /// `--actor` before the hold is removed; `hold list --released` reads the
+    /// releases back.
+    #[arg(long, conflicts_with = "reason")]
     lift: bool,
 }
 
 /// The emergency stop, as a verb: an incident is the worst time to discover
 /// that the brake needs a compiler.
 ///
-/// `--reason` and `--actor` are required to halt and refused to lift: the next
-/// person to look will be somebody else, possibly at three in the morning, and
-/// *why* and *who* are the whole question. A lift needs neither, because it
-/// restores the default and the row it clears is gone.
+/// `--reason` and `--actor` are required to halt: the next person to look will
+/// be somebody else, possibly at three in the morning, and *why* and *who* are
+/// the whole question. `--actor` is required to lift too, and `--reason` is
+/// refused: the lift is journaled under that name before the row goes, and
+/// `halt list --lifted` reads the lifts back.
 #[derive(clap::Args, Debug)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct HaltArgs {
     #[command(subcommand)]
-    list: Option<Listing>,
+    list: Option<HaltListing>,
 
     /// The store holding the halt, and which tenant to stop.
     #[command(flatten)]
     at: Option<StoreRef>,
 
     /// What to stop: `tenant`, `agent:<metadata.name>`,
-    /// `revision:<manifest digest>`, or `subject:<delegation subject>`.
+    /// `revision:<manifest digest>`, or `subject:<principal on the chain>` —
+    /// any principal on the run's delegation chain.
     ///
     /// `revision:` is the one to reach for when a bad deploy is the incident:
     /// it names the exact reviewed bytes, so a fix published as a new version
@@ -623,9 +771,9 @@ struct HaltArgs {
     #[arg(long)]
     reason: Option<String>,
 
-    /// Who is throwing it. Required unless `--lift`.
+    /// Who is throwing or lifting it. Required either way.
     ///
-    /// It goes on the row, and it is recorded as **asserted** rather than
+    /// It goes on the row or the lift record, and it is recorded as **asserted** rather than
     /// authenticated: nothing here verified it, and what it proves is that
     /// whoever ran this command could open the store. The operator API records
     /// the same field from the credential its authenticator checked, and the
@@ -638,7 +786,7 @@ struct HaltArgs {
     actor: Option<String>,
 
     /// Lift this halt instead of setting it.
-    #[arg(long, conflicts_with_all = ["reason", "actor"])]
+    #[arg(long, conflicts_with = "reason")]
     lift: bool,
 
     /// Print one JSON document on stdout instead of text — `halt list` too.
@@ -801,6 +949,39 @@ struct VerifyArgs {
     /// store's own answer is the thing under suspicion.
     #[arg(long)]
     origin: Option<String>,
+
+    /// A grader-verdict sidecar to check against this export. Repeatable.
+    /// Each is reported bound, refused or not checked; a refused one fails.
+    #[arg(long = "grader-verdict", value_name = "FILE")]
+    grader_verdict: Vec<String>,
+
+    /// A grader key a sidecar's signature may verify under, as
+    /// `<key-id>=<64 hex chars>`. Repeatable; separate from `--key`.
+    #[arg(long = "grader-key", value_name = "KEY_ID=HEX")]
+    grader_key: Vec<String>,
+}
+
+/// Bind a grader's verdict to a prefix of one run in an export.
+#[derive(clap::Args, Debug)]
+struct BindArgs {
+    /// The export, or `-` for standard input.
+    export: String,
+
+    /// The run the verdict is about.
+    #[arg(long)]
+    run: String,
+
+    /// The last record of the bound prefix. Defaults to the run's last record.
+    #[arg(long = "last-seq")]
+    last_seq: Option<u64>,
+
+    /// The verdict, as a file of bytes this binary never interprets.
+    #[arg(long)]
+    content: String,
+
+    /// Where to write the unsigned sidecar.
+    #[arg(long)]
+    out: String,
 }
 
 /// What `audit` takes beyond the shared store arguments: the evidence.
@@ -867,6 +1048,12 @@ struct AuditArgs {
     /// store's own answer is the thing under suspicion.
     #[arg(long)]
     origin: Option<String>,
+
+    /// The oldest, in seconds, each witness key's latest signed timestamp may
+    /// be at this machine's clock. A key older than this — or ahead of it by
+    /// more — is a finding. Without it freshness is not judged.
+    #[arg(long = "max-checkpoint-age", value_name = "SECS")]
+    max_checkpoint_age: Option<u64>,
 }
 
 /// The arguments the two journal verbs share.
@@ -903,6 +1090,50 @@ struct ExportArgs {
     /// it is the artifact an auditor is handed.
     #[arg(long)]
     allow_partial: bool,
+
+    /// Disclose one matter instead: the runs this case holds now, each sealed
+    /// run with its inclusion path, and the case's whole block — its state,
+    /// deadlines, blob digests, hold reason and the ids of every run it holds,
+    /// including runs not carried. Repeatable.
+    ///
+    /// The disclosure is recorded in the plane's register — recipient, runs,
+    /// package digest, actor — before any byte reaches the destination, so a
+    /// later erasure names the copy. One recorded and then not delivered (a
+    /// closed standard output) stays recorded.
+    #[arg(long = "case", conflicts_with_all = ["outcome", "allow_partial"])]
+    cases: Vec<String>,
+
+    /// Disclose this run. Repeatable, and combines with `--case`.
+    #[arg(long = "run", conflicts_with_all = ["outcome", "allow_partial"])]
+    runs: Vec<String>,
+
+    /// Who receives the package. Required with `--case` or `--run`.
+    #[arg(long)]
+    to: Option<String>,
+
+    /// Who is disclosing it, recorded as asserted. Required with `--case` or
+    /// `--run`.
+    #[arg(long)]
+    actor: Option<String>,
+
+    /// Where to deliver the package. Standard output when omitted.
+    #[arg(long)]
+    output: Option<String>,
+}
+
+/// What `disclosures` takes.
+#[derive(clap::Args, Debug)]
+struct DisclosuresArgs {
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// List the disclosures carrying this case. Repeatable.
+    #[arg(long = "case")]
+    cases: Vec<String>,
+
+    /// List the disclosures carrying this run. Repeatable.
+    #[arg(long = "run")]
+    runs: Vec<String>,
 }
 
 /// Where a plane's state is, and whose.
@@ -1003,6 +1234,13 @@ struct InitArgs {
     /// The agent's `metadata.name`, and the capability it provides.
     #[arg(long, default_value = "my-agent")]
     name: String,
+
+    /// Write a plane ready to serve into DIR instead: a manifest, the shipped
+    /// policy, freshly generated tokens, the framework caller's token alone,
+    /// a generated Postgres password, the plane's store connection, and a
+    /// compose file. Refused when any of the seven exists.
+    #[arg(long, value_name = "DIR", conflicts_with_all = ["tools", "name", "path"])]
+    serve: Option<String>,
 
     #[command(flatten)]
     out: JsonFlag,
@@ -1110,6 +1348,12 @@ struct RunArgs {
     /// belongs to, or to resolve a `$correlation/customer` subject.
     #[arg(long, value_name = "NAMESPACE=VALUE")]
     correlate: Vec<String>,
+
+    /// Admit only if the declaration governing the capability has this digest
+    /// (hex, as `agentplane digest` prints it). Another revision is refused
+    /// before anything is recorded.
+    #[arg(long, value_name = "DIGEST")]
+    expect_digest: Option<String>,
 }
 
 /// Re-execute a recorded run.
@@ -1186,6 +1430,34 @@ struct CardArgs {
     url: String,
 }
 
+/// Content rules, tried before they are deployed.
+#[derive(clap::Args, Debug)]
+struct ContentArgs {
+    #[command(subcommand)]
+    act: ContentAct,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ContentAct {
+    /// Judge one JSON value with a manifest's content rules.
+    Check(ContentCheckArgs),
+}
+
+/// Runs the runtime's own evaluator over one value. Reads the manifest and the
+/// value; opens no store and calls no checker.
+#[derive(clap::Args, Debug)]
+struct ContentCheckArgs {
+    /// The manifest declaring the rules: one agent.
+    manifest: String,
+    /// Where the value is judged: `admission`, `source:<kind>` or
+    /// `sink:<kind>`.
+    #[arg(long)]
+    at: String,
+    /// The JSON value to judge. Standard input when absent.
+    #[arg(long)]
+    value: Option<String>,
+}
+
 /// Policy over recorded history.
 #[derive(clap::Args, Debug)]
 struct PolicyArgs {
@@ -1233,13 +1505,60 @@ struct PolicyCheckArgs {
     out: JsonFlag,
 }
 
+/// Measure an export against the manifests its runs name.
+///
+/// Reads one file and the manifests given, opens no store and calls no
+/// network. A sealed export's arguments are not opened here, so its grants are
+/// reported as not established.
+#[derive(clap::Args, Debug)]
+struct GrantsArgs {
+    /// The export to read. `-` reads standard input.
+    #[arg(long)]
+    from: String,
+
+    /// A manifest the runs may name by digest. Repeatable.
+    #[arg(long, required = true)]
+    manifest: Vec<String>,
+
+    /// Write each proposed manifest to `<dir>/<digest>.yaml`. Never applied,
+    /// signed or published.
+    #[arg(long)]
+    propose: Option<String>,
+
+    #[command(flatten)]
+    out: JsonFlag,
+}
+
+/// Where one memory subject's data went.
+///
+/// Read-only: appends nothing and changes no store. Sealed arguments and
+/// recall outputs are not opened here.
+#[derive(clap::Args, Debug)]
+struct SubjectArgs {
+    /// The subject, as governed memory and run bindings name it.
+    subject: String,
+
+    #[command(flatten)]
+    at: StoreRef,
+
+    /// How many runs to scan per outcome, and in flight.
+    #[arg(long, default_value_t = 1000)]
+    limit: usize,
+
+    #[command(flatten)]
+    out: JsonFlag,
+}
+
 #[derive(clap::Args, Debug)]
 struct ServeArgs {
-    /// The manifest. `serve` hosts exactly one agent.
+    /// The manifest, or a room file. A2A serves its one agent, or the room's
+    /// one `topology.role: orchestrator`; `--mcp-addr` serves every agent in it.
     manifest: String,
 
-    /// Where callers reach this plane. Goes on the Agent Card, so it is the
-    /// public URL rather than what you bind.
+    /// The A2A endpoint callers reach this plane at — `/a2a` under its public
+    /// address, as `http://localhost:8080/a2a`. Goes on the Agent Card, so it
+    /// is the public URL rather than what you bind; refused unless it ends in
+    /// `/a2a`.
     #[arg(long, env = "AGENTPLANE_URL")]
     url: Option<String>,
 
@@ -1268,6 +1587,29 @@ struct ServeArgs {
     /// `GET /runs?outcome=quarantined` — on its own listener.
     #[arg(long, env = "AGENTPLANE_OPERATOR_ADDR")]
     operator_addr: Option<String>,
+
+    /// Also serve every agent in the file as MCP tools, over Streamable HTTP
+    /// at `/mcp` on its own listener — under the same `--policy` and
+    /// `--tokens`, asked as `mcp:*` actions.
+    #[arg(long, env = "AGENTPLANE_MCP_ADDR")]
+    mcp_addr: Option<String>,
+
+    /// Serve only this agent on `--mcp-addr`, by `metadata.name`. Repeatable;
+    /// without it every agent in the file is served, and each must declare
+    /// `spec.input`.
+    #[arg(long, value_name = "NAME")]
+    mcp_agent: Vec<String>,
+
+    /// A `Host` authority the MCP listener answers besides loopback, as
+    /// `host` or `host:port`. Repeatable; required for a non-loopback bind.
+    #[arg(long, value_name = "HOST")]
+    mcp_allowed_host: Vec<String>,
+
+    /// A browser `Origin` the MCP listener accepts, as `scheme://host[:port]`.
+    /// Repeatable. A request carrying any other `Origin` is refused; one
+    /// carrying none — every server-side framework — is not.
+    #[arg(long, value_name = "ORIGIN")]
+    mcp_allowed_origin: Vec<String>,
 
     /// How often deadlines, task expiry, dead letters and due timers are swept.
     /// `0` runs the sweep from your own scheduler instead.
@@ -1305,6 +1647,31 @@ struct ServeArgs {
     /// Reach an A2A peer at URL as `tool://NAME/...`, as `run` takes it.
     #[arg(long, value_name = "NAME=URL")]
     peer: Vec<String>,
+
+    /// Submit this plane's checkpoints to the witness at this submission
+    /// prefix, on the sweep. Repeatable; needs `--witness-key` and `--log-key`.
+    #[arg(long = "witness-submit", value_name = "URL")]
+    witness_submit: Vec<String>,
+
+    /// A submission witness's key to trust, as `<name>=<base64 Ed25519 public
+    /// key>`. Repeatable.
+    #[arg(long = "witness-key", value_name = "NAME=BASE64")]
+    witness_key: Vec<String>,
+
+    /// How many witnesses must cosign each round. Defaults to all of them.
+    #[arg(long = "witness-quorum", value_name = "N")]
+    witness_quorum: Option<usize>,
+
+    /// This log's note key: its `signed-note` name and a file holding the
+    /// 32-byte Ed25519 seed as 64 hex characters.
+    #[arg(long = "log-key", value_name = "NAME=PATH")]
+    log_key: Option<String>,
+
+    /// Re-submit an unchanged checkpoint to every witness at least this
+    /// often, in seconds, so an idle plane still carries a fresh witness
+    /// time. Refused if shorter than `--sweep-every`.
+    #[arg(long = "witness-interval", value_name = "SECS")]
+    witness_interval: Option<u64>,
 
     /// How long to keep working after a stop signal, in seconds.
     ///
@@ -1371,11 +1738,12 @@ struct Anchor {
     /// is visible from.
     #[serde(skip)]
     checkpoints: Vec<agentplane::audit::Anchor>,
-    /// The witness keys whose cosignatures verified, by monitoring prefix.
+    /// The witness keys whose cosignatures verified, by monitoring prefix or
+    /// by the signed-note file that carried them.
     ///
-    /// Absent for a checkpoint read from a file: a file carries no signature
-    /// this command can check, so it is an asserted fact and saying nothing is
-    /// how that is said.
+    /// Absent for a checkpoint nobody trusted cosigned — a plain note, a JSON
+    /// file, or a signed note with no line verifying under a `--witness-key`:
+    /// it is an asserted fact, and saying nothing is how that is said.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     cosigned_by: Vec<String>,
     /// Witnesses that were asked and gave no anchor, with why.
@@ -1431,6 +1799,8 @@ struct VerifyDocument<'a> {
     anchor: &'a Anchor,
     #[serde(flatten)]
     report: &'a agentplane::export::VerifyReport,
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    grader_verdicts: &'a [agentplane::grader_verdict::SidecarReport],
 }
 
 /// The two verbs that read a journal instead of a manifest.
@@ -1467,6 +1837,84 @@ fn witness_keys(keys: &[String]) -> Result<Vec<agentplane::journal::TrustedWitne
         out.push(agentplane::journal::TrustedWitness::ed25519(name, key));
     }
     Ok(out)
+}
+
+/// Wire `serve`'s submission witnesses and checkpoint interval into the plane.
+///
+/// An interval shorter than a non-zero `--sweep-every` is refused: the sweep is
+/// what re-submits, so it could not be kept.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn with_submission_witnesses(
+    builder: agentplane::runtime::RuntimeBuilder,
+    opts: &ServeArgs,
+) -> Result<agentplane::runtime::RuntimeBuilder, String> {
+    if opts.witness_submit.is_empty() {
+        if !opts.witness_key.is_empty()
+            || opts.witness_quorum.is_some()
+            || opts.log_key.is_some()
+            || opts.witness_interval.is_some()
+        {
+            return Err(
+                "--witness-key, --witness-quorum, --log-key and --witness-interval need \
+                 --witness-submit: there is no witness to submit to"
+                    .to_owned(),
+            );
+        }
+        return Ok(builder);
+    }
+    let trusted = witness_keys(&opts.witness_key)?;
+    if trusted.is_empty() {
+        return Err("--witness-submit needs at least one --witness-key".to_owned());
+    }
+    let Some((name, path)) = opts.log_key.as_deref().and_then(|k| k.split_once('=')) else {
+        return Err(
+            "--witness-submit needs --log-key <name>=<path to a 64-hex-character seed>: \
+             a witness recognises a log by its signed note"
+                .to_owned(),
+        );
+    };
+    let seed_hex = std::fs::read_to_string(path).map_err(|e| format!("--log-key {path}: {e}"))?;
+    let seed: [u8; 32] = hex::decode(seed_hex.trim())
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| format!("--log-key {path}: not a 32-byte seed as 64 hex characters"))?;
+    let signer = agentplane::policy::Ed25519Signer::new(name, &seed);
+    let public = signer.verifying_key();
+    let log = agentplane::journal::LogKey::ed25519(name, public, Arc::new(signer))
+        .map_err(|e| format!("--log-key {name}: {e}"))?;
+    let mut witnesses: Vec<Arc<dyn agentplane::journal::Witness>> = Vec::new();
+    for prefix in &opts.witness_submit {
+        let witness = agentplane::journal::HttpWitness::new(prefix, log.clone(), trusted.clone())
+            .map_err(|e| format!("--witness-submit {prefix}: {e}"))?;
+        witnesses.push(Arc::new(witness));
+    }
+    let required = opts.witness_quorum.unwrap_or(witnesses.len());
+    if required > witnesses.len() {
+        return Err(format!(
+            "--witness-quorum {required} is above the {} witness(es) given",
+            witnesses.len()
+        ));
+    }
+    let quorum = agentplane::journal::WitnessQuorum::of(required)
+        .map_err(|e| format!("--witness-quorum {required}: {e}"))?;
+    let mut builder = builder.witnesses(witnesses, quorum);
+    if let Some(secs) = opts.witness_interval {
+        let sweep = opts.sweep_every.unwrap_or(DEFAULT_SWEEP_SECONDS);
+        if sweep != 0 && secs < u64::from(sweep) {
+            return Err(format!(
+                "--witness-interval {secs} is shorter than --sweep-every {sweep}: the sweep \
+                 re-submits, so an interval shorter than it cannot be kept"
+            ));
+        }
+        if sweep == 0 {
+            eprintln!(
+                "--witness-interval {secs} with --sweep-every 0: the interval is kept only as \
+                 often as your own scheduler sweeps"
+            );
+        }
+        builder = builder.witness_interval(std::time::Duration::from_secs(secs));
+    }
+    Ok(builder)
 }
 
 /// What the named witnesses hold for `origin`, and whether they agree.
@@ -1526,10 +1974,12 @@ async fn anchor_from_witnesses(
                 // same answer, never assembled separately — a basis describing
                 // a checkpoint other than the one used would be the laundering
                 // these records exist to prevent.
-                anchor.checkpoints.push(agentplane::audit::Anchor::new(
-                    cosigned.checkpoint.clone(),
-                    format!("witness {prefix}"),
-                ));
+                anchor
+                    .checkpoints
+                    .push(agentplane::audit::Anchor::from_cosigned(
+                        &cosigned,
+                        format!("witness {prefix}"),
+                    ));
                 anchor.cosigned_by.extend(
                     cosigned
                         .cosignatures
@@ -1634,12 +2084,21 @@ async fn audit_report(
         ));
     }
 
+    // The auditor's own clock is what a freshness bound is judged against.
+    #[allow(clippy::disallowed_methods)]
+    let now = agentplane::core::Timestamp::now_utc();
     let evidence = agentplane::audit::Evidence {
         anchors: &anchor.checkpoints,
         verifier: verifier
             .as_ref()
             .map(|v| v as &dyn agentplane::core::Verifier),
         require_signatures: audit.require_signatures,
+        freshness: audit
+            .max_checkpoint_age
+            .map(|secs| agentplane::audit::Freshness {
+                now,
+                max_age: std::time::Duration::from_secs(secs),
+            }),
     };
     let report = agentplane::audit::audit(store, runs, &evidence)
         .await
@@ -1708,14 +2167,10 @@ async fn export_runs(
         return Ok(ExitCode::from(exit::PARTIAL));
     }
     let stdout = std::io::stdout();
-    let trailer = agentplane::export::to_jsonl(
-        store,
-        Some(cases),
-        runs,
-        std::io::BufWriter::new(stdout.lock()),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    let trailer =
+        agentplane::export::to_jsonl(store, cases, runs, std::io::BufWriter::new(stdout.lock()))
+            .await
+            .map_err(|e| e.to_string())?;
     eprintln!(
         "exported {} record(s) from {}/{} run(s) and {} case(s)",
         trailer.records, trailer.runs_exported, trailer.runs_requested, trailer.cases
@@ -1731,6 +2186,112 @@ async fn export_runs(
     } else {
         exit::OK
     }))
+}
+
+/// The grant exercise report, from an export and the manifests it names.
+fn grants_verb(opts: &GrantsArgs) -> Result<ExitCode, Fault> {
+    let manifests = opts
+        .manifest
+        .iter()
+        .map(|path| {
+            let text =
+                std::fs::read_to_string(path).map_err(|e| usage(format!("reading {path}: {e}")))?;
+            Manifest::parse(&text).map_err(|e| usage(format!("{path}: {e}")))
+        })
+        .collect::<Result<Vec<_>, Fault>>()?;
+    let grants = agentplane::grants::Grants::new(&manifests);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    let report = if opts.from == "-" {
+        rt.block_on(grants.run(std::io::stdin().lock()))
+    } else {
+        let file =
+            std::fs::File::open(&opts.from).map_err(|e| format!("reading {}: {e}", opts.from))?;
+        rt.block_on(grants.run(std::io::BufReader::new(file)))
+    }
+    .map_err(|e| match e {
+        agentplane::grants::GrantsError::NotAnExport(_)
+        | agentplane::grants::GrantsError::Manifest(_) => usage(format!("{}: {e}", opts.from)),
+        _ => Fault::Operational(e.to_string()),
+    })?;
+
+    if let Some(dir) = &opts.propose {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {dir}: {e}"))?;
+        for row in &report.digests {
+            let (Some(digest), Some(proposal)) = (&row.digest, &row.proposal) else {
+                continue;
+            };
+            let yaml = agentplane::manifest::registry::to_yaml(&proposal.manifest)
+                .map_err(|e| e.to_string())?;
+            let header = format!(
+                "# Proposed by `agentplane grants` from {}: unsigned, not published.\n\
+                 # Equal to the input after parsing except for the removed grants: {:?}.\n\
+                 # Comments and key order are not kept. Export {}.\n",
+                opts.from,
+                proposal.removed,
+                if report.window.complete() {
+                    "complete"
+                } else {
+                    "INCOMPLETE"
+                },
+            );
+            let path = std::path::Path::new(dir).join(format!("{digest}.yaml"));
+            std::fs::write(&path, header + &yaml)
+                .map_err(|e| format!("writing {}: {e}", path.display()))?;
+        }
+    }
+
+    if opts.out.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
+    } else {
+        print!("{report}");
+    }
+    Ok(if report.has_unused() {
+        ExitCode::from(exit::FINDING)
+    } else if report.partial() {
+        ExitCode::from(exit::PARTIAL)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+/// Where a subject's data went, read from a store and changing nothing.
+fn subject_verb(opts: &SubjectArgs) -> Result<ExitCode, Fault> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    rt.block_on(async {
+        let backend = opts.at.open().await?;
+        let tenant = backend.tenant();
+        let report = agentplane::subject::Trace::new(tenant.as_str())
+            .report(
+                &backend.journal(),
+                backend.memory().as_ref(),
+                &opts.subject,
+                opts.limit,
+            )
+            .await
+            .map_err(|e| Fault::Operational(e.to_string()))?;
+        if opts.out.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+            );
+        } else {
+            print!("{report}");
+        }
+        Ok(if report.partial() {
+            ExitCode::from(exit::PARTIAL)
+        } else {
+            ExitCode::SUCCESS
+        })
+    })
 }
 
 fn journal_verb(
@@ -1765,44 +2326,24 @@ fn journal_verb(
             opts.outcome.clone()
         };
 
-        let mut runs = Vec::new();
-        let mut truncated = Vec::new();
-        for outcome in &wanted {
-            let found = store
-                .runs_by_outcome(outcome, opts.limit + 1)
+        // In-flight runs are skipped when the caller narrowed to specific
+        // outcomes, because that is a request for exactly those conclusions.
+        let found =
+            agentplane::export::runs_to_read(&store, &wanted, opts.outcome.is_empty(), opts.limit)
                 .await
                 .map_err(|e| e.to_string())?;
-            // One more than asked for, so a full page and an overflowing one are
-            // distinguishable. An export that quietly stopped at the limit is
-            // shaped exactly like a complete one.
-            if found.len() > opts.limit {
-                truncated.push(outcome.clone());
-            }
-            runs.extend(found.into_iter().take(opts.limit));
+        let runs = found.runs;
+        let truncated = found.reached;
+        for (run, why) in &found.unreadable {
+            eprintln!("warning: in-flight run {run} could not be read: {why}");
         }
-
-        // The runs no outcome names. Skipped when the caller narrowed to
-        // specific outcomes, because that is a request for exactly those
-        // conclusions — and an in-flight run is not one.
-        if opts.outcome.is_empty() {
-            let flight = agentplane::export::runs_in_flight(&store, opts.limit)
-                .await
-                .map_err(|e| e.to_string())?;
-            if flight.truncated {
-                truncated.push("in-flight runs".to_owned());
-            }
-            for (run, why) in &flight.unreadable {
-                eprintln!("warning: in-flight run {run} could not be read: {why}");
-            }
-            if !flight.runs.is_empty() {
-                eprintln!(
-                    "including {} run(s) still in flight — sleeping, awaiting a message, \
-                     or waiting on a person. The Merkle log commits to sealed runs only, \
-                     so these are carried and the checkpoint does not cover them",
-                    flight.runs.len()
-                );
-            }
-            runs.extend(flight.runs);
+        if found.in_flight > 0 {
+            eprintln!(
+                "including {} run(s) still in flight — sleeping, awaiting a message, \
+                 or waiting on a person. The Merkle log commits to sealed runs only, \
+                 so these are carried and the checkpoint does not cover them",
+                found.in_flight
+            );
         }
 
         // Said on stderr so it survives `> out.jsonl`, and said before the work
@@ -2060,10 +2601,31 @@ fn missing_store() -> String {
         .to_owned()
 }
 
-/// Every standing legal hold.
-fn holds_verb(at: &StoreRef) -> Result<ExitCode, Fault> {
+/// Every standing legal hold; or, with `released`, up to that many recorded
+/// releases, newest first.
+fn holds_verb(at: &StoreRef, released: Option<usize>) -> Result<ExitCode, Fault> {
     blocking(async {
-        let cases = at.open().await?.cases();
+        let backend = at.open().await?;
+        if let Some(limit) = released {
+            let plane = backend.plane().build();
+            let mut records = plane
+                .released_holds(limit.saturating_add(1))
+                .await
+                .map_err(|e| e.to_string())?;
+            let truncated = records.len() > limit;
+            records.truncate(limit);
+            let rows: Vec<serde_json::Value> = records.iter().filter_map(release_row).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "released": rows,
+                    "truncated": truncated,
+                }))
+                .map_err(|e| e.to_string())?
+            );
+            return Ok(listed_status(truncated));
+        }
+        let cases = backend.cases();
         let mut standing = Vec::new();
         let mut after = None;
         loop {
@@ -2097,7 +2659,9 @@ fn holds_verb(at: &StoreRef) -> Result<ExitCode, Fault> {
 /// the control move has not been told whether they moved it.
 fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, Fault> {
     let (at, case) = match (&opts.list, &opts.at, &opts.case) {
-        (Some(Listing::List(list)), ..) => return holds_verb(&list.at),
+        (Some(HoldListing::List(list)), ..) => {
+            return holds_verb(&list.at, list.released.then_some(list.limit));
+        }
         (None, Some(at), Some(case)) => (at, case.as_str()),
         (None, None, _) => return Err(usage(missing_store())),
         (None, Some(_), None) => {
@@ -2113,23 +2677,41 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, Fault> {
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
+    if opts.lift {
+        let by = lifter(opts.actor.as_deref(), "release a hold")?;
+        let case =
+            agentplane::core::CaseId::parse(case).map_err(|e| usage(format!("--case: {e}")))?;
+        return rt.block_on(async {
+            let plane = at.open().await?.plane().build();
+            // Wall clock by design: when a hold was released is a fact about
+            // the outside world, not a journaled observation.
+            #[allow(clippy::disallowed_methods)]
+            let now = time::OffsetDateTime::now_utc();
+            let record = plane
+                .release_hold(case, &by, now)
+                .await
+                .map_err(|e| e.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "case": case.to_string(),
+                    "lifted": record.is_some(),
+                    "removed": record.is_some_and(|r| r.removed),
+                    "by": by.actor(),
+                    "basis": by.basis().as_str(),
+                    "record": record.map(|r| r.record.to_string()),
+                }))
+                .map_err(|e| e.to_string())?
+            );
+            Ok(lift_status(record.is_some()))
+        });
+    }
+
     rt.block_on(async {
         let cases = at.open().await?.cases();
 
         let case =
             agentplane::core::CaseId::parse(case).map_err(|e| usage(format!("--case: {e}")))?;
-        if opts.lift {
-            let lifted = cases.release_hold(case).await.map_err(|e| e.to_string())?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "case": case.to_string(),
-                    "lifted": lifted,
-                }))
-                .map_err(|e| e.to_string())?
-            );
-            return Ok(lift_status(lifted));
-        }
 
         let Some(reason) = opts.reason.as_deref() else {
             return Err(usage(
@@ -2195,7 +2777,9 @@ fn hold_verb(opts: &HoldArgs) -> Result<ExitCode, Fault> {
 /// not been told whether they threw it.
 fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, Fault> {
     let at = match (&opts.list, &opts.at) {
-        (Some(Listing::List(list)), _) => return halts_verb(&list.at, opts.json),
+        (Some(HaltListing::List(list)), _) => {
+            return halts_verb(&list.at, list.lifted.then_some(list.limit), opts.json);
+        }
         (None, Some(at)) => at,
         (None, None) => return Err(usage(missing_store())),
     };
@@ -2206,9 +2790,11 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, Fault> {
             agentplane::quota::HaltScope::forms()
         ))
     })?;
-    let thrown = if opts.lift {
-        None
-    } else {
+    if opts.lift {
+        let by = lifter(opts.actor.as_deref(), "lift a halt")?;
+        return lift_one_halt(at, &scope, &by, opts.json);
+    }
+    let thrown = {
         let reason = opts.reason.as_deref().ok_or_else(|| {
             usage(concat!(
                 "--reason is required to halt: the next person to look will be somebody else, ",
@@ -2224,7 +2810,7 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, Fault> {
             ))
         })?;
         let by = agentplane::core::Operator::asserted(actor).map_err(|e| usage(e.to_string()))?;
-        Some((by, reason))
+        (by, reason)
     };
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -2232,28 +2818,21 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, Fault> {
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
+    let (by, reason) = &thrown;
     rt.block_on(async {
         let quotas = at.open().await?.quotas();
-        let printed = if let Some((by, reason)) = &thrown {
-            {
-                // Wall clock by design, like the retention cutoff and a hold's
-                // instant: when a person threw a stop is a fact about the
-                // outside world, not a journaled observation.
-                #[allow(clippy::disallowed_methods)]
-                let now = time::OffsetDateTime::now_utc();
-                quotas
-                    .set_halt(&scope, by, now, reason)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                if !opts.json {
-                    println!(
-                        "halted {}: {reason} (by {}, {})",
-                        scope.key(),
-                        by.actor(),
-                        by.basis().as_str()
-                    );
-                    return Ok(ExitCode::SUCCESS);
-                }
+        // Wall clock by design, like the retention cutoff and a hold's
+        // instant: when a person threw a stop is a fact about the outside
+        // world, not a journaled observation.
+        #[allow(clippy::disallowed_methods)]
+        let now = time::OffsetDateTime::now_utc();
+        quotas
+            .set_halt(&scope, by, now, reason)
+            .await
+            .map_err(|e| e.to_string())?;
+        if opts.json {
+            println!(
+                "{}",
                 serde_json::json!({
                     "scope": scope.key(),
                     "halted": true,
@@ -2261,34 +2840,83 @@ fn halt_verb(opts: &HaltArgs) -> Result<ExitCode, Fault> {
                     "by": by.actor(),
                     "basis": by.basis().as_str(),
                 })
-            }
+            );
         } else {
-            {
-                let was_standing = quotas.lift_halt(&scope).await.map_err(|e| e.to_string())?;
-                // Whether one was standing is the answer to *did I clear the
-                // right scope*, which is the question during an incident. A lift
-                // that found nothing must not read as success, so it exits as a
-                // negative answer.
-                if opts.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "scope": scope.key(),
-                            "halted": false,
-                            "was_standing": was_standing,
-                        })
-                    );
-                } else if was_standing {
-                    println!("lifted {}", scope.key());
-                } else {
-                    println!("no halt was standing on {}; nothing lifted", scope.key());
-                }
-                return Ok(lift_status(was_standing));
-            }
-        };
-        println!("{printed}");
+            println!(
+                "halted {}: {reason} (by {}, {})",
+                scope.key(),
+                by.actor(),
+                by.basis().as_str()
+            );
+        }
         Ok(ExitCode::SUCCESS)
     })
+}
+
+/// Lift the halt at `scope`, journaled under `by` before the row goes.
+///
+/// Whether one was standing is the answer to *did I clear the right scope*,
+/// which is the question during an incident. A lift that found nothing must not
+/// read as success, so it exits as a negative answer.
+fn lift_one_halt(
+    at: &StoreRef,
+    scope: &agentplane::quota::HaltScope,
+    by: &agentplane::core::Operator,
+    json: bool,
+) -> Result<ExitCode, Fault> {
+    blocking(async {
+        let plane = at.open().await?.plane().build();
+        // Wall clock by design, as the throw's instant is.
+        #[allow(clippy::disallowed_methods)]
+        let now = time::OffsetDateTime::now_utc();
+        let record = plane
+            .lift_halt(scope, by, now)
+            .await
+            .map_err(|e| e.to_string())?;
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "scope": scope.key(),
+                    "halted": false,
+                    "was_standing": record.is_some(),
+                    "removed": record.is_some_and(|r| r.removed),
+                    "by": by.actor(),
+                    "basis": by.basis().as_str(),
+                    "record": record.map(|r| r.record.to_string()),
+                })
+            );
+        } else if let Some(lifted) = record {
+            let removal = if lifted.removed {
+                ""
+            } else {
+                "; another lift removed the row first"
+            };
+            println!(
+                "lifted {} (by {}, {}; recorded in run {}{removal})",
+                scope.key(),
+                by.actor(),
+                by.basis().as_str(),
+                lifted.record
+            );
+        } else {
+            println!("no halt was standing on {}; nothing lifted", scope.key());
+        }
+        Ok(lift_status(record.is_some()))
+    })
+}
+
+/// The operator a terminal lift is recorded under, refused before any store is
+/// opened when `--actor` is absent: the lift is journaled under this name, and
+/// a lift nobody can account for is the gap the record exists to close.
+fn lifter(actor: Option<&str>, act: &str) -> Result<agentplane::core::Operator, Fault> {
+    let Some(actor) = actor else {
+        return Err(usage(format!(
+            "--actor is required to {act}: the lift is recorded under that name, and the \
+             record says it was asserted rather than authenticated"
+        )));
+    };
+    agentplane::core::Operator::asserted(actor).map_err(|e| usage(e.to_string()))
 }
 
 /// How a lift exits: a lift that found nothing standing is a negative answer.
@@ -2300,15 +2928,107 @@ fn lift_status(was_standing: bool) -> ExitCode {
     })
 }
 
-/// Every standing halt, so an operator can see what an incident left behind.
-fn halts_verb(at: &StoreRef, json: bool) -> Result<ExitCode, Fault> {
+/// One recorded release as `hold list --released` prints it.
+fn release_row(record: &agentplane::journal::Record) -> Option<serde_json::Value> {
+    let agentplane::journal::RecordKind::HoldReleased {
+        by,
+        at,
+        placed_by,
+        placed_at,
+    } = record.kind()
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "case": record.body.case.map(|c| c.to_string()),
+        "by": by.actor(),
+        "basis": by.basis().as_str(),
+        "released_at": at.unix_timestamp(),
+        "placed_by": placed_by.actor(),
+        "placed_basis": placed_by.basis().as_str(),
+        "placed_at": placed_at.unix_timestamp(),
+        "record": record.body.run.to_string(),
+    }))
+}
+
+/// One recorded lift as `halt list --lifted` prints it.
+fn lift_row(record: &agentplane::journal::Record) -> Option<serde_json::Value> {
+    let agentplane::journal::RecordKind::HaltLifted {
+        scope,
+        by,
+        at,
+        reason,
+        thrown_by,
+        thrown_at,
+    } = record.kind()
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "scope": scope,
+        "by": by.actor(),
+        "basis": by.basis().as_str(),
+        "lifted_at": at.unix_timestamp(),
+        "reason": reason,
+        "thrown_by": thrown_by.actor(),
+        "thrown_basis": thrown_by.basis().as_str(),
+        "thrown_at": thrown_at.unix_timestamp(),
+        "record": record.body.run.to_string(),
+    }))
+}
+
+/// Every standing halt, so an operator can see what an incident left behind;
+/// or, with `lifted`, up to that many recorded lifts, newest first.
+fn halts_verb(at: &StoreRef, lifted: Option<usize>, json: bool) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start the async runtime: {e}"))?;
 
     rt.block_on(async {
-        let quotas = at.open().await?.quotas();
+        let backend = at.open().await?;
+        if let Some(limit) = lifted {
+            let plane = backend.plane().build();
+            let mut records = plane
+                .lifted_halts(limit.saturating_add(1))
+                .await
+                .map_err(|e| e.to_string())?;
+            let truncated = records.len() > limit;
+            records.truncate(limit);
+            let rows: Vec<serde_json::Value> = records.iter().filter_map(lift_row).collect();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "lifted": rows,
+                        "truncated": truncated,
+                    }))
+                    .map_err(|e| e.to_string())?
+                );
+            } else if rows.is_empty() {
+                println!("no lifts recorded");
+            } else {
+                for row in &rows {
+                    println!(
+                        "{}\tlifted {} by {} ({}); thrown {} by {} ({}): {}\trun {}",
+                        row["scope"].as_str().unwrap_or_default(),
+                        row["lifted_at"],
+                        row["by"].as_str().unwrap_or_default(),
+                        row["basis"].as_str().unwrap_or_default(),
+                        row["thrown_at"],
+                        row["thrown_by"].as_str().unwrap_or_default(),
+                        row["thrown_basis"].as_str().unwrap_or_default(),
+                        row["reason"].as_str().unwrap_or_default(),
+                        row["record"].as_str().unwrap_or_default(),
+                    );
+                }
+                if truncated {
+                    println!("truncated: --limit {limit} cut the listing short");
+                }
+            }
+            return Ok(listed_status(truncated));
+        }
+        let quotas = backend.quotas();
         let halts = quotas.halts().await.map_err(|e| e.to_string())?;
         let rows: Vec<serde_json::Value> = halts
             .iter()
@@ -2355,10 +3075,12 @@ fn waiting_verb(opts: &WaitingArgs) -> Result<ExitCode, Fault> {
 
     rt.block_on(async {
         let store = opts.at.open().await?.journal();
-        let waiting = store
-            .waiting_runs(opts.limit)
+        let mut waiting = store
+            .waiting_runs(opts.limit.saturating_add(1))
             .await
             .map_err(|e| e.to_string())?;
+        let truncated = waiting.len() > opts.limit;
+        waiting.truncate(opts.limit);
         let rows: Vec<serde_json::Value> = waiting
             .iter()
             .map(|w| {
@@ -2374,19 +3096,16 @@ fn waiting_verb(opts: &WaitingArgs) -> Result<ExitCode, Fault> {
             .collect();
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({ "waiting": rows }))
-                .map_err(|e| e.to_string())?
+            serde_json::to_string_pretty(&serde_json::json!({
+                "waiting": rows,
+                "truncated": truncated,
+            }))
+            .map_err(|e| e.to_string())?
         );
-        Ok(ExitCode::SUCCESS)
+        Ok(listed_status(truncated))
     })
 }
 
-/// Ask the plane whether anything needs a person, and exit non-zero if so.
-///
-/// **The exit code is the point.** This is a verb a scheduler runs, and a check
-/// that always exits zero is a check nobody notices has stopped working — the
-/// same reason `drill` and `verify` report through their status rather than
-/// only on stdout.
 /// One async runtime, for the verbs that only touch stores.
 fn blocking<T, E: From<String>>(
     f: impl std::future::Future<Output = Result<T, E>>,
@@ -2435,9 +3154,7 @@ fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, Fault> {
 
     blocking(async move {
         let backend = opts.at.open().await?;
-        let plane = Runtime::builder_with(backend.stores())
-            .tenant(backend.tenant())
-            .build();
+        let plane = backend.plane().build();
         plane
             .reconcile_effect(run, effect, assertion, &by, &opts.note)
             .await
@@ -2480,9 +3197,7 @@ fn quarantine_verb(opts: &QuarantineArgs) -> Result<ExitCode, Fault> {
 
     blocking(async move {
         let backend = opts.at.open().await?;
-        let plane = Runtime::builder_with(backend.stores())
-            .tenant(backend.tenant())
-            .build();
+        let plane = backend.plane().build();
         plane
             .record_quarantine_decision(run, &by, &opts.reason, decision)
             .await
@@ -2536,6 +3251,8 @@ fn task_json(task: &agentplane::core::Task, whole: bool) -> serde_json::Value {
         // rendered as nothing or reordered the text around it.
         "escaped": shown.escaped,
         "mixed_script": shown.mixed_script,
+        // The version of the stored row, which `decide --digest` names back.
+        "digest": j.digest().to_hex(),
     });
     if whole {
         out["confidence"] = serde_json::json!(j.confidence);
@@ -2586,8 +3303,13 @@ fn tasks_verb(opts: &TasksArgs) -> Result<ExitCode, Fault> {
             }))
             .map_err(|e| e.to_string())?
         );
-        Ok(ExitCode::SUCCESS)
+        Ok(listed_status(truncated))
     })
+}
+
+/// How a listing exits: one that `--limit` cut short is a partial answer.
+fn listed_status(truncated: bool) -> ExitCode {
+    ExitCode::from(if truncated { exit::PARTIAL } else { exit::OK })
 }
 
 /// Decide a task on the worklist.
@@ -2600,6 +3322,14 @@ fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, Fault> {
     let by = opts.who.operator()?;
     let id = agentplane::core::TaskId::parse(&opts.task_id)
         .map_err(|e| usage(format!("`{}` is not a task id: {e}", opts.task_id)))?;
+    let expected = opts
+        .digest
+        .as_deref()
+        .map(|hex| {
+            agentplane::core::Digest::from_hex(hex)
+                .map_err(|e| usage(format!("--digest `{hex}` is not a digest: {e}")))
+        })
+        .transpose()?;
     let approved = opts.verdict == Verdict::Approve;
     let decision = if approved {
         agentplane::core::Decision::approve(by.clone(), opts.reason.clone())
@@ -2612,12 +3342,22 @@ fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, Fault> {
         // The shortest lease the store can renew: this plane holds no agent,
         // so a resume after the decision keeps its lease for recovery to find
         // the run, and the operator's `replay` should not wait long for it.
-        let plane = Runtime::builder_with(backend.stores())
-            .tenant(backend.tenant())
+        let plane = backend
+            .plane()
             .lease_ttl(std::time::Duration::from_secs(2))
             .build();
-        let delivery = match plane.decide_task(id, &decision, &opts.roles).await {
+        let delivery = match plane
+            .decide_task_at(id, &decision, &opts.roles, expected)
+            .await
+        {
             Ok(delivery) => delivery,
+            Err(e @ agentplane::core::RuntimeError::TaskChanged { .. }) => {
+                eprintln!(
+                    "{e}\n  agentplane tasks --show {id}{}",
+                    where_flags(Some(&opts.at.store), opts.at.tenant.as_deref())
+                );
+                return Ok(ExitCode::from(exit::FINDING));
+            }
             // A refusal, not an outage: nothing was recorded and the task is
             // still open, and the person at this terminal is owed the way on.
             Err(agentplane::core::RuntimeError::ProposalWithheld { reason, .. }) => {
@@ -2728,9 +3468,7 @@ fn cancel_verb(opts: &CancelArgs) -> Result<ExitCode, Fault> {
     let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| usage(e.to_string()))?;
     blocking(async move {
         let backend = opts.at.open().await?;
-        let plane = Runtime::builder_with(backend.stores())
-            .tenant(backend.tenant())
-            .build();
+        let plane = backend.plane().build();
         let first = plane
             .request_cancel(run, &by, &opts.reason)
             .await
@@ -2756,10 +3494,7 @@ fn rearm_verb(opts: &RearmArgs) -> Result<ExitCode, Fault> {
     let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| usage(e.to_string()))?;
     blocking(async move {
         let backend = opts.at.open().await?;
-        let plane = Runtime::builder_with(backend.stores())
-            .tenant(backend.tenant())
-            .push(backend.push())
-            .build();
+        let plane = backend.plane().push(backend.push()).build();
         let rearmed = plane
             .rearm_push(run, &opts.id)
             .await
@@ -2779,6 +3514,12 @@ fn rearm_verb(opts: &RearmArgs) -> Result<ExitCode, Fault> {
     })
 }
 
+/// Ask the plane whether anything needs a person, and exit non-zero if so.
+///
+/// **The exit code is the point.** This is a verb a scheduler runs, and a check
+/// that always exits zero is a check nobody notices has stopped working — the
+/// same reason `drill` and `verify` report through their status rather than
+/// only on stdout.
 fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, Fault> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2790,10 +3531,7 @@ fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, Fault> {
         // The quota store is wired for its reservations only: which stopped
         // runs hold the tenant's period is a condition, and no ceiling this
         // verb could state is consulted.
-        let plane = Runtime::builder_with(backend.stores())
-            .tenant(backend.tenant())
-            .quota(backend.quotas(), agentplane::quota::TenantQuota::default())
-            .build();
+        let plane = backend.plane().build();
         // The clock is this verb's, which is what makes the runtime's own
         // escapes stay at three: a binary reading the wall clock to ask "what
         // is overdue right now" is not the deterministic zone reaching for it.
@@ -2830,6 +3568,310 @@ fn attention_verb(opts: &WaitingArgs) -> Result<ExitCode, Fault> {
         } else {
             ExitCode::SUCCESS
         })
+    })
+}
+
+/// How many records `history` reads from the store at a time.
+const HISTORY_PAGE: usize = 500;
+
+/// `history`: one run's journal, one line per record.
+fn history_verb(opts: &HistoryArgs) -> Result<ExitCode, Fault> {
+    let run = agentplane::core::RunId::parse(&opts.run)
+        .map_err(|e| usage(format!("`{}` is not a run id: {e}", opts.run)))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    rt.block_on(async {
+        let backend = opts.at.open().await?;
+        let lines = history_lines(&backend.journal(), run, opts.from, opts.json).await?;
+        let Some(lines) = lines else {
+            eprintln!(
+                "no run {run} in {}{}",
+                without_password(&opts.at.store),
+                opts.at
+                    .tenant
+                    .as_deref()
+                    .map_or_else(String::new, |t| format!(" (tenant {t})"))
+            );
+            return Ok(ExitCode::from(exit::FINDING));
+        };
+        let mut out = std::io::stdout().lock();
+        for line in lines {
+            std::io::Write::write_all(&mut out, line.as_bytes())
+                .and_then(|()| std::io::Write::write_all(&mut out, b"\n"))
+                .map_err(|e| format!("could not write the timeline: {e}"))?;
+        }
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// The lines `history` prints, or `None` for a run the store does not hold.
+///
+/// `--json` prints each record as the history route serves it. The text form
+/// is built from the same view, and every line passes through the plane's
+/// hidden-code-point escaping: a recorded string is somebody's input, and an
+/// escape sequence in it would otherwise drive the terminal reading it.
+async fn history_lines(
+    journal: &Arc<dyn JournalStore>,
+    run: agentplane::core::RunId,
+    from: Option<u64>,
+    json: bool,
+) -> Result<Option<Vec<String>>, Fault> {
+    let start = from.unwrap_or(1).max(1);
+    let mut next = start;
+    let mut lines = Vec::new();
+    loop {
+        let page = journal
+            .read_page(run, next, HISTORY_PAGE)
+            .await
+            .map_err(|e| e.to_string())?;
+        for record in &page {
+            let view = agentplane::journal::view::record_view(record);
+            lines.push(if json {
+                serde_json::to_string(&view).map_err(|e| e.to_string())?
+            } else {
+                timeline_line(&view)
+            });
+            next = record.seq() + 1;
+        }
+        if page.len() < HISTORY_PAGE {
+            break;
+        }
+    }
+    // A run with no first record is a run nobody has heard of, whatever
+    // `from` asked; an empty page from further along a run that exists is a
+    // reader who has caught up.
+    if lines.is_empty()
+        && (start == 1
+            || journal
+                .read_page(run, 1, 1)
+                .await
+                .map_err(|e| e.to_string())?
+                .is_empty())
+    {
+        return Ok(None);
+    }
+    Ok(Some(lines))
+}
+
+/// One record as a terminal line: sequence, kind, step, phase, then the
+/// payload — escaped.
+fn timeline_line(view: &agentplane::journal::view::RecordView) -> String {
+    use std::fmt::Write as _;
+    let mut payload = view.record.clone();
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("kind");
+    }
+    let mut line = format!("{:>5}  {}", view.seq, view.kind);
+    if let Some(step) = &view.step {
+        let _ = write!(line, "  step {step}");
+    }
+    if view.phase != "forward" {
+        let _ = write!(line, "  {}", view.phase);
+    }
+    line.push_str("  ");
+    line.push_str(&serde_json::to_string(&payload).unwrap_or_default());
+    agentplane::core::visible::escape(&line).0
+}
+
+/// The file beside a scratch store that says `dev` created it.
+#[cfg(feature = "dev")]
+const DEV_MARKER: &str = ".agentplane-dev";
+
+/// The marker's exact contents.
+#[cfg(feature = "dev")]
+const DEV_MARKER_TEXT: &str = "created by `agentplane dev`; not a deployment's store\n";
+
+/// The scratch store's file name.
+#[cfg(feature = "dev")]
+const DEV_STORE: &str = "dev.redb";
+
+/// The store a dev plane runs on: memory, or a scratch directory this mode
+/// created.
+///
+/// Refused before anything is opened: a `PostgreSQL` connection string, a
+/// file, a symbolic link, a directory holding anything without the marker's
+/// exact bytes, a `dev.redb` that is not a regular file, and a tenant other
+/// than `dev`. A deployment's store is never one of these, so a page that
+/// starts runs over HTTP cannot write to one.
+#[cfg(feature = "dev")]
+fn dev_store(scratch: Option<&str>, tenant: Option<&str>) -> Result<Backend, Fault> {
+    if let Some(other) = tenant.filter(|t| *t != agentplane::api::dev::TENANT) {
+        return Err(usage(format!(
+            "`agentplane dev` runs as tenant `{}` only, and `{other}` was named (by --tenant or \
+             AGENTPLANE_TENANT) — a deployment's tenant is not a scratch plane",
+            agentplane::api::dev::TENANT
+        )));
+    }
+    let tenant =
+        agentplane::core::TenantId::new(agentplane::api::dev::TENANT).map_err(|e| e.to_string())?;
+    let Some(dir) = scratch else {
+        let store = RedbStore::open_in_memory().map_err(|e| e.to_string())?;
+        return Ok(Backend::Embedded(
+            Arc::new(store.for_tenant(tenant.clone())),
+            tenant,
+        ));
+    };
+    if is_connection_string(dir) {
+        return Err(usage(
+            "--scratch names a database; `agentplane dev` opens only a directory it created",
+        ));
+    }
+    let dir = std::path::Path::new(dir);
+    // Nothing here follows a link: a link is a path into a store this mode
+    // did not create.
+    let kind = |path: &std::path::Path| std::fs::symlink_metadata(path).map(|m| m.file_type());
+    if let Ok(found) = kind(dir) {
+        if found.is_symlink() {
+            return Err(usage(format!(
+                "--scratch {} is a symbolic link; `agentplane dev` opens only a directory it \
+                 created, and a link can name any other",
+                dir.display()
+            )));
+        }
+        if !found.is_dir() {
+            return Err(usage(format!(
+                "--scratch {} is a file; `agentplane dev` opens only a directory it created, so \
+                 no deployment's store is one it writes to",
+                dir.display()
+            )));
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let held: Vec<String> = std::fs::read_dir(dir)
+        .map_err(|e| format!("could not read {}: {e}", dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    let marker = dir.join(DEV_MARKER);
+    let ours = kind(&marker).is_ok_and(|k| k.is_file())
+        && std::fs::read(&marker).is_ok_and(|bytes| bytes == DEV_MARKER_TEXT.as_bytes());
+    if held.is_empty() {
+        std::fs::write(&marker, DEV_MARKER_TEXT)
+            .map_err(|e| format!("could not mark {}: {e}", dir.display()))?;
+    } else if !ours {
+        return Err(usage(format!(
+            "--scratch {} holds files and no dev marker; `agentplane dev` opens only an empty \
+             directory or one it marked",
+            dir.display()
+        )));
+    } else if let Some(other) = held.iter().find(|n| *n != DEV_MARKER && *n != DEV_STORE) {
+        return Err(usage(format!(
+            "--scratch {} holds `{other}` beside its dev store; `agentplane dev` opens only a \
+             directory holding nothing else",
+            dir.display()
+        )));
+    } else if kind(&dir.join(DEV_STORE)).is_ok_and(|k| !k.is_file()) {
+        return Err(usage(format!(
+            "--scratch {}/{DEV_STORE} is not a regular file; `agentplane dev` opens only the \
+             store it created there",
+            dir.display()
+        )));
+    }
+    let path = dir.join(DEV_STORE);
+    let store = RedbStore::open(&path).map_err(|e| Fault::from(held_by_a_plane(&e.to_string())))?;
+    Ok(Backend::Embedded(
+        Arc::new(store.for_tenant(tenant.clone())),
+        tenant,
+    ))
+}
+
+/// `--mcp` and `--peer` reach systems outside this process, so an approval on
+/// the page performs a real effect: refused until the author says they own
+/// them.
+#[cfg(feature = "dev")]
+fn refuse_live_without_consent(opts: &DevArgs) -> Result<(), Fault> {
+    if !opts.allow_live && (!opts.mcp.is_empty() || !opts.peer.is_empty()) {
+        return Err(usage(
+            "--mcp and --peer reach real systems, and approving a task on the page performs \
+             a real effect through them; add --allow-live to say they are yours to act on",
+        ));
+    }
+    Ok(())
+}
+
+/// The dev listener: loopback, on `port`.
+#[cfg(feature = "dev")]
+async fn bind_dev(port: u16) -> Result<tokio::net::TcpListener, Fault> {
+    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .map_err(|e| usage(format!("could not listen on 127.0.0.1:{port}: {e}")))
+}
+
+/// Who the dev session's decisions are recorded under.
+#[cfg(feature = "dev")]
+fn dev_actor() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .filter(|u| {
+            !u.trim().is_empty()
+                && u.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        })
+        .unwrap_or_else(|| "author".to_owned());
+    format!("dev:{user}")
+}
+
+/// `dev`: serve the page until interrupted.
+#[cfg(feature = "dev")]
+fn dev_verb(opts: &DevArgs) -> Result<ExitCode, Fault> {
+    refuse_live_without_consent(opts)?;
+    let manifests = manifests_at(&opts.manifest).map_err(usage)?;
+    require_declarative(&manifests).map_err(usage)?;
+    let token = fresh_token()?;
+    let actor = dev_actor();
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    rt.block_on(async {
+        let backend = dev_store(opts.scratch.as_deref(), opts.tenant.as_deref())?;
+        let bench = dev::Bench::start(
+            backend,
+            dev::Wiring {
+                file: opts.manifest.clone(),
+                mcp: opts.mcp.clone(),
+                peer: opts.peer.clone(),
+                acting_as: opts.acting_as.clone(),
+                policy: Arc::new(agentplane::api::dev::DevPolicy::new(&actor)),
+            },
+            manifests,
+        )
+        .await?;
+        let auth = agentplane::api::tokens::TokenAuthenticator::new(vec![
+            agentplane::api::tokens::TokenEntry {
+                token: token.clone(),
+                actor,
+                roles: Vec::new(),
+                tenant: Some(agentplane::api::dev::TENANT.to_owned()),
+                scope: None,
+                not_after: None,
+            },
+        ])
+        .map_err(|e| e.to_string())?;
+        let listener = bind_dev(opts.port).await?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| format!("the listener has no address: {e}"))?
+            .port();
+        println!("http://127.0.0.1:{port}/#t={token}");
+        let streams = agentplane::api::dev::Workbench::streams(&bench);
+        axum::serve(
+            listener,
+            agentplane::api::dev::router(Arc::new(bench), Arc::new(auth), port),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            // An open page holds its stream open; graceful shutdown would
+            // wait on it for ever.
+            streams.close();
+        })
+        .await
+        .map_err(|e| format!("the dev page stopped: {e}"))?;
+        Ok(ExitCode::SUCCESS)
     })
 }
 
@@ -2906,6 +3948,24 @@ impl Backend {
         ))
     }
 
+    /// A plane on this backend, as every verb here builds one.
+    ///
+    /// **The only door to a runtime in this binary**, so no verb wires its
+    /// stores or tenant differently from another.
+    fn plane(&self) -> RuntimeBuilder {
+        Runtime::builder_with(self.stores()).tenant(self.tenant())
+    }
+
+    /// A backend held in this process's memory, for a `run` with no `--store`.
+    fn in_memory() -> Result<Self, Fault> {
+        let tenant = agentplane::core::TenantId::default();
+        let store = RedbStore::open_in_memory().map_err(|e| e.to_string())?;
+        Ok(Self::Embedded(
+            Arc::new(store.for_tenant(tenant.clone())),
+            tenant,
+        ))
+    }
+
     /// The stores a plane runs on.
     fn stores(&self) -> agentplane::runtime::Stores {
         match self {
@@ -2923,6 +3983,14 @@ impl Backend {
         }
     }
 
+    fn disclosures(&self) -> Arc<dyn agentplane::disclosure::DisclosureRegister> {
+        match self {
+            Self::Embedded(s, _) => Arc::clone(s) as _,
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => Arc::clone(s) as _,
+        }
+    }
+
     fn cases(&self) -> Arc<dyn agentplane::case::CaseStore> {
         match self {
             Self::Embedded(s, _) => Arc::clone(s) as _,
@@ -2932,6 +4000,14 @@ impl Backend {
     }
 
     fn tasks(&self) -> Arc<dyn agentplane::case::TaskStore> {
+        match self {
+            Self::Embedded(s, _) => Arc::clone(s) as _,
+            #[cfg(feature = "postgres")]
+            Self::Shared(s, _) => Arc::clone(s) as _,
+        }
+    }
+
+    fn memory(&self) -> Arc<dyn agentplane::memory::MemoryStore> {
         match self {
             Self::Embedded(s, _) => Arc::clone(s) as _,
             #[cfg(feature = "postgres")]
@@ -3017,6 +4093,76 @@ fn is_connection_string(spec: &str) -> bool {
 /// A manifest that does not validate is not a thing to run, digest, or reason
 /// about — and in a multi-document file every document is held to that, because
 /// deploying two thirds of a room is worse than deploying none of it.
+/// Judge one value with a manifest's content rules, through the evaluator the
+/// runtime uses.
+///
+/// Exit 1 when a rule would refuse it. Names rules and pointers, never what
+/// matched. A declared check is reported as not evaluable here: it needs the
+/// checker, and the checker is the deployment's.
+fn content_check_verb(a: &ContentCheckArgs) -> Result<ExitCode, Fault> {
+    use agentplane::content::At;
+    use std::io::Read as _;
+
+    let at = match a.at.split_once(':') {
+        None if a.at == "admission" => At::Admission,
+        Some(("source", kind)) => At::Source(kind),
+        Some(("sink", kind)) => At::Sink(kind),
+        _ => {
+            return Err(usage(format!(
+                "--at '{}': use admission, source:<kind> or sink:<kind>",
+                a.at
+            )));
+        }
+    };
+    let manifests = manifests_at(&a.manifest).map_err(usage)?;
+    let [manifest] = manifests.as_slice() else {
+        return Err(usage(format!(
+            "{} holds {} agents; content check reads one",
+            a.manifest,
+            manifests.len()
+        )));
+    };
+    let text = if let Some(path) = &a.value {
+        std::fs::read_to_string(path).map_err(|e| usage(format!("reading {path}: {e}")))?
+    } else {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .map_err(|e| usage(format!("reading standard input: {e}")))?;
+        text
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| usage(format!("the value is not JSON: {e}")))?;
+    let Some(content) = manifest.spec.security.content.as_ref() else {
+        println!("{}", serde_json::json!({ "evaluated": [] }));
+        return Ok(ExitCode::SUCCESS);
+    };
+    let outcome = content.rules().map_err(usage)?.at(at, &value);
+    let hits = |hits: &[agentplane::content::Hit]| {
+        hits.iter()
+            .map(|h| serde_json::json!({ "rule": h.rule, "pointer": h.pointer }))
+            .collect::<Vec<_>>()
+    };
+    let not_evaluable: Vec<&str> = content.checks_at(at).map(|c| c.id.as_str()).collect();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "evaluated": outcome.evaluated,
+            "refused": hits(&outcome.refused),
+            "redacted": hits(&outcome.redactions),
+            "classified": outcome.classified,
+            "sensitivity": outcome.sensitivity,
+            "checks_not_evaluable": not_evaluable,
+        }))
+        .map_err(|e| e.to_string())?
+    );
+    Ok(if outcome.refused.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(exit::FINDING)
+    })
+}
+
 fn manifests_at(path: &str) -> Result<Vec<Manifest>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("reading {path}: {e}"))?;
     Manifest::parse_all(&text).map_err(|e| e.to_string())
@@ -3071,9 +4217,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode, Fault> {
             );
             Ok(ExitCode::SUCCESS)
         }
+        Verb::Openapi => openapi_verb(),
         Verb::Digest(a) => digest_verb(&a),
         Verb::Audit(a) => journal_verb(&a.store, Some(&a), false),
+        Verb::Export(a) if !a.cases.is_empty() || !a.runs.is_empty() => disclose_verb(&a),
         Verb::Export(a) => journal_verb(&a.store, None, a.allow_partial),
+        Verb::Disclosures(a) => disclosures_verb(&a),
         Verb::Drill(a) => drill_verb(&a),
         Verb::ForgetAdmissions(a) => forget_admissions_verb(&a),
         Verb::Retention(RetentionArgs {
@@ -3090,6 +4239,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode, Fault> {
         #[cfg(feature = "push")]
         Verb::Rearm(a) => rearm_verb(&a),
         Verb::Cancel(a) => cancel_verb(&a),
+        Verb::History(a) => history_verb(&a),
+        #[cfg(feature = "dev")]
+        Verb::Dev(a) => dev_verb(&a),
         Verb::Waiting(a) => waiting_verb(&a),
         Verb::Attention(a) => attention_verb(&a),
         Verb::Restore(a) => {
@@ -3098,18 +4250,22 @@ fn dispatch(cli: Cli) -> Result<ExitCode, Fault> {
                 .build()
                 .map_err(|e| format!("could not start the async runtime: {e}"))?;
             rt.block_on(async {
+                let open = || {
+                    std::fs::File::open(&a.file)
+                        .map(std::io::BufReader::new)
+                        .map_err(|e| format!("reading {}: {e}", a.file))
+                };
+                if let Some(why) = restore_unverifiable(open()?) {
+                    eprintln!("restore: {why}");
+                    return Ok(ExitCode::from(exit::UNVERIFIABLE));
+                }
                 let backend = a.at.open().await?;
                 let store = backend.journal();
                 let cases = backend.cases();
-                let file =
-                    std::fs::File::open(&a.file).map_err(|e| format!("reading {}: {e}", a.file))?;
-                let report = agentplane::export::from_jsonl(
-                    &store,
-                    Some(&cases),
-                    std::io::BufReader::new(file),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+                let file = open()?;
+                let report = agentplane::export::from_jsonl(&store, Some(&cases), file)
+                    .await
+                    .map_err(|e| e.to_string())?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
@@ -3125,9 +4281,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode, Fault> {
             })
         }
         Verb::Verify(a) => verify_verb(&a),
+        Verb::Bind(a) => bind_verb(&a),
         Verb::Policy(PolicyArgs {
             act: PolicyAct::Check(a),
         }) => policy_check_verb(&a),
+        Verb::Content(ContentArgs {
+            act: ContentAct::Check(a),
+        }) => content_check_verb(&a),
+        Verb::Grants(a) => grants_verb(&a),
+        Verb::Subject(a) => subject_verb(&a),
         Verb::Run(a) => {
             let manifests = manifests_at(&a.manifest).map_err(usage)?;
             execute(&manifests, &a)
@@ -3208,6 +4370,9 @@ spec:
 /// Refuses to overwrite: a starter is a first file, and replacing a reviewed
 /// one with it is the kind of mistake nothing downstream would notice.
 fn init_verb(opts: &InitArgs) -> Result<ExitCode, Fault> {
+    if let Some(dir) = &opts.serve {
+        return init_serve_verb(dir, opts.out);
+    }
     let template = if opts.tools { STARTER_TOOLS } else { STARTER };
     let text = template
         .replace("NAME", &opts.name)
@@ -3249,32 +4414,357 @@ fn init_verb(opts: &InitArgs) -> Result<ExitCode, Fault> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The files `init --serve` writes, in the order it reports them.
+const SERVED_FILES: [&str; 7] = [
+    "agent.yaml",
+    "policy.cedar",
+    "tokens.yaml",
+    "framework.token",
+    "postgres.password",
+    "store.env",
+    "compose.yaml",
+];
+
+/// The served starter, embedded from the files CI brings up, so what an
+/// adopter is handed and what is tested are one set of bytes.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+const SERVED_MANIFEST: &str = include_str!("../../examples/served-starter.yaml");
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+const SERVED_POLICY: &str = include_str!("../../examples/serve-policy.cedar");
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+const SERVED_COMPOSE: &str = include_str!("../../examples/compose.yaml");
+
+/// What `init --serve` wrote: each path, and the manifest's digest.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+#[derive(Debug)]
+struct Served {
+    paths: Vec<String>,
+    digest: String,
+}
+
+/// 32 bytes from the operating system's random source, as hex.
+#[cfg(any(
+    feature = "dev",
+    all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http")
+))]
+fn fresh_token() -> Result<String, Fault> {
+    use rand::TryRng as _;
+    let mut bytes = [0_u8; agentplane::api::tokens::MIN_TOKEN_BYTES];
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| format!("the operating system's random source failed: {e}"))?;
+    Ok(bytes.iter().fold(String::new(), |mut hex, b| {
+        let _ = std::fmt::Write::write_fmt(&mut hex, format_args!("{b:02x}"));
+        hex
+    }))
+}
+
+/// The files one `init --serve` has created, removed again unless it finishes.
+///
+/// Each is opened `create_new`, so every path here is one this call made; a
+/// failure partway leaves the directory as it was and a re-run is not refused
+/// over the files of the attempt that failed.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+#[derive(Default)]
+struct Written {
+    paths: Vec<std::path::PathBuf>,
+    kept: bool,
+}
+
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+impl Written {
+    /// Create `dir/name` holding `text`, mode 0600 when `secret`.
+    fn create(
+        &mut self,
+        dir: &std::path::Path,
+        name: &str,
+        text: &str,
+        secret: bool,
+    ) -> Result<(), Fault> {
+        let path = dir.join(name);
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            open.mode(if secret { 0o600 } else { 0o644 });
+        }
+        #[cfg(not(unix))]
+        let _ = secret;
+        let mut file = open
+            .open(&path)
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
+        self.paths.push(path.clone());
+        std::io::Write::write_all(&mut file, text.as_bytes())
+            .map_err(|e| format!("writing {}: {e}", path.display()).into())
+    }
+
+    /// Keep every file, and report their paths.
+    fn keep(mut self) -> Vec<String> {
+        self.kept = true;
+        self.paths.iter().map(|p| p.display().to_string()).collect()
+    }
+}
+
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+impl Drop for Written {
+    fn drop(&mut self) {
+        if !self.kept {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
+/// The compose `user:` the plane runs as: the owner of the token file it reads.
+///
+/// The file is mode 0600, so only its owner can read it. Root is refused: a
+/// plane started under `sudo` would run its container as root.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+fn plane_user(uid: u32, gid: u32) -> Result<String, Fault> {
+    if uid == 0 {
+        return Err(usage(
+            "init --serve ran as root, so the token file is root's and the plane would run \
+             as root to read it; run it as the user the plane should run as (in a container, \
+             `docker run --user \"$(id -u):$(id -g)\"`), so nothing was written",
+        ));
+    }
+    Ok(format!("{uid}:{gid}"))
+}
+
+/// Write the served starter into `dir`, every file checked by the loader that
+/// will read it before any is written.
+///
+/// Refuses before generating anything when any target exists: a token file
+/// replaced under a running plane locks out every caller holding the old one,
+/// and half a starter written over a reviewed directory is a mistake nothing
+/// downstream notices. A failure after the first file is written removes what
+/// this call wrote.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+fn init_serve(dir: &std::path::Path) -> Result<Served, Fault> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    if let Some(existing) = SERVED_FILES
+        .iter()
+        .find(|name| dir.join(name).symlink_metadata().is_ok())
+    {
+        return Err(usage(format!(
+            "{} exists; init --serve writes nothing over a file, so nothing was written",
+            dir.join(existing).display()
+        )));
+    }
+
+    let [peer, framework, operator] = [fresh_token()?, fresh_token()?, fresh_token()?];
+    let tokens = format!(
+        "# The callers this plane accepts, generated by `agentplane init --serve`.\n\
+         # Keep this file secret; `serve` reads it from a mounted file, never from\n\
+         # the environment. Roles are inputs to policy.cedar, not grants.\n\
+         - token: \"{peer}\"\n  actor: peer-1\n  roles: [peer]\n\n\
+         - token: \"{framework}\"\n  actor: framework-1\n  roles: [framework]\n\n\
+         - token: \"{operator}\"\n  actor: ops-1\n  roles: [operator]\n"
+    );
+    let password = fresh_token()?;
+    let store = format!(
+        "# The plane's journal, read by `serve` as AGENTPLANE_STORE. Keep this file\n\
+         # secret: it holds the Postgres password.\n\
+         AGENTPLANE_STORE=postgres://agentplane:{password}@postgres:5432/agentplane?sslmode=disable\n"
+    );
+
+    let parsed = Manifest::parse_all(SERVED_MANIFEST)
+        .map_err(|e| format!("the served starter does not parse: {e}"))?;
+    agentplane::policy::CedarEngine::from_bundle(SERVED_POLICY, None, None)
+        .map_err(|e| format!("the shipped policy was refused: {e}"))?;
+    agentplane::api::tokens::TokenAuthenticator::from_yaml(&tokens)
+        .map_err(|e| format!("the generated tokens were refused: {e}"))?;
+    let digest = parsed
+        .first()
+        .map(|m| m.digest().map(agentplane::Digest::to_hex))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+
+    let mut written = Written::default();
+    written.create(dir, SERVED_FILES[0], SERVED_MANIFEST, false)?;
+    written.create(dir, SERVED_FILES[1], SERVED_POLICY, false)?;
+    written.create(dir, SERVED_FILES[2], &tokens, true)?;
+    written.create(dir, SERVED_FILES[3], &framework, true)?;
+    written.create(dir, SERVED_FILES[4], &format!("{password}\n"), true)?;
+    written.create(dir, SERVED_FILES[5], &store, true)?;
+
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::MetadataExt as _;
+        let token_file = dir.join(SERVED_FILES[2]);
+        let meta = std::fs::metadata(&token_file)
+            .map_err(|e| format!("reading {}: {e}", token_file.display()))?;
+        plane_user(meta.uid(), meta.gid())?
+    };
+    #[cfg(not(unix))]
+    let owner = "65532:65532".to_owned();
+    let compose = SERVED_COMPOSE
+        .replace("AGENTPLANE_VERSION", env!("CARGO_PKG_VERSION"))
+        .replace("PLANE_USER", &owner);
+    written.create(dir, SERVED_FILES[6], &compose, false)?;
+    Ok(Served {
+        paths: written.keep(),
+        digest,
+    })
+}
+
+/// What `init --serve` prints on stdout: paths and the digest, never a token.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+fn served_report(served: &Served, json: bool) -> String {
+    if json {
+        return serde_json::json!({ "wrote": served.paths, "digest": served.digest }).to_string();
+    }
+    let mut out = String::new();
+    for (index, path) in served.paths.iter().enumerate() {
+        out.push_str("wrote ");
+        out.push_str(path);
+        if index == 0 {
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!(" ({})", served.digest));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `init --serve`: the served starter, and the two commands after it.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+fn init_serve_verb(dir: &str, out: JsonFlag) -> Result<ExitCode, Fault> {
+    let served = init_serve(std::path::Path::new(dir))?;
+    print!("{}", served_report(&served, out.json));
+    if out.json {
+        println!();
+    }
+    eprintln!(
+        "next:\n  docker compose -f {dir}/compose.yaml up --wait\n  \
+         then a framework quickstart: \
+         https://hupe1980.github.io/agentplane/docs/getting-started/#zero-to-governed"
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The `--url` the Agent Card publishes, refused unless it ends in `/a2a`.
+///
+/// The card carries the URL verbatim and a client follows it, while the plane
+/// serves A2A at `/a2a` only; a bare host would publish an endpoint that answers
+/// every client with `404`.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn a2a_endpoint(url: &str) -> Result<&str, Fault> {
+    if url.ends_with("/a2a") {
+        return Ok(url);
+    }
+    let base = url.trim_end_matches('/');
+    let fix = if base.ends_with("/a2a") {
+        base.to_owned()
+    } else {
+        format!("{base}/a2a")
+    };
+    Err(usage(format!(
+        "--url {url} does not end in /a2a: the Agent Card publishes it verbatim and this \
+         plane serves A2A at /a2a only, so a client following the card would be answered \
+         404. Pass --url {fix}"
+    )))
+}
+
+/// `init --serve` in a build that cannot serve what it would write.
+#[cfg(not(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http")))]
+#[allow(clippy::unnecessary_wraps)]
+fn init_serve_verb(_dir: &str, _out: JsonFlag) -> Result<ExitCode, Fault> {
+    Err(usage(format!(
+        "this build cannot write a served plane: `init --serve` writes for `serve --mcp-addr`, \
+         which needs the `a2a-server`, `cedar` and `mcp-server-http` features. Use the \
+         `:full` container image, or reinstall with `--features \
+         cli,a2a-server,cedar,mcp-server-http`; it would have written {}",
+        SERVED_FILES.join(", ")
+    )))
+}
+
 /// Read a checkpoint an auditor was handed, in either form they hold it in.
 ///
 /// Two forms because two things produce one: `audit` prints JSON, and a
 /// witness cosigns a `tlog-checkpoint` note. Requiring a conversion between
 /// them would put a step between the auditor and the check, and the steps
 /// between an auditor and a check are what this crate keeps removing.
-fn read_checkpoint(path: &str) -> Result<agentplane::journal::Checkpoint, String> {
+fn read_checkpoint(
+    path: &str,
+) -> Result<
+    (
+        agentplane::journal::Checkpoint,
+        Option<agentplane::journal::SignedNote>,
+    ),
+    String,
+> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("reading --checkpoint {path}: {e}"))?;
     // The note first: it is the form that travels, and it is unambiguous —
     // JSON never parses as three newline-terminated lines.
     if let Ok(cp) = agentplane::journal::Checkpoint::from_note(&text) {
-        return Ok(cp);
+        return Ok((cp, None));
     }
-    // A signed note carries the checkpoint as its body, so a reader who was
-    // handed the cosigned artifact does not have to cut the signatures off.
+    // A signed note carries the checkpoint as its body, and its lines are the
+    // cosignatures a `--witness-key` checks.
     if let Ok(note) = agentplane::journal::SignedNote::parse(&text)
         && let Ok(cp) = agentplane::journal::Checkpoint::from_note(&note.text)
     {
-        return Ok(cp);
+        return Ok((cp, Some(note)));
     }
-    serde_json::from_str(&text).map_err(|e| {
-        format!(
-            "--checkpoint {path} is neither a tlog-checkpoint note nor the `current` \
-             field of an audit report: {e}"
+    serde_json::from_str(&text)
+        .map(|cp| (cp, None))
+        .map_err(|e| {
+            format!(
+                "--checkpoint {path} is neither a tlog-checkpoint note nor the `current` \
+                 field of an audit report: {e}"
+            )
+        })
+}
+
+/// The anchor a `--checkpoint` file gives, and who cosigned it.
+struct FileAnchor {
+    anchor: agentplane::audit::Anchor,
+    /// `<path>:<witness name>` per cosignature that verified.
+    cosigned_by: Vec<String>,
+    /// Whether the file is a signed note, which a `--witness-key` checks.
+    signed_note: bool,
+}
+
+/// Read a `--checkpoint` file. A signed note's lines are checked under
+/// `witness_keys`, through the rule a witness fetch uses, and each one that
+/// verifies contributes its signed time; any other file carries no signature
+/// to check.
+fn checkpoint_anchor(path: &str, keys: &[String]) -> Result<FileAnchor, String> {
+    let (checkpoint, note) = read_checkpoint(path)?;
+    let from = format!("file {path}");
+    let signed_note = note.is_some();
+    let Some(note) = note.filter(|_| !keys.is_empty()) else {
+        return Ok(FileAnchor {
+            anchor: agentplane::audit::Anchor::new(checkpoint, from),
+            cosigned_by: Vec::new(),
+            signed_note,
+        });
+    };
+    let trusted = witness_keys(keys)?;
+    let cosignatures = agentplane::journal::cosignatures_in(&note, &trusted);
+    let cosigned_by = cosignatures
+        .iter()
+        .map(|c| format!("{path}:{}", c.key_id))
+        .collect();
+    let anchor = if cosignatures.is_empty() {
+        agentplane::audit::Anchor::new(checkpoint, from)
+    } else {
+        agentplane::audit::Anchor::from_cosigned(
+            &agentplane::journal::CosignedCheckpoint {
+                checkpoint,
+                cosignatures,
+            },
+            from,
         )
+    };
+    Ok(FileAnchor {
+        anchor,
+        cosigned_by,
+        signed_note,
     })
 }
 
@@ -3492,9 +4982,10 @@ fn policy_report_text(report: &agentplane::policy::check::Report) -> String {
 fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, Fault> {
     let verifier = verifier_from(&opts.key).map_err(usage)?;
     let saved = match &opts.checkpoint {
-        Some(path) => Some(read_checkpoint(path).map_err(usage)?),
+        Some(path) => Some(checkpoint_anchor(path, &opts.witness_key).map_err(usage)?),
         None => None,
     };
+    let note_checked = saved.as_ref().is_some_and(|file| file.signed_note);
     // The origin an export is *supposed* to be of. Read from the file would
     // defeat the purpose — the header is written by whoever wrote the file —
     // so `--origin` is required to fetch an anchor here, where `audit` can ask
@@ -3520,13 +5011,15 @@ fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, Fault> {
                     .to_owned(),
             ));
         }
-        // No witness named. The key check still has to happen, so a
-        // `--witness-key` with nothing to use it against is a refusal rather
-        // than a flag that did nothing.
+        // No witness named. A `--witness-key` with neither a witness nor a
+        // signed-note checkpoint to use it against is a refusal rather than a
+        // flag that did nothing.
         (_, true) => {
-            if !opts.witness_key.is_empty() {
+            if !opts.witness_key.is_empty() && !note_checked {
                 return Err(usage(
-                    "--witness-key was given with no --witness to use it against".to_owned(),
+                    "--witness-key was given with no --witness and no signed-note \
+                     --checkpoint to use it against"
+                        .to_owned(),
                 ));
             }
             Anchor::default()
@@ -3537,43 +5030,268 @@ fn verify_verb(opts: &VerifyArgs) -> Result<ExitCode, Fault> {
     // obtained.
     let mut anchor = fetched;
     if let Some(saved) = saved {
-        anchor.checkpoints.push(agentplane::audit::Anchor::new(
-            saved,
-            match &opts.checkpoint {
-                Some(path) => format!("file {path}"),
-                None => "file".to_owned(),
-            },
-        ));
+        anchor.checkpoints.push(saved.anchor);
+        anchor.cosigned_by.extend(saved.cosigned_by);
     }
     let verifier = verifier
         .as_ref()
         .map(|v| v as &dyn agentplane::core::Verifier);
-    let report = if opts.file == "-" {
-        agentplane::export::verify(std::io::stdin().lock(), verifier, &anchor.checkpoints)
-            .map_err(|e| e.to_string())
+    if opts.grader_verdict.is_empty() && !opts.grader_key.is_empty() {
+        return Err(usage(
+            "--grader-key was given with no --grader-verdict to use it against".to_owned(),
+        ));
+    }
+    let graders =
+        verifier_from(&opts.grader_key).map_err(|e| usage(e.replace("--key", "--grader-key")))?;
+    let sidecars = opts
+        .grader_verdict
+        .iter()
+        .map(|path| std::fs::read(path).map_err(|e| format!("reading {path}: {e}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let input: Box<dyn std::io::BufRead> = if opts.file == "-" {
+        Box::new(std::io::stdin().lock())
     } else {
         let file =
             std::fs::File::open(&opts.file).map_err(|e| format!("reading {}: {e}", opts.file))?;
-        agentplane::export::verify(std::io::BufReader::new(file), verifier, &anchor.checkpoints)
-            .map_err(|e| e.to_string())
-    }?;
+        Box::new(std::io::BufReader::new(file))
+    };
+    let checked = agentplane::grader_verdict::check(
+        input,
+        verifier,
+        &anchor.checkpoints,
+        &sidecars,
+        graders
+            .as_ref()
+            .map(|v| v as &dyn agentplane::core::Verifier),
+    )
+    .map_err(|e| e.to_string())?;
+    let report = &checked.export;
     println!(
         "{}",
         serde_json::to_string_pretty(&VerifyDocument {
             anchor: &anchor,
-            report: &report,
+            report,
+            grader_verdicts: &checked.sidecars,
         })
         .map_err(|e| e.to_string())?
     );
+    if checked.any_refused() {
+        return Ok(ExitCode::from(exit::FINDING));
+    }
     // Findings fail; `not_checked` does not. A pass with no key — or with no
     // checkpoint — has established less, and saying so is different from
     // failing.
     // A split view fails here too. Only a caller that asked more than one
     // witness can see it, so neither the library's report nor the file can.
-    Ok(if report.is_sound() && anchor.split_view.is_empty() {
-        ExitCode::SUCCESS
+    Ok(verify_status(report, anchor.split_view.is_empty()))
+}
+
+/// The selection `--case` and `--run` name, refused as usage when an id does
+/// not parse.
+fn selection_of(cases: &[String], runs: &[String]) -> Result<agentplane::export::Selection, Fault> {
+    Ok(agentplane::export::Selection {
+        cases: cases
+            .iter()
+            .map(|c| {
+                agentplane::core::CaseId::parse(c).map_err(|e| usage(format!("--case {c}: {e}")))
+            })
+            .collect::<Result<_, _>>()?,
+        runs: runs
+            .iter()
+            .map(|r| {
+                agentplane::core::RunId::parse(r).map_err(|e| usage(format!("--run {r}: {e}")))
+            })
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+/// The sentence every surface naming a disclosure carries.
+const REGISTER_RUNG: &str = "read from the operator's disclosure register — an unchained row \
+     whoever administers the store can edit or delete, so an empty list does not show that \
+     nothing left the plane";
+
+/// Write a disclosure package of one matter, recording the act first.
+fn disclose_verb(opts: &ExportArgs) -> Result<ExitCode, Fault> {
+    let selection = selection_of(&opts.cases, &opts.runs)?;
+    let Some(to) = opts.to.as_deref().filter(|t| !t.trim().is_empty()) else {
+        return Err(usage(
+            "--to is required to disclose: an erasure names a copy by who received it".to_owned(),
+        ));
+    };
+    let Some(actor) = opts.actor.as_deref() else {
+        return Err(usage(
+            "--actor is required to disclose: the register records who made the copy".to_owned(),
+        ));
+    };
+    let by = agentplane::core::Operator::asserted(actor).map_err(|e| usage(e.to_string()))?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    rt.block_on(async {
+        let backend = opts.store.at.open().await?;
+        // Wall clock by design, as for a hold: when a copy left is a fact about
+        // the outside world, not a journaled observation.
+        #[allow(clippy::disallowed_methods)]
+        let at = time::OffsetDateTime::now_utc();
+        let request = agentplane::disclosure::Request {
+            selection,
+            recipient: to.to_owned(),
+            by,
+            at,
+        };
+        // Standard output gets the bytes only once the act is recorded, so they
+        // are staged in a private directory first.
+        let staging = match &opts.output {
+            Some(_) => None,
+            None => Some(private_dir()?),
+        };
+        let destination = staging.as_ref().map_or_else(
+            || std::path::PathBuf::from(opts.output.as_deref().unwrap_or_default()),
+            |dir| dir.join("package.jsonl"),
+        );
+        let disclosed = agentplane::disclosure::disclose(
+            &backend.journal(),
+            &backend.cases(),
+            backend.disclosures().as_ref(),
+            &request,
+            &destination,
+        )
+        .await;
+        let delivered = match disclosed {
+            Ok(act) => {
+                if staging.is_some() {
+                    let bytes = std::fs::read(&destination).map_err(|e| e.to_string());
+                    let written = bytes.and_then(|b| {
+                        use std::io::Write as _;
+                        std::io::stdout().lock().write_all(&b).map_err(|e| {
+                            format!(
+                                "disclosure {} is recorded and was not delivered: {e}",
+                                act.id
+                            )
+                        })
+                    });
+                    written.map(|()| act).map_err(Fault::from)
+                } else {
+                    Ok(act)
+                }
+            }
+            Err(agentplane::disclosure::DiscloseError::Write(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                Err(usage(e.to_string()))
+            }
+            Err(e) => Err(Fault::from(e.to_string())),
+        };
+        if let Some(dir) = &staging {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let act = delivered?;
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "disclosure": act,
+                "register": REGISTER_RUNG,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// A directory only this user can read, for a package on its way to stdout.
+fn private_dir() -> Result<std::path::PathBuf, Fault> {
+    let dir = std::env::temp_dir().join(format!(
+        "agentplane-disclosure-{}-{}",
+        std::process::id(),
+        agentplane::core::RunId::generate()
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&dir)
+        .map_err(|e| format!("staging {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// List the disclosure register for a case or a run.
+fn disclosures_verb(opts: &DisclosuresArgs) -> Result<ExitCode, Fault> {
+    if opts.cases.is_empty() && opts.runs.is_empty() {
+        return Err(usage("name a matter with --case or --run".to_owned()));
+    }
+    let selection = selection_of(&opts.cases, &opts.runs)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("could not start the async runtime: {e}"))?;
+    rt.block_on(async {
+        let acts = opts
+            .at
+            .open()
+            .await?
+            .disclosures()
+            .disclosures(&selection.cases, &selection.runs)
+            .await
+            .map_err(|e| e.to_string())?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "disclosures": acts,
+                "register": REGISTER_RUNG,
+            }))
+            .map_err(|e| e.to_string())?
+        );
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+/// Write an unsigned grader-verdict sidecar and print the digest to sign.
+///
+/// The binary holds no grader key: the grader signs the printed digest with
+/// its own tool and adds the `signature` member.
+fn bind_verb(opts: &BindArgs) -> Result<ExitCode, Fault> {
+    let run = agentplane::core::RunId::parse(&opts.run)
+        .map_err(|e| usage(format!("--run {}: {e}", opts.run)))?;
+    let content =
+        std::fs::read(&opts.content).map_err(|e| format!("reading {}: {e}", opts.content))?;
+    let input: Box<dyn std::io::BufRead> = if opts.export == "-" {
+        Box::new(std::io::stdin().lock())
     } else {
-        ExitCode::from(exit::FINDING)
+        let file = std::fs::File::open(&opts.export)
+            .map_err(|e| format!("reading {}: {e}", opts.export))?;
+        Box::new(std::io::BufReader::new(file))
+    };
+    let sidecar = agentplane::grader_verdict::bind(input, run, opts.last_seq, content)
+        .map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(&sidecar).map_err(|e| e.to_string())?;
+    std::fs::write(&opts.out, json + "\n").map_err(|e| format!("writing {}: {e}", opts.out))?;
+    println!("{}", sidecar.signing_digest().to_hex());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Why `restore` cannot rebuild the export `input` holds, when its header names
+/// a canon this build does not implement: checked before any store is opened.
+fn restore_unverifiable(input: impl std::io::BufRead) -> Option<String> {
+    let header = input.lines().next()?.ok()?;
+    agentplane::export::foreign_canon(&header)
+}
+
+/// What `verify` exits with: a finding or a split view fails, and a file under
+/// a canon this build does not implement is neither sound nor damaged — this
+/// reader could not answer, which is its own status.
+fn verify_status(report: &agentplane::export::VerifyReport, one_view: bool) -> ExitCode {
+    ExitCode::from(if !report.findings.is_empty() || !one_view {
+        exit::FINDING
+    } else if report.unverifiable.is_some() {
+        exit::UNVERIFIABLE
+    } else if report.is_sound() {
+        exit::OK
+    } else {
+        exit::FINDING
     })
 }
 
@@ -3680,26 +5398,17 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
     use agentplane::api::a2a::A2aServer;
     use agentplane::api::tokens::TokenAuthenticator;
 
-    // One card, one agent. A room is several manifests and A2A's well-known
-    // card path is singular, so serving a bundle would have to pick one and
-    // silently not serve the others.
-    let [manifest] = manifests else {
-        return Err(usage(format!(
-            "`serve` hosts one agent and this file holds {}. A2A's card path is \
-             well-known and singular, so a room would have to advertise one \
-             document and quietly not serve the rest — split the file, or run \
-             one process per agent",
-            manifests.len()
-        )));
-    };
+    let manifest = a2a_agent(manifests)?;
+    refuse_mcp_listener(opts)?;
 
     let url = opts.url.as_deref().ok_or_else(|| {
         usage(
-            "`serve` needs --url: the address callers reach this plane on. It goes on the \
-         Agent Card, so it is the public URL rather than what you bind — an agent's \
-         declaration must not change when its address does",
+            "`serve` needs --url: the A2A endpoint callers reach this plane at, `/a2a` under \
+         its public address. It goes on the Agent Card, so it is the public URL rather \
+         than what you bind — an agent's declaration must not change when its address does",
         )
     })?;
+    let url = a2a_endpoint(url)?;
     let policy_path = opts.policy.as_deref().ok_or_else(|| {
         usage(
             "`serve` needs --policy: a Cedar policy set. There is deliberately no default — \
@@ -3752,23 +5461,17 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
         // case layer would accept an agent that waits, sleeps or opens a human
         // task and then never make progress on any of them — a suspended run is
         // a row, and something has to come back for it.
-        let mut builder = with_providers(
-            Runtime::builder_with(backend.stores()).tenant(backend.tenant()),
-            std::slice::from_ref(manifest),
-        )
-        .await?;
-        for (name, client) in connect_mcp_servers(&opts.mcp, std::slice::from_ref(manifest)).await?
-        {
+        let mut builder = with_providers(backend.plane(), manifests).await?;
+        for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
-        if let Some((registry, client)) =
-            connect_peers(&opts.peer, std::slice::from_ref(manifest)).map_err(usage)?
-        {
+        if let Some((registry, client)) = connect_peers(&opts.peer, manifests).map_err(usage)? {
             builder = builder.peers(registry, client);
         }
-        builder = builder
-            .policy(Arc::new(policy) as Arc<dyn agentplane::core::PolicyEngine>)
-            .agent(agentplane::runtime::Agent::new(manifest));
+        builder = builder.policy(Arc::new(policy) as Arc<dyn agentplane::core::PolicyEngine>);
+        for m in manifests {
+            builder = builder.agent(agentplane::runtime::Agent::new(m));
+        }
         // The same handle `wire_push` gives the A2A server below. The plane
         // holds it because the registrations that stop being delivered are a
         // backlog, and the operator surface is where a backlog is answered —
@@ -3776,8 +5479,10 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
         if !opts.push_host.is_empty() {
             builder = builder.push(backend.push());
         }
+        let builder = with_submission_witnesses(builder, opts).map_err(usage)?;
         let runtime = builder.try_build().map_err(|e| e.to_string())?;
 
+        let mcp = mcp_surface(&runtime, Arc::clone(&auth), manifests, opts)?;
         let security = agentplane::peers::CardSecurity::bearer("bearer", Vec::<String>::new());
         let mut server = A2aServer::new(Arc::clone(&runtime), auth, &security, manifest, url)
             .map_err(|e| e.to_string())?;
@@ -3786,6 +5491,7 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
         serve_until_stopped(
             &runtime,
             server,
+            mcp,
             operator_auth,
             opts,
             manifest,
@@ -3803,9 +5509,11 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
 /// with different failure modes, and because the shutdown order below is the
 /// part worth reading on its own.
 #[cfg(all(feature = "a2a-server", feature = "cedar"))]
+#[allow(clippy::too_many_arguments)]
 async fn serve_until_stopped(
     runtime: &Arc<Runtime>,
     server: agentplane::api::a2a::A2aServer,
+    mcp: Option<McpSurface>,
     operator_auth: Arc<dyn agentplane::api::Authenticator>,
     opts: &ServeArgs,
     manifest: &Manifest,
@@ -3842,6 +5550,9 @@ async fn serve_until_stopped(
         background.push(
             spawn_operator_surface(runtime, operator_auth, operator_addr, stop_rx.clone()).await?,
         );
+    }
+    if let Some(mcp) = mcp {
+        background.push(spawn_mcp_surface(mcp, stop_rx.clone()).await?);
     }
 
     let listener = tokio::net::TcpListener::bind(addr)
@@ -4186,6 +5897,207 @@ async fn spawn_operator_surface(
             tracing::error!(%error, "the operator surface stopped");
         }
     }))
+}
+
+/// Which agent A2A serves: the file's one agent, or a room's one
+/// `topology.role: orchestrator`. A2A's card path is well-known and singular,
+/// so a room with no single entry would have to advertise one document and
+/// quietly not serve the rest.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn a2a_agent(manifests: &[Manifest]) -> Result<&Manifest, Fault> {
+    if let [only] = manifests {
+        return Ok(only);
+    }
+    let orchestrators: Vec<&Manifest> = manifests
+        .iter()
+        .filter(|m| {
+            m.spec
+                .topology
+                .as_ref()
+                .is_some_and(|t| t.role == agentplane::manifest::Role::Orchestrator)
+        })
+        .collect();
+    match orchestrators.as_slice() {
+        [desk] => Ok(desk),
+        found => Err(usage(format!(
+            "`serve` hosts a room on A2A through its one orchestrator, and this file holds \
+             {} agents of which {} declare `topology.role: orchestrator`. A2A's card path \
+             is well-known and singular — declare exactly one orchestrator, or split the file",
+            manifests.len(),
+            found.len()
+        ))),
+    }
+}
+
+/// The MCP listener's startup refusals, before anything is opened.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn refuse_mcp_listener(opts: &ServeArgs) -> Result<(), Fault> {
+    let Some(addr) = opts.mcp_addr.as_deref() else {
+        if opts.mcp_agent.is_empty() {
+            return Ok(());
+        }
+        return Err(usage(
+            "--mcp-agent names an agent to serve on the MCP listener, and no \
+             --mcp-addr opens one",
+        ));
+    };
+    if !cfg!(feature = "mcp-server-http") {
+        return Err(usage(
+            "this build cannot serve MCP over HTTP: `--mcp-addr` needs the \
+             `mcp-server-http` feature. Reinstall with \
+             `--features cli,a2a-server,cedar,mcp-server-http`, or use the `:full` \
+             container image, which is built with it",
+        ));
+    }
+    if addr == opts.addr || opts.operator_addr.as_deref() == Some(addr) {
+        return Err(usage(format!(
+            "--mcp-addr {addr} is another listener's address. Each surface has its own \
+             socket and its own action vocabulary — give MCP a port of its own"
+        )));
+    }
+    if !loopback_bind(addr) && opts.mcp_allowed_host.is_empty() {
+        return Err(usage(format!(
+            "--mcp-addr {addr} is not a loopback address and no --mcp-allowed-host names \
+             the host callers reach it by, so every request would be refused at its \
+             `Host` header. Name it, as `host` or `host:port`"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a bind address is reachable only from this host.
+#[cfg(all(feature = "a2a-server", feature = "cedar"))]
+fn loopback_bind(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>().map_or_else(
+        |_| {
+            addr.rsplit_once(':')
+                .is_some_and(|(host, _)| host == "localhost")
+        },
+        |a| a.ip().is_loopback(),
+    )
+}
+
+/// The MCP listener, built and not yet bound: the service and its address.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+type McpSurface = (agentplane::tools::serve_http::McpHttp, String);
+
+/// No MCP listener in this build; `refuse_mcp_listener` said so.
+#[cfg(all(
+    feature = "a2a-server",
+    feature = "cedar",
+    not(feature = "mcp-server-http")
+))]
+type McpSurface = std::convert::Infallible;
+
+/// Every agent in the file, as one MCP catalogue, behind the same tokens and
+/// policy as the other listeners.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+fn mcp_surface(
+    runtime: &Arc<Runtime>,
+    auth: Arc<dyn agentplane::api::Authenticator>,
+    manifests: &[Manifest],
+    opts: &ServeArgs,
+) -> Result<Option<McpSurface>, String> {
+    use agentplane::tools::serve::McpServer;
+    use agentplane::tools::serve_http::{HttpConfig, McpHttp};
+
+    let Some(addr) = opts.mcp_addr.clone() else {
+        return Ok(None);
+    };
+    let chosen = mcp_served(manifests, &opts.mcp_agent)?;
+    let server = McpServer::new(Arc::clone(runtime), &chosen).map_err(|e| mcp_refusal(&e))?;
+    let mut config = HttpConfig::new();
+    for host in &opts.mcp_allowed_host {
+        config = config.allow_host(host.clone());
+    }
+    for origin in &opts.mcp_allowed_origin {
+        config = config.allow_origin(origin.clone());
+    }
+    let http = McpHttp::new(server, auth, &config).map_err(|e| format!("--mcp-addr: {e}"))?;
+    Ok(Some((http, addr)))
+}
+
+#[cfg(all(
+    feature = "a2a-server",
+    feature = "cedar",
+    not(feature = "mcp-server-http")
+))]
+#[allow(clippy::unnecessary_wraps)]
+fn mcp_surface(
+    _runtime: &Arc<Runtime>,
+    _auth: Arc<dyn agentplane::api::Authenticator>,
+    _manifests: &[Manifest],
+    _opts: &ServeArgs,
+) -> Result<Option<McpSurface>, String> {
+    Ok(None)
+}
+
+/// The agents `--mcp-addr` serves: those `--mcp-agent` names, or every one.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+fn mcp_served(manifests: &[Manifest], named: &[String]) -> Result<Vec<Manifest>, String> {
+    if named.is_empty() {
+        return Ok(manifests.to_vec());
+    }
+    if let Some(unknown) = named
+        .iter()
+        .find(|name| !manifests.iter().any(|m| &m.metadata.name == *name))
+    {
+        return Err(format!(
+            "--mcp-agent {unknown}: no agent in the file is named that"
+        ));
+    }
+    Ok(manifests
+        .iter()
+        .filter(|m| named.contains(&m.metadata.name))
+        .cloned()
+        .collect())
+}
+
+/// Why the MCP catalogue could not be built, with what this command can do
+/// about it.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+fn mcp_refusal(error: &agentplane::tools::serve::ServeError) -> String {
+    match error {
+        agentplane::tools::serve::ServeError::NoInputSchema { .. } => {
+            format!("--mcp-addr: {error} — `--mcp-agent NAME` serves only the agents it names")
+        }
+        _ => format!("--mcp-addr: {error}"),
+    }
+}
+
+/// Bind the MCP listener and serve it until the stop signal, then end its
+/// open streams so the graceful shutdown is not held open by an idle host.
+#[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+async fn spawn_mcp_surface((http, addr): McpSurface, stop: Stop) -> Result<Task, String> {
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| format!("could not bind the MCP surface {addr}: {e}"))?;
+    eprintln!(
+        "  mcp: http://{addr}{}",
+        agentplane::tools::serve_http::MCP_PATH
+    );
+    let router = http.router();
+    Ok(tokio::spawn(async move {
+        let served = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                stopping(stop).await;
+                http.close();
+            })
+            .await;
+        if let Err(error) = served {
+            tracing::error!(%error, "the MCP surface stopped");
+        }
+    }))
+}
+
+#[cfg(all(
+    feature = "a2a-server",
+    feature = "cedar",
+    not(feature = "mcp-server-http")
+))]
+#[allow(clippy::unused_async)]
+async fn spawn_mcp_surface(surface: McpSurface, _stop: Stop) -> Result<Task, String> {
+    match surface {}
 }
 
 /// A peer registry and the transport that reaches every peer in it.
@@ -4821,6 +6733,31 @@ fn serve(_manifests: &[Manifest], _opts: &ServeArgs) -> Result<ExitCode, Fault> 
     ))
 }
 
+/// The operator API's description, as the site publishes it.
+#[cfg(feature = "http")]
+fn openapi_text() -> String {
+    serde_json::to_string_pretty(&agentplane::api::openapi::document())
+        .expect("a generated document serializes")
+}
+
+#[cfg(feature = "http")]
+#[allow(clippy::unnecessary_wraps)]
+fn openapi_verb() -> Result<ExitCode, Fault> {
+    println!("{}", openapi_text());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `openapi` in a build without the operator API it would describe.
+#[cfg(not(feature = "http"))]
+#[allow(clippy::unnecessary_wraps)]
+fn openapi_verb() -> Result<ExitCode, Fault> {
+    Err(usage(
+        "this build cannot describe the operator API: `openapi` needs the `http` feature. \
+         Reinstall with `--features cli,http`, or read the published document at \
+         https://hupe1980.github.io/agentplane/openapi.json",
+    ))
+}
+
 /// `policy check` in a build without the evaluator it would run.
 ///
 /// Said in words rather than left to the parser, so a reader is told the verb
@@ -5112,6 +7049,45 @@ fn in_cli_terms(error: &agentplane::runtime::BuildError, manifests: &[Manifest])
     }
 }
 
+/// The plane `run` and `dev` admit runs on, built one way: the manifest's
+/// providers, its MCP servers and peers, the chain `--acting-as` names, and
+/// `policy` where the verb has one.
+async fn build_plane(
+    backend: &Backend,
+    manifests: &[Manifest],
+    mcp: &[String],
+    peers: &[String],
+    chain: Option<agentplane::core::Delegation>,
+    policy: Option<Arc<dyn agentplane::core::PolicyEngine>>,
+    streams: Option<Arc<dyn agentplane::runtime::RunStreamObserver>>,
+) -> Result<Arc<Runtime>, Fault> {
+    let mut builder = with_providers(backend.plane(), manifests).await?;
+    if let Some(streams) = streams {
+        builder = builder.observe_model_streams(streams);
+    }
+    for (name, client) in connect_mcp_servers(mcp, manifests).await? {
+        builder = builder.tool_server(name, client);
+    }
+    if let Some((registry, client)) = connect_peers(peers, manifests).map_err(usage)? {
+        builder = builder.peers(registry, client);
+    }
+    if let Some(chain) = chain {
+        builder = builder.acting_as(chain);
+    }
+    if let Some(policy) = policy {
+        builder = builder.policy(policy);
+    }
+    for manifest in manifests {
+        builder = builder.agent(agentplane::runtime::Agent::new(manifest));
+    }
+    // `try_build`, because everything on this plane arrived as input: a
+    // wiring mistake in a file somebody handed us is a refusal with a
+    // sentence, not a programmer error worth a crash.
+    builder
+        .try_build()
+        .map_err(|e| Fault::from(in_cli_terms(&e, manifests)))
+}
+
 fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
     require_declarative(manifests).map_err(usage)?;
     // Before anything is started: a peer call is made on somebody's behalf,
@@ -5125,6 +7101,14 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
         .transpose()
         .map_err(usage)?;
     let keys = correlation(&opts.correlate).map_err(usage)?;
+    let pinned = opts
+        .expect_digest
+        .as_deref()
+        .map(|hex| {
+            agentplane::core::Digest::from_hex(hex)
+                .map_err(|e| usage(format!("--expect-digest `{hex}` is not a digest: {e}")))
+        })
+        .transpose()?;
 
     // Current-thread on purpose. A CLI runs one agent and exits, so a work
     // stealing pool buys nothing and would mean pulling `rt-multi-thread` into
@@ -5138,52 +7122,40 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
         // **The whole plane, not the journal alone**, as `serve` wires it: a
         // declaration naming memory or a wait is not a different declaration
         // because of which verb reached it.
-        let (stores, tenant) = if let Some(backend) = opts.at.open().await? {
-            (backend.stores(), backend.tenant())
+        let backend = if let Some(backend) = opts.at.open().await? {
+            backend
         } else {
             // Said out loud rather than assumed: a run whose journal disappears
             // is the opposite of what this crate is for.
             eprintln!("note: journaling to memory; this run will not survive the process");
-            (
-                agentplane::runtime::Stores::on(Arc::new(
-                    RedbStore::open_in_memory().map_err(|e| e.to_string())?,
-                )),
-                agentplane::core::TenantId::default(),
-            )
+            Backend::in_memory()?
         };
-        let mut builder =
-            with_providers(Runtime::builder_with(stores).tenant(tenant), manifests).await?;
-        for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
-            builder = builder.tool_server(name, client);
-        }
-        if let Some((registry, client)) = connect_peers(&opts.peer, manifests).map_err(usage)? {
-            builder = builder.peers(registry, client);
-        }
-        if let Some(chain) = chain {
-            builder = builder.acting_as(chain);
-        }
-        for manifest in manifests {
-            builder = builder.agent(agentplane::runtime::Agent::new(manifest));
-        }
-        // `try_build`, because everything on this plane arrived as input: a
-        // wiring mistake in a file somebody handed us is a refusal with a
-        // sentence, not a programmer error worth a crash.
-        let agent = builder
-            .try_build()
-            .map_err(|e| in_cli_terms(&e, manifests))?;
+        let agent = build_plane(
+            &backend, manifests, &opts.mcp, &opts.peer, chain, None, None,
+        )
+        .await?;
 
         let capability = entry_capability(manifests, opts.capability.as_deref()).map_err(usage)?;
         // The case kind is the capability: a case is a matter, and the matter
         // a terminal run belongs to is the thing it was asked to do.
-        let outcome = agent
-            .run_correlated(
+        let mut terms = agentplane::runtime::RunTerms::default().correlated(&capability, &keys);
+        if let Some(digest) = pinned {
+            terms = terms.expect_declaration(digest);
+        }
+        // No admission key, so the admission is always fresh.
+        let agentplane::runtime::Admission::Fresh(outcome) = agent
+            .run_under(
                 &capability,
                 Tainted::trusted(opts.read_input().map_err(usage)?),
-                &capability,
-                &keys,
+                terms,
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(admission_fault)?
+        else {
+            return Err("an unkeyed run was answered as a keyed one"
+                .to_owned()
+                .into());
+        };
 
         Ok(conclude(
             &outcome,
@@ -5225,11 +7197,7 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, Fault> 
 
     rt.block_on(async {
         let backend = Backend::open(store, opts.at.tenant.as_deref()).await?;
-        let mut builder = with_providers(
-            Runtime::builder_with(backend.stores()).tenant(backend.tenant()),
-            manifests,
-        )
-        .await?;
+        let mut builder = with_providers(backend.plane(), manifests).await?;
         for (name, client) in connect_mcp_servers(&opts.mcp, manifests).await? {
             builder = builder.tool_server(name, client);
         }
@@ -5341,11 +7309,7 @@ fn verify_replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, 
 
     rt.block_on(async {
         // Each source is a set of stores and the runs to replay from it.
-        let mut sources: Vec<(
-            agentplane::runtime::Stores,
-            agentplane::core::TenantId,
-            Vec<agentplane::core::RunId>,
-        )> = Vec::new();
+        let mut sources: Vec<(Backend, Vec<agentplane::core::RunId>)> = Vec::new();
         if opts.from.is_empty() {
             let store = opts.at.store.as_deref().ok_or_else(|| {
                 usage("--strict needs a source: --store <file|postgres://…> or --from <export>")
@@ -5354,7 +7318,7 @@ fn verify_replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, 
                 usage("a strict replay of a store names its run; replay every run of an export with --from")
             })?;
             let backend = Backend::open(store, opts.at.tenant.as_deref()).await?;
-            sources.push((backend.stores(), backend.tenant(), vec![run]));
+            sources.push((backend, vec![run]));
         } else {
             for path in &opts.from {
                 let file = std::fs::File::open(path)
@@ -5369,8 +7333,7 @@ fn verify_replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, 
                     None => source.runs.clone(),
                 };
                 sources.push((
-                    agentplane::runtime::Stores::on(source.store),
-                    agentplane::core::TenantId::default(),
+                    Backend::Embedded(source.store, agentplane::core::TenantId::default()),
                     runs,
                 ));
             }
@@ -5382,9 +7345,9 @@ fn verify_replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, 
         }
 
         let mut results = Vec::new();
-        for (stores, tenant, runs) in sources {
+        for (backend, runs) in sources {
             for run in runs {
-                results.push(verify_one(manifests, &stores, &tenant, run).await?);
+                results.push(verify_one(manifests, &backend, run).await?);
             }
         }
         Ok(ExitCode::from(replay_exit(&results)))
@@ -5394,29 +7357,10 @@ fn verify_replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, 
 /// Replay one run strictly and print its verdict.
 async fn verify_one(
     manifests: &[Manifest],
-    stores: &agentplane::runtime::Stores,
-    tenant: &agentplane::core::TenantId,
+    backend: &Backend,
     run: agentplane::core::RunId,
 ) -> Result<Replayed, Fault> {
-    let history = match stores.journal.read(run, 1).await {
-        Ok(history) => history,
-        Err(e) => {
-            eprintln!("run {run} — cannot be read: {e}");
-            return Ok(Replayed::Unreadable);
-        }
-    };
-    let mut builder = agentplane::runtime::replay_only::wire(
-        Runtime::builder_with(stores.clone()).tenant(tenant.clone()),
-        manifests,
-        &history,
-    );
-    for manifest in manifests {
-        builder = builder.agent(agentplane::runtime::Agent::new(manifest));
-    }
-    let plane = builder
-        .try_build()
-        .map_err(|e| usage(in_cli_terms(&e, manifests)))?;
-    match plane.verify(run).await {
+    match strict_verdict(manifests, backend, run).await? {
         Ok(verdict) => {
             eprint!("{verdict}");
             Ok(Replayed::of(&verdict))
@@ -5426,6 +7370,27 @@ async fn verify_one(
             Ok(Replayed::Unreadable)
         }
     }
+}
+
+/// One run's strict-replay verdict under `manifests`, or why the run could
+/// not be read. Every driver is replay-only: nothing is dispatched.
+async fn strict_verdict(
+    manifests: &[Manifest],
+    backend: &Backend,
+    run: agentplane::core::RunId,
+) -> Result<Result<agentplane::runtime::Verdict, String>, Fault> {
+    let history = match backend.journal().read(run, 1).await {
+        Ok(history) => history,
+        Err(e) => return Ok(Err(e.to_string())),
+    };
+    let mut builder = agentplane::runtime::replay_only::wire(backend.plane(), manifests, &history);
+    for manifest in manifests {
+        builder = builder.agent(agentplane::runtime::Agent::new(manifest));
+    }
+    let plane = builder
+        .try_build()
+        .map_err(|e| usage(in_cli_terms(&e, manifests)))?;
+    Ok(plane.verify(run).await.map_err(|e| e.to_string()))
 }
 
 /// Register a driver for each provider the manifest names — and only those.
@@ -5566,7 +7531,12 @@ async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
             Ok(Arc::new(driver))
         }
         #[cfg(feature = "fake-model")]
-        "fake" => Ok(agentplane::model::fake::FakeProvider::new()),
+        "fake" => {
+            let fake = agentplane::model::fake::FakeProvider::new();
+            // Its deltas reach an observer only where one listens.
+            fake.streaming();
+            Ok(fake)
+        }
         other => Err(format!(
             "no driver for provider '{other}'. This binary ships {}; anything else is an \
              embedder's own driver, registered through RuntimeBuilder::provider",
@@ -5604,11 +7574,106 @@ fn key(var: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    /// **An input the agent cannot read its data subject from is a usage
+    /// error**, not an outage: the same input is refused again, so a caller
+    /// told to retry would retry forever.
+    #[test]
+    fn an_unbound_subject_exits_as_usage() {
+        let unbound = agentplane::core::RuntimeError::SubjectUnbound {
+            binding: "$input/customer/id".to_owned(),
+            reason: "it selects nothing in the run's input".to_owned(),
+        };
+        assert_eq!(super::admission_fault(unbound).status(), super::exit::USAGE);
+        assert_eq!(
+            super::admission_fault(agentplane::core::RuntimeError::Draining).status(),
+            super::exit::OPERATIONAL
+        );
+    }
+
+    /// **`verify` checks the cosignature on a note it was handed as a file.**
+    /// The golden cosigned checkpoint, read with the golden witness key, names
+    /// its witness and carries the time the witness signed; without the key it
+    /// names nobody, and a key that is not the witness's names nobody either.
+    #[test]
+    fn a_cosigned_note_file_names_its_witness_in_verify() {
+        let golden = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+        let note = golden
+            .join("checkpoint.cosigned.note")
+            .display()
+            .to_string();
+        let keys = std::fs::read_to_string(golden.join("keys.txt")).expect("keys.txt");
+        let witness = keys
+            .lines()
+            .find_map(|l| l.strip_prefix("--witness-key "))
+            .expect("a witness key")
+            .to_owned();
+
+        let file = super::checkpoint_anchor(&note, std::slice::from_ref(&witness))
+            .expect("the note reads");
+        assert!(file.signed_note);
+        assert_eq!(file.cosigned_by, vec![format!("{note}:golden-witness")]);
+        assert_eq!(
+            file.anchor
+                .witnessed
+                .iter()
+                .map(|t| (t.key_id.as_str(), t.timestamp))
+                .collect::<Vec<_>>(),
+            vec![("golden-witness", 1_700_000_600)],
+            "the witness's signed time travels with the anchor, for `audit`'s freshness rule"
+        );
+
+        let unkeyed = super::checkpoint_anchor(&note, &[]).expect("the note reads");
+        assert!(unkeyed.cosigned_by.is_empty() && unkeyed.anchor.witnessed.is_empty());
+        let stranger = format!(
+            "golden-witness={}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                agentplane::policy::Ed25519Signer::new("x", &[3u8; 32]).verifying_key()
+            )
+        );
+        let wrong = super::checkpoint_anchor(&note, &[stranger]).expect("the note reads");
+        assert!(
+            wrong.cosigned_by.is_empty(),
+            "a line is a cosignature only under the key that made it"
+        );
+    }
+
     use super::{
         EXIT_STATUS_HELP, Fault, Truncation, audit_status, cutoff_before, declared_bound, exit,
-        lift_status, refuse_ambiguous_peers, refuses_partial_export, shell_quote, where_flags,
-        without_password,
+        lift_status, refuse_ambiguous_peers, refuses_partial_export, restore_unverifiable,
+        shell_quote, verify_status, where_flags, without_password,
     };
+    use std::sync::Arc;
+
+    /// **The verb prints the document the site publishes.** Regenerate the file
+    /// with `cargo run --features cli,http -- openapi > site/static/openapi.json`.
+    #[cfg(feature = "http")]
+    #[test]
+    fn the_openapi_verb_prints_the_published_document() {
+        let published = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/site/static/openapi.json"
+        ))
+        .expect("site/static/openapi.json exists");
+        assert_eq!(
+            super::openapi_text().trim_end(),
+            published.trim_end(),
+            "`agentplane openapi` and site/static/openapi.json disagree"
+        );
+    }
+
+    /// **A build without the operator API says which feature describes it.**
+    #[cfg(not(feature = "http"))]
+    #[test]
+    fn the_openapi_verb_names_the_feature_it_needs() {
+        match super::openapi_verb() {
+            Err(fault @ Fault::Usage(_)) => {
+                assert_eq!(fault.status(), super::exit::USAGE);
+                assert!(fault.to_string().contains("`http`"), "{fault}");
+            }
+            other => panic!("a build without `http` described the operator API: {other:?}"),
+        }
+    }
 
     /// A fresh directory under the system temp dir, unique to this test.
     #[cfg(feature = "cedar")]
@@ -5804,6 +7869,50 @@ spec:
         assert_eq!(lift_status(true), ExitCode::SUCCESS);
         assert_eq!(lift_status(false), ExitCode::from(exit::FINDING));
 
+        // An export this build cannot verify is partial, not damaged; a finding
+        // beside it still fails.
+        let mut report = agentplane::export::VerifyReport {
+            checkpoint: agentplane::journal::Checkpoint {
+                origin: String::new(),
+                size: 0,
+                root: agentplane::core::Digest::ZERO,
+            },
+            sound: Vec::new(),
+            findings: Vec::new(),
+            not_checked: Vec::new(),
+            records: 0,
+            cases: 0,
+            complete: true,
+            unverifiable: None,
+            selection: None,
+        };
+        assert_eq!(verify_status(&report, true), ExitCode::SUCCESS);
+        report.unverifiable = Some("unknown canon".to_owned());
+        assert_eq!(
+            verify_status(&report, true),
+            ExitCode::from(exit::UNVERIFIABLE)
+        );
+        let version = agentplane::export::FORMAT_VERSION;
+        let foreign =
+            format!("{{\"kind\":\"agentplane.export\",\"version\":{version},\"canon\":999}}\n");
+        assert!(restore_unverifiable(foreign.as_bytes()).is_some());
+        let native = format!(
+            "{{\"kind\":\"agentplane.export\",\"version\":{version},\"canon\":{}}}\n",
+            agentplane::core::canon::VERSION
+        );
+        assert!(restore_unverifiable(native.as_bytes()).is_none());
+        // Kind and version before canon, in `verify`'s order: neither of these
+        // is an export this build could hold to its digests under any canon.
+        let not_an_export = "{\"kind\":\"RunAdmitted\",\"canon\":999}\n";
+        assert!(restore_unverifiable(not_an_export.as_bytes()).is_none());
+        let other_version = format!(
+            "{{\"kind\":\"agentplane.export\",\"version\":{},\"canon\":999}}\n",
+            version + 1
+        );
+        assert!(restore_unverifiable(other_version.as_bytes()).is_none());
+        report.findings.push("damage".to_owned());
+        assert_eq!(verify_status(&report, true), ExitCode::from(exit::FINDING));
+
         for (code, word) in [
             (exit::OK, "ok"),
             (exit::FINDING, "finding"),
@@ -5811,6 +7920,7 @@ spec:
             (exit::SUSPENDED, "suspended"),
             (exit::OPERATIONAL, "operational"),
             (exit::PARTIAL, "partial"),
+            (exit::UNVERIFIABLE, "unverifiable"),
         ] {
             assert!(
                 EXIT_STATUS_HELP
@@ -5991,14 +8101,636 @@ spec:
 
                 let replayed = super::verify_one(
                     &manifests,
-                    &agentplane::runtime::Stores::on(store),
-                    &agentplane::core::TenantId::default(),
+                    &super::Backend::Embedded(store, agentplane::core::TenantId::default()),
                     recorded.run_id,
                 )
                 .await
                 .expect("a strict replay needs no driver this binary can build");
                 assert_eq!(replayed, super::Replayed::Verified);
             });
+    }
+
+    /// `serve`'s arguments for the witness tests: one submission witness at a
+    /// port nothing listens on, a trusted key, and a log key on disk.
+    #[cfg(all(feature = "a2a-server", feature = "cedar"))]
+    fn serve_witness_args(extra: &[&str]) -> super::ServeArgs {
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-logkey-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let seed = dir.join("log.seed");
+        std::fs::write(&seed, "07".repeat(32)).expect("seed");
+        let witness_key = format!(
+            "w={}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                agentplane::policy::Ed25519Signer::new("w", &[9u8; 32]).verifying_key()
+            )
+        );
+        let log_key = format!("log.example/plane={}", seed.display());
+        let mut args = vec![
+            "agentplane",
+            "serve",
+            "agent.yaml",
+            "--witness-submit",
+            "http://127.0.0.1:9",
+            "--witness-key",
+            &witness_key,
+            "--log-key",
+            &log_key,
+        ];
+        args.extend_from_slice(extra);
+        match <super::Cli as clap::Parser>::try_parse_from(args)
+            .expect("parses")
+            .verb
+        {
+            super::Verb::Serve(opts) => *opts,
+            _ => unreachable!("a serve line"),
+        }
+    }
+
+    /// An interval shorter than the sweep that keeps it is refused, naming
+    /// both; an externally run sweep owns the cadence.
+    #[test]
+    #[cfg(all(feature = "a2a-server", feature = "cedar"))]
+    fn serve_refuses_an_interval_shorter_than_its_sweep() {
+        let builder = || {
+            agentplane::runtime::Runtime::builder(std::sync::Arc::new(
+                agentplane::store::RedbStore::open_in_memory().expect("store"),
+            )
+                as std::sync::Arc<dyn agentplane::journal::JournalStore>)
+        };
+        let short = serve_witness_args(&["--sweep-every", "60", "--witness-interval", "30"]);
+        let refused = super::with_submission_witnesses(builder(), &short)
+            .expect_err("an interval the sweep cannot keep");
+        assert!(
+            refused.contains("30") && refused.contains("60"),
+            "the refusal does not name both values: {refused}"
+        );
+        let external = serve_witness_args(&["--sweep-every", "0", "--witness-interval", "30"]);
+        assert!(super::with_submission_witnesses(builder(), &external).is_ok());
+    }
+
+    /// A `serve`-built plane submits its checkpoint to its `--witness-submit`
+    /// witnesses on the sweep: an unreachable one is a shortfall, not silence.
+    #[test]
+    #[cfg(all(feature = "a2a-server", feature = "cedar"))]
+    fn serve_wires_its_submission_witnesses_into_the_sweep() {
+        use agentplane::journal::JournalStore;
+
+        const AGENT: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summariser, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  identity: { role: "Summarise a support ticket" }
+  capabilities: { provides: [support.summarise] }
+  models:
+    privileged: { provider: acme, model: sum-1 }
+  budgets: { max_tokens: 10000 }
+"#;
+        let manifest = agentplane::manifest::Manifest::parse(AGENT).expect("parses");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let store = std::sync::Arc::new(
+                    agentplane::store::RedbStore::open_in_memory().expect("store"),
+                );
+                agentplane::runtime::Runtime::builder(
+                    std::sync::Arc::clone(&store) as std::sync::Arc<dyn JournalStore>
+                )
+                .provider("acme", agentplane::model::fake::FakeProvider::new())
+                .agent(agentplane::runtime::Agent::new(&manifest))
+                .build()
+                .run(
+                    "support.summarise",
+                    agentplane::core::Tainted::trusted(serde_json::json!({ "t": 1 })),
+                )
+                .await
+                .expect("a sealed run");
+
+                let plane = super::with_submission_witnesses(
+                    agentplane::runtime::Runtime::builder(
+                        std::sync::Arc::clone(&store) as std::sync::Arc<dyn JournalStore>
+                    ),
+                    &serve_witness_args(&[]),
+                )
+                .expect("wired")
+                .build();
+                #[allow(clippy::disallowed_methods)]
+                let now = agentplane::core::Timestamp::now_utc();
+                let report = plane
+                    .sweep(now, std::time::Duration::from_secs(60))
+                    .await
+                    .expect("a sweep");
+                assert_eq!(
+                    report.witness_shortfall, 1,
+                    "serve's witnesses never reached the sweep: {report:?}"
+                );
+            });
+    }
+
+    /// Run one command line through this binary's own dispatch.
+    fn cli(args: &[&str]) -> Result<std::process::ExitCode, Fault> {
+        super::dispatch(<super::Cli as clap::Parser>::try_parse_from(args).expect("parses"))
+    }
+
+    /// **A halt thrown at the terminal stops a plane this binary builds.**
+    ///
+    /// `halt --store` writes to the quota store; a `run`, `serve` or resume
+    /// that built its plane without that store admits straight past it.
+    #[test]
+    fn a_halt_thrown_at_the_terminal_refuses_a_run_on_the_same_store() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-halt-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let store = dir.join("plane.redb");
+        let store = store.to_str().expect("utf-8 path");
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/summariser.yaml");
+        let input = r#"{"ticket":"printer on fire"}"#;
+
+        cli(&[
+            "agentplane",
+            "run",
+            manifest,
+            "--input",
+            input,
+            "--store",
+            store,
+        ])
+        .expect("an unhalted plane runs the example");
+        cli(&[
+            "agentplane",
+            "halt",
+            "--store",
+            store,
+            "--reason",
+            "incident 7",
+            "--actor",
+            "ops",
+        ])
+        .expect("the halt is thrown");
+        let refused = cli(&[
+            "agentplane",
+            "run",
+            manifest,
+            "--input",
+            input,
+            "--store",
+            store,
+        ])
+        .expect_err("a run under a standing tenant halt must be refused at admission");
+        assert!(
+            refused.to_string().contains("halt"),
+            "the refusal must name the halt: {refused}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch store holding one case, and that case's id.
+    fn store_with_a_case(tag: &str) -> (std::path::PathBuf, String, String) {
+        use agentplane::case::CaseStore;
+
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-{tag}-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("plane.redb");
+        let store = path.to_str().expect("utf-8 path").to_owned();
+        let case = {
+            let cases = agentplane::store::RedbStore::open(&store).expect("store");
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(
+                    cases.correlate_or_open(
+                        "matter",
+                        &[agentplane::core::CorrelationKey::new("matter", "M-1")],
+                        agentplane::core::Timestamp::from_unix_timestamp(1_700_000_000)
+                            .expect("an instant"),
+                    ),
+                )
+                .expect("a case")
+                .case_id()
+                .to_string()
+        };
+        (dir, store, case)
+    }
+
+    /// The first record of every run sealed under `outcome` in `store`.
+    fn lift_records(store: &str, outcome: &str) -> Vec<agentplane::journal::RecordKind> {
+        use agentplane::journal::JournalStore;
+
+        let journal = agentplane::store::RedbStore::open(store).expect("store");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let mut kinds = Vec::new();
+                for run in journal.runs_by_outcome(outcome, 100).await.expect("index") {
+                    let page = journal.read_page(run, 1, 1).await.expect("records");
+                    kinds.extend(page.into_iter().map(|r| r.kind().clone()));
+                }
+                kinds
+            })
+    }
+
+    /// **A lift at the terminal is recorded under `--actor`, as asserted**, and
+    /// the history listings read it back.
+    #[test]
+    fn a_terminal_lift_is_recorded_as_asserted() {
+        let (dir, store, case) = store_with_a_case("lift");
+        let store = store.as_str();
+        cli(&[
+            "agentplane",
+            "halt",
+            "--store",
+            store,
+            "--reason",
+            "incident 7",
+            "--actor",
+            "ops",
+        ])
+        .expect("the halt is thrown");
+        cli(&[
+            "agentplane",
+            "hold",
+            "--store",
+            store,
+            "--case",
+            &case,
+            "--reason",
+            "order 9",
+            "--actor",
+            "ops",
+        ])
+        .expect("the hold is placed");
+
+        assert_eq!(
+            cli(&[
+                "agentplane",
+                "halt",
+                "--store",
+                store,
+                "--lift",
+                "--actor",
+                "ops-erin"
+            ])
+            .expect("the halt is lifted"),
+            std::process::ExitCode::SUCCESS
+        );
+        assert_eq!(
+            cli(&[
+                "agentplane",
+                "hold",
+                "--store",
+                store,
+                "--case",
+                &case,
+                "--lift",
+                "--actor",
+                "ops-erin",
+            ])
+            .expect("the hold is released"),
+            std::process::ExitCode::SUCCESS
+        );
+
+        let lifts = lift_records(store, "halt-lifted");
+        assert_eq!(lifts.len(), 1, "{lifts:?}");
+        let agentplane::journal::RecordKind::HaltLifted { by, thrown_by, .. } = &lifts[0] else {
+            panic!("a lift run holds a lift record: {lifts:?}");
+        };
+        assert_eq!((by.actor(), by.basis().as_str()), ("ops-erin", "asserted"));
+        assert_eq!(thrown_by.actor(), "ops");
+        let releases = lift_records(store, "hold-released");
+        assert_eq!(releases.len(), 1, "{releases:?}");
+        let agentplane::journal::RecordKind::HoldReleased { by, .. } = &releases[0] else {
+            panic!("a release run holds a release record: {releases:?}");
+        };
+        assert_eq!((by.actor(), by.basis().as_str()), ("ops-erin", "asserted"));
+
+        the_histories_list(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both histories list in full under the default page, and exit partial
+    /// under a page shorter than the one lift and one release `store` holds.
+    fn the_histories_list(store: &str) {
+        for args in [
+            &["agentplane", "halt", "list", "--store", store, "--lifted"][..],
+            &[
+                "agentplane",
+                "halt",
+                "list",
+                "--store",
+                store,
+                "--lifted",
+                "--json",
+            ][..],
+            &["agentplane", "hold", "list", "--store", store, "--released"][..],
+        ] {
+            assert_eq!(
+                cli(args).expect("the history lists"),
+                std::process::ExitCode::SUCCESS,
+                "{args:?}"
+            );
+        }
+        // A page shorter than the history is a partial answer.
+        for args in [
+            &[
+                "agentplane",
+                "halt",
+                "list",
+                "--store",
+                store,
+                "--lifted",
+                "--limit",
+                "0",
+            ][..],
+            &[
+                "agentplane",
+                "hold",
+                "list",
+                "--store",
+                store,
+                "--released",
+                "--limit",
+                "0",
+            ][..],
+        ] {
+            assert_eq!(
+                cli(args).expect("the history lists"),
+                std::process::ExitCode::from(exit::PARTIAL),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// **A lift at the terminal with no `--actor` is refused** before the
+    /// store is touched: the halt and the hold still stand, and nothing is
+    /// recorded.
+    #[test]
+    fn a_terminal_lift_without_an_actor_is_refused() {
+        use agentplane::case::CaseStore;
+        use agentplane::quota::QuotaStore;
+
+        let (dir, store, case) = store_with_a_case("unattributed");
+        let store = store.as_str();
+        cli(&[
+            "agentplane",
+            "halt",
+            "--store",
+            store,
+            "--reason",
+            "incident 7",
+            "--actor",
+            "ops",
+        ])
+        .expect("the halt is thrown");
+        cli(&[
+            "agentplane",
+            "hold",
+            "--store",
+            store,
+            "--case",
+            &case,
+            "--reason",
+            "order 9",
+            "--actor",
+            "ops",
+        ])
+        .expect("the hold is placed");
+
+        for args in [
+            &["agentplane", "halt", "--store", store, "--lift"][..],
+            &[
+                "agentplane",
+                "hold",
+                "--store",
+                store,
+                "--case",
+                &case,
+                "--lift",
+            ][..],
+        ] {
+            let refused = cli(args).expect_err("a lift nobody is named for");
+            assert!(
+                matches!(refused, Fault::Usage(_)) && refused.to_string().contains("--actor"),
+                "{args:?}: {refused}"
+            );
+        }
+
+        let plane = agentplane::store::RedbStore::open(store).expect("store");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                assert_eq!(
+                    plane.halts().await.expect("halts").len(),
+                    1,
+                    "the halt stands"
+                );
+                let id = agentplane::core::CaseId::parse(&case).expect("case id");
+                assert!(
+                    plane.hold(id).await.expect("hold").is_some(),
+                    "the hold stands"
+                );
+            });
+        drop(plane);
+        assert!(lift_records(store, "halt-lifted").is_empty());
+        assert!(lift_records(store, "hold-released").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`content check` answers with the runtime's own evaluator**: exit 1
+    /// when a rule would refuse the value, 0 when none would, and a usage
+    /// error for a boundary it cannot name.
+    #[test]
+    fn content_check_exits_on_what_a_rule_would_refuse() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-content-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let manifest = dir.join("agent.yaml");
+        std::fs::write(
+            &manifest,
+            "apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: ruled, version: \"1.0.0\" }
+spec:
+  capabilities: { provides: [work.do] }
+  budgets: {}
+  security:
+    content:
+      rules:
+        - id: codename
+          match: {contains: [falcon], case: fold}
+          at: {sinks: [model.complete]}
+          then: refuse
+",
+        )
+        .expect("manifest");
+        let check = |value: &str, at: &str| {
+            let path = dir.join("value.json");
+            std::fs::write(&path, value).expect("value");
+            cli(&[
+                "agentplane",
+                "content",
+                "check",
+                manifest.to_str().expect("utf-8"),
+                "--at",
+                at,
+                "--value",
+                path.to_str().expect("utf-8"),
+            ])
+        };
+        assert_eq!(
+            check(r#"{"q": "Falcon"}"#, "sink:model.complete").expect("judged"),
+            std::process::ExitCode::from(exit::FINDING)
+        );
+        assert_eq!(
+            check(r#"{"q": "Falcon"}"#, "sink:tool.call").expect("judged"),
+            std::process::ExitCode::SUCCESS,
+            "a rule applies only where it is declared"
+        );
+        assert!(matches!(
+            check(r#"{"q": "x"}"#, "outbound"),
+            Err(Fault::Usage(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A listing cut short by `--limit` exits partial.** The help table says
+    /// 5 means exactly this, and a script reading exit 0 takes the page for
+    /// the whole worklist.
+    #[test]
+    fn a_listing_cut_short_by_its_limit_exits_partial() {
+        use agentplane::case::TaskStore;
+
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-listing-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("plane.redb");
+        let store = path.to_str().expect("utf-8 path");
+        {
+            let tasks = agentplane::store::RedbStore::open(store).expect("store");
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    for summary in ["first", "second"] {
+                        tasks
+                            .open(&listed(summary, serde_json::json!({}), None))
+                            .await
+                            .expect("opened");
+                    }
+                });
+        }
+        let status = |limit: &str| {
+            cli(&["agentplane", "tasks", "--store", store, "--limit", limit]).expect("listed")
+        };
+        assert_eq!(
+            status("1"),
+            std::process::ExitCode::from(exit::PARTIAL),
+            "a page of one over two tasks is a partial answer"
+        );
+        assert_eq!(status("2"), std::process::ExitCode::SUCCESS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A decision naming a version the task no longer holds is refused at
+    /// the terminal**: exit 1, and the task is still open. A digest that is
+    /// not one is a usage error.
+    #[test]
+    fn a_stale_digest_at_the_terminal_is_refused() {
+        use agentplane::case::TaskStore;
+
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-stale-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("plane.redb");
+        let store = path.to_str().expect("utf-8 path");
+        let task = listed("Refund the invoice", serde_json::json!({}), None);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        {
+            let tasks = agentplane::store::RedbStore::open(store).expect("store");
+            rt.block_on(tasks.open(&task)).expect("opened");
+        }
+        let id = task.id.to_string();
+        let decide = |digest: &str| {
+            cli(&[
+                "agentplane",
+                "decide",
+                &id,
+                "reject",
+                "--reason",
+                "no",
+                "--actor",
+                "ops",
+                "--store",
+                store,
+                "--digest",
+                digest,
+            ])
+        };
+
+        let stale = agentplane::core::Digest::of(b"another version").to_hex();
+        assert_eq!(
+            decide(&stale).expect("a refusal, not a fault"),
+            std::process::ExitCode::from(exit::FINDING)
+        );
+        let tasks = agentplane::store::RedbStore::open(store).expect("store");
+        let after = rt.block_on(tasks.task(task.id)).unwrap().unwrap();
+        assert!(
+            after.state.is_pending() && after.assignee.is_none(),
+            "{after:?}"
+        );
+        drop(tasks);
+
+        assert!(matches!(decide("not-hex"), Err(Fault::Usage(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Every plane this binary builds comes from one door.**
+    ///
+    /// [`super::Backend::plane`] is what binds a plane to the operator's
+    /// backend and tenant. A second builder in this file is a verb whose plane
+    /// can sit on other stores or another tenant — or, started from the
+    /// journal alone, on no quota store, where the operator's halts do not
+    /// reach.
+    #[test]
+    fn every_plane_this_binary_builds_comes_through_backend_plane() {
+        let source = include_str!("agentplane.rs");
+        let body = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the file has a body");
+        assert_eq!(
+            body.matches("Runtime::builder_with(").count(),
+            1,
+            "only Backend::plane may start a runtime builder"
+        );
+        for other in ["Runtime::builder(", "Runtime::builder_on("] {
+            assert_eq!(
+                body.matches(other).count(),
+                0,
+                "only Backend::plane may start a runtime builder, and {other} does"
+            );
+        }
     }
 
     /// A task for the terminal tests, proposing `proposed` under `summary`.
@@ -6055,6 +8787,12 @@ spec:
         );
         let shown = super::task_json(&task, true);
         assert_eq!(shown["proposed_action"], serde_json::Value::Null, "{shown}");
+        // The version of the stored row, not of what is shown.
+        assert_eq!(
+            shown["digest"],
+            task.justification.digest().to_hex(),
+            "{shown}"
+        );
         assert!(
             shown["withheld"]
                 .as_str()
@@ -6087,5 +8825,990 @@ spec:
             !printed.contains('\u{202E}') && !printed.contains('\u{200B}'),
             "{printed}"
         );
+    }
+
+    /// **`--mcp-agent` chooses what the MCP listener serves**, so one agent
+    /// with no `spec.input` in the file is left off rather than failing the
+    /// whole listener — and a name that matches nothing is refused, never an
+    /// empty catalogue.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    #[test]
+    fn mcp_agent_serves_only_the_agents_it_names() {
+        let agent = |name: &str| {
+            agentplane::manifest::Manifest::parse(&format!(
+                "apiVersion: agentplane.hupe1980.github.io/v1alpha1\n\
+                 kind: Agent\n\
+                 metadata: {{ name: {name}, version: \"1.0.0\" }}\n\
+                 spec:\n  identity: {{ role: r }}\n  capabilities: {{ provides: [{name}.do] }}\n  budgets: {{}}\n"
+            ))
+            .expect("manifest")
+        };
+        let file = [agent("triage"), agent("specialist")];
+        let all = super::mcp_served(&file, &[]).expect("every agent");
+        assert_eq!(all.len(), 2, "no --mcp-agent must serve every agent");
+        let one = super::mcp_served(&file, &["triage".to_owned()]).expect("one agent");
+        assert_eq!(
+            one.iter()
+                .map(|m| m.metadata.name.as_str())
+                .collect::<Vec<_>>(),
+            ["triage"],
+            "--mcp-agent served an agent it did not name"
+        );
+        let unknown = super::mcp_served(&file, &["nobody".to_owned()]);
+        assert!(
+            unknown.is_err_and(|e| e.contains("nobody")),
+            "a name matching no agent was not refused"
+        );
+        let refusal = super::mcp_refusal(&agentplane::tools::serve::ServeError::NoInputSchema {
+            agent: "specialist".into(),
+            capability: "specialist.do".into(),
+        });
+        assert!(
+            refusal.contains("--mcp-agent"),
+            "the refusal does not name what this command can do: {refusal}"
+        );
+    }
+
+    /// A fresh, empty directory for `init --serve` to write into.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    fn served_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "agentplane-served-{name}-{}",
+            agentplane::core::RunId::generate()
+        ))
+    }
+
+    /// The tokens a token file holds, in file order.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    fn tokens_in(file: &str) -> Vec<(String, String)> {
+        let entries: Vec<serde_json::Value> = serde_yaml_ng::from_str(file).expect("yaml");
+        entries
+            .iter()
+            .map(|e| {
+                (
+                    e["actor"].as_str().expect("actor").to_owned(),
+                    e["token"].as_str().expect("token").to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// **The starter's credentials are fresh, distinct, accepted, and private.**
+    ///
+    /// A token this project printed is a token every reader holds, so each run
+    /// generates its own from the operating system; and the file is not
+    /// world-readable, because the token file is the plane's whole notion of
+    /// who is calling.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    #[test]
+    fn init_serve_writes_three_distinct_accepted_tokens() {
+        let dir = served_dir("tokens");
+        let served = super::init_serve(&dir).expect("an empty directory");
+        let again = super::init_serve(&served_dir("again")).expect("a second plane");
+        for name in super::SERVED_FILES {
+            assert!(dir.join(name).is_file(), "{name} was not written");
+        }
+        let file = std::fs::read_to_string(dir.join("tokens.yaml")).unwrap();
+        agentplane::api::tokens::TokenAuthenticator::from_yaml(&file).expect("serve accepts it");
+        let tokens = tokens_in(&file);
+        let actors: Vec<&str> = tokens.iter().map(|(a, _)| a.as_str()).collect();
+        assert_eq!(actors, ["peer-1", "framework-1", "ops-1"]);
+        assert!(tokens.iter().all(|(_, t)| t.len() >= 64), "{tokens:?}");
+        let other = std::fs::read_to_string(
+            again
+                .paths
+                .iter()
+                .find(|p| p.ends_with("tokens.yaml"))
+                .unwrap(),
+        )
+        .unwrap();
+        let distinct: std::collections::BTreeSet<String> = tokens
+            .iter()
+            .chain(&tokens_in(&other))
+            .map(|(_, t)| t.clone())
+            .collect();
+        assert_eq!(distinct.len(), 6, "a token repeats across two planes");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("framework.token")).unwrap(),
+            tokens[1].1,
+            "framework.token is not the framework caller's token"
+        );
+        #[cfg(unix)]
+        for name in [
+            "tokens.yaml",
+            "framework.token",
+            "postgres.password",
+            "store.env",
+        ] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name} is mode {mode:o}");
+        }
+        for json in [false, true] {
+            let printed = super::served_report(&served, json);
+            assert!(printed.contains(&served.digest) && printed.contains("compose.yaml"));
+            for (_, token) in &tokens {
+                assert!(!printed.contains(token.as_str()), "a token was printed");
+            }
+        }
+    }
+
+    /// **`init --serve` writes nothing when any of its files exists.**
+    ///
+    /// Each target is pre-created in turn; the refusal names it, its bytes are
+    /// untouched, and no other file appears.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    #[test]
+    fn init_serve_refuses_and_writes_nothing_when_a_file_exists() {
+        for name in super::SERVED_FILES {
+            let dir = served_dir("refused");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(name), "reviewed\n").unwrap();
+            let err = super::init_serve(&dir).expect_err("an existing file");
+            assert!(err.to_string().contains(name), "{err}");
+            // Refused before anything is generated, and told so.
+            assert!(err.to_string().contains("so nothing was written"), "{err}");
+            assert_eq!(
+                std::fs::read_to_string(dir.join(name)).unwrap(),
+                "reviewed\n"
+            );
+            let present: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(present, [name], "a refused init --serve wrote {present:?}");
+        }
+    }
+
+    /// **The written policy is the shipped file**, not a second bundle beside
+    /// it; the manifest validates; the compose file runs this version.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    #[test]
+    fn init_serve_writes_the_shipped_policy() {
+        let dir = served_dir("policy");
+        super::init_serve(&dir).expect("an empty directory");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            std::fs::read(dir.join("policy.cedar")).unwrap(),
+            std::fs::read(root.join("examples/serve-policy.cedar")).unwrap(),
+            "init --serve wrote a policy that is not the shipped bundle"
+        );
+        let manifest = std::fs::read_to_string(dir.join("agent.yaml")).unwrap();
+        let parsed = agentplane::manifest::Manifest::parse_all(&manifest).expect("it parses");
+        super::mcp_served(&parsed, &[]).expect("the MCP listener serves it");
+        let compose = std::fs::read_to_string(dir.join("compose.yaml")).unwrap();
+        assert!(
+            compose.contains(&format!("agentplane:{}-full", env!("CARGO_PKG_VERSION"))),
+            "the compose file does not run this version"
+        );
+        assert!(!compose.contains("PLANE_USER") && !compose.contains("AGENTPLANE_VERSION"));
+    }
+
+    /// **The starter's Postgres takes a generated password, carried by files.**
+    ///
+    /// A network marked internal still gives a Linux host an address on its
+    /// bridge, so a passwordless Postgres is one any local process reaches as
+    /// the superuser. The password is in no command line and the compose file
+    /// holds no secret; every port is published on loopback.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    #[test]
+    fn init_serve_gives_postgres_a_password_off_the_command_line() {
+        let dir = served_dir("password");
+        super::init_serve(&dir).expect("an empty directory");
+        let password = std::fs::read_to_string(dir.join("postgres.password")).unwrap();
+        let password = password.trim();
+        assert!(password.len() >= 64, "{password:?}");
+        let store = std::fs::read_to_string(dir.join("store.env")).unwrap();
+        assert!(
+            store.contains(&format!(
+                "AGENTPLANE_STORE=postgres://agentplane:{password}@postgres:5432/"
+            )),
+            "store.env does not connect with the generated password: {store}"
+        );
+        let compose = std::fs::read_to_string(dir.join("compose.yaml")).unwrap();
+        let yaml: serde_json::Value = serde_yaml_ng::from_str(&compose).expect("yaml");
+        let postgres = &yaml["services"]["postgres"];
+        assert_eq!(
+            postgres["environment"]["POSTGRES_PASSWORD_FILE"], "/run/secrets/postgres_password",
+            "{postgres}"
+        );
+        assert!(
+            postgres["environment"]["POSTGRES_HOST_AUTH_METHOD"].is_null(),
+            "{postgres}"
+        );
+        assert_eq!(
+            yaml["secrets"]["postgres_password"]["file"], "./postgres.password",
+            "{yaml}"
+        );
+        let plane = &yaml["services"]["plane"];
+        assert_eq!(plane["env_file"][0], "./store.env", "{plane}");
+        let command = plane["command"].to_string();
+        assert!(
+            !command.contains("--store") && !command.contains("postgres://"),
+            "{command}"
+        );
+        assert!(
+            !compose.contains(password),
+            "the compose file holds the password"
+        );
+        for port in plane["ports"].as_array().expect("published ports") {
+            let port = port.as_str().expect("a short-syntax port");
+            assert!(
+                port.starts_with("127.0.0.1:"),
+                "{port} is published beyond loopback"
+            );
+        }
+    }
+
+    /// **The plane runs as the token file's owner, and never as root.**
+    ///
+    /// The token file is mode 0600, so the container must run as its owner to
+    /// read it; root would read it, and run the plane as root.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    #[test]
+    fn init_serve_runs_the_plane_as_the_token_files_owner_and_never_root() {
+        let err = super::plane_user(0, 0).expect_err("root");
+        assert!(err.to_string().contains("--user"), "{err}");
+        assert_eq!(super::plane_user(1000, 1000).unwrap(), "1000:1000");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let dir = served_dir("owner");
+            super::init_serve(&dir).expect("an empty directory");
+            let meta = std::fs::metadata(dir.join("tokens.yaml")).unwrap();
+            let compose = std::fs::read_to_string(dir.join("compose.yaml")).unwrap();
+            let user = format!("user: \"{}:{}\"", meta.uid(), meta.gid());
+            assert!(
+                compose.contains(&user),
+                "the compose file does not hold {user}"
+            );
+        }
+    }
+
+    /// **A failed `init --serve` leaves nothing behind.**
+    ///
+    /// Files written before the failure are removed, so a re-run is not refused
+    /// over the remains of the attempt that failed.
+    #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
+    #[test]
+    fn a_failed_init_serve_removes_what_it_wrote() {
+        let dir = served_dir("partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut written = super::Written::default();
+            written
+                .create(&dir, "agent.yaml", "a\n", false)
+                .expect("the first file");
+            written
+                .create(&dir, "tokens.yaml", "t\n", true)
+                .expect("the second file");
+            written
+                .create(&dir, "no-such-dir/compose.yaml", "c\n", false)
+                .expect_err("a file under a missing directory");
+        }
+        let present: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert!(present.is_empty(), "a failed init --serve left {present:?}");
+        super::init_serve(&dir).expect("a re-run after the failure");
+    }
+
+    /// **`serve` refuses a `--url` that is not the A2A endpoint.**
+    ///
+    /// The card publishes the URL verbatim and A2A is served at `/a2a` only, so
+    /// a bare host would answer every client that follows the card with `404`.
+    #[cfg(all(feature = "a2a-server", feature = "cedar"))]
+    #[test]
+    fn serve_refuses_a_url_that_is_not_the_a2a_endpoint() {
+        for (bare, fix) in [
+            ("https://agent.example.com", "https://agent.example.com/a2a"),
+            (
+                "https://agent.example.com/",
+                "https://agent.example.com/a2a",
+            ),
+            ("http://h:8080/a2a/", "http://h:8080/a2a"),
+        ] {
+            let err = super::a2a_endpoint(bare).expect_err(bare);
+            assert!(err.to_string().ends_with(&format!("--url {fix}")), "{err}");
+        }
+        assert_eq!(
+            super::a2a_endpoint("http://localhost:8080/a2a").unwrap(),
+            "http://localhost:8080/a2a"
+        );
+    }
+
+    /// A fresh directory under the system temp dir.
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-{name}-{}",
+            agentplane::core::RunId::generate()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// The runs a store concluded as `succeeded`.
+    fn succeeded_in(store: &str) -> Vec<agentplane::core::RunId> {
+        let journal = agentplane::store::RedbStore::open(store).expect("store");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime")
+            .block_on(agentplane::journal::JournalStore::runs_by_outcome(
+                &journal,
+                "succeeded",
+                10,
+            ))
+            .expect("listed")
+    }
+
+    /// **`history` prints a recorded string escaped**, one line per record
+    /// in sequence order; `--from` starts there; an unknown run exits 1
+    /// whatever `--from` names.
+    #[test]
+    fn history_prints_a_hostile_record_escaped() {
+        let dir = temp_dir("history");
+        let path = dir.join("plane.redb");
+        let store = path.to_str().expect("utf-8 path");
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/summariser.yaml");
+        let hostile =
+            "\u{1b}]52;c;ZXZpbA==\u{7}\u{9b}31m<img src=x onerror=alert(1)>\u{202E}gnp.exe";
+        let input = serde_json::json!({ "ticket": hostile }).to_string();
+        cli(&[
+            "agentplane",
+            "run",
+            manifest,
+            "--input",
+            &input,
+            "--store",
+            store,
+        ])
+        .expect("the example runs");
+        let run = succeeded_in(store)[0];
+
+        let journal: Arc<dyn agentplane::journal::JournalStore> =
+            Arc::new(agentplane::store::RedbStore::open(store).expect("store"));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let lines = rt
+            .block_on(super::history_lines(&journal, run, None, false))
+            .expect("read")
+            .expect("the run exists");
+        assert!(lines.len() >= 2, "{lines:?}");
+        let seqs: Vec<u64> = lines
+            .iter()
+            .map(|l| l.split_whitespace().next().unwrap().parse().unwrap())
+            .collect();
+        assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "{seqs:?}");
+        let printed = lines.join("\n");
+        assert!(
+            printed.contains("\\u{202E}gnp.exe"),
+            "the bidi override was not shown escaped: {printed}"
+        );
+        for raw in ['\u{1b}', '\u{7}', '\u{9b}', '\u{202E}'] {
+            assert!(
+                !printed.contains(raw),
+                "U+{:04X} reached the terminal raw",
+                raw as u32
+            );
+        }
+
+        let later = rt
+            .block_on(super::history_lines(&journal, run, Some(2), false))
+            .expect("read")
+            .expect("the run exists");
+        assert!(later[0].trim_start().starts_with("2 "), "{later:?}");
+        let unknown = agentplane::core::RunId::generate();
+        for from in [None, Some(2)] {
+            assert!(
+                rt.block_on(super::history_lines(&journal, unknown, from, false))
+                    .expect("read")
+                    .is_none(),
+                "an unknown run read from {from:?} was answered as one that exists"
+            );
+        }
+        assert!(
+            rt.block_on(super::history_lines(&journal, run, Some(1_000), false))
+                .expect("read")
+                .is_some_and(|lines| lines.is_empty()),
+            "a reader past the end of a run that exists was told it does not"
+        );
+        drop(journal);
+        assert_eq!(
+            cli(&[
+                "agentplane",
+                "history",
+                &unknown.to_string(),
+                "--store",
+                store
+            ])
+            .expect("an answer"),
+            std::process::ExitCode::from(exit::FINDING)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`dev` opens only memory or a directory it created**, following no
+    /// link and trusting no marker but its own exact bytes.
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_refuses_a_store_it_did_not_create() {
+        let refused = |scratch: Option<&str>, tenant: Option<&str>| {
+            matches!(super::dev_store(scratch, tenant), Err(Fault::Usage(_)))
+        };
+        assert!(refused(Some("postgres://ops@db/plane"), None));
+        assert!(refused(None, Some("acme")));
+
+        let deployed = temp_dir("dev-deployed");
+        // Named as a dev store would be, so only the missing marker refuses it.
+        let file = deployed.join("dev.redb");
+        drop(agentplane::store::RedbStore::open(&file).expect("a deployment's store"));
+        assert!(refused(file.to_str(), None), "a redb file was opened");
+        assert!(
+            refused(deployed.to_str(), None),
+            "an unmarked directory was opened"
+        );
+        assert_eq!(
+            std::fs::read_dir(&deployed).unwrap().count(),
+            1,
+            "a refused directory was written to"
+        );
+
+        let scratch = temp_dir("dev-scratch");
+        let scratch = scratch.to_str().expect("utf-8 path");
+        drop(super::dev_store(Some(scratch), Some("dev")).expect("an empty directory opens"));
+        drop(super::dev_store(Some(scratch), None).expect("a marked directory reopens"));
+        #[cfg(unix)]
+        {
+            let linked = temp_dir("dev-linked");
+            let link = linked.join("scratch");
+            std::os::unix::fs::symlink(scratch, &link).expect("a link");
+            assert!(
+                refused(link.to_str(), None),
+                "a symbolic link to a marked directory was followed"
+            );
+            let store = std::path::Path::new(scratch).join("dev.redb");
+            std::fs::remove_file(&store).expect("the dev store");
+            std::os::unix::fs::symlink(&file, &store).expect("a link");
+            assert!(
+                refused(Some(scratch), None),
+                "a dev.redb linking to a deployment's store was opened"
+            );
+            std::fs::remove_file(&store).expect("the link");
+            let _ = std::fs::remove_dir_all(&linked);
+        }
+        let marker = std::path::Path::new(scratch).join(".agentplane-dev");
+        std::fs::write(&marker, "").expect("an empty marker");
+        assert!(
+            refused(Some(scratch), None),
+            "a marker without the exact bytes dev writes was accepted"
+        );
+        std::fs::write(&marker, super::DEV_MARKER_TEXT).expect("the marker");
+        drop(super::dev_store(Some(scratch), None).expect("a marked directory reopens"));
+        std::fs::write(std::path::Path::new(scratch).join("other"), "x").unwrap();
+        assert!(
+            refused(Some(scratch), None),
+            "a marked directory holding more was opened"
+        );
+        let _ = std::fs::remove_dir_all(&deployed);
+        let _ = std::fs::remove_dir_all(scratch);
+    }
+
+    /// **`--mcp` and `--peer` are refused without `--allow-live`.**
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_refuses_live_transports_without_consent() {
+        let args = |extra: &[&str]| {
+            let mut line = vec!["agentplane", "dev", "agent.yaml"];
+            line.extend_from_slice(extra);
+            match <super::Cli as clap::Parser>::try_parse_from(line)
+                .expect("parses")
+                .verb
+            {
+                super::Verb::Dev(args) => args,
+                other => panic!("parsed as {other:?}"),
+            }
+        };
+        for extra in [
+            &["--mcp", "files=mcp-files"][..],
+            &[
+                "--peer",
+                "billing=https://billing.example/a2a",
+                "--acting-as",
+                "ada",
+            ][..],
+        ] {
+            let refused = super::refuse_live_without_consent(&args(extra))
+                .expect_err("a live transport without consent");
+            assert!(refused.to_string().contains("--allow-live"), "{refused}");
+            let mut consented = extra.to_vec();
+            consented.push("--allow-live");
+            super::refuse_live_without_consent(&args(&consented)).expect("consented");
+        }
+        super::refuse_live_without_consent(&args(&[])).expect("nothing live");
+    }
+
+    /// **The dev listener is bound to loopback.**
+    #[cfg(feature = "dev")]
+    #[test]
+    fn the_dev_listener_binds_loopback_only() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let listener = rt.block_on(super::bind_dev(0)).expect("bound");
+        let addr = listener.local_addr().expect("an address");
+        assert!(addr.ip().is_loopback(), "the dev page listens on {addr}");
+        assert_ne!(addr.port(), 0);
+    }
+
+    #[cfg(feature = "dev")]
+    const DEV_PORT: u16 = 47_312;
+    #[cfg(feature = "dev")]
+    const DEV_TOKEN: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    /// A dev session over memory, as `dev` builds it.
+    #[cfg(feature = "dev")]
+    async fn dev_session(
+        manifest: &str,
+    ) -> (axum::Router, Arc<dyn agentplane::journal::JournalStore>) {
+        dev_session_as(manifest, None).await
+    }
+
+    /// A dev session over memory, acting as `acting_as` when one is named.
+    #[cfg(feature = "dev")]
+    async fn dev_session_as(
+        manifest: &str,
+        acting_as: Option<&str>,
+    ) -> (axum::Router, Arc<dyn agentplane::journal::JournalStore>) {
+        let backend = super::dev_store(None, None).expect("memory");
+        let journal = backend.journal();
+        let manifests = super::manifests_at(manifest).expect("the manifest");
+        let bench = super::dev::Bench::start(
+            backend,
+            super::dev::Wiring {
+                file: manifest.to_owned(),
+                mcp: Vec::new(),
+                peer: Vec::new(),
+                acting_as: acting_as.map(str::to_owned),
+                policy: Arc::new(agentplane::api::dev::DevPolicy::new("dev:author")),
+            },
+            manifests,
+        )
+        .await
+        .expect("the plane builds");
+        let auth = agentplane::api::tokens::TokenAuthenticator::new(vec![
+            agentplane::api::tokens::TokenEntry {
+                token: DEV_TOKEN.to_owned(),
+                actor: "dev:author".to_owned(),
+                roles: Vec::new(),
+                tenant: Some("dev".to_owned()),
+                scope: None,
+                not_after: None,
+            },
+        ])
+        .expect("tokens");
+        (
+            agentplane::api::dev::router(Arc::new(bench), Arc::new(auth), DEV_PORT),
+            journal,
+        )
+    }
+
+    /// One request from the page's own tab, and its JSON answer.
+    #[cfg(feature = "dev")]
+    async fn page(
+        router: &axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> (u16, serde_json::Value) {
+        use tower::ServiceExt as _;
+        let request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", format!("127.0.0.1:{DEV_PORT}"))
+            .header("origin", format!("http://127.0.0.1:{DEV_PORT}"))
+            .header("authorization", format!("Bearer {DEV_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                body.map(|b| b.to_string()).unwrap_or_default(),
+            ))
+            .expect("a request");
+        let response = router.clone().oneshot(request).await.expect("an answer");
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Every record the history route serves for `run`, paged with `?from=`.
+    #[cfg(feature = "dev")]
+    async fn served_history(router: &axum::Router, run: &str) -> Vec<serde_json::Value> {
+        let mut records = Vec::new();
+        let mut from = 1;
+        loop {
+            let (status, page_) = page(
+                router,
+                "GET",
+                &format!("/api/runs/{run}/history?from={from}"),
+                None,
+            )
+            .await;
+            assert_eq!(status, 200, "{page_}");
+            for record in page_["records"].as_array().expect("records") {
+                records.push(record.clone());
+            }
+            match page_["next_from"].as_u64() {
+                Some(next) => from = next,
+                None => return records,
+            }
+        }
+    }
+
+    /// **`history --json` prints what the history route serves.**
+    #[cfg(feature = "dev")]
+    #[test]
+    fn history_json_is_the_history_routes_records() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/summariser.yaml");
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (router, journal) = dev_session(manifest).await;
+                let (status, started) = page(
+                    &router,
+                    "POST",
+                    "/dev/runs",
+                    Some(serde_json::json!({ "input": { "ticket": "printer\u{202E} on fire" } })),
+                )
+                .await;
+                assert_eq!(status, 200, "{started}");
+                let run_text = started["run"].as_str().expect("a run").to_owned();
+                let run = agentplane::core::RunId::parse(&run_text).expect("a run id");
+                let served = served_history(&router, &run_text).await;
+                let printed: Vec<serde_json::Value> =
+                    super::history_lines(&journal, run, None, true)
+                        .await
+                        .expect("read")
+                        .expect("the run exists")
+                        .iter()
+                        .map(|l| serde_json::from_str(l).expect("one JSON object per line"))
+                        .collect();
+                assert!(!printed.is_empty());
+                assert_eq!(printed, served);
+            });
+    }
+
+    /// **The page's timeline shows a hidden character escaped**, as
+    /// `history` prints it, and otherwise the records the history route
+    /// serves.
+    #[cfg(feature = "dev")]
+    #[test]
+    fn the_dev_timeline_escapes_hidden_characters() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/summariser.yaml");
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (router, _) = dev_session(manifest).await;
+                let (_, started) = page(
+                    &router,
+                    "POST",
+                    "/dev/runs",
+                    Some(serde_json::json!({ "input": { "printer\u{202E}": "on\u{200B} fire" } })),
+                )
+                .await;
+                let run = started["run"].as_str().expect("a run").to_owned();
+                let (status, shown) =
+                    page(&router, "GET", &format!("/dev/runs/{run}/history"), None).await;
+                assert_eq!(status, 200, "{shown}");
+                let text = shown["records"].to_string();
+                assert!(
+                    !text.contains('\u{202E}') && !text.contains('\u{200B}'),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("printer\\\\u{202E}"),
+                    "a key was not escaped: {text}"
+                );
+                assert!(text.contains("on\\\\u{200B} fire"), "{text}");
+                assert_eq!(shown["escaped"], true);
+                let served = served_history(&router, &run).await;
+                assert_eq!(
+                    shown["records"].as_array().expect("records").len(),
+                    served.len()
+                );
+
+                let (status, _) = page(&router, "GET", "/dev/runs/not-a-run/history", None).await;
+                assert_eq!(status, 400);
+            });
+    }
+
+    /// The `governed_by` a run's admission recorded.
+    #[cfg(feature = "dev")]
+    async fn governed_by(
+        journal: &Arc<dyn agentplane::journal::JournalStore>,
+        run: agentplane::core::RunId,
+    ) -> serde_json::Value {
+        super::history_lines(journal, run, None, true)
+            .await
+            .expect("read")
+            .expect("the run exists")
+            .iter()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("JSON"))
+            .find(|r| r["kind"] == "RunAdmitted")
+            .expect("an admission")["record"]["governed_by"]
+            .clone()
+    }
+
+    /// **`run` and `dev` admit a run under the same declaration.**
+    #[cfg(feature = "dev")]
+    #[test]
+    fn dev_and_run_admit_the_same_declaration() {
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/summariser.yaml");
+        let dir = temp_dir("dev-same");
+        let path = dir.join("plane.redb");
+        let store = path.to_str().expect("utf-8 path");
+        cli(&[
+            "agentplane",
+            "run",
+            manifest,
+            "--input",
+            "{\"ticket\":\"t\"}",
+            "--store",
+            store,
+        ])
+        .expect("run");
+        let ran = succeeded_in(store)[0];
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let by_run = rt.block_on(async {
+            let journal: Arc<dyn agentplane::journal::JournalStore> =
+                Arc::new(agentplane::store::RedbStore::open(store).expect("store"));
+            governed_by(&journal, ran).await
+        });
+        let by_dev = rt.block_on(async {
+            let (router, journal) = dev_session(manifest).await;
+            let (_, started) = page(
+                &router,
+                "POST",
+                "/dev/runs",
+                Some(serde_json::json!({ "input": { "ticket": "t" } })),
+            )
+            .await;
+            let run = agentplane::core::RunId::parse(started["run"].as_str().expect("a run"))
+                .expect("a run id");
+            governed_by(&journal, run).await
+        });
+        assert!(by_run.is_object(), "{by_run}");
+        assert_eq!(by_run, by_dev);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A saved file widens the `--acting-as` chain**: a capability added
+    /// to the file is in scope after the rebuild, not refused until restart.
+    #[cfg(feature = "dev")]
+    #[test]
+    fn a_rebuild_scopes_the_acting_as_chain_to_the_saved_file() {
+        let dir = temp_dir("dev-chain");
+        let file = dir.join("agent.yaml");
+        let original = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/summariser.yaml"
+        ))
+        .expect("the example");
+        std::fs::write(&file, &original).expect("written");
+        let manifest = file.to_str().expect("utf-8 path").to_owned();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (router, _) = dev_session_as(&manifest, Some("ada")).await;
+                let start = |capability: &str| {
+                    serde_json::json!({
+                        "input": { "ticket": "t" },
+                        "capability": capability,
+                    })
+                };
+                let (status, ran) = page(
+                    &router,
+                    "POST",
+                    "/dev/runs",
+                    Some(start("support.summarise")),
+                )
+                .await;
+                assert_eq!(status, 200, "{ran}");
+                assert_eq!(ran["status"], "succeeded", "{ran}");
+
+                let triager = original
+                    .replace("name: summariser", "name: triager")
+                    .replace("support.summarise", "support.triage");
+                std::fs::write(&file, format!("{original}---\n{triager}")).expect("edited");
+                let (status, declared) = page(&router, "GET", "/dev/manifest", None).await;
+                assert_eq!(status, 200, "{declared}");
+                assert!(declared["refused"].is_null(), "{declared}");
+                let (status, ran) =
+                    page(&router, "POST", "/dev/runs", Some(start("support.triage"))).await;
+                assert_eq!(status, 200, "{ran}");
+                assert_eq!(ran["status"], "succeeded", "{ran}");
+            });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The page's loop, end to end**: start a run that waits on an
+    /// approval, page its history, decide the task with the served digest
+    /// (a stale one is 412), strict-replay to reproduced, see an edited
+    /// manifest diverge, and export a store that verifies.
+    #[cfg(feature = "dev")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn a_run_started_on_the_dev_page_is_decided_replayed_and_exported() {
+        let dir = temp_dir("dev-loop");
+        let file = dir.join("agent.yaml");
+        let original = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/approval.yaml"
+        ))
+        .expect("the example");
+        std::fs::write(&file, &original).expect("written");
+        let manifest = file.to_str().expect("utf-8 path").to_owned();
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                let (router, journal) = dev_session(&manifest).await;
+                let (status, declared) = page(&router, "GET", "/dev/manifest", None).await;
+                assert_eq!(status, 200);
+                assert_eq!(
+                    declared["agents"][0]["name"], "approved-summary",
+                    "{declared}"
+                );
+
+                let start = |ticket: &str| {
+                    serde_json::json!({
+                        "input": { "ticket": ticket },
+                        "correlate": ["customer=C-7"],
+                    })
+                };
+                let (status, started) =
+                    page(&router, "POST", "/dev/runs", Some(start("T-1"))).await;
+                assert_eq!(status, 200, "{started}");
+                assert_eq!(started["status"], "suspended", "{started}");
+                let run = started["run"].as_str().expect("a run").to_owned();
+                let run_id = agentplane::core::RunId::parse(&run).expect("a run id");
+
+                let served = served_history(&router, &run).await;
+                let held = journal.read(run_id, 1).await.expect("the journal");
+                assert_eq!(served.len(), held.len());
+                assert_eq!(
+                    served.last().expect("records")["seq"],
+                    held.last().expect("records").seq()
+                );
+
+                // A second run on the same key joins the same case.
+                let (_, second) = page(&router, "POST", "/dev/runs", Some(start("T-2"))).await;
+                let second_history =
+                    served_history(&router, second["run"].as_str().expect("a run")).await;
+                assert_eq!(served[0]["case"], second_history[0]["case"]);
+                assert!(served[0]["case"].is_string());
+
+                let (status, worklist) = page(&router, "GET", "/api/tasks", None).await;
+                assert_eq!(status, 200, "{worklist}");
+                let task = worklist["tasks"]
+                    .as_array()
+                    .expect("tasks")
+                    .iter()
+                    .find(|t| t["run"] == run.as_str())
+                    .expect("the run's task")
+                    .clone();
+                assert!(task["rendering"]["summary"].is_string(), "{task}");
+                let decide = format!("/api/tasks/{}/decide", task["id"].as_str().expect("an id"));
+                let stale = agentplane::core::Digest::of(b"another version").to_hex();
+                let (status, _) = page(
+                    &router,
+                    "POST",
+                    &decide,
+                    Some(serde_json::json!({ "approved": true, "reason": "ok", "digest": stale })),
+                )
+                .await;
+                assert_eq!(status, 412, "a stale digest was not refused");
+                let (status, decided) = page(
+                    &router,
+                    "POST",
+                    &decide,
+                    Some(serde_json::json!({
+                        "approved": true,
+                        "reason": "checked",
+                        "digest": task["digest"],
+                    })),
+                )
+                .await;
+                assert_eq!(status, 200, "{decided}");
+                assert_eq!(decided["decided_by"], "dev:author");
+
+                let mut concluded = false;
+                for _ in 0..50 {
+                    let (_, view) = page(&router, "GET", &format!("/api/runs/{run}"), None).await;
+                    if view["status"] == "succeeded" {
+                        concluded = true;
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                assert!(
+                    concluded,
+                    "the decided run did not resume to its conclusion"
+                );
+
+                let (status, verdicts) = page(
+                    &router,
+                    "POST",
+                    "/dev/replay",
+                    Some(serde_json::json!({ "run": run })),
+                )
+                .await;
+                assert_eq!(status, 200, "{verdicts}");
+                assert_eq!(verdicts[0]["verdict"], "reproduced", "{verdicts}");
+
+                let (status, export) = page(&router, "GET", "/dev/export", None).await;
+                assert_eq!(status, 200, "{export}");
+                let report = &export["report"];
+                assert_eq!(report["findings"], serde_json::json!([]), "{report}");
+                let reverified = agentplane::export::verify(
+                    export["export"].as_str().expect("the export").as_bytes(),
+                    None,
+                    &[],
+                )
+                .expect("readable");
+                assert_eq!(
+                    serde_json::to_value(&reverified).expect("a report"),
+                    *report,
+                    "the bytes offered are not the bytes verified"
+                );
+
+                std::fs::write(&file, original.replace("One sentence.", "Two sentences."))
+                    .expect("edited");
+                let (status, verdicts) = page(
+                    &router,
+                    "POST",
+                    "/dev/replay",
+                    Some(serde_json::json!({ "run": run })),
+                )
+                .await;
+                assert_eq!(status, 200, "{verdicts}");
+                assert_eq!(verdicts[0]["verdict"], "diverged", "{verdicts}");
+            });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

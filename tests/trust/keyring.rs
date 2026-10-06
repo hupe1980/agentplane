@@ -335,6 +335,20 @@ async fn an_envelope_does_not_open_at_an_address_it_was_not_sealed_for() {
 /// key ring is down and it will be back. Reporting a KMS outage as a completed
 /// erasure would tell somebody their data no longer exists while it sits intact
 /// on disk — and they would stop looking for it.
+/// **The key ring every other test here stands on keeps the key-ring
+/// contract**: a destroyed scope reports itself destroyed, refuses a fresh
+/// key, and keeps the first destruction's reason through a retry.
+#[tokio::test]
+async fn the_memory_key_ring_satisfies_the_key_ring_contract() {
+    let ring = MemoryKeyRing::new();
+    agentplane::testkit::conformance_keyring::check(&ring, "acme/case-1")
+        .await
+        .assert_conforms("MemoryKeyRing");
+    agentplane::testkit::conformance_keyring::check_isolated(&ring, "acme/case-2", "acme/case-3")
+        .await
+        .assert_conforms("MemoryKeyRing (isolation)");
+}
+
 #[tokio::test]
 async fn a_key_ring_outage_is_not_reported_as_an_erasure() {
     #[derive(Debug)]
@@ -503,6 +517,7 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
         Some(disk.as_ref()),
         store.as_ref(),
         Some(ring.as_ref() as &dyn KeyRing),
+        None,
         &agentplane::core::TenantId::default(),
         case_id,
         now(),
@@ -511,7 +526,7 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
     .await
     .expect("erase");
     assert_eq!(
-        n, 1,
+        n.blobs, 1,
         "the case's blob was not linked, so erasure found nothing"
     );
 
@@ -653,6 +668,7 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )
@@ -689,6 +705,174 @@ async fn a_sealed_journal_hides_payloads_and_still_verifies_without_keys() {
 
     // **The property that matters**: verified with no key ring in sight.
     Record::verify_chain(&raw, Digest::ZERO).expect("the chain verifies without keys");
+}
+
+/// A sealed export restores only into the tenant its envelopes name.
+///
+/// The ciphertext's associated data and its erasure scope both name the tenant
+/// that sealed it, so a copy put back under another tenant opens for nobody,
+/// and erasing the case there destroys a key that wraps none of it.
+#[tokio::test]
+async fn a_sealed_export_is_refused_by_a_tenant_its_envelopes_do_not_name() {
+    use agentplane::core::{Label, RunId, TenantId};
+    use agentplane::journal::{Append, JournalStore, RecordKind};
+    use agentplane::keyring::SealedJournal;
+
+    let acme = TenantId::new("acme").expect("valid");
+    let plain: Arc<dyn JournalStore> = Arc::new(
+        agentplane::store::RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(acme.clone()),
+    );
+    let sealed = SealedJournal::wrap(
+        Arc::clone(&plain),
+        Arc::new(MemoryKeyRing::default()) as Arc<dyn KeyRing>,
+        acme.clone(),
+    );
+    let run = RunId::generate();
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    sealed
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "intake".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "patient": "Ada Lovelace" }),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                    plane_chain: false,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&plain, &crate::no_cases(), &[run], &mut out)
+        .await
+        .expect("export");
+
+    let disk = agentplane::store::RedbStore::open_in_memory().expect("store");
+    let globex: Arc<dyn JournalStore> = Arc::new(
+        disk.clone()
+            .for_tenant(TenantId::new("globex").expect("valid")),
+    );
+    let refused = agentplane::export::from_jsonl(&globex, None, std::io::Cursor::new(&out))
+        .await
+        .expect_err("a sealed history was restored under a tenant its envelopes do not name");
+    assert!(
+        refused.to_string().contains("acme"),
+        "the refusal does not name the sealing tenant: {refused}"
+    );
+    assert!(
+        globex.read(run, 1).await.expect("read").is_empty(),
+        "the refused restore wrote before refusing"
+    );
+
+    let home: Arc<dyn JournalStore> = Arc::new(disk.for_tenant(acme));
+    agentplane::export::from_jsonl(&home, None, std::io::Cursor::new(&out))
+        .await
+        .expect("the sealing tenant restores its own export");
+}
+
+/// **A restored sealed journal is the exported one, and still opens.**
+///
+/// A restore writes back the bytes the export carried — ciphertext included —
+/// so the rebuilt chain hashes as the exported one, and the same ring opens it.
+#[tokio::test]
+async fn a_restored_sealed_journal_verifies_against_its_export() {
+    use agentplane::core::{Label, RunId, TenantId};
+    use agentplane::journal::{Append, JournalStore, RecordKind};
+    use agentplane::keyring::SealedJournal;
+
+    let acme = TenantId::new("acme").expect("valid");
+    let keys = Arc::new(MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let plain: Arc<dyn JournalStore> = Arc::new(
+        agentplane::store::RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(acme.clone()),
+    );
+    let sealed = SealedJournal::wrap(Arc::clone(&plain), Arc::clone(&keys), acme.clone());
+    let run = RunId::generate();
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    sealed
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "intake".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "patient": "Ada Lovelace" }),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                    plane_chain: false,
+                },
+            )],
+        )
+        .await
+        .expect("append");
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&plain, &crate::no_cases(), &[run], &mut out)
+        .await
+        .expect("export");
+
+    let restored: Arc<dyn JournalStore> = Arc::new(
+        agentplane::store::RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(acme.clone()),
+    );
+    let report = agentplane::export::from_jsonl(&restored, None, std::io::Cursor::new(&out))
+        .await
+        .expect("the sealing tenant restores its own export");
+    assert!(report.is_faithful(), "{report:?}");
+
+    let mut again = Vec::new();
+    agentplane::export::to_jsonl(&restored, &crate::no_cases(), &[run], &mut again)
+        .await
+        .expect("re-export");
+    let records = |file: &[u8]| -> Vec<serde_json::Value> {
+        String::from_utf8_lossy(file)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|l| l.get("kind").is_none())
+            .map(|l| serde_json::json!([l["raw"], l["hash"]]))
+            .collect()
+    };
+    assert_eq!(
+        records(&again),
+        records(&out),
+        "the restored sealed journal does not hold the exported bytes"
+    );
+    let verified = agentplane::export::verify(std::io::Cursor::new(&again), None, &[])
+        .expect("the file reads");
+    assert!(verified.findings.is_empty(), "{:?}", verified.findings);
+
+    let reopened = SealedJournal::wrap(restored, keys, acme);
+    let back = reopened.read(run, 1).await.expect("read");
+    assert!(
+        matches!(
+            back[0].kind(),
+            RecordKind::RunAdmitted { input, .. } if input["patient"] == "Ada Lovelace"
+        ),
+        "the restored ciphertext does not open under the ring that sealed it"
+    );
 }
 
 /// A conclusion's reason is a payload, and reaches the store sealed.
@@ -903,6 +1087,7 @@ async fn erasing_the_key_leaves_the_chain_verifiable() {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )
@@ -1079,6 +1264,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 )
                 .case(case),
@@ -1110,6 +1296,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         spend: agentplane::core::Spend::default(),
                         disposition: agentplane::core::Disposition::DidNotHappen,
                         permanent: false,
+                        elapsed_ms: None,
                     },
                 )
                 .case(case),
@@ -1156,6 +1343,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
         Some(&blobs),
         cases_plain.as_ref(),
         Some(ring.as_ref()),
+        None,
         &tenant,
         case,
         at,
@@ -1282,6 +1470,7 @@ async fn a_case_less_runs_payloads_are_erasable_by_run() {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )
@@ -1298,6 +1487,7 @@ async fn a_case_less_runs_payloads_are_erasable_by_run() {
 
     agentplane::blob::erase_run(
         ring.as_ref(),
+        None,
         &tenant,
         run,
         at,
@@ -1315,13 +1505,184 @@ async fn a_case_less_runs_payloads_are_erasable_by_run() {
         other => panic!("unexpected record: {other:?}"),
     }
     // Idempotent: a retry cannot rewrite when or why the data went.
-    agentplane::blob::erase_run(ring.as_ref(), &tenant, run, at, "retry")
+    agentplane::blob::erase_run(ring.as_ref(), None, &tenant, run, at, "retry")
         .await
         .expect("second erasure");
     // And the history still proves itself with no key at all.
     let stored = raw.read(run, 1).await.expect("raw");
     Record::verify_chain(&stored, Digest::ZERO)
         .expect("the erasure destroyed the tamper evidence along with the data");
+}
+
+/// Permits every request, so the consent call and its release both run.
+#[cfg(feature = "redb")]
+#[derive(Debug)]
+struct PermitsAll;
+#[cfg(feature = "redb")]
+impl agentplane::core::PolicyEngine for PermitsAll {
+    fn authorize(
+        &self,
+        _: &agentplane::core::PolicyRequest<'_>,
+    ) -> agentplane::core::PolicyDecision {
+        agentplane::core::PolicyDecision::Permit
+    }
+    fn bundle(&self) -> agentplane::core::PolicyBundleIdentity {
+        agentplane::core::PolicyBundleIdentity::new(
+            agentplane::core::Digest::of(b"permits"),
+            "test/permits-v1",
+        )
+    }
+}
+
+/// Sends a one-bit consent and releases the same bit.
+#[cfg(feature = "redb")]
+#[derive(Debug)]
+struct SendsConsent;
+#[cfg(feature = "redb")]
+#[async_trait::async_trait]
+impl agentplane::core::Skill for SendsConsent {
+    fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+        agentplane::core::SkillDescriptor::new("consents").provides("demo.consent")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut agentplane::runtime::StepCtx<'_>,
+        input: agentplane::core::Tainted<serde_json::Value>,
+    ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+        let consent = serde_json::json!({ "consent": false });
+        cx.sink(
+            agentplane::runtime::effects::Recorded::new("consent").payload(consent.clone()),
+            &agentplane::core::Tainted::trusted(consent),
+        )
+        .await?;
+        cx.release(
+            agentplane::core::Tainted::from_source(
+                serde_json::json!(false),
+                agentplane::core::SourceId::new("form:consent"),
+            ),
+            agentplane::core::Release::whole(
+                agentplane::core::ReleaseScope::trust(),
+                "the subject's own answer",
+                "tool://crm/consent",
+                ["form:v1"],
+            ),
+        )
+        .await?;
+        Ok(agentplane::core::Outcome::done(input))
+    }
+}
+
+/// **An erased low-entropy value is recoverable from the export's clear
+/// digests.** The effect key and a release's `value` are unkeyed digests over
+/// the arguments and the released value, so after the run's erasure a
+/// two-value dictionary still finds the one that was sent — the residual the
+/// erasure guide states.
+#[cfg(all(feature = "redb", feature = "keyring"))]
+#[tokio::test]
+async fn an_erased_low_entropy_value_is_recoverable_from_the_export() {
+    use agentplane::core::{Digest, EffectDescriptor, EffectKey, StepId, Tainted, TenantId, canon};
+    use agentplane::journal::{JournalStore, RecordBody, RecordKind, payload};
+    use agentplane::runtime::{RunStatus, Runtime};
+    use serde_json::{Value, json};
+
+    let tenant = TenantId::default();
+    let ring = Arc::new(MemoryKeyRing::default()) as Arc<dyn KeyRing>;
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .tenant(tenant.clone())
+        .keyring(Arc::clone(&ring))
+        .policy(Arc::new(PermitsAll))
+        .skill(SendsConsent)
+        .build();
+    let out = rt
+        .run("demo.consent", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+    let erased = now();
+    agentplane::blob::erase_run(ring.as_ref(), None, &tenant, out.run_id, erased, "erasure")
+        .await
+        .expect("erase");
+
+    let mut export = Vec::new();
+    agentplane::export::to_jsonl(
+        &(Arc::clone(&store) as Arc<dyn JournalStore>),
+        &crate::no_cases(),
+        &[out.run_id],
+        &mut export,
+    )
+    .await
+    .expect("export");
+    let report = agentplane::export::verify(export.as_slice(), None, &[]).expect("readable");
+    assert!(report.is_sound(), "{:?}", report.findings);
+
+    // From here on, the export alone.
+    let bodies: Vec<RecordBody> = std::str::from_utf8(&export)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()?
+                .get("body")
+                .cloned()
+        })
+        .map(|body| serde_json::from_value(body).expect("a record body"))
+        .collect();
+    let sent = bodies
+        .iter()
+        .find_map(|b| match &b.kind {
+            RecordKind::EffectStarted {
+                descriptor,
+                attempt,
+                ..
+            } if descriptor.kind == "test.consent" => Some((b, descriptor, *attempt)),
+            _ => None,
+        })
+        .expect("the consent call was recorded");
+    let (body, descriptor, attempt) = sent;
+    assert!(
+        payload::is_sealed(&descriptor.args),
+        "the arguments are not sealed, so this proves nothing about erasure"
+    );
+    let released = bodies
+        .iter()
+        .find_map(|b| match &b.kind {
+            RecordKind::Released { value, .. } => Some(*value),
+            _ => None,
+        })
+        .expect("the release was recorded");
+
+    let by_key: Vec<bool> = [true, false]
+        .into_iter()
+        .filter(|candidate| {
+            let guess =
+                EffectDescriptor::new(descriptor.kind.clone(), json!({ "consent": candidate }));
+            (0..8).any(|ordinal| {
+                Some(EffectKey::for_effect(
+                    body.step.unwrap_or(StepId(0)),
+                    body.phase,
+                    ordinal,
+                    attempt,
+                    &guess,
+                )) == body.effect_key
+            })
+        })
+        .collect();
+    assert_eq!(
+        by_key,
+        [false],
+        "the effect key did not give the erased value away"
+    );
+
+    let by_release: Vec<bool> = [true, false]
+        .into_iter()
+        .filter(|candidate| Digest::of(&canon::value_bytes(&json!(candidate))) == released)
+        .collect();
+    assert_eq!(
+        by_release,
+        [false],
+        "the release digest did not give the erased value away"
+    );
 }
 
 /// A buffered event's payload is sealed — including the dead-letter copy,
@@ -1557,6 +1918,7 @@ async fn configuring_a_key_ring_seals_every_store() {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )
@@ -2155,6 +2517,92 @@ impl KeyRing for FlakyRing {
     }
 }
 
+/// Seals and never opens: a key service that fails between a write's commit
+/// and anything after it.
+#[derive(Debug, Default)]
+struct SealsOnly(MemoryKeyRing);
+
+#[async_trait::async_trait]
+impl KeyRing for SealsOnly {
+    async fn data_key(
+        &self,
+        scope: &str,
+    ) -> Result<
+        (
+            agentplane::keyring::DataKey,
+            agentplane::keyring::WrappedKey,
+        ),
+        KeyError,
+    > {
+        self.0.data_key(scope).await
+    }
+    async fn open(
+        &self,
+        _: &agentplane::keyring::WrappedKey,
+    ) -> Result<agentplane::keyring::DataKey, KeyError> {
+        Err(KeyError::Unavailable("the KMS did not answer".into()))
+    }
+    async fn destroy(
+        &self,
+        scope: &str,
+        at: agentplane::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), KeyError> {
+        self.0.destroy(scope, at, reason).await
+    }
+}
+
+/// **A committed sealed write is reported as committed.**
+///
+/// The plaintext was in hand before sealing, so nothing after the commit needs
+/// the key service: a write that landed must not come back as a backend error
+/// because the ring stopped answering in between.
+#[tokio::test]
+async fn a_sealed_append_hands_back_what_it_was_given_without_the_ring() {
+    use agentplane::core::{Label, RunId, TenantId};
+    use agentplane::journal::{Append, JournalStore, RecordKind};
+    use agentplane::keyring::SealedJournal;
+
+    let plain: Arc<dyn JournalStore> =
+        Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let sealed = SealedJournal::wrap(
+        Arc::clone(&plain),
+        Arc::new(SealsOnly::default()) as Arc<dyn KeyRing>,
+        TenantId::default(),
+    );
+    let run = RunId::generate();
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    let written = sealed
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "intake".into(),
+                    governed_by: None,
+                    input_label: Label::trusted(),
+                    input: serde_json::json!({ "patient": "Ada Lovelace" }),
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                    plane_chain: false,
+                },
+            )],
+        )
+        .await
+        .expect("a committed write was reported as failed");
+    match written[0].kind() {
+        RecordKind::RunAdmitted { input, .. } => assert_eq!(input["patient"], "Ada Lovelace"),
+        other => panic!("unexpected record: {other:?}"),
+    }
+    assert_eq!(plain.head(run).await.expect("head").seq, 1);
+}
+
 /// **A journal read during a key-ring outage is not a run that was erased.**
 ///
 /// The two are one byte apart on the wire — a payload left sealed — and they
@@ -2199,6 +2647,7 @@ async fn a_journal_read_during_a_key_ring_outage_is_not_an_erasure() {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )
@@ -2632,4 +3081,136 @@ async fn an_undecodable_proposal_is_not_reported_as_erased() {
         .expect("read")
         .expect("present");
     assert_eq!(read.withheld, Some(Withheld::Erased));
+}
+
+/// **An erased binding names nobody, and no clear field ever held the
+/// subject.** The subject is sealed under the run's case; with the key the
+/// report matches it, and after the case is erased it counts the binding
+/// erased and lists none of its effects.
+#[cfg(feature = "redb")]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn an_erased_binding_names_nobody_and_leaves_no_subject_in_the_clear() {
+    use agentplane::core::{
+        CaseId, EffectDescriptor, EffectKey, Label, Recovery, RunId, StepId, SubjectRef, TenantId,
+        Timestamp,
+    };
+    use agentplane::journal::{Append, BoundSubject, JournalStore, RecordKind, SubjectBinding};
+    use agentplane::keyring::SealedJournal;
+    use agentplane::subject::{Class, Trace};
+
+    const SUBJECT: &str = "cust-ada-lovelace";
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let plain = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let keys = Arc::new(MemoryKeyRing::default());
+    let tenant = TenantId::default();
+    let sealed = SealedJournal::wrap(
+        Arc::clone(&plain),
+        Arc::clone(&keys) as Arc<dyn KeyRing>,
+        tenant.clone(),
+    );
+
+    let run = RunId::generate();
+    let case = CaseId::generate();
+    let mut outbound = Label::trusted();
+    outbound.data_subjects.insert(SubjectRef { run, index: 0 });
+    let lease = sealed
+        .acquire(run, "test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    sealed
+        .append(
+            lease.epoch,
+            vec![
+                Append::new(
+                    run,
+                    RecordKind::RunAdmitted {
+                        capability: "support".into(),
+                        governed_by: None,
+                        input: serde_json::json!({ "customer": SUBJECT }),
+                        input_label: Label::trusted(),
+                        policy_bundle: None,
+                        canon: agentplane::core::canon::VERSION,
+                        idempotency_key: None,
+                        admitted_by: None,
+                        served_unchained: false,
+                        plane_chain: false,
+                    },
+                )
+                .case(case),
+                Append::new(
+                    run,
+                    RecordKind::DataSubjectBound {
+                        bindings: vec![BoundSubject {
+                            index: 0,
+                            binding: SubjectBinding::Input {
+                                pointer: "/customer".into(),
+                            },
+                            trusted: true,
+                            subject: SUBJECT.into(),
+                        }],
+                    },
+                )
+                .case(case),
+                Append::new(
+                    run,
+                    RecordKind::EffectStarted {
+                        descriptor: EffectDescriptor::new("crm.upsert", serde_json::json!({})),
+                        recovery: Recovery::Retry,
+                        mutates: false,
+                        attempt: 1,
+                        backoff_ms: 0,
+                        outbound_label: Some(outbound),
+                        outbound_bytes: Some(7),
+                        content_rules: None,
+                        credential: None,
+                    },
+                )
+                .case(case)
+                .step(StepId(1))
+                .effect(EffectKey::from_hex(&format!("{:064x}", 1)).expect("key")),
+            ],
+        )
+        .await
+        .expect("append");
+
+    for record in plain.read(run, 1).await.expect("raw read") {
+        assert!(
+            !String::from_utf8_lossy(record.raw()).contains(SUBJECT),
+            "a {} record holds the subject in the clear",
+            record.kind().kind_str()
+        );
+    }
+
+    let keyed = || Trace::new(tenant.as_str()).with_keys(keys.as_ref());
+    let met = |report: &agentplane::subject::SubjectReport, class: Class| {
+        report.coverage.iter().any(|c| c.class == class && c.met)
+    };
+    let before = keyed()
+        .report(&plain, store.as_ref(), SUBJECT, 100)
+        .await
+        .expect("report");
+    assert_eq!(before.effects.len(), 1, "{:#?}", before.effects);
+    assert_eq!(before.bound.len(), 1);
+    let blind = Trace::new(tenant.as_str())
+        .report(&plain, store.as_ref(), SUBJECT, 100)
+        .await
+        .expect("report");
+    assert!(blind.effects.is_empty());
+    assert!(met(&blind, Class::UnopenedBinding));
+
+    keys.destroy(
+        &agentplane::keyring::scope(&tenant, &case.to_string()),
+        Timestamp::from_unix_timestamp(1_760_000_000).expect("time"),
+        "subject exercised the right to erasure",
+    )
+    .await
+    .expect("destroy");
+    let after = keyed()
+        .report(&plain, store.as_ref(), SUBJECT, 100)
+        .await
+        .expect("report");
+    assert!(after.effects.is_empty(), "{:#?}", after.effects);
+    assert!(after.bound.is_empty());
+    assert!(met(&after, Class::ErasedBinding), "{:#?}", after.coverage);
 }

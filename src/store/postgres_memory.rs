@@ -122,6 +122,10 @@ impl MemoryStore for PostgresStore {
         self.tenant_str()
     }
 
+    fn seals(&self) -> bool {
+        false
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
         let mut client = self.pool_ref().get().await.map_err(|error| {

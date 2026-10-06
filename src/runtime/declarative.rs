@@ -42,7 +42,8 @@ pub(super) struct Declarative {
     /// The capability this agent answers, from `spec.capabilities.provides`.
     capability: String,
     name: String,
-    provider: Arc<dyn ModelProvider>,
+    /// `None` for a `call` agent, which calls no model.
+    provider: Option<Arc<dyn ModelProvider>>,
     /// The operator's catalogue and client, for a tool-calling agent.
     tools: Option<(
         Arc<crate::tools::ToolCatalog>,
@@ -57,7 +58,7 @@ impl Declarative {
         kind: ExecutionKind,
         capability: String,
         name: String,
-        provider: Arc<dyn ModelProvider>,
+        provider: Option<Arc<dyn ModelProvider>>,
         tools: Option<(
             Arc<crate::tools::ToolCatalog>,
             Arc<dyn crate::tools::ToolClient>,
@@ -72,6 +73,27 @@ impl Declarative {
             tools,
             max_turns,
         }
+    }
+
+    /// The privileged model, for a kind that calls one.
+    fn require_role(&self, role: Option<ModelRole>) -> Result<ModelRole, SkillError> {
+        role.ok_or_else(|| {
+            SkillError::Other(format!(
+                "manifest '{}' declares execution but no privileged model — a \
+                 declarative agent has nothing to call",
+                self.name
+            ))
+        })
+    }
+
+    /// The model driver, for a kind that calls one.
+    fn model_provider(&self) -> Result<Arc<dyn ModelProvider>, SkillError> {
+        self.provider.clone().ok_or_else(|| {
+            SkillError::Other(format!(
+                "agent '{}' calls a model and the plane wired no provider for it",
+                self.name
+            ))
+        })
     }
 
     /// Call tools until the model stops asking, then answer.
@@ -93,6 +115,8 @@ impl Declarative {
         formation: Option<crate::manifest::MemoryFormation>,
         output_schema: Option<Value>,
     ) -> Result<Outcome, SkillError> {
+        let stream = cx.model_stream();
+        let provider = self.model_provider()?;
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
             SkillError::Other(
                 "this agent declares `tool-calling` but the plane has no tool \
@@ -132,10 +156,10 @@ impl Declarative {
             let outbound = prompt.with_joined_label(&conversation_label);
             let completion = cx
                 .sink_with(&outbound, |value| {
-                    let mut call =
-                        ModelCall::new(Arc::clone(&self.provider), role.model.clone(), value)
-                            .with_tools(declared.clone())
-                            .continuing(exchanges.clone());
+                    let mut call = ModelCall::new(Arc::clone(&provider), role.model.clone(), value)
+                        .observed_by(stream.clone())
+                        .with_tools(declared.clone())
+                        .continuing(exchanges.clone());
                     // The declared output shape rides on **every** turn, not
                     // only the last. Which turn answers is the model's choice,
                     // so there is no moment before dispatch at which "this is
@@ -310,6 +334,7 @@ impl Declarative {
                 // What the task carries is the exact tool and the exact
                 // arguments about to be sent — not a description of them, and
                 // not the answer they will produce.
+                let mut approved: Option<crate::core::Reach> = None;
                 if grant.requires_approval {
                     let Some(spec) = oversight.as_ref() else {
                         // Unreachable through the parser, which refuses the
@@ -322,7 +347,9 @@ impl Declarative {
                     };
                     cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
                         .await?;
-                    let mut task = spec.approve_call(&reference, &asked.arguments);
+                    let reach = consulted(cx, &id).await?;
+                    let mut task = spec.approve_call(&reference, &asked.arguments, reach.clone());
+                    approved = reach;
                     // Consequences beside the instruction, when the grant names
                     // a dry run that can produce them.
                     if let Some(preview) = grant.preview.as_deref() {
@@ -368,7 +395,7 @@ impl Declarative {
                 // does to transported calls — a reviewer sees the capability
                 // and the arguments before any specialist runs.
                 if id.server == crate::tools::AGENT_SERVER {
-                    match cx.commission(&id.tool, args).await {
+                    match consult(cx, &id.tool, args, approved.as_ref()).await {
                         Ok(answer) => {
                             conversation_label = conversation_label.join(answer.label());
                             exchanges
@@ -583,6 +610,7 @@ impl Declarative {
         let Some(declaration) = declaration else {
             return Ok(());
         };
+        let provider = self.model_provider()?;
         let subject = resolve_subject(cx, "memory.formation", &declaration.subject, input)?;
         // The extraction runs on the **quarantined** model when one is
         // declared. Formation is the dual-model pattern's quarantined job to
@@ -628,7 +656,7 @@ impl Declarative {
                 max_sensitivity: declaration.max_sensitivity,
             },
             answer,
-            Arc::clone(&self.provider),
+            Arc::clone(&provider),
             formation_role,
         )
         .await?;
@@ -676,6 +704,88 @@ impl Declarative {
         }))))
     }
 
+    /// Dispatch the one granted tool with the input as its arguments.
+    ///
+    /// The input is held to `spec.input` and then to the tool's declaration —
+    /// the one a `tool-calling` or `planned` agent offers a model — before
+    /// anything happens, because here it *is* the arguments: the caller's
+    /// shape and the tool's are both reviewed, and an argument either one
+    /// leaves out is refused. With no declaration, `spec.input` is the shape,
+    /// and the parser holds it closed. What reaches the sink keeps the input's
+    /// own label, so a served caller's arguments arrive at the field gate as
+    /// untrusted data from that caller.
+    async fn single_call(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let (schema, grant, oversight) = {
+            let m = cx
+                .manifest()
+                .ok_or_else(|| SkillError::Other("a `call` agent ran without a manifest".into()))?;
+            let [grant] = m.spec.tools.as_slice() else {
+                return Err(SkillError::Other(
+                    "a `call` agent grants exactly one tool, and the parser holds it to that"
+                        .into(),
+                ));
+            };
+            (
+                m.input_schema().cloned().unwrap_or_else(|| json!({})),
+                grant.clone(),
+                m.spec.oversight.as_ref().map(Proposal::from_manifest),
+            )
+        };
+        if let Err(detail) = crate::model::validate_schema(&schema, input.peek()) {
+            return Ok(Outcome::fail(format!(
+                "the input does not satisfy the declared `spec.input`: {detail}"
+            )));
+        }
+        let Some((catalog, client)) = self.tools.as_ref() else {
+            return Err(SkillError::Other(
+                "this agent declares `call` but the plane has no tool catalogue — \
+                 `RuntimeBuilder::tools` is what lets a declarative agent reach one"
+                    .into(),
+            ));
+        };
+        let Some(id) = catalog.resolve_reference(&grant.reference) else {
+            return Ok(Outcome::fail(format!(
+                "'{}' is granted and absent from this plane's tool catalogue",
+                grant.reference
+            )));
+        };
+        let parameters = match declared_arguments(catalog, &id, &grant) {
+            Some(declared) => {
+                if let Err(detail) = crate::model::validate_schema(declared, input.peek()) {
+                    return Ok(Outcome::fail(format!(
+                        "the input does not satisfy the declaration of '{}': {detail}",
+                        grant.reference
+                    )));
+                }
+                declared.clone()
+            }
+            None => schema,
+        };
+        let answer = match dispatch_granted(
+            cx,
+            (catalog, client),
+            id,
+            &grant,
+            &parameters,
+            input,
+            oversight.as_ref(),
+            "the call",
+        )
+        .await?
+        {
+            Ok(answer) => answer,
+            Err(why) => return Ok(Outcome::fail(why)),
+        };
+        if let Some(spec) = oversight.as_ref() {
+            self.triage(cx, spec, &answer).await?;
+        }
+        Ok(Outcome::done(answer))
+    }
+
     /// Plan first over trusted input, then execute without the model.
     ///
     /// The `CaMeL` shape, on this runtime's machinery: one privileged call
@@ -706,6 +816,8 @@ impl Declarative {
         formation: Option<crate::manifest::MemoryFormation>,
         output_schema: Option<Value>,
     ) -> Result<Outcome, SkillError> {
+        let stream = cx.model_stream();
+        let provider = self.model_provider()?;
         // The plan is this run's authorization order, and the planner reads
         // the input to write it. Untrusted input authoring a plan is the
         // attacker choosing the control flow — the thing I8 refuses for
@@ -763,9 +875,9 @@ impl Declarative {
         // the loop's model call for why nothing restates it here.
         let completion = cx
             .sink_with(&prompt, |value| {
-                let mut call =
-                    ModelCall::new(Arc::clone(&self.provider), role.model.clone(), value)
-                        .expecting(plan_schema(self.max_turns));
+                let mut call = ModelCall::new(Arc::clone(&provider), role.model.clone(), value)
+                    .observed_by(stream.clone())
+                    .expecting(plan_schema(self.max_turns));
                 call = role.applied_to(call);
                 if let Some(ceiling) = egress {
                     call = call.with_max_sensitivity(ceiling);
@@ -862,7 +974,7 @@ impl Declarative {
                             return Ok(Outcome::fail(format!("plan step {index}: {why}")));
                         }
                     };
-                    let mut assembled = match assemble_arguments(
+                    let assembled = match assemble_arguments(
                         &Value::Object(args),
                         &plan_label,
                         &input,
@@ -879,73 +991,20 @@ impl Declarative {
                         return Ok(Outcome::fail(format!("plan step {index}: {detail}")));
                     }
 
-                    let reference = id.reference();
-                    // A person sees the call before dispatch when the grant
-                    // asks for one — the same gate the loop applies, and a
-                    // refusal fails the run because there is no model turn to
-                    // report it to.
-                    if grant.requires_approval {
-                        let Some(spec) = oversight.as_ref() else {
-                            return Err(SkillError::Other(
-                                "a tool grant requires approval but the agent declares no \
-                                 oversight policy — there is nobody to ask"
-                                    .into(),
-                            ));
-                        };
-                        cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
-                            .await?;
-                        let mut task = spec.approve_call(&reference, assembled.peek());
-                        if let Some(preview) = grant.preview.as_deref() {
-                            let evidence =
-                                preview_evidence(cx, catalog, client, preview, &assembled).await;
-                            task.justification.evidence.push(evidence);
-                        }
-                        let decision = cx.task(&task).await?;
-                        if !decision.approved {
-                            return Ok(Outcome::fail(format!(
-                                "{} refused the call to {reference}: {}",
-                                decision.decided, decision.reason
-                            )));
-                        }
-                        // As in the loop: the approval's amendment is the
-                        // call. Here there is no next turn to report a
-                        // malformed one to, so it fails the step.
-                        assembled =
-                            match approved_arguments(&decision, &declaration.parameters, assembled)
-                            {
-                                Ok(assembled) => assembled,
-                                Err(detail) => {
-                                    return Ok(Outcome::fail(format!(
-                                        "plan step {index}: {detail}"
-                                    )));
-                                }
-                            };
-                    }
-
-                    // Dispatch takes the same two paths the loop takes, and
-                    // errors leave the same way — the executor reaches its own
-                    // verdict, exactly as for a hand-written skill.
-                    let out = if id.server == crate::tools::AGENT_SERVER {
-                        cx.commission(&id.tool, assembled).await?
-                    } else if let Some(peer) = cx.peer_named(&id.server) {
-                        cx.call_peer(&peer, &id.tool, &assembled).await?
-                    } else {
-                        let egress = cx.tool_egress();
-                        cx.sink_with(&assembled, |value| {
-                            crate::tools::ToolCall::prepare(
-                                catalog,
-                                Arc::clone(client),
-                                id,
-                                value,
-                                egress.as_deref(),
-                            )
-                            .map_err(|e| {
-                                crate::core::StepError::Effect(crate::core::EffectError::Rejected(
-                                    e.to_string(),
-                                ))
-                            })
-                        })
-                        .await?
+                    let out = match dispatch_granted(
+                        cx,
+                        (catalog, client),
+                        id,
+                        grant,
+                        &declaration.parameters,
+                        assembled,
+                        oversight.as_ref(),
+                        &format!("plan step {index}"),
+                    )
+                    .await?
+                    {
+                        Ok(out) => out,
+                        Err(why) => return Ok(Outcome::fail(why)),
                     };
                     outputs.push(out);
                 }
@@ -1003,10 +1062,11 @@ impl Declarative {
                     let completion = cx
                         .sink_with(&prompt, |value| {
                             let mut call = ModelCall::new(
-                                Arc::clone(&self.provider),
+                                Arc::clone(&provider),
                                 parse_role.model.clone(),
                                 value,
                             )
+                            .observed_by(stream.clone())
                             .expecting(schema);
                             call = parse_role.applied_to(call);
                             if let Some(ceiling) = egress {
@@ -1100,6 +1160,7 @@ impl Skill for Declarative {
         cx: &mut StepCtx<'_>,
         input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        let stream = cx.model_stream();
         // Read into owned values before any effect runs, so nothing borrows the
         // agent across an await.
         let (system, role, schema, egress, oversight, granted, memory) = {
@@ -1112,13 +1173,8 @@ impl Skill for Declarative {
                     "a declarative agent ran without a manifest — it has nothing to be".into(),
                 )
             })?;
-            let role = privileged(m).ok_or_else(|| {
-                SkillError::Other(format!(
-                    "manifest '{}' declares execution but no privileged model — a \
-                     declarative agent has nothing to call",
-                    m.metadata.name
-                ))
-            })?;
+            // Required by the arms that call a model; a `call` calls none.
+            let role = privileged(m);
             (
                 m.spec
                     .identity
@@ -1142,12 +1198,13 @@ impl Skill for Declarative {
         // a recall is a journaled store read. The refusal itself lives at
         // parse, where a reviewer meets it.
         let remembered = match self.kind {
-            ExecutionKind::Planned => None,
+            ExecutionKind::Planned | ExecutionKind::Call => None,
             _ => self.recall_into(cx, memory.as_ref(), &input).await?,
         };
 
         match self.kind {
             ExecutionKind::Completion => {
+                let role = self.require_role(role)?;
                 // `Tainted::object`, not `input.map(...)`. The instruction comes from the
                 // manifest — reviewed, and inside the digest — so it is trusted; the
                 // input is whoever called us and stays whatever it arrived as. `map`
@@ -1157,6 +1214,7 @@ impl Skill for Declarative {
                 // conflation is refused rather than obeyed.
                 // See `tool_loop`: a subject binding resolves against the run's
                 // own input, not against the prompt object it is folded into.
+                let provider = self.model_provider()?;
                 let bindable_input = input.clone();
                 let prompt = prompt_object(&system, input, remembered);
                 // The completion's floor derives from the egress ceiling
@@ -1165,7 +1223,8 @@ impl Skill for Declarative {
                 let completion = cx
                     .sink_with(&prompt, |value| {
                         let mut call =
-                            ModelCall::new(Arc::clone(&self.provider), role.model.clone(), value);
+                            ModelCall::new(Arc::clone(&provider), role.model.clone(), value)
+                                .observed_by(stream.clone());
                         call = role.applied_to(call);
                         if let Some(schema) = schema {
                             call = call.expecting(schema);
@@ -1215,6 +1274,7 @@ impl Skill for Declarative {
             }
 
             ExecutionKind::ToolCalling => {
+                let role = self.require_role(role)?;
                 self.tool_loop(
                     cx, input, remembered, system, role, egress, granted, oversight, formation,
                     schema,
@@ -1223,11 +1283,13 @@ impl Skill for Declarative {
             }
 
             ExecutionKind::Planned => {
+                let role = self.require_role(role)?;
                 self.planned(
                     cx, input, system, role, egress, granted, oversight, formation, schema,
                 )
                 .await
             }
+            ExecutionKind::Call => self.single_call(cx, input).await,
         }
     }
 }
@@ -1284,12 +1346,24 @@ impl Proposal {
     /// in front of them moves money is being asked to vet the wrong artifact —
     /// the exact conflation `oversight.approval: tools-only` exists to
     /// prevent, reintroduced in the sentence the reviewer actually reads.
-    fn approve_call(&self, reference: &str, arguments: &Value) -> crate::core::TaskSpec {
-        self.task(
+    ///
+    /// A consultation of another agent carries `reach` — what that agent's
+    /// declaration lets it do, derived by the runtime on this pass — inside
+    /// the justification, so the digest the reviewer approves covers the
+    /// callee as well as the arguments.
+    fn approve_call(
+        &self,
+        reference: &str,
+        arguments: &Value,
+        reach: Option<crate::core::Reach>,
+    ) -> crate::core::TaskSpec {
+        let mut spec = self.task(
             APPROVE_CALL_KIND,
             format!("approve this agent's call to {reference}"),
             json!({ "tool": reference, "arguments": arguments }),
-        )
+        );
+        spec.justification.reach = reach;
+        spec
     }
 
     fn task(&self, kind: &str, summary: impl Into<String>, action: Value) -> crate::core::TaskSpec {
@@ -1303,6 +1377,36 @@ impl Proposal {
         spec.candidate_roles.clone_from(&self.approvers);
         spec.on_expiry = self.on_expiry.clone();
         spec
+    }
+}
+
+/// What the agent a granted call would consult may do, when the call is a
+/// consultation.
+async fn consulted(
+    cx: &mut StepCtx<'_>,
+    id: &crate::tools::ToolId,
+) -> Result<Option<crate::core::Reach>, crate::core::StepError> {
+    if id.server == crate::tools::AGENT_SERVER {
+        cx.reach(&id.tool).await
+    } else {
+        Ok(None)
+    }
+}
+
+/// Consult another agent — pinned to the revision an approval showed, when
+/// one did, so a callee redeployed since is refused rather than consulted.
+async fn consult(
+    cx: &mut StepCtx<'_>,
+    capability: &str,
+    input: Tainted<Value>,
+    approved: Option<&crate::core::Reach>,
+) -> Result<Tainted<Value>, crate::core::StepError> {
+    match approved.and_then(|reach| reach.declaration.as_ref()) {
+        Some(declared) => {
+            cx.commission_pinned(capability, input, declared.digest)
+                .await
+        }
+        None => cx.commission(capability, input).await,
     }
 }
 
@@ -1893,6 +1997,84 @@ fn untrusted_contact_model(m: &Manifest, fallback: &ModelRole) -> ModelRole {
     m.quarantined_role().unwrap_or_else(|| fallback.clone())
 }
 
+/// One granted call: through the approval gate when the grant asks for one,
+/// then dispatched the way its server says — `commission` for an agent on this
+/// plane, `call_peer` for a registered peer, the sink gate otherwise.
+///
+/// `Ok(Err(why))` is a call that did not happen — refused by the reviewer, or
+/// an amendment that does not fit `parameters` — and fails the run, because
+/// neither caller has a model turn to report it to. `step` names the call in
+/// that sentence. Errors leave the way a hand-written skill's do, so the
+/// executor reaches its own verdict.
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_granted(
+    cx: &mut StepCtx<'_>,
+    (catalog, client): (
+        &Arc<crate::tools::ToolCatalog>,
+        &Arc<dyn crate::tools::ToolClient>,
+    ),
+    id: crate::tools::ToolId,
+    grant: &crate::manifest::ToolGrant,
+    parameters: &Value,
+    mut assembled: Tainted<Value>,
+    oversight: Option<&Proposal>,
+    step: &str,
+) -> Result<Result<Tainted<Value>, String>, SkillError> {
+    let reference = id.reference();
+    let mut approved: Option<crate::core::Reach> = None;
+    if grant.requires_approval {
+        let Some(spec) = oversight else {
+            return Err(SkillError::Other(
+                "a tool grant requires approval but the agent declares no oversight \
+                 policy — there is nobody to ask"
+                    .into(),
+            ));
+        };
+        cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
+            .await?;
+        let reach = consulted(cx, &id).await?;
+        let mut task = spec.approve_call(&reference, assembled.peek(), reach.clone());
+        approved = reach;
+        if let Some(preview) = grant.preview.as_deref() {
+            let evidence = preview_evidence(cx, catalog, client, preview, &assembled).await;
+            task.justification.evidence.push(evidence);
+        }
+        let decision = cx.task(&task).await?;
+        if !decision.approved {
+            return Ok(Err(format!(
+                "{} refused the call to {reference}: {}",
+                decision.decided, decision.reason
+            )));
+        }
+        // The approval's amendment is the call.
+        assembled = match approved_arguments(&decision, parameters, assembled) {
+            Ok(assembled) => assembled,
+            Err(detail) => return Ok(Err(format!("{step}: {detail}"))),
+        };
+    }
+    let out = if id.server == crate::tools::AGENT_SERVER {
+        consult(cx, &id.tool, assembled, approved.as_ref()).await?
+    } else if let Some(peer) = cx.peer_named(&id.server) {
+        cx.call_peer(&peer, &id.tool, &assembled).await?
+    } else {
+        let egress = cx.tool_egress();
+        cx.sink_with(&assembled, |value| {
+            crate::tools::ToolCall::prepare(
+                catalog,
+                Arc::clone(client),
+                id,
+                value,
+                egress.as_deref(),
+            )
+            .map_err(|e| {
+                crate::core::StepError::Effect(crate::core::EffectError::Rejected(e.to_string()))
+            })
+        })
+        .await?
+    };
+    Ok(Ok(out))
+}
+
 /// The tool surface a declarative agent offers a model: exactly the manifest's
 /// grants, resolved through the operator's catalogue, with the declared
 /// descriptions and argument shapes.
@@ -1919,22 +2101,32 @@ fn offered_tools<'g>(
     let declared: Vec<crate::model::ToolDeclaration> = offered
         .iter()
         .map(|(id, grant)| {
-            let (description, arguments) = catalog.declaration(id).map_or_else(
-                || {
-                    (
-                        grant.description.clone().unwrap_or_default(),
-                        grant
-                            .arguments
-                            .clone()
-                            .unwrap_or_else(|| json!({ "type": "object" })),
-                    )
-                },
-                |(description, arguments)| (description.to_owned(), arguments.clone()),
+            let description = catalog.declaration(id).map_or_else(
+                || grant.description.clone().unwrap_or_default(),
+                |(description, _)| description.to_owned(),
             );
+            let arguments = declared_arguments(catalog, id, grant)
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object" }));
             crate::model::ToolDeclaration::new(id.wire_name(), description, arguments)
         })
         .collect();
     (offered, declared)
+}
+
+/// The argument shape a grant's tool is declared with: the catalogue's, else
+/// the grant's own `arguments`. One rule for the offer and for a `call`, so
+/// the shape a model is shown and the shape a caller is held to are the same
+/// document.
+fn declared_arguments<'a>(
+    catalog: &'a crate::tools::ToolCatalog,
+    id: &crate::tools::ToolId,
+    grant: &'a crate::manifest::ToolGrant,
+) -> Option<&'a Value> {
+    catalog
+        .declaration(id)
+        .map(|(_, arguments)| arguments)
+        .or(grant.arguments.as_ref())
 }
 
 fn privileged(m: &Manifest) -> Option<ModelRole> {

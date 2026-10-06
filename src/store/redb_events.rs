@@ -94,9 +94,8 @@ const EVENT_CORR: TableDefinition<(&str, &str, &str, &str), ()> =
 const EVENT_BY_KEY: TableDefinition<(&str, &str, &str, i64, &str), ()> =
     TableDefinition::new("inbound_by_key");
 
-/// `(run_id, effect_key, namespace, value) -> (case_id, has_case, step, phase, kind, created_at)`.
-/// `(case_id, has_case, step, phase, kind, created_at)`.
-type SubRow<'a> = (&'a str, u8, u32, &'a str, &'a str, i64);
+/// `(run_id, effect_key, namespace, value) -> (case_id, has_case, step, phase, kind, created_at, from)`.
+type SubRow<'a> = (&'a str, u8, u32, &'a str, &'a str, i64, Option<&'a str>);
 
 const SUBS: TableDefinition<(&str, &str, &str, &str, &str), SubRow<'static>> =
     TableDefinition::new("subscriptions");
@@ -123,14 +122,24 @@ const EVENTS_LIVE: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new
 /// `(received_at, event_id) -> ()`, retired events, for the dead-letter view.
 const EVENTS_DEAD: TableDefinition<(&str, i64, &str), ()> = TableDefinition::new("inbound_dead");
 
-/// `(tenant, run_id, event_id) -> ()`, events a run currently holds claimed.
+/// `(tenant, run_id, event_id) -> effect_key`, events a run holds claimed and
+/// has not yet consumed, with the wait each was claimed for.
 ///
-/// The index `unsubscribe` strips delivered payloads through. Written in the
-/// same transaction as every claim, removed when the run's unsubscribe sheds
-/// the payload — without it, finding "the events this run claimed" is a scan
-/// of every event the tenant ever received, on the hot path of every wait.
-const EVENTS_CLAIMED: TableDefinition<(&str, &str, &str), ()> =
+/// The wait is what makes a claim recoverable without being re-consumable: a
+/// wait recovers only a claim made for it, and only while the entry stands.
+/// Written in the same transaction as every claim, removed when that wait's
+/// unsubscribe sheds the payload — so retiring one wait never strips another
+/// wait's undelivered message, and a consumed message is never handed to the
+/// run's next wait on the same key.
+const EVENTS_CLAIMED: TableDefinition<(&str, &str, &str), &str> =
     TableDefinition::new("inbound_claimed");
+
+/// `(tenant, event_id) -> ()`, messages delivered to one run by name.
+///
+/// A message addressed to a run is that run's alone: one its run never
+/// consumed is dead-lettered when the run's waits retire, never offered to
+/// another run waiting on the same key.
+const EVENTS_TARGETED: TableDefinition<(&str, &str), ()> = TableDefinition::new("inbound_targeted");
 
 /// `(created_at, run_id, effect_key, namespace, value) -> ()`, waits in
 /// registration order.
@@ -164,6 +173,7 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(EVENTS_LIVE).map_err(|e| be(&e))?;
     w.open_table(EVENTS_DEAD).map_err(|e| be(&e))?;
     w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
+    w.open_table(EVENTS_TARGETED).map_err(|e| be(&e))?;
     w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
     w.open_table(PARKED).map_err(|e| be(&e))?;
     Ok(())
@@ -199,7 +209,7 @@ fn load_correlation(
 
 /// A waiting subscription's identity and the fields needed to rebuild it:
 /// `(run_id, effect_key, case_id, has_case, step, phase)`.
-type Waiter = (String, String, String, u8, u32, String);
+type Waiter = (String, String, String, u8, u32, String, Option<String>);
 
 /// Stamp an event row as claimed by one run.
 ///
@@ -443,6 +453,7 @@ fn oldest_waiter(
         SubRow<'static>,
     >,
     kind: &str,
+    source: &str,
     keys: &[CorrelationKey],
 ) -> Result<Option<Waiter>, StoreError> {
     for k in keys {
@@ -486,7 +497,11 @@ fn oldest_waiter(
                 .get((tenant, run, effect, ns, val))
                 .map_err(|e| be(&e))?
             {
-                let (case, has_case, step, phase, _, _) = v.value();
+                let (case, has_case, step, phase, _, _, from) = v.value();
+                // A wait naming its sender is not a waiter for anyone else.
+                if from.is_some_and(|from| from != source) {
+                    continue;
+                }
                 return Ok(Some((
                     run.to_owned(),
                     effect.to_owned(),
@@ -494,6 +509,7 @@ fn oldest_waiter(
                     has_case,
                     step,
                     phase.to_owned(),
+                    from.map(str::to_owned),
                 )));
             }
         }
@@ -550,6 +566,7 @@ fn register_wait(
                     phase,
                     sub.kind.as_str(),
                     at,
+                    sub.from.as_deref(),
                 ),
             )
             .map_err(|e| be(&e))?;
@@ -602,7 +619,7 @@ fn drop_wait(
     {
         let (k, v) = e.map_err(|e| be(&e))?;
         let (_, _, _, ns, val) = k.value();
-        let (_, _, _, _, kind, created) = v.value();
+        let (_, _, _, _, kind, created, _) = v.value();
         doomed.push((ns.to_owned(), val.to_owned(), kind.to_owned(), created));
     }
     let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
@@ -632,23 +649,30 @@ fn drop_wait(
     Ok(())
 }
 
-/// Shed the buffer's copy of every payload `run` holds claimed.
+/// Shed the buffer's copy of the payloads `run` holds claimed for `effect`,
+/// or for every wait when `effect` is `None`.
 ///
-/// A run's unsubscribe is the store's signal that delivery was journaled, so
-/// the row keeps its `(source, id)` identity, claim and dead-letter fields —
+/// A wait's unsubscribe is the store's signal that its delivery was journaled,
+/// so the row keeps its `(source, id)` identity, claim and dead-letter fields —
 /// dedup and accounting need those, and only the content was ever the erasure
 /// concern. Stripping at the *claim* instead would lose the payload for a run
 /// that crashed between claim and resume, whose recovery re-reads it from the
 /// buffer.
-fn shed_claimed(w: &redb::WriteTransaction, tenant: &str, run: &str) -> Result<(), StoreError> {
+fn shed_claimed(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run: &str,
+    effect: Option<&str>,
+) -> Result<(), StoreError> {
     let mut claimed = w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
     let held: Vec<String> = claimed
         .range((tenant, run, "")..=(tenant, run, MAX_STR))
         .map_err(|e| be(&e))?
-        .map(|entry| {
-            entry
-                .map(|(key, _)| key.value().2.to_owned())
-                .map_err(|error| be(&error))
+        .filter_map(|entry| match entry {
+            Ok((key, value)) => effect
+                .is_none_or(|effect| value.value() == effect)
+                .then(|| Ok(key.value().2.to_owned())),
+            Err(error) => Some(Err(be(&error))),
         })
         .collect::<Result<_, _>>()?;
     let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
@@ -659,6 +683,106 @@ fn shed_claimed(w: &redb::WriteTransaction, tenant: &str, run: &str) -> Result<(
             .map_err(|e| be(&e))?;
     }
     Ok(())
+}
+
+/// Hand back to the buffer, unclaimed and live, what `run` holds claimed for
+/// a wait in `unanswered`, and return those messages.
+fn release_claimed(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    run: &str,
+    unanswered: &std::collections::BTreeSet<String>,
+) -> Result<Vec<InboundEvent>, StoreError> {
+    let mut claimed = w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
+    let held: Vec<String> = claimed
+        .range((tenant, run, "")..=(tenant, run, MAX_STR))
+        .map_err(|e| be(&e))?
+        .filter_map(|entry| match entry {
+            Ok((key, effect)) => unanswered
+                .contains(effect.value())
+                .then(|| Ok(key.value().2.to_owned())),
+            Err(error) => Some(Err(be(&error))),
+        })
+        .collect::<Result<_, _>>()?;
+    let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
+    let mut live = w.open_table(EVENTS_LIVE).map_err(|e| be(&e))?;
+    let corr = w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
+    let mut released = Vec::with_capacity(held.len());
+    for id in held {
+        claimed
+            .remove((tenant, run, id.as_str()))
+            .map_err(|e| be(&e))?;
+        let Some((src, bid, kind, payload, received, dead, ba, bb)) = events
+            .get((tenant, id.as_str()))
+            .map_err(|e| be(&e))?
+            .map(|v| {
+                let (src, bid, kd, pl, ra, _, _, _, dead, _, ba, bb) = v.value();
+                (
+                    src.to_owned(),
+                    bid.to_owned(),
+                    kd.to_owned(),
+                    pl.to_owned(),
+                    ra,
+                    dead,
+                    ba.to_owned(),
+                    bb.to_owned(),
+                )
+            })
+        else {
+            continue;
+        };
+        if dead == 1 {
+            continue;
+        }
+        let addressed = w
+            .open_table(EVENTS_TARGETED)
+            .map_err(|e| be(&e))?
+            .get((tenant, id.as_str()))
+            .map_err(|e| be(&e))?
+            .is_some();
+        events
+            .insert(
+                (tenant, id.as_str()),
+                (
+                    src.as_str(),
+                    bid.as_str(),
+                    kind.as_str(),
+                    payload.as_str(),
+                    received,
+                    "",
+                    0i64,
+                    0u8,
+                    u8::from(addressed),
+                    if addressed {
+                        crate::case::ADDRESSEE_CONCLUDED_REASON
+                    } else {
+                        ""
+                    },
+                    ba.as_str(),
+                    bb.as_str(),
+                ),
+            )
+            .map_err(|e| be(&e))?;
+        if addressed {
+            // Its run's alone: dead-lettered, never offered to another run.
+            w.open_table(EVENTS_DEAD)
+                .map_err(|e| be(&e))?
+                .insert((tenant, received, id.as_str()), ())
+                .map_err(|e| be(&e))?;
+            continue;
+        }
+        live.insert((tenant, received, id.as_str()), ())
+            .map_err(|e| be(&e))?;
+        released.push(InboundEvent {
+            correlation: load_correlation(&corr, tenant, &id)?,
+            source: src,
+            id: bid,
+            kind,
+            payload: serde_json::from_str(&payload)?,
+            by: decode_minter(&ba, &bb)?,
+        });
+    }
+    Ok(released)
 }
 
 #[async_trait]
@@ -739,11 +863,23 @@ impl EventStore for RedbStore {
     ) -> Result<Option<BufferedEvent>, StoreError> {
         let tenant = self.tenant_name();
         let run = sub.run.to_string();
+        let effect = sub.effect.to_hex();
         let kind = sub.kind.clone();
         let keys = sub.correlation.clone();
+        let wait = sub.clone();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let found = {
+                // A wait already parked holds a claim — made by a delivery
+                // that reached it between its registration and this call, or
+                // before a crash — and recovers that one alone. Taking a second
+                // message too would leave one of the two to be shed unread.
+                let parked_here = w
+                    .open_table(PARKED)
+                    .map_err(|e| be(&e))?
+                    .get((tenant.as_str(), run.as_str(), effect.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_some();
                 let by_key = w.open_table(EVENT_BY_KEY).map_err(|e| be(&e))?;
                 let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
 
@@ -792,25 +928,34 @@ impl EventStore for RedbStore {
                         else {
                             continue;
                         };
-                        // Unclaimed — or already claimed **by this very run**.
-                        // The second arm is crash recovery, and it is the same
-                        // idempotence `deliver_to` grants a retried targeted
-                        // delivery: `match_waiter` claims durably and the run
+                        // Unclaimed — or already claimed **for this very wait**
+                        // and not yet consumed. The second arm is crash
+                        // recovery: `match_waiter` claims durably and the run
                         // resumes in a separate step, so a crash between the
-                        // two leaves an event claimed for a run that never saw
-                        // it. Without this arm the resumed wait re-subscribes,
-                        // finds nothing — its own event filtered out by its own
-                        // claim — and sleeps until the deadline breaches: the
-                        // message arrived in time and was lost anyway. Single
-                        // delivery is untouched, because only the claiming run
-                        // can re-claim.
+                        // two leaves an event claimed for a wait that never saw
+                        // it. Scoped to the wait, not the run, and to a claim
+                        // its unsubscribe has not consumed: a message the run
+                        // already journaled is never handed to its next wait
+                        // on the same key.
+                        let own_claim = row.3 == 1
+                            && row.7 == run
+                            && w.open_table(EVENTS_CLAIMED)
+                                .map_err(|e| be(&e))?
+                                .get((tenant.as_str(), run.as_str(), id.as_str()))
+                                .map_err(|e| be(&e))?
+                                .is_some_and(|claimed| claimed.value() == effect);
                         let erased = w
                             .open_table(EVENTS_ERASED)
                             .map_err(|e| be(&e))?
                             .get((tenant.as_str(), id.as_str()))
                             .map_err(|e| be(&e))?
                             .is_some();
-                        if row.0 == kind && (row.3 == 0 || row.7 == run) && row.4 == 0 && !erased {
+                        if row.0 == kind
+                            && wait.accepts_source(&row.5)
+                            && ((row.3 == 0 && !parked_here) || own_claim)
+                            && row.4 == 0
+                            && !erased
+                        {
                             hit = Some((id, row));
                             break 'outer;
                         }
@@ -849,11 +994,22 @@ impl EventStore for RedbStore {
                             .map_err(|e| be(&e))?
                             .remove((tenant.as_str(), received, id.as_str()))
                             .map_err(|e| be(&e))?;
-                        // Findable by the claiming run, so its unsubscribe can
+                        // Findable by the claiming wait, so its unsubscribe can
                         // shed the delivered payload without a scan.
                         w.open_table(EVENTS_CLAIMED)
                             .map_err(|e| be(&e))?
-                            .insert((tenant.as_str(), run.as_str(), id.as_str()), ())
+                            .insert(
+                                (tenant.as_str(), run.as_str(), id.as_str()),
+                                effect.as_str(),
+                            )
+                            .map_err(|e| be(&e))?;
+                        // Parked in the claim's transaction: a wait holding an
+                        // undelivered message takes no second one, and a crash
+                        // before it is journaled leaves a pair the redelivery
+                        // pass finds.
+                        w.open_table(PARKED)
+                            .map_err(|e| be(&e))?
+                            .insert((tenant.as_str(), run.as_str(), effect.as_str()), ts(at))
                             .map_err(|e| be(&e))?;
                         let corr_t = w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
                         let correlation = load_correlation(&corr_t, &tenant, &id)?;
@@ -888,6 +1044,7 @@ impl EventStore for RedbStore {
         // event is durable and no waiter ever matches it.
         let id = event.dedup_key();
         let kind = event.kind.clone();
+        let source = event.source.clone();
         let keys = event.correlation.clone();
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -895,13 +1052,13 @@ impl EventStore for RedbStore {
             // redb's commit consumes it.
             let found = {
                 let by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
-                let mut subs = w.open_table(SUBS).map_err(|e| be(&e))?;
-                let hit = oldest_waiter(&w, &tenant, &by_key, &subs, &kind, &keys)?;
+                let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
+                let hit = oldest_waiter(&w, &tenant, &by_key, &subs, &kind, &source, &keys)?;
                 drop(by_key);
 
                 match hit {
                     None => None,
-                    Some((run, effect, case, has_case, step, phase)) => {
+                    Some((run, effect, case, has_case, step, phase, from)) => {
                         // Claim the event for this run in the same transaction,
                         // so one message cannot resume two runs.
                         let mut events = w.open_table(EVENTS).map_err(|e| be(&e))?;
@@ -942,15 +1099,17 @@ impl EventStore for RedbStore {
                                 .map_err(|e| be(&e))?
                                 .remove((tenant.as_str(), ra, id.as_str()))
                                 .map_err(|e| be(&e))?;
-                            // Findable by the claiming run, so its unsubscribe
+                            // Findable by the claiming wait, so its unsubscribe
                             // can shed the delivered payload without a scan.
                             w.open_table(EVENTS_CLAIMED)
                                 .map_err(|e| be(&e))?
-                                .insert((tenant.as_str(), run.as_str(), id.as_str()), ())
+                                .insert(
+                                    (tenant.as_str(), run.as_str(), id.as_str()),
+                                    effect.as_str(),
+                                )
                                 .map_err(|e| be(&e))?;
 
                             let mut correlation = Vec::new();
-                            let mut retired = Vec::new();
                             for e in subs
                                 .range(
                                     (tenant.as_str(), run.as_str(), effect.as_str(), "", "")
@@ -964,66 +1123,21 @@ impl EventStore for RedbStore {
                                 )
                                 .map_err(|e| be(&e))?
                             {
-                                let (k, v) = e.map_err(|e| be(&e))?;
+                                let (k, _) = e.map_err(|e| be(&e))?;
                                 let (_, _, _, ns, val) = k.value();
-                                let (_, _, _, _, sub_kind, created) = v.value();
                                 correlation
                                     .push(CorrelationKey::new(ns.to_owned(), val.to_owned()));
-                                retired.push((
-                                    ns.to_owned(),
-                                    val.to_owned(),
-                                    sub_kind.to_owned(),
-                                    created,
-                                ));
                             }
-                            // The claim retires the subscription, in the same
-                            // transaction. Left registered until the run's own
-                            // unsubscribe, it matched a *second* event —
-                            // sequentially, no race required — which was then
-                            // claimed for a run whose wait the first event
-                            // already satisfied: parked under a claim nobody
-                            // consumes, and claimed events never dead-letter.
-                            // The resumed wait re-subscribes idempotently and
-                            // recovers its own claimed event through the
-                            // crash-recovery arm, so nothing legitimate needs
-                            // the stale registration.
+                            // The claim parks the subscription, in the same
+                            // transaction: a parked wait is matched no second
+                            // event, and a crash before the resume leaves a
+                            // pair the redelivery pass finds and finishes. The
+                            // wait's own unsubscribe, after its delivery is
+                            // journaled, retires it.
                             w.open_table(PARKED)
                                 .map_err(|e| be(&e))?
-                                .remove((tenant.as_str(), run.as_str(), effect.as_str()))
+                                .insert((tenant.as_str(), run.as_str(), effect.as_str()), ts(at))
                                 .map_err(|e| be(&e))?;
-                            for (ns, val, sub_kind, created) in retired {
-                                subs.remove((
-                                    tenant.as_str(),
-                                    run.as_str(),
-                                    effect.as_str(),
-                                    ns.as_str(),
-                                    val.as_str(),
-                                ))
-                                .map_err(|e| be(&e))?;
-                                let mut by_key = w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
-                                by_key
-                                    .remove((
-                                        tenant.as_str(),
-                                        sub_kind.as_str(),
-                                        ns.as_str(),
-                                        val.as_str(),
-                                        created,
-                                        run.as_str(),
-                                        effect.as_str(),
-                                    ))
-                                    .map_err(|e| be(&e))?;
-                                let mut by_time = w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
-                                by_time
-                                    .remove((
-                                        tenant.as_str(),
-                                        created,
-                                        run.as_str(),
-                                        effect.as_str(),
-                                        ns.as_str(),
-                                        val.as_str(),
-                                    ))
-                                    .map_err(|e| be(&e))?;
-                            }
 
                             Some(Subscription {
                                 run: RunId::parse(&run).map_err(|e| StoreError::Corrupt {
@@ -1048,6 +1162,7 @@ impl EventStore for RedbStore {
                                 phase: phase_from(&phase)?,
                                 kind: kind.clone(),
                                 correlation,
+                                from,
                             })
                         } else {
                             None
@@ -1087,8 +1202,23 @@ impl EventStore for RedbStore {
                         let (_, _, _, _, _, claimed_by, _, has_claim, _, _, _, _) = row.value();
                         (claimed_by.to_owned(), has_claim)
                     });
+                // A message this run already holds claimed resumes the wait it
+                // was claimed for, while that claim stands — a retry after a
+                // crash between claim and resume. Consumed, or claimed by
+                // another run, it is a duplicate. A new message goes to a wait
+                // holding no undelivered message.
+                let claimed_for: Option<String> = match &existing_claim {
+                    Some((claimed_by, 1)) if *claimed_by == run => w
+                        .open_table(EVENTS_CLAIMED)
+                        .map_err(|e| be(&e))?
+                        .get((tenant.as_str(), run.as_str(), id.as_str()))
+                        .map_err(|e| be(&e))?
+                        .map(|effect| effect.value().to_owned()),
+                    _ => None,
+                };
+                let parked = w.open_table(PARKED).map_err(|e| be(&e))?;
                 let subs = w.open_table(SUBS).map_err(|e| be(&e))?;
-                let mut selected: Option<(String, String, u8, u32, String)> = None;
+                let mut selected: Option<(String, String, u8, u32, String, Option<String>)> = None;
                 for row in subs
                     .range(
                         (tenant.as_str(), run.as_str(), "", "", "")
@@ -1098,8 +1228,18 @@ impl EventStore for RedbStore {
                 {
                     let (key, value) = row.map_err(|e| be(&e))?;
                     let (_, _, effect, namespace, value_key) = key.value();
-                    let (case, has_case, step, phase, event_kind, _) = value.value();
-                    if event_kind == kind
+                    let (case, has_case, step, phase, event_kind, _, from) = value.value();
+                    let eligible = match (&existing_claim, &claimed_for) {
+                        (Some(_), Some(claimed)) => claimed == effect,
+                        (Some(_), None) => false,
+                        (None, _) => parked
+                            .get((tenant.as_str(), run.as_str(), effect))
+                            .map_err(|e| be(&e))?
+                            .is_none(),
+                    };
+                    if eligible
+                        && event_kind == kind
+                        && from.is_none_or(|from| from == source)
                         && keys.iter().any(|candidate| {
                             candidate.namespace == namespace && candidate.value == value_key
                         })
@@ -1110,12 +1250,14 @@ impl EventStore for RedbStore {
                             has_case,
                             step,
                             phase.to_owned(),
+                            from.map(str::to_owned),
                         ));
                         break;
                     }
                 }
 
-                let Some((effect, case, has_case, step, phase)) = selected else {
+                drop(parked);
+                let Some((effect, case, has_case, step, phase, from)) = selected else {
                     drop(subs);
                     drop(events);
                     w.commit().map_err(|e| be(&e))?;
@@ -1165,15 +1307,13 @@ impl EventStore for RedbStore {
                     phase: phase_from(&phase)?,
                     kind: kind.clone(),
                     correlation,
+                    from,
                 };
 
-                if let Some((claimed_by, has_claim)) = existing_claim {
+                if existing_claim.is_some() {
+                    // Selected only as the wait its standing claim was made for.
                     drop(events);
-                    if has_claim == 1 && claimed_by == run {
-                        TargetedDelivery::Matched(subscription)
-                    } else {
-                        TargetedDelivery::Duplicate
-                    }
+                    TargetedDelivery::Matched(subscription)
                 } else {
                     events
                         .insert(
@@ -1196,11 +1336,18 @@ impl EventStore for RedbStore {
                         .map_err(|e| be(&e))?;
                     drop(events);
                     index_correlation(&w, &tenant, &id, &keys, ts(at))?;
-                    // Findable by the claiming run, so its unsubscribe can
+                    w.open_table(EVENTS_TARGETED)
+                        .map_err(|e| be(&e))?
+                        .insert((tenant.as_str(), id.as_str()), ())
+                        .map_err(|e| be(&e))?;
+                    // Findable by the claiming wait, so its unsubscribe can
                     // shed the delivered payload without a scan.
                     w.open_table(EVENTS_CLAIMED)
                         .map_err(|e| be(&e))?
-                        .insert((tenant.as_str(), run.as_str(), id.as_str()), ())
+                        .insert(
+                            (tenant.as_str(), run.as_str(), id.as_str()),
+                            subscription_effect.as_str(),
+                        )
                         .map_err(|e| be(&e))?;
                     // Parked until the run's unsubscribe: a crash between this
                     // claim and the resume leaves a pair the redelivery pass
@@ -1212,16 +1359,6 @@ impl EventStore for RedbStore {
                             ts(at),
                         )
                         .map_err(|e| be(&e))?;
-                    // The subscription is deliberately **not** retired here,
-                    // unlike `match_waiter` — the asymmetry is the two paths'
-                    // retry semantics. A retried targeted delivery rebuilds
-                    // its `Matched` from these rows to resume a run that
-                    // crashed between claim and resume; and a second distinct
-                    // message claimed through a satisfied wait is recovered by
-                    // the protocol itself, because the task's next
-                    // continuation re-matches the claimed event for the same
-                    // run. The broadcast path has no such retry loop, which
-                    // is why `match_waiter` retires and this does not.
                     TargetedDelivery::Matched(subscription)
                 }
             };
@@ -1237,16 +1374,22 @@ impl EventStore for RedbStore {
         self.with_db(move |db| {
             let w = begin_write(db)?;
             drop_wait(&w, &tenant, &run, &effect)?;
-            shed_claimed(&w, &tenant, &run)?;
+            shed_claimed(&w, &tenant, &run, Some(&effect))?;
             w.commit().map_err(|e| be(&e))?;
             Ok(())
         })
         .await
     }
 
-    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
+    async fn unsubscribe_run(
+        &self,
+        run: RunId,
+        unanswered: &[EffectKey],
+    ) -> Result<crate::case::Retired, StoreError> {
         let tenant = self.tenant_name();
         let run = run.to_string();
+        let unanswered: std::collections::BTreeSet<String> =
+            unanswered.iter().map(|effect| effect.to_hex()).collect();
         self.with_db(move |db| {
             let w = begin_write(db)?;
             let effects: std::collections::BTreeSet<String> = {
@@ -1262,9 +1405,13 @@ impl EventStore for RedbStore {
             for effect in &effects {
                 drop_wait(&w, &tenant, &run, effect)?;
             }
-            shed_claimed(&w, &tenant, &run)?;
+            let released = release_claimed(&w, &tenant, &run, &unanswered)?;
+            shed_claimed(&w, &tenant, &run, None)?;
             w.commit().map_err(|e| be(&e))?;
-            Ok(effects.len())
+            Ok(crate::case::Retired {
+                waits: effects.len(),
+                released,
+            })
         })
         .await
     }
@@ -1317,7 +1464,7 @@ impl EventStore for RedbStore {
             for (run, effect) in listed {
                 if is_sealed(&w, &tenant, &run)? {
                     drop_wait(&w, &tenant, &run, &effect)?;
-                    shed_claimed(&w, &tenant, &run)?;
+                    shed_claimed(&w, &tenant, &run, None)?;
                 } else {
                     live.push((run, effect));
                 }
@@ -1329,7 +1476,7 @@ impl EventStore for RedbStore {
                     break;
                 }
                 let (run, effect) = (run.as_str(), effect.as_str());
-                let mut found: Option<(String, u8, u32, String, String)> = None;
+                let mut found: Option<(String, u8, u32, String, String, Option<String>)> = None;
                 let mut correlation = Vec::new();
                 for row in subs
                     .range(
@@ -1340,7 +1487,7 @@ impl EventStore for RedbStore {
                 {
                     let (key, value) = row.map_err(|e| be(&e))?;
                     let (_, _, _, ns, val) = key.value();
-                    let (case, has_case, step, phase, kind, _) = value.value();
+                    let (case, has_case, step, phase, kind, _, from) = value.value();
                     correlation.push(CorrelationKey::new(ns.to_owned(), val.to_owned()));
                     found.get_or_insert_with(|| {
                         (
@@ -1349,10 +1496,11 @@ impl EventStore for RedbStore {
                             step,
                             phase.to_owned(),
                             kind.to_owned(),
+                            from.map(str::to_owned),
                         )
                     });
                 }
-                let Some((case, has_case, step, phase, kind)) = found else {
+                let Some((case, has_case, step, phase, kind, from)) = found else {
                     continue;
                 };
                 out.push(Subscription {
@@ -1376,6 +1524,7 @@ impl EventStore for RedbStore {
                     phase: phase_from(&phase)?,
                     kind,
                     correlation,
+                    from,
                 });
             }
             drop(subs);
@@ -1662,7 +1811,7 @@ impl EventStore for RedbStore {
                 else {
                     continue;
                 };
-                let (case, has_case, step, phase, kind, _) = v.value();
+                let (case, has_case, step, phase, kind, _, from) = v.value();
                 out.push(Subscription {
                     run: RunId::parse(run).map_err(|e| StoreError::Corrupt {
                         seq: 0,
@@ -1684,6 +1833,7 @@ impl EventStore for RedbStore {
                     phase: phase_from(phase)?,
                     kind: kind.to_owned(),
                     correlation: vec![CorrelationKey::new(ns.to_owned(), val.to_owned())],
+                    from: from.map(str::to_owned),
                 });
             }
             Ok(out)

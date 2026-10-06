@@ -89,7 +89,7 @@ jobs:
           - variant: slim
             features: cli
           - variant: full
-            features: cli,mcp,mcp-stdio,a2a,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push
+            features: cli,mcp,mcp-stdio,mcp-server-http,a2a,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push
           - platform: linux/amd64
             runner: ubuntu-latest
           - platform: linux/arm64
@@ -142,6 +142,47 @@ jobs:
           name: digests-${{ matrix.variant }}-${{ strategy.job-index }}
           path: /tmp/digests/*
           retention-days: 1
+      # The digest the framework walk pulls: `:full` on the walk's architecture.
+      - if: matrix.variant == 'full' && matrix.platform == 'linux/amd64'
+        run: echo "$DIGEST" > /tmp/walk-digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - if: matrix.variant == 'full' && matrix.platform == 'linux/amd64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: walk-digest
+          path: /tmp/walk-digest
+          retention-days: 1
+
+  # Every framework quickstart walked against the pushed, untagged `:full`
+  # digest, before anything is tagged or signed.
+  #
+  # Its own job because the walk executes third-party code — each framework's
+  # locked dependency closure from PyPI. It holds no credential: read-only
+  # contents, no registry login (the digest is pulled the way an adopter pulls
+  # it, anonymously), and nothing it does can tag, sign or attest. A failure
+  # leaves only an untagged digest no tag points at.
+  frameworks:
+    needs: image
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: walk-digest
+          path: /tmp
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.8.22"
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.18.4
+      - name: Every framework reaches the pushed plane
+        run: IMAGE="ghcr.io/${{ github.repository }}@$(cat /tmp/walk-digest)" tools/frameworks.sh
 
   # One manifest list per variant, then sign and attest it.
   #
@@ -149,7 +190,7 @@ jobs:
   # is the list: signing only the per-arch digests would leave the thing anybody
   # actually verifies unsigned.
   publish-image:
-    needs: image
+    needs: [image, frameworks]
     permissions:
       contents: read
       packages: write

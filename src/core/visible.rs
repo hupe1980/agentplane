@@ -25,7 +25,7 @@
 /// characters that render blank; variation selectors, which carry data
 /// invisibly after any character; and the Unicode tag block.
 #[must_use]
-pub(crate) const fn is_hidden(c: char) -> bool {
+pub const fn is_hidden(c: char) -> bool {
     matches!(
         c as u32,
         0x00..=0x08
@@ -52,8 +52,14 @@ pub(crate) const fn is_hidden(c: char) -> bool {
 }
 
 /// `text` with every hidden code point shown as `\u{…}`, and whether any was.
+///
+/// Escaped: the classes [`is_hidden`] names — C0 and C1 controls other than
+/// tab and the line breaks (so ESC, which starts every terminal escape
+/// sequence), the bidirectional controls, the zero-width and invisible
+/// characters, variation selectors and the tag block. Everything else, line
+/// breaks included, passes through.
 #[must_use]
-pub(crate) fn escape(text: &str) -> (String, bool) {
+pub fn escape(text: &str) -> (String, bool) {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(text.len());
     let mut escaped = false;

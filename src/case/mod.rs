@@ -4,7 +4,10 @@ mod events;
 mod tasks;
 mod timers;
 
-pub use events::{BufferedEvent, ERASED_REASON, EventStore, Minter, TargetedDelivery};
+pub use events::{
+    ADDRESSEE_CONCLUDED_REASON, BufferedEvent, ERASED_REASON, EventStore, Minter, Retired,
+    TargetedDelivery,
+};
 pub use tasks::{ClaimError, TaskStore};
 pub use timers::TimerStore;
 
@@ -138,22 +141,6 @@ pub trait CaseStore: Send + Sync + Debug {
 
     /// Record that a run touched this case.
     async fn attach_run(&self, case: CaseId, run: RunId) -> Result<(), StoreError>;
-
-    /// Undo an attachment whose run never came to exist.
-    ///
-    /// **Not** a way to remove a run from a matter after the fact: a run that
-    /// wrote records belongs to the case's history permanently. This covers the
-    /// admission that attached and then failed before its first record — a
-    /// refused append, an admission key another instance won by milliseconds —
-    /// leaving a row that answers *"everything about this matter"* with a run
-    /// that never happened.
-    ///
-    /// The position is **not** reused. Attachment order is the case's record of
-    /// what happened in what sequence; a gap is honest, a reused position would
-    /// make two runs share a place in it.
-    ///
-    /// Returns whether a row was there to remove.
-    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError>;
 
     /// Record that a case produced a blob.
     ///
@@ -378,18 +365,40 @@ pub trait CaseStore: Send + Sync + Debug {
     /// the same reason.
     ///
     /// **The register answers *what is preserved now*, not *what ever was*.**
-    /// Releasing leaves no history, deliberately: kept rows would make their
-    /// free-text reasons outlive the matter they preserved, and destroying them
-    /// with the matter would destroy the record of the erasure's own
-    /// authorisation. The chain of custody belongs to the system that issued the
-    /// order; what this crate supplies is the capability split
-    /// (`api:hold.place`, `api:hold.release`) that lets a deployment's own
-    /// access log answer it.
+    /// The register keeps no row for a released hold, deliberately: a kept row
+    /// would make its free-text reason outlive the matter it preserved. The
+    /// history is the journal's —
+    /// [`Runtime::release_hold`](crate::runtime::Runtime::release_hold)
+    /// records who released the hold, when, and who had placed it, stamped
+    /// with the case and without the reason, before removing the hold through
+    /// [`release_hold_if`](Self::release_hold_if); both of the plane's doors
+    /// release through that. This is the raw register verb: a
+    /// direct call is the embedder's own act, and nothing records it.
     ///
     /// # Errors
     ///
     /// [`StoreError::NotFound`] if the case does not exist.
     async fn release_hold(&self, case: CaseId) -> Result<bool, StoreError>;
+
+    /// Lift the hold on `case` only if it is still `standing` — same instant,
+    /// same reason, same operator.
+    ///
+    /// Answers whether that hold was removed. `false` when the matter is not
+    /// held or holds a different hold; a different hold is left standing.
+    ///
+    /// The compare and the removal MUST be one write. A release followed by a
+    /// re-place puts a new hold where the old one was, so an unconditional
+    /// removal by a releaser that read the old one would delete the new hold
+    /// under a record that names the old.
+    /// [`Runtime::release_hold`](crate::runtime::Runtime::release_hold)
+    /// removes through this, with the hold it journaled.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the case does not exist; otherwise if the
+    /// store cannot be reached, or holds a row it cannot read.
+    async fn release_hold_if(&self, case: CaseId, standing: &LegalHold)
+    -> Result<bool, StoreError>;
 
     /// The hold on one matter, if it is held.
     ///

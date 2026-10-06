@@ -30,15 +30,16 @@ remaining design pressure is, grouped by
 |---|---|---|
 | *What the freeze will cover* | | |
 | **Effect / disposition / recovery vocabulary** | stable | `DidNotHappen`/`InDoubt`/`Landed` and the recovery classes are the load-bearing idea; changing them would be a different system |
-| **Journal record format** | **will change** | not frozen. Upcasters exist, but a format-freeze milestone has not happened and hard cuts are preferred until it does — see the freeze conditions below for what has to land first, and for the export-as-the-durable-artifact position in the meantime |
-| *Additive either way — a new field or variant, never a removed one* | | |
+| **Journal record format** | **will change** | not frozen. Every shipped reader reads through an upcaster, but the freeze has not been performed and hard cuts are preferred until it is — see the freeze conditions below, and the export-as-the-durable-artifact position in the meantime |
+| *Additive under the freeze too — a new field, never a removed one* | | |
 | **Manifest schema** | additive, with hard cuts | `deny_unknown_fields` makes an added field safe and a *removed* one a hard failure. The published [JSON Schema](/agentplane/agent.schema.json) is generated from the parser's types and moves with them |
+| *Outside the promise — pin an exact version* | | |
+| **Operator API ([OpenAPI document](/agentplane/openapi.json))** | will change | generated from the routes and the types they answer with, so it moves with them; generate a client per version → [the operator surface](@/docs/operations.md#what-the-endpoints-are-for) |
 | **Error enums** | additive; `#[non_exhaustive]` | they gain variants as the runtime learns to say more — a rate limit is its own variant rather than a generic rejection, and the next distinction will be too. Match with a `_` arm |
 | **`RetryPolicy` fields** | additive | it is a plain struct, so a literal breaks when a field lands. Build with `RetryPolicy::attempts(n)` and the builder methods, or spread `..RetryPolicy::default()` |
 | **Policy seam (`PolicyEngine`, request context)** | stable seam, growing context | the trait is settled; `context` gains attributes as the runtime learns to say more. Guard optional ones with `has` → [security](@/docs/security.md#the-authorization-context) |
 | **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
 | **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
-| *Outside the promise — pin an exact version* | | |
 | **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
 | **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
 | **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
@@ -58,21 +59,24 @@ This one is not.
 There is no date. What there is instead is a condition list, each row naming
 what it demands and where the evidence is.
 
-**Conditions 5 and 6 are not met; they are what performing the freeze has to
-deliver.** The rest are met. The freeze itself is a deliberate act — the point
+**Every condition is met.** The freeze itself is a deliberate act — the point
 at which hard cuts stop and a shape change becomes an upcaster plus a version
-bump — with no target release.
+bump — with no target release. It lands together with what holds a frozen
+vector, which is not yet in place: a check that every build still reads and
+hashes the vectors earlier builds wrote, a corpus that only gains vectors, and
+the operator vocabulary's spellings pinned as [the promise](#what-the-freeze-promises)
+states them.
 
 | # | Condition | Where the evidence is |
 |---|---|---|
 | 1 | **Canonicalization is versioned and vector-checked** — a rule change must read as *unverifiable*, never as a divergence | RFC 8785 held to the standard's own number vectors → [canonical JSON](@/docs/format.md#canonical-json) |
-| 2 | **Golden corpora for the journal record format** — a fixed set of records every future build must still read and still hash identically | `tests/golden/records.jsonl`, with a guard holding the corpus to the record vocabulary |
-| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | `tools/verify_export.py`, re-deriving all 30 record vectors from the [specification](@/docs/format.md#vectors) alone |
+| 2 | **Golden corpora for the journal record format** — a fixed set of records every future build must still read and still hash identically | `tests/golden/records.jsonl`, one record per kind, which this build writes byte for byte, with a guard holding the corpus to the record vocabulary. That a later build still reads them is held from the act on |
+| 3 | **Golden vectors for the export format** — the artifact a third party verifies without this crate | `tools/verify_export.py`, re-deriving all 33 record vectors from the [specification](@/docs/format.md#vectors) alone |
 | 4 | **A stated unknown-field policy per durable format** | per format, not once — a record body, a sealed header and an export's framing each say what they refuse → [format](@/docs/format.md#not-promised) |
-| 5 | **Upcasters exercised end-to-end**, not only unit-tested | **not met.** The seam exists and a test lifts a record through it, but no shipped reader takes an upcaster: stores and export read through a reader wired to this build's record shapes → [versioning](@/docs/format.md#versioning) |
-| 6 | **A migration and rollback procedure**, written down and rehearsed | **not met.** The procedure across builds is [written down](@/docs/upgrading.md#procedure); it has no rollback across a cut, and no rehearsal across two builds is repeatable in-tree |
+| 5 | **Upcasters exercised end-to-end**, not only unit-tested | both stores, `verify`, `restore` and `export` read through an upcaster, and the store battery reads an older record shape back lifted with its bytes as written → [versioning](@/docs/format.md#versioning) |
+| 6 | **A migration and rollback procedure**, written down and rehearsed | [readers before writers](@/docs/upgrading.md#readers-first), the rollback window closing at the first write of a bumped kind, rehearsed in-tree over an export one record shape older than this build writes |
 | 7 | **An algorithm-agility plan** — how SHA-256 is replaced without invalidating history | [written down](@/docs/format.md#algorithm-agility): hashes agile by version, signatures by key, and nothing rehashes stored bytes |
-| 8 | **The deferred format questions are settled** | the set is empty |
+| 8 | **The deferred format questions are settled** | none is open as a question: each parked record change, and each open item whose specification would move a durable format, is collected as a cost of the act, which a freeze performed first prices at an upcaster rather than a cut |
 | 9 | **The surface the promise attaches to is named** | the artifacts, not either doorway — [below](#what-the-freeze-promises) |
 
 ### What the freeze is a promise about {#what-the-freeze-promises}
@@ -123,18 +127,11 @@ need would move it.
 | **[ACP](https://agentclientprotocol.com/) as a control plane** | A permission request is answered from a list of `optionId`s the *agent* supplied; there is no amendment or deferral; a pending request dies with the client process; `rawInput` is arbitrary JSON a field-level gate cannot bind to; and the client's filesystem and terminal are not a sandbox. Recording such a session is supported → [observing an agent you do not run](@/docs/interop.md#observing-an-agent-you-do-not-run) |
 | **Per-capability aggregates as a plane query** | An export carries every record, so each effect's `outbound_bytes` joins to its run's `capability` as a distribution, which a fixed vector of totals cannot give. `count_by_outcome` and `waiting_runs` each answer an operator verb; a baseline names nothing anybody does next. What would change this: a figure an operator acts on *in the plane* that an export cannot supply |
 | **The operator verbs on the MCP tool list** | Who is acting comes from the request's identity, never from its body, and a tool call is arguments — a projection puts the actor there and retires four-eyes. Every operator route already carries its own `api:` capability over HTTP |
-| **A rate-limit wait the runtime takes by suspending** | A replayed failure is rebuilt from the recorded message, so a window handed to a skill as a typed value would be a branch input present live and absent on replay. `Retry-After` is honoured up to `RetryPolicy::max_advice` (60 s); a longer wait is a skill's, via `cx.sleep()` with a declared window |
+| **A rate-limit wait the runtime takes by suspending** | A suspension inside the retry loop holds a worker and adds an ordered read to every strict cursor, and the peer's window is not a field of the recorded failure. `Retry-After` is honoured up to `RetryPolicy::max_advice` (60 s); a longer wait is a skill's, via `cx.sleep()` with a declared window |
+| **Proving a policy set rather than testing it** | Quantifying over `context.args` needs a declared argument shape per effect kind, which means one Cedar action per kind — a change to the stored action vocabulary. `agentplane policy check` re-derives recorded verdicts, and a bundle loaded with a schema refuses a rule no request can reach |
 | **A curated event type between the journal and the wire** | `Runtime::journal()` plus `JournalStore::read(run, from)` is already a seq-cursored, reconnect-safe stream, and a third vocabulary would drift from both. Live deltas (`ModelCall::streaming_to`) stay advisory and unjournaled, because a durable delta stream is a second truth beside the terminal `Completion` |
 
 ### Deferred
-
-**Symbolic policy analysis.** Cedar can *prove* a policy set cannot widen access
-rather than test it — the check that catches a guarded rule reading an
-attribute no request carries, which never matches rather than erroring. The
-prover and its solver are released and work. *Waiting on:* a schema. A universal
-one is not expressible — `context.args` is caller data of arbitrary shape and
-Cedar records are closed — and a per-deployment one needs a vocabulary decision
-first, since `effect:perform` spans every effect kind.
 
 **Serving [ACS](https://github.com/GenAI-Security-Project/agent-control-standard)
 as a Guardian** — so agents this runtime does not execute can be governed by a

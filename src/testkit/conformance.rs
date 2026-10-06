@@ -970,6 +970,7 @@ pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
         phase: Phase::Forward,
         kind: "reply".to_owned(),
         correlation: vec![CorrelationKey::new("order", id.to_owned())],
+        from: None,
     };
 
     // ── A delivered payload is shed at unsubscribe, and dedup survives ─────
@@ -1006,22 +1007,22 @@ pub async fn event_erasure(store: Arc<dyn crate::case::EventStore>) {
          between claim and resume — stripping must wait for the unsubscribe"
     );
 
+    // The unsubscribe consumes the claim: the journal holds the delivered
+    // copy, the buffer keeps only the `(source, id)` identity, and the wait
+    // asking again gets nothing — not the message a second time, and not its
+    // stripped husk.
     store.unsubscribe(run, effect).await.expect("unsubscribe");
     store
         .subscribe(&sub(run, effect, "A-1"), at(1_004))
         .await
         .expect("resubscribe");
-    let after = store
-        .claim_for(&sub(run, effect, "A-1"), at(1_005))
-        .await
-        .expect("claim after the strip")
-        .expect("the row keeps its identity");
-    assert_eq!(
-        after.event.payload,
-        serde_json::Value::Null,
-        "a delivered payload outlived its delivery in the buffer — the \
-         journal holds the delivered copy, and the buffer needs only the \
-         (source, id) identity"
+    assert!(
+        store
+            .claim_for(&sub(run, effect, "A-1"), at(1_005))
+            .await
+            .expect("claim after the strip")
+            .is_none(),
+        "a consumed message was handed back to the wait that consumed it"
     );
     store.unsubscribe(run, effect).await.expect("clean up");
     assert!(
@@ -1154,6 +1155,21 @@ fn admitted_under(run: RunId, key: &str) -> Append {
             idempotency_key: Some(key.to_owned()),
             admitted_by: None,
             served_unchained: false,
+            plane_chain: false,
+        },
+    )
+}
+
+/// A run from admission to conclusion, ready to seal.
+fn whole(run: RunId) -> Vec<Append> {
+    vec![admitted(run), concluded(run, "succeeded")]
+}
+
+fn note(run: RunId) -> Append {
+    Append::new(
+        run,
+        RecordKind::Note {
+            text: "probe".into(),
         },
     )
 }
@@ -1171,6 +1187,7 @@ fn admitted(run: RunId) -> Append {
             idempotency_key: None,
             admitted_by: None,
             served_unchained: false,
+            plane_chain: false,
         },
     )
 }
@@ -1200,6 +1217,8 @@ fn started(run: RunId, key: EffectKey) -> Append {
             backoff_ms: 0,
             outbound_label: None,
             outbound_bytes: None,
+            content_rules: None,
+            credential: None,
         },
     )
     .step(StepId(0))
@@ -1217,7 +1236,12 @@ fn key(n: u8) -> EffectKey {
     )
 }
 
-/// Run every check.
+/// Run every check that a plain factory can drive.
+///
+/// That a store keeps a restored append's written bytes as they stand and
+/// reads them back through its upcaster is [`check_upcasting`]'s, which this
+/// does not run, because it needs a store built with an upcaster and an older
+/// export; a backend that can be a restore's target runs both.
 ///
 /// # Panics
 ///
@@ -1263,7 +1287,211 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     retiring_a_key_frees_it_and_leaves_the_run(fresh, &mut r).await;
     the_waiting_listing_follows_the_last_record(fresh, &mut r).await;
     one_producers_runs_are_listed_apart(fresh, &mut r).await;
+    the_log_places_each_run_in_seal_order(fresh, &mut r).await;
+    inclusion_at_a_past_size_verifies_against_that_checkpoint(fresh, &mut r).await;
+    the_id_walk_does_not_move_under_writes(fresh, &mut r).await;
+    only_a_concluded_run_is_sealed(fresh, &mut r).await;
     r
+}
+
+/// **Only a run whose last record is its conclusion is sealed.**
+///
+/// A seal is a leaf in the log: sealing a run with no records commits the zero
+/// digest, and sealing one mid-flight freezes a history that never ended.
+async fn only_a_concluded_run_is_sealed(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        return;
+    };
+    if store.seal(run, lease.epoch, "succeeded").await.is_ok() {
+        r.record("seal", "a run with no records was sealed".to_owned());
+    }
+    let _ = store.append(lease.epoch, vec![admitted(run)]).await;
+    if store.seal(run, lease.epoch, "succeeded").await.is_ok() {
+        r.record(
+            "seal",
+            "a run whose last record is not its conclusion was sealed".to_owned(),
+        );
+    }
+    match store.checkpoint().await {
+        Ok(cp) if cp.size == 0 => {}
+        Ok(cp) => r.record(
+            "seal",
+            format!("a refused seal entered the log: size {}", cp.size),
+        ),
+        Err(e) => r.record("seal", format!("checkpoint failed: {e}")),
+    }
+    let _ = store
+        .append(lease.epoch, vec![concluded(run, "succeeded")])
+        .await;
+    if let Err(e) = store.seal(run, lease.epoch, "succeeded").await {
+        r.record("seal", format!("a concluded run was refused its seal: {e}"));
+    }
+}
+
+/// **`runs_by_id` pages every run once, in id order, however runs write.**
+async fn the_id_walk_does_not_move_under_writes(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        if store
+            .append(lease.epoch, vec![admitted(run)])
+            .await
+            .is_err()
+        {
+            return;
+        }
+        runs.push((run, lease.epoch));
+    }
+    let mut expected: Vec<RunId> = runs.iter().map(|(run, _)| *run).collect();
+    expected.sort_by_key(ToString::to_string);
+
+    let first = store.runs_by_id(None, 2).await;
+    // The first page's head writes again before the second page is asked.
+    if let Some(&(run, epoch)) = runs.iter().find(|(run, _)| *run == expected[0]) {
+        let _ = store.append(epoch, vec![note(run)]).await;
+    }
+    let second = match &first {
+        Ok(page) => store.runs_by_id(page.last().copied(), 2).await,
+        Err(_) => Ok(Vec::new()),
+    };
+    match (first, second) {
+        (Ok(a), Ok(b)) if a == expected[..2] && b == expected[2..] => {}
+        (Ok(a), Ok(b)) => r.record(
+            "id walk",
+            format!("runs_by_id paged {a:?} then {b:?}, the runs by id are {expected:?}"),
+        ),
+        (Err(e), _) | (_, Err(e)) => r.record("id walk", format!("runs_by_id failed: {e}")),
+    }
+}
+
+/// **`log_positions` answers what `inclusion_proof` does, for any set of runs.**
+///
+/// Asked in an order unrelated to the log's, with an open run and an unknown
+/// one among them: each sealed run at its seal-order index with its chain head
+/// as the leaf, the others `None`, in the order asked.
+async fn the_log_places_each_run_in_seal_order(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let mut sealed = Vec::new();
+    for _ in 0..3 {
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        let _ = store.append(lease.epoch, whole(run)).await;
+        let Ok(head) = store.seal(run, lease.epoch, "succeeded").await else {
+            return;
+        };
+        sealed.push((run, head));
+    }
+    let open = RunId::generate();
+    let Ok(lease) = store.acquire(open, "conformance", LEASE).await else {
+        return;
+    };
+    let _ = store.append(lease.epoch, vec![admitted(open)]).await;
+
+    let asked = [
+        sealed[2].0,
+        open,
+        sealed[0].0,
+        RunId::generate(),
+        sealed[1].0,
+    ];
+    let expected = vec![
+        Some((2, sealed[2].1)),
+        None,
+        Some((0, sealed[0].1)),
+        None,
+        Some((1, sealed[1].1)),
+    ];
+    match store.log_positions(&asked).await {
+        Ok(found) if found == expected => {}
+        Ok(found) => r.record(
+            "log positions",
+            format!("log_positions answered {found:?}, the log holds {expected:?}"),
+        ),
+        Err(e) => r.record("log positions", format!("log_positions failed: {e}")),
+    }
+}
+
+/// **A proof at a past size verifies against the checkpoint of that size.**
+///
+/// Three runs sealed, the checkpoint taken, two more sealed: the first run's
+/// path at the old size holds against the old root, a run sealed after it has
+/// none at that size, and a size past the log is refused.
+async fn inclusion_at_a_past_size_verifies_against_that_checkpoint(
+    fresh: Factory<'_>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let store = fresh().await;
+    let mut sealed = Vec::new();
+    let mut then = None;
+    for at in 0..5 {
+        if at == 3 {
+            let Ok(checkpoint) = store.checkpoint().await else {
+                return;
+            };
+            then = Some(checkpoint);
+        }
+        let run = RunId::generate();
+        let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+            return;
+        };
+        let _ = store.append(lease.epoch, whole(run)).await;
+        if store.seal(run, lease.epoch, "succeeded").await.is_err() {
+            return;
+        }
+        sealed.push(run);
+    }
+    let Some(then) = then else { return };
+    match store.inclusion_proof_at(sealed[1], then.size).await {
+        Ok(Some(inc))
+            if inc.size == then.size
+                && crate::core::merkle::verify_inclusion(
+                    crate::core::merkle::leaf_hash(&inc.seal),
+                    usize::try_from(inc.index).unwrap_or(usize::MAX),
+                    usize::try_from(then.size).unwrap_or(0),
+                    &inc.proof,
+                    &then.root,
+                ) => {}
+        Ok(found) => r.record(
+            "past inclusion",
+            format!(
+                "a proof at size {} did not verify against that root: {found:?}",
+                then.size
+            ),
+        ),
+        Err(e) => r.record("past inclusion", format!("inclusion_proof_at failed: {e}")),
+    }
+    match store.inclusion_proof_at(sealed[4], then.size).await {
+        Ok(None) => {}
+        other => r.record(
+            "past inclusion",
+            format!(
+                "a run sealed after size {} was proved at it: {other:?}",
+                then.size
+            ),
+        ),
+    }
+    if store
+        .inclusion_proof_at(sealed[0], then.size + 100)
+        .await
+        .is_ok()
+    {
+        r.record(
+            "past inclusion",
+            "a size past the log was answered rather than refused".to_owned(),
+        );
+    }
 }
 
 /// **One producer's runs are listed apart, and the listing follows activity.**
@@ -2154,11 +2382,7 @@ async fn the_log_only_grows(fresh: Factory<'_>, r: &mut Report) {
             r.record("fencing", "acquire() failed on a fresh run");
             return;
         };
-        if store
-            .append(lease.epoch, vec![admitted(run)])
-            .await
-            .is_err()
-        {
+        if store.append(lease.epoch, whole(run)).await.is_err() {
             r.record("merkle-log", "append failed under a fresh lease");
             return;
         }
@@ -2857,11 +3081,7 @@ async fn a_stale_epoch_cannot_seal(fresh: Factory<'_>, r: &mut Report) {
     let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
         return;
     };
-    if store
-        .append(lease.epoch, vec![admitted(run)])
-        .await
-        .is_err()
-    {
+    if store.append(lease.epoch, whole(run)).await.is_err() {
         return;
     }
     if store.seal(run, lease.epoch + 7, "succeeded").await.is_ok() {
@@ -3137,6 +3357,16 @@ async fn a_sealed_run_refuses_appends(fresh: Factory<'_>, r: &mut Report) {
         r.record("seal", format!("append before seal failed: {e}"));
         return;
     }
+    if let Err(e) = store
+        .append(lease.epoch, vec![concluded(run, "succeeded")])
+        .await
+    {
+        r.record(
+            "seal",
+            format!("the conclusion before the seal failed: {e}"),
+        );
+        return;
+    }
     if let Err(e) = store.seal(run, lease.epoch, "succeeded").await {
         r.record("seal", format!("seal failed: {e}"));
         return;
@@ -3281,6 +3511,128 @@ async fn read_starts_where_it_is_told(fresh: Factory<'_>, r: &mut Report) {
             }
         }
         Err(e) => r.record("chaining", format!("read_page(limit=2) failed: {e}")),
+    }
+}
+
+/// Produces a store with no history in it that reads through the upcaster it
+/// is handed.
+pub type UpcastingFactory<'a> = &'a (
+        dyn Fn(
+    Arc<dyn crate::journal::Upcaster>,
+) -> std::pin::Pin<Box<dyn Future<Output = Arc<dyn JournalStore>> + Send>>
+            + Sync
+    );
+
+/// Run the checks that need a store built with an upcaster.
+///
+/// `older` is an export one record shape older than this build writes, as
+/// [`older_shape`](super::older_shape::older_shape) crafts it; no build can
+/// write one, so the battery is handed it rather than producing it.
+///
+/// # Panics
+///
+/// Only if the factory itself fails.
+pub async fn check_upcasting(fresh: UpcastingFactory<'_>, older: &str) -> Report {
+    let mut r = Report::default();
+    an_older_journal_is_lifted_through_the_store_s_upcaster(fresh, older, &mut r).await;
+    r
+}
+
+/// **A store reads what it holds through its upcaster, and the bytes stay as
+/// written.**
+///
+/// Restored into a store built with the upcaster that lifts the older shape,
+/// every record reads back lifted on both read paths — by run and by case —
+/// with its bytes and hash the ones the export carries. A store that read
+/// through this build's own shapes regardless would refuse its own history
+/// the first time a shape moved.
+async fn an_older_journal_is_lifted_through_the_store_s_upcaster(
+    fresh: UpcastingFactory<'_>,
+    older: &str,
+    r: &mut Report,
+) {
+    use super::older_shape::LiftsTheOlderShape;
+    const INVARIANT: &str = "reads lift through the store's upcaster";
+
+    r.checked += 1;
+    let lifts = Arc::new(LiftsTheOlderShape);
+    let store = fresh(lifts.clone()).await;
+    let lines: Vec<serde_json::Value> = older
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let written: Vec<(&str, &str)> = lines
+        .iter()
+        .filter(|l| l.get("kind").is_none())
+        .filter_map(|l| Some((l.get("raw")?.as_str()?, l.get("hash")?.as_str()?)))
+        .collect();
+    let Some(run) = lines
+        .iter()
+        .find(|l| l["kind"] == "agentplane.export.run")
+        .and_then(|l| l["run"].as_str())
+        .and_then(|s| RunId::parse(s).ok())
+    else {
+        r.record(INVARIANT, "the older export names no run");
+        return;
+    };
+
+    if let Err(e) = crate::export::from_jsonl_with(
+        &store,
+        None,
+        std::io::Cursor::new(older.as_bytes()),
+        lifts.as_ref(),
+    )
+    .await
+    {
+        r.record(
+            INVARIANT,
+            format!("restoring the older export into a store that lifts it failed: {e}"),
+        );
+        return;
+    }
+
+    let records = match store.read(run, 1).await {
+        Ok(records) => records,
+        Err(e) => {
+            r.record(INVARIANT, format!("read refused the older records: {e}"));
+            return;
+        }
+    };
+    let as_written = |records: &[Record]| {
+        records.len() == written.len()
+            && records.iter().zip(&written).all(|(record, (raw, hash))| {
+                record.raw() == raw.as_bytes() && record.hash.to_string() == *hash
+            })
+    };
+    if !as_written(&records) {
+        r.record(
+            INVARIANT,
+            "read returned bytes or hashes other than the ones the export carried",
+        );
+    }
+    let lifted = |records: &[Record]| {
+        records
+            .iter()
+            .any(|rec| matches!(rec.kind(), RecordKind::StepStarted { skill } if !skill.is_empty()))
+    };
+    if !lifted(&records) {
+        r.record(INVARIANT, "read returned no lifted StepStarted record");
+    }
+
+    let Some(case) = records.iter().find_map(|rec| rec.body.case) else {
+        r.record(INVARIANT, "the older export stamps no record with a case");
+        return;
+    };
+    match store.case_history(case, 100).await {
+        Ok(stamped) if lifted(&stamped) => {}
+        Ok(_) => r.record(
+            INVARIANT,
+            "case_history returned no lifted StepStarted record",
+        ),
+        Err(e) => r.record(
+            INVARIANT,
+            format!("case_history refused the older records: {e}"),
+        ),
     }
 }
 

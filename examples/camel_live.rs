@@ -52,8 +52,8 @@ use serde_json::{Value, json};
 /// they are separately *chosen* — the privileged one writes an authorization
 /// order and is worth paying for, the quarantined one copies fields out of
 /// hostile text and is not.
-const PRIVILEGED: &str = "gpt-4o";
-const QUARANTINED: &str = "gpt-4o-mini";
+const PRIVILEGED: &str = "gpt-5";
+const QUARANTINED: &str = "gpt-5-mini";
 
 /// The line the attacker wrote. Nothing matches on it at runtime; it is here
 /// so the assertions below can ask which model was shown it.
@@ -158,8 +158,8 @@ spec:
       and that order number.
   security: { max_sensitivity_egress: internal }
   models:
-    privileged:  { provider: openai, model: gpt-4o }
-    quarantined: { provider: openai, model: gpt-4o-mini }
+    privileged:  { provider: openai, model: gpt-5 }
+    quarantined: { provider: openai, model: gpt-5-mini }
   tools:
     - ref: tool://inbox/fetch
       mutates: false
@@ -282,8 +282,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1. planned run  → {:?}", out.status);
     println!("   spend         → {} tokens", out.spend().tokens);
     println!(
-        "   refunds       → {:?}",
-        desk.refunds.lock().expect("refunds")
+        "   refunds       → {}",
+        Value::Array(desk.refunds.lock().expect("refunds").clone())
     );
 
     // ── 2. What each model was shown ────────────────────────────────────────

@@ -48,7 +48,7 @@ spec:
       pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
     quarantined:
       provider: anthropic
-      model: claude-haiku-4-5-20251001
+      model: claude-haiku-4-5
       pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125 }
   output:
     schema:

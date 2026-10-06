@@ -14,6 +14,8 @@ mod calendar;
 pub mod canon;
 mod case;
 mod cloudevent;
+mod content;
+pub use content::{ContentRefusal, ContentVerdict, joined as content_joined};
 mod doubt;
 mod effect;
 pub(crate) mod error;
@@ -33,7 +35,7 @@ mod signature;
 mod skill;
 mod task;
 mod tenant;
-mod visible;
+pub mod visible;
 
 pub use budget::{Budget, BudgetExceeded, Consumed, Ledger, Spend};
 pub use calendar::{Calendar, CalendarError, WallClock};
@@ -43,11 +45,11 @@ pub use cloudevent::{
     is_structured_media_type as is_cloudevent_media_type,
 };
 pub use signature::{
-    CheckpointSigner, DOMAIN_MANIFEST, DOMAIN_PROVENANCE, DOMAIN_RECORD, KeyId, KeySignature,
-    SignError, SignatureError, Signer, Verifier, signing_hash,
+    CheckpointSigner, DOMAIN_GRADER_VERDICT, DOMAIN_MANIFEST, DOMAIN_PROVENANCE, DOMAIN_RECORD,
+    KeyId, KeySignature, SignError, SignatureError, Signer, Verifier, signing_hash,
 };
 mod quorum;
-pub use quorum::{Outcome as QuorumOutcome, Quorum, QuorumError, Tally, Verdict};
+pub use quorum::{PanelOutcome, Quorum, QuorumError, Tally, Verdict};
 
 mod egress;
 pub use egress::{Egress, EgressError};
@@ -61,8 +63,8 @@ pub use case::{
 };
 pub use doubt::{Assertion, Doubt, QuarantineDecision, Undecided};
 pub use effect::{
-    AnyEffect, DeclaredOutput, Effect, EffectDescriptor, GenAiRequest, GenAiResponse, GroupOutcome,
-    Reconciliation, Recovery,
+    AnyEffect, CredentialBinding, DeclaredOutput, Effect, EffectDescriptor, GenAiRequest,
+    GenAiResponse, GroupOutcome, Reconciliation, Recovery,
 };
 #[cfg(any(feature = "a2a-server", feature = "mcp-server"))]
 pub(crate) use error::withheld_fault;
@@ -80,21 +82,22 @@ pub use id::{
 };
 pub use identity::{Delegation, DelegationError, MAX_DELEGATION_DEPTH, Principal, Scope};
 pub use label::{
-    Label, ProtectedField, Release, ReleaseMark, ReleaseScope, Sensitivity, SourceId, Tainted,
-    Trust,
+    Label, ProtectedField, Release, ReleaseMark, ReleaseScope, Sensitivity, SourceId, SubjectRef,
+    Tainted, Trust,
 };
 pub use observe::{ObservedDecision, ObservedStatus, ObservedStep};
 pub use operator::{Basis, Operator, OperatorError};
 pub use plan::{ArgSource, Collaboration, PlanError, PlanIR, PlanNode, Topology};
 pub use policy::{
-    ACTION_ADMIT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE, ACTIONS, DenyAll,
-    PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
+    ACTION_ADMIT, ACTION_CONTENT, ACTION_DECLARED, ACTION_EGRESS, ACTION_PERFORM, ACTION_RELEASE,
+    ACTIONS, DenyAll, PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest,
+    PrincipalKind,
 };
 pub use retry::{RetryPolicy, retry_after_seconds};
 pub use secret::Secret;
 pub use skill::{Capability, Compensation, Outcome, Skill, SkillDescriptor};
 pub use task::{
-    ClaimError, Decided, Decision, Expiry, Justification, MixedScript, OnExpiry, Priority,
-    Rendering, Task, TaskId, TaskSpec, TaskState, Withheld,
+    ClaimError, Decided, Decision, DeclaredReach, Expiry, Justification, MixedScript, OnExpiry,
+    Priority, Reach, ReachGrant, Rendering, Task, TaskId, TaskSpec, TaskState, Withheld,
 };
 pub use tenant::{TenantError, TenantId, erasure_scope};

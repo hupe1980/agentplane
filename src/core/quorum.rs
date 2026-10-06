@@ -26,7 +26,7 @@
 //! the case where the judgement is genuinely hard. Silently resolving it is how
 //! a system converts *we do not know* into *approved*.
 //!
-//! [`Outcome::NoQuorum`] therefore carries the tally and offers no accessor that
+//! [`PanelOutcome::NoQuorum`] therefore carries the tally and offers no accessor that
 //! resolves it. There is no `majority()`, deliberately: the caller escalates,
 //! because there is nothing else the type lets them do.
 
@@ -132,28 +132,42 @@ impl Quorum {
         self.lenses.iter().map(String::as_str)
     }
 
-    /// Tally judgements into a decision, or into an escalation.
+    /// Tally judgements, each named by the lens that gave it, into a decision
+    /// or an escalation.
     ///
-    /// Verdicts are expected one per lens, in lens order. A panel that returned
-    /// fewer than it was asked for has not reached quorum — a missing judgement
-    /// is not an abstention that the others can outvote, it is evidence the
-    /// panel did not run.
-    #[must_use]
-    pub fn tally(&self, verdicts: &[Verdict]) -> Outcome {
-        let passed = verdicts.iter().filter(|&&v| v == Verdict::Pass).count();
-        let failed = verdicts.iter().filter(|&&v| v == Verdict::Fail).count();
+    /// A panel that returned fewer than it was asked for has not reached
+    /// quorum — a missing judgement is not an abstention the others can
+    /// outvote, it is evidence the panel did not run.
+    ///
+    /// # Errors
+    ///
+    /// [`QuorumError::NotALens`] for a judgement from a lens this panel does
+    /// not declare, and [`QuorumError::JudgedTwice`] for a lens counted twice:
+    /// either would let one judge's answer stand in for another's.
+    pub fn tally(&self, verdicts: &[(&str, Verdict)]) -> Result<PanelOutcome, QuorumError> {
+        let mut seen = BTreeSet::new();
+        for (lens, _) in verdicts {
+            if !self.lenses.iter().any(|l| l == lens) {
+                return Err(QuorumError::NotALens((*lens).to_owned()));
+            }
+            if !seen.insert(*lens) {
+                return Err(QuorumError::JudgedTwice((*lens).to_owned()));
+            }
+        }
+        let passed = verdicts.iter().filter(|(_, v)| *v == Verdict::Pass).count();
+        let failed = verdicts.iter().filter(|(_, v)| *v == Verdict::Fail).count();
         let tally = Tally {
             passed: u32::try_from(passed).unwrap_or(u32::MAX),
             failed: u32::try_from(failed).unwrap_or(u32::MAX),
             asked: self.of(),
         };
         if tally.passed >= self.need {
-            return Outcome::Reached(Verdict::Pass, tally);
+            return Ok(PanelOutcome::Reached(Verdict::Pass, tally));
         }
         if tally.failed >= self.need {
-            return Outcome::Reached(Verdict::Fail, tally);
+            return Ok(PanelOutcome::Reached(Verdict::Fail, tally));
         }
-        Outcome::NoQuorum(tally)
+        Ok(PanelOutcome::NoQuorum(tally))
     }
 }
 
@@ -176,17 +190,17 @@ pub struct Tally {
 /// The panel's decision, or its failure to reach one.
 ///
 /// Note what is missing: there is no way to extract a decision from
-/// [`NoQuorum`](Outcome::NoQuorum). That is the point. A panel that could not
+/// [`NoQuorum`](PanelOutcome::NoQuorum). That is the point. A panel that could not
 /// agree is the signal a person should look, and an accessor returning "whoever
 /// had more votes" would turn the one useful thing this mechanism produces back
 /// into a confident answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
+pub enum PanelOutcome {
     Reached(Verdict, Tally),
     NoQuorum(Tally),
 }
 
-impl Outcome {
+impl PanelOutcome {
     /// The decision, if there was one.
     #[must_use]
     pub const fn decided(&self) -> Option<Verdict> {
@@ -228,6 +242,12 @@ pub enum QuorumError {
 
     #[error("a lens with no name cannot be a distinct angle")]
     UnnamedLens,
+
+    #[error("a judgement from '{0}', which is not a lens of this panel")]
+    NotALens(String),
+
+    #[error("lens '{0}' was judged twice; one judge counted twice is not two judges")]
+    JudgedTwice(String),
 }
 
 #[cfg(test)]
@@ -297,7 +317,13 @@ mod tests {
     #[test]
     fn an_agreeing_panel_decides() {
         let quorum = q(2, &["a", "b", "c"]);
-        let out = quorum.tally(&[Verdict::Pass, Verdict::Pass, Verdict::Fail]);
+        let out = quorum
+            .tally(&[
+                ("a", Verdict::Pass),
+                ("b", Verdict::Pass),
+                ("c", Verdict::Fail),
+            ])
+            .unwrap();
         assert_eq!(out.decided(), Some(Verdict::Pass));
         assert_eq!(out.tally().passed, 2);
         assert_eq!(out.tally().failed, 1);
@@ -306,7 +332,13 @@ mod tests {
     #[test]
     fn a_panel_agreeing_to_refuse_also_decides() {
         let quorum = q(2, &["a", "b", "c"]);
-        let out = quorum.tally(&[Verdict::Fail, Verdict::Fail, Verdict::Pass]);
+        let out = quorum
+            .tally(&[
+                ("a", Verdict::Fail),
+                ("b", Verdict::Fail),
+                ("c", Verdict::Pass),
+            ])
+            .unwrap();
         assert_eq!(out.decided(), Some(Verdict::Fail));
     }
 
@@ -314,14 +346,20 @@ mod tests {
     #[test]
     fn a_split_panel_decides_nothing() {
         let quorum = q(3, &["a", "b", "c"]);
-        let out = quorum.tally(&[Verdict::Pass, Verdict::Pass, Verdict::Fail]);
+        let out = quorum
+            .tally(&[
+                ("a", Verdict::Pass),
+                ("b", Verdict::Pass),
+                ("c", Verdict::Fail),
+            ])
+            .unwrap();
         assert_eq!(
             out.decided(),
             None,
             "2 of 3 where 3 was required is a disagreement, and reporting the \
              majority converts 'we do not know' into 'approved'"
         );
-        assert!(matches!(out, Outcome::NoQuorum(_)));
+        assert!(matches!(out, PanelOutcome::NoQuorum(_)));
         assert_eq!(out.tally().passed, 2, "the tally is still reported");
     }
 
@@ -329,7 +367,7 @@ mod tests {
     #[test]
     fn a_short_panel_does_not_reach_quorum() {
         let quorum = q(2, &["a", "b", "c"]);
-        let out = quorum.tally(&[Verdict::Pass]);
+        let out = quorum.tally(&[("a", Verdict::Pass)]).unwrap();
         assert_eq!(out.decided(), None);
         assert_eq!(out.tally().asked, 3, "the shortfall is visible");
     }
@@ -337,7 +375,22 @@ mod tests {
     #[test]
     fn an_empty_panel_decides_nothing() {
         let quorum = q(2, &["a", "b", "c"]);
-        assert_eq!(quorum.tally(&[]).decided(), None);
+        assert_eq!(quorum.tally(&[]).unwrap().decided(), None);
+    }
+
+    /// One judge counted twice is not two judges.
+    #[test]
+    fn a_lens_judged_twice_is_refused() {
+        let quorum = q(2, &["a", "b", "c"]);
+        assert_eq!(
+            quorum.tally(&[("a", Verdict::Pass), ("a", Verdict::Pass)]),
+            Err(QuorumError::JudgedTwice("a".to_owned())),
+            "four passes over three lenses must not reach a quorum"
+        );
+        assert_eq!(
+            quorum.tally(&[("a", Verdict::Pass), ("z", Verdict::Pass)]),
+            Err(QuorumError::NotALens("z".to_owned()))
+        );
     }
 
     #[test]

@@ -29,7 +29,9 @@ use crate::core::{CaseId, Digest, RunId, Timestamp};
 ///
 /// Inbound messages do not know run ids. They carry document numbers, meter
 /// ids, order references — so that is what correlation matches on.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct CorrelationKey {
     /// What kind of identifier this is, e.g. `"document-number"`, `"meter"`.
@@ -53,7 +55,7 @@ impl std::fmt::Display for CorrelationKey {
 }
 
 /// Where a case is in its life.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CaseStatus {
     Open,
@@ -131,6 +133,7 @@ impl CaseStatus {
 ///
 /// [`Operator`]: crate::core::Operator
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LegalHold {
     /// When the hold was placed. Supplied by the caller, never read from a
     /// clock here, for the reason every other lifecycle instant in this crate
@@ -146,7 +149,8 @@ pub struct LegalHold {
 }
 
 /// A long-lived, correlated business fact.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct Case {
     pub id: CaseId,
     /// Opaque to the engine — `"gpke.supplier-switch"` means nothing here.
@@ -154,6 +158,7 @@ pub struct Case {
     pub status: CaseStatus,
     pub correlation: Vec<CorrelationKey>,
     /// Schema-validated per kind by the adapter; opaque to the engine.
+    #[schemars(extend("x-agentplane-holds" = "The case's state as its adapter wrote it, validated per kind by the adapter; the plane does not read it."))]
     pub state: Value,
     /// Which revision of [`state`](Self::state) this is.
     ///
@@ -161,6 +166,7 @@ pub struct Case {
     /// [`CaseVersion`].
     pub version: CaseVersion,
     #[serde(with = "time::serde::rfc3339")]
+    #[schemars(with = "String")]
     pub opened_at: Timestamp,
     pub runs: Vec<RunId>,
 }
@@ -188,7 +194,18 @@ pub struct Case {
 /// application logic for the same reason exactly-once is: application logic can
 /// be bypassed by the next caller, a constraint cannot.
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize, Hash,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    Hash,
+    schemars::JsonSchema,
 )]
 pub struct CaseVersion(pub u64);
 
@@ -257,7 +274,7 @@ impl DeadlineSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeadlineState {
     Pending,
@@ -372,7 +389,8 @@ impl DeadlineState {
 /// [`CaseStore::breached`].
 ///
 /// [`CaseStore::breached`]: crate::case::CaseStore::breached
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct BreachNote {
     /// Who accounted for it, and what established the name — an
     /// authenticated credential, or an assertion by whoever could open the
@@ -384,6 +402,7 @@ pub struct BreachNote {
     /// nothing to add has still answered the question the listing asked.
     pub note: String,
     #[serde(with = "time::serde::rfc3339")]
+    #[schemars(with = "String")]
     pub at: Timestamp,
 }
 
@@ -396,16 +415,19 @@ pub struct BreachNote {
 /// would silently move a legally binding instant under an audit. The
 /// `calendar_digest` records which calendar version produced it, so a shifted
 /// rule is *visible* rather than retroactive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct Deadline {
     pub case: CaseId,
     /// Unique within the case.
     pub name: String,
     #[serde(with = "time::serde::rfc3339")]
+    #[schemars(with = "String")]
     pub resolved_at: Timestamp,
     /// Which calendar version produced `resolved_at`.
     pub calendar_digest: Digest,
     #[serde(default, with = "time::serde::rfc3339::option")]
+    #[schemars(with = "Option<String>")]
     pub warn_at: Option<Timestamp>,
     pub state: DeadlineState,
     /// Who accounted for the breach, once somebody has.

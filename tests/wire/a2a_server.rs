@@ -675,6 +675,80 @@ async fn push_configuration_crud_is_authorized_and_redacted() {
     assert_eq!(err_code(&missing), i64::from(code::TASK_NOT_FOUND));
 }
 
+/// **A task's push registrations are bounded, and so is an id.** Each one is
+/// a delivery per record, so a peer registering without limit multiplies the
+/// plane's outbound traffic by its own choice. Replacing a held id stays open.
+#[tokio::test]
+async fn push_registrations_are_bounded_per_task_and_by_id_length() {
+    let f = fixture();
+    let (_, sent) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = sent["result"]["task"]["id"].as_str().unwrap();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+    let create = |id: &str| {
+        json!({
+            "taskId": task,
+            "id": id,
+            "url": "https://client.example/hook",
+        })
+    };
+
+    let (_, long) = send(
+        &router,
+        rpc(
+            "CreateTaskPushNotificationConfig",
+            &create(&"x".repeat(129)),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&long), i64::from(code::INVALID_PARAMS), "{long:#}");
+
+    for n in 0..10 {
+        let (_, created) = send(
+            &router,
+            rpc(
+                "CreateTaskPushNotificationConfig",
+                &create(&format!("cfg-{n}")),
+                Some("peer-a"),
+            ),
+        )
+        .await;
+        assert_eq!(created["result"]["id"], format!("cfg-{n}"), "{created:#}");
+    }
+    let (_, over) = send(
+        &router,
+        rpc(
+            "CreateTaskPushNotificationConfig",
+            &create("cfg-10"),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(err_code(&over), i64::from(code::INVALID_PARAMS), "{over:#}");
+    let (_, replaced) = send(
+        &router,
+        rpc(
+            "CreateTaskPushNotificationConfig",
+            &create("cfg-3"),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        replaced["result"]["id"], "cfg-3",
+        "replacing a held id must stay open at the ceiling: {replaced:#}"
+    );
+}
+
 /// A caller may not register into the namespace an operator destination owns.
 ///
 /// Both share one push store and are told apart by an id prefix. A caller
@@ -1022,37 +1096,65 @@ async fn a_receiver_answering_500_is_rejected_and_the_cursor_does_not_advance() 
 }
 
 /// Every method authenticates, and the card is the only route that does not.
+/// A refused credential is HTTP 401 with a bearer challenge, as A2A requires.
 #[tokio::test]
 async fn every_method_is_authenticated() {
     let f = fixture();
     let router = f.router();
 
+    let challenged = router
+        .clone()
+        .oneshot(rpc(
+            "GetTask",
+            &json!({"id": "01JRJ00000000000000000000A"}),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        challenged
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer"),
+        "a 401 without a challenge does not say how to authenticate"
+    );
+
     for (method, params) in [
         ("SendMessage", json!({"message": text("check this")})),
-        ("GetTask", json!({"id": "01JRJ0000000000000000000000"})),
-        ("CancelTask", json!({"id": "01JRJ0000000000000000000000"})),
+        ("GetTask", json!({"id": "01JRJ00000000000000000000A"})),
+        ("CancelTask", json!({"id": "01JRJ00000000000000000000A"})),
+        // Authentication comes before the id is read: a malformed id must
+        // not earn an unauthenticated caller an answer about tasks.
+        ("GetTask", json!({"id": "not-a-task"})),
+        ("CancelTask", json!({"id": "not-a-task"})),
         ("GetExtendedAgentCard", json!({})),
         (
             "CreateTaskPushNotificationConfig",
-            json!({"taskId": "01JRJ0000000000000000000000", "url": "https://client.example/hook"}),
+            json!({"taskId": "01JRJ00000000000000000000A", "url": "https://client.example/hook"}),
         ),
         (
             "GetTaskPushNotificationConfig",
-            json!({"taskId": "01JRJ0000000000000000000000", "id": "cfg"}),
+            json!({"taskId": "01JRJ00000000000000000000A", "id": "cfg"}),
         ),
         (
             "ListTaskPushNotificationConfigs",
-            json!({"taskId": "01JRJ0000000000000000000000"}),
+            json!({"taskId": "01JRJ00000000000000000000A"}),
         ),
         (
             "DeleteTaskPushNotificationConfig",
-            json!({"taskId": "01JRJ0000000000000000000000", "id": "cfg"}),
+            json!({"taskId": "01JRJ00000000000000000000A", "id": "cfg"}),
         ),
     ] {
-        let (_, body) = send(&router, rpc(method, &params, None)).await;
+        let (status, body) = send(&router, rpc(method, &params, None)).await;
         assert!(
             body.get("error").is_some(),
             "{method} answered an unauthenticated caller: {body:#}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} told an unauthenticated caller something other than to authenticate"
         );
         assert!(
             body.get("result").is_none(),
@@ -2291,6 +2393,53 @@ async fn task_id_continues_the_exact_input_required_task() {
     );
 }
 
+/// **A continuation is authorized on the kind it delivers.** The task gate
+/// says the peer may continue its own task; a rule refusing it the awaited
+/// event's kind still refuses the continuation, as `POST /events` would.
+#[tokio::test]
+async fn a_continuation_is_refused_the_kind_policy_refuses() {
+    let f = continuation_fixture();
+    let router = f.router();
+    let (_, first) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": {
+                "messageId": "m-initial",
+                "role": "ROLE_USER",
+                "parts": [{"text": "begin"}]
+            }}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = first["result"]["task"]["id"]
+        .as_str()
+        .expect("task id")
+        .to_owned();
+    *f.policy.hidden_resource.lock().unwrap() = Some("a2a.task.input".to_owned());
+
+    let continuation = json!({
+        "message": {
+            "messageId": "m-followup",
+            "taskId": task,
+            "role": "ROLE_USER",
+            "parts": [{"data": {"approved": true}, "mediaType": "application/json"}]
+        }
+    });
+    let (_, refused) = send(&router, rpc("SendMessage", &continuation, Some("peer-a"))).await;
+    assert_eq!(err_code(&refused), -32600, "{refused:#}");
+    let run = RunId::parse(&task).expect("run id");
+    let last = f.store.read(run, 1).await.expect("read");
+    assert!(
+        matches!(
+            last.last().expect("records").kind(),
+            RecordKind::RunSuspended { .. }
+        ),
+        "a refused continuation must leave the task waiting"
+    );
+}
+
 /// A blocking call returns the answer as a task artifact.
 #[tokio::test]
 async fn a_blocking_call_returns_the_agents_answer() {
@@ -2786,7 +2935,7 @@ async fn a_named_tenant_is_advertised_and_required() {
 #[tokio::test]
 async fn a_peer_cannot_name_a_tenant_its_credential_does_not_hold() {
     let f = fixture(); // serves the default tenant
-    let (_, body) = send(
+    let (status, body) = send(
         &f.router(),
         // Authenticated into `globex`, asking to be served as the default.
         rpc(
@@ -2797,11 +2946,22 @@ async fn a_peer_cannot_name_a_tenant_its_credential_does_not_hold() {
     )
     .await;
 
+    // Refused as a credential, like any other this endpoint does not serve:
+    // answered 200 with a parameter error, a client reads a malformed request
+    // and retries it with the same credential.
     assert_eq!(
-        err_code(&body),
-        i64::from(code::INVALID_PARAMS),
-        "a peer authenticated into another tenant was served from this one: \
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a peer authenticated into another tenant was not refused as a credential: \
          {body:#}"
+    );
+    assert!(body.get("result").is_none(), "{body:#}");
+    // The one sentence every refused credential gets: naming the tenant tells
+    // a prober its token is valid somewhere else.
+    assert_eq!(
+        body["error"]["message"],
+        agentplane::api::AuthError::Rejected.to_string(),
+        "{body:#}"
     );
     assert_eq!(
         f.seen.lock().unwrap().len(),
@@ -3363,6 +3523,7 @@ async fn this_planes_client_cancels_a_task_on_this_planes_server() {
         &registry,
         Arc::clone(&client) as Arc<dyn agentplane::peers::PeerClient>,
         task.clone(),
+        agentplane::peers::Asker::Nobody,
     )
     .expect("a registered peer");
     let snapshot = agentplane::core::Effect::perform(&cancel)
@@ -4480,7 +4641,8 @@ async fn a_plaintext_peer_endpoint_and_card_url_are_refused() {
     use agentplane::peers::a2a::{A2aClient, Endpoint};
     use agentplane::peers::{CardClient, DiscoveryError, PeerClient, PeerId};
 
-    let client = A2aClient::new(Endpoint::new("http://peer.example/a2a")).expect("client");
+    let client =
+        A2aClient::new(Endpoint::new("http://peer.example/a2a?key=s3cret")).expect("client");
     let chain = Delegation::root(Principal::new("user:owner", Scope::root()));
     let error = client
         .send(
@@ -4497,6 +4659,11 @@ async fn a_plaintext_peer_endpoint_and_card_url_are_refused() {
         matches!(&error, agentplane::peers::PeerError::Refused { detail, .. }
             if detail.contains("not https")),
         "a plaintext peer endpoint was not refused as such: {error:?}"
+    );
+    assert!(
+        matches!(&error, agentplane::peers::PeerError::Refused { detail, .. }
+            if detail.contains("peer.example") && !detail.contains("s3cret")),
+        "the refusal names the host and nothing a URL can carry: {error:?}"
     );
     assert_eq!(
         error.disposition(),
@@ -5374,6 +5541,9 @@ impl JournalStore for CountsReads {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
+    fn seals(&self) -> bool {
+        self.inner.seals()
+    }
     fn atomic(&self) -> Option<&dyn agentplane::journal::AtomicJournal> {
         self.inner.atomic()
     }
@@ -5422,6 +5592,13 @@ impl JournalStore for CountsReads {
         older_than: agentplane::core::Timestamp,
     ) -> Result<usize, agentplane::core::StoreError> {
         self.inner.forget_admissions(older_than).await
+    }
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, agentplane::core::StoreError> {
+        self.inner.runs_by_id(after, limit).await
     }
     async fn recent_runs(
         &self,
@@ -5632,4 +5809,63 @@ async fn a_timestamp_cutoff_ends_the_listing_scan() {
         1,
         "the listing kept paging the index past a cutoff every later row is older than"
     );
+}
+
+/// **A message its agent cannot read a data subject from is invalid params,
+/// and opens no context.** The binding is resolved before the message is
+/// correlated, so a refused message leaves no `a2a.context` case behind, and
+/// the refusal is the caller's to fix rather than a server fault — on every
+/// admission site.
+#[tokio::test]
+async fn a_message_with_no_data_subject_is_invalid_params_and_opens_no_case() {
+    let manifest = Manifest::parse(&format!(
+        "{ONE_SKILL}  data_subjects: [\"$input/customer/id\"]\n"
+    ))
+    .expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let policy = Arc::new(Recording::default());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .policy(policy.clone() as Arc<dyn PolicyEngine>)
+        .agent(agentplane::runtime::Agent::new(&manifest).skill(Echoes {
+            capability: "settlement.check",
+            seen: seen.clone(),
+        }))
+        .build();
+    let f = Fixture {
+        rt,
+        store,
+        policy,
+        seen,
+        manifest,
+    };
+    for (method, configuration) in [
+        ("SendMessage", json!({})),
+        ("SendMessage", json!({ "returnImmediately": true })),
+        ("SendStreamingMessage", json!({})),
+    ] {
+        let (_, body) = send(
+            &f.router(),
+            rpc(
+                method,
+                &json!({ "message": text("go"), "configuration": configuration }),
+                Some("peer-a"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            err_code(&body),
+            i64::from(code::INVALID_PARAMS),
+            "{method} {configuration}: {body:#}"
+        );
+        assert!(
+            CaseStore::cases(f.store.as_ref(), None, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{method} {configuration}: a refused message opened a case"
+        );
+    }
+    assert!(f.seen.lock().unwrap().is_empty(), "the agent ran");
 }

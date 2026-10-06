@@ -480,11 +480,24 @@ async fn sealed_store(n: usize) -> Arc<agentplane::store::RedbStore> {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 )],
             )
             .await
             .expect("append");
+        let head = store.head(run).await.expect("head");
+        let concluded = RecordKind::RunConcluded {
+            outcome: "succeeded".into(),
+            reason: None,
+            exhaustion: None,
+            live_spend: agentplane::core::Spend::default(),
+            chain_head: head.hash,
+        };
+        store
+            .append(lease.epoch, vec![Append::new(run, concluded)])
+            .await
+            .expect("conclude");
         store
             .seal(run, lease.epoch, "succeeded")
             .await
@@ -625,11 +638,24 @@ async fn a_stale_witness_is_healed_with_a_proof_from_its_cursor() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 )],
             )
             .await
             .expect("append");
+        let head = store.head(run).await.expect("head");
+        let concluded = RecordKind::RunConcluded {
+            outcome: "succeeded".into(),
+            reason: None,
+            exhaustion: None,
+            live_spend: agentplane::core::Spend::default(),
+            chain_head: head.hash,
+        };
+        store
+            .append(lease.epoch, vec![Append::new(run, concluded)])
+            .await
+            .expect("conclude");
         store
             .seal(run, lease.epoch, "succeeded")
             .await
@@ -1135,5 +1161,281 @@ fn a_split_view_is_equal_sizes_with_unequal_roots_and_nothing_else() {
         three.len(),
         3,
         "three mutually disagreeing witnesses: {three:?}"
+    );
+}
+
+// ── Freshness: a declared checkpoint interval, judged by the auditor ───────
+
+/// The seconds `observed()` stands for, as a witness signs them.
+#[cfg(feature = "signing")]
+fn observed_secs() -> u64 {
+    u64::try_from(observed().unix_timestamp()).expect("a positive instant")
+}
+
+/// The getter reads the instant the signature covers, and nothing else.
+#[tokio::test]
+#[cfg(feature = "signing")]
+async fn a_cosignature_carries_the_time_its_signature_covers() {
+    let (_, cp) = log(3);
+    let signer = Arc::new(agentplane::policy::Ed25519Signer::new("w", &[5u8; 32]));
+    let w = MemoryWitness::new(signer, observed()).expect("a witness");
+    let co = w.cosign(&cp, 0, &[]).await.expect("cosigned");
+    assert_eq!(
+        co.timestamp(),
+        Some(observed_secs()),
+        "the cosignature reports a time other than the one its witness signed"
+    );
+
+    let mut zero = co.clone();
+    zero.signature[..8].copy_from_slice(&0u64.to_be_bytes());
+    assert_eq!(zero.timestamp(), None, "a zero time is no observation");
+    let mut unbounded = co;
+    unbounded.signature[..8].copy_from_slice(&u64::MAX.to_be_bytes());
+    assert_eq!(
+        unbounded.timestamp(),
+        None,
+        "past 2^63 - 1 is not a cosignature"
+    );
+}
+
+/// A plane with a declared interval re-submits an unchanged log once the
+/// interval passes, and not before.
+#[tokio::test]
+async fn an_unchanged_log_is_resubmitted_once_the_interval_passes() {
+    use agentplane::journal::{JournalStore, WitnessQuorum};
+
+    let store = sealed_store(2).await;
+    let witnesses: Vec<Arc<dyn Witness>> = vec![Arc::new(witness())];
+    let rt = agentplane::Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .witnesses(witnesses, WitnessQuorum::of(1).expect("one"))
+        .witness_interval(std::time::Duration::from_secs(3600))
+        .build();
+    let tick = std::time::Duration::from_secs(60);
+
+    let first = rt.sweep(observed(), tick).await.expect("a sweep");
+    assert_eq!(first.cosignatures, 1, "{first:?}");
+
+    let within = rt
+        .sweep(observed() + time::Duration::minutes(30), tick)
+        .await
+        .expect("a sweep within the interval");
+    assert_eq!(
+        within.cosignatures, 0,
+        "an unchanged log was re-submitted before its interval passed: {within:?}"
+    );
+
+    let past = rt
+        .sweep(observed() + time::Duration::minutes(61), tick)
+        .await
+        .expect("a sweep past the interval");
+    assert_eq!(
+        past.cosignatures, 1,
+        "an idle plane past its declared interval was not re-submitted, so its \
+         witnesses' latest time goes stale while it is healthy: {past:?}"
+    );
+}
+
+/// An interval with nobody to submit to is refused at build.
+#[test]
+fn an_interval_without_witnesses_is_refused_at_build() {
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let refused = agentplane::Runtime::builder(
+        Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>
+    )
+    .witness_interval(std::time::Duration::from_secs(60))
+    .try_build()
+    .expect_err("an interval no witness receives is a promise nothing keeps");
+    assert!(
+        matches!(
+            refused,
+            agentplane::runtime::BuildError::IntervalWithoutWitnesses
+        ),
+        "wrong refusal: {refused}"
+    );
+}
+
+/// Anchors from two witness keys over the store's current checkpoint, one
+/// signing at `observed()` and one an hour later.
+#[cfg(feature = "signing")]
+async fn timed_anchors(
+    store: &Arc<agentplane::store::RedbStore>,
+) -> Vec<agentplane::journal::Anchor> {
+    use agentplane::journal::{CosignedCheckpoint, JournalStore};
+
+    let cp = store.checkpoint().await.expect("checkpoint");
+    let mut anchors = Vec::new();
+    for (name, seed, at) in [
+        ("old-key", 1u8, observed()),
+        ("new-key", 2u8, observed() + time::Duration::hours(1)),
+    ] {
+        let signer = agentplane::policy::Ed25519Signer::new(name, &[seed; 32]);
+        let w = MemoryWitness::new(Arc::new(signer), at).expect("a witness");
+        let co = w.cosign(&cp, 0, &[]).await.expect("cosigned");
+        let answer = CosignedCheckpoint {
+            checkpoint: cp.clone(),
+            cosignatures: vec![co],
+        };
+        anchors.push(agentplane::journal::Anchor::from_cosigned(
+            &answer,
+            format!("witness {name}"),
+        ));
+    }
+    anchors
+}
+
+#[cfg(feature = "signing")]
+fn freshness(now: agentplane::core::Timestamp, max_age_secs: u64) -> agentplane::audit::Freshness {
+    agentplane::audit::Freshness {
+        now,
+        max_age: std::time::Duration::from_secs(max_age_secs),
+    }
+}
+
+/// Each key is judged on its own against the auditor's clock: the fresh one
+/// does not excuse the stale one, and the window is stated for both.
+#[tokio::test]
+#[cfg(feature = "signing")]
+async fn a_stale_witness_is_a_finding_and_a_fresh_one_is_not() {
+    use agentplane::audit::Finding;
+    use agentplane::journal::JournalStore;
+
+    let store = sealed_store(1).await;
+    let anchors = timed_anchors(&store).await;
+    assert_eq!(
+        anchors[0].witnessed.len(),
+        1,
+        "an anchor from a witness answer dropped its cosignature's time"
+    );
+    let journal = Arc::clone(&store) as Arc<dyn JournalStore>;
+    // Ninety minutes after the first key signed: it is 90 minutes old, the
+    // second 30 minutes, and the auditor allows 45.
+    let now = observed() + time::Duration::minutes(90);
+    let report = agentplane::audit::audit(
+        &journal,
+        &[],
+        &agentplane::audit::Evidence {
+            anchors: &anchors,
+            freshness: Some(freshness(now, 45 * 60)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("an audit");
+
+    let stale: Vec<_> = report
+        .findings
+        .iter()
+        .filter_map(|f| match f {
+            Finding::StaleWitness {
+                key_id, age_secs, ..
+            } => Some((key_id.as_str(), *age_secs)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        stale,
+        vec![("old-key", 90 * 60)],
+        "exactly the key older than the maximum age is a finding: {:?}",
+        report.findings
+    );
+    assert_eq!(report.unwitnessed.len(), 2, "{:?}", report.unwitnessed);
+    assert!(
+        report.not_checked.iter().any(|n| n.contains("not whether")),
+        "the window was not said to bound when, not whether: {:?}",
+        report.not_checked
+    );
+
+    // The same anchors judged within the maximum age are fresh.
+    let fresh = agentplane::audit::audit(
+        &journal,
+        &[],
+        &agentplane::audit::Evidence {
+            anchors: &anchors,
+            freshness: Some(freshness(observed() + time::Duration::minutes(30), 45 * 60)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("an audit");
+    assert!(
+        !fresh
+            .findings
+            .iter()
+            .any(|f| matches!(f, Finding::StaleWitness { .. })),
+        "{:?}",
+        fresh.findings
+    );
+}
+
+/// A time ahead of the auditor's clock by more than the maximum age is a
+/// finding, never fresh.
+#[tokio::test]
+#[cfg(feature = "signing")]
+async fn a_time_in_the_auditor_s_future_is_reported() {
+    use agentplane::journal::JournalStore;
+
+    let store = sealed_store(1).await;
+    let anchors = timed_anchors(&store).await;
+    let report = agentplane::audit::audit(
+        &(Arc::clone(&store) as Arc<dyn JournalStore>),
+        &[],
+        &agentplane::audit::Evidence {
+            anchors: &anchors,
+            freshness: Some(freshness(observed() - time::Duration::hours(2), 60)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("an audit");
+    let ahead = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f, agentplane::audit::Finding::WitnessTimeAhead { .. }))
+        .count();
+    assert_eq!(ahead, 2, "{:?}", report.findings);
+}
+
+/// Witness times with no maximum age are not checked, never passed; and
+/// `export::verify` lists them unchecked too.
+#[tokio::test]
+#[cfg(feature = "signing")]
+async fn freshness_without_a_max_age_is_not_checked() {
+    use agentplane::journal::JournalStore;
+
+    let store = sealed_store(1).await;
+    let anchors = timed_anchors(&store).await;
+    let journal = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let report = agentplane::audit::audit(
+        &journal,
+        &[],
+        &agentplane::audit::Evidence {
+            anchors: &anchors,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("an audit");
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.starts_with("freshness")),
+        "{:?}",
+        report.not_checked
+    );
+    assert!(report.unwitnessed.is_empty());
+
+    let mut file = Vec::new();
+    agentplane::export::to_jsonl(&journal, &crate::no_cases(), &[], &mut file)
+        .await
+        .expect("an export");
+    let verified = agentplane::export::verify(file.as_slice(), None, &anchors).expect("verify");
+    assert!(
+        verified
+            .not_checked
+            .iter()
+            .any(|n| n.starts_with("freshness")),
+        "verify passed freshness silently: {:?}",
+        verified.not_checked
     );
 }

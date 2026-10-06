@@ -27,8 +27,8 @@
 use serde_json::Value;
 
 use crate::core::{
-    ACTION_ADMIT, ACTION_PERFORM, ACTION_RELEASE, Delegation, Label, PolicyRequest, Release, RunId,
-    StepId,
+    ACTION_ADMIT, ACTION_PERFORM, ACTION_RELEASE, Delegation, Label, PolicyRequest, PrincipalKind,
+    Release, RunId, StepId,
 };
 use crate::journal::AgentIdentity;
 
@@ -56,11 +56,13 @@ pub struct Acting<'a> {
 
 impl Acting<'_> {
     /// The principal every question is asked under: the chain's subject, and
-    /// otherwise the admitted capability.
+    /// otherwise the admitted capability — each named as its own kind.
     #[must_use]
-    pub fn principal(&self) -> &str {
+    pub fn principal(&self) -> (PrincipalKind, &str) {
         self.chain
-            .map_or(self.capability, |chain| chain.subject().id.as_str())
+            .map_or((PrincipalKind::Capability, self.capability), |chain| {
+                (PrincipalKind::Subject, chain.subject().id.as_str())
+            })
     }
 }
 
@@ -72,6 +74,7 @@ impl Acting<'_> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct GatedRequest {
     pub principal: String,
+    pub principal_kind: PrincipalKind,
     pub action: &'static str,
     pub resource: String,
     pub context: Value,
@@ -83,6 +86,7 @@ impl GatedRequest {
     pub fn as_request(&self) -> PolicyRequest<'_> {
         PolicyRequest {
             principal: &self.principal,
+            principal_kind: self.principal_kind,
             action: self.action,
             resource: &self.resource,
             context: &self.context,
@@ -115,15 +119,47 @@ pub fn effect(
         // that tool".
         "tenant": acting.tenant,
         "mutates": mutates,
-        "args": args,
+        "args": args_for_policy(args),
     });
     // **Where the value came from**, not only what it is: without the label a
     // deployment can say "amounts over 5000 need approval" and cannot say
     // "not with data that passed through that peer".
     if let Some(label) = label {
-        context["label"] = serde_json::to_value(label).unwrap_or(Value::Null);
+        context["label"] = serde_json::to_value(label.for_policy()).unwrap_or(Value::Null);
     }
     finish(acting, ACTION_PERFORM, kind, context)
+}
+
+/// An effect's arguments as a policy request carries them: every label
+/// embedded in them projected through [`Label::for_policy`].
+///
+/// A descriptor may carry a [`Tainted`](crate::core::Tainted) value whole —
+/// `task.open` carries its justification's fields that way — and its label
+/// would otherwise put `data_subjects` in front of a rule. The projection
+/// walks the whole value rather than naming the effects that embed one, so a
+/// labelled argument added later is covered without anyone remembering to.
+/// An object is a label when it has `provenance`, `trust` and `sensitivity`,
+/// the three members a [`Label`] always serialises.
+fn args_for_policy(args: &Value) -> Value {
+    let mut args = args.clone();
+    strip_subjects(&mut args);
+    args
+}
+
+fn strip_subjects(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if ["provenance", "trust", "sensitivity"]
+                .iter()
+                .all(|key| map.contains_key(*key))
+            {
+                map.remove("data_subjects");
+            }
+            map.values_mut().for_each(strip_subjects);
+        }
+        Value::Array(items) => items.iter_mut().for_each(strip_subjects),
+        _ => {}
+    }
 }
 
 /// The release gate's question about lowering one value's label.
@@ -140,7 +176,7 @@ pub fn release(
         "step": step.0,
         "tenant": acting.tenant,
         "release": release,
-        "label": label,
+        "label": label.for_policy(),
     });
     finish(acting, ACTION_RELEASE, RELEASE_RESOURCE, context)
 }
@@ -166,8 +202,10 @@ fn finish(
         context["agent"] = agent_context(id);
     }
     merge_identity(&mut context, acting.chain);
+    let (principal_kind, principal) = acting.principal();
     GatedRequest {
-        principal: acting.principal().to_owned(),
+        principal: principal.to_owned(),
+        principal_kind,
         action,
         resource: resource.to_owned(),
         context,
@@ -183,7 +221,7 @@ fn finish(
 /// Cedar refuses a context containing a JSON `null` — not the field, the
 /// whole record. A policy asks `context.agent has publisher` and then reads it.
 #[must_use]
-pub fn agent_context(id: &AgentIdentity) -> Value {
+pub(crate) fn agent_context(id: &AgentIdentity) -> Value {
     let mut agent = serde_json::json!({
         "name": id.name,
         "version": id.version,
@@ -203,7 +241,7 @@ pub fn agent_context(id: &AgentIdentity) -> Value {
 ///
 /// Merged rather than nested under a key, so a rule reads `context.owner` and
 /// `context.delegation_depth` directly.
-pub fn merge_identity(context: &mut Value, identity: Option<&Delegation>) {
+pub(crate) fn merge_identity(context: &mut Value, identity: Option<&Delegation>) {
     let (Some(chain), Some(obj)) = (identity, context.as_object_mut()) else {
         return;
     };

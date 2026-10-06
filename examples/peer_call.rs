@@ -6,9 +6,11 @@
 //! * the desk's skill never holds a registry, a client or a chain — it calls
 //!   `cx.call_peer`, and the plane extends the run's own chain by one link
 //!   naming the peer;
-//! * the reviewer records the caller *its authenticator* established, not
-//!   the chain the message claims — a served plane binds each run to the
-//!   chain the credential carries;
+//! * the desk presents a credential obtained for the run's owner, with the
+//!   desk as actor — so the reviewer's authenticator derives Alice, acting
+//!   through the desk, from the credential and never from the message;
+//! * the desk's journal says which credential the hop presented, and never
+//!   the credential itself;
 //! * a strict replay of the desk's run reads the reviewer's answer back from
 //!   the journal, and the reviewer is never asked again.
 //!
@@ -27,7 +29,8 @@ use agentplane::journal::RecordKind;
 use agentplane::manifest::Manifest;
 use agentplane::peers::a2a::{A2aClient, Endpoint};
 use agentplane::peers::{
-    CardSecurity, PeerClient, PeerCredential, PeerGrant, PeerId, PeerRegistry,
+    Cached, CardSecurity, CredentialError, PeerClient, PeerCredential, PeerGrant, PeerId,
+    PeerRegistry, TokenExchange,
 };
 use agentplane::prelude::*;
 use agentplane::runtime::{Agent, RunTerms};
@@ -44,7 +47,30 @@ spec:
   budgets: { max_steps: 3 }
 "#;
 
-const TOKEN: &str = "desk-token";
+/// What the stand-in issuer's tokens start with; the subject follows.
+const ISSUED: &str = "issued-for:";
+
+/// The deployment's token endpoint, in process: it mints a token naming the
+/// subject the desk asked for, valid only at the peer it was asked for. A
+/// deployment runs a real issuer here (`peers::TokenEndpoint` speaks RFC 8693
+/// to one); the reviewer trusts whatever that issuer signs.
+#[derive(Debug)]
+struct Issuer;
+
+#[async_trait::async_trait]
+impl TokenExchange for Issuer {
+    async fn exchange(
+        &self,
+        audience: &PeerId,
+        subject: &str,
+    ) -> Result<PeerCredential, CredentialError> {
+        Ok(PeerCredential::for_subject(
+            audience.clone(),
+            subject,
+            format!("{ISSUED}{subject}"),
+        ))
+    }
+}
 
 /// The reviewer's one skill: an answer, and a note of who asked.
 #[derive(Debug)]
@@ -70,8 +96,9 @@ impl Skill for Checks {
     }
 }
 
-/// The reviewer's front door: the bearer token names the desk, and the
-/// credential — not the message — is what the served run acts under.
+/// The reviewer's front door: the issuer's token names the person, the
+/// desk is the party presenting it, and the credential — not the message —
+/// is what the served run acts under.
 #[derive(Debug)]
 struct DeskToken(Arc<AtomicUsize>);
 
@@ -83,18 +110,15 @@ impl Authenticator for DeskToken {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(AuthError::Missing)?;
-        if token != TOKEN {
-            return Err(AuthError::Rejected);
-        }
+        let subject = token.strip_prefix(ISSUED).ok_or(AuthError::Rejected)?;
         self.0.fetch_add(1, Ordering::SeqCst);
-        // A one-link chain rooted at the desk, holding exactly what the
-        // reviewer's operator granted it. The chain inside the message is a
-        // claim; this is the credential.
-        Ok(
-            Caller::new("desk", vec!["peer".to_owned()]).acting_as(Delegation::root(
-                Principal::new("plane:desk", Scope::of(["audit.*"])),
-            )),
-        )
+        // The person the token names, acting through the desk, holding
+        // exactly what the reviewer's operator granted. The chain inside the
+        // message is a claim; this is the credential.
+        let chain = Delegation::root(Principal::new(subject, Scope::of(["audit.*"])))
+            .delegate(Principal::new("plane:desk", Scope::of(["audit.*"])))
+            .map_err(|_| AuthError::Rejected)?;
+        Ok(Caller::new("desk", vec!["peer".to_owned()]).acting_as(chain))
     }
 }
 
@@ -160,15 +184,11 @@ async fn serve_reviewer()
 
 /// The desk plane: the reviewer is wired once, on the plane.
 fn desk_plane(url: &str) -> Result<Arc<Runtime>, Box<dyn std::error::Error>> {
-    let reviewer = PeerId::new("reviewer");
     let registry = PeerRegistry::new().allow(
-        reviewer.clone(),
+        PeerId::new("reviewer"),
         PeerGrant::new(Scope::of(["audit.*"]))
             .read_only()
-            .with_credential(
-                &reviewer,
-                PeerCredential::for_audience(reviewer.clone(), TOKEN),
-            ),
+            .with_source(Arc::new(Cached::new(Arc::new(Issuer)))),
     );
     // The loopback exception exists only in `testkit` builds; a deployment
     // reaches a peer over https.
@@ -217,6 +237,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "   desk run:     {:?}",
         recorded_chain(desk.journal().as_ref(), out.run_id).await
     );
+    println!(
+        "   the hop:      {:?}  (what the credential named; never the token)",
+        recorded_binding(desk.journal().as_ref(), out.run_id).await
+    );
     let (reviewer_run, _) = reviewer_store
         .recent_runs(None, 1)
         .await?
@@ -240,8 +264,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "   requests served: {} (unchanged)",
         requests.load(Ordering::SeqCst)
     );
-    println!("\nThe peer saw Alice's chain plus one link; the replay saw only the journal.");
+    println!(
+        "\nThe peer saw Alice, through the desk, in the credential; the replay saw only the journal."
+    );
     Ok(())
+}
+
+/// What the run's peer hop recorded about its credential.
+async fn recorded_binding(
+    store: &dyn JournalStore,
+    run: agentplane::core::RunId,
+) -> Option<agentplane::core::CredentialBinding> {
+    store
+        .read(run, 1)
+        .await
+        .unwrap_or_default()
+        .iter()
+        .find_map(|record| match record.kind() {
+            RecordKind::EffectStarted { credential, .. } => credential.clone(),
+            _ => None,
+        })
 }
 
 /// The chain a run's journal says it acted under.

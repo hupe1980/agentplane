@@ -1,0 +1,91 @@
+# The plane `agentplane init --serve DIR` writes beside its manifest, policy
+# and tokens: the A2A, MCP and operator listeners over a Postgres journal.
+#
+#   docker compose -f DIR/compose.yaml up --wait
+#
+# `init --serve` fills in the two capitalised placeholders below — the image of
+# the version that wrote the file, and the user that owns the token file —
+# so this copy is the template, not a file to run as it stands. Beside it,
+# `init --serve` writes `postgres.password` and `store.env` (the plane's
+# connection string, holding that password), both mode 0600.
+#
+# Every port is published on this machine's loopback only. To serve other
+# machines, publish 8080 and 8081 on an address they reach, set --url to the
+# public A2A endpoint, and add an --mcp-allowed-host for each name the MCP
+# listener is reached by.
+name: agentplane
+
+services:
+  plane:
+    image: ghcr.io/hupe1980/agentplane:AGENTPLANE_VERSION-full
+    # The owner of `tokens.yaml`, which is mode 0600: the plane reads its
+    # credentials as the user who generated them, and nobody else can.
+    user: "PLANE_USER"
+    command:
+      - serve
+      - /work/agent.yaml
+      - --addr=0.0.0.0:8080
+      - --url=http://localhost:8080/a2a
+      - --mcp-addr=0.0.0.0:8081
+      # The `Host` a framework on this machine sends. Add one per name the MCP
+      # listener is reached by; any other is refused.
+      - --mcp-allowed-host=localhost:8081
+      - --operator-addr=0.0.0.0:9090
+      - --policy=/work/policy.cedar
+      - --tokens=/run/secrets/tokens
+    # The store's connection string, password included, reaches `serve` as
+    # AGENTPLANE_STORE from a 0600 file: off the command line, which `ps` shows
+    # every local user. `docker inspect` still shows it, to whoever can already
+    # run Docker on this machine.
+    env_file: [./store.env]
+    # The image has no shell and the plane writes nothing outside Postgres.
+    read_only: true
+    depends_on:
+      postgres: { condition: service_healthy }
+    volumes:
+      - ./agent.yaml:/work/agent.yaml:ro
+      - ./policy.cedar:/work/policy.cedar:ro
+    # The callers' tokens are a file, never a variable: a variable is
+    # inherited by everything the process starts.
+    secrets: [tokens]
+    ports:
+      - "127.0.0.1:8080:8080"   # A2A: the Agent Card and peers
+      - "127.0.0.1:8081:8081"   # MCP: frameworks calling the served tools
+      # The operator listener halts, cancels and reconciles; it stays on
+      # loopback when the other two are widened.
+      - "127.0.0.1:9090:9090"
+    networks: [default, store]
+    # `serve` drains for 25 seconds on SIGTERM; the stop grace must exceed it.
+    stop_grace_period: 35s
+
+  postgres:
+    image: postgres:17.6-alpine
+    environment:
+      POSTGRES_USER: agentplane
+      POSTGRES_DB: agentplane
+      # A generated password, required on every connection. A network marked
+      # internal still gives the host an address on its bridge on Linux, so
+      # without one any local process could connect as the superuser.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "agentplane", "-d", "agentplane"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - journal:/var/lib/postgresql/data
+    networks: [store]
+
+networks:
+  store:
+    internal: true
+
+secrets:
+  tokens:
+    file: ./tokens.yaml
+  postgres_password:
+    file: ./postgres.password
+
+volumes:
+  journal:

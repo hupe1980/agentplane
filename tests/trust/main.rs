@@ -15,12 +15,23 @@
 //! times. Five groups keep both costs reasonable rather than optimising one
 //! into the other.
 
+/// A case store holding nothing, for an export of runs that name no case.
+#[cfg(feature = "redb")]
+fn no_cases() -> std::sync::Arc<dyn agentplane::case::CaseStore> {
+    std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"))
+}
+
 mod boundary;
 mod budgets;
+mod call;
 mod cedar;
+mod content;
+mod disclosure;
 mod drill;
 mod export;
 mod format;
+#[cfg(feature = "manifest")]
+mod grants;
 mod identity;
 #[cfg(feature = "keyring")]
 mod keyring;
@@ -31,4 +42,5 @@ mod planned;
 mod policy;
 mod policy_check;
 mod signature;
+mod subject;
 mod witness;

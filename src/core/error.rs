@@ -162,6 +162,18 @@ pub enum RuntimeError {
         reason: crate::core::Withheld,
     },
 
+    /// A decision named a version of its task that is no longer the row's.
+    ///
+    /// Nothing was recorded, and no claim this call took is left behind. The
+    /// remedy is to read the task again and decide on what it says now; the
+    /// current version is deliberately not carried, so a caller cannot
+    /// resubmit without reading.
+    #[error(
+        "task {task} changed since the version named was read; nothing was recorded — read \
+         it again and decide on what it says now"
+    )]
+    TaskChanged { task: String },
+
     #[error("plan contract violation: {0}")]
     PlanContract(String),
 
@@ -235,6 +247,31 @@ pub enum RuntimeError {
         configured: crate::core::Digest,
     },
 
+    /// A run pinned to one declaration revision was offered to a plane where
+    /// another governs its capability — or none does.
+    ///
+    /// Refused at admission, before authorization and reservation, so nothing
+    /// is recorded: the caller reviewed one revision and this plane would run
+    /// another.
+    #[error(
+        "the run was pinned to declaration {expected} for `{agent}`, and this plane holds {} \
+         — nothing was admitted",
+        declaration_named(.found.as_ref())
+    )]
+    DeclarationPinMismatch {
+        agent: String,
+        expected: crate::core::Digest,
+        found: Option<crate::core::Digest>,
+    },
+
+    /// A data-subject binding the run's declaration names resolved to nothing.
+    ///
+    /// Refused at admission, before the run's records are written: a run whose
+    /// declaration says whose data it takes in, and which could not say it,
+    /// would be traced to nobody.
+    #[error("the data-subject binding `{binding}` cannot be resolved for this run: {reason}")]
+    SubjectUnbound { binding: String, reason: String },
+
     /// The history was written under a different canonicalization rule.
     ///
     /// Not a divergence, and reporting it as one is the defect this exists to
@@ -296,6 +333,18 @@ pub enum RuntimeError {
          under is wired"
     )]
     PayloadsSealed { run: String },
+
+    /// The run is bound to a case and this plane holds no case store, so what
+    /// a resume wrote would sit outside the case.
+    ///
+    /// About this plane, not the run: a plane with a case store continues it,
+    /// so a caller holding a durable request — a stop, a delivered answer —
+    /// leaves the driving to that plane.
+    #[error(
+        "run {run} is bound to case {case} and this plane has no case store, so what \
+         the resume wrote would sit outside the case — resume it on a plane with one"
+    )]
+    NoCaseStore { run: String, case: String },
 
     /// Nothing on this plane answers to the name `run` was given.
     ///
@@ -429,6 +478,18 @@ pub enum RuntimeError {
     /// operator "recorded" for a stop that can never happen.
     #[error("run {run} already concluded as '{outcome}'; there is nothing left to stop")]
     AlreadyConcluded { run: String, outcome: String },
+
+    /// An operator's lift or release was recorded, and the control it ended
+    /// still stands.
+    ///
+    /// The record is written before the register row goes, and the two share
+    /// no transaction. Its own variant rather than a store failure, because
+    /// the record exists: `run` names it, and acting again writes a second.
+    #[error(
+        "the act was recorded in run {run}, but the register row was not removed, so the \
+         control still stands: {detail}"
+    )]
+    ControlStands { run: String, detail: String },
 
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -885,6 +946,15 @@ pub enum StepError {
     #[error(transparent)]
     Budget(#[from] crate::core::BudgetExceeded),
 
+    /// The authority this run acts under was withdrawn, found at a hop about
+    /// to present a credential on its behalf.
+    ///
+    /// Not a fault, and not a failure: a pause, as a withdrawal found at a
+    /// step boundary is. Nothing was announced or sent, the run's mutations
+    /// stand, and it resumes when the halt is lifted.
+    #[error("the authority of '{subject}' was withdrawn: {reason}")]
+    Withheld { subject: String, reason: String },
+
     /// **Not a failure.** The run is waiting for something that has not
     /// happened, and its frame has been persisted.
     ///
@@ -979,6 +1049,7 @@ impl StepError {
             Self::Unreproducible { .. } => "unreproducible",
             Self::NonDeterminism { .. } => "nondeterminism",
             Self::Budget(_) => "budget",
+            Self::Withheld { .. } => "withheld",
             Self::Suspended(_) => "suspended",
             Self::Denied { .. } => "denied",
             Self::GroupFootprint { .. } => "group_footprint",
@@ -1170,6 +1241,15 @@ pub enum PolicyError {
         actual: crate::core::Sensitivity,
         ceiling: crate::core::Sensitivity,
     },
+
+    /// A declared content rule refused the value.
+    ///
+    /// Names the rule and where in the value it matched, never what matched:
+    /// the matched text is the thing the rule exists to keep from crossing,
+    /// and an error message is one more place it would cross to. An object key
+    /// any rule matches is written `*` in the pointer for the same reason.
+    #[error("content rule '{rule}' refused the value at '{pointer}'")]
+    Content { rule: String, pointer: String },
 
     /// A value's sensitivity exceeds what the sink is allowed to receive. This
     /// is the exfiltration path that matters: not the network, but a
@@ -1537,6 +1617,10 @@ pub enum StoreError {
 /// engine, which is a bundle of its own and not a blank.
 fn bundle_named(digest: Option<&crate::core::Digest>) -> String {
     digest.map_or_else(|| "no policy engine".to_owned(), ToString::to_string)
+}
+
+fn declaration_named(digest: Option<&crate::core::Digest>) -> String {
+    digest.map_or_else(|| "no declaration".to_owned(), ToString::to_string)
 }
 
 impl RuntimeError {

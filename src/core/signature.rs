@@ -161,6 +161,13 @@ pub const DOMAIN_RECORD: &str = "io.github.hupe1980.agentplane/record/v1";
 /// values a caller chose.
 pub const DOMAIN_PROVENANCE: &str = "io.github.hupe1980.agentplane/provenance/v1";
 
+/// The domain a grader-verdict sidecar is signed under.
+///
+/// Answers *this grader's key signed this verdict about these records*. The
+/// grader is not this plane, so a key it shares with anything else must not
+/// make a record attestation or a provenance seal verify as a verdict.
+pub const DOMAIN_GRADER_VERDICT: &str = "io.github.hupe1980.agentplane/grader-verdict/v1";
+
 /// Signs the rare, high-value things: checkpoints and cosignatures.
 ///
 /// A deliberate second trait, and the split is about **granularity**, not taste.
@@ -293,6 +300,7 @@ mod tests {
             signing_hash(DOMAIN_MANIFEST, &payload),
             signing_hash(DOMAIN_RECORD, &payload),
             signing_hash(DOMAIN_PROVENANCE, &payload),
+            signing_hash(DOMAIN_GRADER_VERDICT, &payload),
         ];
 
         for (i, a) in inputs.iter().enumerate() {

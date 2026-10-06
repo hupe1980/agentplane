@@ -67,6 +67,10 @@ pub enum EffectReplay {
         /// relabel a value the run read months ago — with nothing diverging,
         /// because nothing about the call changed.
         declared: crate::core::DeclaredOutput,
+        /// What the content rules decided when the output arrived: a refusal
+        /// the step is handed again, a classification its label is joined
+        /// with. Read back so no rule is evaluated on replay.
+        content: Option<crate::core::ContentVerdict>,
     },
     /// It failed, and the failure is part of history — including what that
     /// failure said about whether the call reached the outside world.
@@ -102,6 +106,12 @@ pub enum EffectReplay {
         action: String,
         resource: String,
     },
+    /// The run's authority was withdrawn at this hop, before it was
+    /// announced.
+    ///
+    /// Distinct from `Refused`: not a limit the run reached but a principal an
+    /// operator withdrew, and the run pauses until the halt is lifted.
+    Withheld { subject: String, reason: String },
     /// It started and we do not know whether it landed.
     ///
     /// The recorded [`Recovery`] is what decides whether re-performing it is
@@ -129,16 +139,17 @@ struct Attempted {
 impl EffectReplay {
     /// What this state says the attempt cost so far.
     ///
-    /// Zero for the states that describe an attempt nobody made: a refusal and
-    /// a denial both stop a call before it starts, and an announcement with no
+    /// Zero for the states that describe an attempt nobody made: a refusal, a
+    /// denial and a withholding all stop a call before it starts, and an announcement with no
     /// terminal record has reported no figure yet.
     #[must_use]
     pub const fn spend(&self) -> crate::core::Spend {
         match self {
             Self::Done { spend, .. } | Self::Failed { spend, .. } => *spend,
-            Self::Refused { .. } | Self::Denied { .. } | Self::Orphan { .. } => {
-                crate::core::Spend::ZERO
-            }
+            Self::Refused { .. }
+            | Self::Denied { .. }
+            | Self::Withheld { .. }
+            | Self::Orphan { .. } => crate::core::Spend::ZERO,
         }
     }
 
@@ -150,7 +161,10 @@ impl EffectReplay {
     fn add_spend(&mut self, extra: crate::core::Spend) {
         match self {
             Self::Done { spend, .. } | Self::Failed { spend, .. } => *spend += extra,
-            Self::Refused { .. } | Self::Denied { .. } | Self::Orphan { .. } => {}
+            Self::Refused { .. }
+            | Self::Denied { .. }
+            | Self::Withheld { .. }
+            | Self::Orphan { .. } => {}
         }
     }
 }
@@ -312,6 +326,7 @@ impl StepCursor {
         recovery: &Recovery,
         attempt: u32,
     ) {
+        self.supersede_withheld(key);
         self.effects.push(Journaled {
             key,
             seq,
@@ -322,6 +337,39 @@ impl StepCursor {
             replay: EffectReplay::Orphan {
                 recovery: recovery.clone(),
             },
+        });
+    }
+
+    /// Drop every withholding recorded at `key`: what follows it there is
+    /// the decision that let the hop go on.
+    fn supersede_withheld(&mut self, key: EffectKey) {
+        self.effects
+            .retain(|e| !(e.key == key && matches!(e.replay, EffectReplay::Withheld { .. })));
+    }
+
+    /// A hop withheld before it was announced. The latest withholding at a
+    /// hop is the one that stands: an earlier one there was lifted, or the
+    /// hop would not have been reached to be withheld again.
+    fn withheld(&mut self, key: EffectKey, seq: Seq, subject: &str, reason: &str) {
+        self.supersede_withheld(key);
+        self.unannounced(
+            key,
+            seq,
+            EffectReplay::Withheld {
+                subject: subject.to_owned(),
+                reason: reason.to_owned(),
+            },
+        );
+    }
+
+    /// A position the run stopped at before announcing anything: a refusal,
+    /// a denial or a withholding.
+    fn unannounced(&mut self, key: EffectKey, seq: Seq, replay: EffectReplay) {
+        self.effects.push(Journaled {
+            key,
+            seq,
+            what: None,
+            replay,
         });
     }
 
@@ -340,6 +388,8 @@ impl StepCursor {
                 by,
                 spend,
                 declared,
+                content,
+                elapsed_ms: _,
             } => {
                 self.settle(
                     key,
@@ -349,6 +399,7 @@ impl StepCursor {
                         by: by.clone(),
                         spend: *spend,
                         declared: *declared,
+                        content: content.clone(),
                     },
                 );
             }
@@ -367,17 +418,14 @@ impl StepCursor {
             // A refusal has no preceding `EffectStarted` — the whole point
             // is that nothing was announced — so it pushes its own entry
             // rather than updating one.
-            RecordKind::BudgetRefused { limit, used } => {
-                self.effects.push(Journaled {
-                    key,
-                    seq,
-                    what: None,
-                    replay: EffectReplay::Refused {
-                        limit: limit.clone(),
-                        used: used.clone(),
-                    },
-                });
-            }
+            RecordKind::BudgetRefused { limit, used } => self.unannounced(
+                key,
+                seq,
+                EffectReplay::Refused {
+                    limit: limit.clone(),
+                    used: used.clone(),
+                },
+            ),
             // A re-admission supersedes the refusal it was journaled beside: a
             // resume asked the ledger then in force and was answered yes, so a
             // later replay must read refusal-then-continuation as a decision on
@@ -395,28 +443,33 @@ impl StepCursor {
                     self.effects.remove(pos);
                 }
             }
+            // A withholding at a hop, like a refusal, announced nothing. The
+            // hop's later announcement at the same key supersedes it — the
+            // run-level `AuthorityRestored` is the decision that let it go on —
+            // so a second pass reads the continuation rather than the pause.
+            RecordKind::AuthorityWithheld {
+                subject, reason, ..
+            } => self.withheld(key, seq, subject, reason),
             RecordKind::PolicyDenied {
                 reason,
                 action,
                 resource,
-            } => {
-                self.effects.push(Journaled {
-                    key,
-                    seq,
-                    what: None,
-                    replay: EffectReplay::Denied {
-                        reason: reason.clone(),
-                        action: action.clone(),
-                        resource: resource.clone(),
-                    },
-                });
-            }
+            } => self.unannounced(
+                key,
+                seq,
+                EffectReplay::Denied {
+                    reason: reason.clone(),
+                    action: action.clone(),
+                    resource: resource.clone(),
+                },
+            ),
             RecordKind::Released { .. } => self.record_release(key, seq),
             RecordKind::EffectFailed {
                 error,
                 disposition,
                 spend,
                 permanent,
+                elapsed_ms: _,
             } => {
                 self.settle(
                     key,
@@ -458,6 +511,8 @@ impl StepCursor {
                 // relabel the field exists to stop, so the conservative point
                 // stands in.
                 declared: declared.unwrap_or_else(crate::core::DeclaredOutput::untrusted),
+                // A probe's recovered answer was not judged by a source rule.
+                content: None,
             },
             // Zero, because what the failed attempt spent is on the slot
             // already: `settle` carries it forward, and stating a figure here
@@ -486,6 +541,7 @@ impl StepCursor {
                 // `Released` record. The conservative point keeps this from
                 // being the one synthesized `Done` that means *trusted*.
                 declared: crate::core::DeclaredOutput::untrusted(),
+                content: None,
             },
         });
     }
@@ -903,6 +959,8 @@ mod tests {
             backoff_ms: 0,
             outbound_label: None,
             outbound_bytes: None,
+            content_rules: None,
+            credential: None,
         }
     }
 
@@ -933,6 +991,39 @@ mod tests {
         out
     }
 
+    /// A hop withheld twice is one standing withholding, so a resume past it
+    /// reaches the frontier rather than re-raising an older one; and the
+    /// hop's later announcement supersedes both.
+    #[test]
+    fn a_hop_withheld_twice_stands_withheld_once() {
+        let withheld = || RecordKind::AuthorityWithheld {
+            subject: "alice".into(),
+            reason: "laptop lost".into(),
+            by: crate::core::Operator::asserted("ops").unwrap(),
+        };
+        let twice = records(vec![(S0, key(1), withheld()), (S0, key(1), withheld())]);
+        let mut slice = ReplayCursor::from_records(&twice).take(S0, Phase::Forward);
+        assert!(matches!(
+            slice.next(key(1), &desc(), 1).unwrap(),
+            Some(EffectReplay::Withheld { .. })
+        ));
+        assert!(slice.exhausted(), "an older withholding was left standing");
+
+        let resumed = records(vec![
+            (S0, key(1), withheld()),
+            (S0, key(1), withheld()),
+            (S0, key(1), started()),
+        ]);
+        let mut slice = ReplayCursor::from_records(&resumed).take(S0, Phase::Forward);
+        assert!(
+            matches!(
+                slice.next(key(1), &desc(), 1).unwrap(),
+                Some(EffectReplay::Orphan { .. })
+            ),
+            "the announcement did not supersede every withholding before it"
+        );
+    }
+
     #[test]
     fn replays_a_completed_effect_without_performing_it() {
         let recs = records(vec![
@@ -946,6 +1037,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
         ]);
@@ -957,7 +1050,8 @@ mod tests {
                 output: json!("recorded"),
                 source: None,
                 by: None,
-                spend: crate::core::Spend::default()
+                spend: crate::core::Spend::default(),
+                content: None,
             })
         );
         assert!(cur.exhausted(S0, Phase::Forward));
@@ -978,6 +1072,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
         ]);
@@ -1076,6 +1172,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
             (S0, key(2), started()),
@@ -1088,6 +1186,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
         ]);
@@ -1117,6 +1217,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
             (
@@ -1128,6 +1230,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
         ]);
@@ -1141,7 +1245,8 @@ mod tests {
                 output: json!("a"),
                 source: None,
                 by: None,
-                spend: crate::core::Spend::default()
+                spend: crate::core::Spend::default(),
+                content: None,
             })
         );
         assert_eq!(
@@ -1151,7 +1256,8 @@ mod tests {
                 output: json!("b"),
                 source: None,
                 by: None,
-                spend: crate::core::Spend::default()
+                spend: crate::core::Spend::default(),
+                content: None,
             })
         );
         assert!(cur.fully_exhausted());
@@ -1172,6 +1278,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
             (S1, key(10), started()),
@@ -1184,6 +1292,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
         ]);
@@ -1219,6 +1329,8 @@ mod tests {
                     source: None,
                     by: None,
                     spend: crate::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             ),
         ]);
@@ -1257,6 +1369,7 @@ mod tests {
                     disposition: Disposition::DidNotHappen,
                     spend: crate::core::Spend::default(),
                     permanent: false,
+                    elapsed_ms: None,
                 },
             ),
         ]);

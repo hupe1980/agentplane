@@ -23,6 +23,17 @@
         }
       ]
     },
+    "Boundary": {
+      "description": "An effect kind a rule can name.",
+      "enum": [
+        "model.complete",
+        "tool.call",
+        "event.await",
+        "media.fetch",
+        "memory.recall"
+      ],
+      "type": "string"
+    },
     "Budgets": {
       "additionalProperties": false,
       "description": "Ceilings, in the manifest's own vocabulary.",
@@ -125,6 +136,36 @@
       },
       "type": "object"
     },
+    "Case": {
+      "enum": [
+        "fold"
+      ],
+      "type": "string"
+    },
+    "CheckAction": {
+      "description": "What a category a check reports does. Neither can admit or lower.",
+      "oneOf": [
+        {
+          "enum": [
+            "refuse"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Join the value's sensitivity with this one.",
+          "properties": {
+            "classify": {
+              "$ref": "#/definitions/Sensitivity"
+            }
+          },
+          "required": [
+            "classify"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Condition": {
       "description": "One field of the answer, and one thing that must be true of it.",
       "oneOf": [
@@ -198,6 +239,101 @@
       },
       "required": [
         "path"
+      ],
+      "type": "object"
+    },
+    "Content": {
+      "additionalProperties": false,
+      "description": "`spec.security.content`: the rules a deployment holds this agent's values to.",
+      "properties": {
+        "checks": {
+          "description": "Uses of a registered `ContentChecker`: a classifier describes the value in categories, and the declared `on` table decides.",
+          "items": {
+            "$ref": "#/definitions/ContentCheck"
+          },
+          "type": "array"
+        },
+        "rules": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/ContentRule"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "ContentCheck": {
+      "additionalProperties": false,
+      "description": "A declared use of a registered checker.",
+      "properties": {
+        "at": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Positions"
+            }
+          ],
+          "description": "Sinks, and the outputs of model and tool calls: a check runs as an effect of the step, so it judges what a step sends or what one of its calls returns."
+        },
+        "checker": {
+          "description": "The `ContentChecker::name` of a checker registered on the builder.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Unique among the manifest's rules and checks; what a refusal names.",
+          "type": "string"
+        },
+        "on": {
+          "additionalProperties": {
+            "$ref": "#/definitions/CheckAction"
+          },
+          "description": "From the checker's declared categories to what each one does.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "checker",
+        "at",
+        "on"
+      ],
+      "type": "object"
+    },
+    "ContentRule": {
+      "additionalProperties": false,
+      "description": "One declared rule: a matcher, where it applies, and its one action.",
+      "properties": {
+        "at": {
+          "$ref": "#/definitions/Positions"
+        },
+        "fields": {
+          "description": "JSON pointers narrowing which subtrees are read. Empty reads the whole value.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "description": "Unique within the manifest; what a refusal names.",
+          "type": "string"
+        },
+        "match": {
+          "$ref": "#/definitions/Matcher"
+        },
+        "then": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RuleAction"
+            }
+          ],
+          "description": "`refuse`, `{classify: <sensitivity>}` or `{redact: <token>}` — a map, not a YAML tag, in every format the manifest is read from."
+        }
+      },
+      "required": [
+        "id",
+        "match",
+        "at",
+        "then"
       ],
       "type": "object"
     },
@@ -306,6 +442,11 @@
       ],
       "type": "object"
     },
+    "DataSubject": {
+      "description": "Whose data a run takes in: `$input/<RFC 6901 pointer>` or `$case`. A literal and a correlation key are refused.",
+      "pattern": "^\\$(case|input(/.*)?)$",
+      "type": "string"
+    },
     "Execution": {
       "additionalProperties": false,
       "description": "How a declarative agent runs.",
@@ -347,6 +488,11 @@
         {
           "const": "planned",
           "description": "Plan first over trusted input, then execute without the model.",
+          "type": "string"
+        },
+        {
+          "const": "call",
+          "description": "Dispatch the one granted tool, with the run's input as its arguments.",
           "type": "string"
         }
       ]
@@ -417,6 +563,46 @@
           "type": "string"
         }
       ]
+    },
+    "Matcher": {
+      "additionalProperties": false,
+      "description": "Exactly one of `pattern`, `contains` or `invisible`.",
+      "properties": {
+        "case": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Case"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "With `contains`: `fold` matches regardless of case."
+        },
+        "contains": {
+          "description": "Literal substrings; any one matches.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "invisible": {
+          "description": "The code points that render as nothing: tag characters, variation selectors, zero-width and bidirectional controls.",
+          "type": "boolean"
+        },
+        "luhn": {
+          "description": "With `pattern`: a match counts only when its digits pass the Luhn check, so a card-number rule skips order numbers of the same length.",
+          "type": "boolean"
+        },
+        "pattern": {
+          "description": "A regular expression under the linear-time engine: no backreferences, no look-around.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     },
     "Memory": {
       "additionalProperties": false,
@@ -756,6 +942,31 @@
       ],
       "type": "object"
     },
+    "Positions": {
+      "additionalProperties": false,
+      "description": "Where a rule applies.",
+      "properties": {
+        "admission": {
+          "description": "The run's input, before it is admitted.",
+          "type": "boolean"
+        },
+        "sinks": {
+          "description": "A value about to be sent, before the effect is announced.",
+          "items": {
+            "$ref": "#/definitions/Boundary"
+          },
+          "type": "array"
+        },
+        "sources": {
+          "description": "An effect's output, as it is recorded.",
+          "items": {
+            "$ref": "#/definitions/Boundary"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
     "Pricing": {
       "additionalProperties": false,
       "description": "What a model's tokens cost, as the deployment states it.",
@@ -843,7 +1054,7 @@
           "type": "integer"
         },
         "window_seconds": {
-          "description": "The window, in seconds. At least one.",
+          "description": "The window, in seconds. At least one, at most 31 days.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -883,10 +1094,58 @@
         }
       ]
     },
+    "RuleAction": {
+      "description": "What a matching rule does. None of these can admit, trust or lower.",
+      "oneOf": [
+        {
+          "enum": [
+            "refuse"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Join the value's sensitivity with this one.",
+          "properties": {
+            "classify": {
+              "$ref": "#/definitions/Sensitivity"
+            }
+          },
+          "required": [
+            "classify"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Replace each match with this token. Sinks only.",
+          "properties": {
+            "redact": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "redact"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "Security": {
       "additionalProperties": false,
       "description": "The constraints a runtime enforces.",
       "properties": {
+        "content": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Content"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Rules over a value's content, applied at admission, where an effect's output arrives, and at sinks. They may refuse a value, raise its sensitivity or redact it at a sink — never admit, trust or lower it."
+        },
         "max_delegation_depth": {
           "description": "How far authority may be re-delegated. Checked both against the runtime's configured identity and against every delegating sink before dispatch.",
           "format": "uint8",
@@ -968,6 +1227,13 @@
             }
           ],
           "description": "External context this agent may retrieve."
+        },
+        "data_subjects": {
+          "description": "Whose data a run of this agent takes in, read from the run.",
+          "items": {
+            "$ref": "#/definitions/DataSubject"
+          },
+          "type": "array"
         },
         "execution": {
           "anyOf": [

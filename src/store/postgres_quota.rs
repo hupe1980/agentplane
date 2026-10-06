@@ -212,7 +212,7 @@ impl QuotaStore for PostgresStore {
             return Ok(());
         }
 
-        let floor = crate::quota::rate_prune_floor(reservation.at, &reservation.ceilings);
+        let floor = crate::quota::rate_prune_floor(reservation.at);
         tx.execute(
             "DELETE FROM quota_rate WHERE tenant = $1 AND grant_ref = $2 AND reserved_at <= $3",
             &[&tenant, &grant, &floor],
@@ -322,6 +322,26 @@ impl QuotaStore for PostgresStore {
             .execute(
                 "DELETE FROM quota_halted WHERE tenant = $1 AND scope = $2",
                 &[&self.tenant_name(), &scope.key()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        Ok(removed > 0)
+    }
+
+    async fn lift_halt_if(&self, standing: &Halt) -> Result<bool, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| pool_err(&e))?;
+        let removed = client
+            .execute(
+                "DELETE FROM quota_halted WHERE tenant = $1 AND scope = $2 AND reason = $3 \
+                 AND by_actor = $4 AND by_basis = $5 AND thrown_at = $6",
+                &[
+                    &self.tenant_name(),
+                    &standing.scope.key(),
+                    &standing.reason,
+                    &standing.by.actor(),
+                    &standing.by.basis().as_str(),
+                    &standing.at.unix_timestamp(),
+                ],
             )
             .await
             .map_err(|e| be(&e))?;

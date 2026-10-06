@@ -60,13 +60,16 @@ pub trait Calendar: Send + Sync + std::fmt::Debug {
 pub struct WallClock;
 
 impl WallClock {
+    /// The count `n`: a positive integer. Zero or fewer units would resolve to
+    /// `from` or before it — an obligation breached as it is registered.
     fn count(spec: &DeadlineSpec) -> Result<i64, CalendarError> {
         spec.params
             .get("n")
             .and_then(serde_json::Value::as_i64)
+            .filter(|n| *n > 0)
             .ok_or_else(|| CalendarError::BadParams {
                 kind: spec.kind.clone(),
-                detail: "expected an integer field `n`".into(),
+                detail: "expected a positive integer field `n`".into(),
             })
     }
 }

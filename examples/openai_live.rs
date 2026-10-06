@@ -1,7 +1,7 @@
 //! A governed run against a **real** `OpenAI` model.
 //!
 //! ```sh
-//! export OPENAI_API_KEY=...        # or put it in .env and use `just test-live`
+//! export OPENAI_API_KEY=...
 //! cargo run --example openai_live --features redb,providers
 //! ```
 //!
@@ -32,7 +32,7 @@ use serde_json::{Value, json};
 
 /// Pinned, not "latest": an example whose subject changes underneath it
 /// demonstrates the model's behaviour rather than this crate's.
-const MODEL: &str = "gpt-4o-mini";
+const MODEL: &str = "gpt-5-mini";
 
 /// Counts calls, so "did not ask again" is observed rather than asserted.
 #[derive(Debug)]

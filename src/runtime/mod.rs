@@ -13,6 +13,9 @@ pub mod effects;
 mod executor;
 pub mod group;
 pub mod metrics;
+mod pass_journal;
+#[cfg(feature = "manifest")]
+mod reach;
 pub mod replay_only;
 mod sweeper;
 pub mod telemetry;
@@ -25,6 +28,7 @@ pub use ctx::{BuildsEffect, Mode, StepCtx};
 pub use drain::DrainReport;
 #[cfg(feature = "manifest")]
 pub use executor::Agent;
+pub(crate) use executor::LEASE_FREE_EPOCH;
 /// The one `RunStatus` list, shared by every test that owes a per-variant
 /// decision — resume, sealing, and the A2A state mapping. Test-only.
 #[cfg(test)]
@@ -39,9 +43,10 @@ pub(crate) use executor::every_status;
 /// copy that disagrees the day a record kind arrives.
 pub(crate) use executor::observed_status;
 pub use executor::{
-    Admission, FullBackend, LEASE_TTL, LiveRun, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL,
-    OBSERVED_OUTCOME, OUTCOMES_OF_RECORD, RunFailure, RunOutcome, RunStatus, RunTerms, Runtime,
-    RuntimeBuilder, SEALED_OUTCOMES, Spawned, Stores,
+    Admission, ControlLifted, FullBackend, HALT_LIFTED_OUTCOME, HOLD_RELEASED_OUTCOME, LEASE_TTL,
+    LiveRun, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, OBSERVED_OUTCOME, OUTCOMES_OF_RECORD,
+    RunFailure, RunOutcome, RunStatus, RunStreamObserver, RunTerms, Runtime, RuntimeBuilder,
+    SEALED_OUTCOMES, Spawned, Stores,
 };
 pub use group::{EffectGroup, Invariant};
 pub use verdict::{CannotReplay, Finding, Verdict};

@@ -76,7 +76,7 @@ pub struct Anthropic {
     /// driver instance serves many models over one key and one connection pool;
     /// a capability setting on the driver would force a second instance per
     /// model, which is a strange thing to make somebody do to say that
-    /// `claude-haiku-3` cannot do what `claude-opus-4-5` can.
+    /// `claude-haiku-4-5` cannot do what `claude-opus-5` can.
     schema_modes: std::collections::BTreeMap<String, SchemaMode>,
     /// Whether to ask for the response as a stream.
     ///

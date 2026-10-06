@@ -213,6 +213,8 @@ async fn a_refired_timer_does_not_duplicate_the_recorded_wake() {
                         by: None,
                         spend: agentplane::core::Spend::default(),
                         declared: agentplane::core::DeclaredOutput::trusted(),
+                        content: None,
+                        elapsed_ms: None,
                     },
                 )
                 .effect(timer.effect)
@@ -748,9 +750,14 @@ async fn a_restored_wait_is_armed_by_nothing_until_the_run_is_resumed() {
 
     let journal = f.store.clone() as Arc<dyn JournalStore>;
     let mut out = Vec::new();
-    agentplane::export::to_jsonl(&journal, None, &[run], &mut out)
-        .await
-        .expect("an in-flight run exports");
+    agentplane::export::to_jsonl(
+        &journal,
+        &(f.store.clone() as Arc<dyn agentplane::case::CaseStore>),
+        &[run],
+        &mut out,
+    )
+    .await
+    .expect("an in-flight run exports");
 
     // A different store, as a restore is.
     let fresh_store = Arc::new(RedbStore::open_in_memory().unwrap());
@@ -857,6 +864,70 @@ async fn a_cancelled_sleeping_run_leaves_no_timer_armed() {
 /// half, for a timer that outlived that — a crash between the seal and the
 /// retirement. Claimed and fired, it fails on the sealed journal every lease
 /// period; passed over, it would sit at the head of the due order for ever.
+/// **A timer for a run whose conclusion is durable wakes nothing.** The
+/// crash window: the conclusion landed, the seal did not, the timer is still
+/// armed. Firing it must not append a wake after the conclusion — a run its
+/// seal would refuse forever — but finish the run instead.
+#[tokio::test]
+async fn a_timer_for_a_concluded_run_finishes_it_rather_than_waking_it() {
+    use agentplane::journal::JournalStore;
+
+    let f = fixture(Duration::from_mins(1));
+    let out =
+        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+            .await
+            .unwrap();
+    let lease = f
+        .store
+        .acquire(out.run_id, "crashed-owner", Duration::from_secs(60))
+        .await
+        .expect("the sleeping run is claimable");
+    let head = f.store.head(out.run_id).await.unwrap();
+    f.store
+        .append(
+            lease.epoch,
+            vec![agentplane::journal::Append::new(
+                out.run_id,
+                agentplane::journal::RecordKind::RunConcluded {
+                    outcome: "succeeded".to_owned(),
+                    reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
+                    chain_head: head.hash,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    f.store
+        .release_lease(out.run_id, lease.epoch)
+        .await
+        .unwrap();
+
+    f.rt.fire_timers(later(120)).await.unwrap();
+    let records = f.store.read(out.run_id, 1).await.unwrap();
+    let concluded_at = records
+        .iter()
+        .position(|r| {
+            matches!(
+                r.kind(),
+                agentplane::journal::RecordKind::RunConcluded { .. }
+            )
+        })
+        .expect("concluded");
+    assert!(
+        !records[concluded_at..]
+            .iter()
+            .any(|r| matches!(r.kind(), agentplane::journal::RecordKind::EffectDone { .. })),
+        "a wake was appended after the run's conclusion"
+    );
+    assert!(
+        f.store.inclusion_proof(out.run_id).await.unwrap().is_some(),
+        "the concluded run was left unsealed"
+    );
+    assert_eq!(f.woke.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn a_sealed_runs_leftover_timer_is_retired_not_fired() {
     let f = fixture(Duration::from_mins(1));

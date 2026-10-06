@@ -194,22 +194,28 @@ async fn erases(
     }
 
     report.checked += 1;
-    match ring.open(&minted.1).await {
-        Err(KeyError::Destroyed { .. }) => {}
-        Err(e) => report.record(
-            "an erased scope reports itself erased",
-            format!(
-                "opening after destruction failed with `{e}` rather than \
+    let first = match ring.open(&minted.1).await {
+        Err(KeyError::Destroyed { reason, .. }) => Some(reason),
+        Err(e) => {
+            report.record(
+                "an erased scope reports itself erased",
+                format!(
+                    "opening after destruction failed with `{e}` rather than \
                  `Destroyed`. A caller cannot tell a completed erasure from an \
                  outage, and will either retry forever or report data loss"
-            ),
-        ),
-        Ok(_) => report.record(
-            "destroy erases a scope",
-            "a wrapped key still opened after its scope was destroyed, so the \
-             erasure reached nothing at all",
-        ),
-    }
+                ),
+            );
+            None
+        }
+        Ok(_) => {
+            report.record(
+                "destroy erases a scope",
+                "a wrapped key still opened after its scope was destroyed, so the \
+                 erasure reached nothing at all",
+            );
+            None
+        }
+    };
 
     report.checked += 1;
     match ring.data_key(scope).await {
@@ -236,5 +242,24 @@ async fn erases(
                  makes a completed erasure look unfinished"
             ),
         );
+    }
+
+    // The first destruction stands: whatever account of it the ring gives —
+    // the caller's reason, or a fixed sentence where the service keeps none —
+    // a retry does not rewrite it.
+    report.checked += 1;
+    match ring.open(&minted.1).await {
+        Err(KeyError::Destroyed { reason, .. }) if Some(&reason) == first.as_ref() => {}
+        Err(KeyError::Destroyed { reason, .. }) => report.record(
+            "the first destruction's reason stands",
+            format!(
+                "after a second destruction the scope reports `{reason}` where it \
+                 reported {first:?} — a retry rewrote the account of why the data went"
+            ),
+        ),
+        other => report.record(
+            "the first destruction's reason stands",
+            format!("opening after a second destruction answered {other:?}"),
+        ),
     }
 }

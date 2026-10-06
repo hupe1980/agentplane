@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentplane dev</title>
+<link rel="stylesheet" href="/assets/app.css">
+<script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◆</span>
+    <h1>agentplane dev</h1>
+    <span id="file" class="muted mono"></span>
+  </div>
+  <div id="agents" class="agents"></div>
+  <div class="session">
+    <span id="session" class="muted">connecting…</span>
+    <span class="pill" title="Content-security-policy violations this page has seen">CSP <output id="violations">0</output></span>
+  </div>
+</header>
+<p id="live" class="banner" role="alert" hidden></p>
+<p id="refused" class="banner bad" role="alert" hidden></p>
+
+<div class="layout">
+  <aside class="sidebar" aria-labelledby="runs-h">
+    <div class="sidebar-head">
+      <h2 id="runs-h">Runs</h2>
+      <button id="new-run" type="button" class="small" title="Start a run (n)">New run</button>
+    </div>
+    <label class="sr-only" for="run-filter">Filter runs</label>
+    <input id="run-filter" type="search" placeholder="Filter by id or status" spellcheck="false">
+    <ul id="runs-list" class="runs-list" aria-live="polite"></ul>
+    <p id="runs-empty" class="muted small-text">No runs yet. Start one.</p>
+  </aside>
+
+  <main>
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button type="button" role="tab" class="tab" data-tab="run" aria-selected="true">Run</button>
+      <button type="button" role="tab" class="tab" data-tab="worklist" aria-selected="false">Worklist <span id="task-count" class="count" hidden></span></button>
+      <button type="button" role="tab" class="tab" data-tab="declaration" aria-selected="false">Declaration</button>
+      <button type="button" role="tab" class="tab" data-tab="verify" aria-selected="false">Replay &amp; export</button>
+    </nav>
+
+    <section id="tab-run" class="panel" role="tabpanel">
+      <details id="composer" class="card" open>
+        <summary><h2>Start a run</h2></summary>
+        <div class="grid2">
+          <div>
+            <label for="capability">Capability</label>
+            <select id="capability"></select>
+          </div>
+          <div>
+            <label for="correlate">Correlation keys <span class="muted">namespace=value, one per line — runs sharing one share a case</span></label>
+            <textarea id="correlate" rows="2" spellcheck="false"></textarea>
+          </div>
+        </div>
+        <label for="input">Input <span class="muted">JSON</span> <span id="input-state" class="muted"></span></label>
+        <textarea id="input" rows="6" spellcheck="false" class="mono">{}</textarea>
+        <p id="schema-hint" class="muted small-text" hidden></p>
+        <div class="actions">
+          <button id="start-run" type="button">Start <kbd>⌘↵</kbd></button>
+          <button id="format-input" type="button" class="secondary">Format</button>
+          <span id="start-result" class="result" role="status"></span>
+        </div>
+      </details>
+
+      <div id="run-view" hidden>
+        <div class="card run-head">
+          <div class="run-title">
+            <span id="run-status" class="badge"></span>
+            <code id="run-id" class="mono"></code>
+            <button id="copy-run" type="button" class="icon" title="Copy run id">Copy</button>
+          </div>
+          <dl id="run-facts" class="facts"></dl>
+          <div class="stats" id="run-stats"></div>
+          <div class="actions">
+            <button id="run-again" type="button" class="secondary" title="Start a new run with this run's input">Run again…</button>
+            <button id="replay-one" type="button" class="secondary">Strict replay</button>
+            <button id="cancel-run" type="button" class="danger" hidden>Cancel run…</button>
+            <span id="run-result" class="result" role="status"></span>
+          </div>
+          <form id="event-form" class="event-form" hidden>
+            <h3>Deliver the event this run waits for</h3>
+            <div class="grid2">
+              <div><label for="event-kind">Kind</label><input id="event-kind" type="text" spellcheck="false"></div>
+              <div><label for="event-correlation">Correlation <span class="muted">namespace=value, one per line</span></label><textarea id="event-correlation" rows="2" spellcheck="false"></textarea></div>
+            </div>
+            <label for="event-payload">Payload <span class="muted">JSON</span></label>
+            <textarea id="event-payload" rows="3" spellcheck="false" class="mono">{}</textarea>
+            <div class="actions"><button id="send-event" type="submit">Deliver</button><span id="event-result" class="result" role="status"></span></div>
+          </form>
+        </div>
+
+        <div id="live-output" class="card live" aria-live="polite" hidden>
+          <h3><span class="dot run" aria-hidden="true"></span> The model is writing</h3>
+          <div id="live-text" class="text"></div>
+          <p id="live-usage" class="muted small-text"></p>
+        </div>
+
+        <div class="card">
+          <div class="timeline-head">
+            <div class="segmented" role="tablist" aria-label="Run view">
+              <button type="button" role="tab" class="seg" data-view="timeline" aria-selected="true">Timeline</button>
+              <button type="button" role="tab" class="seg" data-view="conversation" aria-selected="false">Conversation</button>
+            </div>
+            <div class="timeline-tools">
+              <label class="sr-only" for="timeline-filter">Filter records</label>
+              <input id="timeline-filter" type="search" placeholder="Filter: kind, step, text" spellcheck="false">
+              <label class="toggle"><input id="effects-only" type="checkbox"> effects only</label>
+              <button id="expand-all" type="button" class="secondary small">Expand all</button>
+              <button id="collapse-all" type="button" class="secondary small">Collapse</button>
+            </div>
+          </div>
+          <p id="timeline-escaped" class="flag" hidden>Hidden characters are shown as \u{…}.</p>
+          <ol id="timeline" class="timeline"></ol>
+          <div id="conversation" class="conversation" hidden></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-worklist" class="panel" role="tabpanel" hidden>
+      <ul id="tasks" class="tasks"></ul>
+    </section>
+
+    <section id="tab-declaration" class="panel" role="tabpanel" hidden>
+      <div id="declaration-body"></div>
+    </section>
+
+    <section id="tab-verify" class="panel" role="tabpanel" hidden>
+      <div class="card">
+        <h2>Strict replay</h2>
+        <p class="muted">Re-executes recorded runs against the file as it is now and names the first effect an edit changed.</p>
+        <div class="actions"><button id="replay-all" type="button">Replay every run</button></div>
+        <ul id="verdicts" class="verdicts"></ul>
+      </div>
+      <div class="card">
+        <h2>Export</h2>
+        <p class="muted">Exports the store, verifies the export, and offers the verified bytes.</p>
+        <div class="actions"><button id="export-run" type="button">Export and verify</button></div>
+        <div id="export-body"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

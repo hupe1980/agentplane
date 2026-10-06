@@ -358,15 +358,18 @@ async fn openai_embeddings_put_related_text_closer_than_unrelated() {
     let query = embedder
         .embed("what language does the customer prefer?")
         .await
-        .expect("the live embedding failed");
+        .expect("the live embedding failed")
+        .vector;
     let related = embedder
         .embed("The customer prefers German.")
         .await
-        .expect("the live embedding failed");
+        .expect("the live embedding failed")
+        .vector;
     let unrelated = embedder
         .embed("The warehouse roof was replaced in March.")
         .await
-        .expect("the live embedding failed");
+        .expect("the live embedding failed")
+        .vector;
 
     assert_eq!(
         query.len(),

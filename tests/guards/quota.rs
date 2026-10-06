@@ -132,6 +132,13 @@ impl QuotaStore for FailsFirstSettlement {
         self.inner.lift_halt(scope).await
     }
 
+    async fn lift_halt_if(
+        &self,
+        standing: &agentplane::quota::Halt,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.lift_halt_if(standing).await
+    }
+
     async fn halts(&self) -> Result<Vec<agentplane::quota::Halt>, agentplane::core::StoreError> {
         self.inner.halts().await
     }
@@ -753,9 +760,13 @@ spec:
     )
     .await
     .expect("widen");
-    rt.lift_halt(&HaltScope::agent("payments-clerk"))
-        .await
-        .expect("narrow the stop");
+    rt.lift_halt(
+        &HaltScope::agent("payments-clerk"),
+        &operator("ops"),
+        test_instant(),
+    )
+    .await
+    .expect("narrow the stop");
     match rt.run("support.do", Tainted::trusted(json!({}))).await {
         Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, .. })) => {
             assert_eq!(scope, HaltScope::Tenant);
@@ -763,7 +774,9 @@ spec:
         other => panic!("lifting a narrow halt lifted the broad one under it: {other:?}"),
     }
 
-    rt.lift_halt(&HaltScope::Tenant).await.expect("lift");
+    rt.lift_halt(&HaltScope::Tenant, &operator("ops"), test_instant())
+        .await
+        .expect("lift");
     assert_eq!(
         rt.run("pay.do", Tainted::trusted(json!({})))
             .await
@@ -917,9 +930,13 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
         "halting one tenant stopped another"
     );
 
-    one.lift_halt(&agentplane::quota::HaltScope::Tenant)
-        .await
-        .expect("lift");
+    one.lift_halt(
+        &agentplane::quota::HaltScope::Tenant,
+        &operator("ops"),
+        test_instant(),
+    )
+    .await
+    .expect("lift");
     assert_eq!(
         two.run("work", Tainted::trusted(json!({})))
             .await
@@ -1171,6 +1188,11 @@ async fn a_failed_quota_settlement_is_recovered_exactly_once() {
         .await
         .expect("recovery sweep");
     assert_eq!(report.runs_recovered, 1, "{report:?}");
+    assert_eq!(
+        report.slots_released, 0,
+        "the recovery sealed the run before settling it, and only the sealed-slot \
+         backstop billed the charge: {report:?}"
+    );
     assert_eq!(quotas.running().await.expect("running"), 0);
     assert_eq!(quotas.spent(&period).await.expect("spent").tokens, 100);
     assert!(store.inclusion_proof(run).await.expect("proof").is_some());
@@ -1331,10 +1353,7 @@ async fn settlement_recovery_preserves_an_open_failure() {
 
     let records = store.read(run, 1).await.expect("records");
     assert_eq!(
-        records
-            .iter()
-            .filter(|record| matches!(record.kind(), RecordKind::QuotaPassStarted { .. }))
-            .count(),
+        SPENDS_THEN_FAILS_RAN.load(std::sync::atomic::Ordering::SeqCst),
         1,
         "settlement recovery started a second execution pass"
     );
@@ -1383,6 +1402,12 @@ impl Skill for SpendsOnce {
     }
 }
 
+/// How often [`SpendsThenFails`] has been invoked, so a recovery that retries
+/// its failure is visible even when the retry fails the same way and writes
+/// nothing.
+static SPENDS_THEN_FAILS_RAN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Spends once and reaches an ordinary resumable failure.
 #[derive(Debug)]
 struct SpendsThenFails;
@@ -1397,6 +1422,7 @@ impl Skill for SpendsThenFails {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
+        SPENDS_THEN_FAILS_RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         cx.effect(Costs(100)).await?;
         Ok(Outcome::fail("the work itself failed"))
     }
@@ -1515,9 +1541,13 @@ async fn a_halt_can_name_the_authority_a_run_acts_for() {
         .expect("the plane's own chain is not the withdrawn one");
 
     // Lifting restores it.
-    rt.lift_halt(&HaltScope::subject("alice"))
-        .await
-        .expect("lift");
+    rt.lift_halt(
+        &HaltScope::subject("alice"),
+        &operator("ops"),
+        test_instant(),
+    )
+    .await
+    .expect("lift");
     rt.run_under(
         "work",
         Tainted::trusted(json!({})),
@@ -1576,10 +1606,8 @@ impl Effect for Charge {
 /// credential withdrawn under it.
 ///
 /// Withdrawing from inside the run is what puts the completed step in the
-/// executor's `completed` list when the boundary check fires. Throwing the
-/// halt from outside and resuming would fire the check at the *first*
-/// boundary of the resume, where nothing has completed in that pass — and
-/// the claim that nothing was unwound would hold however the code behaved.
+/// executor's `completed` list when the boundary check fires on the live pass,
+/// so the claim that nothing was unwound is about work that could have been.
 #[derive(Debug)]
 struct Charges(Arc<dyn QuotaStore>, AtomicBool);
 
@@ -1759,9 +1787,13 @@ async fn a_lifted_withdrawal_lets_a_withheld_run_continue() {
     );
 
     // Lifted, and the run continues from where it stopped.
-    rt.lift_halt(&HaltScope::subject("alice"))
-        .await
-        .expect("lift");
+    rt.lift_halt(
+        &HaltScope::subject("alice"),
+        &operator("ops"),
+        test_instant(),
+    )
+    .await
+    .expect("lift");
     let restored = rt
         .replay(run, Mode::Resume)
         .await
@@ -2354,4 +2386,668 @@ async fn a_reservation_covers_every_step_in_flight() {
             "the reservation was not sized for the steps this run may have in flight"
         );
     }
+}
+
+/// Fails every time, doing nothing.
+#[derive(Debug)]
+struct Declines;
+
+#[async_trait::async_trait]
+impl Skill for Declines {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("declines").provides("declines")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Ok(Outcome::fail("the dependency is still down"))
+    }
+}
+
+/// **A no-op resume under a quota writes nothing, and its run still reads as
+/// what it concluded.**
+///
+/// A resume pass that owes the ledger a settlement marks itself in the
+/// journal, and the marker rides the pass's first append. A resume reaching
+/// the conclusion the record already holds appends nothing, so it leaves no
+/// marker and no second conclusion — and the run's last record is still its
+/// conclusion, which is what every status reader reads.
+#[tokio::test]
+async fn a_no_op_resume_under_a_quota_repeats_no_conclusion() {
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.for_tenant(tenant("acme")));
+    let rt = Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .budget(bounded())
+        .quota(
+            scoped.clone() as Arc<dyn QuotaStore>,
+            TenantQuota {
+                max_tokens_per_period: Some(1_000_000),
+                ..TenantQuota::default()
+            },
+        )
+        .skill(Declines)
+        .build();
+    let out = rt
+        .run("declines", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "got {:?}",
+        out.status
+    );
+    let before = scoped.read(out.run_id, 1).await.expect("read").len();
+
+    for _ in 0..2 {
+        let again = rt
+            .replay(out.run_id, agentplane::runtime::Mode::Resume)
+            .await
+            .expect("resumed");
+        assert!(matches!(again.status, RunStatus::Failed(_)));
+    }
+    let records = scoped.read(out.run_id, 1).await.expect("read");
+    assert_eq!(
+        records.len(),
+        before,
+        "a resume that did nothing new grew the journal: {:?}",
+        records
+            .iter()
+            .map(|r| r.kind().kind_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(
+            records.last().map(agentplane::journal::Record::kind),
+            Some(RecordKind::RunConcluded { .. })
+        ),
+        "the run's last record is not its conclusion, so every status reader \
+         reports it as still working"
+    );
+    assert!(matches!(
+        rt.recorded_outcome(out.run_id)
+            .await
+            .expect("outcome")
+            .map(|o| o.status),
+        Some(RunStatus::Failed(_))
+    ));
+    scoped.verify(out.run_id).await.expect("chain intact");
+}
+
+/// **A resume that works marks its pass ahead of the first record it writes.**
+///
+/// The positive half of the lazy marker: recovery settles a crashed pass
+/// from its marker, so a pass that appends anything carries one, in its own
+/// epoch, before its first record.
+#[tokio::test]
+async fn a_working_resume_marks_its_pass_before_its_first_record() {
+    use agentplane::case::TimerStore;
+
+    let quota = TenantQuota {
+        max_tokens_per_period: Some(1_000_000),
+        ..TenantQuota::default()
+    };
+    let store = RedbStore::open_in_memory().expect("store");
+    let scoped = Arc::new(store.clone().for_tenant(tenant("acme")));
+    let rt = Runtime::builder(scoped.clone() as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("t")
+        .timers(scoped.clone() as Arc<dyn TimerStore>)
+        .budget(bounded())
+        .quota(scoped.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(SpendThenSleep)
+        .build();
+    let out = rt
+        .run("spender", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(out.status.is_suspended());
+    let before = scoped.read(out.run_id, 1).await.expect("read").len();
+
+    #[allow(clippy::disallowed_methods)]
+    let later = agentplane::core::Timestamp::now_utc() + std::time::Duration::from_secs(3600);
+    assert_eq!(rt.fire_timers(later).await.expect("fire").fired, 1);
+
+    let records = scoped.read(out.run_id, 1).await.expect("read");
+    let resumed = &records[before..];
+    let kinds: Vec<_> = resumed
+        .iter()
+        .map(|r| (r.kind().kind_str(), r.body.epoch))
+        .collect();
+    let marker = resumed
+        .iter()
+        .position(|r| {
+            matches!(
+                r.kind(),
+                RecordKind::QuotaPassStarted {
+                    period: Some(_),
+                    release_slot: false
+                }
+            )
+        })
+        .unwrap_or_else(|| panic!("the working resume left no pass marker: {kinds:?}"));
+    let first_written = resumed
+        .iter()
+        .position(|r| matches!(r.kind(), RecordKind::StepFinished { .. }))
+        .expect("the resume finished its step");
+    assert!(
+        marker < first_written && resumed[marker].body.epoch == resumed[first_written].body.epoch,
+        "the pass marker does not precede the pass's first record in its epoch: {kinds:?}"
+    );
+    assert!(matches!(
+        records.last().map(agentplane::journal::Record::kind),
+        Some(RecordKind::RunConcluded { .. })
+    ));
+}
+
+/// **A plane with no ledger resumes what no pass billed to a period.**
+///
+/// A plane on one backend has its ledger wired, unlimited, so every run it
+/// admits carries a pass marker. A plane sharing that journal with no quota
+/// store can still resume those runs: nothing they spent was accrued to a
+/// period it would leave unbilled. A pass that did accrue is refused.
+#[tokio::test]
+async fn a_plane_with_no_ledger_resumes_what_no_pass_billed() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let wired = Runtime::builder_on(store.clone()).skill(Declines).build();
+    let bare = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .skill(Declines)
+        .build();
+    let unbilled = wired
+        .run("declines", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    let resumed = bare
+        .replay(unbilled.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("a pass that accrued nothing to a period needs no ledger to resume");
+    assert!(matches!(resumed.status, RunStatus::Failed(_)));
+
+    let billing = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .budget(bounded())
+        .quota(
+            store.clone() as Arc<dyn QuotaStore>,
+            TenantQuota {
+                max_tokens_per_period: Some(1_000_000),
+                ..TenantQuota::default()
+            },
+        )
+        .skill(Declines)
+        .build();
+    let billed = billing
+        .run("declines", Tainted::trusted(json!({})))
+        .await
+        .expect("admitted");
+    let refused = bare
+        .replay(billed.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect_err("a pass billed to a period cannot be settled without a ledger");
+    assert!(refused.to_string().contains("quota period"), "{refused}");
+}
+
+/// **A halt naming a person reaches the work delegated from them.**
+///
+/// A run acts for everyone on its chain: the person at the root, every
+/// workload they delegated through, and the one acting. Withdrawing the
+/// person must stop what their delegate is doing for them — keyed on the
+/// acting workload alone, `subject:alice` would stop nothing alice asked a
+/// service to do, which is the incident the halt was thrown for. Both doors:
+/// admission, and a run already in flight.
+#[tokio::test]
+async fn a_halt_naming_a_person_reaches_the_work_delegated_from_them() {
+    use agentplane::core::{CorrelationKey, Delegation, Principal, RuntimeError, Scope};
+    use agentplane::quota::QuotaError;
+    use agentplane::runtime::RunTerms;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn agentplane::case::CaseStore>)
+        .events(store.clone() as Arc<dyn agentplane::case::EventStore>)
+        .timers(store.clone() as Arc<dyn agentplane::case::TimerStore>)
+        .quota(store.clone() as Arc<dyn QuotaStore>, TenantQuota::default())
+        .skill(Work)
+        .skill(Waits)
+        .build();
+    let delegated = || {
+        Delegation::root(Principal::new("alice", Scope::root()))
+            .delegate(Principal::new("svc:billing", Scope::root()))
+            .expect("a narrower link")
+    };
+
+    // In flight: suspended before the withdrawal.
+    let waiting = rt
+        .run_under(
+            "waits",
+            Tainted::trusted(json!({})),
+            RunTerms::default()
+                .acting_as(delegated())
+                .correlated("claim", &[CorrelationKey::new("claim", "CLM-1")]),
+        )
+        .await
+        .expect("admitted before any withdrawal");
+    let waiting = waiting.outcome().expect("ran to a pause").clone();
+    assert!(waiting.status.is_suspended(), "got {:?}", waiting.status);
+
+    rt.set_halt(
+        &HaltScope::subject("alice"),
+        &operator("ops"),
+        test_instant(),
+        "alice has left",
+    )
+    .await
+    .expect("withdraw the person");
+
+    match rt
+        .run_under(
+            "work",
+            Tainted::trusted(json!({})),
+            RunTerms::default().acting_as(delegated()),
+        )
+        .await
+    {
+        Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, .. })) => {
+            assert_eq!(scope, HaltScope::subject("alice"));
+        }
+        other => panic!("a delegate of a withdrawn person was admitted: {other:?}"),
+    }
+
+    let resumed = rt
+        .replay(waiting.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("resumed");
+    match resumed.status {
+        RunStatus::Withheld { subject, .. } => assert_eq!(subject, "alice"),
+        other => panic!("a delegate of a withdrawn person carried on: {other:?}"),
+    }
+}
+
+/// A plane wired from one full backend obeys a halt nobody configured it for.
+///
+/// Halts live in the quota store, so a plane that could be built without one
+/// would admit past every emergency stop an operator throws.
+#[tokio::test]
+async fn a_plane_on_a_full_backend_obeys_halts_without_being_told_to() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    QuotaStore::set_halt(
+        store.as_ref(),
+        &HaltScope::Tenant,
+        &operator("ops"),
+        test_instant(),
+        "incident 7",
+    )
+    .await
+    .expect("halt");
+
+    let rt = Runtime::builder_with(agentplane::runtime::Stores::on(Arc::clone(&store)))
+        .skill(Work)
+        .build();
+    match rt.run("work", Tainted::trusted(json!({}))).await {
+        Err(agentplane::core::RuntimeError::QuotaExceeded(QuotaError::Halted {
+            scope, ..
+        })) => assert_eq!(scope, HaltScope::Tenant),
+        other => panic!("a plane built without `.quota` admitted past a tenant halt: {other:?}"),
+    }
+}
+
+/// A resume whose first write is its conclusion names the head it sits on.
+///
+/// The pass marker rides the pass's first append, so when that append is the
+/// conclusion the marker lands between the head the conclusion was drawn over
+/// and the conclusion itself. The run is sound; an audit or an offline verify
+/// reading a foreign `chain_head` would call it tampered.
+#[tokio::test]
+async fn a_resume_that_only_concludes_names_the_head_it_sits_on() {
+    use agentplane::journal::Append;
+    use agentplane::runtime::MIN_LEASE_TTL;
+
+    let origin = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant("acme")),
+    );
+    let first = Runtime::builder(Arc::clone(&origin) as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .skill(Work)
+        .build()
+        .run("work", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    let run = first.run_id;
+
+    // The shape a crash after the last step and before the conclusion leaves.
+    let raw = RedbStore::open_in_memory().expect("store");
+    let store = Arc::new(raw.clone().for_tenant(tenant("acme")));
+    let records = origin.read(run, 1).await.expect("records");
+    let lease = store
+        .acquire(run, "dead-instance", MIN_LEASE_TTL)
+        .await
+        .expect("lease");
+    for r in records
+        .iter()
+        .filter(|r| !matches!(r.kind(), RecordKind::RunConcluded { .. }))
+    {
+        let mut a = Append::new(run, r.kind().clone()).phase(r.body.phase);
+        if let Some(s) = r.body.step {
+            a = a.step(s);
+        }
+        if let Some(c) = r.body.case {
+            a = a.case(c);
+        }
+        if let Some(k) = r.effect_key() {
+            a = a.effect(k);
+        }
+        store.append(lease.epoch, vec![a]).await.expect("append");
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let rt = plane(
+        &raw,
+        "acme",
+        TenantQuota {
+            max_tokens_per_period: Some(1_000_000),
+            ..TenantQuota::default()
+        },
+    );
+    let report = rt
+        .sweep(harness_now(), std::time::Duration::ZERO)
+        .await
+        .expect("sweep");
+    assert_eq!(report.runs_recovered, 1, "{report:?}");
+
+    let resumed = store.read(run, 1).await.expect("records");
+    assert!(
+        resumed
+            .iter()
+            .any(|r| matches!(r.kind(), RecordKind::QuotaPassStarted { .. })),
+        "the resume opened no quota pass, so this test proves nothing"
+    );
+    let journal = Arc::clone(&store) as Arc<dyn JournalStore>;
+    let audit = agentplane::audit::audit(&journal, &[run], &agentplane::audit::Evidence::default())
+        .await
+        .expect("audit");
+    assert!(
+        audit.sound.contains(&run),
+        "a recovered run whose resume only concluded audits as tampered: {:#?}",
+        audit.findings
+    );
+
+    let cases: Arc<dyn agentplane::case::CaseStore> =
+        Arc::new(RedbStore::open_in_memory().expect("store"));
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(&journal, &cases, &[run], &mut out)
+        .await
+        .expect("export");
+    let verified =
+        agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("verify");
+    assert!(
+        verified.sound.contains(&run),
+        "a recovered run whose resume only concluded fails offline verification: {:#?}",
+        verified.findings
+    );
+}
+
+/// A slot a sealed run still holds is released by the plane that holds it.
+///
+/// A plane with no quota store may finish a run whose passes billed no
+/// period, and it cannot give back the admission slot another plane's ledger
+/// holds. Once the run is sealed no resume or recovery selects it again.
+#[tokio::test]
+async fn a_sealed_run_still_holding_a_slot_is_released() {
+    use agentplane::runtime::MIN_LEASE_TTL;
+
+    let quota = slots(1);
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant("acme")),
+    );
+    let quotas = Arc::new(FailsFirstSettlement {
+        inner: Arc::clone(&store),
+        fail: AtomicBool::new(true),
+    });
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("with-ledger")
+        .lease_ttl(MIN_LEASE_TTL)
+        .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
+        .skill(Work)
+        .build();
+    rt.run("work", Tainted::trusted(json!({})))
+        .await
+        .expect_err("the injected settlement outage must reach the caller");
+    assert_eq!(quotas.running().await.expect("running"), 1);
+
+    // A plane with no ledger takes the run over and seals it.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let ledgerless = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .owner("without-ledger")
+        .skill(Work)
+        .build();
+    let report = ledgerless
+        .sweep(harness_now(), std::time::Duration::ZERO)
+        .await
+        .expect("sweep");
+    assert_eq!(report.runs_recovered, 1, "{report:?}");
+    assert_eq!(
+        quotas.running().await.expect("running"),
+        1,
+        "the ledgerless plane cannot release the slot, so this test proves nothing"
+    );
+
+    let report = rt
+        .sweep(harness_now(), std::time::Duration::ZERO)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        quotas.running().await.expect("running"),
+        0,
+        "a sealed run holds the tenant's only slot and nothing will release it"
+    );
+    assert_eq!(report.slots_released, 1, "{report:?}");
+}
+
+/// What another operator does between a lift's read and its removal.
+#[derive(Debug, Clone, Copy)]
+enum Between {
+    /// Throws the halt again, over the row the lift read.
+    Rethrows,
+    /// Lifts it first.
+    LiftsFirst,
+}
+
+/// A quota register where another operator acts inside a lift's window.
+#[derive(Debug)]
+struct Interleaved {
+    inner: Arc<RedbStore>,
+    between: Between,
+}
+
+#[async_trait::async_trait]
+impl QuotaStore for Interleaved {
+    fn tenant(&self) -> &str {
+        QuotaStore::tenant(self.inner.as_ref())
+    }
+    async fn reserve(
+        &self,
+        run: agentplane::RunId,
+        quota: &TenantQuota,
+        hold: Option<&SpendHold>,
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), QuotaError> {
+        self.inner.reserve(run, quota, hold, at).await
+    }
+    async fn release(&self, run: agentplane::RunId) -> Result<(), agentplane::core::StoreError> {
+        self.inner.release(run).await
+    }
+    async fn carry(
+        &self,
+        run: agentplane::RunId,
+        period: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.carry(run, period).await
+    }
+    async fn reservations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::quota::Held>, agentplane::core::StoreError> {
+        self.inner.reservations(limit).await
+    }
+    async fn reserved(&self, period: &str) -> Result<Spend, agentplane::core::StoreError> {
+        self.inner.reserved(period).await
+    }
+    async fn set_halt(
+        &self,
+        scope: &agentplane::quota::HaltScope,
+        by: &agentplane::core::Operator,
+        at: agentplane::core::Timestamp,
+        reason: &str,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.set_halt(scope, by, at, reason).await
+    }
+    async fn lift_halt(
+        &self,
+        scope: &agentplane::quota::HaltScope,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        self.inner.lift_halt(scope).await
+    }
+    async fn lift_halt_if(
+        &self,
+        standing: &agentplane::quota::Halt,
+    ) -> Result<bool, agentplane::core::StoreError> {
+        match self.between {
+            Between::Rethrows => {
+                self.inner
+                    .set_halt(
+                        &standing.scope,
+                        &operator("ops-dave"),
+                        test_instant() + time::Duration::minutes(5),
+                        "INC-2",
+                    )
+                    .await?;
+            }
+            Between::LiftsFirst => {
+                self.inner.lift_halt(&standing.scope).await?;
+            }
+        }
+        self.inner.lift_halt_if(standing).await
+    }
+    async fn halts(&self) -> Result<Vec<agentplane::quota::Halt>, agentplane::core::StoreError> {
+        self.inner.halts().await
+    }
+    async fn settle(
+        &self,
+        settlement: &QuotaSettlement,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.settle(settlement).await
+    }
+    async fn spent(&self, period: &str) -> Result<Spend, agentplane::core::StoreError> {
+        self.inner.spent(period).await
+    }
+    async fn running(&self) -> Result<u32, agentplane::core::StoreError> {
+        self.inner.running().await
+    }
+    async fn running_runs(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<agentplane::RunId>, agentplane::core::StoreError> {
+        self.inner.running_runs(limit).await
+    }
+    async fn reserve_rate(
+        &self,
+        reservation: &agentplane::quota::RateReservation,
+    ) -> Result<(), QuotaError> {
+        self.inner.reserve_rate(reservation).await
+    }
+    async fn rate_room(
+        &self,
+        grant: &str,
+        ceilings: &[agentplane::quota::RateCeiling],
+        at: agentplane::core::Timestamp,
+    ) -> Result<(), QuotaError> {
+        self.inner.rate_room(grant, ceilings, at).await
+    }
+}
+
+/// A plane whose quota register lets `between` happen inside each lift.
+async fn interleaved(between: Between) -> Arc<Runtime> {
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant("acme")),
+    );
+    store
+        .set_halt(
+            &agentplane::quota::HaltScope::Tenant,
+            &operator("ops-carol"),
+            test_instant(),
+            "INC-1",
+        )
+        .await
+        .expect("halt");
+    Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .tenant(tenant("acme"))
+        .quota(
+            Arc::new(Interleaved {
+                inner: store,
+                between,
+            }) as Arc<dyn QuotaStore>,
+            TenantQuota::default(),
+        )
+        .build()
+}
+
+/// **A lift removes only the halt it recorded.**
+///
+/// A halt re-thrown after the lift read the old one stands in the same row.
+/// The lift's record names the old stop; deleting the new one under it would
+/// let the work start again with nobody recorded as having allowed it.
+#[tokio::test]
+async fn a_halt_rethrown_during_a_lift_still_stands() {
+    let rt = interleaved(Between::Rethrows).await;
+    let refused = rt
+        .lift_halt(
+            &agentplane::quota::HaltScope::Tenant,
+            &operator("ops-erin"),
+            test_instant(),
+        )
+        .await
+        .expect_err("a lift that would delete a halt it did not record is refused");
+    let agentplane::core::RuntimeError::ControlStands { run, detail } = &refused else {
+        panic!("not a standing control: {refused}");
+    };
+    assert!(detail.contains("re-thrown"), "{detail}");
+    let lifts = rt.lifted_halts(10).await.expect("lifts");
+    assert_eq!(lifts.len(), 1, "the lift was recorded before the removal");
+    assert_eq!(
+        &lifts[0].body.run.to_string(),
+        run,
+        "the error names the record's run"
+    );
+    let halts = rt.halts().await.expect("halts");
+    assert_eq!(halts.len(), 1, "the re-thrown halt was deleted");
+    assert_eq!(halts[0].reason, "INC-2");
+    assert_eq!(halts[0].by, operator("ops-dave"));
+}
+
+/// **A lift that another lift beat answers that it removed nothing.**
+///
+/// Both were recorded; only one removed the row. The second is not an error —
+/// the scope is clear — but it must not claim the removal.
+#[tokio::test]
+async fn a_lift_beaten_by_another_answers_not_removed() {
+    let rt = interleaved(Between::LiftsFirst).await;
+    let lifted = rt
+        .lift_halt(
+            &agentplane::quota::HaltScope::Tenant,
+            &operator("ops-erin"),
+            test_instant(),
+        )
+        .await
+        .expect("a lift whose row is already gone is an answer")
+        .expect("a halt was standing when it read");
+    assert!(!lifted.removed, "another lift removed the row first");
+    assert!(rt.halts().await.expect("halts").is_empty());
 }

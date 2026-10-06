@@ -523,7 +523,9 @@ fn verify_line(
     let key = trusted
         .iter()
         .find(|k| k.name == line.name && k.note_key_id == line.key_id)?;
-    let verifying = VerifyingKey::from_bytes(&key.public_key).ok()?;
+    let verifying = VerifyingKey::from_bytes(&key.public_key)
+        .ok()
+        .filter(|k| !k.is_weak())?;
     let (timestamp, sig) = cosignature_payload(&line.signature)?;
     if timestamp == 0 {
         return None;
@@ -536,6 +538,22 @@ fn verify_line(
         note_key_id: key.note_key_id,
         signature: line.signature.clone(),
     })
+}
+
+/// Every cosignature a signed note carries from a trusted witness.
+///
+/// For a cosigned checkpoint handed over as a file: the note's own body is
+/// what every line signed, so the rule is the one a witness's answer is
+/// checked by, over that body.
+/// Each line is considered; one that is not a cosignature by a trusted key is
+/// skipped, and an empty result means nobody this caller trusts vouched for
+/// the checkpoint.
+#[must_use]
+pub fn cosignatures_in(note: &SignedNote, trusted: &[TrustedWitness]) -> Vec<Cosignature> {
+    note.signatures
+        .iter()
+        .filter_map(|line| verify_line(line, &note.text, trusted))
+        .collect()
 }
 
 /// A 200 body is one or more note signature lines, and at least one of them

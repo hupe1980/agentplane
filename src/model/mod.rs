@@ -1215,6 +1215,13 @@ pub enum SchemaMode {
     /// *produce a tool call*, and providers vary in how strictly they validate
     /// its arguments against the declared schema. Native mode makes a malformed
     /// answer impossible; this makes it unlikely.
+    ///
+    /// It spends the request's tool choice, so it cannot sit beside caller
+    /// tools. Anthropic rejects a forced tool choice beside extended thinking,
+    /// and its newest models reject it outright: the Anthropic driver refuses
+    /// this mode beside a reasoning effort rather than send a request the
+    /// provider rejects, and a model that takes no forced choice needs
+    /// [`Native`](Self::Native).
     ForcedTool,
 }
 
@@ -1443,12 +1450,16 @@ impl ModelCall {
     /// [`Tainted::object`](crate::core::Tainted::object) keeps the two apart,
     /// which is what it is for.
     fn with_protected_instruction(mut self) -> Self {
-        self.protected = if self.prompt.get("system").is_some_and(|s| !s.is_null()) {
+        self.protected = Self::instruction_rule(&self.prompt);
+        self
+    }
+
+    fn instruction_rule(prompt: &Value) -> Vec<crate::core::ProtectedField> {
+        if prompt.get("system").is_some_and(|s| !s.is_null()) {
             vec![crate::core::ProtectedField::trusted("/system")]
         } else {
             Vec::new()
-        };
-        self
+        }
     }
 
     /// Tell the model which tools it may ask for.
@@ -1496,6 +1507,15 @@ impl ModelCall {
     #[must_use]
     pub fn streaming_to(mut self, observer: Arc<dyn ModelStreamObserver>) -> Self {
         self.stream = Some(observer);
+        self
+    }
+
+    /// The plane's observer, when it has one and the call has none of its own.
+    #[must_use]
+    pub(crate) fn observed_by(mut self, observer: Option<Arc<dyn ModelStreamObserver>>) -> Self {
+        if self.stream.is_none() {
+            self.stream = observer;
+        }
         self
     }
 
@@ -1741,6 +1761,14 @@ impl Effect for ModelCall {
 
     fn sink_arguments(&self) -> Option<&Value> {
         Some(&self.prompt)
+    }
+
+    fn rebind(&mut self, arguments: Value) -> bool {
+        self.prompt = arguments;
+        // Recomputed from the prompt it now holds, so the instruction rule
+        // never describes a prompt this call no longer sends.
+        self.protected = Self::instruction_rule(&self.prompt);
+        true
     }
 
     /// Everything the provider is sent, not only the prompt the sink gate

@@ -560,6 +560,7 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 ),
                 // Replay reads the plan back from history rather than
@@ -589,6 +590,8 @@ async fn an_orphaned_mutating_effect_is_quarantined_not_retried() {
                         mutates: true,
                         outbound_label: None,
                         outbound_bytes: None,
+                        content_rules: None,
+                        credential: None,
                     },
                 )
                 .step(StepId(0))
@@ -1274,30 +1277,63 @@ async fn an_expired_unreleased_lease_marks_a_run_abandoned() {
     );
 }
 
+/// Copy a run's journal into `into` without its trailing conclusion, under a
+/// lease `dead-instance` holds and never hands back.
+///
+/// The shape a `kill -9` mid-run leaves: a prefix of the history, and an
+/// owned lease that lapses. A run that *concluded* and then lost its owner is
+/// a different case — recovery finishes that conclusion rather than resuming.
+async fn crashed_before_concluding(
+    from: &Arc<RedbStore>,
+    into: &Arc<RedbStore>,
+    run: agentplane::core::RunId,
+    ttl: std::time::Duration,
+) {
+    use agentplane::journal::{Append, RecordKind};
+    let records = from.read(run, 1).await.unwrap();
+    let cut = records
+        .iter()
+        .rposition(|r| !matches!(r.kind(), RecordKind::RunConcluded { .. }))
+        .expect("the run did something")
+        + 1;
+    let lease = into.acquire(run, "dead-instance", ttl).await.unwrap();
+    for r in &records[..cut] {
+        let mut a = Append::new(run, r.kind().clone()).phase(r.body.phase);
+        if let Some(s) = r.body.step {
+            a = a.step(s);
+        }
+        if let Some(c) = r.body.case {
+            a = a.case(c);
+        }
+        if let Some(k) = r.effect_key() {
+            a = a.effect(k);
+        }
+        into.append(lease.epoch, vec![a]).await.unwrap();
+    }
+}
+
 /// **The liveness property.** A run stranded by a dead instance is found and
 /// resumed by the sweep — no event, no timer, no operator.
 #[tokio::test]
 async fn the_sweep_recovers_a_run_its_owner_died_holding() {
     use std::time::Duration;
 
+    let origin = Arc::new(RedbStore::open_in_memory().unwrap());
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let crash_at = Arc::new(AtomicUsize::new(0));
     let calls = tally();
-    let rt = Runtime::builder(store.clone())
+    let first = Runtime::builder(origin.clone())
         .skill(pipeline(&crash_at, &calls))
-        .build();
-
-    // A run dies after stage 0 — and, unlike an orderly failure, its "owner"
-    // then vanishes holding the lease, the way a killed process does.
-    let first = rt
+        .build()
         .run("pipeline", Tainted::trusted(json!({})))
         .await
         .unwrap();
-    assert!(matches!(first.status, RunStatus::Failed(_)));
-    (store.clone() as Arc<dyn JournalStore>)
-        .acquire(first.run_id, "dead-instance", Duration::from_secs(2))
-        .await
-        .unwrap();
+    // The run dies after stage 0, before concluding, and its owner vanishes
+    // holding the lease, the way a killed process does.
+    crashed_before_concluding(&origin, &store, first.run_id, Duration::from_secs(2)).await;
+    let rt = Runtime::builder(store.clone())
+        .skill(pipeline(&crash_at, &calls))
+        .build();
 
     crash_at.store(NO_CRASH, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1366,15 +1402,14 @@ async fn a_takeover_whose_note_cannot_be_written_is_not_taken() {
         .skill(pipeline(&crash_at, &calls))
         .build();
 
-    let first = rt_clean
+    let origin = Arc::new(RedbStore::open_in_memory().unwrap());
+    let first = Runtime::builder(origin.clone())
+        .skill(pipeline(&crash_at, &calls))
+        .build()
         .run("pipeline", Tainted::trusted(json!({})))
         .await
         .unwrap();
-    assert!(matches!(first.status, RunStatus::Failed(_)));
-    (inner.clone() as Arc<dyn JournalStore>)
-        .acquire(first.run_id, "dead-instance", Duration::from_secs(2))
-        .await
-        .unwrap();
+    crashed_before_concluding(&origin, &inner, first.run_id, Duration::from_secs(2)).await;
     crash_at.store(NO_CRASH, Ordering::SeqCst);
     tokio::time::sleep(Duration::from_secs(3)).await;
     let before = calls[1].load(Ordering::SeqCst);
@@ -1560,6 +1595,7 @@ async fn a_recovery_that_cannot_succeed_is_quarantined_not_retried() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 ),
                 Append::new(
@@ -1648,6 +1684,12 @@ fn every_conclusion_but_success_carries_a_reason() {
             actor: operator("ops:hupe"),
             reason: "INC-42: stuck settlement".into(),
         },
+        RunStatus::HaltLifted {
+            actor: operator("ops:hupe"),
+        },
+        RunStatus::HoldReleased {
+            actor: operator("ops:hupe"),
+        },
         RunStatus::Withheld {
             subject: "alice".into(),
             reason: "credential withdrawn: laptop lost".into(),
@@ -1664,7 +1706,13 @@ fn every_conclusion_but_success_carries_a_reason() {
             // An observed session is beside them for the third version of the
             // same reason: this plane did not run it, so it has no account of
             // why it ended and must not manufacture one.
-            RunStatus::Succeeded | RunStatus::Swept | RunStatus::Observed => assert!(
+            // A lift's record holds the control it ended; the lifter is asked
+            // for no reason, so there is none to report.
+            RunStatus::Succeeded
+            | RunStatus::Swept
+            | RunStatus::Observed
+            | RunStatus::HaltLifted { .. }
+            | RunStatus::HoldReleased { .. } => assert!(
                 reason.is_none(),
                 "a success has no reason to give, and inventing one would put a \
                  sentence in a field an embedder renders as a failure note"
@@ -1705,5 +1753,91 @@ fn every_conclusion_but_success_carries_a_reason() {
             .expect("exhaustion has a reason")
             .contains('3'),
         "the exhaustion's reason must name the ceiling it hit"
+    );
+}
+
+/// Fails cleanly, every time.
+#[derive(Debug)]
+struct Refuses {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Skill for Refuses {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("refuses").provides("demo.post")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, agentplane::core::SkillError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(agentplane::core::SkillError::Other("declined".into()))
+    }
+}
+
+/// **Recovery finishes a conclusion; it does not retry one.**
+///
+/// The owner concluded the run `failed`, having compensated, and died before
+/// handing the lease back. The sweep finds the lapsed lease. What is left is
+/// the release, and nothing else: no quota store is wired, so no pass marker
+/// says the conclusion was this pass's — the conclusion itself does. Resumed
+/// instead, the run is refused for its undone work, keeps its owned lease,
+/// and is recovered and refused again every lease period.
+#[tokio::test]
+async fn recovery_hands_back_a_concluded_run_rather_than_resuming_it() {
+    use std::time::Duration;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let undone = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::builder(store.clone())
+        .skill(Prepares {
+            undone: Arc::clone(&undone),
+        })
+        .skill(Refuses {
+            calls: Arc::clone(&calls),
+        })
+        .build();
+    let out = rt
+        .run_plan(prepare_then_post(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "got {:?}",
+        out.status
+    );
+    assert_eq!(undone.load(Ordering::SeqCst), 1, "the failure compensated");
+
+    // The owner concluded, then died holding the lease.
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    journal
+        .acquire(out.run_id, "dead-instance", Duration::from_secs(2))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let report = rt
+        .sweep(sweep_now(), Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.recovery_failures, 0,
+        "recovering a concluded run failed, so it stays owned and is retried forever"
+    );
+    assert!(
+        journal.abandoned_runs(10).await.unwrap().is_empty(),
+        "the concluded run's lease was not handed back"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "the failed step ran again");
+    assert!(
+        journal
+            .runs_by_outcome("failed", 10)
+            .await
+            .unwrap()
+            .contains(&out.run_id),
+        "the run's recorded conclusion is the one it keeps"
     );
 }

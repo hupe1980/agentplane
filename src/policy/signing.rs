@@ -121,14 +121,19 @@ impl Ed25519Verifier {
     ///
     /// # Errors
     ///
-    /// If the bytes are not a valid Ed25519 public key.
+    /// If the bytes are not a valid Ed25519 public key, or are one of small
+    /// order — a weak key, under which a signature verifies without anybody's
+    /// secret.
     pub fn trust(
         mut self,
         key_id: impl Into<KeyId>,
         public: &[u8; 32],
     ) -> Result<Self, ed25519_dalek::SignatureError> {
-        self.keys
-            .insert(key_id.into(), VerifyingKey::from_bytes(public)?);
+        let key = VerifyingKey::from_bytes(public)?;
+        if key.is_weak() {
+            return Err(ed25519_dalek::SignatureError::new());
+        }
+        self.keys.insert(key_id.into(), key);
         Ok(self)
     }
 }

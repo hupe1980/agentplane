@@ -249,3 +249,26 @@ fn journal_records_carry_no_component_array() {
         assert_no_component_array(kind.kind_str(), kind);
     }
 }
+
+/// Standing authority and its revocation, which the authority stores keep as
+/// JSON an operator reads.
+#[test]
+fn a_standing_authority_carries_no_component_array() {
+    use agentplane::authority::{Holder, Revocation, StandingAuthority};
+
+    let mut authority = StandingAuthority::new(
+        "refunds-q3",
+        Holder::subject("user:rita"),
+        "quarterly refund allowance",
+        agentplane::core::Spend::default(),
+    );
+    authority.expires_at = Some(at());
+    assert_no_component_array("StandingAuthority", &authority);
+    assert_no_component_array(
+        "Revocation",
+        &Revocation {
+            at: at(),
+            reason: "left the team".to_owned(),
+        },
+    );
+}

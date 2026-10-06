@@ -55,6 +55,9 @@ pub struct Event {
 pub struct Decoder {
     /// Bytes received but not yet terminated by a newline.
     partial: String,
+    /// How much of `partial` is known to hold no terminator, so a line that
+    /// arrives in many chunks is searched once rather than once per chunk.
+    scanned: usize,
     /// The event being built.
     name: String,
     data: String,
@@ -76,6 +79,7 @@ impl Default for Decoder {
     fn default() -> Self {
         Self {
             partial: String::new(),
+            scanned: 0,
             name: String::new(),
             data: String::new(),
             started: false,
@@ -112,28 +116,34 @@ impl Decoder {
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<Event>, DecodeError> {
         self.pending.extend_from_slice(chunk);
         let mut text = String::new();
+        // Decoded at an offset and the consumed prefix dropped once, so a
+        // chunk of many invalid bytes is one pass.
+        let mut start = 0;
         loop {
-            match std::str::from_utf8(&self.pending) {
+            match std::str::from_utf8(&self.pending[start..]) {
                 Ok(valid) => {
                     text.push_str(valid);
-                    self.pending.clear();
+                    start = self.pending.len();
                     break;
                 }
                 Err(error) => {
                     let valid = error.valid_up_to();
-                    text.push_str(&String::from_utf8_lossy(&self.pending[..valid]));
+                    text.push_str(&String::from_utf8_lossy(
+                        &self.pending[start..start + valid],
+                    ));
                     if let Some(bad) = error.error_len() {
                         // Genuinely invalid bytes: one replacement char, move on.
                         text.push('\u{FFFD}');
-                        self.pending.drain(..valid + bad);
+                        start += valid + bad;
                     } else {
                         // The front half of a codepoint. Kept for the next chunk.
-                        self.pending.drain(..valid);
+                        start += valid;
                         break;
                     }
                 }
             }
         }
+        self.pending.drain(..start);
         // The stream may open with one BOM, which the spec says to ignore.
         if !self.bom_checked && !text.is_empty() {
             self.bom_checked = true;
@@ -146,8 +156,13 @@ impl Decoder {
 
         // Consume whole lines only. Whatever trails the last terminator stays in
         // `partial` — it is the front half of a line whose back half is still in
-        // flight.
-        while let Some((line, rest)) = split_line(&self.partial) {
+        // flight. Lines are read at an offset and the consumed prefix dropped
+        // once, so a chunk of many lines costs one pass rather than a copy of
+        // the remainder per line.
+        let mut consumed = 0;
+        let mut from = self.scanned;
+        while let Some((line, rest)) = split_line(&self.partial[consumed..], from) {
+            from = 0;
             if line.len() > self.max_event_bytes {
                 return Err(self.too_large());
             }
@@ -159,11 +174,11 @@ impl Decoder {
             //
             // Without it, a mutation of `split_line` spins here forever and
             // reads as a timeout rather than a catch.
-            if rest.len() >= self.partial.len() {
+            if rest.len() >= self.partial.len() - consumed {
                 break;
             }
             let line = line.to_owned();
-            self.partial = rest.to_owned();
+            consumed = self.partial.len() - rest.len();
             if let Some(event) = self.line(&line) {
                 out.push(event);
             }
@@ -171,6 +186,10 @@ impl Decoder {
                 return Err(self.too_large());
             }
         }
+        self.partial.drain(..consumed);
+        // What remains holds no terminator but perhaps a trailing `\r`, which
+        // the next chunk may complete as `\r\n`.
+        self.scanned = self.partial.len() - usize::from(self.partial.ends_with('\r'));
         if self.partial.len() > self.max_event_bytes {
             return Err(self.too_large());
         }
@@ -231,15 +250,20 @@ impl Decoder {
     }
 }
 
-/// Split off the first complete line, handling all three terminators.
+/// Split off the first complete line, handling all three terminators; the
+/// search starts at `from`, before which `buf` is known to hold none.
 ///
 /// Returns `None` when no terminator has arrived yet. The `\r` case has to look
 /// ahead: a bare `\r` at the very end of the buffer might be the front half of a
 /// `\r\n` whose `\n` is in the next chunk, and treating it as a terminator would
 /// dispatch an event one chunk early and then see a stray empty line.
-fn split_line(buf: &str) -> Option<(&str, &str)> {
+fn split_line(buf: &str, from: usize) -> Option<(&str, &str)> {
     let bytes = buf.as_bytes();
-    let idx = bytes.iter().position(|&b| b == b'\n' || b == b'\r')?;
+    let idx = from
+        + bytes
+            .get(from..)?
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')?;
     match bytes[idx] {
         b'\n' => Some((&buf[..idx], &buf[idx + 1..])),
         // Bare `\r` at the buffer's end: wait for more, in case it is `\r\n`.

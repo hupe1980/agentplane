@@ -260,8 +260,23 @@ impl EventStore for SealedEvents {
         self.inner.unsubscribe(run, effect).await
     }
 
-    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
-        self.inner.unsubscribe_run(run).await
+    async fn unsubscribe_run(
+        &self,
+        run: RunId,
+        unanswered: &[EffectKey],
+    ) -> Result<crate::case::Retired, StoreError> {
+        let mut retired = self.inner.unsubscribe_run(run, unanswered).await?;
+        // Handed back opened, as a claim is: the caller offers each to the
+        // next waiter. One whose key was destroyed is not offered at all.
+        let mut opened = Vec::with_capacity(retired.released.len());
+        for mut event in std::mem::take(&mut retired.released) {
+            if let Some(payload) = self.payload(&event).await? {
+                event.payload = payload;
+                opened.push(event);
+            }
+        }
+        retired.released = opened;
+        Ok(retired)
     }
 
     async fn park_wait(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
@@ -521,8 +536,12 @@ mod aad_tests {
         async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError> {
             self.0.unsubscribe(run, effect).await
         }
-        async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError> {
-            self.0.unsubscribe_run(run).await
+        async fn unsubscribe_run(
+            &self,
+            run: RunId,
+            unanswered: &[EffectKey],
+        ) -> Result<crate::case::Retired, StoreError> {
+            self.0.unsubscribe_run(run, unanswered).await
         }
         async fn park_wait(&self, s: &Subscription, at: Timestamp) -> Result<(), StoreError> {
             self.0.park_wait(s, at).await
@@ -598,6 +617,7 @@ mod aad_tests {
             phase: Phase::Forward,
             kind: "reply".to_owned(),
             correlation: vec![CorrelationKey::new("order", "O-7")],
+            from: None,
         };
         sealed.subscribe(&sub, at(3_000)).await.expect("subscribe");
         let claimed = sealed.claim_for(&sub, at(3_001)).await.expect("claim");

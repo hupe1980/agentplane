@@ -503,6 +503,8 @@ async fn the_store_refuses_a_duplicate_effect_start() {
         backoff_ms: 0,
         outbound_label: None,
         outbound_bytes: None,
+        content_rules: None,
+        credential: None,
     };
 
     s.append(lease.epoch, vec![Append::new(run, started()).effect(key)])
@@ -602,6 +604,7 @@ async fn the_journal_chain_verifies() {
 /// A tampered history could otherwise be used to "confirm" something that never
 /// happened, which is worse than having no journal at all.
 #[tokio::test]
+#[cfg(feature = "testkit")]
 async fn replay_refuses_a_tampered_journal() {
     let calls = Arc::new(AtomicUsize::new(0));
     let s = Arc::new(RedbStore::open_in_memory().unwrap());
@@ -1006,6 +1009,7 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )
@@ -1060,4 +1064,79 @@ impl agentplane::core::PolicyEngine for PermitsReleases {
             "test/permits-releases-v1",
         )
     }
+}
+
+/// A call that takes a while.
+#[derive(Debug)]
+struct Slow;
+
+#[async_trait::async_trait]
+impl agentplane::core::Effect for Slow {
+    type Output = Value;
+    fn descriptor(&self) -> agentplane::core::EffectDescriptor {
+        agentplane::core::EffectDescriptor::new("slow.call", json!({}))
+    }
+    fn mutates(&self) -> bool {
+        false
+    }
+    fn recovery(&self) -> agentplane::core::Recovery {
+        agentplane::core::Recovery::Retry
+    }
+    async fn perform(&self) -> Result<Value, agentplane::core::EffectError> {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        Ok(json!("done"))
+    }
+}
+
+#[derive(Debug)]
+struct CallsSlowly;
+
+#[async_trait::async_trait]
+impl agentplane::core::Skill for CallsSlowly {
+    fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+        agentplane::core::SkillDescriptor::new("slowly").provides("slowly")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: agentplane::core::Tainted<Value>,
+    ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+        Ok(agentplane::core::Outcome::done(cx.effect(Slow).await?))
+    }
+}
+
+/// **A call's outcome says how long it took, and a replay measures nothing.**
+/// The figure is the live call's, read back unchanged; a strict replay adds
+/// no record carrying a second one.
+#[tokio::test]
+async fn an_effects_outcome_records_how_long_it_took() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(CallsSlowly)
+        .build();
+    let out = rt
+        .run("slowly", agentplane::core::Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+    let elapsed = |records: &[Record]| -> Vec<Option<u64>> {
+        records
+            .iter()
+            .filter_map(|r| match r.kind() {
+                RecordKind::EffectDone { elapsed_ms, .. } => Some(*elapsed_ms),
+                _ => None,
+            })
+            .collect()
+    };
+    let live = elapsed(&store.read(out.run_id, 1).await.unwrap());
+    assert!(
+        live.iter().any(|e| e.is_some_and(|ms| ms >= 40)),
+        "the slow call's outcome does not say it took at least 40ms: {live:?}"
+    );
+    rt.replay(out.run_id, Mode::Strict).await.unwrap();
+    assert_eq!(
+        elapsed(&store.read(out.run_id, 1).await.unwrap()),
+        live,
+        "a replay changed or added a measured figure"
+    );
 }

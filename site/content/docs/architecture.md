@@ -141,12 +141,23 @@ src/
   audit      the outsider's verification pass over a journal
   export     the same history as framed JSON Lines, so the outsider can take
              it away as well as check it in place
+  grader_verdict an outside grader's verdict bound to a prefix of one
+             run, as a sidecar beside an export, which the grader may
+             sign — bound and checked, never graded
+  disclosure one matter leaving the plane: the act recorded before the
+             package's first byte, in a register erasures read
   drill      the live half of that check: blob bytes re-hashed and sealed
              state proven to open, with erasure told from loss
   retention  the time-windowed erasure pass: closed cases past a window, with
              an honest account of what it cannot make unreadable
+  subject    where one memory subject's data went: outbound effects and
+             recalls, read-only, beside the classes it cannot trace
+  grants     the tool grants an export shows no run used, and a proposal
+             removing them (feature `manifest`)
   manifest/  the declaration an agent is built from, and the registry it is
              pinned in (feature `manifest`, off by default)
+  content/   declared content rules, their one evaluator, and the checker
+             seam a classifier plugs into (feature `manifest`)
   api/       the HTTP surface for operators (feature `http`, off by default)
   model/     the ModelProvider seam and the metering rules, always present;
              the provider drivers, each with a streaming twin, sit behind

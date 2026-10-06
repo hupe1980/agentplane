@@ -47,7 +47,7 @@ it must fail.
 | `tests/guards/postgres.rs` | The shared-store backend against a real PostgreSQL server: tenant isolation with a *valid* identifier from the other tenant, concurrency under a lock, the case layer's contracts |
 | `tests/wire/a2a_interop.rs` | This crate's A2A **client** against the reference SDK's server — the one interoperability gap the conformance kit cannot close, since the kit validates servers |
 | `tests/guards/vault.rs` | The key-ring contract against a real Vault — where the status codes an in-process ring cannot get wrong actually live |
-| `tla/` | TLA+ models — `Authorization`, `Delegation`, `EffectGroup`, `EffectProtocol`, `Equivocation`, `Fencing`, `RetrySafety`, `Saga` — plus the mutants that prove those models constrain anything |
+| `tla/` | TLA+ models — `Authorization`, `Delegation`, `Delivery`, `EffectGroup`, `EffectProtocol`, `Equivocation`, `Fencing`, `KeyLifecycle`, `Quota`, `RateWindow`, `RetrySafety`, `Saga`, `SinkGate`, `TaskDelivery` — plus the mutants that prove those models constrain anything |
 
 `postgres.rs`, `a2a_interop.rs` and `vault.rs` need a Docker daemon or a
 foreign implementation, and are skipped
@@ -100,7 +100,7 @@ agree with it by construction. It runs in the gate, and it does three things:
 just verify-golden
 ```
 
-- **`--canon-check`** re-derives all 30 record vectors from their *parsed
+- **`--canon-check`** re-derives all 33 record vectors from their *parsed
   values* — an independent canonicalizer, an independent chain digest. This is
   the half that **produces** bytes rather than accepting them, and it is
   non-circular: the input is what each record means, the output is what the
@@ -164,7 +164,11 @@ worthless.
 
 So `tla/verify.sh` runs two passes. The first checks the specs. The second
 checks the check: each spec is re-run against deliberately broken copies of
-itself, and each mutant must be caught by the specific invariant written for it.
+itself, and each mutant must be caught by the specific invariant written for it
+— or, for a liveness claim, must make TLC report that property violated: a
+claim that still holds once the fairness it rests on is dropped holds for some
+other reason than the one stated. Every `.tla` is checked; there is no list to
+add a new one to.
 A selection — the full table, one entry per mutant, is `tla/mutations.py`
 (`python3 tla/mutations.py --list`):
 
@@ -184,6 +188,12 @@ A selection — the full table, one entry per mutant, is `tla/mutations.py`
 | A resumed unwind repeats compensations it already performed | `Saga` | `CompensatedAtMostOnce` |
 | The unwind passes over a step it could have undone | `Saga` | `UnwindIsComplete` |
 | Store accepts a write without checking the epoch | `Fencing` | `EpochsNeverRegress` |
+| Admission checks settled spend and ignores outstanding holds | `Quota` | `PeriodSpendWithinCeiling` |
+| The gate is skipped for the whole of a resumed pass | `SinkGate` | `NoSinkWithoutCoveringRelease` |
+| An outage is answered as a destroyed scope | `KeyLifecycle` | `OutageIsNotErasure` |
+| A wait recovers any claim of its run, consumed or not | `Delivery` | `ConsumedExactlyOnce` |
+| A closed run's unconsumed addressed message is offered to another run | `Delivery` | `TargetedReachesOnlyItsRun` |
+| A counterparty's retry is answered from the dedup and never matched | `Delivery` | `EveryMessageReachesAWaiter` (liveness) |
 
 Tripping the top-level `Safety` conjunction is not accepted — that shows only
 that *something* broke, not that the invariant aimed at this bug is the one that

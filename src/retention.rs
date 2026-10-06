@@ -86,6 +86,11 @@ pub struct RetentionReport {
     /// that noise is filtered, hides a real failure among entries everyone has
     /// learned to ignore.
     pub held: Vec<String>,
+    /// Every disclosure of an erased case or its runs, one sentence each:
+    /// what the erasure does to that copy, named from the operator's
+    /// disclosure register — an unchained row, so an empty list does not show
+    /// that nothing left the plane.
+    pub disclosed: Vec<String>,
 }
 
 impl RetentionReport {
@@ -192,6 +197,9 @@ pub struct Stores<'a> {
     /// the tenant, so a pass that assumed one would tombstone another tenant's
     /// addresses — or, worse, none.
     pub tenant: &'a crate::core::TenantId,
+    /// Where disclosures are recorded, so an erasure names the copies that
+    /// left the plane. Without one the report says no register was consulted.
+    pub disclosures: Option<&'a Arc<dyn crate::disclosure::DisclosureRegister>>,
 }
 
 /// Erase every closed case opened before `older_than`.
@@ -223,6 +231,7 @@ pub async fn retain(
         failures: Vec::new(),
         not_erasable: Vec::new(),
         held: Vec::new(),
+        disclosed: Vec::new(),
     };
 
     // Stated before anything is erased, so a report that fails early still
@@ -278,6 +287,7 @@ pub async fn retain(
             stores.cases.as_ref(),
             #[cfg(feature = "keyring")]
             stores.keys.map(std::convert::AsRef::as_ref),
+            stores.disclosures.map(std::convert::AsRef::as_ref),
             stores.tenant,
             case,
             at,
@@ -287,7 +297,10 @@ pub async fn retain(
         match erased {
             Ok(n) => {
                 report.erased += 1;
-                report.blobs_expired += n;
+                report.blobs_expired += n.blobs;
+                report
+                    .disclosed
+                    .extend(n.copies.iter().map(|copy| format!("case {case}: {copy}")));
             }
             // The control working, not the pass failing — and nothing was
             // destroyed, because `erase_case` checks the hold before it writes
@@ -316,8 +329,8 @@ fn finish(mut report: RetentionReport) -> RetentionReport {
             .to_owned(),
     );
     report.not_erasable.push(
-        "a run that belongs to no case is not reached by a case walk; erase one with \
-         `blob::erase_run`"
+        "a run that belongs to no case is not reached by a case walk, and its disclosures are \
+         not listed here; erase one with `blob::erase_run`, whose result names them"
             .to_owned(),
     );
     report
@@ -337,6 +350,6 @@ const OUTSIDE_THE_CASE: [&str; 4] = [
      message was delivered into",
     "media fetched under a named external retention policy belongs to that policy's unit, not \
      the case, so this pass neither tombstones nor unseals it — its lifecycle controller does",
-    "semantic-index vectors are derived from memory content and live in the retriever's index; \
-     nothing here removes them — delete them where the index is kept",
+    "semantic-index vectors are derived from memory content and erased with it, by the memory \
+     erasure verbs through `IndexedMemoryStore` — not by a case walk",
 ];

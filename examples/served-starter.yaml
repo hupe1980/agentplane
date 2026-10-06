@@ -1,0 +1,60 @@
+# yaml-language-server: $schema=https://hupe1980.github.io/agentplane/agent.schema.json
+#
+# The agent `agentplane init --serve` writes: one tool a framework can call over
+# MCP (`--mcp-addr`) and an A2A peer can message, answered by the deterministic
+# `fake` provider so the first governed call needs no model key. It grants no
+# tool and asks for no approval, so it cannot suspend, and every MCP revision
+# the listener accepts is offered it.
+#
+# To route a framework's tool call through the plane instead — the plane
+# governing the effect, the framework keeping its model — replace `execution`,
+# `models` and `output` with the `call` form, granting exactly one tool:
+#
+#   execution: { kind: call }
+#   tools:
+#     - ref: "tool://tickets/read"
+#       mutates: false
+#       description: "Read a ticket by id"
+#       arguments:
+#         type: object
+#         additionalProperties: false
+#         required: [id]
+#         properties: { id: { type: string } }
+#
+# and give `spec.input` the same shape as the grant's `arguments`. The binary
+# reaches that tool one of two ways, named on `serve` and never in this file:
+#
+#   --mcp tickets=/opt/tools/tickets-mcp     a static MCP server binary mounted
+#                                            into the image (it has no shell)
+#   --peer tickets=https://tickets.internal  an A2A peer
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: starter, version: "0.1.0" }
+spec:
+  execution: { kind: completion }
+  identity:
+    role: "Summarise the text in one sentence"
+    constraints: "No speculation."
+  # The tool's name on the MCP listener, and the skill on the Agent Card.
+  capabilities: { provides: [support.summarise] }
+  # The shape a caller is offered; the MCP listener serves no agent without one.
+  input:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [text]
+      properties: { text: { type: string } }
+  models:
+    privileged: { provider: fake, model: starter-1 }
+  output:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [summary]
+      properties: { summary: { type: string } }
+  budgets: { max_tokens: 10000 }
+  security:
+    # A served caller's input arrives labelled `Internal`, and the default
+    # egress ceiling is `Public`: without this line no served call reaches the
+    # model. An agent that answers strangers says so here, in the reviewed file.
+    max_sensitivity_egress: internal

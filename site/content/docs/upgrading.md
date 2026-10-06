@@ -40,7 +40,9 @@ effect is left announced with no terminal record. `agentplane serve` drains on
 `SIGTERM`, bounded by `--drain-secs` — see
 [stopping an instance](@/docs/operations.md#stopping-an-instance). An embedder
 calls `Runtime::drain(grace)` and reads `DrainReport::unfinished`. To keep work
-from starting on a shared store while the copy is taken, halt the tenant:
+from starting on a shared store while the copy is taken, halt the tenant — a
+`postgres://` store needs a binary built with `postgres`, or the `:full` image
+([which verb needs which feature](@/docs/operations.md#cli-features)):
 
 ```sh
 agentplane halt --store "$DATABASE_URL" --tenant acme \
@@ -61,7 +63,9 @@ is refused and exits `5` — raise the limit rather than reaching for
 `--allow-partial`, because a restore from a partial export is a partial plane.
 
 **3. Recreate the store.** A new redb file, or a fresh database or tenant on
-PostgreSQL. `restore` refuses a store that already holds any of the runs.
+PostgreSQL. `restore` refuses a store that already holds any of the runs, and
+refuses a sealed export under a tenant other than the one that sealed it: the
+ciphertext names its tenant, so it would open for nobody there.
 
 **4. Restore on the new build.**
 
@@ -81,15 +85,23 @@ agentplane drill  --store ./restored.redb --tenant acme
 agentplane waiting --store ./restored.redb --tenant acme
 ```
 
-Resume every run `waiting` lists before accepting traffic: a resume is what
-re-arms its timers, subscriptions and tasks, and a message delivered before
-that dead-letters. Timers, subscriptions, leases, delivery cursors, blob bytes
-and key material are not in an export — what re-establishes each is in
-[what an operator re-establishes](@/docs/operations.md#recovery-by-hand). Lift
-the halt when the plane is serving:
+Resume every run `waiting` lists before accepting traffic, under the manifest
+it was admitted under:
 
 ```sh
-agentplane halt --store "$DATABASE_URL" --tenant acme --lift
+agentplane replay <run> --store ./restored.redb --tenant acme --manifest agent.yaml
+```
+
+A resume is what re-arms its timers, subscriptions and tasks, and a message
+delivered before that dead-letters. Timers, subscriptions, leases, delivery cursors, blob bytes
+and key material are not in an export — what re-establishes each is in
+[what an operator re-establishes](@/docs/operations.md#recovery-by-hand). Nor
+are the standing-authority, quota and batch ledgers: a recreated store holds no
+standing authority until it is issued again, so re-issue it before accepting
+traffic. Lift the halt when the plane is serving:
+
+```sh
+agentplane halt --store "$DATABASE_URL" --tenant acme --lift --actor ops-carol
 ```
 
 ## When the format moves {#format-moves}
@@ -105,6 +117,28 @@ and 4 start the new build on an **empty** store rather than restoring:
 - Keep the old export and the old binary. They are the record of that history,
   and `agentplane verify` of that build checks the file offline.
 
+## Readers before writers {#readers-first}
+
+Every reader — each store, `verify` and `restore` — reads a record through the
+build's upcaster. A record at an older version is lifted to the shape the build
+reads, and its bytes and hash stay as written; a version no upcaster reaches is
+a version skew (`StoreError::UnknownRecordVersion`), never damage. Before the
+[format freeze](@/docs/status.md#format-freeze) a shape change is a hard cut
+instead, above. A shape that moves with a version bump deploys in this order:
+
+1. **Readers first.** Every instance, and every `verify` an auditor runs, moves
+   to the build that reads the new version before any instance writes it.
+2. **The rollback window closes at the first write of a bumped kind.** Until
+   the new build writes a record of a kind whose version moved, the store
+   holds only records at versions the old build reads — a restore keeps them
+   byte for byte, and a kind whose version did not move is written as the old
+   build would. The first record of a bumped kind is at the new version, which
+   the old build refuses as a skew. From then on a rollback is a restore of
+   the last export taken before it.
+
+`two_builds_rehearse_the_upgrade_and_the_rollback_window` holds this sequence in
+the tree, over an export one record shape older than the build writes.
+
 ## What a build refuses at startup {#startup}
 
 Beyond the store, a new build checks the deployment around it and refuses
@@ -115,9 +149,9 @@ plane that ran on the old build does not start:
 |---|---|---|
 | **Token files** (`serve --tokens`) | Every token is at least 32 bytes and is none of the values printed in this project's examples | Generate each with `openssl rand -hex 32` |
 | **Vault transit keys** (`keyring-vault`) | The key for a scope is named `ap-` and the hex SHA-256 of the scope — `VaultTransit::key_name` — and no other name is read | Provision the keys under those names. Vault's transit `backup` and `restore/<name>` carry existing key material to a new name, which keeps sealed payloads readable |
-| **The policy bundle** (`serve --policy`) | A file or a directory, loaded as `agentplane policy check` loads it. A served surface refuses a set that cannot evaluate every request shape it will ask, including a caller that presents no chain; a plane with no engine refuses every `release` | Run `agentplane policy check --bundle <bundle> --from plane.jsonl` against the old export, and `--candidate` for the bundle you are moving to |
+| **The policy bundle** (`serve --policy`) | A file or a directory, loaded as `agentplane policy check` loads it. A served surface refuses a set that cannot evaluate every request shape it will ask, including a caller that presents no chain; a plane with no engine refuses every `release`. A principal is `Subject::"…"` or `Capability::"…"` — there is no `Agent::` — and a schema's `appliesTo` lists both ([the authorization context](@/docs/security.md#the-authorization-context)) | Run `agentplane policy check --bundle <bundle> --from plane.jsonl` — a `cedar` build — against the old export, and `--candidate` for the bundle you are moving to |
 | **Manifests** | Parsed by this build's schema — for example a money ceiling needs `pricing` on every model role | `agentplane validate`, below |
-| **Scripts that drive the CLI** | A verb or flag this build does not have is a usage error, exit `2`; statuses follow [one table](@/docs/operations.md#exit-statuses) | Check each against `agentplane <verb> --help`, and alert on `1`, `4` and `5` as the different pages they are |
+| **Scripts that drive the CLI** | A verb or flag this build does not have is a usage error, exit `2`; statuses follow [one table](@/docs/operations.md#exit-statuses) | Check each against `agentplane <verb> --help`, and alert on `1`, `4`, `5` and `6` as the different pages they are |
 
 ## Checking your own upgrade {#checking}
 

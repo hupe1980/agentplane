@@ -23,6 +23,35 @@ fn core_sources() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The grader-verdict binder cannot grade: it reaches no model, runtime,
+/// policy, tool, peer, plan or task type, so a verdict is bytes it binds and
+/// never something it could compute.
+#[test]
+fn the_grader_verdict_binder_imports_nothing_that_could_grade() {
+    const FORBIDDEN: &[&str] = &[
+        "crate::model",
+        "crate::runtime",
+        "crate::policy",
+        "crate::tools",
+        "crate::peers",
+        "crate::plan",
+        "core::task",
+    ];
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/grader_verdict.rs");
+    let src = std::fs::read_to_string(&path).expect("the binder's module");
+    assert!(
+        src.contains("pub fn bind") && src.contains("pub fn check"),
+        "the binder's module holds no binder, so this guard is reading the wrong file"
+    );
+    for needle in FORBIDDEN {
+        assert!(
+            !src.contains(needle),
+            "the grader-verdict binder references `{needle}` — a binder that can reach \
+             a grader is the refused evaluation framework under another name"
+        );
+    }
+}
+
 /// `core` must stay free of I/O.
 ///
 /// Keeping the type layer dependency-free is what lets the whole runtime be
@@ -173,6 +202,177 @@ fn unsafe_code_is_forbidden() {
 /// Which test checks each spec invariant against the implementation:
 /// `(spec, invariant, test)`.
 const CLAIMS: &[(&str, &str, &str)] = &[
+    // The tenant ceilings. Admission counts every slot row, stopped runs'
+    // included; a refusal is explained by the refused tenant's own state.
+    (
+        "Quota",
+        "AdmissionsWithinCeiling",
+        "a_tenant_at_its_ceiling_is_refused",
+    ),
+    (
+        "Quota",
+        "TenantsIndependent",
+        "one_tenants_ceiling_does_not_throttle_another",
+    ),
+    // A recovered pass is settled once, into the period its marker recorded.
+    (
+        "Quota",
+        "PassSettledOnce",
+        "a_failed_quota_settlement_is_recovered_exactly_once",
+    ),
+    (
+        "Quota",
+        "SpendInAdmittedPeriod",
+        "a_failed_quota_settlement_is_recovered_exactly_once",
+    ),
+    // The reservation is what bounds the period, under concurrent admission.
+    (
+        "Quota",
+        "PeriodSpendWithinCeiling",
+        "concurrent_admissions_at_the_spend_ceiling_admit_only_what_fits",
+    ),
+    (
+        "Quota",
+        "CarriedHoldFollowsTheResume",
+        "a_resume_across_a_period_boundary_follows_the_stated_rule",
+    ),
+    // The sliding rate window, keyed by run and first attempt, never refunded.
+    (
+        "RateWindow",
+        "RateWithinWindow",
+        "the_call_past_the_ceiling_is_refused_and_journaled",
+    ),
+    (
+        "RateWindow",
+        "RetrySpendsOnce",
+        "a_retried_dispatch_reserves_once",
+    ),
+    (
+        "RateWindow",
+        "EveryDispatchCounted",
+        "two_runs_making_the_same_call_each_count",
+    ),
+    (
+        "RateWindow",
+        "RowsNeverRefunded",
+        "redb_satisfies_the_quota_store_contract",
+    ),
+    // The sink gate: judged on every live dispatch, a resume's tail included;
+    // a recorded verdict is read back, never re-judged or re-sent.
+    (
+        "SinkGate",
+        "NoSinkWithoutCoveringRelease",
+        "the_egress_ceiling_holds_on_the_live_tail_of_a_resume",
+    ),
+    (
+        "SinkGate",
+        "ReplayReproducesRefusal",
+        "a_refused_sink_strict_replays_to_the_same_refusal",
+    ),
+    (
+        "SinkGate",
+        "SentOnce",
+        "a_destination_scoped_release_replays_to_the_same_verdicts",
+    ),
+    // The key lifecycle: an outage is not an erasure, rotation keeps every
+    // version the floor admits, the first destruction stands, and a destroyed
+    // scope hands out no key.
+    (
+        "KeyLifecycle",
+        "OutageIsNotErasure",
+        "a_key_ring_outage_is_not_reported_as_an_erasure",
+    ),
+    (
+        "KeyLifecycle",
+        "NamedVersionAdmitted",
+        "rotation_adds_a_version_without_disturbing_sealed_bytes",
+    ),
+    (
+        "KeyLifecycle",
+        "ErasureIdempotent",
+        "the_memory_key_ring_satisfies_the_key_ring_contract",
+    ),
+    (
+        "KeyLifecycle",
+        "NoWriteIntoErasedScope",
+        "the_memory_key_ring_satisfies_the_key_ring_contract",
+    ),
+    // Delivery: each message journaled once, by the one wait that took it;
+    // a sender filter and an addressee hold on every door; nothing lands
+    // after a durable conclusion; a wake is recorded once.
+    (
+        "Delivery",
+        "ConsumedExactlyOnce",
+        "redb_satisfies_the_case_layer_contracts",
+    ),
+    (
+        "Delivery",
+        "OneMessagePerWait",
+        "redb_satisfies_the_case_layer_contracts",
+    ),
+    (
+        "Delivery",
+        "DurableBeforeMatch",
+        "an_event_arriving_before_the_wait_is_not_lost",
+    ),
+    (
+        "Delivery",
+        "CollidingIdsAreDistinct",
+        "two_producers_sharing_an_id_are_not_one_event",
+    ),
+    (
+        "Delivery",
+        "SenderFilterHolds",
+        "redb_satisfies_the_case_layer_contracts",
+    ),
+    (
+        "Delivery",
+        "TargetedReachesOnlyItsRun",
+        "redb_satisfies_the_case_layer_contracts",
+    ),
+    (
+        "Delivery",
+        "NoAnswerAfterConclusion",
+        "a_message_for_a_concluded_run_goes_to_the_live_waiter_behind_it",
+    ),
+    (
+        "Delivery",
+        "NoWakeAfterConclusion",
+        "a_timer_for_a_concluded_run_finishes_it_rather_than_waking_it",
+    ),
+    (
+        "Delivery",
+        "OneWakePerTimer",
+        "a_refired_timer_does_not_duplicate_the_recorded_wake",
+    ),
+    // A task's answer: one decision, never after the conclusion, a withdrawn
+    // task stays withdrawn, and a decider is told the truth.
+    (
+        "TaskDelivery",
+        "OneDecisionPerTask",
+        "a_resubmitted_decision_is_not_a_second_answer",
+    ),
+    (
+        "TaskDelivery",
+        "NoDecisionReachesAConcludedRun",
+        "a_decision_that_lost_to_the_runs_conclusion_is_refused",
+    ),
+    (
+        "TaskDelivery",
+        "WithdrawnStaysWithdrawn",
+        "a_cancelled_runs_open_task_is_withdrawn",
+    ),
+    (
+        "TaskDelivery",
+        "DeciderToldTheTruth",
+        "a_decision_that_lost_to_the_runs_conclusion_is_refused",
+    ),
+    // The lazy marker: a pass that writes nothing leaves nothing to settle.
+    (
+        "Quota",
+        "NoMarkerNoSettlement",
+        "a_no_op_resume_under_a_quota_repeats_no_conclusion",
+    ),
     // A witness settles what a single witness can settle, and the test is the
     // refusal itself: a history that does not extend what it recorded is not
     // cosigned, so nothing it vouched for contradicts anything else it
@@ -759,11 +959,13 @@ fn telemetry_did_not_loosen_the_determinism_gate() {
     //                 and a rate reservation's instant, neither of which
     //                 enters the journal.
     //   ctx.rs      — `subscription_clock`, store metadata like a lease.
+    //   ctx.rs      — `stopwatch`, an effect's elapsed time, written on its
+    //                 outcome record and read by nothing a run decides.
     //
     // Instrumentation must observe, not reach: a span may not read a clock or
-    // mint an id. If adding one had needed a fourth escape, that would be the
-    // signal a span was doing more than watching.
-    const KNOWN_ESCAPES: usize = 3;
+    // mint an id. A span that needed an escape of its own would be doing more
+    // than watching.
+    const KNOWN_ESCAPES: usize = 4;
 
     // Every file in `runtime/`, not a hand-listed subset. A fixed list is a
     // guard that stops guarding the moment someone adds a module — which is
@@ -2046,6 +2248,28 @@ fn every_outbound_client_is_guarded() {
     }
 }
 
+/// The operator API's routes, as `(METHOD, path)`, read from the table the
+/// router is built from: each entry's `method: Method::Get,` and the `path:`
+/// that follows it.
+fn operator_routes() -> Vec<(String, String)> {
+    let table = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/openapi.rs"),
+    )
+    .expect("the route table");
+    let mut routes = Vec::new();
+    let mut method = None;
+    for line in table.lines().map(str::trim) {
+        if let Some(m) = line.strip_prefix("method: Method::") {
+            method = Some(m.trim_end_matches(',').to_ascii_uppercase());
+        } else if let Some(path) = line.strip_prefix("path: \"")
+            && let (Some(m), Some(path)) = (method.take(), path.split('"').next())
+        {
+            routes.push((m, path.to_owned()));
+        }
+    }
+    routes
+}
+
 /// Every declared route appears in the unauthenticated-request test.
 ///
 /// That test is the one saying "no credentials, no answer — on every route", and
@@ -2060,7 +2284,6 @@ fn every_outbound_client_is_guarded() {
 #[test]
 fn every_api_route_is_covered_by_the_unauthenticated_test() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let router = std::fs::read_to_string(root.join("src/api/mod.rs")).expect("the api module");
     let guard = std::fs::read_to_string(root.join("tests/wire/api.rs")).expect("the api tests");
 
     let start = guard
@@ -2068,13 +2291,8 @@ fn every_api_route_is_covered_by_the_unauthenticated_test() {
         .expect("the unauthenticated-request test is gone, so this guard is inert");
     let body = &guard[start..];
 
-    let paths: Vec<&str> = router
-        .match_indices(".route(\"")
-        .filter_map(|(i, _)| {
-            let rest = &router[i + ".route(\"".len()..];
-            rest.find('"').map(|end| &rest[..end])
-        })
-        .collect();
+    let routes = operator_routes();
+    let paths: Vec<&str> = routes.iter().map(|(_, path)| path.as_str()).collect();
     assert!(
         paths.len() > 5,
         "found only {} routes; the extraction broke and this guard now proves \
@@ -2687,6 +2905,11 @@ fn every_durable_format_is_at_version_one_and_the_list_is_closed() {
         1,
         "export::FORMAT_VERSION"
     );
+    assert_eq!(
+        agentplane::grader_verdict::FORMAT_VERSION,
+        1,
+        "grader_verdict::FORMAT_VERSION"
+    );
     #[cfg(feature = "keyring")]
     assert_eq!(
         agentplane::keyring::ENVELOPE_FORMAT_VERSION,
@@ -2705,6 +2928,7 @@ fn every_durable_format_is_at_version_one_and_the_list_is_closed() {
     let known: &[&str] = &[
         "core/canon",
         "export",
+        "grader_verdict",
         "keyring/envelope",
         "keyring/mod",
         "blob/opendal_store",
@@ -2780,6 +3004,7 @@ fn every_versioned_crypto_domain_is_enumerated_and_at_version_one() {
         "io.github.hupe1980.agentplane/manifest/v1", // signature::DOMAIN_MANIFEST
         "io.github.hupe1980.agentplane/record/v1", // signature::DOMAIN_RECORD
         "io.github.hupe1980.agentplane/provenance/v1", // signature::DOMAIN_PROVENANCE
+        "io.github.hupe1980.agentplane/grader-verdict/v1", // signature::DOMAIN_GRADER_VERDICT
     ];
 
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3032,7 +3257,6 @@ fn every_public_function_is_called_or_tested_somewhere() {
 fn every_verb_an_attention_remedy_names_is_one_the_cli_has() {
     let remedies = read("src/runtime/attention.rs");
     let cli = read("src/bin/agentplane.rs");
-    let api = read("src/api/mod.rs");
 
     // The string literal after each `cli:` / `http:` field, with `\`-newline
     // continuations folded the way the compiler folds them.
@@ -3104,22 +3328,10 @@ fn every_verb_an_attention_remedy_names_is_one_the_cli_has() {
          wrong thing"
     );
 
-    // `.route("/runs/{run}/cancel", post(cancel_run))` → `POST /runs/{run}/cancel`.
-    let mut routes: Vec<String> = Vec::new();
-    for line in api.lines() {
-        let t = line.trim();
-        let Some(after) = t.strip_prefix(".route(\"") else {
-            continue;
-        };
-        let Some((path, handlers)) = after.split_once('"') else {
-            continue;
-        };
-        for method in ["get", "post", "put", "delete", "patch"] {
-            if handlers.contains(&format!("{method}(")) {
-                routes.push(format!("{} {path}", method.to_ascii_uppercase()));
-            }
-        }
-    }
+    let routes: Vec<String> = operator_routes()
+        .into_iter()
+        .map(|(method, path)| format!("{method} {path}"))
+        .collect();
     assert!(
         routes.len() > 10,
         "this guard read {routes:?} as the route table — it is scanning the wrong thing"
@@ -3229,6 +3441,11 @@ fn the_example_bundle_names_every_action_the_crate_asks_about() {
         "found {expected:?} — the extraction broke and this guard now proves nothing"
     );
     expected.extend(canonical(&read("src/api/a2a.rs"), "a2a:"));
+    expected.extend(canonical(&read("src/tools/serve.rs"), "mcp:"));
+    assert!(
+        expected.iter().any(|a| a.starts_with("mcp:")),
+        "no `mcp:` action was extracted — the guard now proves nothing about them"
+    );
     // The runtime's own three, taken from the type rather than from source:
     // `core` is unconditional, so nothing here depends on a feature.
     expected.extend(agentplane::core::ACTIONS.iter().map(|a| (*a).to_owned()));
@@ -3245,11 +3462,12 @@ fn the_example_bundle_names_every_action_the_crate_asks_about() {
 
     for token in bundle.split(|c: char| !(c.is_alphanumeric() || c == ':' || c == '.' || c == '_'))
     {
-        // A bare `api:` or `a2a:` is the prose wildcard `api:*` with the star
-        // eaten by the tokenizer, not a malformed action.
+        // A bare `api:`, `a2a:` or `mcp:` is the prose wildcard `api:*` with
+        // the star eaten by the tokenizer, not a malformed action.
         let named = token
             .strip_prefix("api:")
-            .or_else(|| token.strip_prefix("a2a:"));
+            .or_else(|| token.strip_prefix("a2a:"))
+            .or_else(|| token.strip_prefix("mcp:"));
         assert!(
             named.is_none_or(str::is_empty) || expected.iter().any(|a| a == token),
             "examples/serve-policy.cedar names `{token}`, which is not an action \
@@ -3386,6 +3604,45 @@ fn the_policy_check_imports_no_store_or_client() {
     }
 }
 
+/// **The grant report reads an export and opens nothing else.**
+///
+/// It answers from a file a reviewer holds; one that opened a store or held a
+/// client would be the plane query the export stands in for.
+#[test]
+fn the_grant_report_imports_no_store_or_client() {
+    const FORBIDDEN: &[&str] = &[
+        "JournalStore",
+        "CaseStore",
+        "EventStore",
+        "TaskStore",
+        "TimerStore",
+        "BlobStore",
+        "MemoryStore",
+        "Lease",
+        "ToolClient",
+        "reqwest",
+        "crate::store",
+        "crate::api",
+        "crate::runtime",
+        "crate::manifest::registry",
+        "std::fs",
+        "std::net",
+        "tokio::",
+    ];
+    let code = code_only(&read("src/grants.rs"));
+    assert!(
+        code.contains("pub async fn run"),
+        "this guard is not reading the grant report"
+    );
+    for needle in FORBIDDEN {
+        assert!(
+            !code.contains(needle),
+            "src/grants.rs names `{needle}` — the grant report opens no store and holds \
+             no client"
+        );
+    }
+}
+
 /// **Nothing that executes a run can reach the offline check.**
 ///
 /// Replay does not re-judge history under current policy, and the check is
@@ -3407,4 +3664,96 @@ fn the_policy_check_is_reachable_from_no_executor_path() {
             "{path} names the offline policy check, which no executor path may reach"
         );
     }
+}
+
+/// **The dev page's script inserts text only.**
+///
+/// Every string on that page came from a journal, and a journal holds
+/// whatever a model, a tool or a counterparty wrote. So the script reaches the
+/// document through `textContent` and nothing else: no HTML-parsing sink, no
+/// code from a string, no handler attribute, and no link or source taken from
+/// data — the one link it makes is to a blob it built itself.
+///
+/// A vocabulary check, so it proves the script does not *name* a sink, not
+/// that nothing reaches one; the headless browser smoke loads the page over
+/// hostile records and is the check on the claim.
+#[test]
+fn the_dev_page_script_inserts_text_only() {
+    let script = read("src/api/dev/app.js");
+    assert!(
+        script.contains("textContent"),
+        "the dev page script is empty or moved — this guard read nothing"
+    );
+    for sink in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "Function(",
+        "setAttribute(",
+        "srcdoc",
+        "javascript:",
+        ".src =",
+        "createContextualFragment",
+        "DOMParser",
+    ] {
+        assert!(
+            !script.contains(sink),
+            "src/api/dev/app.js names `{sink}`; insert plane data with textContent only"
+        );
+    }
+    for (at, _) in script.match_indices(".href =") {
+        assert!(
+            script[at..].starts_with(".href = URL.createObjectURL("),
+            "src/api/dev/app.js sets a link from something other than a blob it built"
+        );
+    }
+    let page = read("src/api/dev/index.html");
+    let handler = page.match_indices(" on").any(|(at, _)| {
+        let rest = &page[at + 3..];
+        let name = rest.len()
+            - rest
+                .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+                .len();
+        name > 0 && rest[name..].starts_with('=')
+    });
+    assert!(
+        !page.contains("<script>") && !page.contains("<style") && !handler,
+        "the dev page shell carries inline script, style or a handler attribute"
+    );
+}
+
+/// **Every model call the runtime builds carries the plane's stream observer.**
+///
+/// The observer is attached per call, at each site that builds one, so a new
+/// site that forgets it streams nothing and nothing else fails: a surface
+/// following a run would go quiet for that path alone.
+#[test]
+fn every_model_call_the_runtime_builds_is_observed() {
+    let mut sites = 0;
+    for file in walk("src/runtime") {
+        let text = read(&file);
+        let code: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        let code = code.join("\n");
+        let mut from = 0;
+        while let Some(at) = code[from..].find("ModelCall::new(") {
+            let start = from + at;
+            sites += 1;
+            let window = &code[start..code.len().min(start + 400)];
+            assert!(
+                window.contains(".observed_by("),
+                "{file}: a ModelCall built here does not attach the plane's stream \
+                 observer with `.observed_by(..)`"
+            );
+            from = start + 1;
+        }
+    }
+    assert!(
+        sites >= 7,
+        "found {sites} model-call sites; the scan read nothing"
+    );
 }

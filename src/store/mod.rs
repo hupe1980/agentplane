@@ -15,6 +15,8 @@ mod postgres_authority;
 #[cfg(feature = "postgres")]
 mod postgres_cases;
 #[cfg(feature = "postgres")]
+mod postgres_disclosures;
+#[cfg(feature = "postgres")]
 mod postgres_memory;
 #[cfg(all(feature = "postgres", feature = "push"))]
 mod postgres_push;
@@ -30,6 +32,8 @@ mod redb_authority;
 mod redb_batches;
 #[cfg(feature = "redb")]
 mod redb_cases;
+#[cfg(feature = "redb")]
+mod redb_disclosures;
 #[cfg(feature = "redb")]
 mod redb_events;
 #[cfg(feature = "redb")]

@@ -57,6 +57,13 @@ pub enum BuildError {
     )]
     WitnessQuorumUnreachable { declared: usize, configured: usize },
 
+    /// A checkpoint interval declared with no witness to submit to.
+    #[error(
+        "this plane declares a checkpoint interval and no witnesses — nothing \
+         would ever be re-submitted, so the interval would be a promise nothing keeps"
+    )]
+    IntervalWithoutWitnesses,
+
     /// The plane and its journal store are scoped to different tenants.
     ///
     /// The dangerous one, because it *works*. Runs are written into another
@@ -265,6 +272,38 @@ pub enum BuildError {
          with `RuntimeBuilder::memory(..)`"
     )]
     SemanticMemoryWithoutStore,
+
+    /// A sealed memory store whose own subject erasure misses the wired
+    /// semantic index.
+    ///
+    /// `EncryptedMemoryStore::erase_subject` runs beneath any wrapper the
+    /// plane could add, so only an index beneath the seal is told what it
+    /// removed; above it, a person's erasure leaves their embeddings behind.
+    #[error(
+        "this plane wires a semantic index beside a sealed memory store whose subject \
+         erasure does not reach it, so `erase_subject` would leave the subject's \
+         embeddings in the index. Put the index beneath the seal: \
+         `EncryptedMemoryStore::new(Arc::new(IndexedMemoryStore::new(inner, retriever)), ..)`, \
+         with the same retriever `semantic_memory(..)` is given"
+    )]
+    SealedMemoryMissesIndex,
+
+    /// A memory store that already tells a semantic index other than the one
+    /// `semantic_memory(..)` wires.
+    #[error(
+        "this plane's memory store already tells a semantic index other than the one \
+         `semantic_memory(..)` is given, so an erasure would leave the subject's embeddings \
+         in the wired index. Give both the same retriever"
+    )]
+    MemoryIndexedElsewhere,
+
+    /// A money ceiling is stated and the embedder states no price.
+    #[error(
+        "embedder '{embedder}' states no pricing, and this plane caps money — its calls \
+         would report no cost and the ceiling would never bind on them; give the driver \
+         `.pricing(..)`, or remove the money ceiling"
+    )]
+    UnpricedEmbedder { embedder: String },
 
     /// A memory subject binds to a case on a plane with no cases.
     ///
@@ -475,6 +514,17 @@ pub enum BuildError {
     ProvidesWhatItDoesNotAdvertise {
         agent: String,
         undeclared: Vec<String>,
+    },
+
+    /// A declared content check nothing on this plane could run as declared:
+    /// its checker is not registered, or it maps a category the checker never
+    /// reports.
+    #[cfg(feature = "manifest")]
+    #[error("agent '{agent}' declares content check '{check}' that cannot run: {detail}")]
+    ContentCheck {
+        agent: String,
+        check: String,
+        detail: String,
     },
 
     /// A declarative agent has no model to call.

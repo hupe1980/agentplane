@@ -686,6 +686,11 @@ impl Gemini {
                     if e.failed {
                         response["response"] = json!({ "error": e.output });
                     }
+                    // A call the provider identified is answered under its id;
+                    // an id this driver synthesized was never the provider's.
+                    if !is_synthesized_id(&e.call.name, &e.call.id) {
+                        response["id"] = json!(e.call.id);
+                    }
                     json!({ "functionResponse": response })
                 })
                 .collect::<Vec<_>>(),
@@ -925,11 +930,12 @@ impl Gemini {
             // what this process holds, not what it has already held. The
             // refusal is `Unusable` rather than `severed` — it is this
             // plane's rather than the provider's, and the call generated.
-            // This wire reports no usage until the end, so the figure is
-            // zero here for the same reason `severed` reports `Unaccounted`:
-            // what is unknown is the amount, not whether it happened.
+            // It carries the cumulative usage the chunks already reported.
             if let Err(e) = meter.charge(chunk.len()) {
-                return Err(super::wire::classify_intake(model, Usage::default(), &e));
+                let usage = acc
+                    .usage_envelope()
+                    .map_or_else(Usage::default, |envelope| Self::usage(&envelope));
+                return Err(super::wire::classify_intake(model, usage, &e));
             }
             let events = decoder
                 .push(&chunk)
@@ -1017,7 +1023,7 @@ impl Gemini {
                     id: call
                         .get("id")
                         .and_then(Value::as_str)
-                        .map_or_else(|| format!("{name}-{index}"), ToOwned::to_owned),
+                        .map_or_else(|| synthesized_id(&name, index), ToOwned::to_owned),
                     name,
                     arguments,
                 });
@@ -1033,6 +1039,19 @@ impl Gemini {
             forced,
         }
     }
+}
+
+/// The id given a function call the provider sent without one: its name and
+/// its position in the response.
+fn synthesized_id(name: &str, index: usize) -> String {
+    format!("{name}-{index}")
+}
+
+/// Whether `id` has the shape [`synthesized_id`] gives a call named `name`.
+fn is_synthesized_id(name: &str, id: &str) -> bool {
+    id.strip_prefix(name)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 /// A stream that stopped before the model said why.

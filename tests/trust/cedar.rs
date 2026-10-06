@@ -47,6 +47,7 @@ fn ask<'a>(
 ) -> PolicyDecision {
     engine.authorize(&PolicyRequest {
         principal,
+        principal_kind: agentplane::core::PrincipalKind::Subject,
         action,
         resource,
         context,
@@ -195,7 +196,7 @@ fn a_policy_set_that_does_not_parse_is_refused_at_startup() {
 
 const READ_ONLY: &str = r#"
 permit(
-    principal == Agent::"agent:auditor",
+    principal == Subject::"agent:auditor",
     action == Action::"effect:perform",
     resource == Resource::"ledger.read"
 );
@@ -439,7 +440,7 @@ fn a_forbidden_principal_holds_no_authority() {
     let engine = CedarEngine::new(
         r#"
         permit(principal, action, resource);
-        forbid(principal == Agent::"agent:quarantined", action, resource);
+        forbid(principal == Subject::"agent:quarantined", action, resource);
         "#,
     )
     .unwrap();
@@ -478,10 +479,11 @@ fn an_effect_kind_with_punctuation_is_a_usable_entity_id() {
 #[test]
 fn a_principal_containing_a_quote_cannot_forge_an_entity() {
     let engine =
-        CedarEngine::new(r#"permit(principal == Agent::"agent:real", action, resource);"#).unwrap();
+        CedarEngine::new(r#"permit(principal == Subject::"agent:real", action, resource);"#)
+            .unwrap();
     let ctx = json!({});
 
-    let hostile = r#"nobody" || true || Agent::"agent:real"#;
+    let hostile = r#"nobody" || true || Subject::"agent:real"#;
     assert!(
         !ask(&engine, hostile, ACTION_PERFORM, "x", &ctx).is_permit(),
         "a crafted principal must not be able to match a rule it is not"
@@ -557,13 +559,13 @@ const REQUEST_SCHEMA: &str = r#"
 {
     "": {
         "entityTypes": {
-            "Agent": {},
+            "Subject": {},
             "Resource": {}
         },
         "actions": {
             "effect:perform": {
                 "appliesTo": {
-                    "principalTypes": ["Agent"],
+                    "principalTypes": ["Subject"],
                     "resourceTypes": ["Resource"],
                     "context": {
                         "type": "Record",
@@ -591,7 +593,7 @@ fn the_bundle_identity_covers_every_static_policy_input() {
     let with_entities = CedarEngine::from_bundle(
         "",
         None,
-        Some(r#"[{"uid":{"type":"Agent","id":"agent:a"},"attrs":{"risk":"low"},"parents":[]}]"#),
+        Some(r#"[{"uid":{"type":"Subject","id":"agent:a"},"attrs":{"risk":"low"},"parents":[]}]"#),
     )
     .unwrap()
     .bundle();
@@ -666,7 +668,7 @@ fn static_entities_are_used_by_authorization() {
                 when { principal.risk == "low" };
         "#;
     let entities = r#"
-            [{"uid":{"type":"Agent","id":"agent:a"},
+            [{"uid":{"type":"Subject","id":"agent:a"},
                 "attrs":{"risk":"low"},"parents":[]}]
         "#;
     let engine = CedarEngine::from_bundle(source, None, Some(entities)).unwrap();
@@ -737,7 +739,7 @@ fn the_evaluator_identity_is_the_linked_cedar_language_version() {
 /// nothing ever evaluates it.
 #[test]
 fn a_rule_that_can_never_fire_is_refused_at_construction() {
-    // `effect:perform` is declared over Agent principals, so scoping the rule
+    // `effect:perform` is declared over Subject principals, so scoping the rule
     // to a `Resource` principal leaves an action no request can satisfy. It
     // type-checks; it simply never applies.
     let src = r#"
@@ -1135,14 +1137,14 @@ fn null_stripping_is_visible_to_an_audit() {
     let with_nulls = json!({
         "args": { "amount": 50, "memo": Value::Null, "tags": ["a", Value::Null] },
     });
+    // `tracing` caches, process-wide, whether anybody is interested in a
+    // callsite, and with one dispatcher registered it computes that from
+    // whichever thread registers the callsite first — a parallel test with no
+    // subscriber caches "nobody", and this `debug!` then emits nothing however
+    // correct the stripping is. A second live dispatcher makes the interest
+    // "sometimes", so each call asks the dispatcher it runs under.
+    let _second = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let decision = tracing::subscriber::with_default(sink.clone(), || {
-        // `tracing` caches, once and process-wide, whether anybody is
-        // interested in a callsite. If this `debug!` is first reached on a
-        // thread with no subscriber — which any other test building a plane
-        // can do — the answer "nobody" is cached, and this closure then emits
-        // nothing however correct the stripping is. Rebuilding with the sink
-        // installed makes the test a question about stripping rather than
-        // about which test ran first.
         tracing::callsite::rebuild_interest_cache();
         ask(&engine, "p", ACTION_PERFORM, TOOL_CALL, &with_nulls)
     });
@@ -1604,4 +1606,333 @@ fn a_depth_cap_with_no_action_scope_is_refused_by_the_operator_api() {
         "{err}"
     );
     assert!(err.to_string().contains("delegation_depth"), "{err}");
+}
+
+// ── The shipped bundle ──────────────────────────────────────────────────────
+
+/// The verbs an operator reaches for during an incident.
+const ON_CALL_VERBS: [&str; 7] = [
+    "api:halt.place",
+    "api:halt.lift",
+    "api:run.abandon",
+    "api:run.cancel",
+    "api:effect.reconcile",
+    "api:hold.place",
+    "api:hold.release",
+];
+
+/// The bundle a deployment copies grants the incident verbs to an operator,
+/// and to nobody else.
+///
+/// Cedar denies what no rule permits, so a bundle missing these is found out
+/// during the incident — the one time nobody is reading policy files. The
+/// other roles are asked too: a rule that granted them to every caller would
+/// pass a permit-only check and hand a peer the halt switch.
+#[test]
+fn the_shipped_bundle_permits_the_on_call_verbs_to_operators_only() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/serve-policy.cedar"
+    ))
+    .unwrap();
+    let engine = CedarEngine::new(&text).expect("the shipped bundle loads");
+    let caller = |roles: &[&str], tenant: &str| json!({ "roles": roles, "tenant": tenant });
+    let operator = caller(&["operator"], "default");
+    for verb in ON_CALL_VERBS {
+        assert!(
+            ask(&engine, "ops-1", verb, "*", &operator).is_permit(),
+            "an operator is refused {verb}"
+        );
+        for other in [
+            caller(&["peer"], "default"),
+            caller(&["framework"], "default"),
+            caller(&["operator"], "elsewhere"),
+        ] {
+            assert!(
+                !ask(&engine, "ops-1", verb, "*", &other).is_permit(),
+                "{verb} is permitted to {other}"
+            );
+        }
+    }
+    let framework = caller(&["framework"], "default");
+    assert!(ask(&engine, "app-1", "mcp:tool.call", "*", &framework).is_permit());
+    assert!(!ask(&engine, "ops-1", "mcp:tool.call", "*", &operator).is_permit());
+}
+
+/// The reads an operator needs beside the on-call verbs: which halts are in
+/// force, which runs are in flight or waiting, and what needs a person.
+const ON_CALL_READS: [&str; 4] = [
+    "api:halt.list",
+    "api:run.live",
+    "api:run.waiting",
+    "api:attention",
+];
+
+/// **An operator granted the halt switch can see what it would stop.**
+///
+/// A bundle that permits `api:halt.lift` and denies `api:halt.list` sends the
+/// on-call person to lift a halt they cannot find.
+#[test]
+fn the_shipped_bundle_lets_an_operator_see_what_it_can_stop() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/serve-policy.cedar"
+    ))
+    .unwrap();
+    let engine = CedarEngine::new(&text).expect("the shipped bundle loads");
+    let caller = |roles: &[&str], tenant: &str| json!({ "roles": roles, "tenant": tenant });
+    for read in ON_CALL_READS {
+        assert!(
+            ask(
+                &engine,
+                "ops-1",
+                read,
+                "*",
+                &caller(&["operator"], "default")
+            )
+            .is_permit(),
+            "an operator is refused {read}"
+        );
+        for other in [
+            caller(&["peer"], "default"),
+            caller(&["framework"], "default"),
+        ] {
+            assert!(
+                !ask(&engine, "ops-1", read, "*", &other).is_permit(),
+                "{read} is permitted to {other}"
+            );
+        }
+    }
+}
+
+/// **The shipped bundle grants a peer no event kind.**
+///
+/// `a2a:event.deliver` is asked on the kind a task awaits; a peer permitted it
+/// on every kind may answer any wait its task reaches, whatever the wait is
+/// for. The bundle leaves the per-kind rule for the deployment to name.
+#[test]
+fn the_shipped_bundle_grants_a_peer_no_event_kind() {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/serve-policy.cedar"
+    ))
+    .unwrap();
+    let engine = CedarEngine::new(&text).expect("the shipped bundle loads");
+    let peer = json!({ "roles": ["peer"], "tenant": "default" });
+    assert!(ask(&engine, "peer-1", "a2a:message.send", "*", &peer).is_permit());
+    for kind in ["approval.response", "payment.confirmed"] {
+        assert!(
+            !ask(&engine, "peer-1", "a2a:event.deliver", kind, &peer).is_permit(),
+            "a peer may deliver {kind}"
+        );
+    }
+}
+
+/// **The policy context carries no subject reference.** A bound run's sink
+/// request shows the value's provenance under `context.label` and nothing a
+/// subject binding added, so a rule — or a strict schema typing
+/// `context.label` — answers as it did for the same value unbound.
+#[tokio::test]
+async fn a_cedar_context_label_carries_no_subject_references() {
+    #[derive(Debug, Default)]
+    struct Recording(Mutex<Vec<Value>>);
+
+    impl PolicyEngine for Recording {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            if r.action == ACTION_PERFORM {
+                self.0.lock().unwrap().push(r.context.clone());
+            }
+            PolicyDecision::Permit
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            PolicyBundleIdentity::new(
+                agentplane::core::Digest::of(b"recording"),
+                "test/recording-v1",
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct Upsert(Value);
+
+    #[async_trait::async_trait]
+    impl Effect for Upsert {
+        type Output = Value;
+        fn descriptor(&self) -> EffectDescriptor {
+            EffectDescriptor::new("crm.upsert", json!({}))
+        }
+        fn mutates(&self) -> bool {
+            false
+        }
+        fn sink_arguments(&self) -> Option<&Value> {
+            Some(&self.0)
+        }
+        fn max_sensitivity(&self) -> agentplane::core::Sensitivity {
+            agentplane::core::Sensitivity::Secret
+        }
+        fn recovery(&self) -> Recovery {
+            Recovery::Retry
+        }
+        fn retry(&self) -> RetryPolicy {
+            RetryPolicy::never()
+        }
+        async fn perform(&self) -> Result<Value, EffectError> {
+            Ok(json!({}))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Forwards;
+
+    #[async_trait::async_trait]
+    impl Skill for Forwards {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("forward").provides("forward")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            Ok(Outcome::done(cx.sink(Upsert(i.peek().clone()), &i).await?))
+        }
+    }
+
+    let mut labels = Vec::new();
+    for subject in [None, Some("cust-17")] {
+        let recording = Arc::new(Recording::default());
+        let runtime = Runtime::builder(
+            Arc::new(RedbStore::open_in_memory().unwrap()) as Arc<dyn JournalStore>
+        )
+        .policy(Arc::clone(&recording) as Arc<dyn PolicyEngine>)
+        .skill(Forwards)
+        .build();
+        let terms = subject.map_or_else(agentplane::runtime::RunTerms::default, |s| {
+            agentplane::runtime::RunTerms::default().subject(s)
+        });
+        let input = Tainted::from_source(
+            json!({ "name": "Ada" }),
+            agentplane::core::SourceId::new("sender:acme"),
+        );
+        let admission = runtime.run_under("forward", input, terms).await.unwrap();
+        assert_eq!(
+            admission.outcome().expect("fresh").status,
+            RunStatus::Succeeded
+        );
+        let seen = recording.0.lock().unwrap().clone();
+        let label = seen
+            .iter()
+            .find_map(|context| context.get("label").cloned())
+            .expect("the sink request carried a label");
+        labels.push(label);
+    }
+    assert!(
+        labels[1].get("data_subjects").is_none(),
+        "the policy context carried subject references: {}",
+        labels[1]
+    );
+    assert_eq!(
+        labels[0], labels[1],
+        "a subject binding changed what policy sees"
+    );
+}
+
+/// **A label embedded in an effect's arguments carries no subject reference
+/// either.** `task.open` carries its justification's fields whole, labels
+/// included, and the request builder projects every label in `context.args`
+/// as it projects `context.label` — so a bound run's task request reads as
+/// the same request unbound.
+#[tokio::test]
+async fn a_cedar_context_args_label_carries_no_subject_references() {
+    #[derive(Debug, Default)]
+    struct Recording(Mutex<Vec<Value>>);
+
+    impl PolicyEngine for Recording {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            if r.action == ACTION_PERFORM && r.resource == "task.open" {
+                self.0.lock().unwrap().push(r.context.clone());
+            }
+            PolicyDecision::Permit
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            PolicyBundleIdentity::new(
+                agentplane::core::Digest::of(b"recording"),
+                "test/recording-v1",
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct Triage;
+
+    #[async_trait::async_trait]
+    impl Skill for Triage {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("triage").provides("triage")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            i: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            cx.deadline("review", &agentplane::core::DeadlineSpec::days(2), None)
+                .await?;
+            let summary = i.map(|v| v["name"].as_str().unwrap_or_default().to_owned());
+            let spec = agentplane::core::TaskSpec::new(
+                "review",
+                agentplane::core::Justification::new(summary, json!({})),
+                "review",
+            )
+            .role("reviewer");
+            cx.open_task(&spec).await?;
+            Ok(Outcome::done(Tainted::trusted(json!({}))))
+        }
+    }
+
+    let mut args = Vec::new();
+    for subject in [None, Some("cust-17")] {
+        let recording = Arc::new(Recording::default());
+        let store = Arc::new(RedbStore::open_in_memory().unwrap());
+        let runtime = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .cases(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)
+            .tasks(Arc::clone(&store) as Arc<dyn agentplane::case::TaskStore>)
+            .policy(Arc::clone(&recording) as Arc<dyn PolicyEngine>)
+            .skill(Triage)
+            .build();
+        let terms = agentplane::runtime::RunTerms::default().correlated(
+            "review",
+            &[agentplane::core::CorrelationKey::new("document", "D-1")],
+        );
+        let terms = match subject {
+            Some(s) => terms.subject(s),
+            None => terms,
+        };
+        let input = Tainted::from_source(
+            json!({ "name": "Ada" }),
+            agentplane::core::SourceId::new("sender:acme"),
+        );
+        let admission = runtime.run_under("triage", input, terms).await.unwrap();
+        assert_eq!(
+            admission.outcome().expect("fresh").status,
+            RunStatus::Succeeded
+        );
+        let seen = recording.0.lock().unwrap().clone();
+        let context = seen.first().expect("task.open was asked").clone();
+        args.push(context["args"].clone());
+    }
+    let label = &args[1]["justification"]["summary"]["label"];
+    assert!(
+        label.get("provenance").is_some(),
+        "the summary's label did not reach the args: {}",
+        args[1]
+    );
+    assert!(
+        label.get("data_subjects").is_none(),
+        "the policy context's args carried subject references: {}",
+        args[1]
+    );
+    assert_eq!(
+        args[0]["justification"], args[1]["justification"],
+        "a subject binding changed what policy sees in the args"
+    );
 }

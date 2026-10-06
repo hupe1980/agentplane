@@ -385,7 +385,7 @@ async fn a_run_awaiting_a_message() -> (RunId, Vec<u8>) {
     let journal = origin.clone() as Arc<dyn JournalStore>;
     let cases = origin.clone() as Arc<dyn CaseStore>;
     let mut bytes = Vec::new();
-    agentplane::export::to_jsonl(&journal, Some(&cases), &[out.run_id], &mut bytes)
+    agentplane::export::to_jsonl(&journal, &cases, &[out.run_id], &mut bytes)
         .await
         .expect("an in-flight run exports");
     (out.run_id, bytes)
@@ -538,6 +538,9 @@ impl JournalStore for CountsAcquires {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
+    fn seals(&self) -> bool {
+        self.inner.seals()
+    }
     fn atomic(&self) -> Option<&dyn agentplane::journal::AtomicJournal> {
         self.inner.atomic()
     }
@@ -575,6 +578,13 @@ impl JournalStore for CountsAcquires {
         older_than: agentplane::core::Timestamp,
     ) -> Result<usize, StoreError> {
         self.inner.forget_admissions(older_than).await
+    }
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        self.inner.runs_by_id(after, limit).await
     }
     async fn recent_runs(
         &self,

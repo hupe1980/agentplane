@@ -214,6 +214,43 @@ async fn duplicate_delivery_is_a_no_op() {
     assert_eq!(second, Delivery::Duplicate);
 }
 
+/// **A retry repairs a delivery that stored its message and died before
+/// offering it.** The buffer and the match are two writes; a crash between
+/// them leaves a stored message no waiter was offered, and the counterparty's
+/// retry — a duplicate by its id — is what offers it.
+#[tokio::test]
+async fn a_retried_delivery_offers_a_message_a_crash_left_unmatched() {
+    use agentplane::case::EventStore;
+
+    let f = fixture("D-31");
+    let out =
+        f.rt.run_correlated(
+            "demo.request",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-31")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended());
+
+    // The first delivery's buffer write landed; its match never ran.
+    let message = reply("EV-31", "D-31", json!(1));
+    assert!(
+        f.store
+            .buffer(&message, agentplane::core::Timestamp::now_utc())
+            .await
+            .unwrap()
+    );
+
+    let retried = f.rt.deliver(&message).await.unwrap();
+    assert!(
+        matches!(retried, Delivery::Resumed { .. }),
+        "the retry was answered from the dedup alone and the waiting run was \
+         never offered the message: {retried:?}"
+    );
+}
+
 /// An event for a different key does not satisfy someone else's wait.
 #[tokio::test]
 async fn events_are_matched_by_correlation_not_by_kind_alone() {
@@ -357,6 +394,7 @@ async fn a_capped_redelivery_pass_says_so() {
                     phase: Phase::Forward,
                     kind: "never.arrives".to_owned(),
                     correlation: vec![key(&format!("W-{i}"))],
+                    from: None,
                 },
                 at,
             )
@@ -1201,6 +1239,7 @@ async fn a_parked_delivery_behind_a_page_of_long_waits_is_redelivered() {
                     phase: Phase::Forward,
                     kind: "never.arrives".to_owned(),
                     correlation: vec![key(&format!("LONG-{i}"))],
+                    from: None,
                 },
                 long_ago,
             )
@@ -1326,6 +1365,111 @@ async fn a_repaired_seal_retires_the_runs_waits() {
     assert!(
         f.store.waiting(10).await.unwrap().is_empty(),
         "a run whose seal was repaired on resume kept its wait registered"
+    );
+}
+
+/// **A message for a run whose conclusion is durable goes to the run that
+/// can still use it.** The crash window: the conclusion landed, the seal did
+/// not, and the run's wait is still registered — the oldest on its key. A
+/// delivery then must not append an answer after the conclusion (a run its
+/// seal would refuse forever); it finishes the closed run and hands the
+/// message, unconsumed, to the live run waiting behind it.
+#[tokio::test]
+async fn a_message_for_a_concluded_run_goes_to_the_live_waiter_behind_it() {
+    let f = fixture("D-HAND");
+    let closed =
+        f.rt.run_correlated(
+            "demo.request",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-HAND")],
+        )
+        .await
+        .unwrap();
+    assert!(closed.status.is_suspended());
+    let lease = f
+        .store
+        .acquire(
+            closed.run_id,
+            "crashed-owner",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .expect("the suspended run is claimable");
+    let head = f.store.head(closed.run_id).await.unwrap();
+    f.store
+        .append(
+            lease.epoch,
+            vec![agentplane::journal::Append::new(
+                closed.run_id,
+                RecordKind::RunConcluded {
+                    outcome: "succeeded".to_owned(),
+                    reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
+                    chain_head: head.hash,
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    f.store
+        .release_lease(closed.run_id, lease.epoch)
+        .await
+        .unwrap();
+
+    let live =
+        f.rt.run_correlated(
+            "demo.request",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-HAND")],
+        )
+        .await
+        .unwrap();
+    assert!(live.status.is_suspended());
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        f.rt.deliver(&reply("EV-HAND", "D-HAND", json!(1))),
+    )
+    .await
+    .expect("the delivery finishes")
+    .expect("delivered");
+
+    let records = f.store.read(closed.run_id, 1).await.unwrap();
+    let concluded_at = records
+        .iter()
+        .position(|r| matches!(r.kind(), RecordKind::RunConcluded { .. }))
+        .expect("concluded");
+    assert!(
+        !records[concluded_at..]
+            .iter()
+            .any(|r| matches!(r.kind(), RecordKind::EffectDone { .. })),
+        "an answer was appended after the run's conclusion"
+    );
+    assert!(
+        f.store
+            .inclusion_proof(closed.run_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the closed run was left unsealed"
+    );
+    assert!(
+        f.store
+            .read(live.run_id, 1)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| matches!(
+                r.kind(),
+                RecordKind::EffectDone {
+                    source: Some(_),
+                    ..
+                }
+            )),
+        "the live run waiting behind the closed one never received the message"
     );
 }
 

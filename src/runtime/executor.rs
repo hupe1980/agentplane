@@ -65,6 +65,11 @@ pub struct RunTerms {
     /// Who asked for this run, when a person or peer did. Journaled on
     /// `RunAdmitted`, and barred from deciding the run's own tasks.
     admitted_by: Option<String>,
+    /// The declaration revision the caller reviewed, when it pinned one.
+    expected_declaration: Option<Digest>,
+    /// Data subjects the embedder names for this run, beside any its
+    /// declaration binds.
+    subjects: Vec<String>,
 }
 
 /// On whose authority a run acts.
@@ -128,6 +133,8 @@ impl RunTerms {
             idempotency_key: None,
             acting_as: Acting::Plane,
             admitted_by: None,
+            expected_declaration: None,
+            subjects: Vec::new(),
         }
     }
 
@@ -193,6 +200,31 @@ impl RunTerms {
     #[must_use]
     pub fn admitted_by(mut self, actor: impl Into<String>) -> Self {
         self.admitted_by = Some(actor.into());
+        self
+    }
+
+    /// Attribute what this run takes in to a data subject.
+    ///
+    /// Recorded in the run's `DataSubjectBound` after any subjects its
+    /// declaration binds, so `agentplane subject` follows the run's input,
+    /// events and case state to the effects they reached. Attribution only:
+    /// no gate reads it.
+    #[must_use]
+    pub fn subject(mut self, subject: impl Into<String>) -> Self {
+        self.subjects.push(subject.into());
+        self
+    }
+
+    /// Admit only if this declaration revision governs the capability.
+    ///
+    /// For a caller that reviewed one revision and schedules runs against a
+    /// plane it does not control: another revision — or no declaration at
+    /// all, including on a build without the `manifest` feature — is refused
+    /// as [`RuntimeError::DeclarationPinMismatch`] before authorization, and
+    /// nothing is recorded.
+    #[must_use]
+    pub const fn expect_declaration(mut self, digest: Digest) -> Self {
+        self.expected_declaration = Some(digest);
         self
     }
 
@@ -374,10 +406,10 @@ pub struct Spawned {
     pub fresh: bool,
 }
 
-/// The six stores a full plane runs on, as handles rather than as one type.
+/// The stores a full plane runs on, as handles rather than as one type.
 ///
 /// [`Runtime::builder_on`] is the shorthand for one backend implementing all
-/// six, and is the wrong shape for a caller that picks its backend at **run
+/// of them, and is the wrong shape for a caller that picks its backend at **run
 /// time** — an operator naming either a file or a connection string holds
 /// `Arc<dyn JournalStore>`, and unsizing a generic parameter needs it `Sized`,
 /// so the wiring is a value that `builder_on` builds.
@@ -393,18 +425,22 @@ pub struct Stores {
     pub events: std::sync::Arc<dyn crate::case::EventStore>,
     pub timers: std::sync::Arc<dyn crate::case::TimerStore>,
     pub memory: std::sync::Arc<dyn crate::memory::MemoryStore>,
+    /// Where halts, subject withdrawals, rate windows and tenant ceilings live.
+    pub quotas: std::sync::Arc<dyn crate::quota::QuotaStore>,
+    /// Where disclosures of a matter are recorded.
+    pub disclosures: std::sync::Arc<dyn crate::disclosure::DisclosureRegister>,
 }
 
 impl std::fmt::Debug for Stores {
     /// The handles are trait objects with no identity to print, so what a reader
     /// wants here is *that the set is complete*, which it is by construction.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Stores { journal, cases, tasks, events, timers, memory }")
+        f.write_str("Stores { journal, cases, tasks, events, timers, memory, quotas, disclosures }")
     }
 }
 
 impl Stores {
-    /// Every store from one backend that implements all six.
+    /// Every store from one backend that implements all of them.
     #[must_use]
     pub fn on<B: FullBackend + 'static>(store: std::sync::Arc<B>) -> Self {
         Self {
@@ -413,7 +449,9 @@ impl Stores {
             tasks: std::sync::Arc::clone(&store) as _,
             events: std::sync::Arc::clone(&store) as _,
             timers: std::sync::Arc::clone(&store) as _,
-            memory: store as _,
+            memory: std::sync::Arc::clone(&store) as _,
+            quotas: std::sync::Arc::clone(&store) as _,
+            disclosures: store as _,
         }
     }
 }
@@ -498,6 +536,8 @@ impl std::fmt::Display for RunFailure {
             RunStatus::BrokeGlass { actor, reason } => {
                 write!(f, "{actor} crossed into this tenant — {reason}")
             }
+            RunStatus::HaltLifted { actor } => write!(f, "{actor} lifted an emergency stop"),
+            RunStatus::HoldReleased { actor } => write!(f, "{actor} released a legal hold"),
             RunStatus::Abandoned { actor, reason } => {
                 write!(
                     f,
@@ -592,6 +632,21 @@ pub enum RunStatus {
         actor: crate::core::Operator,
         reason: String,
     },
+    /// An operator lifted an emergency stop, recorded as a run of its own.
+    ///
+    /// `actor` is read back from the run's
+    /// [`HaltLifted`](crate::journal::RecordKind::HaltLifted) record, which
+    /// also holds the stop it ended.
+    HaltLifted {
+        actor: crate::core::Operator,
+    },
+    /// An operator released a legal hold, recorded as a run of its own.
+    ///
+    /// `actor` is read back from the run's
+    /// [`HoldReleased`](crate::journal::RecordKind::HoldReleased) record.
+    HoldReleased {
+        actor: crate::core::Operator,
+    },
     /// The authority this run acts under was withdrawn while it was running.
     ///
     /// **A pause, not a fault**, for the reason exhaustion is one: the run did
@@ -649,7 +704,12 @@ impl RunStatus {
             // Nothing to say, for three different reasons and one answer: a
             // success has no why, a sweep's records carry theirs, and an
             // observed session ended because somebody else ended it.
-            Self::Succeeded | Self::Swept | Self::Observed => None,
+            // A lift's record carries what it ended; the lifter gave no reason.
+            Self::Succeeded
+            | Self::Swept
+            | Self::Observed
+            | Self::HaltLifted { .. }
+            | Self::HoldReleased { .. } => None,
             Self::Failed(reason)
             | Self::Quarantined(reason)
             | Self::Replanning(reason)
@@ -701,6 +761,8 @@ impl RunStatus {
             Self::Cancelled { .. }
             | Self::Abandoned { .. }
             | Self::BrokeGlass { .. }
+            | Self::HaltLifted { .. }
+            | Self::HoldReleased { .. }
             | Self::Withheld { .. }
             | Self::Succeeded
             | Self::Swept
@@ -738,6 +800,8 @@ impl RunStatus {
             Self::Abandoned { .. } => "abandoned",
             Self::Swept => super::sweeper::SWEEP_OUTCOME,
             Self::BrokeGlass { .. } => BREAK_GLASS_OUTCOME,
+            Self::HaltLifted { .. } => HALT_LIFTED_OUTCOME,
+            Self::HoldReleased { .. } => HOLD_RELEASED_OUTCOME,
             Self::Withheld { .. } => WITHHELD_OUTCOME,
             Self::Observed => OBSERVED_OUTCOME,
         }
@@ -754,7 +818,9 @@ impl RunStatus {
         match self {
             Self::Cancelled { actor, .. }
             | Self::Abandoned { actor, .. }
-            | Self::BrokeGlass { actor, .. } => Some(actor),
+            | Self::BrokeGlass { actor, .. }
+            | Self::HaltLifted { actor }
+            | Self::HoldReleased { actor } => Some(actor),
             // A withdrawal names a *subject*, not an actor: the operator who
             // threw the halt and the credential it covers are different
             // parties, and answering "who" with the subject would report the
@@ -815,6 +881,8 @@ impl RunStatus {
                 | Self::Abandoned { .. }
                 | Self::Swept
                 | Self::BrokeGlass { .. }
+                | Self::HaltLifted { .. }
+                | Self::HoldReleased { .. }
                 | Self::Observed
         )
     }
@@ -843,6 +911,8 @@ pub const SEALED_OUTCOMES: &[&str] = &[
     "abandoned",
     super::sweeper::SWEEP_OUTCOME,
     BREAK_GLASS_OUTCOME,
+    HALT_LIFTED_OUTCOME,
+    HOLD_RELEASED_OUTCOME,
     OBSERVED_OUTCOME,
 ];
 
@@ -868,6 +938,8 @@ pub const OUTCOMES_OF_RECORD: &[&str] = &[
     "quarantined",
     super::sweeper::SWEEP_OUTCOME,
     BREAK_GLASS_OUTCOME,
+    HALT_LIFTED_OUTCOME,
+    HOLD_RELEASED_OUTCOME,
     OBSERVED_OUTCOME,
 ];
 
@@ -906,6 +978,8 @@ struct Admitted {
     /// The chain admission bound — the caller's where one was presented,
     /// the plane's otherwise — and what every step of this run acts under.
     identity: Option<crate::core::Delegation>,
+    /// The references its `DataSubjectBound` record makes available.
+    subjects: BTreeSet<crate::core::SubjectRef>,
 }
 
 /// The quota identity of one live execution pass.
@@ -1120,6 +1194,10 @@ pub struct Runtime {
     /// absent policy engine is.
     #[cfg(feature = "manifest")]
     egress: Option<Arc<crate::core::Egress>>,
+    #[cfg(feature = "manifest")]
+    checkers: crate::content::Checkers,
+    /// Where live model output is forwarded, when anything listens.
+    streams: Option<Arc<dyn RunStreamObserver>>,
     /// How this plane attributes its metrics.
     meter: super::metrics::Meter,
     /// Durable per-tenant ceilings, when a deployment wires them.
@@ -1138,6 +1216,9 @@ pub struct Runtime {
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    /// Where disclosures are recorded, read by a retention pass so it names
+    /// the copies of what it erased.
+    disclosures: Option<Arc<dyn crate::disclosure::DisclosureRegister>>,
     /// Where webhook registrations and their cursors live.
     ///
     /// Held by the plane rather than only by whoever delivers, because the
@@ -1157,9 +1238,10 @@ pub struct Runtime {
     signer: Option<Arc<dyn crate::core::Signer>>,
     /// Where this plane sends its own events, when a deployment configures it.
     ///
-    /// Registered per run **at admission**: a destination attached after the
-    /// first record would silently miss it, and "the journal is the outbox" only
-    /// holds if the cursor starts at sequence one.
+    /// Registered per run **at admission**, and again by every resume that
+    /// executes: a destination attached after the first record would silently
+    /// miss it, and "the journal is the outbox" only holds if the cursor starts
+    /// at sequence one.
     #[cfg(feature = "push")]
     outbox: Option<Arc<crate::push::Outbox>>,
     /// The parties this plane submits its checkpoints to, and how many must
@@ -1197,6 +1279,12 @@ pub(crate) struct Witnessing {
     /// re-submits once and the protocol absorbs it; a durable copy would be a
     /// second answer to a question the counterparty already answers.
     pub(crate) submitted: std::sync::atomic::AtomicU64,
+    /// The declared maximum time between submissions of an unchanged log;
+    /// `None` never re-submits one.
+    pub(crate) interval: Option<std::time::Duration>,
+    /// The sweep instant of the last round that met quorum, in memory for the
+    /// reason `submitted` is.
+    pub(crate) last_met: std::sync::Mutex<Option<crate::core::Timestamp>>,
 }
 
 /// Where a run is entering this plane from.
@@ -1221,26 +1309,41 @@ pub(crate) enum Entry {
 /// A backend that implements every store a full plane runs on.
 ///
 /// Blanket-implemented, so it is a *description* rather than an obligation:
-/// any type providing the six store traits — journal, cases, tasks, events,
-/// timers, memory — is a `FullBackend` without saying so, and both shipped
-/// backends are. What it buys is [`Runtime::builder_on`], where the
-/// alternative was six casts of one `Arc` that every deployment spelled out
+/// any type providing the store traits — journal, cases, tasks, events,
+/// timers, memory, quotas, disclosures — is a `FullBackend` without saying so, and both
+/// shipped backends are. The quota store is in the set because halts live
+/// there: a plane without it would admit past every emergency stop. What it buys is [`Runtime::builder_on`], where the
+/// alternative was a cast of one `Arc` per store that every deployment spelled out
 /// and none could get differently.
 pub trait FullBackend:
-    JournalStore + CaseStore + TaskStore + EventStore + TimerStore + crate::memory::MemoryStore
+    JournalStore
+    + CaseStore
+    + TaskStore
+    + EventStore
+    + TimerStore
+    + crate::memory::MemoryStore
+    + crate::quota::QuotaStore
+    + crate::disclosure::DisclosureRegister
 {
 }
 
 impl<B> FullBackend for B where
-    B: JournalStore + CaseStore + TaskStore + EventStore + TimerStore + crate::memory::MemoryStore
+    B: JournalStore
+        + CaseStore
+        + TaskStore
+        + EventStore
+        + TimerStore
+        + crate::memory::MemoryStore
+        + crate::quota::QuotaStore
+        + crate::disclosure::DisclosureRegister
 {
 }
 
 impl Runtime {
     /// A builder with the whole case layer wired to one backend.
     ///
-    /// The one-call form of the six-cast litany: journal, cases, tasks,
-    /// events, timers and memory all backed by `store`, which is what a
+    /// The one-call form of the seven-cast litany: journal, cases, tasks,
+    /// events, timers, memory and quotas all backed by `store`, which is what a
     /// deployment on a single `RedbStore` or `PostgresStore` means anyway. The
     /// à-la-carte methods remain — [`cases`](RuntimeBuilder::cases) and
     /// friends override an individual store afterwards, and
@@ -1257,11 +1360,11 @@ impl Runtime {
 
     /// A builder with the whole case layer wired from handles.
     ///
-    /// What [`builder_on`](Self::builder_on) is in terms of: the six casts live
+    /// What [`builder_on`](Self::builder_on) is in terms of: the seven casts live
     /// in one place, so a deployment that chose its backend at run time — an
     /// operator naming either a file or a connection string — wires exactly what
     /// a deployment on one concrete type wires, rather than a hand-written
-    /// approximation of it that drifts the day a seventh store is added.
+    /// approximation of it that drifts the day an eighth store is added.
     #[must_use]
     pub fn builder_with(stores: Stores) -> RuntimeBuilder {
         Self::builder(stores.journal)
@@ -1270,6 +1373,8 @@ impl Runtime {
             .events(stores.events)
             .timers(stores.timers)
             .memory(stores.memory)
+            .quota(stores.quotas, crate::quota::TenantQuota::default())
+            .disclosures(stores.disclosures)
     }
 
     #[must_use]
@@ -1294,6 +1399,7 @@ impl Runtime {
             tasks: None,
             timers: None,
             blobs: None,
+            disclosures: None,
             #[cfg(feature = "push")]
             push: None,
             #[cfg(feature = "keyring")]
@@ -1303,6 +1409,9 @@ impl Runtime {
             journal_ceiling: None,
             #[cfg(feature = "manifest")]
             egress: None,
+            #[cfg(feature = "manifest")]
+            checkers: crate::content::Checkers::default(),
+            streams: None,
             tenant: crate::core::TenantId::default(),
             batches: None,
             policy: None,
@@ -1321,6 +1430,7 @@ impl Runtime {
             outbox: None,
             witnesses: Vec::new(),
             quorum: None,
+            witness_interval: None,
         }
     }
 
@@ -1504,6 +1614,7 @@ impl Runtime {
             #[cfg(feature = "keyring")]
             keys: self.keyring.as_ref(),
             tenant: &self.tenant,
+            disclosures: self.disclosures.as_ref(),
         };
         crate::retention::retain(&stores, older_than, at, reason)
             .await
@@ -1682,15 +1793,17 @@ impl Runtime {
         // epoch* the live execution is writing under — two executors on one
         // chain that fencing, by construction, cannot tell apart.
         //
-        // A plane holding no provider for the run — an operator's terminal —
-        // records the request and leaves the driving to the plane that does:
-        // that plane's next resume finds the request standing.
+        // A plane holding no provider, case store or key ring for the run — an
+        // operator's terminal, a library plane — records the request and
+        // leaves the driving to the plane that does: that plane's next resume
+        // finds the request standing.
         if fresh {
             match self.replay(run, Mode::Resume).await {
                 Ok(_)
                 | Err(
                     RuntimeError::LeaseHeld { .. }
                     | RuntimeError::NoProvider { .. }
+                    | RuntimeError::NoCaseStore { .. }
                     | RuntimeError::PayloadsSealed { .. },
                 ) => {}
                 Err(e) => return Err(e),
@@ -2039,8 +2152,6 @@ impl Runtime {
         Ok(crate::journal::undecided_effects(&records))
     }
 
-    /// The stop request standing against a run, if any.
-    ///
     /// Stop this tenant from starting new work, or let it start again.
     ///
     /// The emergency stop. `Some(reason)` halts, `None` lifts, and the reason is
@@ -2067,12 +2178,13 @@ impl Runtime {
     /// and the scopes divide on *which axis they name* rather than on how
     /// broad they are. Three name a workload — the tenant, every revision of
     /// one declared agent, or one exact reviewed digest — and stop admission.
-    /// The fourth names an **authority**, the delegation subject a run was
-    /// admitted under, and is the one that reaches work already running:
+    /// The fourth names an **authority**, any principal on the delegation
+    /// chain a run was admitted under, and is the one that reaches work
+    /// already running:
     /// there the incident *is* the credential, so a run carrying on under it is
     /// the harm rather than a side effect, and it pauses at its next step
     /// boundary with its completed work standing
-    /// ([`withdrawn_subject`](crate::quota::HaltScope::withdrawn_subject) is the
+    /// ([`withdraws_from`](crate::quota::HaltScope::withdraws_from) is the
     /// predicate, so the distinction is checked rather than remembered).
     /// Scopes are independent rows — lifting a narrow halt leaves a broad one
     /// standing. An ungoverned run, with no manifest, is stopped only by a
@@ -2105,25 +2217,231 @@ impl Runtime {
             .map_err(RuntimeError::Store)
     }
 
-    /// Lift one, and let work at that scope start again.
+    /// Lift one, and let work at that scope start again — recording who did.
     ///
-    /// Answers whether one was standing. An operator who lifts a scope nobody
-    /// halted is told so rather than told *done* — during an incident the
-    /// difference between *I cleared it* and *I cleared the wrong one* is the
-    /// whole of what they need.
+    /// Answers the run holding the lift record and whether this call removed
+    /// the row, or `None` when nothing was standing at `scope`: an operator who
+    /// lifts a scope nobody halted is told so rather than told *done*, and
+    /// nothing is written.
     ///
-    /// **Lifting names nobody on the record**, because the row goes. The
-    /// asymmetry with throwing one is stated rather than papered over: what
-    /// this store keeps is *what is stopped now*, and a history of episodes
-    /// would be a listing that grows with nothing to empty it. Where the stop
-    /// reached a run, the run's own journal holds both halves.
+    /// **The record comes first, then the row goes.** The lift is written as
+    /// the sole [`HaltLifted`](crate::journal::RecordKind::HaltLifted) record
+    /// of a sealed run of its own, carrying `by`, `at` and the whole stop it
+    /// ended; only then is the register's row removed. The journal and the
+    /// register share no transaction, so a lift that cannot be recorded does
+    /// not happen, and a removal that fails after the record is written is an
+    /// error naming the record's run — the halt still stands, the register is
+    /// the answer to what is in force, and lifting again writes a second
+    /// record. The record attests the instruction and the row as read, not
+    /// that the removal succeeded.
+    ///
+    /// **Only the row the record names goes.** The removal is
+    /// [`QuotaStore::lift_halt_if`](crate::quota::QuotaStore::lift_halt_if)
+    /// with that row, so a halt re-thrown between the read and the removal is
+    /// left standing and the call fails naming the record's run. A row another
+    /// lift already removed answers `removed: false`.
+    ///
+    /// [`QuotaStore::lift_halt`](crate::quota::QuotaStore::lift_halt) is the
+    /// raw register verb; a direct call to it is unrecorded.
     ///
     /// # Errors
     ///
-    /// If no quota store is wired, or the store is unreachable.
-    pub async fn lift_halt(&self, scope: &crate::quota::HaltScope) -> Result<bool, RuntimeError> {
+    /// If no quota store is wired, the store is unreachable, or the record
+    /// cannot be written; [`RuntimeError::ControlStands`] if the row cannot be
+    /// removed after the record was written, or was re-thrown in between.
+    pub async fn lift_halt(
+        &self,
+        scope: &crate::quota::HaltScope,
+        by: &crate::core::Operator,
+        at: crate::core::Timestamp,
+    ) -> Result<Option<ControlLifted>, RuntimeError> {
         let quotas = self.quota_store()?;
-        quotas.lift_halt(scope).await.map_err(RuntimeError::Store)
+        let standing = quotas.halts().await.map_err(RuntimeError::Store)?;
+        let Some(halt) = standing.into_iter().find(|h| &h.scope == scope) else {
+            return Ok(None);
+        };
+        let run = self
+            .seal_operator_record(
+                RecordKind::HaltLifted {
+                    scope: scope.key(),
+                    by: by.clone(),
+                    at,
+                    reason: halt.reason.clone(),
+                    thrown_by: halt.by.clone(),
+                    thrown_at: halt.at,
+                },
+                None,
+                HALT_LIFTED_OUTCOME,
+                None,
+            )
+            .await?;
+        let removed = quotas
+            .lift_halt_if(&halt)
+            .await
+            .map_err(|e| removal_failed(run, &e))?;
+        if !removed {
+            let now = quotas.halts().await.map_err(|e| removal_failed(run, &e))?;
+            if now.iter().any(|h| &h.scope == scope) {
+                return Err(RuntimeError::ControlStands {
+                    run: run.to_string(),
+                    detail: format!(
+                        "the halt on '{}' was re-thrown after this lift read it, and the new \
+                         halt still stands",
+                        scope.key()
+                    ),
+                });
+            }
+        }
+        Ok(Some(ControlLifted {
+            record: run,
+            removed,
+        }))
+    }
+
+    /// Release the legal hold on `case` — recording who did.
+    ///
+    /// The hold's counterpart of [`lift_halt`](Self::lift_halt), in the same
+    /// order for the same reason: the
+    /// [`HoldReleased`](crate::journal::RecordKind::HoldReleased) record is
+    /// written, stamped with `case`, before the row goes. It names the releaser
+    /// and the hold's placing operator and instant, and not the hold's reason,
+    /// so the erasure the release permits leaves its authorization readable.
+    ///
+    /// `None` when the matter is not held, with nothing written; `removed:
+    /// false` when another release removed the row first.
+    ///
+    /// **Only the hold the record names goes.** The removal is
+    /// [`CaseStore::release_hold_if`](crate::case::CaseStore::release_hold_if)
+    /// with that hold, so a hold placed again between the read and the removal
+    /// is left standing and the call fails naming the record's run.
+    /// [`CaseStore::release_hold`](crate::case::CaseStore::release_hold) is the
+    /// raw register verb; a direct call to it is unrecorded.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`](crate::core::StoreError::NotFound) if the case
+    /// does not exist; [`RuntimeError::ControlStands`] if the row cannot be
+    /// removed after the record was written, or was placed again in between;
+    /// otherwise if no case store is
+    /// wired, the store is unreachable, or the record cannot be written.
+    pub async fn release_hold(
+        &self,
+        case: crate::core::CaseId,
+        by: &crate::core::Operator,
+        at: crate::core::Timestamp,
+    ) -> Result<Option<ControlLifted>, RuntimeError> {
+        let cases = self.cases.as_ref().ok_or_else(|| {
+            RuntimeError::PlanContract("releasing a hold needs a case store".to_owned())
+        })?;
+        let Some(standing) = cases.hold(case).await.map_err(RuntimeError::Store)? else {
+            return match cases.case(case).await.map_err(RuntimeError::Store)? {
+                Some(_) => Ok(None),
+                None => Err(RuntimeError::Store(crate::core::StoreError::NotFound(
+                    format!("case {case}"),
+                ))),
+            };
+        };
+        let run = self
+            .seal_operator_record(
+                RecordKind::HoldReleased {
+                    by: by.clone(),
+                    at,
+                    placed_by: standing.by.clone(),
+                    placed_at: standing.placed_at,
+                },
+                Some(case),
+                HOLD_RELEASED_OUTCOME,
+                None,
+            )
+            .await?;
+        let removed = cases
+            .release_hold_if(case, &standing)
+            .await
+            .map_err(|e| removal_failed(run, &e))?;
+        if !removed
+            && cases
+                .hold(case)
+                .await
+                .map_err(|e| removal_failed(run, &e))?
+                .is_some()
+        {
+            return Err(RuntimeError::ControlStands {
+                run: run.to_string(),
+                detail: format!(
+                    "the hold on case {case} was placed again after this release read it, \
+                     and the new hold still stands"
+                ),
+            });
+        }
+        Ok(Some(ControlLifted {
+            record: run,
+            removed,
+        }))
+    }
+
+    /// Every recorded halt lift, newest first: the one record of each run.
+    ///
+    /// # Errors
+    ///
+    /// If the journal is unreachable, or a lift run does not hold a lift record.
+    pub async fn lifted_halts(&self, limit: usize) -> Result<Vec<Record>, RuntimeError> {
+        self.operator_records(HALT_LIFTED_OUTCOME, limit).await
+    }
+
+    /// Every recorded hold release, newest first: the one record of each run.
+    ///
+    /// # Errors
+    ///
+    /// If the journal is unreachable, or a release run does not hold a release
+    /// record.
+    pub async fn released_holds(&self, limit: usize) -> Result<Vec<Record>, RuntimeError> {
+        self.operator_records(HOLD_RELEASED_OUTCOME, limit).await
+    }
+
+    /// The first record of each run sealed under `outcome`, in the index's
+    /// newest-first order. A run whose first record is not the act its outcome
+    /// names is a store error, never skipped: a history that silently thins is
+    /// one that reads as complete.
+    async fn operator_records(
+        &self,
+        outcome: &str,
+        limit: usize,
+    ) -> Result<Vec<Record>, RuntimeError> {
+        let runs = self
+            .store
+            .runs_by_outcome(outcome, limit)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let mut found = Vec::with_capacity(runs.len());
+        for run in runs {
+            let first = self
+                .store
+                .read_page(run, 1, 1)
+                .await
+                .map_err(RuntimeError::from_store)?
+                .into_iter()
+                .next();
+            match first {
+                Some(record)
+                    if matches!(
+                        (outcome, record.kind()),
+                        (HALT_LIFTED_OUTCOME, RecordKind::HaltLifted { .. })
+                            | (HOLD_RELEASED_OUTCOME, RecordKind::HoldReleased { .. })
+                    ) =>
+                {
+                    found.push(record);
+                }
+                _ => {
+                    return Err(RuntimeError::Store(crate::core::StoreError::Corrupt {
+                        seq: 1,
+                        detail: format!(
+                            "run {run} is sealed as '{outcome}' but holds no such record"
+                        ),
+                    }));
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// The quota store, when one is wired.
@@ -2408,6 +2726,58 @@ impl Runtime {
         &self.meter
     }
 
+    /// Write an operator act as the sole record of a sealed run of its own.
+    ///
+    /// The act, then its conclusion, then the seal — so it carries the chain,
+    /// the signature, Merkle inclusion and the witness, and an offline reader
+    /// checks it without being taught what the act was. `case` stamps the
+    /// record onto a matter's history; `reason` is the conclusion's, for the
+    /// one act whose reason lives there.
+    async fn seal_operator_record(
+        &self,
+        kind: RecordKind,
+        case: Option<crate::core::CaseId>,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<RunId, RuntimeError> {
+        let run = RunId::generate();
+        let epoch = BREAK_GLASS_EPOCH;
+        let mut act = Append::new(run, kind);
+        if let Some(case) = case {
+            act = act.case(case);
+        }
+        self.store
+            .append(epoch, vec![act])
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let head = self
+            .store
+            .head(run)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        self.store
+            .append(
+                epoch,
+                vec![Append::new(
+                    run,
+                    RecordKind::RunConcluded {
+                        outcome: outcome.to_owned(),
+                        reason: reason.map(str::to_owned),
+                        exhaustion: None,
+                        live_spend: Spend::default(),
+                        chain_head: head.hash,
+                    },
+                )],
+            )
+            .await
+            .map_err(RuntimeError::from_store)?;
+        self.store
+            .seal(run, epoch, outcome)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        Ok(run)
+    }
+
     /// Record an operator deliberately crossing into this tenant, and return
     /// the run that holds the record.
     ///
@@ -2444,51 +2814,18 @@ impl Runtime {
                     .to_owned(),
             ));
         }
-        let run = RunId::generate();
-        let epoch = BREAK_GLASS_EPOCH;
-        self.store
-            .append(
-                epoch,
-                vec![Append::new(
-                    run,
-                    RecordKind::BreakGlass {
-                        actor: actor.clone(),
-                        roles: roles.to_vec(),
-                        reason: reason.to_owned(),
-                    },
-                )],
+        let run = self
+            .seal_operator_record(
+                RecordKind::BreakGlass {
+                    actor: actor.clone(),
+                    roles: roles.to_vec(),
+                    reason: reason.to_owned(),
+                },
+                None,
+                BREAK_GLASS_OUTCOME,
+                Some(reason),
             )
-            .await
-            .map_err(RuntimeError::from_store)?;
-        // Concluded and closed like any other terminal run, so the outcome is
-        // in the chain and the run enters the Merkle log. `broke-glass` rather
-        // than a run status: it neither succeeded nor failed at a goal, which
-        // is the same reason a sweep seals as `swept`.
-        let head = self
-            .store
-            .head(run)
-            .await
-            .map_err(RuntimeError::from_store)?;
-        self.store
-            .append(
-                epoch,
-                vec![Append::new(
-                    run,
-                    RecordKind::RunConcluded {
-                        outcome: BREAK_GLASS_OUTCOME.to_owned(),
-                        reason: Some(reason.to_owned()),
-                        exhaustion: None,
-                        live_spend: Spend::default(),
-                        chain_head: head.hash,
-                    },
-                )],
-            )
-            .await
-            .map_err(RuntimeError::from_store)?;
-        self.store
-            .seal(run, epoch, BREAK_GLASS_OUTCOME)
-            .await
-            .map_err(RuntimeError::from_store)?;
+            .await?;
         tracing::warn!(
             tenant = %self.tenant(),
             %actor,
@@ -2568,6 +2905,85 @@ impl Runtime {
         &self.owner
     }
 
+    /// The input as the declared admission rules leave it: refused with no
+    /// record, as an admission policy denial is, or with its sensitivity
+    /// raised to every matched classification — which `RunAdmitted` then
+    /// records as the input's label.
+    #[cfg(feature = "manifest")]
+    fn admit_content(
+        &self,
+        agent: &str,
+        input: Tainted<Value>,
+    ) -> Result<Tainted<Value>, RuntimeError> {
+        let Some(manifest) = self
+            .resolve(agent)
+            .ok()
+            .and_then(|skill| self.governing(skill.as_ref()))
+        else {
+            return Ok(input);
+        };
+        let outcome = super::ctx::judged(
+            manifest.spec.security.content.as_ref(),
+            crate::content::At::Admission,
+            input.peek(),
+        )
+        .map_err(RuntimeError::PolicyDenied)?;
+        if let Some(hit) = outcome.refused.first() {
+            return Err(RuntimeError::PolicyDenied(
+                crate::core::PolicyError::Content {
+                    rule: hit.rule.clone(),
+                    pointer: hit.pointer.clone(),
+                },
+            ));
+        }
+        let raised = outcome.raise(input.label().sensitivity);
+        if raised == input.label().sensitivity {
+            return Ok(input);
+        }
+        Ok(input.with_joined_label(&crate::core::Label::trusted().with_sensitivity(raised)))
+    }
+
+    #[cfg(not(feature = "manifest"))]
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    fn admit_content(
+        &self,
+        _agent: &str,
+        input: Tainted<Value>,
+    ) -> Result<Tainted<Value>, RuntimeError> {
+        Ok(input)
+    }
+
+    /// The content rules' verdict on an event delivered to a suspended run,
+    /// under the declaration governing the run's skill; `None` where no rule
+    /// matched or none is declared.
+    #[cfg(feature = "manifest")]
+    fn delivered_verdict(
+        &self,
+        history: &[crate::journal::Record],
+        payload: &serde_json::Value,
+    ) -> Option<crate::core::ContentVerdict> {
+        let capability = history.iter().find_map(|r| match r.kind() {
+            RecordKind::RunAdmitted { capability, .. } => Some(capability.clone()),
+            _ => None,
+        })?;
+        let manifest = self.governing(self.resolve(&capability).ok()?.as_ref())?;
+        super::ctx::verdict(super::ctx::judged(
+            manifest.spec.security.content.as_ref(),
+            crate::content::At::Source(super::ctx::AWAIT_KIND),
+            payload,
+        ))
+    }
+
+    #[cfg(not(feature = "manifest"))]
+    #[allow(clippy::unused_self)]
+    fn delivered_verdict(
+        &self,
+        _history: &[crate::journal::Record],
+        _payload: &serde_json::Value,
+    ) -> Option<crate::core::ContentVerdict> {
+        None
+    }
+
     /// The declaration governing a skill, if its agent has one.
     ///
     /// Per skill, not per plane: a runtime runs several agents, and a step must
@@ -2618,8 +3034,9 @@ impl Runtime {
     ///
     /// Read at a step boundary on a live pass only: a halt thrown *today* must
     /// not decide what a run did last year, which is the rule the cancellation
-    /// check beside it follows. Only a subject-scoped halt reaches here — see
-    /// [`HaltScope::withdrawn_subject`](crate::quota::HaltScope::withdrawn_subject).
+    /// check beside it follows. Only a subject-scoped halt naming a principal
+    /// on the run's chain reaches here — see
+    /// [`HaltScope::withdraws_from`](crate::quota::HaltScope::withdraws_from).
     ///
     /// An unreachable store propagates. Carrying on would leave a withdrawal
     /// unenforced exactly while the accounting is down.
@@ -2631,14 +3048,27 @@ impl Runtime {
         &self,
         identity: Option<&crate::core::Delegation>,
     ) -> Result<Option<Withdrawal>, RuntimeError> {
+        self.withdrawal_against(identity)
+            .await
+            .map_err(RuntimeError::Store)
+    }
+
+    /// The standing withdrawal that reaches `identity`, if one does.
+    ///
+    /// The one predicate the step boundary and a subject-bound hop both ask,
+    /// so the two cannot disagree about whose authority is withdrawn.
+    pub(crate) async fn withdrawal_against(
+        &self,
+        identity: Option<&crate::core::Delegation>,
+    ) -> Result<Option<Withdrawal>, crate::core::StoreError> {
         let (Some(quotas), Some(chain)) = (self.quotas.as_ref(), identity) else {
             return Ok(None);
         };
-        let subject = chain.subject().id.as_str();
-        let halts = quotas.halts().await.map_err(RuntimeError::Store)?;
+        let halts = quotas.halts().await?;
         Ok(halts.into_iter().find_map(|halt| {
-            (halt.scope.withdrawn_subject() == Some(subject)).then(|| Withdrawal {
-                subject: subject.to_owned(),
+            let subject = halt.scope.withdraws_from(chain)?.to_owned();
+            Some(Withdrawal {
+                subject,
                 reason: halt.reason,
                 by: halt.by,
             })
@@ -2717,7 +3147,7 @@ impl Runtime {
         &self,
         run: RunId,
         governed_by: Option<&crate::journal::AgentIdentity>,
-        subject: Option<&str>,
+        chain: Option<&crate::core::Delegation>,
         at: crate::core::Timestamp,
         (budget, width): (&Budget, usize),
     ) -> Result<QuotaPass, RuntimeError> {
@@ -2746,7 +3176,7 @@ impl Runtime {
             Ok(halts) => {
                 if let Some(halt) = halts
                     .into_iter()
-                    .filter(|halt| halt.scope.covers(governed_by, subject))
+                    .filter(|halt| halt.scope.covers(governed_by, chain))
                     .max_by(|a, b| a.scope.cmp(&b.scope))
                 {
                     return Err(RuntimeError::QuotaExceeded(
@@ -2849,6 +3279,93 @@ impl Runtime {
         }
     }
 
+    /// Settle and release the admission slots sealed runs still hold.
+    ///
+    /// A plane with no quota store may seal a run whose admission holds a
+    /// slot in this ledger, and no resume or recovery selects a sealed run
+    /// again. Settlement is idempotent, so a slot another path already settled
+    /// is not billed twice. Returns how many slots were given back.
+    pub(crate) async fn release_sealed_slots(&self, limit: usize) -> Result<usize, RuntimeError> {
+        let Some(quotas) = self.quotas.as_ref() else {
+            return Ok(0);
+        };
+        let held = quotas
+            .running_runs(limit)
+            .await
+            .map_err(RuntimeError::Store)?;
+        let positions = self
+            .store
+            .log_positions(&held)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        let mut released = 0;
+        for (run, sealed) in held.into_iter().zip(positions) {
+            if sealed.is_none() {
+                continue;
+            }
+            let records = self
+                .store
+                .read(run, 1)
+                .await
+                .map_err(RuntimeError::from_store)?;
+            match self.settle_recorded_quota_passes(run, &records).await {
+                Ok(()) => released += 1,
+                Err(error) => tracing::warn!(
+                    %run,
+                    %error,
+                    "a sealed run's admission slot could not be released; the next sweep retries"
+                ),
+            }
+        }
+        Ok(released)
+    }
+
+    /// Seal the lease-free runs whose sealing conclusion is written and whose
+    /// seal is not.
+    ///
+    /// Each [`LEASE_FREE_OUTCOMES`] writer appends its conclusion and then
+    /// seals in a second call, and holds no lease, so recovery never selects
+    /// a run whose writer died between the two. The conclusion alone already
+    /// lists the run under its outcome, so a history reads it as done while
+    /// the audit finds it in no log. The conclusion is what was decided; the
+    /// seal adds nothing to it but the log position, so finishing it here
+    /// writes no decision the writer did not make.
+    ///
+    /// Looks at the newest `limit` runs of each outcome. Returns how many it
+    /// sealed.
+    pub(crate) async fn seal_unsealed_conclusions(
+        &self,
+        limit: usize,
+    ) -> Result<usize, RuntimeError> {
+        let mut sealed = 0;
+        for &outcome in LEASE_FREE_OUTCOMES {
+            let runs = self
+                .store
+                .runs_by_outcome(outcome, limit)
+                .await
+                .map_err(RuntimeError::from_store)?;
+            let positions = self
+                .store
+                .log_positions(&runs)
+                .await
+                .map_err(RuntimeError::from_store)?;
+            for (run, position) in runs.into_iter().zip(positions) {
+                if position.is_some() {
+                    continue;
+                }
+                match self.store.seal(run, LEASE_FREE_EPOCH, outcome).await {
+                    Ok(_) => sealed += 1,
+                    Err(error) => tracing::warn!(
+                        %run,
+                        %error,
+                        "a concluded run's seal could not be finished; the next sweep retries"
+                    ),
+                }
+            }
+        }
+        Ok(sealed)
+    }
+
     /// Settle every quota pass present in history, idempotently.
     ///
     /// Reached before a resume can dispatch. A normally settled pass is a cheap
@@ -2861,13 +3378,24 @@ impl Runtime {
         run: RunId,
         records: &[Record],
     ) -> Result<(), RuntimeError> {
+        // A plane with no ledger resumes a run only when no pass of it accrued
+        // spend to a period, which would otherwise go unbilled. It cannot give
+        // back the concurrency slot of an admission whose process died
+        // mid-pass; the ledger's own plane does, on its next sweep once the
+        // run is sealed.
         let Some(quotas) = self.quotas.as_ref() else {
-            if records
-                .iter()
-                .any(|record| matches!(record.kind(), RecordKind::QuotaPassStarted { .. }))
-            {
+            if records.iter().any(|record| {
+                matches!(
+                    record.kind(),
+                    RecordKind::QuotaPassStarted {
+                        period: Some(_),
+                        ..
+                    }
+                )
+            }) {
                 return Err(RuntimeError::PlanContract(
-                    "this run has unsettled quota passes but the resuming plane has no quota store"
+                    "this run has passes that accrued spend to a quota period, and the resuming \
+                     plane has no quota store to settle them"
                         .to_owned(),
                 ));
             }
@@ -2923,12 +3451,13 @@ impl Runtime {
         Ok(())
     }
 
-    /// Repair quota receipts before abandonment recovery continues.
+    /// Repair quota receipts, and finish a conclusion an owner died after.
     ///
-    /// Returns a recorded conclusion only when the abandoned pass itself
-    /// carried quota intent. That is settlement recovery, not permission to
-    /// retry failed business work; an ordinary crashed run with no such marker
-    /// continues through replay as before.
+    /// Under recovery, a run whose last record is a conclusion lost its owner
+    /// between concluding and handing the lease back. What remains is the seal and the release, never the business
+    /// work: recovery is not permission to retry a failure, with or without a
+    /// quota store. A run that crashed before concluding continues through
+    /// replay.
     async fn recover_quota_before_resume(
         &self,
         run: RunId,
@@ -2943,10 +3472,6 @@ impl Runtime {
         let Some(last) = records.last() else {
             return Ok(None);
         };
-        let same_quota_pass = records.iter().any(|record| {
-            record.body.epoch == last.body.epoch
-                && matches!(record.kind(), RecordKind::QuotaPassStarted { .. })
-        });
         let RecordKind::RunConcluded {
             outcome,
             reason,
@@ -2956,9 +3481,6 @@ impl Runtime {
         else {
             return Ok(None);
         };
-        if !same_quota_pass {
-            return Ok(None);
-        }
 
         let status = recorded_status(outcome, reason.as_deref(), exhaustion.as_ref(), records);
         let chain_head = if SEALED_OUTCOMES.contains(&outcome.as_str()) {
@@ -3047,7 +3569,7 @@ impl Runtime {
             status,
             None,
             true,
-            self.recorded_case(records).map(|c| c.id()),
+            recorded_case_id(records),
             Consumed::default(),
             Spend::ZERO,
             &QuotaPass::disabled(),
@@ -3056,12 +3578,29 @@ impl Runtime {
         .map(Some)
     }
 
+    /// This plane, writing through a journal that puts `quota`'s marker on
+    /// the pass's first append — so a pass that writes nothing leaves no
+    /// marker. `None` for a pass with no marker.
+    fn marking_pass(&self, run: RunId, quota: &QuotaPass) -> Option<Self> {
+        let marker = quota.started()?;
+        Some(Self {
+            store: Arc::new(super::pass_journal::PassJournal::new(
+                Arc::clone(&self.store),
+                run,
+                marker,
+            )),
+            ..self.clone()
+        })
+    }
+
     /// Open the quota identity of the live tail a resume is about to execute.
+    ///
+    /// Its marker is not written here: it rides the pass's first append (see
+    /// [`super::pass_journal`]), so a resume that writes nothing leaves none.
     async fn start_replay_quota_pass(
         &self,
         run: RunId,
         mode: Mode,
-        lease: Option<&crate::journal::Lease>,
         width: usize,
     ) -> Result<QuotaPass, RuntimeError> {
         let (Mode::Resume, Some(quotas)) = (mode, self.quotas.as_ref()) else {
@@ -3076,16 +3615,6 @@ impl Runtime {
                 .await
                 .map_err(RuntimeError::Store)?;
         }
-        self.store
-            .append(
-                lease.expect("resume holds a lease").epoch,
-                vec![Append::new(
-                    run,
-                    pass.started().expect("an enabled pass has a marker"),
-                )],
-            )
-            .await
-            .map_err(RuntimeError::from_store)?;
         Ok(pass)
     }
 
@@ -3122,6 +3651,30 @@ impl Runtime {
         self.identity_of(self.governing(skill.as_ref())?.as_ref())
     }
 
+    /// What the agent answering `capability` may do, as its declaration says.
+    ///
+    /// `None` when nothing on this plane answers it; a reach with no
+    /// declaration when something does and no declaration governs it.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn reach_of(&self, capability: &str) -> Option<crate::core::Reach> {
+        let skill = self.resolve(capability).ok()?;
+        let declaration = self.governing(skill.as_ref()).and_then(|manifest| {
+            let digest = manifest.digest().ok()?;
+            Some(super::reach::declared(&manifest, digest, |server| {
+                self.peers.as_ref().is_some_and(|wiring| {
+                    wiring
+                        .registry
+                        .grant(&crate::peers::PeerId::new(server))
+                        .is_some()
+                })
+            }))
+        });
+        Some(crate::core::Reach {
+            capability: capability.to_owned(),
+            declaration,
+        })
+    }
+
     /// The declaration's identity, as every gate reports it.
     ///
     /// One construction, because admission and each effect gate must name the
@@ -3150,6 +3703,18 @@ impl Runtime {
     #[cfg(feature = "mcp-server")]
     pub(crate) fn provides(&self, target: &str) -> bool {
         self.resolve(target).is_ok()
+    }
+
+    /// Whether a grant's server component names a registered A2A peer — a
+    /// call the run may wait on.
+    #[cfg(feature = "mcp-server")]
+    pub(crate) fn wires_peer(&self, server: &str) -> bool {
+        self.peers.as_ref().is_some_and(|wiring| {
+            wiring
+                .registry
+                .grant(&crate::peers::PeerId::new(server))
+                .is_some()
+        })
     }
 
     fn resolve(&self, target: &str) -> Result<Arc<dyn Skill>, RuntimeError> {
@@ -3860,7 +4425,7 @@ impl Runtime {
         input: &Tainted<Value>,
         idempotency_key: Option<String>,
         admitted_by: Option<String>,
-        served_unchained: bool,
+        acting_as: &Acting,
     ) -> RecordKind {
         RecordKind::RunAdmitted {
             capability: capability.to_owned(),
@@ -3871,7 +4436,8 @@ impl Runtime {
             canon: crate::core::canon::VERSION,
             idempotency_key,
             admitted_by,
-            served_unchained,
+            served_unchained: matches!(acting_as, Acting::Nobody),
+            plane_chain: matches!(acting_as, Acting::Plane) && self.identity.is_some(),
         }
     }
 
@@ -3914,6 +4480,17 @@ impl Runtime {
         #[cfg(not(feature = "manifest"))]
         let governed_by: Option<crate::journal::AgentIdentity> = None;
 
+        if let Some(expected) = terms.expected_declaration {
+            let found = governed_by.as_ref().map(|id| id.digest);
+            if found != Some(expected) {
+                return Err(RuntimeError::DeclarationPinMismatch {
+                    agent,
+                    expected,
+                    found,
+                });
+            }
+        }
+
         // The caller's chain where one was presented, the plane's otherwise —
         // one choice, made once, so the gate, the policy context and the
         // record cannot disagree about whom this run acts for.
@@ -3924,6 +4501,7 @@ impl Runtime {
             chain.is_some(),
         )?;
         self.authorize_admission(&agent, governed_by.as_ref(), chain, input.peek())?;
+        let input = self.admit_content(&agent, input)?;
 
         self.admit_reserved(run, plan, input, terms, agent, governed_by)
             .await
@@ -3965,23 +4543,18 @@ impl Runtime {
         // Boxed: the quota decision holds its store round trips across awaits,
         // and inlined it pushes every admission future past the size clippy
         // allows on the served surfaces that await one.
-        let quota = match Box::pin(
-            self.check_quota(
-                run,
-                governed_by.as_ref(),
-                // **The chain this run acts under, not the plane's.** A served
-                // surface admits each run under its caller's chain, so reading
-                // the plane's here would check a withdrawal against the
-                // operator's own subject and never match the caller's — a
-                // refusal that does not happen, which leaves no trace anywhere.
-                terms
-                    .acting_as
-                    .resolve(self.identity.as_ref())
-                    .map(|c| c.subject().id.as_str()),
-                now_for_admission(),
-                (&budget, reserved_width(&budget, &plan)),
-            ),
-        )
+        let quota = match Box::pin(self.check_quota(
+            run,
+            governed_by.as_ref(),
+            // **The chain this run acts under, not the plane's.** A served
+            // surface admits each run under its caller's chain, so reading
+            // the plane's here would check a withdrawal against the
+            // operator's own subject and never match the caller's — a
+            // refusal that does not happen, which leaves no trace anywhere.
+            terms.acting_as.resolve(self.identity.as_ref()),
+            now_for_admission(),
+            (&budget, reserved_width(&budget, &plan)),
+        ))
         .await
         {
             Ok(pass) => pass,
@@ -4028,6 +4601,8 @@ impl Runtime {
             idempotency_key,
             acting_as,
             admitted_by,
+            expected_declaration: _,
+            subjects,
         } = terms;
         let chain = acting_as.resolve(self.identity.as_ref());
         let mut records = vec![
@@ -4039,7 +4614,7 @@ impl Runtime {
                     &input,
                     idempotency_key,
                     admitted_by,
-                    matches!(acting_as, Acting::Nobody),
+                    &acting_as,
                 ),
             ),
             // From here the plan is an authorization graph: compiled from
@@ -4063,6 +4638,27 @@ impl Runtime {
             records.push(Append::new(run, started));
         }
 
+        #[cfg(feature = "manifest")]
+        let declared: Vec<crate::journal::SubjectBinding> = self
+            .resolve(agent)
+            .ok()
+            .and_then(|skill| self.governing(skill.as_ref()))
+            .map(|m| {
+                m.spec
+                    .data_subjects
+                    .iter()
+                    .map(crate::manifest::DataSubject::binding)
+                    .collect()
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "manifest"))]
+        let declared: Vec<crate::journal::SubjectBinding> = Vec::new();
+        // Before correlation, because `correlate_or_open` commits a case: a
+        // binding that refuses the run must refuse it before anything outside
+        // the journal names it. `$case` alone needs the case, and the case is
+        // bound whenever the run asked for one, so it cannot refuse later.
+        let bound = bind_subjects(&declared, subjects, &input, case.is_some())?;
+
         // Correlation is deterministic and runs before planning: which case a
         // message belongs to is a matter of fact, settled by a lookup.
         let case_ctx = match (case, self.cases.as_ref()) {
@@ -4072,10 +4668,6 @@ impl Runtime {
                     .await
                     .map_err(RuntimeError::from_store)?;
                 let case_id = correlation.case_id();
-                cases
-                    .attach_run(case_id, run)
-                    .await
-                    .map_err(RuntimeError::from_store)?;
                 // The case's own keys, not the ones this message carried. A run
                 // that *joined* an existing case may have been admitted with one
                 // key while the case holds three, and a binding naming any of
@@ -4122,10 +4714,6 @@ impl Runtime {
                         "case '{case_id}' is closed and cannot accept another run"
                     )));
                 }
-                cases
-                    .attach_run(case_id, run)
-                    .await
-                    .map_err(RuntimeError::from_store)?;
                 for record in &mut records {
                     record.case = Some(case_id);
                 }
@@ -4159,46 +4747,39 @@ impl Runtime {
             (None, _) => None,
         };
 
-        // The append claims the admission key, so a key already held is refused
-        // here — after the case work above has attached this run. A run whose
-        // records never landed has no history, so leaving it attached would put
-        // a run that never happened into the matter's own account of what did.
-        // Unwound for every failed append: why it failed does not change the
-        // fact that the run does not exist.
-        if let Err(e) = self.store.append(lease.epoch, records).await {
-            if let Some(ctx) = case_ctx.as_ref()
-                && let Err(detach) = ctx.cases.detach_run(ctx.case_id, run).await
-            {
-                tracing::warn!(
-                    %run,
-                    case = %ctx.case_id,
-                    error = %detach,
-                    "a failed admission stayed attached to its case; the case lists a \
-                     run with no journal"
-                );
-            }
-            return Err(RuntimeError::from_store(e));
+        let bound = fill_case_subjects(bound, case_ctx.as_ref());
+        let subject_refs = subject_refs(run, &bound);
+        if !bound.is_empty() {
+            let mut append = Append::new(run, RecordKind::DataSubjectBound { bindings: bound });
+            append.case = case_ctx.as_ref().map(CaseContext::id);
+            records.push(append);
         }
 
+        // The append claims the admission key, so a key already held is refused
+        // here, before anything outside the journal names the run.
+        self.store
+            .append(lease.epoch, records)
+            .await
+            .map_err(RuntimeError::from_store)?;
+
         // Registered before the run is handed back, and its failure fails
-        // admission. A run that started with its destinations unregistered would
-        // produce a history nothing is watching, and the events it missed are
-        // unrecoverable without a scan nobody schedules — which is the exact
-        // failure a durable outbox exists to remove, arriving one layer up.
+        // admission: a case that does not list the run, or destinations that
+        // never see its history.
         //
-        // After the append rather than before: the cursor starts at sequence
-        // one, so a registration written for a run whose admission then failed
-        // would sit against an empty journal forever. The price of that order
-        // is paid here instead: the admission records above are already
-        // durable, so a registration failure must **conclude** the run rather
-        // than merely return — an open journal under a lease that then lapses
-        // is exactly what the recovery sweep reads as a crashed run, and it
-        // would execute a run whose admission failed. Concluded `failed`, in
-        // the chain, with the reason beside it; the caller's cleanup then
-        // releases the lease.
-        #[cfg(feature = "push")]
-        if let Some(outbox) = &self.outbox
-            && let Err(open_failed) = outbox.open(run).await
+        // After the append rather than before: a registration written for a
+        // run whose admission then failed — or whose process died — would name
+        // a run no journal holds, and nothing could tell which case to take it
+        // off. The price of that order is paid here instead: the admission
+        // records above are already durable, so a registration failure must
+        // **conclude** the run rather than merely return — an open journal
+        // under a lease that then lapses is exactly what the recovery sweep
+        // reads as a crashed run, and it would execute a run whose admission
+        // failed. Concluded `failed`, in the chain, with the reason beside it;
+        // the caller's cleanup then releases the lease, and a resume registers
+        // again before it executes.
+        if let Err(open_failed) = self
+            .register(run, case_ctx.as_ref().map(CaseContext::id))
+            .await
         {
             let head = self
                 .store
@@ -4208,31 +4789,19 @@ impl Runtime {
             self.store
                 .append(
                     lease.epoch,
-                    vec![
-                        Append::new(
-                            run,
-                            RecordKind::Note {
-                                text: format!(
-                                    "admission failed after its records were written: the \
-                                     outbox registration was refused ({open_failed}) — the \
-                                     run is concluded failed and was never executed"
-                                ),
-                            },
-                        ),
-                        Append::new(
-                            run,
-                            RecordKind::RunConcluded {
-                                outcome: RunStatus::Failed(String::new()).as_str().to_owned(),
-                                reason: Some(format!(
-                                    "the outbox registration was refused ({open_failed}), so \
-                                     this run was concluded without ever executing"
-                                )),
-                                exhaustion: None,
-                                live_spend: Spend::default(),
-                                chain_head: head.hash,
-                            },
-                        ),
-                    ],
+                    vec![Append::new(
+                        run,
+                        RecordKind::RunConcluded {
+                            outcome: RunStatus::Failed(String::new()).as_str().to_owned(),
+                            reason: Some(format!(
+                                "the run's registration was refused ({open_failed}), so this \
+                                 run was concluded without ever executing"
+                            )),
+                            exhaustion: None,
+                            live_spend: Spend::default(),
+                            chain_head: head.hash,
+                        },
+                    )],
                 )
                 .await
                 .map_err(RuntimeError::from_store)?;
@@ -4249,6 +4818,7 @@ impl Runtime {
             input,
             case: case_ctx,
             identity: chain.cloned(),
+            subjects: subject_refs,
         })
     }
 
@@ -4270,11 +4840,13 @@ impl Runtime {
                 budget: a.budget,
                 agent: a.agent,
                 identity: a.identity,
+                subjects: a.subjects,
                 refusal: None,
                 withheld_subject: None,
                 successors: Vec::new(),
                 started: BTreeSet::new(),
                 finished: BTreeSet::new(),
+                succeeded: BTreeSet::new(),
                 recorded_groups: BTreeMap::new(),
             },
             &mut cursor,
@@ -4326,17 +4898,51 @@ impl Runtime {
     /// Every plan the run froze is checked, not only the one in force: an
     /// unwind resolves the steps that ran, and those may belong to a plan a
     /// replan replaced.
-    fn refuse_undrivable(&self, records: &[Record]) -> Result<(), RuntimeError> {
-        let plans = records.iter().filter_map(|r| match r.kind() {
-            RecordKind::PlanFrozen { plan, .. } => {
-                serde_json::from_value::<PlanIR>(plan.clone()).ok()
-            }
-            _ => None,
-        });
-        for node in plans.flat_map(|p| p.nodes) {
+    fn refuse_undrivable<'p>(
+        &self,
+        plans: impl IntoIterator<Item = &'p PlanIR>,
+    ) -> Result<(), RuntimeError> {
+        for node in plans.into_iter().flat_map(|p| &p.nodes) {
             self.resolve(&node.capability.0)?;
         }
         Ok(())
+    }
+
+    /// Name the run where it is watched from outside its journal: on its case,
+    /// and to every outbox destination.
+    ///
+    /// Only after the admission's append, and idempotent — an existing case
+    /// row and an existing delivery cursor are kept — so every writing resume
+    /// repeats it.
+    async fn register(
+        &self,
+        run: RunId,
+        case: Option<crate::core::CaseId>,
+    ) -> Result<(), crate::core::StoreError> {
+        if let (Some(case), Some(cases)) = (case, self.cases.as_ref()) {
+            cases.attach_run(case, run).await?;
+        }
+        #[cfg(feature = "push")]
+        if let Some(outbox) = &self.outbox {
+            outbox.open(run).await?;
+        }
+        Ok(())
+    }
+
+    /// [`RuntimeError::NoCaseStore`] when the run is bound to a case and this
+    /// plane has no case store.
+    ///
+    /// Everything a resume writes belongs to the case, and without the store
+    /// it would land under the run alone, where erasing the case misses it.
+    /// About this plane rather than the run, so another plane may resume it.
+    fn refuse_caseless(&self, run: RunId, records: &[Record]) -> Result<(), RuntimeError> {
+        match recorded_case_id(records) {
+            Some(case) if self.cases.is_none() => Err(RuntimeError::NoCaseStore {
+                run: run.to_string(),
+                case: case.to_string(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Journal a resume refusal as the run's quarantine, naming what moved.
@@ -4353,7 +4959,7 @@ impl Runtime {
             RunStatus::Quarantined(refusal.to_string()),
             None,
             true,
-            self.recorded_case(records).map(|c| c.id()),
+            recorded_case_id(records),
             Consumed::default(),
             Spend::ZERO,
             &QuotaPass::disabled(),
@@ -4739,6 +5345,7 @@ impl Runtime {
         outcome
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn replay_under(
         &self,
         run: RunId,
@@ -4817,7 +5424,8 @@ impl Runtime {
         let input = records.iter().find_map(recorded_input).ok_or_else(|| {
             RuntimeError::PlanContract("journal has no RunAdmitted record".into())
         })?;
-        let plan = frozen_plan(run, &records).map_err(|e| self.sealed_or_erased(e))?;
+        let (plan, successors) =
+            frozen_plans(run, &records).map_err(|e| self.sealed_or_erased(e))?;
 
         // Only a plane that can drive the run judges it. A plane holding no
         // provider for the run's steps — an operator's terminal, a fleet
@@ -4826,7 +5434,8 @@ impl Runtime {
         // nothing about the run, and quarantining it would stop a run this
         // plane could never have continued.
         if mode == Mode::Resume {
-            self.refuse_undrivable(&records)?;
+            self.refuse_undrivable(std::iter::once(&plan).chain(&successors))?;
+            self.refuse_caseless(run, &records)?;
         }
 
         // Resume can dispatch new effects past the end of history, so it is
@@ -4852,14 +5461,24 @@ impl Runtime {
                 .await;
         }
 
+        // A resume executes the run, so it registers it first: what it adds is
+        // whatever an admission that failed or died partway never wrote.
+        if mode == Mode::Resume {
+            self.register(run, recorded_case_id(&records))
+                .await
+                .map_err(RuntimeError::from_store)?;
+        }
+
         *dispatched = true;
         // The agent recorded at admission, so a replay is bounded by the
         // ceilings the run actually had — and dispatched no wider than the
         // width its reservation was sized for.
         let budget = self.budget_for(&recorded_agent(&records));
         let quota = self
-            .start_replay_quota_pass(run, mode, lease, reserved_width(&budget, &plan))
+            .start_replay_quota_pass(run, mode, reserved_width(&budget, &plan))
             .await?;
+        let through = self.marking_pass(run, &quota);
+        let this = through.as_ref().unwrap_or(self);
 
         let case_ctx = self.recorded_case(&records);
 
@@ -4873,7 +5492,7 @@ impl Runtime {
 
         // Strict verification never writes, so it holds no lease to renew.
         let _heartbeat = lease.map(|l| self.heartbeat(run, l.epoch));
-        self.execute(
+        this.execute(
             Execution {
                 run,
                 epoch,
@@ -4885,25 +5504,16 @@ impl Runtime {
                 budget,
                 agent: recorded_agent(&records),
                 identity: recorded_chain(&records)?,
+                subjects: recorded_subjects(run, &records),
                 // A step-level refusal has no effect key, so it cannot ride the
                 // replay cursor like an effect's does. It is lifted here from
                 // the records `replay` has already read.
                 refusal: recorded_step_refusal(&records),
                 withheld_subject: standing_withholding(&records),
-                // Every `PlanFrozen` after the first is a successor this run
-                // produced. Replay walks them in the order they were made.
-                successors: records
-                    .iter()
-                    .filter_map(|r| match r.kind() {
-                        RecordKind::PlanFrozen { plan, .. } => {
-                            serde_json::from_value::<PlanIR>(plan.clone()).ok()
-                        }
-                        _ => None,
-                    })
-                    .skip(1)
-                    .collect(),
+                successors,
                 started: recorded_started_steps(&records),
                 finished: recorded_finished_steps(&records),
+                succeeded: recorded_succeeded_steps(&records),
                 recorded_groups: recorded_groups(&records),
             },
             &mut cursor,
@@ -4975,13 +5585,17 @@ impl Runtime {
             budget,
             agent,
             identity,
+            subjects,
             refusal: recorded_refusal,
             withheld_subject,
             successors,
             started,
             finished,
+            succeeded,
             recorded_groups,
         } = plan;
+        // Every value derived from what the run took in carries its subjects.
+        let input = input.attributed(&subjects);
         let writing = !matches!(mode, Mode::Strict);
         let case_id = case.as_ref().map(super::ctx::CaseContext::id);
         let stamp = |a: Append| match case_id {
@@ -5026,10 +5640,34 @@ impl Runtime {
 
         // ── Ready-set scheduling ───────────────────────────────────────────
         //
-        // Dispatch order is a deterministic total order (topological rank, then
-        // id), so replay reproduces it exactly. A plan with parallelism that
+        // Dispatch order is a deterministic total order (ascending step id), so
+        // replay reproduces it exactly. A plan with parallelism that
         // dispatched in completion order would replay differently every time.
+        // The new work of a ready set whose recorded successes replay first.
+        let mut deferred: Option<Vec<StepId>> = None;
         loop {
+            let mut ready = current.ready(&done);
+            if let Some(rest) = deferred.take() {
+                let held: Vec<StepId> =
+                    ready.iter().copied().filter(|s| rest.contains(s)).collect();
+                if !held.is_empty() {
+                    ready = held;
+                }
+            }
+            // A resume's ready set can hold a step the record shows succeeding
+            // beside one it does not — parallel work cut off mid-flight. The
+            // recorded steps replay as a set of their own first, so the checks
+            // below meet the frontier with their outputs already restored; the
+            // rest is the next set, with nothing their replay made ready
+            // joining it.
+            if writing
+                && ready.iter().any(|s| succeeded.contains(s))
+                && ready.iter().any(|s| !succeeded.contains(s))
+            {
+                let (recorded, rest) = ready.into_iter().partition(|s| succeeded.contains(s));
+                ready = recorded;
+                deferred = Some(rest);
+            }
             // ── The stop check, at a step boundary and nowhere else ────────
             //
             // Between boundaries an effect may be announced and not yet
@@ -5042,7 +5680,16 @@ impl Runtime {
             // contains whatever stop it received, and re-reading the live
             // request would let a cancellation arriving *today* rewrite what a
             // run did last year.
+            //
+            // A resume asks only at its frontier — once the ready set holds a
+            // step the record does not show succeeding. Before that, the
+            // replayed steps have not yet refilled `completed` and `outputs`,
+            // and an unwind from there would hand each compensation nothing
+            // and walk the steps in id order rather than in reverse of the
+            // order they finished.
+            let at_frontier = ready.is_empty() || ready.iter().any(|s| !succeeded.contains(s));
             if writing
+                && at_frontier
                 && let Some(c) = self
                     .store
                     .cancellation(run)
@@ -5075,6 +5722,7 @@ impl Runtime {
                         Unwind {
                             agent: &agent,
                             identity: identity.as_ref(),
+                            subjects: &subjects,
                             run,
                             epoch,
                             ir: &current,
@@ -5099,7 +5747,7 @@ impl Runtime {
             // Beside the stop check and for its reasons. Unlike a cancellation
             // this is a **pause**: `stop` is reached with a status
             // `maybe_unwind` passes straight through, as exhaustion is.
-            if writing {
+            if writing && at_frontier {
                 let standing = self.withdrawn_authority(identity.as_ref()).await?;
                 match (standing, withheld.take()) {
                     // Lifted since the run was withheld: that decision is a
@@ -5132,6 +5780,7 @@ impl Runtime {
                                 Unwind {
                                     agent: &agent,
                                     identity: identity.as_ref(),
+                                    subjects: &subjects,
                                     run,
                                     epoch,
                                     ir: &current,
@@ -5157,6 +5806,7 @@ impl Runtime {
                                 Unwind {
                                     agent: &agent,
                                     identity: identity.as_ref(),
+                                    subjects: &subjects,
                                     run,
                                     epoch,
                                     ir: &current,
@@ -5179,7 +5829,6 @@ impl Runtime {
                     (None, None) => {}
                 }
             }
-            let ready = current.ready(&done);
             if ready.is_empty() {
                 break;
             }
@@ -5210,6 +5859,7 @@ impl Runtime {
                     Batch {
                         agent: &agent,
                         identity: identity.as_ref(),
+                        subjects: &subjects,
                         run,
                         epoch,
                         ir: &current,
@@ -5331,6 +5981,7 @@ impl Runtime {
                         Unwind {
                             agent: &agent,
                             identity: identity.as_ref(),
+                            subjects: &subjects,
                             run,
                             epoch,
                             ir: &current,
@@ -5476,6 +6127,7 @@ impl Runtime {
                     StepRun {
                         agent: batch.agent,
                         identity: batch.identity,
+                        subjects: batch.subjects,
                         run: batch.run,
                         epoch: batch.epoch,
                         node,
@@ -6261,6 +6913,7 @@ impl Runtime {
             case,
             ledger,
             identity,
+            subjects,
             agent,
             #[cfg(feature = "manifest")]
             manifest,
@@ -6285,6 +6938,9 @@ impl Runtime {
             #[cfg(feature = "manifest")]
             egress: self.egress.clone(),
             #[cfg(feature = "manifest")]
+            checkers: self.checkers.clone(),
+            streams: self.streams.clone(),
+            #[cfg(feature = "manifest")]
             rates: self.rates.clone(),
             meter: self.meter.clone(),
             #[cfg(feature = "keyring")]
@@ -6293,6 +6949,7 @@ impl Runtime {
             ledger,
             policy: self.policy.clone(),
             identity,
+            subjects,
             agent,
             plane: self.self_ref.clone(),
             #[cfg(feature = "manifest")]
@@ -6339,6 +6996,7 @@ impl Runtime {
                 case: cx.case.clone(),
                 ledger: Arc::clone(cx.ledger),
                 identity: cx.identity.cloned(),
+                subjects: cx.subjects.clone(),
                 agent: cx.agent.to_owned(),
                 #[cfg(feature = "manifest")]
                 manifest: self.governing(skill),
@@ -6581,6 +7239,7 @@ impl Runtime {
     > {
         let StepRun {
             identity,
+            subjects,
             run,
             epoch,
             node,
@@ -6639,6 +7298,7 @@ impl Runtime {
                 case,
                 ledger: Arc::clone(ledger),
                 identity: identity.cloned(),
+                subjects: subjects.clone(),
                 agent: agent.to_owned(),
                 #[cfg(feature = "manifest")]
                 manifest: self.governing(skill.as_ref()),
@@ -6711,6 +7371,28 @@ impl Runtime {
         Ok((status, output, cursor))
     }
 
+    /// Whether the chain's last record is already this conclusion. `head` is
+    /// the chain's last sequence.
+    async fn last_is_conclusion(
+        &self,
+        run: RunId,
+        head: crate::core::Seq,
+        status: &RunStatus,
+    ) -> Result<bool, RuntimeError> {
+        if head < 1 {
+            return Ok(false);
+        }
+        let page = self
+            .store
+            .read_page(run, head, 1)
+            .await
+            .map_err(RuntimeError::from_store)?;
+        Ok(matches!(
+            page.first().map(Record::kind),
+            Some(RecordKind::RunConcluded { outcome, .. }) if outcome == status.as_str()
+        ))
+    }
+
     /// Seal the run and report.
     /// Eight arguments, and each is a distinct fact about how the run ended
     /// that the caller already holds. Bundling them into a struct would move the
@@ -6763,26 +7445,13 @@ impl Runtime {
             // the record already carries, and appending it again would grow
             // the journal by one identical conclusion per resume. The chain's
             // own last record is the authority: only when it already *is*
-            // this conclusion is the append skipped — a resume that worked
-            // and then concluded the same way has its work between the two
-            // conclusions, so its last record is not a conclusion and both
-            // are kept. Scoped to open conclusions, because a sealing one is
+            // this conclusion is the append skipped. A resume that worked and then concluded the same way
+            // has its work between the two conclusions, so both are kept.
+            // Scoped to open conclusions, because a sealing one is
             // unreachable twice: the seal refuses further appends and a
             // sealed run's replay is a no-op long before here.
-            let repeated = !status.seals()
-                && self
-                    .store
-                    .read(run, before.seq)
-                    .await
-                    .map_err(RuntimeError::from_store)?
-                    .last()
-                    .is_some_and(|r| {
-                        matches!(
-                            r.kind(),
-                            RecordKind::RunConcluded { outcome, .. }
-                                if outcome == status.as_str()
-                        )
-                    });
+            let repeated =
+                !status.seals() && self.last_is_conclusion(run, before.seq, &status).await?;
             if repeated {
                 before.hash
             } else {
@@ -6844,6 +7513,13 @@ impl Runtime {
             // it fails, the conclusion remains open under an owned lease; once
             // that lease expires, recovery derives this pass from the journal
             // and retries the idempotent receipt.
+            //
+            // Whatever the outcome this instance is finished with the run, so
+            // a **suspended** run gives its slot back too — it costs a row,
+            // not a thread, and holding the slot would mean a tenant waiting
+            // on a hundred approvals could start nothing. The figure accrued
+            // is what *this pass* dispatched, not the run's cumulative spend,
+            // which would bill the replayed prefix once per resume.
             self.settle_quota(run, epoch, live_spend, quota, status.seals())
                 .await?;
 
@@ -6867,16 +7543,6 @@ impl Runtime {
                 );
             }
 
-            // Beside the lease, and for the same reason: this instance is
-            // finished with the run whatever the outcome. A **suspended** run
-            // gives its slot back too — it costs a row, not a thread, and
-            // holding the slot would mean a tenant waiting on a hundred
-            // approvals could start nothing.
-            //
-            // The figure accrued is what *this pass* dispatched, not the run's
-            // cumulative spend: `spend` includes the replayed prefix so the
-            // caller sees what the run has cost in total, but accruing it
-            // would bill the prefix once per suspend/resume cycle.
             announce(&self.meter, run, &status);
 
             return Ok(RunOutcome {
@@ -6941,7 +7607,6 @@ fn unanswered_waits(records: &[Record]) -> Vec<crate::core::EffectKey> {
         .collect()
 }
 
-/// Spend durably recorded by effects written under one live pass epoch.
 /// Whether `epoch` holds the conclusion that sealed the run — the pass whose
 /// settlement releases what the run still held.
 fn concluded_in(records: &[Record], epoch: crate::core::Epoch) -> bool {
@@ -6957,6 +7622,7 @@ fn is_sealing_conclusion(record: &Record) -> bool {
     )
 }
 
+/// Spend durably recorded by effects written under one live pass epoch.
 fn spend_recorded_in_epoch(records: &[Record], epoch: crate::core::Epoch) -> Spend {
     records
         .iter()
@@ -7104,8 +7770,8 @@ fn severity(status: &RunStatus) -> u8 {
         // A replan request is the weakest signal in a batch: a sibling that
         // failed outright has already decided the run, and re-planning around a
         // failure is not what the requesting step was asking for.
-        // Neither is reachable here at all — a sweep and a crossing are sealed
-        // at birth with no steps to compete — and both are named for the reason
+        // Neither is reachable here at all — a sweep, a crossing and a lift are
+        // sealed at birth with no steps to compete — and both are named for the reason
         // abandonment is: a rank given by omission is a decision nobody made.
         RunStatus::Replanning(_)
         | RunStatus::Suspended(_)
@@ -7115,7 +7781,9 @@ fn severity(status: &RunStatus) -> u8 {
         // wildcard: an observed session has no steps of this plane's to
         // compete, because this plane ran none of it.
         | RunStatus::Observed
-        | RunStatus::BrokeGlass { .. } => 0,
+        | RunStatus::BrokeGlass { .. }
+        | RunStatus::HaltLifted { .. }
+        | RunStatus::HoldReleased { .. } => 0,
     }
 }
 
@@ -7154,6 +7822,7 @@ fn collect(
 struct Batch<'a> {
     agent: &'a str,
     identity: Option<&'a crate::core::Delegation>,
+    subjects: &'a BTreeSet<crate::core::SubjectRef>,
     run: RunId,
     epoch: u64,
     ir: &'a PlanIR,
@@ -7182,10 +7851,10 @@ struct Batch<'a> {
 /// Carries the operator from the halt rather than only its reason: the
 /// withholding record is the one durable trace of this act on the run it
 /// stopped, and a pause nobody is named on cannot be asked about afterwards.
-struct Withdrawal {
-    subject: String,
-    reason: String,
-    by: crate::core::Operator,
+pub(crate) struct Withdrawal {
+    pub(crate) subject: String,
+    pub(crate) reason: String,
+    pub(crate) by: crate::core::Operator,
 }
 
 /// What the journal proves about a run an unwind is deciding over.
@@ -7243,6 +7912,7 @@ struct Journalling<'a> {
 /// What unwinding a run needs.
 struct Unwind<'a> {
     identity: Option<&'a crate::core::Delegation>,
+    subjects: &'a BTreeSet<crate::core::SubjectRef>,
     run: RunId,
     epoch: u64,
     ir: &'a PlanIR,
@@ -7257,6 +7927,7 @@ struct Unwind<'a> {
 /// What one step's execution needs.
 struct StepRun<'a> {
     identity: Option<&'a crate::core::Delegation>,
+    subjects: &'a BTreeSet<crate::core::SubjectRef>,
     run: RunId,
     epoch: u64,
     node: &'a PlanNode,
@@ -7290,6 +7961,7 @@ struct StepFrame {
     case: Option<CaseContext>,
     ledger: Arc<std::sync::Mutex<Ledger>>,
     identity: Option<crate::core::Delegation>,
+    subjects: BTreeSet<crate::core::SubjectRef>,
     agent: String,
     #[cfg(feature = "manifest")]
     manifest: Option<Arc<crate::manifest::Manifest>>,
@@ -7417,6 +8089,29 @@ fn recorded_finished_steps(records: &[Record]) -> BTreeSet<StepId> {
             _ => None,
         })
         .collect()
+}
+
+/// The case the run is bound to, read from its `CaseBound` record.
+fn recorded_case_id(records: &[Record]) -> Option<crate::core::CaseId> {
+    records.iter().find_map(|r| match r.kind() {
+        RecordKind::CaseBound { .. } => r.body.case,
+        _ => None,
+    })
+}
+
+/// The steps whose latest forward ending on the record is a success.
+fn recorded_succeeded_steps(records: &[Record]) -> BTreeSet<StepId> {
+    let mut succeeded = BTreeSet::new();
+    for r in records.iter().filter(|r| r.body.phase.is_forward()) {
+        if let (RecordKind::StepFinished { outcome }, Some(step)) = (r.kind(), r.body.step) {
+            if outcome == RunStatus::Succeeded.as_str() {
+                succeeded.insert(step);
+            } else {
+                succeeded.remove(&step);
+            }
+        }
+    }
+    succeeded
 }
 
 /// The group records already on the journal, by writing step and phase.
@@ -7660,6 +8355,125 @@ fn default_owner() -> String {
     format!("agentplane-{seed:016x}-{n}")
 }
 
+/// Resolve a run's data-subject bindings against its input, before the run
+/// is bound to a case.
+///
+/// Declared bindings first, in declaration order, then the subjects the
+/// embedder named; each entry's position is the index every reference to it
+/// names. A binding that resolves to nothing refuses the run rather than
+/// attributing its data to nobody. A `$case` binding is refused when the run
+/// asked for no case, and otherwise left for [`fill_case_subjects`].
+fn bind_subjects(
+    declared: &[crate::journal::SubjectBinding],
+    named: Vec<String>,
+    input: &Tainted<Value>,
+    in_case: bool,
+) -> Result<Vec<crate::journal::BoundSubject>, RuntimeError> {
+    use crate::journal::SubjectBinding;
+    let refuse = |binding: &SubjectBinding, reason: &str| RuntimeError::SubjectUnbound {
+        binding: binding.to_string(),
+        reason: reason.to_owned(),
+    };
+    let mut resolved = Vec::new();
+    let named = named
+        .into_iter()
+        .map(|subject| (SubjectBinding::Named, Some(subject)));
+    for (position, (binding, given)) in declared
+        .iter()
+        .cloned()
+        .map(|binding| (binding, None))
+        .chain(named)
+        .enumerate()
+    {
+        let (subject, trusted) = match (&binding, given) {
+            (_, Some(subject)) => (subject, true),
+            (SubjectBinding::Input { pointer }, None) => {
+                let Some(selected) = input.project_pointer(pointer) else {
+                    return Err(refuse(&binding, "it selects nothing in the run's input"));
+                };
+                let subject = match selected.peek() {
+                    Value::String(text) => text.clone(),
+                    Value::Number(number) => number.to_string(),
+                    _ => {
+                        return Err(refuse(&binding, "it selects neither a string nor a number"));
+                    }
+                };
+                (
+                    subject,
+                    selected.label().trust == crate::core::Trust::Trusted,
+                )
+            }
+            (SubjectBinding::Case, None) => {
+                if !in_case {
+                    return Err(refuse(&binding, "the run belongs to no case"));
+                }
+                (CASE_PENDING.to_owned(), true)
+            }
+            (SubjectBinding::Named, None) => {
+                return Err(refuse(&binding, "no subject was named"));
+            }
+        };
+        if subject.trim().is_empty() {
+            return Err(refuse(&binding, "it resolves to an empty subject"));
+        }
+        let index = u16::try_from(position)
+            .map_err(|_| refuse(&binding, "a run binds at most 65536 subjects"))?;
+        resolved.push(crate::journal::BoundSubject {
+            index,
+            binding,
+            trusted,
+            subject,
+        });
+    }
+    Ok(resolved)
+}
+
+/// What a `$case` binding holds between [`bind_subjects`] and
+/// [`fill_case_subjects`]: never journaled.
+const CASE_PENDING: &str = "$case";
+
+/// Give each `$case` binding the id of the case the run was bound to.
+fn fill_case_subjects(
+    mut bound: Vec<crate::journal::BoundSubject>,
+    case: Option<&CaseContext>,
+) -> Vec<crate::journal::BoundSubject> {
+    if let Some(case) = case {
+        for entry in &mut bound {
+            if entry.binding == crate::journal::SubjectBinding::Case {
+                entry.subject = case.case_id.to_string();
+            }
+        }
+    }
+    bound
+}
+
+/// The references a run's `DataSubjectBound` record makes available to every
+/// value it reads.
+fn subject_refs(
+    run: RunId,
+    bound: &[crate::journal::BoundSubject],
+) -> BTreeSet<crate::core::SubjectRef> {
+    bound
+        .iter()
+        .map(|b| crate::core::SubjectRef {
+            run,
+            index: b.index,
+        })
+        .collect()
+}
+
+/// The references a recorded run's `DataSubjectBound` names, read back so a
+/// resume attributes exactly as the live run did.
+fn recorded_subjects(run: RunId, records: &[Record]) -> BTreeSet<crate::core::SubjectRef> {
+    records
+        .iter()
+        .find_map(|r| match r.kind() {
+            RecordKind::DataSubjectBound { bindings } => Some(subject_refs(run, bindings)),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 /// The admitted input, label and all.
 ///
 /// Read back rather than recomputed: a replay that re-labelled would reach a
@@ -7731,9 +8545,9 @@ fn recorded_chain(records: &[Record]) -> Result<Option<crate::core::Delegation>,
 ///
 /// Named rather than negated: a failure not listed here is retried, so a
 /// transient one added later costs a retry loop rather than a quarantine.
-/// `PlanContract` is not listed because some of its refusals are about this
-/// plane — a quota store it lacks — and another plane may settle what this
-/// one cannot.
+/// `PlanContract`, `NoProvider` and `NoCaseStore` are not listed because they
+/// are about this plane — a quota store, an agent or a case store it lacks —
+/// and another plane may settle what this one cannot.
 const fn recurs_on_every_resume(error: &RuntimeError) -> bool {
     matches!(
         error,
@@ -7932,6 +8746,11 @@ fn classify(
         Err(SkillError::Step(StepError::Budget(exceeded))) => {
             (RunStatus::Exhausted(exceeded), None)
         }
+        // A withdrawal found at a hop is the boundary's pause, reached
+        // mid-step: the hop recorded the withholding before refusing.
+        Err(SkillError::Step(StepError::Withheld { subject, reason })) => {
+            (RunStatus::Withheld { subject, reason }, None)
+        }
         Err(e) => {
             let msg = e.to_string();
             // Matched structurally, never on the message: a match on the word
@@ -8023,6 +8842,10 @@ struct Execution<'a> {
     /// Steps whose `StepFinished` is already on the record. Empty on a live
     /// run.
     finished: BTreeSet<StepId>,
+    /// Steps whose latest forward ending on the record is a success. Empty on
+    /// a live run. A resume replays these before it asks whether to stop, so
+    /// an unwind sees their outputs and the order they finished in.
+    succeeded: BTreeSet<StepId>,
     /// Group records already on the journal, keyed by the step and phase
     /// that wrote them. Empty on a live run. Read back for the same reason
     /// `finished` is: group records are not effects, so the cursor cannot
@@ -8038,6 +8861,9 @@ struct Execution<'a> {
     mode: Mode,
     case: Option<CaseContext>,
     budget: Budget,
+    /// The run's data-subject references: from the `DataSubjectBound` just
+    /// written on a live run, read back from it on a replay.
+    subjects: BTreeSet<crate::core::SubjectRef>,
     /// Who is acting, for the policy principal. Read back from `RunAdmitted` on
     /// a replay rather than recomputed, for the same reason the plan is: the
     /// principal a run was authorized as is a fact about that run.
@@ -8098,7 +8924,7 @@ const UNATTRIBUTED: &str = "the chain records this ending and not who asked for 
 /// `RunSealed` is written by `conclude` for exactly the runs that reached a
 /// conclusion, and never for a suspended one. That is the fact this needs, so
 /// it is the fact it reads.
-fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
+pub(crate) fn resume_is_closed(records: &[Record]) -> Option<RunStatus> {
     let outcome = records.iter().rev().find_map(|r| match r.kind() {
         RecordKind::RunConcluded { outcome, .. } => Some(outcome.as_str()),
         _ => None,
@@ -8377,6 +9203,14 @@ fn recorded_status(
             || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
             |(actor, reason)| RunStatus::BrokeGlass { actor, reason },
         ),
+        HALT_LIFTED_OUTCOME => recorded_halt_lift(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| RunStatus::HaltLifted { actor },
+        ),
+        HOLD_RELEASED_OUTCOME => recorded_hold_release(records).map_or_else(
+            || RunStatus::Quarantined(UNATTRIBUTED.to_owned()),
+            |actor| RunStatus::HoldReleased { actor },
+        ),
         // Fail closed, as the resume path does: a conclusion this build cannot
         // interpret is not permission to treat the run as ordinary. Every
         // outcome this build *writes* has an arm above, and a guard holds the
@@ -8422,7 +9256,7 @@ fn recorded_ending(records: &[Record]) -> Option<String> {
 
 /// Whether an ending was an act rather than something the run's steps reached.
 ///
-/// A cancellation, an abandonment, a sweep, a break-glass crossing, a
+/// A cancellation, an abandonment, a sweep, a break-glass crossing, a lift, a
 /// withdrawal and an observation are each recorded by whoever took them; a
 /// strict replay re-derives steps, and no step decided these.
 fn ended_by_an_act(outcome: &str) -> bool {
@@ -8430,38 +9264,48 @@ fn ended_by_an_act(outcome: &str) -> bool {
         || [
             super::sweeper::SWEEP_OUTCOME,
             BREAK_GLASS_OUTCOME,
+            HALT_LIFTED_OUTCOME,
+            HOLD_RELEASED_OUTCOME,
             WITHHELD_OUTCOME,
             OBSERVED_OUTCOME,
         ]
         .contains(&outcome)
 }
 
-/// The plan a run was admitted under, read back from its own history.
+/// The plan the run was admitted under, and each successor a replan produced,
+/// oldest first. Read back rather than recompiled, which could produce a graph
+/// that never governed the run.
 ///
-/// Read back rather than recompiled. Recompiling could produce a different
-/// graph — a changed manifest, a different router — and replay would then
-/// verify a run against a plan that never governed it.
+/// All or nothing. Successors are walked by position, so skipping one this
+/// build cannot read would put every later replan on the wrong plan.
 ///
 /// # Errors
 ///
-/// [`RuntimeError::PayloadsErased`] when the record is still sealed, named
-/// before it is parsed: a sealed payload deserialises into a *missing field*,
-/// and that sentence sends an operator looking for a corrupt journal rather
-/// than telling them the data was erased on request.
-fn frozen_plan(run: RunId, records: &[Record]) -> Result<PlanIR, RuntimeError> {
-    let frozen = records
+/// [`RuntimeError::PayloadsErased`] when a plan is still sealed, named before
+/// it is parsed: a sealed payload deserialises into a *missing field*, and that
+/// sentence sends an operator looking for a corrupt journal rather than telling
+/// them the data was erased on request.
+fn frozen_plans(run: RunId, records: &[Record]) -> Result<(PlanIR, Vec<PlanIR>), RuntimeError> {
+    let mut plans = records
         .iter()
-        .find_map(|r| match r.kind() {
-            RecordKind::PlanFrozen { plan, .. } => Some(plan.clone()),
+        .filter_map(|r| match r.kind() {
+            RecordKind::PlanFrozen { plan, .. } => Some(plan),
             _ => None,
         })
+        .map(|plan| {
+            if sealed_payload(plan) {
+                return Err(RuntimeError::PayloadsErased {
+                    run: run.to_string(),
+                });
+            }
+            serde_json::from_value(plan.clone()).map_err(RuntimeError::Encoding)
+        })
+        .collect::<Result<Vec<PlanIR>, _>>()?
+        .into_iter();
+    let admitted = plans
+        .next()
         .ok_or_else(|| RuntimeError::PlanContract("journal has no PlanFrozen record".into()))?;
-    if sealed_payload(&frozen) {
-        return Err(RuntimeError::PayloadsErased {
-            run: run.to_string(),
-        });
-    }
-    serde_json::from_value(frozen).map_err(RuntimeError::Encoding)
+    Ok((admitted, plans.collect()))
 }
 
 /// Whether this run's history is sealed to a key that no longer exists.
@@ -8512,6 +9356,22 @@ fn recorded_crossing(records: &[Record]) -> Option<(crate::core::Operator, Strin
     })
 }
 
+/// Who lifted the halt this run records, read back from its lift record.
+fn recorded_halt_lift(records: &[Record]) -> Option<crate::core::Operator> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::HaltLifted { by, .. } => Some(by.clone()),
+        _ => None,
+    })
+}
+
+/// Who released the hold this run records, read back from its release record.
+fn recorded_hold_release(records: &[Record]) -> Option<crate::core::Operator> {
+    records.iter().rev().find_map(|r| match r.kind() {
+        RecordKind::HoldReleased { by, .. } => Some(by.clone()),
+        _ => None,
+    })
+}
+
 /// Whose authority was withdrawn, and what the operator said when withdrawing
 /// it — read back from the withholding record.
 ///
@@ -8539,17 +9399,46 @@ pub(super) fn now_for_admission() -> crate::core::Timestamp {
     crate::core::Timestamp::now_utc()
 }
 
-/// The epoch a break-glass record is written under.
+/// A lift was recorded in `run` and the register's row was not removed.
 ///
-/// A break-glass run has no competing writer to fence against — it is created,
+/// The control still stands; the operator is told the lift failed and which
+/// run recorded the attempt.
+fn removal_failed(run: RunId, e: &crate::core::StoreError) -> RuntimeError {
+    RuntimeError::ControlStands {
+        run: run.to_string(),
+        detail: e.to_string(),
+    }
+}
+
+/// An operator's lift or release that found a control standing and recorded
+/// ending it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlLifted {
+    /// The run holding the record.
+    pub record: RunId,
+    /// Whether this call removed the register row. `false` when another lift
+    /// or release removed it between this call's read and its removal: the
+    /// control is gone either way, and the record still stands.
+    pub removed: bool,
+}
+
+/// The epoch an operator act's own run is written under.
+///
+/// Such a run has no competing writer to fence against — it is created,
 /// written and sealed in one call — so a constant is honest here for the same
 /// reason it is in the sweeper.
-const BREAK_GLASS_EPOCH: crate::core::Epoch = 1;
+const BREAK_GLASS_EPOCH: crate::core::Epoch = LEASE_FREE_EPOCH;
 
 /// How a break-glass run ends. Not a run status: it neither succeeded nor
 /// failed at a goal, which is why a sweep seals as `swept` rather than
 /// borrowing one.
 const BREAK_GLASS_OUTCOME: &str = "broke-glass";
+
+/// How a run recording an operator lifting a halt ends.
+pub const HALT_LIFTED_OUTCOME: &str = "halt-lifted";
+
+/// How a run recording an operator releasing a legal hold ends.
+pub const HOLD_RELEASED_OUTCOME: &str = "hold-released";
 
 /// How a run ends when the authority it acts under is withdrawn under it.
 ///
@@ -8565,6 +9454,25 @@ pub const WITHHELD_OUTCOME: &str = "withheld";
 /// agent's work in the column an operator reads as *this plane did it*. The
 /// distinction is the whole reason the status exists.
 pub const OBSERVED_OUTCOME: &str = "observed";
+
+/// The epoch every run written without a lease is written under: a sweep's
+/// record, an operator act's, an observed session's. Nothing takes such a run
+/// over, so there is no ownership for the epoch to arbitrate, and one constant
+/// lets the pass that finishes their seals use the epoch they were written at.
+pub(crate) const LEASE_FREE_EPOCH: crate::core::Epoch = 1;
+
+/// The sealing outcomes whose runs are written without a lease.
+///
+/// Recovery selects a run by its lapsed lease, so it never finds one of these
+/// whose writer died between conclusion and seal;
+/// [`Runtime::seal_unsealed_conclusions`] is what finishes them.
+pub(crate) const LEASE_FREE_OUTCOMES: &[&str] = &[
+    super::sweeper::SWEEP_OUTCOME,
+    BREAK_GLASS_OUTCOME,
+    HALT_LIFTED_OUTCOME,
+    HOLD_RELEASED_OUTCOME,
+    OBSERVED_OUTCOME,
+];
 
 /// One governed identity: a declaration and the skills that serve it.
 ///
@@ -8640,6 +9548,16 @@ impl Agent {
     }
 }
 
+/// Receives every model call's live output, with the run it belongs to.
+///
+/// What [`ModelStreamObserver`](crate::model::ModelStreamObserver) receives for
+/// one call, for every call a plane makes — so a surface can show a run's model
+/// writing while the journal holds only the finished answer.
+pub trait RunStreamObserver: Send + Sync + std::fmt::Debug {
+    /// Delivery is advisory and must not block the call.
+    fn event(&self, run: RunId, event: Tainted<crate::model::ModelStreamEvent>);
+}
+
 /// Assembles a [`Runtime`].
 #[derive(Debug)]
 pub struct RuntimeBuilder {
@@ -8649,6 +9567,7 @@ pub struct RuntimeBuilder {
     /// witnessing whose evidence is whatever happened to arrive.
     witnesses: Vec<Arc<dyn crate::journal::Witness>>,
     quorum: Option<crate::journal::WitnessQuorum>,
+    witness_interval: Option<std::time::Duration>,
     signer: Option<Arc<dyn crate::core::Signer>>,
     skills: Vec<Arc<dyn Skill>>,
     #[cfg(feature = "manifest")]
@@ -8658,6 +9577,9 @@ pub struct RuntimeBuilder {
     )>,
     #[cfg(feature = "manifest")]
     egress: Option<Arc<crate::core::Egress>>,
+    #[cfg(feature = "manifest")]
+    checkers: crate::content::Checkers,
+    streams: Option<Arc<dyn RunStreamObserver>>,
     journal_ceiling: Option<crate::core::Sensitivity>,
     tenant: crate::core::TenantId,
     owner: Option<String>,
@@ -8688,6 +9610,7 @@ pub struct RuntimeBuilder {
     tasks: Option<Arc<dyn TaskStore>>,
     timers: Option<Arc<dyn TimerStore>>,
     blobs: Option<Arc<dyn crate::blob::BlobStore>>,
+    disclosures: Option<Arc<dyn crate::disclosure::DisclosureRegister>>,
     #[cfg(feature = "push")]
     push: Option<Arc<dyn crate::push::PushStore>>,
     #[cfg(feature = "keyring")]
@@ -8809,6 +9732,20 @@ impl RuntimeBuilder {
             retriever,
         }));
         self
+    }
+
+    /// Whether the plane's budget, or any registered agent's, caps money.
+    fn states_a_money_ceiling(&self) -> bool {
+        #[cfg(feature = "manifest")]
+        if self
+            .agents
+            .iter()
+            .filter_map(|agent| agent.manifest.as_ref())
+            .any(|manifest| manifest.budget().max_minor_units.is_some())
+        {
+            return true;
+        }
+        self.budget.max_minor_units.is_some()
     }
 
     /// Attach durable standing-authority accounting.
@@ -9055,6 +9992,14 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Where disclosures of a matter are recorded, so a retention pass names
+    /// the copies of what it erased.
+    #[must_use]
+    pub fn disclosures(mut self, register: Arc<dyn crate::disclosure::DisclosureRegister>) -> Self {
+        self.disclosures = Some(register);
+        self
+    }
+
     /// The operator's tool catalogue, and the client that reaches those tools.
     ///
     /// Required by a `tool-calling` agent and by nothing else: a skill that
@@ -9162,6 +10107,30 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn egress(mut self, egress: crate::core::Egress) -> Self {
         self.egress = Some(Arc::new(egress));
+        self
+    }
+
+    /// Forward every model call's live output, with the run it belongs to.
+    ///
+    /// Advisory and live-only: the journal's completion stays the canonical
+    /// answer, a replay performs no call and so streams nothing, and an
+    /// observer that drops events changes nothing a run does.
+    #[must_use]
+    pub fn observe_model_streams(mut self, observer: Arc<dyn RunStreamObserver>) -> Self {
+        self.streams = Some(observer);
+        self
+    }
+
+    /// Register a content checker, by its [`name`](crate::content::ContentChecker::name).
+    ///
+    /// A manifest check naming a checker no builder registered, or mapping a
+    /// category the checker does not declare, refuses the build: a declared
+    /// check nothing could run is a control a reviewer approved that does not
+    /// exist.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn content_checker(mut self, checker: Arc<dyn crate::content::ContentChecker>) -> Self {
+        Arc::make_mut(&mut self.checkers).insert(checker.name().to_owned(), checker);
         self
     }
 
@@ -9454,6 +10423,24 @@ impl RuntimeBuilder {
     ) -> Self {
         self.witnesses = witnesses;
         self.quorum = Some(quorum);
+        self
+    }
+
+    /// Declare the maximum time between checkpoint submissions to each
+    /// witness: [`sweep`](Runtime::sweep) re-submits an unchanged checkpoint
+    /// once it has passed since the last round that met quorum, so an idle
+    /// plane still carries a fresh witness timestamp. Without it an unchanged
+    /// log is never re-submitted.
+    ///
+    /// The interval is kept only as often as `sweep` runs; a deployment
+    /// sweeping on its own scheduler owns that cadence.
+    ///
+    /// # Errors
+    ///
+    /// [`build`](RuntimeBuilder::build) refuses an interval with no witnesses.
+    #[must_use]
+    pub fn witness_interval(mut self, interval: std::time::Duration) -> Self {
+        self.witness_interval = Some(interval);
         self
     }
 
@@ -9755,6 +10742,67 @@ impl RuntimeBuilder {
         }
     }
 
+    /// The driver for a declarative agent's privileged model — named rather
+    /// than defaulted, because falling back to some other registered driver
+    /// would run the agent on a model its own declaration does not name.
+    /// Every declared content check names a registered checker, and maps only
+    /// categories that checker declares.
+    #[cfg(feature = "manifest")]
+    fn check_content_checkers(
+        checkers: &crate::content::Checkers,
+        m: &crate::manifest::Manifest,
+    ) -> Result<(), BuildError> {
+        let Some(content) = m.spec.security.content.as_ref() else {
+            return Ok(());
+        };
+        for check in &content.checks {
+            let refused = |detail: String| BuildError::ContentCheck {
+                agent: m.metadata.name.clone(),
+                check: check.id.clone(),
+                detail,
+            };
+            let Some(checker) = checkers.get(&check.checker) else {
+                return Err(refused(format!(
+                    "no checker named '{}' is registered on this plane",
+                    check.checker
+                )));
+            };
+            if let Some(unknown) = check
+                .on
+                .keys()
+                .find(|category| !checker.categories().contains(*category))
+            {
+                return Err(refused(format!(
+                    "'{unknown}' is not a category checker '{}' declares",
+                    check.checker
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "manifest")]
+    fn declared_provider(
+        providers: &HashMap<String, Arc<dyn crate::model::ModelProvider>>,
+        m: &crate::manifest::Manifest,
+    ) -> Result<Arc<dyn crate::model::ModelProvider>, BuildError> {
+        let model = m
+            .spec
+            .models
+            .as_ref()
+            .and_then(|x| x.privileged.as_ref())
+            .ok_or_else(|| BuildError::DeclarativeWithoutModel {
+                agent: m.metadata.name.clone(),
+            })?;
+        providers
+            .get(&model.provider)
+            .map(Arc::clone)
+            .ok_or_else(|| BuildError::UnknownProvider {
+                agent: m.metadata.name.clone(),
+                provider: model.provider.clone(),
+            })
+    }
+
     /// Assemble the runtime, or say why it cannot be.
     ///
     /// The same checks as [`build`](Self::build), returned rather than raised.
@@ -9825,9 +10873,27 @@ impl RuntimeBuilder {
             if embedder != index {
                 return Err(BuildError::EmbeddingSpaceMismatch { embedder, index });
             }
-            if self.memories.is_none() {
-                return Err(BuildError::SemanticMemoryWithoutStore);
+            if semantic.embedder.pricing().is_none() && self.states_a_money_ceiling() {
+                return Err(BuildError::UnpricedEmbedder { embedder });
             }
+            let Some(memories) = self.memories.take() else {
+                return Err(BuildError::SemanticMemoryWithoutStore);
+            };
+            // Every erasure through the plane's store — and through a sealed
+            // store's own subject erasure — reaches the index built from it.
+            let reached = memories.erasure_index();
+            let indexed: Arc<dyn crate::memory::MemoryStore> = match reached {
+                Some(index) if Arc::ptr_eq(&index, &semantic.retriever) => memories,
+                Some(_) => return Err(BuildError::MemoryIndexedElsewhere),
+                None if memories.seals() => {
+                    return Err(BuildError::SealedMemoryMissesIndex);
+                }
+                None => Arc::new(crate::memory::IndexedMemoryStore::new(
+                    Arc::clone(&memories),
+                    Arc::clone(&semantic.retriever),
+                )),
+            };
+            self.memories = Some(indexed);
         }
         self.seal_stores();
         #[cfg(feature = "manifest")]
@@ -9872,25 +10938,12 @@ impl RuntimeBuilder {
             // A declarative agent needs no skill: the runtime supplies the
             // behaviour its manifest asked for.
             if let Some(execution) = &m.spec.execution {
-                let model = m
-                    .spec
-                    .models
-                    .as_ref()
-                    .and_then(|x| x.privileged.as_ref())
-                    .ok_or_else(|| BuildError::DeclarativeWithoutModel {
-                        agent: m.metadata.name.clone(),
-                    })?;
-                // Named rather than defaulted. Falling back to some other
-                // registered driver would run the agent on a model its own
-                // declaration does not name.
-                let provider = self
-                    .providers
-                    .get(&model.provider)
-                    .map(Arc::clone)
-                    .ok_or_else(|| BuildError::UnknownProvider {
-                        agent: m.metadata.name.clone(),
-                        provider: model.provider.clone(),
-                    })?;
+                // A `call` calls no model, so it needs no provider.
+                let provider = if execution.kind == crate::manifest::ExecutionKind::Call {
+                    None
+                } else {
+                    Some(Self::declared_provider(&self.providers, &m)?)
+                };
                 if m.spec.capabilities.provides.is_empty() {
                     return Err(BuildError::DeclarativeProvidesNothing {
                         agent: m.metadata.name.clone(),
@@ -9941,7 +10994,10 @@ impl RuntimeBuilder {
                                 format!("{} tool grant(s)", m.spec.tools.len())
                             })
                         }
-                        crate::manifest::ExecutionKind::Planned if !m.spec.tools.is_empty() => {
+                        crate::manifest::ExecutionKind::Planned
+                        | crate::manifest::ExecutionKind::Call
+                            if !m.spec.tools.is_empty() =>
+                        {
                             Some(format!("{} tool grant(s)", m.spec.tools.len()))
                         }
                         _ => None,
@@ -10033,7 +11089,7 @@ impl RuntimeBuilder {
                         execution.kind,
                         cap.clone(),
                         m.metadata.name.clone(),
-                        Arc::clone(&provider),
+                        provider.clone(),
                         tools.clone(),
                         execution.max_turns,
                     ));
@@ -10056,6 +11112,7 @@ impl RuntimeBuilder {
                 if !checked.insert(m.metadata.name.clone()) {
                     continue;
                 }
+                Self::check_content_checkers(&self.checkers, m)?;
                 for grant in &m.spec.tools {
                     let Some(id) = crate::tools::ToolId::parse(&grant.reference) else {
                         continue;
@@ -10144,6 +11201,9 @@ impl RuntimeBuilder {
 
         // Both or neither, checked here because a builder cannot see the other
         // half at the moment either is set.
+        if self.witness_interval.is_some() && self.witnesses.is_empty() {
+            return Err(BuildError::IntervalWithoutWitnesses);
+        }
         let witnesses = match (self.witnesses.is_empty(), self.quorum) {
             (true, None) => None,
             (false, Some(quorum)) if quorum.required() <= self.witnesses.len() => {
@@ -10151,6 +11211,8 @@ impl RuntimeBuilder {
                     witnesses: self.witnesses,
                     quorum,
                     submitted: std::sync::atomic::AtomicU64::new(0),
+                    interval: self.witness_interval,
+                    last_met: std::sync::Mutex::new(None),
                 }))
             }
             (empty, quorum) => {
@@ -10186,6 +11248,9 @@ impl RuntimeBuilder {
             journal_ceiling: self.journal_ceiling,
             #[cfg(feature = "manifest")]
             egress: self.egress,
+            #[cfg(feature = "manifest")]
+            checkers: self.checkers,
+            streams: self.streams,
             quotas: self.quotas,
             #[cfg(feature = "manifest")]
             rates,
@@ -10197,6 +11262,7 @@ impl RuntimeBuilder {
             tasks: self.tasks,
             timers: self.timers,
             blobs: self.blobs,
+            disclosures: self.disclosures,
             #[cfg(feature = "keyring")]
             keyring: self.keyring,
             batches: self.batches,
@@ -10448,7 +11514,7 @@ impl Runtime {
     /// failure or a refused resume.
     pub async fn deliver(&self, event: &InboundEvent) -> Result<Delivery, RuntimeError> {
         refuse_reserved_kind(event)?;
-        self.deliver_minted(event).await
+        self.deliver_buffered(event, true).await
     }
 
     /// Deliver an event this plane minted itself — a worklist decision.
@@ -10458,6 +11524,21 @@ impl Runtime {
     pub(crate) async fn deliver_minted(
         &self,
         event: &InboundEvent,
+    ) -> Result<Delivery, RuntimeError> {
+        self.deliver_buffered(event, false).await
+    }
+
+    /// Store `event`, then offer it to the oldest eligible waiter.
+    ///
+    /// `rematch` offers a duplicate again: the buffer and the match are two
+    /// writes, and a counterparty's retry is the one chance to repair a crash
+    /// between them. A minted decision is never re-offered, because its
+    /// duplicate is the answer *already on record*, and offering that stored
+    /// answer under a second decider's call would report it as theirs.
+    async fn deliver_buffered(
+        &self,
+        event: &InboundEvent,
+        rematch: bool,
     ) -> Result<Delivery, RuntimeError> {
         let events = self.events.as_ref().ok_or_else(|| {
             RuntimeError::PlanContract(
@@ -10469,20 +11550,26 @@ impl Runtime {
 
         // Durable first. Deduplication by event id makes a counterparty's retry
         // — and they all retry — harmless.
-        if !events
+        let fresh = events
             .buffer(event, now)
             .await
-            .map_err(RuntimeError::from_store)?
-        {
+            .map_err(RuntimeError::from_store)?;
+
+        // The match claims only an unclaimed, live row, so a retry of a
+        // message already consumed matches nothing.
+        if !fresh && !rematch {
             return Ok(Delivery::Duplicate);
         }
-
         let Some(sub) = events
             .match_waiter(event, now)
             .await
             .map_err(RuntimeError::from_store)?
         else {
-            return Ok(Delivery::Buffered);
+            return Ok(if fresh {
+                Delivery::Buffered
+            } else {
+                Delivery::Duplicate
+            });
         };
 
         self.resume_subscription(events, sub, event).await
@@ -10591,17 +11678,25 @@ impl Runtime {
             }
         };
 
-        let already_recorded = self
+        let history = self
             .store
             .read(sub.run, 1)
             .await
-            .map_err(RuntimeError::from_store)?
-            .iter()
-            .any(|record| {
-                record.effect_key() == Some(sub.effect)
-                    && matches!(record.kind(), RecordKind::EffectDone { .. })
-            });
-        if !already_recorded {
+            .map_err(RuntimeError::from_store)?;
+        let already_recorded = history.iter().any(|record| {
+            record.effect_key() == Some(sub.effect)
+                && matches!(record.kind(), RecordKind::EffectDone { .. })
+        });
+        // A run whose conclusion is durable consumes nothing. An answer
+        // appended after `RunConcluded` is one the run never acted on, and it
+        // leaves a run its seal refuses forever. The resume below finishes it
+        // instead — seals it and retires its waits, which hands this message,
+        // still unconsumed, to the next waiter on its key.
+        let closed = resume_is_closed(&history).is_some();
+        if !already_recorded && !closed {
+            // Judged here, where the output is recorded, under the run's own
+            // declaration: the step that resumes reads the verdict back.
+            let content = self.delivered_verdict(&history, &event.payload);
             self.store
                 .append(
                     lease.epoch,
@@ -10624,6 +11719,8 @@ impl Runtime {
                                 // names — the same one the run's own delivery
                                 // path records.
                                 declared: crate::core::DeclaredOutput::untrusted(),
+                                content,
+                                elapsed_ms: None,
                             },
                         )
                         .effect(sub.effect)
@@ -10641,10 +11738,12 @@ impl Runtime {
                 .map_err(RuntimeError::from_store)?;
         }
 
-        events
-            .unsubscribe(sub.run, sub.effect)
-            .await
-            .map_err(RuntimeError::from_store)?;
+        if !closed {
+            events
+                .unsubscribe(sub.run, sub.effect)
+                .await
+                .map_err(RuntimeError::from_store)?;
+        }
 
         // The event is recorded as the awaited effect's result, and the resume
         // continues under the *same* lease. Releasing here and letting the
@@ -10667,13 +11766,20 @@ impl Runtime {
             // listing, where the plane that runs the agent recovers it from
             // the recorded answer. Failing here would leave a recorded
             // decision reported as lost and the task it answers still claimed.
-            // A plane holding no key ring for a sealed run is the same
-            // terminal on a sealed plane: it cannot read the run, and the
-            // plane that holds the ring can.
-            Err(RuntimeError::NoProvider { .. } | RuntimeError::PayloadsSealed { .. }) => {
+            // A plane holding no key ring for a sealed run, or no case store
+            // for a case-bound one, is the same terminal: the plane that holds
+            // it continues the run.
+            Err(
+                RuntimeError::NoProvider { .. }
+                | RuntimeError::NoCaseStore { .. }
+                | RuntimeError::PayloadsSealed { .. },
+            ) => {
                 return Ok(Delivery::Buffered);
             }
             Err(e) => return Err(e),
+        }
+        if closed {
+            return Ok(Delivery::Buffered);
         }
         Ok(Delivery::Resumed { run: sub.run })
     }
@@ -10701,28 +11807,60 @@ impl Runtime {
         {
             tracing::error!(%run, %error, "a closed run's timers could not be retired");
         }
-        if let Some(events) = &self.events
-            && let Err(error) = events.unsubscribe_run(run).await
-        {
-            tracing::error!(%run, %error, "a closed run's subscriptions could not be retired");
+        // The waits the run announced and never had answered: a message
+        // claimed for one of them reached nobody and goes to the next waiter,
+        // and a task opened for one is withdrawn. A task opened beside an
+        // answer completes its own effect and is not among them: it is a
+        // finding for a desk, and outlives the run by design.
+        let unanswered = match self.store.read(run, 1).await {
+            Ok(records) => unanswered_waits(&records),
+            Err(error) => {
+                tracing::error!(%run, %error, "a closed run's waits could not be read to retire them");
+                return;
+            }
+        };
+        if let Some(events) = &self.events {
+            match events.unsubscribe_run(run, &unanswered).await {
+                Ok(retired) => {
+                    for event in retired.released {
+                        self.offer_released(events, &event).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%run, %error, "a closed run's subscriptions could not be retired");
+                }
+            }
         }
         if let Some(tasks) = &self.tasks {
-            // The waits the run announced and never had answered. A task opened
-            // beside an answer completes its own effect and is not among them:
-            // it is a finding for a desk, and outlives the run by design.
-            let awaited = match self.store.read(run, 1).await {
-                Ok(records) => unanswered_waits(&records)
-                    .into_iter()
-                    .map(|effect| crate::core::TaskId::derive(run, effect))
-                    .collect::<Vec<_>>(),
-                Err(error) => {
-                    tracing::error!(%run, %error, "a closed run's open tasks could not be withdrawn");
-                    return;
-                }
-            };
+            let awaited: Vec<_> = unanswered
+                .iter()
+                .map(|effect| crate::core::TaskId::derive(run, *effect))
+                .collect();
             if let Err(error) = tasks.withdraw_run(run, &awaited).await {
                 tracing::error!(%run, %error, "a closed run's open tasks could not be withdrawn");
             }
+        }
+    }
+
+    /// Offer a message a closed run held, and never consumed, to the next
+    /// waiter on its key — the delivery it would have had if that run had not
+    /// concluded first. Best effort, like the retirement that released it: a
+    /// message no waiter takes now stays buffered for the next one.
+    async fn offer_released(
+        &self,
+        events: &Arc<dyn crate::case::EventStore>,
+        event: &InboundEvent,
+    ) {
+        let sub = match events.match_waiter(event, now_for_admission()).await {
+            Ok(Some(sub)) => sub,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::error!(event = %event.id, %error, "a released message could not be offered");
+                return;
+            }
+        };
+        if let Err(error) = Box::pin(self.resume_subscription(events, sub, event)).await {
+            tracing::error!(event = %event.id, %error, "a released message could not be delivered");
         }
     }
 
@@ -10880,6 +12018,12 @@ pub(crate) fn every_status() -> Vec<RunStatus> {
             actor: crate::core::Operator::asserted("ops").expect("a name"),
             reason: "INC-42".into(),
         },
+        RunStatus::HaltLifted {
+            actor: crate::core::Operator::asserted("ops").expect("a name"),
+        },
+        RunStatus::HoldReleased {
+            actor: crate::core::Operator::asserted("ops").expect("a name"),
+        },
         RunStatus::Withheld {
             subject: "alice".into(),
             reason: "credential withdrawn".into(),
@@ -10917,7 +12061,7 @@ mod resume_agreement_tests {
         let statuses = every_status();
         assert_eq!(
             statuses.len(),
-            12,
+            14,
             "a RunStatus variant was added or removed — decide whether it seals \
              and whether a resume may continue from it, then update this list"
         );
@@ -11158,6 +12302,20 @@ mod resume_agreement_tests {
                 actor: who(),
                 roles: vec!["oncall".into()],
                 reason: "INC-42".into(),
+            }],
+            super::HALT_LIFTED_OUTCOME => vec![RecordKind::HaltLifted {
+                scope: "tenant".into(),
+                by: who(),
+                at: crate::core::Timestamp::UNIX_EPOCH,
+                reason: "INC-42".into(),
+                thrown_by: who(),
+                thrown_at: crate::core::Timestamp::UNIX_EPOCH,
+            }],
+            super::HOLD_RELEASED_OUTCOME => vec![RecordKind::HoldReleased {
+                by: who(),
+                at: crate::core::Timestamp::UNIX_EPOCH,
+                placed_by: who(),
+                placed_at: crate::core::Timestamp::UNIX_EPOCH,
             }],
             super::WITHHELD_OUTCOME => vec![RecordKind::AuthorityWithheld {
                 subject: "alice".into(),

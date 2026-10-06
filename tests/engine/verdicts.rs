@@ -273,7 +273,7 @@ async fn a_run_replays_from_an_export_with_no_store_path() {
     let mut file = Vec::new();
     agentplane::export::to_jsonl(
         &(Arc::clone(&store) as Arc<dyn JournalStore>),
-        Some(&(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>)),
+        &(Arc::clone(&store) as Arc<dyn agentplane::case::CaseStore>),
         &[run],
         &mut file,
     )
@@ -428,6 +428,7 @@ async fn a_run_under_another_canonicalization_rule_cannot_be_replayed() {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )

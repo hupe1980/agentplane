@@ -2,7 +2,7 @@
 #
 #   # tokens.yaml: examples/serve-tokens.yaml with its placeholders replaced
 #   agentplane serve examples/served.yaml \
-#     --url http://localhost:8080 \
+#     --url http://localhost:8080/a2a \
 #     --policy examples/serve-policy.cedar \
 #     --tokens tokens.yaml \
 #     --store /tmp/served.redb
@@ -17,6 +17,13 @@ spec:
     role: "Summarise a support ticket"
     constraints: "One sentence. No speculation."
   capabilities: { provides: [support.summarise] }
+  # The shape a caller is offered — and what `--mcp-addr` needs to serve this
+  # agent as a tool at all.
+  input:
+    schema:
+      type: object
+      required: [text]
+      properties: { text: { type: string } }
   models:
     privileged: { provider: fake, model: sum-1 }
   output:

@@ -50,7 +50,10 @@ pub async fn check(store: &dyn QuotaStore, report: &mut Report) {
     spend_accrues_per_period(store, report).await;
     spend_holds(store, at, report).await;
     halt(store, report).await;
+    lift_only_the_halt_read(store, report).await;
     rate(store, report).await;
+    rate_windows_share_a_grant(store, report).await;
+    an_uncountable_rate_window_is_refused(store, report).await;
 }
 
 /// A quota with only a concurrency ceiling.
@@ -776,6 +779,103 @@ async fn halt(store: &dyn QuotaStore, report: &mut Report) {
     }
 }
 
+/// A conditional lift removes only the row it names.
+///
+/// [`set_halt`](QuotaStore::set_halt) overwrites, so a halt re-thrown after a
+/// lifter read the old one stands in the same row. A removal keyed on the
+/// scope alone deletes the new halt under a record naming the old one, and the
+/// work it stopped starts again with nobody having lifted it.
+async fn lift_only_the_halt_read(store: &dyn QuotaStore, report: &mut Report) {
+    use crate::quota::HaltScope;
+
+    let scope = HaltScope::agent("conditional-lift");
+    let first_by = crate::core::Operator::authenticated("ops-erin").expect("a name");
+    let second_by = crate::core::Operator::authenticated("ops-frank").expect("a name");
+    let first_at = instant(1_700_000_100);
+    let second_at = instant(1_700_000_160);
+    let read = |halts: Vec<crate::quota::Halt>| halts.into_iter().find(|h| h.scope == scope);
+
+    report.checked += 1;
+    if let Err(e) = store
+        .set_halt(&scope, &first_by, first_at, "incident 46")
+        .await
+    {
+        report.record("throwing the halt a lifter reads", format!("{e}"));
+        return;
+    }
+    let first = match store.halts().await.map(read) {
+        Ok(Some(h)) => h,
+        Ok(None) => {
+            report.record(
+                "reading the halt a lifter reads",
+                "it did not read back".to_owned(),
+            );
+            return;
+        }
+        Err(e) => {
+            report.record("reading the halt a lifter reads", format!("{e}"));
+            return;
+        }
+    };
+    if let Err(e) = store
+        .set_halt(&scope, &second_by, second_at, "incident 46")
+        .await
+    {
+        report.record("re-throwing the halt", format!("{e}"));
+        return;
+    }
+    match store.lift_halt_if(&first).await {
+        Ok(false) => {}
+        Ok(true) => report.record(
+            "a conditional lift leaves a re-thrown halt",
+            "lifting the halt as first read removed the one re-thrown over it".to_owned(),
+        ),
+        Err(e) => report.record("lifting a re-thrown halt conditionally", format!("{e}")),
+    }
+    let second = match store.halts().await.map(read) {
+        Ok(Some(h)) if h.by == second_by => h,
+        Ok(other) => {
+            report.record(
+                "a conditional lift leaves a re-thrown halt",
+                format!("after a refused conditional lift the scope reads {other:?}"),
+            );
+            return;
+        }
+        Err(e) => {
+            report.record("reading a re-thrown halt", format!("{e}"));
+            return;
+        }
+    };
+
+    report.checked += 1;
+    match store.lift_halt_if(&second).await {
+        Ok(true) => {}
+        Ok(false) => report.record(
+            "a conditional lift removes the halt it names",
+            "the row as read back was not removed".to_owned(),
+        ),
+        Err(e) => report.record("lifting a halt conditionally", format!("{e}")),
+    }
+    match store.halts().await.map(read) {
+        Ok(None) => {}
+        Ok(Some(h)) => report.record(
+            "a conditional lift removes the halt it names",
+            format!("the scope still reads {h:?} after its lift answered removed"),
+        ),
+        Err(e) => report.record("reading a conditionally lifted halt", format!("{e}")),
+    }
+
+    report.checked += 1;
+    match store.lift_halt_if(&second).await {
+        Ok(false) => {}
+        Ok(true) => report.record(
+            "a second conditional lift removes nothing",
+            "the store answered removed for a row that was already gone".to_owned(),
+        ),
+        Err(e) => report.record("lifting a lifted halt conditionally", format!("{e}")),
+    }
+}
+
 /// A distinct dispatch key per `n`, as a run's successive effects have.
 fn dispatch(n: u32) -> EffectKey {
     EffectKey::derive(StepId(n), Phase::Forward, 0, 1, "tool.call", b"{}")
@@ -1007,6 +1107,99 @@ async fn rate(store: &dyn QuotaStore, report: &mut Report) {
             "an undo is counted",
             format!("a dispatch and an undo under a ceiling of two left room: {other:?}"),
         ),
+    }
+}
+
+/// Two declarations over one grant with different windows: the narrower one's
+/// reservation must not prune rows the wider one still counts — the state of a
+/// rolling deploy that changed a tool's ceiling.
+async fn rate_windows_share_a_grant(store: &dyn QuotaStore, report: &mut Report) {
+    let grant = "tool://conformance/two-windows";
+    let hourly = RateCeiling {
+        count: 3,
+        window_seconds: 3_600,
+    };
+    let minutely = RateCeiling {
+        count: 20,
+        window_seconds: 60,
+    };
+    let start: i64 = 1_760_010_000;
+    let run = RunId::generate();
+    for n in 0..3 {
+        if let Err(e) = store
+            .reserve_rate(&rated(grant, run, dispatch(n), hourly, instant(start)))
+            .await
+        {
+            report.record("a rate ceiling admits its count", format!("{e}"));
+            return;
+        }
+    }
+    let _ = store
+        .reserve_rate(&rated(
+            grant,
+            run,
+            dispatch(3),
+            minutely,
+            instant(start + 120),
+        ))
+        .await;
+    report.checked += 1;
+    if store
+        .reserve_rate(&rated(
+            grant,
+            run,
+            dispatch(4),
+            hourly,
+            instant(start + 180),
+        ))
+        .await
+        .is_ok()
+    {
+        report.record(
+            "a narrower window does not prune a wider one's count",
+            "a reservation under 20 a minute pruned the rows three an hour counts, so \
+             a fourth dispatch within the hour was admitted — co-deployed declarations \
+             with different windows turn the wider ceiling into the narrower one",
+        );
+    }
+}
+
+/// A ceiling built in code with a window wider than a store keeps its rows,
+/// or of no time at all, is refused rather than counted: either would admit
+/// more than it states.
+async fn an_uncountable_rate_window_is_refused(store: &dyn QuotaStore, report: &mut Report) {
+    let grant = "tool://conformance/uncountable";
+    let at = instant(1_760_020_000);
+    for window_seconds in [crate::quota::MAX_RATE_WINDOW_SECONDS + 1, 0] {
+        report.checked += 1;
+        let ceiling = RateCeiling {
+            count: 1,
+            window_seconds,
+        };
+        match store
+            .reserve_rate(&rated(grant, RunId::generate(), dispatch(0), ceiling, at))
+            .await
+        {
+            Err(QuotaError::UncountableRate { .. }) => {}
+            other => report.record(
+                "a rate window no store can count is refused",
+                format!("a ceiling of {ceiling} was reserved under: {other:?}"),
+            ),
+        }
+    }
+    report.checked += 1;
+    let widest = RateCeiling {
+        count: 1,
+        window_seconds: crate::quota::MAX_RATE_WINDOW_SECONDS,
+    };
+    if let Err(e) = store
+        .reserve_rate(&rated(grant, RunId::generate(), dispatch(1), widest, at))
+        .await
+    {
+        report.record(
+            "the widest countable window is counted",
+            format!("a ceiling of {widest} was refused: {e}"),
+        );
     }
 }
 

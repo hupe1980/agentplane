@@ -126,11 +126,12 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use axum::{Json, Router};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -313,6 +314,7 @@ pub fn policy_problems(engine: &dyn crate::core::PolicyEngine) -> Vec<String> {
         .iter()
         .map(|action| PolicyRequest {
             principal: &caller.actor,
+            principal_kind: crate::core::PrincipalKind::Subject,
             action,
             resource: "preflight.resource",
             context: &context,
@@ -328,7 +330,7 @@ pub fn policy_problems(engine: &dyn crate::core::PolicyEngine) -> Vec<String> {
 /// sign is not an intervention. The reason is **required** — a stop with no
 /// stated cause is indistinguishable from an outage to whoever finds the run
 /// tomorrow.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CancelRequest {
     pub reason: String,
@@ -338,8 +340,7 @@ pub struct CancelRequest {
 ///
 /// The pair is the registration's identity: `run` is the task it follows and
 /// `id` is the config the receiver registered under it.
-#[cfg(feature = "push")]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RearmRequest {
     pub run: String,
@@ -352,7 +353,7 @@ pub struct RearmRequest {
 /// harder here, because the reason *is* the evidence. A run reopened with no
 /// stated finding is somebody clicking retry on a payment that may already have
 /// gone out; the sentence is what makes it a judgement instead.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QuarantineRequest {
     /// What was checked, in which system, and what it said.
@@ -368,15 +369,17 @@ pub struct QuarantineRequest {
 /// `output` is present exactly for `landed` and refused otherwise, so a request
 /// cannot quietly assert a landing and supply nothing for the run to read back —
 /// nor supply a value under a verdict that says the call never took.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReconcileRequest {
     /// The effect key, as `GET /runs/{run}` lists it under `undecided`.
     pub effect: String,
     /// `landed` or `did_not_happen`.
+    #[schemars(extend("enum" = ["landed", "did_not_happen"]))]
     pub disposition: String,
     /// The result the run reads back. Required for `landed`, refused otherwise.
     #[serde(default)]
+    #[schemars(extend("x-agentplane-holds" = "The effect's result, which the run reads back as its output. Required when `disposition` is `landed`, refused otherwise."))]
     pub output: Option<Value>,
     /// How this was established — which console, which reference, what it said.
     pub note: String,
@@ -389,7 +392,7 @@ pub struct ReconcileRequest {
 /// cannot name somebody the caller is not — and an account of a missed
 /// obligation that named whoever the request said it was would be no account
 /// at all.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AcknowledgeRequest {
     /// The matter the obligation belongs to.
@@ -403,7 +406,7 @@ pub struct AcknowledgeRequest {
 }
 
 /// Placing a legal hold on one matter.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlaceHoldRequest {
     /// The matter to preserve.
@@ -417,7 +420,12 @@ pub struct PlaceHoldRequest {
 }
 
 /// Lifting one.
-#[derive(Debug, serde::Deserialize)]
+///
+/// No actor field: the release is journaled under the authenticated caller
+/// before the hold is removed, and the answer names the run holding that
+/// record. No reason field either — the record outlives the matter, so it
+/// carries names and instants only.
+#[derive(Debug, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseHoldRequest {
     /// The matter to release.
@@ -432,10 +440,11 @@ pub struct ReleaseHoldRequest {
 /// the one an operator already types on the command line and the one the store
 /// keeps. Two spellings of one scope is two ways for a lift to miss the halt it
 /// meant to clear.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlaceHaltRequest {
     /// What to stop.
+    #[schemars(extend("x-agentplane-holds" = halt_scope_holds()))]
     pub scope: String,
     /// Why, for whoever looks next.
     ///
@@ -450,10 +459,14 @@ pub struct PlaceHaltRequest {
 /// No reason field, deliberately. A halt is the state somebody has to justify;
 /// lifting one restores the default, and demanding a sentence for *returning to
 /// normal* is how a control acquires the reputation that gets it routed around.
-#[derive(Debug, serde::Deserialize)]
+/// *Who* is not asked of the body: the lift is journaled under the
+/// authenticated caller before the row goes, and the answer names the run
+/// holding that record.
+#[derive(Debug, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LiftHaltRequest {
     /// Which halt to clear.
+    #[schemars(extend("x-agentplane-holds" = halt_scope_holds()))]
     pub scope: String,
 }
 
@@ -468,13 +481,19 @@ pub struct LiftHaltRequest {
 /// wrote it believes they are deciding as Alice, the journal says otherwise, and
 /// nobody finds out until an audit asks why the two disagree. Refusing the
 /// request says so at the first call instead.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DecisionRequest {
     pub approved: bool,
     pub reason: String,
     #[serde(default)]
+    #[schemars(extend("x-agentplane-holds" = "Anything the decision adds. On an approved call task, the call's arguments in place of the model's, checked against the tool's schema; on a rejection, recorded advice. Absent or null for nothing."))]
     pub amendment: Value,
+    /// The version of the task row this decision was made against — the
+    /// [`TaskView::digest`] the caller read. A row that changed since is
+    /// refused with 412 and nothing recorded. Absent, nothing is compared.
+    #[serde(default)]
+    pub digest: Option<crate::core::Digest>,
 }
 
 /// A person (or a channel) on a run's record, with what established the name.
@@ -484,7 +503,8 @@ pub struct DecisionRequest {
 /// operator reading `alice` needs to know whether an authenticator said so or
 /// whether somebody holding the store typed it, and a rendered
 /// `alice (asserted)` is a sentence a client would have to parse back.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ActorView {
     pub actor: String,
     pub basis: String,
@@ -500,10 +520,12 @@ impl From<&crate::core::Operator> for ActorView {
 }
 
 /// A run, to somebody working out why it has stopped.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RunView {
     pub run: String,
     /// `running`, `suspended`, or the sealed outcome.
+    #[schemars(extend("x-agentplane-holds" = "`running`, `suspended`, or the status the run concluded with, as `GET /runs?outcome=` takes it."))]
     pub status: String,
     /// Why it is not finishing, in words.
     ///
@@ -573,7 +595,8 @@ pub struct RunView {
 /// readable without a key, and a listing that silently showed ciphertext to
 /// some deployments and plaintext to others would be worse than one that shows
 /// neither.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct DeadLetterView {
     /// Who sent it, and the id they gave it. Together these are the dedup
     /// identity, so they are what a counterparty is asked about.
@@ -605,9 +628,10 @@ impl DeadLetterView {
 /// `config` is [redacted](crate::push::PushConfig::redacted): the bearer the
 /// receiver registered is its own correlation secret, and a listing is not a
 /// place to hand it back.
-#[cfg(feature = "push")]
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct ParkedPushView {
+    #[schemars(extend("x-agentplane-holds" = "The registration as its receiver gave it, with its credentials redacted."))]
     pub config: Value,
     /// The first record this receiver has not acknowledged. Re-arming resumes
     /// here, which is the reason a parked row is kept rather than deleted.
@@ -619,11 +643,13 @@ pub struct ParkedPushView {
 }
 
 /// A task as an operator sees it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct TaskView {
     pub id: String,
     pub run: String,
     pub kind: String,
+    #[schemars(extend("x-agentplane-holds" = "The task's justification as the run wrote it: a summary, the proposed action, evidence, each with its provenance labels."))]
     pub justification: Value,
     pub priority: String,
     pub state: String,
@@ -672,6 +698,10 @@ pub struct TaskView {
     /// characters as nothing, which is how an approval covers what the
     /// approver could not see.
     pub rendering: crate::core::Rendering,
+    /// The version of the stored task row, which a decision may name back as
+    /// a precondition. It is of the row the store holds, not of the served
+    /// `justification`, which withholds what this plane cannot open.
+    pub digest: crate::core::Digest,
 }
 
 impl TaskView {
@@ -684,6 +714,7 @@ impl TaskView {
             has_untrusted_prose: task.justification.has_untrusted_prose(),
             withheld: task.withheld,
             rendering: task.rendering(),
+            digest: task.justification.digest(),
             justification: serde_json::to_value(task.shown_justification()).unwrap_or(Value::Null),
             assignee: task.assignee,
             id: task.id.to_hex(),
@@ -706,7 +737,8 @@ impl TaskView {
 /// off. A queue of 140 items paged at 100 returns 100, and a bare array reads
 /// exactly like a queue of 100 — which is the silent truncation this crate
 /// refuses everywhere else.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct Worklist {
     pub tasks: Vec<TaskView>,
     /// Whether there is more than this page.
@@ -717,10 +749,429 @@ pub struct Worklist {
     pub truncated: bool,
 }
 
+/// The one shape every refusal answers with.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct ErrorBody {
+    error: String,
+}
+
+/// One page of runs that ended a given way.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct RunList {
+    #[schemars(extend("x-agentplane-holds" = OUTCOME_HOLDS))]
+    outcome: String,
+    runs: Vec<String>,
+    truncated: bool,
+}
+
+/// The runs holding an admission slot.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct LiveRuns {
+    runs: Vec<LiveRunView>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct LiveRunView {
+    run: String,
+    agent: Option<AgentView>,
+    subject: Option<String>,
+    stranded: bool,
+}
+
+/// The declared agent and revision governing a run.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct AgentView {
+    name: String,
+    version: String,
+    digest: String,
+}
+
+/// The runs that are waiting, soonest due first.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct WaitingRuns {
+    runs: Vec<WaitingRunView>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct WaitingRunView {
+    run: String,
+    waiting_for: crate::core::SuspendReason,
+    until: String,
+}
+
+/// What on this plane needs a person.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct AttentionView {
+    needs_attention: bool,
+    conditions: Vec<ConditionView>,
+    not_checked: Vec<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct ConditionView {
+    condition: String,
+    found: usize,
+    at_least: bool,
+    subjects: Vec<String>,
+    unlisted: usize,
+    remedy: String,
+}
+
+/// The last recovery rehearsal, or that there was none: every member but
+/// `drilled` is present exactly when it is true.
+#[derive(Debug, Default, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct DrillView {
+    drilled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sound: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cases: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    findings: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_checked: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_size: Option<u64>,
+}
+
+/// One page of a run's journal.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HistoryPage {
+    run: String,
+    from: crate::core::Seq,
+    records: Vec<crate::journal::view::RecordView>,
+    truncated: bool,
+    next_from: Option<crate::core::Seq>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct CancelAnswer {
+    requested_by: String,
+    /// False when somebody else's stop was already standing.
+    recorded: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct QuarantineAnswer {
+    decided_by: String,
+    decision: String,
+    status: String,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct ReconcileAnswer {
+    asserted_by: String,
+    effect: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct DecideAnswer {
+    decided_by: String,
+    approved: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct CaseList {
+    #[schemars(extend("enum" = case_statuses()))]
+    status: String,
+    cases: Vec<crate::core::Case>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct ObligationList {
+    obligations: Vec<crate::core::Deadline>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct DeadLetters {
+    dead_letters: Vec<DeadLetterView>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct AcknowledgeAnswer {
+    acknowledged_by: crate::core::Operator,
+    obligation: String,
+    /// False when somebody had already accounted for it.
+    recorded: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct CaseAnswer {
+    case: crate::core::Case,
+    deadlines: Vec<crate::core::Deadline>,
+    history: Vec<crate::journal::view::RecordView>,
+    history_truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HoldList {
+    /// The holds standing now, oldest first; empty under `?state=released`.
+    holds: Vec<HoldView>,
+    /// The recorded releases, newest first; empty unless `?state=released`.
+    released: Vec<HoldReleaseView>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HoldView {
+    case: String,
+    /// Unix seconds.
+    placed_at: i64,
+    reason: String,
+    /// Who placed it, and what established the name.
+    by: String,
+    basis: String,
+}
+
+/// One recorded release: who released the hold, and the hold it ended. The
+/// hold's reason is not part of the record, so it is not here.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HoldReleaseView {
+    case: String,
+    by: String,
+    basis: String,
+    /// Unix seconds.
+    released_at: i64,
+    placed_by: String,
+    placed_basis: String,
+    /// Unix seconds.
+    placed_at: i64,
+    /// The run holding the release record.
+    record: String,
+}
+
+/// Which side of a register to list: what stands now, or what was ended.
+#[derive(serde::Deserialize, JsonSchema)]
+struct HoldStateQuery {
+    #[schemars(extend("enum" = hold_states()))]
+    state: Option<String>,
+}
+
+/// Which side of a register to list: what stands now, or what was ended.
+#[derive(serde::Deserialize, JsonSchema)]
+struct HaltStateQuery {
+    #[schemars(extend("enum" = halt_states()))]
+    state: Option<String>,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct PlaceHoldAnswer {
+    case: String,
+    /// Whether this call placed the hold; false when one was already standing.
+    placed: bool,
+    in_force: Option<HoldInForce>,
+}
+
+/// The hold the store is acting on, whoever placed it.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HoldInForce {
+    placed_at: i64,
+    reason: String,
+    by: String,
+    basis: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct ReleaseHoldAnswer {
+    case: String,
+    lifted: bool,
+    /// Who released it: the authenticated caller.
+    by: String,
+    basis: String,
+    /// The run holding the release record; absent when nothing was held, so
+    /// nothing was written.
+    record: Option<String>,
+    /// Whether this call removed the hold's row. `false` with a `record` when
+    /// another release removed it first; the matter is released either way.
+    removed: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HaltList {
+    /// The halts standing now; empty under `?state=lifted`.
+    halts: Vec<HaltView>,
+    /// The recorded lifts, newest first; empty unless `?state=lifted`.
+    lifted: Vec<HaltLiftView>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HaltView {
+    #[schemars(extend("x-agentplane-holds" = halt_scope_holds()))]
+    scope: String,
+    covers: String,
+    reason: String,
+    /// Who threw it, and what established the name.
+    by: String,
+    basis: String,
+    /// Unix seconds.
+    thrown_at: i64,
+}
+
+/// One recorded lift: who lifted the halt, and the halt it ended.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct HaltLiftView {
+    #[schemars(extend("x-agentplane-holds" = halt_scope_holds()))]
+    scope: String,
+    by: String,
+    basis: String,
+    /// Unix seconds.
+    lifted_at: i64,
+    reason: String,
+    thrown_by: String,
+    thrown_basis: String,
+    /// Unix seconds.
+    thrown_at: i64,
+    /// The run holding the lift record.
+    record: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct PlaceHaltAnswer {
+    #[schemars(extend("x-agentplane-holds" = halt_scope_holds()))]
+    scope: String,
+    halted: bool,
+    reason: String,
+    by: String,
+    basis: String,
+    /// What the halt reaches, which depends on the scope.
+    reach: String,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct LiftHaltAnswer {
+    #[schemars(extend("x-agentplane-holds" = halt_scope_holds()))]
+    scope: String,
+    halted: bool,
+    was_standing: bool,
+    /// Who lifted it: the authenticated caller.
+    by: String,
+    basis: String,
+    /// The run holding the lift record; absent when nothing was standing, so
+    /// nothing was written.
+    record: Option<String>,
+    /// Whether this call removed the halt's row. `false` with a `record` when
+    /// another lift removed it first; the scope is clear either way.
+    removed: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[cfg_attr(not(feature = "push"), allow(dead_code))]
+struct ParkedPush {
+    parked: Vec<ParkedPushView>,
+    truncated: bool,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+#[cfg_attr(not(feature = "push"), allow(dead_code))]
+struct RearmAnswer {
+    rearmed: bool,
+}
+
+/// What became of a delivered event: `resumed` names the run it woke.
+#[derive(Debug, Serialize, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+struct DeliveryAnswer {
+    #[schemars(extend("enum" = ["resumed", "buffered", "duplicate"]))]
+    delivery: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<String>,
+}
+
+/// An extractor whose refusal answers in the one error shape.
+///
+/// axum's extractors refuse in plain text. Wrapped in this, a malformed body,
+/// a wrong content type, an unknown member or an undecodable path or query
+/// answers with the extractor's own status and `{"error": "<sentence>"}`, the
+/// shape every other refusal here takes — so a client parses one error body.
+struct Uniform<E>(E);
+
+impl<S, E> FromRequestParts<S> for Uniform<E>
+where
+    S: Send + Sync,
+    E: FromRequestParts<S>,
+    E::Rejection: IntoResponse,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        let refused = match E::from_request_parts(parts, state).await {
+            Ok(extracted) => return Ok(Self(extracted)),
+            Err(rejection) => rejection.into_response(),
+        };
+        Err(ApiError::rejected(refused).await)
+    }
+}
+
+impl<S, E> FromRequest<S> for Uniform<E>
+where
+    S: Send + Sync,
+    E: FromRequest<S>,
+    E::Rejection: IntoResponse,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
+        let refused = match E::from_request(req, state).await {
+            Ok(extracted) => return Ok(Self(extracted)),
+            Err(rejection) => rejection.into_response(),
+        };
+        Err(ApiError::rejected(refused).await)
+    }
+}
+
 #[cfg(feature = "a2a-server")]
 pub mod a2a;
 #[cfg(feature = "a2a-server")]
 mod a2a_stream;
+#[cfg(feature = "dev")]
+pub mod dev;
+pub mod openapi;
+#[cfg(any(feature = "dev", feature = "mcp-server-http"))]
+pub(crate) mod rebinding;
 pub mod tokens;
 
 /// The tenants this process serves, one plane each.
@@ -1004,39 +1455,15 @@ impl Api {
     /// Every route authenticates and then authorizes. There is no
     /// unauthenticated one to forget about and no "internal" path that skips
     /// either gate — `tests/wire/api.rs` walks the route table and asserts it.
+    ///
+    /// The routes are [`openapi::ROUTES`], the table the published document is
+    /// generated from, so a route is added in one place and is documented by
+    /// being served.
     pub fn router(self) -> Router {
-        let router = Router::new()
-            .route("/runs", get(runs_by_outcome))
-            .route("/runs/live", get(live_runs))
-            .route("/runs/waiting", get(waiting_runs))
-            .route("/attention", get(attention))
-            .route("/drill", get(last_drill))
-            .route("/runs/{run}", get(run_view))
-            .route("/runs/{run}/history", get(run_history))
-            .route("/runs/{run}/cancel", post(cancel_run))
-            .route("/runs/{run}/reopen", post(reopen_run))
-            .route("/runs/{run}/abandon", post(abandon_run))
-            .route("/runs/{run}/reconcile", post(reconcile_effect))
-            .route("/tasks", get(worklist))
-            .route("/tasks/{task}", get(task_view))
-            .route("/tasks/{task}/claim", post(claim))
-            .route("/tasks/{task}/release", post(release))
-            .route("/tasks/{task}/takeover", post(take_over))
-            .route("/tasks/{task}/decide", post(decide))
-            .route("/cases", get(cases_by_status))
-            .route("/obligations", get(breached_obligations))
-            .route("/obligations/acknowledge", post(acknowledge_obligation))
-            .route("/cases/{case}", get(case_view))
-            .route("/holds", get(standing_holds).post(place_hold))
-            .route("/holds/release", post(release_hold))
-            .route("/halts", get(standing_halts).post(place_halt))
-            .route("/halts/lift", post(lift_halt))
-            .route("/events", post(deliver))
-            .route("/dead-letters", get(dead_letters));
-        #[cfg(feature = "push")]
-        let router = router
-            .route("/push", get(parked_push))
-            .route("/push/rearm", post(rearm_push));
+        let mut router = Router::new();
+        for route in openapi::ROUTES {
+            router = router.route(route.path, route.served());
+        }
         router.with_state(self)
     }
 
@@ -1081,6 +1508,7 @@ impl Api {
         let context = caller.operator_context();
         let decision = policy.authorize(&PolicyRequest {
             principal: &caller.actor,
+            principal_kind: crate::core::PrincipalKind::Subject,
             action,
             resource,
             context: &context,
@@ -1095,8 +1523,13 @@ impl Api {
             // request: 500 rather than 403, because 403 tells an operator to
             // fix their credentials and this one is fixed in the policy set.
             PolicyDecision::Malformed { reason } => {
+                // The engine's reason names rules, attributes and entity
+                // types; it is the operator's, and the caller gets a sentence.
                 tracing::error!(target: "agentplane::api", policy_error = true, reason, "the policy set could not be evaluated");
-                Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, reason))
+                Err(ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    POLICY_UNEVALUABLE.to_owned(),
+                ))
             }
         }
     }
@@ -1246,12 +1679,10 @@ pub mod action {
     /// matter's contents.
     pub const DEADLETTER_LIST: &str = "api:deadletter.list";
     /// Reading the webhook registrations a delivery worker gave up on.
-    #[cfg(feature = "push")]
     pub const PUSH_LIST: &str = "api:push.list";
     /// Re-arming one. Separate from reading it because it resumes outbound
     /// traffic to a third party's endpoint, which is a decision rather than a
     /// look.
-    #[cfg(feature = "push")]
     pub const PUSH_REARM: &str = "api:push.rearm";
 
     /// Every action this surface can ask about.
@@ -1296,9 +1727,7 @@ pub mod action {
         HALT_LIFT,
         EVENT_DELIVER,
         DEADLETTER_LIST,
-        #[cfg(feature = "push")]
         PUSH_LIST,
-        #[cfg(feature = "push")]
         PUSH_REARM,
     ];
 }
@@ -1314,7 +1743,22 @@ struct ApiError(StatusCode, String);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        (self.0, Json(ErrorBody { error: self.1 })).into_response()
+    }
+}
+
+impl ApiError {
+    /// An extractor's refusal, with its status and its sentence.
+    async fn rejected(response: Response) -> Self {
+        let status = response.status();
+        let sentence = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_owned())
+            .unwrap_or_default();
+        if sentence.is_empty() {
+            return Self(status, "the request could not be read".to_owned());
+        }
+        Self(status, sentence)
     }
 }
 
@@ -1352,6 +1796,17 @@ fn unusable_caller(error: &crate::core::OperatorError) -> ApiError {
     )
 }
 
+/// What a caller is told when the policy set could not evaluate its request.
+const POLICY_UNEVALUABLE: &str = "the policy set could not evaluate this request";
+
+/// The quota store, which holds halts and admission slots, or 501.
+fn quota_wired(s: &Session) -> Result<(), ApiError> {
+    s.plane
+        .quota_store_if_wired()
+        .map(|_| ())
+        .ok_or_else(|| unavailable("quota"))
+}
+
 fn unavailable(what: &str) -> ApiError {
     ApiError(
         StatusCode::NOT_IMPLEMENTED,
@@ -1370,38 +1825,6 @@ fn store_failed() -> ApiError {
 
 fn not_found(what: &str) -> ApiError {
     ApiError(StatusCode::NOT_FOUND, format!("no such {what}"))
-}
-
-/// One record, as an operator surface shows it.
-///
-/// One function for the run history and the case history, which answer the same
-/// question over different selections: two renderers are free to disagree about
-/// what a record *is*, and the one that drifts is whichever surface a deployment
-/// does not read.
-///
-/// The **envelope** belongs here as much as the payload. Without it a reader sees
-/// that an effect started and not which effect, cannot pair a start with its
-/// outcome or one attempt with the next, cannot tell a forward record from a
-/// compensating one, and has no way back to the span that performed it.
-///
-/// It carries no content: a step id, a phase and an effect key are identifiers,
-/// and the key is a digest — it names the call rather than reproducing what it
-/// sent.
-#[cfg(feature = "http")]
-fn record_view(r: &crate::journal::Record) -> Value {
-    json!({
-        "seq": r.seq(),
-        "run": r.body.run.to_string(),
-        "case": r.body.case.map(|c| c.to_string()),
-        "step": r.body.step.map(|s| s.to_string()),
-        // Always, rather than only when compensating: a reader who has to know
-        // the default in order to read the absence is a reader who will not.
-        "phase": r.body.phase.as_str(),
-        // The join to `agentplane.effect.key` on the span that performed it.
-        "effect_key": r.effect_key().map(|k| k.to_string()),
-        "kind": r.kind().kind_str(),
-        "record": serde_json::to_value(r.kind()).unwrap_or(Value::Null),
-    })
 }
 
 /// One run's journal, from a sequence the caller names.
@@ -1427,9 +1850,9 @@ fn record_view(r: &crate::journal::Record) -> Value {
 async fn run_history(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(run): Path<String>,
-    Query(page): Query<HistoryQuery>,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Path(run)): Uniform<Path<String>>,
+    Uniform(Query(page)): Uniform<Query<HistoryQuery>>,
+) -> Result<Json<HistoryPage>, ApiError> {
     let s = api.gate(&headers, action::RUN_HISTORY, &run).await?;
     let id = RunId::parse(&run).map_err(|_| bad("run"))?;
     // Sequences start at one, so `0` and absence mean the same thing: from the
@@ -1455,20 +1878,23 @@ async fn run_history(
     records.truncate(api.history);
     let next_from = records.last().map(|r| r.body.seq + 1);
 
-    Ok(Json(json!({
-        "run": id.to_string(),
-        "from": from,
-        "records": records.iter().map(record_view).collect::<Vec<_>>(),
-        "truncated": truncated,
+    Ok(Json(HistoryPage {
+        run: id.to_string(),
+        from,
+        records: records
+            .iter()
+            .map(crate::journal::view::record_view)
+            .collect(),
+        truncated,
         // Only where there is more to ask for. A cursor handed back on a
         // complete page is one a caller loops on forever.
-        "next_from": truncated.then_some(next_from).flatten(),
-    })))
+        next_from: truncated.then_some(next_from).flatten(),
+    }))
 }
 
 /// Where in a run's journal to read from.
 #[cfg(feature = "http")]
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, JsonSchema)]
 struct HistoryQuery {
     from: Option<crate::core::Seq>,
 }
@@ -1476,7 +1902,7 @@ struct HistoryQuery {
 async fn run_view(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(run): Path<String>,
+    Uniform(Path(run)): Uniform<Path<String>>,
 ) -> Result<Json<RunView>, ApiError> {
     // Authorized against the run id, so a policy set can scope a caller to the
     // runs they are entitled to see rather than to the endpoint.
@@ -1577,9 +2003,9 @@ async fn run_view(
 async fn cancel_run(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(run): Path<String>,
-    Json(body): Json<CancelRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Path(run)): Uniform<Path<String>>,
+    Uniform(Json(body)): Uniform<Json<CancelRequest>>,
+) -> Result<(StatusCode, Json<CancelAnswer>), ApiError> {
     let s = api.gate(&headers, action::RUN_CANCEL, &run).await?;
     let id = RunId::parse(&run).map_err(|_| bad("run"))?;
     // The one field of the record the operator writes, and the one a later
@@ -1615,13 +2041,13 @@ async fn cancel_run(
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(json!({
-            "requested_by": s.caller.actor,
+        Json(CancelAnswer {
+            requested_by: s.caller.actor,
             // False means somebody else got there first, and *their* name is on
             // the record. Told plainly rather than swallowed, so a second
             // operator does not believe they own the intervention.
-            "recorded": fresh,
-        })),
+            recorded: fresh,
+        }),
     ))
 }
 
@@ -1634,9 +2060,9 @@ async fn cancel_run(
 async fn reopen_run(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(run): Path<String>,
-    Json(body): Json<QuarantineRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Path(run)): Uniform<Path<String>>,
+    Uniform(Json(body)): Uniform<Json<QuarantineRequest>>,
+) -> Result<(StatusCode, Json<QuarantineAnswer>), ApiError> {
     let s = api.gate(&headers, action::RUN_REOPEN, &run).await?;
     decide_quarantine(&s, &run, &body.reason, QuarantineDecision::Reopen).await
 }
@@ -1649,9 +2075,9 @@ async fn reopen_run(
 async fn abandon_run(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(run): Path<String>,
-    Json(body): Json<QuarantineRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Path(run)): Uniform<Path<String>>,
+    Uniform(Json(body)): Uniform<Json<QuarantineRequest>>,
+) -> Result<(StatusCode, Json<QuarantineAnswer>), ApiError> {
     let s = api.gate(&headers, action::RUN_ABANDON, &run).await?;
     decide_quarantine(&s, &run, &body.reason, QuarantineDecision::Abandon).await
 }
@@ -1662,7 +2088,7 @@ async fn decide_quarantine(
     run: &str,
     reason: &str,
     decision: QuarantineDecision,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<(StatusCode, Json<QuarantineAnswer>), ApiError> {
     let id = RunId::parse(run).map_err(|_| bad("run"))?;
     // The decider is the authenticated caller; `QuarantineRequest` has no field
     // for one. Same rule as deciding a task or stopping a run.
@@ -1679,15 +2105,15 @@ async fn decide_quarantine(
         .map_err(quarantine_error)?;
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "decided_by": s.caller.actor,
-            "decision": decision.as_str(),
+        Json(QuarantineAnswer {
+            decided_by: s.caller.actor.clone(),
+            decision: decision.as_str().to_owned(),
             // What the run reached, which for a reopen is the whole answer: it
             // may have finished, failed, suspended, or come straight back to
             // the same quarantine on a doubt nobody answered.
-            "status": outcome.status.as_str(),
-            "reason": outcome.status.reason(),
-        })),
+            status: outcome.status.as_str().to_owned(),
+            reason: outcome.status.reason().map(std::borrow::Cow::into_owned),
+        }),
     ))
 }
 
@@ -1700,9 +2126,9 @@ async fn decide_quarantine(
 async fn reconcile_effect(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(run): Path<String>,
-    Json(body): Json<ReconcileRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Path(run)): Uniform<Path<String>>,
+    Uniform(Json(body)): Uniform<Json<ReconcileRequest>>,
+) -> Result<(StatusCode, Json<ReconcileAnswer>), ApiError> {
     let s = api.gate(&headers, action::EFFECT_RECONCILE, &run).await?;
     let id = RunId::parse(&run).map_err(|_| bad("run"))?;
     let effect = crate::core::EffectKey::from_hex(&body.effect).map_err(|_| bad("effect"))?;
@@ -1745,10 +2171,10 @@ async fn reconcile_effect(
 
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "asserted_by": s.caller.actor,
-            "effect": body.effect,
-        })),
+        Json(ReconcileAnswer {
+            asserted_by: s.caller.actor,
+            effect: body.effect,
+        }),
     ))
 }
 
@@ -1780,8 +2206,8 @@ fn quarantine_error(e: crate::core::RuntimeError) -> ApiError {
 async fn runs_by_outcome(
     State(api): State<Api>,
     headers: HeaderMap,
-    Query(q): Query<OutcomeQuery>,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Query(q)): Uniform<Query<OutcomeQuery>>,
+) -> Result<Json<RunList>, ApiError> {
     let outcome = q.outcome.unwrap_or_else(|| "quarantined".to_owned());
     let s = api.gate(&headers, action::RUN_LIST, &outcome).await?;
 
@@ -1795,11 +2221,11 @@ async fn runs_by_outcome(
     let truncated = found.len() > api.limit;
     found.truncate(api.limit);
 
-    Ok(Json(json!({
-        "outcome": outcome,
-        "runs": found.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+    Ok(Json(RunList {
+        outcome,
+        runs: found.iter().map(ToString::to_string).collect(),
+        truncated,
+    }))
 }
 
 /// What is executing right now, and under whose authority.
@@ -1815,9 +2241,10 @@ async fn runs_by_outcome(
 async fn live_runs(
     State(api): State<Api>,
     headers: HeaderMap,
-    Query(q): Query<LiveQuery>,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Query(q)): Uniform<Query<LiveQuery>>,
+) -> Result<Json<LiveRuns>, ApiError> {
     let s = api.gate(&headers, action::RUN_LIVE, "*").await?;
+    quota_wired(&s)?;
     let mut found = s
         .plane
         .running_runs(api.limit.saturating_add(1))
@@ -1840,22 +2267,22 @@ async fn live_runs(
         found.retain(|live| live.subject.as_deref() == Some(subject));
     }
 
-    Ok(Json(json!({
-        "runs": found
-            .iter()
-            .map(|live| json!({
-                "run": live.run.to_string(),
-                "agent": live.governed_by.as_ref().map(|id| json!({
-                    "name": id.name,
-                    "version": id.version,
-                    "digest": id.digest.to_hex(),
-                })),
-                "subject": live.subject,
-                "stranded": live.stranded,
-            }))
-            .collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+    Ok(Json(LiveRuns {
+        runs: found
+            .into_iter()
+            .map(|live| LiveRunView {
+                run: live.run.to_string(),
+                agent: live.governed_by.map(|id| AgentView {
+                    digest: id.digest.to_hex(),
+                    name: id.name,
+                    version: id.version,
+                }),
+                subject: live.subject,
+                stranded: live.stranded,
+            })
+            .collect(),
+        truncated,
+    }))
 }
 
 /// What is waiting, and for what.
@@ -1869,7 +2296,10 @@ async fn live_runs(
 /// **Soonest due first**, so the runs whose instant has already passed sort to
 /// the front. An ascending page is legitimate here because resuming a run
 /// removes it from the listing.
-async fn waiting_runs(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn waiting_runs(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<WaitingRuns>, ApiError> {
     let s = api.gate(&headers, action::RUN_WAITING, "*").await?;
     let mut found = s
         .plane
@@ -1879,21 +2309,21 @@ async fn waiting_runs(State(api): State<Api>, headers: HeaderMap) -> Result<Json
     let truncated = found.len() > api.limit;
     found.truncate(api.limit);
 
-    Ok(Json(json!({
-        "runs": found
-            .iter()
-            .map(|w| json!({
-                "run": w.run.to_string(),
+    Ok(Json(WaitingRuns {
+        runs: found
+            .into_iter()
+            .map(|w| WaitingRunView {
+                run: w.run.to_string(),
+                until: w.reason.until().to_string(),
                 // The reason serialises as its own tagged shape, so a caller
                 // reads `reason` to tell a timer from a correlation — the two
                 // fail differently, and an instant that has not arrived is the
                 // system working.
-                "waiting_for": w.reason,
-                "until": w.reason.until().to_string(),
-            }))
-            .collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+                waiting_for: w.reason,
+            })
+            .collect(),
+        truncated,
+    }))
 }
 
 /// Does anything on this plane need a person right now, and which thing.
@@ -1903,31 +2333,34 @@ async fn waiting_runs(State(api): State<Api>, headers: HeaderMap) -> Result<Json
 /// dead letter is not "four" of anything — and `not_checked` says which
 /// backlogs this plane has no store for, so an empty answer from a plane that
 /// looked and one that could not are different sentences.
-async fn attention(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn attention(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<AttentionView>, ApiError> {
     let s = api.gate(&headers, action::ATTENTION, "*").await?;
     let found = s
         .plane
         .attention(now_for_account(), api.limit)
         .await
         .map_err(|_| store_failed())?;
-    Ok(Json(json!({
-        "needs_attention": found.any(),
-        "conditions": found
+    Ok(Json(AttentionView {
+        needs_attention: found.any(),
+        conditions: found
             .conditions
             .iter()
-            .map(|c| json!({
-                "condition": c.kind,
-                "found": c.found,
-                "at_least": c.at_least,
-                "subjects": c.subjects,
-                "unlisted": c.unlisted,
+            .map(|c| ConditionView {
+                condition: c.kind.to_owned(),
+                found: c.found,
+                at_least: c.at_least,
+                subjects: c.subjects.clone(),
+                unlisted: c.unlisted,
                 // In this API's routes: a remedy naming a terminal verb to a
                 // dashboard is a prescription its reader cannot fill here.
-                "remedy": c.remedy.http,
-            }))
-            .collect::<Vec<_>>(),
-        "not_checked": found.not_checked,
-    })))
+                remedy: c.remedy.http.to_owned(),
+            })
+            .collect(),
+        not_checked: found.not_checked.iter().map(|&n| n.to_owned()).collect(),
+    }))
 }
 
 /// **When this plane last rehearsed recovery, and whether it passed.**
@@ -1939,30 +2372,33 @@ async fn attention(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Va
 /// A plane that has never rehearsed answers `{"drilled": false}` rather than
 /// 404: *nobody has drilled this* is a finding an auditor came for, and a
 /// missing resource reads as a missing feature.
-async fn last_drill(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn last_drill(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<DrillView>, ApiError> {
     let s = api.gate(&headers, action::DRILL_READ, "*").await?;
     let found = s.plane.last_drill().await.map_err(|e| match e {
         crate::core::RuntimeError::PlanContract(detail) => ApiError(StatusCode::NOT_FOUND, detail),
         _ => store_failed(),
     })?;
     Ok(Json(match found {
-        None => json!({ "drilled": false }),
-        Some(d) => json!({
-            "drilled": true,
-            "at": d.at.to_string(),
-            "sound": d.sound,
-            "cases": d.cases,
-            "findings": d.findings,
+        None => DrillView::default(),
+        Some(d) => DrillView {
+            drilled: true,
+            at: Some(d.at.to_string()),
+            sound: Some(d.sound),
+            cases: Some(d.cases),
+            findings: Some(d.findings),
             // Kept beside `sound` rather than folded into it: a pass over
             // nothing is not a pass, and a reader who sees only the verdict
             // cannot tell the two apart.
-            "not_checked": d.not_checked,
+            not_checked: Some(d.not_checked),
             // Which store it ran against, from the plane's own checkpoint —
             // so a rehearsal over a restored copy cannot be read as one over
             // production.
-            "origin": d.origin,
-            "log_size": d.size,
-        }),
+            origin: Some(d.origin),
+            log_size: Some(d.size),
+        },
     }))
 }
 
@@ -1971,14 +2407,41 @@ async fn last_drill(State(api): State<Api>, headers: HeaderMap) -> Result<Json<V
 /// Absent means every run this tenant holds a slot for. `subject` is the
 /// delegation subject a run was admitted under, so *what is still running for
 /// the credential I just withdrew* is one query rather than a read-and-grep.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, JsonSchema)]
 struct LiveQuery {
     subject: Option<String>,
 }
 
+/// What the document says a run outcome holds. Not an enumeration: the
+/// listing takes any text, and an outcome no run concluded with lists none.
+const OUTCOME_HOLDS: &str = "The status a run concluded with, as `GET /runs/{run}` reports it — \
+`quarantined`, `succeeded`, `cancelled`, `abandoned`, among others; `quarantined` when absent. \
+An outcome no run concluded with lists no runs.";
+
+/// Every case status, as the document enumerates it.
+fn case_statuses() -> Vec<&'static str> {
+    CaseStatus::ALL.iter().map(|c| c.as_str()).collect()
+}
+
+/// The `?state=` forms of the hold listing.
+fn hold_states() -> Vec<&'static str> {
+    vec!["standing", "released"]
+}
+
+/// The `?state=` forms of the halt listing.
+fn halt_states() -> Vec<&'static str> {
+    vec!["standing", "lifted"]
+}
+
+/// What the document says a halt scope holds: the forms the parser accepts.
+fn halt_scope_holds() -> String {
+    format!("A halt scope, one of {}.", crate::quota::HaltScope::forms())
+}
+
 /// Which ending to list. Defaults to the one somebody is looking for.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, JsonSchema)]
 struct OutcomeQuery {
+    #[schemars(extend("x-agentplane-holds" = OUTCOME_HOLDS))]
     outcome: Option<String>,
 }
 
@@ -2010,7 +2473,7 @@ async fn worklist(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Wor
 async fn task_view(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(task): Path<String>,
+    Uniform(Path(task)): Uniform<Path<String>>,
 ) -> Result<Json<TaskView>, ApiError> {
     let s = api.gate(&headers, action::TASK_READ, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
@@ -2041,7 +2504,7 @@ async fn task_view(
 async fn claim(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(task): Path<String>,
+    Uniform(Path(task)): Uniform<Path<String>>,
 ) -> Result<Json<TaskView>, ApiError> {
     let s = api.gate(&headers, action::TASK_CLAIM, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
@@ -2063,7 +2526,7 @@ async fn claim(
 async fn release(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(task): Path<String>,
+    Uniform(Path(task)): Uniform<Path<String>>,
 ) -> Result<StatusCode, ApiError> {
     let s = api.gate(&headers, action::TASK_RELEASE, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
@@ -2089,8 +2552,8 @@ async fn release(
 async fn take_over(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(task): Path<String>,
-    Json(body): Json<TakeOverBody>,
+    Uniform(Path(task)): Uniform<Path<String>>,
+    Uniform(Json(body)): Uniform<Json<TakeOverBody>>,
 ) -> Result<Json<TaskView>, ApiError> {
     let s = api.gate(&headers, action::TASK_TAKEOVER, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
@@ -2104,7 +2567,7 @@ async fn take_over(
 }
 
 /// The one field a take-over carries: whose claim is being displaced.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct TakeOverBody {
     from: String,
@@ -2141,11 +2604,14 @@ fn claim_refused(e: &crate::case::ClaimError) -> ApiError {
 async fn decide(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(task): Path<String>,
-    Json(body): Json<DecisionRequest>,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Path(task)): Uniform<Path<String>>,
+    Uniform(Json(body)): Uniform<Json<DecisionRequest>>,
+) -> Result<Json<DecideAnswer>, ApiError> {
     let s = api.gate(&headers, action::TASK_DECIDE, &task).await?;
     let id = TaskId::parse(&task).map_err(|_| bad("task"))?;
+    // A decision is stored as a task's answer and delivered as an event.
+    s.plane.tasks().ok_or_else(|| unavailable("task"))?;
+    s.plane.events().ok_or_else(|| unavailable("event"))?;
 
     // The actor is the authenticated caller. There is no other source for it:
     // `DecisionRequest` has no such field, so this is not a convention being
@@ -2169,7 +2635,7 @@ async fn decide(
     // an HTTP surface that enforced it itself would be a second copy that can
     // disagree with the one the in-process caller goes through.
     s.plane
-        .decide_task(id, &decision, &s.caller.roles)
+        .decide_task_at(id, &decision, &s.caller.roles, body.digest)
         .await
         .map_err(|e| match e {
             // The same classification the claim route answers with, from the
@@ -2191,13 +2657,17 @@ async fn decide(
             crate::core::RuntimeError::ProposalWithheld { .. } => {
                 ApiError(StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
             }
+            // The named version is not the row's: read it again.
+            crate::core::RuntimeError::TaskChanged { .. } => {
+                ApiError(StatusCode::PRECONDITION_FAILED, e.to_string())
+            }
             other => ApiError(StatusCode::CONFLICT, other.to_string()),
         })?;
 
-    Ok(Json(json!({
-        "decided_by": s.caller.actor,
-        "approved": decision.approved,
-    })))
+    Ok(Json(DecideAnswer {
+        decided_by: s.caller.actor,
+        approved: decision.approved,
+    }))
 }
 
 /// Cases in a given state — in practice, *what is escalated right now*.
@@ -2221,8 +2691,8 @@ async fn decide(
 async fn cases_by_status(
     State(api): State<Api>,
     headers: HeaderMap,
-    Query(q): Query<StatusQuery>,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Query(q)): Uniform<Query<StatusQuery>>,
+) -> Result<Json<CaseList>, ApiError> {
     let asked = q
         .status
         .unwrap_or_else(|| CaseStatus::Escalated.as_str().to_owned());
@@ -2238,19 +2708,17 @@ async fn cases_by_status(
     let truncated = found.len() > api.limit;
     found.truncate(api.limit);
 
-    Ok(Json(json!({
-        "status": status.as_str(),
-        "cases": found
-            .iter()
-            .map(|c| serde_json::to_value(c).unwrap_or(Value::Null))
-            .collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+    Ok(Json(CaseList {
+        status: status.as_str().to_owned(),
+        cases: found,
+        truncated,
+    }))
 }
 
 /// Which case state to list. Defaults to the one somebody is looking for.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, JsonSchema)]
 struct StatusQuery {
+    #[schemars(extend("enum" = case_statuses()))]
     status: Option<String>,
 }
 
@@ -2265,7 +2733,7 @@ struct StatusQuery {
 async fn breached_obligations(
     State(api): State<Api>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<ObligationList>, ApiError> {
     let s = api
         .gate(&headers, action::OBLIGATION_LIST, "breached")
         .await?;
@@ -2280,13 +2748,10 @@ async fn breached_obligations(
     let truncated = found.len() > api.limit;
     found.truncate(api.limit);
 
-    Ok(Json(json!({
-        "obligations": found
-            .iter()
-            .map(|d| serde_json::to_value(d).unwrap_or(Value::Null))
-            .collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+    Ok(Json(ObligationList {
+        obligations: found,
+        truncated,
+    }))
 }
 
 /// Messages that arrived, matched no waiter, and aged out.
@@ -2298,7 +2763,10 @@ async fn breached_obligations(
 /// A non-empty list means a correlation key is wrong somewhere. That failure
 /// otherwise presents as a process silently never completing, which is the
 /// most expensive shape a bug can take here.
-async fn dead_letters(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn dead_letters(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<DeadLetters>, ApiError> {
     let s = api.gate(&headers, action::DEADLETTER_LIST, "*").await?;
     let events = s.plane.events().ok_or_else(|| unavailable("event"))?;
 
@@ -2311,10 +2779,10 @@ async fn dead_letters(State(api): State<Api>, headers: HeaderMap) -> Result<Json
     let truncated = found.len() > api.limit;
     found.truncate(api.limit);
 
-    Ok(Json(json!({
-        "dead_letters": found.iter().map(DeadLetterView::of).collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+    Ok(Json(DeadLetters {
+        dead_letters: found.iter().map(DeadLetterView::of).collect(),
+        truncated,
+    }))
 }
 
 /// Account for a missed obligation, taking it off the listing.
@@ -2330,8 +2798,8 @@ async fn dead_letters(State(api): State<Api>, headers: HeaderMap) -> Result<Json
 async fn acknowledge_obligation(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(body): Json<AcknowledgeRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Json(body)): Uniform<Json<AcknowledgeRequest>>,
+) -> Result<(StatusCode, Json<AcknowledgeAnswer>), ApiError> {
     let s = api
         .gate(&headers, action::OBLIGATION_ACKNOWLEDGE, &body.case)
         .await?;
@@ -2351,11 +2819,11 @@ async fn acknowledge_obligation(
 
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "acknowledged_by": note.by,
-            "obligation": body.obligation,
-            "recorded": recorded,
-        })),
+        Json(AcknowledgeAnswer {
+            acknowledged_by: note.by,
+            obligation: body.obligation,
+            recorded,
+        }),
     ))
 }
 
@@ -2372,9 +2840,28 @@ async fn acknowledge_obligation(
 async fn standing_holds(
     State(api): State<Api>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Query(q)): Uniform<Query<HoldStateQuery>>,
+) -> Result<Json<HoldList>, ApiError> {
     let s = api.gate(&headers, action::HOLD_LIST, "*").await?;
     let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+    match q.state.as_deref().unwrap_or("standing") {
+        "standing" => {}
+        "released" => {
+            let mut found = s
+                .plane
+                .released_holds(api.limit.saturating_add(1))
+                .await
+                .map_err(|_| store_failed())?;
+            let truncated = found.len() > api.limit;
+            found.truncate(api.limit);
+            return Ok(Json(HoldList {
+                holds: Vec::new(),
+                released: found.iter().filter_map(hold_release_view).collect(),
+                truncated,
+            }));
+        }
+        _ => return Err(invalid("'state' is one of standing, released")),
+    }
 
     // One more than the page, for the reason every sibling listing takes one
     // more: a register of 140 shown as 100 reads as a register of 100.
@@ -2385,17 +2872,71 @@ async fn standing_holds(
     let truncated = found.len() > api.limit;
     found.truncate(api.limit);
 
-    Ok(Json(json!({
-        "holds": found
-            .iter()
-            .map(|(case, hold)| json!({
-                "case": case.to_string(),
-                "placed_at": hold.placed_at.unix_timestamp(),
-                "reason": hold.reason,
-            }))
-            .collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+    Ok(Json(HoldList {
+        holds: found
+            .into_iter()
+            .map(|(case, hold)| HoldView {
+                case: case.to_string(),
+                placed_at: hold.placed_at.unix_timestamp(),
+                reason: hold.reason,
+                by: hold.by.actor().to_owned(),
+                basis: hold.by.basis().as_str().to_owned(),
+            })
+            .collect(),
+        released: Vec::new(),
+        truncated,
+    }))
+}
+
+/// A release record as the listing shows it; the runtime answers only
+/// `HoldReleased` records here, so nothing else reaches the `None` arm.
+fn hold_release_view(record: &crate::journal::Record) -> Option<HoldReleaseView> {
+    let crate::journal::RecordKind::HoldReleased {
+        by,
+        at,
+        placed_by,
+        placed_at,
+    } = record.kind()
+    else {
+        return None;
+    };
+    Some(HoldReleaseView {
+        case: record.body.case.map(|c| c.to_string()).unwrap_or_default(),
+        by: by.actor().to_owned(),
+        basis: by.basis().as_str().to_owned(),
+        released_at: at.unix_timestamp(),
+        placed_by: placed_by.actor().to_owned(),
+        placed_basis: placed_by.basis().as_str().to_owned(),
+        placed_at: placed_at.unix_timestamp(),
+        record: record.body.run.to_string(),
+    })
+}
+
+/// A lift record as the listing shows it; the runtime answers only
+/// `HaltLifted` records here, so nothing else reaches the `None` arm.
+fn halt_lift_view(record: &crate::journal::Record) -> Option<HaltLiftView> {
+    let crate::journal::RecordKind::HaltLifted {
+        scope,
+        by,
+        at,
+        reason,
+        thrown_by,
+        thrown_at,
+    } = record.kind()
+    else {
+        return None;
+    };
+    Some(HaltLiftView {
+        scope: scope.clone(),
+        by: by.actor().to_owned(),
+        basis: by.basis().as_str().to_owned(),
+        lifted_at: at.unix_timestamp(),
+        reason: reason.clone(),
+        thrown_by: thrown_by.actor().to_owned(),
+        thrown_basis: thrown_by.basis().as_str().to_owned(),
+        thrown_at: thrown_at.unix_timestamp(),
+        record: record.body.run.to_string(),
+    })
 }
 
 /// Preserve one matter against every erasure verb.
@@ -2407,8 +2948,8 @@ async fn standing_holds(
 async fn place_hold(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(body): Json<PlaceHoldRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Json(body)): Uniform<Json<PlaceHoldRequest>>,
+) -> Result<(StatusCode, Json<PlaceHoldAnswer>), ApiError> {
     let s = api.gate(&headers, action::HOLD_PLACE, &body.case).await?;
     let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
     let case = crate::core::CaseId::parse(&body.case).map_err(|_| bad("case"))?;
@@ -2435,16 +2976,16 @@ async fn place_hold(
 
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "case": body.case,
-            "placed": placed,
-            "in_force": in_force.map(|h| json!({
-                "placed_at": h.placed_at.unix_timestamp(),
-                "reason": h.reason,
-                "by": h.by.actor(),
-                "basis": h.by.basis().as_str(),
-            })),
-        })),
+        Json(PlaceHoldAnswer {
+            case: body.case,
+            placed,
+            in_force: in_force.map(|h| HoldInForce {
+                placed_at: h.placed_at.unix_timestamp(),
+                by: h.by.actor().to_owned(),
+                basis: h.by.basis().as_str().to_owned(),
+                reason: h.reason,
+            }),
+        }),
     ))
 }
 
@@ -2452,19 +2993,35 @@ async fn place_hold(
 async fn release_hold(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(body): Json<ReleaseHoldRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Json(body)): Uniform<Json<ReleaseHoldRequest>>,
+) -> Result<(StatusCode, Json<ReleaseHoldAnswer>), ApiError> {
     let s = api.gate(&headers, action::HOLD_RELEASE, &body.case).await?;
-    let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
+    s.plane.cases().ok_or_else(|| unavailable("case"))?;
     let case = crate::core::CaseId::parse(&body.case).map_err(|_| bad("case"))?;
+    // The releaser is the authenticated caller, refused before anything is
+    // read; the release is journaled under that name before the row goes.
+    let by = crate::core::Operator::authenticated(s.caller.actor.clone())
+        .map_err(|e| unusable_caller(&e))?;
 
-    let lifted = cases
-        .release_hold(case)
+    let record = s
+        .plane
+        .release_hold(case, &by, now_for_account())
         .await
-        .map_err(|e| hold_refused(&e))?;
+        .map_err(|e| match e {
+            crate::core::RuntimeError::Store(e) => hold_refused(&e),
+            e => control_stands(&e),
+        })?;
+    tracing::info!(target: "agentplane::api", actor = %s.caller.actor, case = %body.case, record = ?record.map(|r| r.record.to_string()), "legal hold released");
     Ok((
         StatusCode::OK,
-        Json(json!({ "case": body.case, "lifted": lifted })),
+        Json(ReleaseHoldAnswer {
+            case: body.case,
+            lifted: record.is_some(),
+            by: by.actor().to_owned(),
+            basis: by.basis().as_str().to_owned(),
+            record: record.map(|r| r.record.to_string()),
+            removed: record.is_some_and(|r| r.removed),
+        }),
     ))
 }
 
@@ -2478,19 +3035,44 @@ async fn release_hold(
 async fn standing_halts(
     State(api): State<Api>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Query(q)): Uniform<Query<HaltStateQuery>>,
+) -> Result<Json<HaltList>, ApiError> {
     let s = api.gate(&headers, action::HALT_LIST, "*").await?;
+    quota_wired(&s)?;
+    match q.state.as_deref().unwrap_or("standing") {
+        "standing" => {}
+        "lifted" => {
+            let mut found = s
+                .plane
+                .lifted_halts(api.limit.saturating_add(1))
+                .await
+                .map_err(|_| store_failed())?;
+            let truncated = found.len() > api.limit;
+            found.truncate(api.limit);
+            return Ok(Json(HaltList {
+                halts: Vec::new(),
+                lifted: found.iter().filter_map(halt_lift_view).collect(),
+                truncated,
+            }));
+        }
+        _ => return Err(invalid("'state' is one of standing, lifted")),
+    }
     let halts = s.plane.halts().await.map_err(|_| store_failed())?;
-    Ok(Json(json!({
-        "halts": halts
-            .iter()
-            .map(|halt| json!({
-                "scope": halt.scope.key(),
-                "covers": halt.scope.to_string(),
-                "reason": halt.reason,
-            }))
-            .collect::<Vec<_>>(),
-    })))
+    Ok(Json(HaltList {
+        halts: halts
+            .into_iter()
+            .map(|halt| HaltView {
+                scope: halt.scope.key(),
+                covers: halt.scope.to_string(),
+                reason: halt.reason,
+                by: halt.by.actor().to_owned(),
+                basis: halt.by.basis().as_str().to_owned(),
+                thrown_at: halt.at.unix_timestamp(),
+            })
+            .collect(),
+        lifted: Vec::new(),
+        truncated: false,
+    }))
 }
 
 /// Throw it.
@@ -2510,9 +3092,10 @@ async fn standing_halts(
 async fn place_halt(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(body): Json<PlaceHaltRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Json(body)): Uniform<Json<PlaceHaltRequest>>,
+) -> Result<(StatusCode, Json<PlaceHaltAnswer>), ApiError> {
     let s = api.gate(&headers, action::HALT_PLACE, &body.scope).await?;
+    quota_wired(&s)?;
     let scope =
         crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| invalid("not a halt scope"))?;
     if body.reason.trim().is_empty() {
@@ -2530,23 +3113,24 @@ async fn place_halt(
     // Derived from the scope; the doc comment above says why one sentence for
     // all four is false in the direction that costs the most.
     let reach = if scope.withdrawn_subject().is_some() {
-        "runs already executing for this subject pause at their next step \
-             boundary; their completed work stands, and lifting this halt \
-             continues them — cancel only if the work itself must be reversed"
+        "runs already executing for this principal, or delegated from it, \
+             pause at their next step boundary; their completed work stands, \
+             and lifting this halt continues them — cancel only if the work \
+             itself must be reversed"
     } else {
         "runs already executing, and suspended runs resuming — cancel a run to \
              reach work in flight"
     };
     Ok((
         StatusCode::OK,
-        Json(json!({
-            "scope": scope.key(),
-            "halted": true,
-            "reason": body.reason,
-            "by": by.actor(),
-            "basis": by.basis().as_str(),
-            "reach": reach,
-        })),
+        Json(PlaceHaltAnswer {
+            scope: scope.key(),
+            halted: true,
+            reason: body.reason,
+            by: by.actor().to_owned(),
+            basis: by.basis().as_str().to_owned(),
+            reach: reach.to_owned(),
+        }),
     ))
 }
 
@@ -2554,27 +3138,54 @@ async fn place_halt(
 async fn lift_halt(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(body): Json<LiftHaltRequest>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+    Uniform(Json(body)): Uniform<Json<LiftHaltRequest>>,
+) -> Result<(StatusCode, Json<LiftHaltAnswer>), ApiError> {
     let s = api.gate(&headers, action::HALT_LIFT, &body.scope).await?;
+    quota_wired(&s)?;
     let scope =
         crate::quota::HaltScope::parse(&body.scope).ok_or_else(|| invalid("not a halt scope"))?;
-    let was_standing = s
+    // The lifter is the authenticated caller, refused before anything is read;
+    // the lift is journaled under that name before the row goes.
+    let by = crate::core::Operator::authenticated(s.caller.actor.clone())
+        .map_err(|e| unusable_caller(&e))?;
+    let record = s
         .plane
-        .lift_halt(&scope)
+        .lift_halt(&scope, &by, now_for_account())
         .await
-        .map_err(|_| store_failed())?;
+        .map_err(|e| control_stands(&e))?;
+    let was_standing = record.is_some();
+    tracing::info!(target: "agentplane::api", actor = %s.caller.actor, scope = %scope.key(), record = ?record.map(|r| r.record.to_string()), "halt lifted");
     Ok((
         StatusCode::OK,
         // `was_standing: false` is the answer to *did I clear the right one*,
         // which during an incident is the question. A lift that found nothing
         // is not an error and must not read as success either.
-        Json(json!({
-            "scope": scope.key(),
-            "halted": false,
-            "was_standing": was_standing,
-        })),
+        Json(LiftHaltAnswer {
+            scope: scope.key(),
+            halted: false,
+            was_standing,
+            by: by.actor().to_owned(),
+            basis: by.basis().as_str().to_owned(),
+            record: record.map(|r| r.record.to_string()),
+            removed: record.is_some_and(|r| r.removed),
+        }),
     ))
+}
+
+/// A lift or release whose record was written while its control still stands
+/// answers naming that record's run, because acting again writes a second
+/// one; any other failure is the store's.
+fn control_stands(e: &crate::core::RuntimeError) -> ApiError {
+    match e {
+        crate::core::RuntimeError::ControlStands { run, .. } => ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "the act was recorded in run {run}, but the control still stands; read the \
+                 standing state before acting again"
+            ),
+        ),
+        _ => store_failed(),
+    }
 }
 
 /// A matter that is not there, told apart from a store that could not be
@@ -2622,7 +3233,10 @@ fn acknowledge_refused(e: crate::core::StoreError) -> ApiError {
 /// deliveries, and an operator who has fixed one re-arms it at
 /// `POST /push/rearm`.
 #[cfg(feature = "push")]
-async fn parked_push(State(api): State<Api>, headers: HeaderMap) -> Result<Json<Value>, ApiError> {
+async fn parked_push(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<ParkedPush>, ApiError> {
     let s = api.gate(&headers, action::PUSH_LIST, "*").await?;
     let push = s.plane.push().ok_or_else(|| unavailable("push"))?;
 
@@ -2633,8 +3247,8 @@ async fn parked_push(State(api): State<Api>, headers: HeaderMap) -> Result<Json<
     let truncated = found.len() > api.limit;
     found.truncate(api.limit);
 
-    Ok(Json(json!({
-        "parked": found
+    Ok(Json(ParkedPush {
+        parked: found
             .iter()
             .map(|r| ParkedPushView {
                 config: r.config.redacted(),
@@ -2642,9 +3256,9 @@ async fn parked_push(State(api): State<Api>, headers: HeaderMap) -> Result<Json<
                 attempts: r.attempts,
                 last_error: r.last_error.clone(),
             })
-            .collect::<Vec<_>>(),
-        "truncated": truncated,
-    })))
+            .collect(),
+        truncated,
+    }))
 }
 
 /// Re-arm one, once its receiver is answering again.
@@ -2660,9 +3274,10 @@ async fn parked_push(State(api): State<Api>, headers: HeaderMap) -> Result<Json<
 async fn rearm_push(
     State(api): State<Api>,
     headers: HeaderMap,
-    Json(body): Json<RearmRequest>,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Json(body)): Uniform<Json<RearmRequest>>,
+) -> Result<Json<RearmAnswer>, ApiError> {
     let s = api.gate(&headers, action::PUSH_REARM, &body.run).await?;
+    s.plane.push().ok_or_else(|| unavailable("push"))?;
     let run = RunId::parse(&body.run).map_err(|_| bad("run"))?;
 
     let rearmed = s
@@ -2674,14 +3289,38 @@ async fn rearm_push(
             other => ApiError(StatusCode::CONFLICT, other.to_string()),
         })?;
 
-    Ok(Json(json!({ "rearmed": rearmed })))
+    Ok(Json(RearmAnswer { rearmed }))
+}
+
+/// The webhook listing in a build without the `push` feature.
+///
+/// Served, so the document describes every build: the same gate as the built
+/// route, so 401 and 403 answer as they would there, then 501.
+#[cfg(not(feature = "push"))]
+async fn parked_push(
+    State(api): State<Api>,
+    headers: HeaderMap,
+) -> Result<Json<ParkedPush>, ApiError> {
+    api.gate(&headers, action::PUSH_LIST, "*").await?;
+    Err(unavailable("push"))
+}
+
+/// Re-arming in a build without the `push` feature: gated, then 501.
+#[cfg(not(feature = "push"))]
+async fn rearm_push(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Uniform(Json(body)): Uniform<Json<RearmRequest>>,
+) -> Result<Json<RearmAnswer>, ApiError> {
+    api.gate(&headers, action::PUSH_REARM, &body.run).await?;
+    Err(unavailable("push"))
 }
 
 async fn case_view(
     State(api): State<Api>,
     headers: HeaderMap,
-    Path(case): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(Path(case)): Uniform<Path<String>>,
+) -> Result<Json<CaseAnswer>, ApiError> {
     let s = api.gate(&headers, action::CASE_READ, &case).await?;
     let id = CaseId::parse(&case).map_err(|_| bad("case"))?;
     let cases = s.plane.cases().ok_or_else(|| unavailable("case"))?;
@@ -2712,16 +3351,19 @@ async fn case_view(
     let history_truncated = history.len() > api.history;
     history.truncate(api.history);
 
-    Ok(Json(json!({
-        "case": serde_json::to_value(&found).unwrap_or(Value::Null),
+    Ok(Json(CaseAnswer {
+        case: found,
         // Shown with the case because "when does this stop being my problem" is
         // the question that follows "what is this".
-        "deadlines": serde_json::to_value(&deadlines).unwrap_or(Value::Null),
-        "history": history.iter().map(record_view).collect::<Vec<_>>(),
+        deadlines,
+        history: history
+            .iter()
+            .map(crate::journal::view::record_view)
+            .collect(),
         // Said out loud: a truncated history is shaped exactly like a complete
         // one, and a reader who cannot tell will read absence as evidence.
-        "history_truncated": history_truncated,
-    })))
+        history_truncated,
+    }))
 }
 
 /// An event as a caller may state it, in this plane's own shape.
@@ -2734,13 +3376,14 @@ async fn case_view(
 ///
 /// Any other field is refused: a misspelt `corelation` accepted silently is an
 /// event that correlates with nothing while its sender believes it did.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct DeliverBody {
     id: String,
     kind: String,
     #[serde(default)]
     correlation: Vec<crate::core::CorrelationKey>,
+    #[schemars(extend("x-agentplane-holds" = "The sender's message, handed to the run that waits for it."))]
     payload: Value,
     /// Accepted and never read. A caller that sends one is mistaken rather
     /// than hostile — it is the field every event shape it knows carries — and
@@ -2748,6 +3391,7 @@ struct DeliverBody {
     /// would be wrong.
     #[serde(default)]
     #[allow(dead_code)]
+    #[schemars(extend("x-agentplane-holds" = "Accepted and never read: an event's source is the authenticated caller, whatever the body says."))]
     source: Option<Value>,
 }
 
@@ -2865,8 +3509,8 @@ fn parse_delivery(headers: &HeaderMap, body: &[u8]) -> Result<DeliverInput, ApiE
 async fn deliver(
     State(api): State<Api>,
     headers: HeaderMap,
-    body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
+    Uniform(body): Uniform<axum::body::Bytes>,
+) -> Result<Json<DeliveryAnswer>, ApiError> {
     // Authenticated before the body is read: the parser's refusals describe
     // the shapes this route accepts, and a caller with no identity is owed
     // none of them. Authorization waits for the kind, which is in the body.
@@ -2878,6 +3522,7 @@ async fn deliver(
     // whatever else the plane happens to wait on. A CloudEvent's `type` is that
     // kind — the same question, asked of whichever envelope arrived.
     let s = api.authorize(caller, action::EVENT_DELIVER, input.kind())?;
+    s.plane.events().ok_or_else(|| unavailable("event"))?;
 
     // The source is who the transport says they are, never who the body claims.
     // A self-asserted source would make `(source, id)` a pair a caller controls
@@ -2907,9 +3552,13 @@ async fn deliver(
 
     // Spelled out rather than `Debug`-formatted: this is a wire contract, and a
     // client keying on it should not break when someone renames a field.
-    Ok(Json(match delivery {
-        Delivery::Resumed { run } => json!({ "delivery": "resumed", "run": run.to_string() }),
-        Delivery::Buffered => json!({ "delivery": "buffered" }),
-        Delivery::Duplicate => json!({ "delivery": "duplicate" }),
+    let (delivery, run) = match delivery {
+        Delivery::Resumed { run } => ("resumed", Some(run.to_string())),
+        Delivery::Buffered => ("buffered", None),
+        Delivery::Duplicate => ("duplicate", None),
+    };
+    Ok(Json(DeliveryAnswer {
+        delivery: delivery.to_owned(),
+        run,
     }))
 }

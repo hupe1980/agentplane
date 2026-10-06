@@ -273,10 +273,6 @@ impl CaseStore for SealedCases {
         self.inner.attach_run(case, run).await
     }
 
-    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError> {
-        self.inner.detach_run(case, run).await
-    }
-
     async fn link_blob(
         &self,
         case: CaseId,
@@ -310,6 +306,14 @@ impl CaseStore for SealedCases {
 
     async fn release_hold(&self, case: CaseId) -> Result<bool, StoreError> {
         self.inner.release_hold(case).await
+    }
+
+    async fn release_hold_if(
+        &self,
+        case: CaseId,
+        standing: &LegalHold,
+    ) -> Result<bool, StoreError> {
+        self.inner.release_hold_if(case, standing).await
     }
 
     async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError> {

@@ -1,0 +1,61 @@
+# The image; the tag defaults to this chart's appVersion with the `-full`
+# variant, the one that carries `serve`.
+image:
+  repository: ghcr.io/hupe1980/agentplane
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The reviewed manifest and the Cedar policy, as text — required. From a
+# directory `agentplane init --serve` wrote:
+#   --set-file manifest=plane/agent.yaml --set-file policy=plane/policy.cedar
+manifest: ""
+policy: ""
+
+# The token file is never a value: name an existing Secret holding it.
+#   kubectl create secret generic agentplane-tokens --from-file=tokens.yaml=plane/tokens.yaml
+tokens:
+  existingSecret: ""
+  key: tokens.yaml
+
+# The journal — one of the two is required. A Postgres connection string
+# belongs in a Secret, read into the pod's environment as AGENTPLANE_STORE:
+#   kubectl create secret generic agentplane-store \
+#     --from-literal=store='postgres://agentplane:PASSWORD@postgres:5432/agentplane'
+storeSecret:
+  existingSecret: ""
+  key: store
+# Rendered into the pod's args, so never a password: a redb path (under /data,
+# one replica only), or a Postgres connection string with none. A
+# `postgres://user:password@…` here is refused.
+store: ""
+tenant: ""
+
+# More than one replica requires a Postgres store. MCP sessions live in one
+# pod's memory, so with more than one the Service pins each client address to
+# a pod (`sessionAffinity: ClientIP`); behind an ingress that hides client
+# addresses, route on the `Mcp-Session-Id` header instead.
+replicas: 1
+
+# Where callers reach the A2A endpoint; goes on the Agent Card. Defaults to the
+# in-cluster Service.
+url: ""
+
+mcp:
+  # `Host` authorities the MCP listener answers besides the in-cluster Service.
+  allowedHosts: []
+
+# How long `serve` drains on SIGTERM. The pod's grace period is this plus ten.
+drainSeconds: 25
+
+# For a redb store: the volume mounted at /data. Unset, an emptyDir — the
+# journal then lives as long as the pod.
+persistence:
+  existingClaim: ""
+
+service:
+  type: ClusterIP
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

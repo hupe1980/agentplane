@@ -54,7 +54,9 @@
 //! and into the settled total, and the pass that concludes the run releases
 //! what is left — in the transaction that writes the receipt. A suspended run
 //! keeps its remainder, and a resume is never refused for spend: the work was
-//! admitted already, and refusing it strands a run mid-saga.
+//! admitted already, and refusing it strands a run mid-saga. That holds on a
+//! plane wired to this store. A plane without one cannot settle a pass, so it
+//! resumes a run only when no recorded pass of it billed a period.
 //!
 //! **What this bounds, exactly.** A period's settled total never exceeds its
 //! ceiling through work admitted in it, however many runs suspend, run
@@ -134,8 +136,9 @@ use crate::core::{Budget, EffectKey, RunId, Spend, StoreError, Timestamp};
 
 /// At most `count` dispatches in any `window_seconds`, across runs.
 ///
-/// Declared on a grant, and never zero in either figure: a manifest refuses
-/// both at parse.
+/// Declared on a grant, never zero in either figure, and a window of at most
+/// [`MAX_RATE_WINDOW_SECONDS`]: a manifest refuses the rest at parse, and
+/// [`check_rate`] refuses a window outside that range however it was built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RateCeiling {
     pub count: u32,
@@ -179,7 +182,7 @@ pub struct RateReservation {
 /// slide with `at` rather than restart at a bucket boundary. Shared by both
 /// backends so the boundary is one comparison.
 #[must_use]
-pub fn rate_window_start(at: i64, window_seconds: u64) -> i64 {
+pub(crate) fn rate_window_start(at: i64, window_seconds: u64) -> i64 {
     at.saturating_sub(i64::try_from(window_seconds).unwrap_or(i64::MAX))
 }
 
@@ -192,7 +195,8 @@ pub fn rate_window_start(at: i64, window_seconds: u64) -> i64 {
 ///
 /// # Errors
 ///
-/// [`QuotaError::RateLimited`] naming the first ceiling without room.
+/// [`QuotaError::UncountableRate`] for a ceiling whose window no store can
+/// count; [`QuotaError::RateLimited`] naming the first ceiling without room.
 pub fn check_rate(
     tenant: &str,
     grant: &str,
@@ -201,6 +205,15 @@ pub fn check_rate(
     at: Timestamp,
 ) -> Result<(), QuotaError> {
     let at = at.unix_timestamp();
+    if let Some(ceiling) = ceilings
+        .iter()
+        .find(|c| c.window_seconds == 0 || c.window_seconds > MAX_RATE_WINDOW_SECONDS)
+    {
+        return Err(QuotaError::UncountableRate {
+            grant: grant.to_owned(),
+            ceiling: *ceiling,
+        });
+    }
     for ceiling in ceilings {
         let start = rate_window_start(at, ceiling.window_seconds);
         let reached = instants.iter().filter(|&&t| t > start).count();
@@ -216,13 +229,21 @@ pub fn check_rate(
     Ok(())
 }
 
-/// The instant at or before which no ceiling in `ceilings` counts a row.
+/// The widest rate window a declaration may state: 31 days.
+///
+/// Also how long a store keeps a reservation. Retention is store-wide rather
+/// than the reserving declaration's widest window, because instances sharing a
+/// store may hold declarations with different windows over one grant, and each
+/// must find the rows its own window counts.
+pub const MAX_RATE_WINDOW_SECONDS: u64 = 31 * 86_400;
+
+/// The instant at or before which no ceiling any declaration may state counts
+/// a row.
 ///
 /// Rows at or before it are pruned in the reserving transaction.
 #[must_use]
-pub fn rate_prune_floor(at: Timestamp, ceilings: &[RateCeiling]) -> i64 {
-    let widest = ceilings.iter().map(|c| c.window_seconds).max().unwrap_or(0);
-    rate_window_start(at.unix_timestamp(), widest)
+pub fn rate_prune_floor(at: Timestamp) -> i64 {
+    rate_window_start(at.unix_timestamp(), MAX_RATE_WINDOW_SECONDS)
 }
 
 /// One live execution pass to settle exactly once.
@@ -323,9 +344,11 @@ pub fn reservation(
 
 /// What one tenant may consume.
 ///
-/// Every field is optional and `None` means *unlimited*, which is the default: a
-/// deployment that has not thought about quotas gets the behaviour it had before
-/// they existed, rather than a ceiling somebody has to discover.
+/// Every field is optional and `None` means *unlimited*, which is the default:
+/// no ceiling somebody has to discover. Unlimited is not unaccounted. A plane
+/// with a quota store — every plane built on one backend has one — still
+/// takes a slot per running run, honours halts, and refuses admission while
+/// the store cannot be reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TenantQuota {
     /// Runs this tenant may have executing at once.
@@ -397,10 +420,13 @@ impl Period {
 /// to reach for when the incident is not the workload but the *authority*: a
 /// credential somebody has withdrawn, a service account that turned out to be
 /// shared, a person who has left. The three scopes above ask *what is running*;
-/// this one asks *who it is running for*, which is the delegation subject bound
-/// at admission and carried on every run's `IdentityBound` record. A run with no
-/// chain of its own is covered by none of them — there is nothing to key on, and
-/// inventing a match would stop work for a reason nobody could look up.
+/// this one asks *who it is running for*: any principal on the delegation chain
+/// bound at admission and carried on every run's `IdentityBound` record — the
+/// person at its root, each workload it was delegated through, and the one
+/// acting. Authority flows down the chain, so withdrawing any link withdraws
+/// everything below it. A run with no chain of its own is covered by none of
+/// them — there is nothing to key on, and inventing a match would stop work for
+/// a reason nobody could look up.
 ///
 /// A name is a string the manifest's author typed, and a halt is still keyed
 /// on one because it is a **refusal**: a name-keyed refusal at worst stops
@@ -418,7 +444,8 @@ pub enum HaltScope {
     /// The form that is precise about *which* revision is stopped, so a fix
     /// published as a new version is not stopped with it.
     Revision { digest: crate::core::Digest },
-    /// Everything acting for one delegation subject.
+    /// Everything acting for one principal, wherever it stands on the run's
+    /// delegation chain.
     ///
     /// The authority axis rather than the workload axis. Ordered last so that
     /// it wins the *message* when several scopes cover one run: an operator who
@@ -440,7 +467,7 @@ impl HaltScope {
         Self::Revision { digest }
     }
 
-    /// Everything acting for one delegation subject.
+    /// Everything acting for one principal on a run's delegation chain.
     pub fn subject(id: impl Into<String>) -> Self {
         Self::Subject { id: id.into() }
     }
@@ -472,7 +499,7 @@ impl HaltScope {
         "tenant",
         "agent:<metadata.name>",
         "revision:<manifest digest>",
-        "subject:<delegation subject>",
+        "subject:<principal on the chain>",
     ];
 
     /// The forms, joined for a refusal a person reads.
@@ -512,18 +539,20 @@ impl HaltScope {
         None
     }
 
-    /// The authority this halt withdraws, when it withdraws one.
+    /// The principal this halt withdraws, if it is anywhere on `chain`.
     ///
     /// **The one scope that reaches work already running.** The others stop
     /// admission, because cutting a saga mid-flight leaves reversals unrun; here
     /// the incident *is* the authority, and a run carrying on under a withdrawn
     /// credential is the harm. It **pauses**: the run stops at its next step
     /// boundary, its mutations stand, and lifting the halt continues it.
-    ///
-    /// Returns the subject rather than a `bool` so the in-flight check has
-    /// nothing to pass and so nothing to get wrong — a caller asking `covers`
-    /// with the agent but not the subject would match nothing, which is a
-    /// refusal that does not happen.
+    #[must_use]
+    pub fn withdraws_from(&self, chain: &crate::core::Delegation) -> Option<&str> {
+        self.withdrawn_subject()
+            .filter(|id| chain.links().any(|link| link.id == *id))
+    }
+
+    /// The principal this halt names, when it names one.
     #[must_use]
     pub fn withdrawn_subject(&self) -> Option<&str> {
         match self {
@@ -532,8 +561,8 @@ impl HaltScope {
         }
     }
 
-    /// Whether this halt stops a run governed by `agent` and acting for
-    /// `subject`.
+    /// Whether this halt stops a run governed by `agent` and acting under
+    /// `chain`.
     ///
     /// **Both, because the scopes ask different questions.** Three of them ask
     /// what is running and one asks who it runs for, so a caller that passed
@@ -549,13 +578,13 @@ impl HaltScope {
     pub fn covers(
         &self,
         agent: Option<&crate::journal::AgentIdentity>,
-        subject: Option<&str>,
+        chain: Option<&crate::core::Delegation>,
     ) -> bool {
         match self {
             Self::Tenant => true,
             Self::Agent { name } => agent.is_some_and(|a| &a.name == name),
             Self::Revision { digest } => agent.is_some_and(|a| &a.digest == digest),
-            Self::Subject { id } => subject.is_some_and(|s| s == id),
+            Self::Subject { .. } => chain.is_some_and(|c| self.withdraws_from(c).is_some()),
         }
     }
 }
@@ -686,6 +715,18 @@ pub enum QuotaError {
         reached: u64,
     },
 
+    /// A rate ceiling states a window no store can count.
+    ///
+    /// A store keeps reservations for [`MAX_RATE_WINDOW_SECONDS`], so a wider
+    /// window counts only what retention left and admits more than it states;
+    /// a window of zero counts nothing. Refused rather than counted, because
+    /// either would be a ceiling that does not bind.
+    #[error(
+        "'{grant}' states {ceiling}, which no store can count — a window is at least \
+         one second and at most {MAX_RATE_WINDOW_SECONDS} seconds"
+    )]
+    UncountableRate { grant: String, ceiling: RateCeiling },
+
     /// The accounting itself could not be reached.
     ///
     /// Fails **closed**. A quota that yields when its store is unreachable is a
@@ -788,7 +829,10 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// Throwing and lifting are **separate verbs** rather than one call taking
     /// an `Option`, for the reason acquiring and renewing a lease are: they are
     /// different acts with different arguments. Throwing one names who threw it
-    /// and when; lifting names neither, because the row goes.
+    /// and when, on the row; lifting removes the row, and who lifted it is
+    /// the journal's record, written by
+    /// [`Runtime::lift_halt`](crate::runtime::Runtime::lift_halt) before the
+    /// row goes.
     ///
     /// **In the store, not in the process.** An in-memory flag is a switch that
     /// only stops the instance it was thrown on — which is the same failure an
@@ -817,10 +861,34 @@ pub trait QuotaStore: Send + Sync + Debug {
     /// Answers whether one was standing, so an operator who lifts a scope
     /// nobody halted is told that rather than told *done*.
     ///
+    /// The raw register verb. [`Runtime::lift_halt`](crate::runtime::Runtime::lift_halt)
+    /// journals who lifted the halt, and the stop it ended, then removes that
+    /// row through [`lift_halt_if`](Self::lift_halt_if); both of the plane's
+    /// doors lift through that. A direct call is the embedder's own act, and
+    /// nothing records it.
+    ///
     /// # Errors
     ///
     /// If the store cannot be reached.
     async fn lift_halt(&self, scope: &HaltScope) -> Result<bool, StoreError>;
+
+    /// Lift the halt at `standing.scope` only if the row there is still
+    /// `standing` — same reason, same operator, same instant.
+    ///
+    /// Answers whether that row was removed. `false` when the scope is clear
+    /// or holds a different halt; a different halt is left standing.
+    ///
+    /// The compare and the removal MUST be one write. [`set_halt`](Self::set_halt)
+    /// overwrites, so a halt re-thrown between a reader's read and its removal
+    /// replaces the row the reader saw; an unconditional removal would delete
+    /// the new halt under a record that names the old one.
+    /// [`Runtime::lift_halt`](crate::runtime::Runtime::lift_halt) removes
+    /// through this, with the row it journaled.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached, or holds a row it cannot read.
+    async fn lift_halt_if(&self, standing: &Halt) -> Result<bool, StoreError>;
 
     /// Every standing halt for this tenant.
     ///

@@ -304,23 +304,25 @@ fn classify_item(out: RunOutcome) -> (ItemOutcome, Spend) {
         RunStatus::Withheld { subject, reason } => {
             ItemOutcome::Withheld(format!("authority '{subject}' withdrawn: {reason}"))
         }
-        // An item somebody stopped did not settle, and the batch must not
-        // report otherwise — but the reason names the person, so a partial
-        // batch can be told apart from one that hit a wall.
         // Unreachable by construction — a batch item is admitted as an ordinary
-        // run and neither of these is ever admitted — so reaching it means the
+        // run and none of these is ever admitted — so reaching it means the
         // reservation points at a run this batch did not start. `Quarantined`
         // for the same reason abandonment is: the answer to *what does a person
         // do next* is hands off, and filing it under `Failed` would hand it to
         // the readers who re-run.
-        RunStatus::Swept | RunStatus::BrokeGlass { .. } | RunStatus::Observed => {
-            ItemOutcome::Quarantined(
-                "this item's run id resolves to one of the plane's own records, or to \
+        RunStatus::Swept
+        | RunStatus::BrokeGlass { .. }
+        | RunStatus::HaltLifted { .. }
+        | RunStatus::HoldReleased { .. }
+        | RunStatus::Observed => ItemOutcome::Quarantined(
+            "this item's run id resolves to one of the plane's own records, or to \
                  a session it only observed, rather than to the item's run — the \
                  reservation and the journal disagree"
-                    .to_owned(),
-            )
-        }
+                .to_owned(),
+        ),
+        // An item somebody stopped did not settle, and the batch must not
+        // report otherwise — but the reason names the person, so a partial
+        // batch can be told apart from one that hit a wall.
         RunStatus::Cancelled { actor, reason } => {
             ItemOutcome::Failed(format!("cancelled by '{actor}': {reason}"))
         }

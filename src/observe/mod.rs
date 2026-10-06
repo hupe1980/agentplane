@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use crate::core::{ObservedStep, RunId, RuntimeError, Tainted};
+use crate::core::{ObservedStep, RunId, RuntimeError};
 use crate::journal::{Append, JournalStore, RecordKind};
 
 #[cfg(feature = "acp")]
@@ -45,7 +45,7 @@ pub mod acp;
 /// Fixed, for the reason a sweep's is: this run is opened here and never taken
 /// over, so there is no ownership to arbitrate. A lease would be arbitrating
 /// between writers that do not exist.
-const OBSERVED_EPOCH: crate::core::Epoch = 1;
+const OBSERVED_EPOCH: crate::core::Epoch = crate::runtime::LEASE_FREE_EPOCH;
 
 /// A session being recorded, open until it is sealed.
 ///
@@ -131,13 +131,11 @@ impl Session {
     /// Record one thing the observed party reported.
     ///
     /// `detail` is their own words — the instruction a user typed, a tool's
-    /// title, the sentence a person was shown — and this labels them for the
-    /// caller rather than taking a label on trust. There is exactly one honest
-    /// answer: the value crossed a trust boundary from the observed session,
-    /// and [`source`](Self::source) is what it is named. A caller handing in a
-    /// `Tainted` could hand in a trusted one, and a sealed record carrying the
-    /// observed party's prose under this plane's own label is the laundering
-    /// this whole module is arranged to prevent.
+    /// title, the sentence a person was shown. It is taken as a plain string
+    /// rather than a `Tainted`, so a caller cannot hand in a trusted label: the
+    /// record kind is what says whose words these are, and a reader takes
+    /// anything in an `Observed` record as the observed party's claim, from
+    /// [`source`](Self::source).
     ///
     /// # Errors
     ///
@@ -154,8 +152,7 @@ impl Session {
             RecordKind::Observed {
                 session: self.id.clone(),
                 reported: step,
-                // Labelled here, from the one source it can have had.
-                detail: detail.map(|d| Tainted::from_source(d, self.source()).peek().clone()),
+                detail,
             },
         );
         if let Some(case) = self.case {

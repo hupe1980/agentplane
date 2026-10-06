@@ -28,6 +28,17 @@
 //! plane is the caller's — never one a skill holds for itself, because a
 //! chain held by the skill is the same owner on every call whoever asked.
 //!
+//! # Who asked
+//!
+//! The chain narrows in-process; what reaches the peer is a credential. A
+//! credential held for the peer names nobody, so every run on the plane looks
+//! the same from the far side. A peer wired with a
+//! [`CredentialSource`] is called instead with a credential the source obtains
+//! for the run's owner — the person the run acts for — with the plane as actor,
+//! and a run that acts for nobody is refused rather than sent out under the
+//! plane's name. Which of the two a hop presented is on its announcement
+//! ([`CredentialBinding`]); the credential never is.
+//!
 //! The registry decides what each peer is *granted*, and that is an operator's
 //! declaration. It is not taken from the peer's agent card, for exactly the
 //! reason MCP annotations are not taken from a server: a party describing its own
@@ -132,14 +143,18 @@ pub use card_sig::{
 #[cfg(all(feature = "manifest", feature = "a2a"))]
 pub use discovery::{CardClient, DiscoveryError, JSONRPC};
 mod credentials;
-pub use credentials::{Cached, CredentialError, CredentialSource, Fixed, TokenExchange};
+pub use credentials::{Cached, CredentialError, CredentialSource, TokenExchange};
+#[cfg(feature = "a2a")]
+mod exchange;
+#[cfg(feature = "a2a")]
+pub use exchange::{ACCESS_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT, TokenEndpoint};
 
 use std::time::Duration;
 
 use crate::core::{
-    Capability, Delegation, DelegationError, Disposition, Effect, EffectDescriptor, EffectError,
-    Principal, ProtectedField, Recovery, RetryPolicy, Scope, Secret, Sensitivity, SourceId,
-    Timestamp, Trust,
+    Capability, CredentialBinding, Delegation, DelegationError, Disposition, Effect,
+    EffectDescriptor, EffectError, Principal, ProtectedField, Recovery, RetryPolicy, Scope, Secret,
+    Sensitivity, SourceId, Timestamp, Trust,
 };
 
 /// Another agent, addressed by the name this plane knows it by.
@@ -169,6 +184,8 @@ impl std::fmt::Display for PeerId {
 #[derive(Clone, PartialEq, Eq)]
 pub struct PeerCredential {
     audience: PeerId,
+    /// The principal it was issued for, when the issuer named one.
+    subject: Option<String>,
     /// Wiped when it drops, and compared in constant time.
     ///
     /// The redacting `Debug` and the absent `Serialize` stop it being *written*
@@ -185,12 +202,26 @@ pub struct PeerCredential {
 }
 
 impl PeerCredential {
-    /// Mint a credential for exactly one peer.
+    /// Mint a credential for exactly one peer, naming nobody.
     pub fn for_audience(audience: PeerId, secret: impl Into<String>) -> Self {
         Self {
             audience,
+            subject: None,
             secret: Secret::new(secret),
             expires_at: None,
+        }
+    }
+
+    /// Mint a credential for exactly one peer, naming the principal it was
+    /// issued for.
+    pub fn for_subject(
+        audience: PeerId,
+        subject: impl Into<String>,
+        secret: impl Into<String>,
+    ) -> Self {
+        Self {
+            subject: Some(subject.into()),
+            ..Self::for_audience(audience, secret)
         }
     }
 
@@ -230,6 +261,12 @@ impl PeerCredential {
         &self.audience
     }
 
+    /// The principal this credential was issued for, if it names one.
+    #[must_use]
+    pub fn subject(&self) -> Option<&str> {
+        self.subject.as_deref()
+    }
+
     /// The bearer value.
     ///
     /// Reachable only once a caller has already been past the audience check, so
@@ -250,6 +287,7 @@ impl Debug for PeerCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PeerCredential")
             .field("audience", &self.audience)
+            .field("subject", &self.subject)
             .field("expires_at", &self.expires_at)
             .field("secret", &"<redacted>")
             .finish()
@@ -268,7 +306,13 @@ pub struct PeerGrant {
     pub max_sensitivity: Sensitivity,
     pub output_sensitivity: Sensitivity,
     pub retry: RetryPolicy,
+    /// The credential held for this peer, naming nobody. On a peer with a
+    /// [`source`](Self::with_source), the plane's own credential, presented
+    /// only for a run admitted as the plane.
     credential: Option<PeerCredential>,
+    /// Where a credential naming the run's owner comes from, for a peer that
+    /// is told who asked.
+    source: Option<Arc<dyn CredentialSource>>,
 }
 
 impl PeerGrant {
@@ -283,6 +327,7 @@ impl PeerGrant {
             output_sensitivity: Sensitivity::Public,
             retry: RetryPolicy::never(),
             credential: None,
+            source: None,
         }
     }
 
@@ -306,6 +351,25 @@ impl PeerGrant {
         );
         self.credential = Some(credential);
         self
+    }
+
+    /// Call this peer with a credential naming the person each run acts for,
+    /// obtained from `source` when the call is made.
+    ///
+    /// From then on a run that acts for nobody is refused this peer rather
+    /// than sent out under the plane's name, and the credential held through
+    /// [`with_credential`](Self::with_credential), if any, is presented only
+    /// for a run admitted as the plane.
+    #[must_use]
+    pub fn with_source(mut self, source: Arc<dyn CredentialSource>) -> Self {
+        self.source = Some(source);
+        self
+    }
+
+    /// Where this peer's subject-bound credentials come from, if it has one.
+    #[must_use]
+    pub fn source(&self) -> Option<&Arc<dyn CredentialSource>> {
+        self.source.as_ref()
     }
 
     #[must_use]
@@ -348,6 +412,25 @@ pub enum PeerError {
          presenting it would let '{peer}' replay it at '{held_for}'"
     )]
     WrongAudience { peer: PeerId, held_for: PeerId },
+
+    /// The peer is told who each call is for, and this run acts for nobody.
+    ///
+    /// Refused rather than sent with the credential held for the peer: that
+    /// credential names nobody, and presenting it for a run with no chain is
+    /// the ambient authority a subject-bound peer was wired to rule out.
+    #[error(
+        "peer '{peer}' is called with a credential naming who asked, and this run acts \
+         for nobody — admit it under a chain"
+    )]
+    NoSubject { peer: PeerId },
+
+    /// A run admitted as the plane called a subject-bound peer, and the grant
+    /// holds no credential of the plane's own for it.
+    #[error(
+        "peer '{peer}' is called with a credential naming who asked; a run admitted as \
+         the plane presents the plane's own, and none is held for '{peer}'"
+    )]
+    NoPlaneCredential { peer: PeerId },
 
     /// The capability asked for is outside what this peer is granted.
     ///
@@ -410,6 +493,8 @@ impl PeerError {
             Self::Unknown { .. }
             | Self::Delegation { .. }
             | Self::WrongAudience { .. }
+            | Self::NoSubject { .. }
+            | Self::NoPlaneCredential { .. }
             | Self::NotGranted { .. }
             | Self::Unreachable { .. }
             | Self::Refused { .. } => Disposition::DidNotHappen,
@@ -672,31 +757,127 @@ pub struct PeerTaskSnapshot {
     pub value: Value,
 }
 
+/// On whose behalf a hop presents its credential.
+#[derive(Debug, Clone, Copy)]
+pub enum Asker<'a> {
+    /// The person this chain acts for — its owner.
+    Owner(&'a Delegation),
+    /// The plane itself: a run admitted under the plane's own chain.
+    Plane,
+    /// Nobody: a run that acts under no chain.
+    Nobody,
+}
+
+/// Which credential a hop presents: decided when the call is prepared,
+/// obtained when it is performed.
+///
+/// Obtained at `perform` because that is the one place that runs live and
+/// only live: a call is constructed on every pass, a replay included, and a
+/// replay must reach no token endpoint.
+#[derive(Debug, Clone)]
+enum Presentation {
+    /// The credential held for the peer, or none; it names nobody.
+    Held(Option<PeerCredential>),
+    /// The plane's own held credential, for a run admitted as the plane.
+    Plane(PeerCredential),
+    /// Obtained from the peer's source for the run's owner.
+    Subject {
+        source: Arc<dyn CredentialSource>,
+        subject: String,
+    },
+}
+
+impl Presentation {
+    /// What the announcement records about this hop's credential.
+    fn binding(&self, audience: &PeerId) -> CredentialBinding {
+        let audience = audience.to_string();
+        match self {
+            Self::Held(_) => CredentialBinding::Unbound { audience },
+            Self::Plane(_) => CredentialBinding::Plane { audience },
+            Self::Subject { subject, .. } => CredentialBinding::Subject {
+                audience,
+                subject: subject.clone(),
+            },
+        }
+    }
+
+    /// The credential to put on the wire, checked for its audience and
+    /// subject whichever source produced it.
+    ///
+    /// A failure here is a refusal before anything was sent: an issuer that
+    /// could not be reached is [`EffectError::Unavailable`], a credential
+    /// for somebody else is [`EffectError::Refused`].
+    async fn obtain(&self, audience: &PeerId) -> Result<Option<PeerCredential>, EffectError> {
+        match self {
+            Self::Held(held) => Ok(held.clone()),
+            Self::Plane(own) => Ok(Some(own.clone())),
+            Self::Subject { source, subject } => {
+                let obtained = source
+                    .credential(audience, subject, credentials::now())
+                    .await
+                    .and_then(|c| credentials::bound_to(c, audience, subject));
+                match obtained {
+                    Ok(c) => Ok(Some(c)),
+                    Err(CredentialError::Unavailable { detail, .. }) => {
+                        Err(EffectError::Unavailable {
+                            driver: audience.to_string(),
+                            detail,
+                        })
+                    }
+                    Err(refused) => Err(EffectError::Refused(refused.to_string())),
+                }
+            }
+        }
+    }
+}
+
+/// Map a peer's failure onto what it says about the world.
+fn effect_error(peer: &PeerId, error: &PeerError) -> EffectError {
+    let detail = error.to_string();
+    match error.disposition() {
+        Disposition::DidNotHappen => EffectError::Rejected(detail),
+        Disposition::InDoubt => EffectError::Interrupted {
+            driver: peer.to_string(),
+            detail,
+        },
+        Disposition::Landed => EffectError::Performed(detail),
+    }
+}
+
 /// A journaled, idempotent read of a remote task.
 #[derive(Debug)]
 pub struct PeerTaskCall {
     task: PeerTask,
     grant: PeerGrant,
-    credential: Option<PeerCredential>,
+    presentation: Presentation,
     client: Arc<dyn PeerClient>,
 }
 
 impl PeerTaskCall {
-    /// Prepare a task read under the same peer grant and audience-bound
-    /// credential as the call that created it.
+    /// Prepare a task read under the same peer grant as the call that
+    /// created it, presenting the credential `asker` is owed.
+    ///
+    /// # Errors
+    ///
+    /// [`PeerError::Unknown`] for an unregistered peer,
+    /// [`PeerError::WrongAudience`] for a held credential bound elsewhere,
+    /// and, at a peer with a credential source, [`PeerError::NoSubject`] for
+    /// a run acting for nobody and [`PeerError::NoPlaneCredential`] for a run
+    /// admitted as the plane with no held credential.
     pub fn prepare(
         registry: &PeerRegistry,
         client: Arc<dyn PeerClient>,
         task: PeerTask,
+        asker: Asker<'_>,
     ) -> Result<Self, PeerError> {
         let Some(grant) = registry.grant(&task.peer).cloned() else {
             return Err(PeerError::Unknown { peer: task.peer });
         };
-        let credential = registry.credential_for(&task.peer)?.cloned();
+        let presentation = registry.presentation(&task.peer, asker)?;
         Ok(Self {
             task,
             grant,
-            credential,
+            presentation,
             client,
         })
     }
@@ -737,22 +918,17 @@ impl Effect for PeerTaskCall {
         Trust::Untrusted
     }
 
+    fn credential_binding(&self) -> Option<CredentialBinding> {
+        Some(self.presentation.binding(&self.task.peer))
+    }
+
     async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let credential = self.presentation.obtain(&self.task.peer).await?;
         let value = self
             .client
-            .get_task(&self.task.peer, &self.task.id, self.credential.as_ref())
+            .get_task(&self.task.peer, &self.task.id, credential.as_ref())
             .await
-            .map_err(|error| {
-                let detail = error.to_string();
-                match error.disposition() {
-                    Disposition::DidNotHappen => EffectError::Rejected(detail),
-                    Disposition::InDoubt => EffectError::Interrupted {
-                        driver: self.task.peer.to_string(),
-                        detail,
-                    },
-                    Disposition::Landed => EffectError::Performed(detail),
-                }
-            })?;
+            .map_err(|error| effect_error(&self.task.peer, &error))?;
         let state = PeerTaskState::parse(&self.task.peer, &value).map_err(|error| {
             EffectError::Interrupted {
                 driver: self.task.peer.to_string(),
@@ -789,13 +965,13 @@ impl Effect for PeerTaskCall {
 pub struct PeerTaskCancel {
     task: PeerTask,
     grant: PeerGrant,
-    credential: Option<PeerCredential>,
+    presentation: Presentation,
     client: Arc<dyn PeerClient>,
 }
 
 impl PeerTaskCancel {
-    /// Prepare a cancellation under the same peer grant and audience-bound
-    /// credential as the call that created the task.
+    /// Prepare a cancellation under the same peer grant as the call that
+    /// created the task, presenting the credential `asker` is owed.
     ///
     /// # Errors
     ///
@@ -804,15 +980,16 @@ impl PeerTaskCancel {
         registry: &PeerRegistry,
         client: Arc<dyn PeerClient>,
         task: PeerTask,
+        asker: Asker<'_>,
     ) -> Result<Self, PeerError> {
         let Some(grant) = registry.grant(&task.peer).cloned() else {
             return Err(PeerError::Unknown { peer: task.peer });
         };
-        let credential = registry.credential_for(&task.peer)?.cloned();
+        let presentation = registry.presentation(&task.peer, asker)?;
         Ok(Self {
             task,
             grant,
-            credential,
+            presentation,
             client,
         })
     }
@@ -857,22 +1034,17 @@ impl Effect for PeerTaskCancel {
         Trust::Untrusted
     }
 
+    fn credential_binding(&self) -> Option<CredentialBinding> {
+        Some(self.presentation.binding(&self.task.peer))
+    }
+
     async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let credential = self.presentation.obtain(&self.task.peer).await?;
         let value = self
             .client
-            .cancel_task(&self.task.peer, &self.task.id, self.credential.as_ref())
+            .cancel_task(&self.task.peer, &self.task.id, credential.as_ref())
             .await
-            .map_err(|error| {
-                let detail = error.to_string();
-                match error.disposition() {
-                    Disposition::DidNotHappen => EffectError::Rejected(detail),
-                    Disposition::InDoubt => EffectError::Interrupted {
-                        driver: self.task.peer.to_string(),
-                        detail,
-                    },
-                    Disposition::Landed => EffectError::Performed(detail),
-                }
-            })?;
+            .map_err(|error| effect_error(&self.task.peer, &error))?;
         let state = PeerTaskState::parse(&self.task.peer, &value).map_err(|error| {
             EffectError::Interrupted {
                 driver: self.task.peer.to_string(),
@@ -937,6 +1109,50 @@ impl PeerRegistry {
             }),
         }
     }
+
+    /// Which credential a hop to `peer` presents for `asker`.
+    ///
+    /// A peer without a source presents the credential held for it, whoever
+    /// asked. A peer with one presents a credential naming the chain's owner,
+    /// the plane's own held credential for a run admitted as the plane, and
+    /// nothing at all for a run that acts for nobody.
+    ///
+    /// # Errors
+    ///
+    /// * [`PeerError::Unknown`] if the peer is not registered.
+    /// * [`PeerError::WrongAudience`] if the credential held is for someone else.
+    /// * [`PeerError::NoSubject`] for a run acting for nobody at a peer with a
+    ///   source.
+    /// * [`PeerError::NoPlaneCredential`] for a run admitted as the plane at a
+    ///   peer with a source and no held credential.
+    fn presentation(&self, peer: &PeerId, asker: Asker<'_>) -> Result<Presentation, PeerError> {
+        let Some(grant) = self.peers.get(peer) else {
+            return Err(PeerError::Unknown { peer: peer.clone() });
+        };
+        let held = self.credential_for(peer)?.cloned();
+        let Some(source) = grant.source.as_ref() else {
+            return Ok(Presentation::Held(held));
+        };
+        match asker {
+            Asker::Owner(chain) => Ok(Presentation::Subject {
+                source: Arc::clone(source),
+                subject: chain.owner().id.clone(),
+            }),
+            Asker::Plane => held
+                .map(Presentation::Plane)
+                .ok_or_else(|| PeerError::NoPlaneCredential { peer: peer.clone() }),
+            Asker::Nobody => Err(PeerError::NoSubject { peer: peer.clone() }),
+        }
+    }
+
+    /// Drop every credential held for `subject`, at every peer's source.
+    pub fn forget(&self, subject: &str) {
+        for grant in self.peers.values() {
+            if let Some(source) = grant.source.as_ref() {
+                source.forget(subject);
+            }
+        }
+    }
 }
 
 /// One request to one peer.
@@ -948,7 +1164,7 @@ pub struct PeerCall {
     grant: PeerGrant,
     /// The chain the *peer* acts under: ours, narrowed, with the peer appended.
     acting_as: Delegation,
-    credential: Option<PeerCredential>,
+    presentation: Presentation,
     client: Arc<dyn PeerClient>,
     /// Who is calling, sealed for this hop. Set by the runtime via
     /// [`Effect::attach`](crate::core::Effect::attach).
@@ -960,11 +1176,13 @@ pub struct PeerCall {
 }
 
 impl PeerCall {
-    /// Prepare a hop, attenuating the caller's authority onto the peer.
+    /// Prepare a hop, attenuating the caller's authority onto the peer and
+    /// presenting the credential the chain's owner is owed.
     ///
     /// # Errors
     ///
     /// * [`PeerError::Unknown`] if the peer is not registered — fail closed.
+    /// * [`PeerError::NotGranted`] if the capability is outside the grant.
     /// * [`PeerError::Delegation`] if the grant would widen the caller's own
     ///   authority, or if the chain is already at its depth limit.
     /// * [`PeerError::WrongAudience`] if the credential held is for someone else.
@@ -976,54 +1194,54 @@ impl PeerCall {
         capability: impl Into<String>,
         payload: Value,
     ) -> Result<Self, PeerError> {
-        let held = registry.credential_for(&peer)?.cloned();
-        Self::prepare_with_credential(registry, client, caller, peer, capability, payload, held)
-    }
-
-    /// Prepare a hop with a credential the caller obtained itself.
-    ///
-    /// For a [`CredentialSource`], which mints
-    /// against an expiry and therefore has to run at call time rather than at
-    /// configuration time. The audience is re-checked here regardless of where
-    /// the credential came from: a source is another place a mistake can be
-    /// made, and this is the last point before it goes on the wire.
-    ///
-    /// # Errors
-    ///
-    /// As [`PeerCall::prepare`], plus [`PeerError::WrongAudience`] if the
-    /// supplied credential is bound to a different peer.
-    #[allow(clippy::too_many_arguments)]
-    pub fn prepare_with_credential(
-        registry: &PeerRegistry,
-        client: Arc<dyn PeerClient>,
-        caller: &Delegation,
-        peer: PeerId,
-        capability: impl Into<String>,
-        payload: Value,
-        credential: Option<PeerCredential>,
-    ) -> Result<Self, PeerError> {
-        if let Some(c) = credential.as_ref()
-            && c.audience() != &peer
-        {
-            return Err(PeerError::WrongAudience {
-                held_for: c.audience().clone(),
-                peer,
-            });
-        }
         Self::build(
-            registry, client, caller, peer, capability, payload, credential,
+            registry,
+            client,
+            caller,
+            Asker::Owner(caller),
+            peer,
+            capability,
+            payload,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Prepare a hop for a run admitted as the plane, under the plane's own
+    /// chain.
+    ///
+    /// The plane is the party that asked, so a peer told who asked is shown
+    /// the plane's own credential rather than one naming the chain's owner as
+    /// if a person had asked.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare`](Self::prepare), plus [`PeerError::NoPlaneCredential`].
+    pub fn prepare_as_plane(
+        registry: &PeerRegistry,
+        client: Arc<dyn PeerClient>,
+        chain: &Delegation,
+        peer: PeerId,
+        capability: impl Into<String>,
+        payload: Value,
+    ) -> Result<Self, PeerError> {
+        Self::build(
+            registry,
+            client,
+            chain,
+            Asker::Plane,
+            peer,
+            capability,
+            payload,
+        )
+    }
+
     fn build(
         registry: &PeerRegistry,
         client: Arc<dyn PeerClient>,
         caller: &Delegation,
+        asker: Asker<'_>,
         peer: PeerId,
         capability: impl Into<String>,
         payload: Value,
-        credential: Option<PeerCredential>,
     ) -> Result<Self, PeerError> {
         let Some(grant) = registry.grant(&peer) else {
             return Err(PeerError::Unknown { peer });
@@ -1048,13 +1266,15 @@ impl PeerCall {
                 source: Box::new(source),
             })?;
 
+        let presentation = registry.presentation(&peer, asker)?;
+
         Ok(Self {
             provenance: None,
             grant: grant.clone(),
             capability,
             payload,
             acting_as,
-            credential,
+            presentation,
             peer,
             client,
             protected: Vec::new(),
@@ -1161,27 +1381,22 @@ impl Effect for PeerCall {
         self.provenance = Some(provenance.clone());
     }
 
+    fn credential_binding(&self) -> Option<CredentialBinding> {
+        Some(self.presentation.binding(&self.peer))
+    }
+
     async fn perform(&self) -> Result<Value, EffectError> {
+        let credential = self.presentation.obtain(&self.peer).await?;
         self.client
             .send(
                 &self.peer,
                 &self.capability,
                 &self.payload,
                 &self.acting_as,
-                self.credential.as_ref(),
+                credential.as_ref(),
                 self.provenance.as_ref(),
             )
             .await
-            .map_err(|e| {
-                let detail = e.to_string();
-                match e.disposition() {
-                    Disposition::DidNotHappen => EffectError::Rejected(detail),
-                    Disposition::InDoubt => EffectError::Interrupted {
-                        driver: self.peer.to_string(),
-                        detail,
-                    },
-                    Disposition::Landed => EffectError::Performed(detail),
-                }
-            })
+            .map_err(|e| effect_error(&self.peer, &e))
     }
 }

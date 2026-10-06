@@ -277,6 +277,11 @@ Exempt from the *verdict*, not from the count: a compensating effect still takes
 its slot and still reports its spend, so the overshoot is visible rather than
 silent — and a pass replaying that announcement bills the same one it did live.
 
+The exemption is the budget's alone. An undo is still checked against the
+agent's declaration and the policy, and one they refuse fails its compensation,
+which quarantines the run for a person to decide — the refusal is on the record,
+and the work it could not take back is still standing.
+
 A **group reversal** carries the same exemption, and needs it stated separately
 because it cannot be inferred: a reversal runs in the step's *forward* phase, so
 the phase — which is what exempts a compensating effect — says nothing about it.

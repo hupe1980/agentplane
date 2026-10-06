@@ -379,8 +379,8 @@ impl PlanIR {
 
     /// Nodes whose dependencies are all satisfied and which have not run.
     ///
-    /// Returned in a deterministic total order — topological rank, then id — so
-    /// replay reproduces dispatch order exactly. Without that, a plan with any
+    /// Returned in a deterministic total order — ascending step id — so replay
+    /// reproduces dispatch order exactly. Without that, a plan with any
     /// parallelism would replay differently every time.
     #[must_use]
     pub fn ready(&self, done: &BTreeSet<StepId>) -> Vec<StepId> {

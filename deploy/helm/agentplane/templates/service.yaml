@@ -1,0 +1,23 @@
+# The doors callers use: A2A peers and MCP frameworks.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agentplane.fullname" . }}
+  labels:
+    {{- include "agentplane.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if gt (int .Values.replicas) 1 }}
+  # A `2025-11-25` MCP session lives in the memory of the pod that opened it;
+  # a request routed to another pod is answered 404.
+  sessionAffinity: ClientIP
+  {{- end }}
+  selector:
+    {{- include "agentplane.selector" . | nindent 4 }}
+  ports:
+    - name: a2a
+      port: 8080
+      targetPort: a2a
+    - name: mcp
+      port: 8081
+      targetPort: mcp

@@ -40,6 +40,8 @@ mod mcp;
 /// model's host calls in and a governed run happens.
 #[cfg(feature = "mcp-server")]
 pub mod serve;
+#[cfg(feature = "mcp-server-http")]
+pub mod serve_http;
 // Not gated on a transport: a typed tool is a tool this process implements, and
 // needs no wire at all.
 mod typed;
@@ -1040,6 +1042,11 @@ impl Effect for ToolCall {
 
     fn sink_arguments(&self) -> Option<&Value> {
         Some(&self.arguments)
+    }
+
+    fn rebind(&mut self, arguments: Value) -> bool {
+        self.arguments = arguments;
+        true
     }
 
     fn protected_fields(&self) -> &[ProtectedField] {

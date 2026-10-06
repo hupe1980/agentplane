@@ -304,8 +304,17 @@ async fn handle_rejection(
         task.kind, task.priority
     );
     println!("       proposal  → {}", task.justification.proposed_action);
-    println!("       confidence→ {:?}", task.justification.confidence);
-    println!("       cost      → {:?}", task.justification.cost);
+    let shown = task.rendering();
+    println!(
+        "       confidence→ {}",
+        task.justification
+            .confidence
+            .map_or_else(|| "not stated".to_owned(), |c| c.to_string())
+    );
+    println!(
+        "       cost      → {}",
+        shown.cost.as_deref().unwrap_or("not stated")
+    );
 
     // Four eyes: the operator who asked for the switch may not approve it.
     let self_approval = rt

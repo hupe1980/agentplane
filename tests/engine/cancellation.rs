@@ -169,6 +169,39 @@ async fn suspended_run(f: &Fixture, target: &str) -> RunId {
 
 // ── The stop itself ─────────────────────────────────────────────────────────
 
+/// **A plane with no case store records a stop for a case-bound run.**
+///
+/// It cannot drive the run — what a resume wrote would sit outside the case —
+/// so it leaves the stop standing for the plane that can, as a plane with no
+/// provider does, rather than recording the request and then failing.
+#[tokio::test]
+async fn a_caseless_plane_records_a_stop_for_a_case_bound_run() {
+    let f = fixture(PostsThenWaits);
+    let run = suspended_run(&f, "demo.post").await;
+    let caseless = Runtime::builder(f.store.clone() as Arc<dyn JournalStore>)
+        .skill(PostsThenWaits)
+        .build();
+
+    let fresh = caseless
+        .request_cancel(run, &operator("ops-carol"), "withdrawn")
+        .await
+        .expect("the stop is recorded and left to the plane with the case store");
+    assert!(fresh);
+    assert!(
+        f.rt.recorded_outcome(run)
+            .await
+            .unwrap()
+            .is_none_or(|o| o.status.is_suspended()),
+        "the caseless plane drove the run"
+    );
+
+    f.rt.replay(run, Mode::Resume).await.expect("resumed");
+    assert!(matches!(
+        f.rt.recorded_outcome(run).await.unwrap().map(|o| o.status),
+        Some(RunStatus::Cancelled { .. })
+    ));
+}
+
 /// A suspended run stops, unwinds, and says who asked.
 #[tokio::test]
 async fn stopping_a_suspended_run_undoes_what_it_did() {
@@ -598,4 +631,164 @@ async fn the_conclusion_does_not_repeat_a_reason_its_own_record_holds() {
         }
         other => panic!("read back as {other:?}"),
     }
+}
+
+// ── Unwinding a resumed run ─────────────────────────────────────────────────
+
+/// Charges, returns what it charged, and undoes that exact charge.
+///
+/// The compensation writes the output it was handed into the world, so a
+/// test can see whether the unwind gave it the step's real result.
+#[derive(Debug)]
+struct Charges;
+
+#[async_trait::async_trait]
+impl Skill for Charges {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("charges").provides("demo.charge")
+    }
+
+    fn compensation(&self) -> Compensation {
+        Compensation::Compensatable
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let world = world_of(cx);
+        let out = cx
+            .effect(Ledger {
+                world,
+                what: "charged",
+            })
+            .await?;
+        Ok(Outcome::done(out))
+    }
+
+    async fn compensate(
+        &self,
+        cx: &mut StepCtx<'_>,
+        out: &Tainted<Value>,
+    ) -> Result<(), SkillError> {
+        world_of(cx)
+            .lock()
+            .unwrap()
+            .push(format!("refund of {}", out.peek()));
+        Ok(())
+    }
+}
+
+/// **A stop on a resumed run unwinds what the run did, as it did it.**
+///
+/// The stop lands on a writing resume. Were it checked before the recorded
+/// steps replay, the unwind would know only which steps mutated: it would
+/// hand each compensation `null` for the output it undoes, and walk the
+/// steps in id order rather than in reverse of the order they finished. The
+/// plan's ids run against its topology here so the two orders differ.
+#[tokio::test]
+async fn a_stopped_resume_unwinds_with_the_recorded_outputs_in_reverse_completion_order() {
+    use agentplane::core::{ArgSource, PlanIR, PlanNode, StepId};
+
+    let world: World = Arc::default();
+    WORLD.with(|w| *w.borrow_mut() = Some(Arc::clone(&world)));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .skill(Charges)
+        .skill(PostsThenWaits)
+        .build();
+
+    // Step 2 runs first; step 1 depends on it and suspends holding a posting.
+    let plan = PlanIR::new(vec![
+        PlanNode::new(2, "demo.charge").arg("input", ArgSource::run_input()),
+        PlanNode::new(1, "demo.post")
+            .arg("x", ArgSource::node(StepId(2)))
+            .terminal(),
+    ]);
+    let out = rt
+        .run_plan_correlated(
+            plan,
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-2")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+
+    rt.request_cancel(out.run_id, &operator("ops-carol"), "withdrawn")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *world.lock().unwrap(),
+        vec![
+            "charged".to_string(),
+            "posted".to_string(),
+            "reversed".to_string(),
+            r#"refund of {"posted":"charged"}"#.to_string(),
+        ],
+        "the interrupted step is undone first, and the completed one is handed \
+         the output it recorded"
+    );
+}
+
+/// **A stop on a resume whose ready set mixes recorded and new work unwinds
+/// what the run did.**
+///
+/// A parallel plan: step 1 finished and step 2 was still working when the
+/// run stopped, so the resume's first ready set holds both. The recorded
+/// step replays before the stop is checked, so the unwind hands its
+/// compensation the output it recorded, after undoing the interrupted step.
+#[tokio::test]
+async fn a_stop_on_a_mixed_ready_set_unwinds_with_the_recorded_outputs() {
+    use agentplane::core::{ArgSource, PlanIR, PlanNode};
+
+    let world: World = Arc::default();
+    WORLD.with(|w| *w.borrow_mut() = Some(Arc::clone(&world)));
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .tasks(store.clone() as Arc<dyn TaskStore>)
+        .skill(Charges)
+        .skill(PostsThenWaits)
+        .build();
+
+    let plan = PlanIR::new(vec![
+        PlanNode::new(1, "demo.charge")
+            .arg("input", ArgSource::run_input())
+            .terminal(),
+        PlanNode::new(2, "demo.post")
+            .arg("input", ArgSource::run_input())
+            .terminal(),
+    ]);
+    let out = rt
+        .run_plan_correlated(
+            plan,
+            Tainted::trusted(json!({})),
+            "dispute",
+            &[key("INV-3")],
+        )
+        .await
+        .unwrap();
+    assert!(out.status.is_suspended(), "got {:?}", out.status);
+
+    rt.request_cancel(out.run_id, &operator("ops-carol"), "withdrawn")
+        .await
+        .unwrap();
+
+    let seen = world.lock().unwrap().clone();
+    assert_eq!(
+        &seen[2..],
+        &[
+            "reversed".to_string(),
+            r#"refund of {"posted":"charged"}"#.to_string(),
+        ],
+        "the stop unwound before the recorded step replayed: {seen:?}"
+    );
 }

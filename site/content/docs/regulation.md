@@ -289,6 +289,15 @@ journal answers "what happened and can you prove it" regardless of which
 framework asks, so no framework-specific integration is needed or planned. The
 export is the integration: JSON Lines goes into whatever collects evidence.
 
+**The AI-logging standards.** ISO/IEC 24970 (*AI system logging*; FDIS ballot,
+stage 50.20, 28 August 2026) and CEN/CENELEC prEN 18229-1 (*AI trustworthiness
+framework — Part 1: Logging*; draft issued for public enquiry 5 June 2026) both
+specify the logging of an AI system's events. Against either, the journal is
+the log — every effect recorded before it is attempted, and hash-chained —
+and the export, under its [published format](@/docs/format.md), is the copy a
+second party reads without this crate. Neither is final and neither has been
+mapped clause by clause, so no conformance to either is claimed.
+
 ---
 
 ## 🙋 If you are evaluating this for a regulated deployment {#if-you-are-evaluating-this-for-a-regulated-deployment}
@@ -313,8 +322,8 @@ table is still the right one.**
 
 | Question | Answer |
 |---|---|
-| Which format-freeze conditions are not met? | Upcasters exercised end to end, and a rehearsed migration and rollback procedure → [the conditions](@/docs/status.md#format-freeze) |
-| Who threw an emergency stop, or placed a legal hold? | On the row, with what established the name — `authenticated` when a credential named it, `asserted` when somebody with the store typed it → [the stop](@/docs/operations.md#the-emergency-stop). Who *lifted* one is deliberately not retained |
+| Which format-freeze conditions are not met? | None; the freeze is an act not yet performed, and it lands with the checks that hold a frozen vector and the operator vocabulary's spellings, which are not yet in place → [the conditions](@/docs/status.md#format-freeze) |
+| Who threw an emergency stop, or placed a legal hold — and who lifted it? | On the row while it stands, with what established the name — `authenticated` when a credential named it, `asserted` when somebody with the store typed it → [the stop](@/docs/operations.md#the-emergency-stop). A lift or release is journaled as a sealed run of its own (`halt-lifted`, `hold-released`) naming the lifter the same way, listed by `GET /halts?state=lifted` and `GET /holds?state=released` |
 | How much data did a run send? | `EffectStarted.outbound_bytes`, per effect → [volume](@/docs/security.md#volume-is-not-sensitivity-and-the-journal-records-it). `Budget::max_egress_bytes` bounds it, exactly — the size is known before dispatch, so the call that would cross the ceiling is the call refused |
 | How often did policy stop a run from *starting*? | The `agentplane.policy.denials` metric, by action. Not the journal, and [deliberately](@/docs/operations.md#what-no-audit-can-answer-the-runs-that-never-started) |
 | What does `max_denials` actually bound? | The refusals a model can probe — sink refusals, which come back as `REFUSED` and let the loop continue. An engine denial ends the run in that same loop → [what it counts](@/docs/security.md#what-max-denials-counts) |

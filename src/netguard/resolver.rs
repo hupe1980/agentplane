@@ -70,6 +70,7 @@ pub(crate) enum Reach {
         feature = "providers",
         feature = "witness-http",
         feature = "keyring-vault",
+        feature = "a2a",
     ))]
     Configured,
 }
@@ -102,6 +103,7 @@ where
             feature = "providers",
             feature = "witness-http",
             feature = "keyring-vault",
+            feature = "a2a",
         ))]
         Reach::Configured => true,
         // Named rather than inferred: the exception covers a host that *is*
@@ -340,6 +342,7 @@ mod tests {
                 feature = "providers",
                 feature = "witness-http",
                 feature = "keyring-vault",
+                feature = "a2a",
             ))]
             return vec![Reach::Configured];
             #[cfg(not(any(
@@ -347,6 +350,7 @@ mod tests {
                 feature = "providers",
                 feature = "witness-http",
                 feature = "keyring-vault",
+                feature = "a2a",
             )))]
             return Vec::new();
         }

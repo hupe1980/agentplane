@@ -245,6 +245,15 @@ pub trait JournalStore: Send + Sync + Debug {
     /// the durable state, not about the layers in front of it.
     fn is_shared(&self) -> bool;
 
+    /// Whether this store seals payloads on append, rewriting what it is
+    /// handed.
+    ///
+    /// No default, for the reason [`Self::is_shared`] has none. A restore
+    /// asks it: it must write each record's bytes exactly as they were
+    /// recorded, and a sealing store would seal an already sealed payload
+    /// again. A decorator that does not seal delegates.
+    fn seals(&self) -> bool;
+
     /// This store's own transaction, when a co-located resource can join it.
     ///
     /// `None` — the default — means the backend cannot offer it, which is the
@@ -457,6 +466,23 @@ pub trait JournalStore: Send + Sync + Debug {
         after: Option<(u64, RunId)>,
         limit: usize,
     ) -> Result<Vec<(RunId, u64)>, StoreError>;
+
+    /// Every run this tenant holds records for, by run id ascending, one
+    /// bounded page strictly after `after`.
+    ///
+    /// For a walk that must see each run exactly once while the plane keeps
+    /// writing. [`recent_runs`](Self::recent_runs) orders by last append, so a
+    /// run that appends during a walk jumps above the cursor and is never
+    /// served; a run's id never moves.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError>;
 
     /// [`recent_runs`](Self::recent_runs), narrowed to the runs one producer
     /// admitted: those whose `RunAdmitted` carries an admission key whose
@@ -748,6 +774,59 @@ pub trait JournalStore: Send + Sync + Debug {
     ///
     /// If the store is unreachable.
     async fn inclusion_proof(&self, run: RunId) -> Result<Option<Inclusion>, StoreError>;
+
+    /// Prove a sealed run is in the log as it stood at `size` leaves — the
+    /// checkpoint an earlier [`checkpoint`](Self::checkpoint) returned, not the
+    /// live one.
+    ///
+    /// `None` for a run that is unsealed or whose position is not below `size`.
+    /// A disclosure package carries paths against its header's checkpoint, and
+    /// a run sealed while it is written must not move them. The default answers
+    /// only while the log is still at `size`, and refuses otherwise rather than
+    /// return a path against another tree; a backend that holds the leaves
+    /// answers at any past size.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable, `size` exceeds the log, or the store cannot
+    /// prove at a past size.
+    async fn inclusion_proof_at(
+        &self,
+        run: RunId,
+        size: u64,
+    ) -> Result<Option<Inclusion>, StoreError> {
+        match self.inclusion_proof(run).await? {
+            Some(inc) if inc.index >= size => Ok(None),
+            Some(inc) if inc.size == size => Ok(Some(inc)),
+            Some(inc) => Err(StoreError::Backend(format!(
+                "this store proves inclusion only against its live log ({} leaves), and \
+                 {size} was asked for",
+                inc.size
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Where each of `runs` sits in the log — its index and leaf — or `None`
+    /// for a run that is not sealed, in the order asked.
+    ///
+    /// What an export needs per run, without the proof. The default asks
+    /// [`inclusion_proof`](Self::inclusion_proof) once per run, which reads the
+    /// whole log each time; a backend answers from one pass over the log.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable.
+    async fn log_positions(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<Option<(u64, Digest)>>, StoreError> {
+        let mut out = Vec::with_capacity(runs.len());
+        for &run in runs {
+            out.push(self.inclusion_proof(run).await?.map(|i| (i.index, i.seal)));
+        }
+        Ok(out)
+    }
 
     /// Ask a run to stop, durably.
     ///

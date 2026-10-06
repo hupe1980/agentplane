@@ -2528,6 +2528,24 @@ fn oversight_without_a_declarative_agent_is_refused() {
     Manifest::parse(&declared).expect("oversight binds for a declarative agent");
 }
 
+/// A deadline of zero or fewer units is refused at parse: it would be due, or
+/// overdue, the moment it is registered.
+#[test]
+fn an_oversight_deadline_counts_at_least_one_unit() {
+    for n in ["0", "-1", "1.5"] {
+        let declared = DECLARATIVE.replace(
+            "  identity:",
+            &format!(
+                "  oversight:\n    approval: required\n    deadline: {{ name: same-day, kind: hours, params: {{ n: {n} }} }}\n  identity:"
+            ),
+        );
+        match Manifest::parse(&declared) {
+            Err(ManifestError::Syntax(detail)) => assert!(detail.contains("params.n"), "{detail}"),
+            other => panic!("a deadline of {n} hours was not refused: {other:?}"),
+        }
+    }
+}
+
 /// Acting unattended has to be written down.
 ///
 /// A coded skill can only spell it `Expiry::ProceedUnattended`. The
@@ -3404,6 +3422,12 @@ spec:
             assert_eq!(field, "spec.models.privileged.max_input_tokens");
         }
         other => panic!("a zero input ceiling, which fails every call, was accepted: {other:?}"),
+    }
+    match Manifest::parse(&yaml.replace("max_tokens: 50,", "max_tokens: 0,")) {
+        Err(ManifestError::Unenforceable { field, .. }) => {
+            assert_eq!(field, "spec.models.quarantined.max_tokens");
+        }
+        other => panic!("a zero output ceiling, which fails every call, was accepted: {other:?}"),
     }
 }
 
@@ -5891,6 +5915,31 @@ async fn an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody() {
         3,
         "strict replay called a model — a consultation was performed again"
     );
+
+    // The consultation's journaled answer names the sub-run that did the
+    // work, so a reader of the editor's journal can follow it there.
+    let records = store.read(out.run_id, 1).await.expect("records");
+    let sub_run = records
+        .iter()
+        .find_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::EffectDone { output, .. } => output
+                .get("run")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            _ => None,
+        })
+        .expect("the consultation's answer names the run that produced it");
+    let sub_run = agentplane::core::RunId::parse(&sub_run).expect("a run id");
+    assert_ne!(sub_run, out.run_id);
+    let admitted = store.read_page(sub_run, 1, 1).await.expect("the sub-run");
+    assert!(
+        matches!(
+            admitted.first().map(agentplane::journal::Record::kind),
+            Some(agentplane::journal::RecordKind::RunAdmitted { capability, .. })
+                if capability == "research.summarise"
+        ),
+        "the named run is not the researcher's"
+    );
 }
 
 /// Every field an agent grant cannot back is refused at parse, with the
@@ -7441,8 +7490,8 @@ fn rated(rate_limit: &str) -> String {
 /// refused at parse.**
 ///
 /// A zero count is a grant that forbids its own tool, which a reviewer reads
-/// as a grant; a zero window counts nothing; and a window past the calendar
-/// has no instant to subtract it from.
+/// as a grant; a zero window counts nothing; and a window past 31 days is
+/// longer than a store keeps the count.
 #[test]
 fn a_rate_ceiling_that_admits_nothing_is_refused() {
     let parsed = Manifest::parse(&rated("{ count: 20, window_seconds: 3600 }"))
@@ -7458,8 +7507,8 @@ fn a_rate_ceiling_that_admits_nothing_is_refused() {
         ("{ count: 0, window_seconds: 3600 }", "a zero count"),
         ("{ count: 20, window_seconds: 0 }", "a zero window"),
         (
-            "{ count: 20, window_seconds: 631107417600 }",
-            "a window past the calendar",
+            "{ count: 20, window_seconds: 2678401 }",
+            "a window past the retained count",
         ),
     ] {
         match Manifest::parse(&rated(declared)) {
@@ -7501,4 +7550,298 @@ fn a_rate_ceiling_changes_the_manifest_digest() {
         "raising a rate ceiling left the digest unchanged, so the revision that ran \
          cannot say which ceiling bound it"
     );
+}
+
+/// A `call` agent: one grant, the input as its arguments, no model.
+const CALL: &str = r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: teller, version: "1.0.0" }
+spec:
+  identity: { role: Move funds. }
+  capabilities: { provides: [ledger.transfer] }
+  input:
+    schema:
+      type: object
+      additionalProperties: false
+      properties:
+        recipient: { type: string }
+  tools:
+    - ref: tool://ledger/transfer
+      mutates: true
+      protected_fields:
+        - path: /recipient
+          allowed_sources: ["peer:bot"]
+  execution: { kind: call }
+  budgets: {}
+"#;
+
+/// The refusal a `call` variant earns, as text.
+fn call_refusal(yaml: &str) -> String {
+    match Manifest::parse(yaml) {
+        Ok(_) => panic!("a `call` manifest that should be refused parsed:\n{yaml}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn a_call_agent_parses_with_one_gated_grant_and_an_input_shape() {
+    let m = Manifest::parse(CALL).expect("the governed `call` shape parses");
+    assert_eq!(
+        m.spec.execution.as_ref().map(|e| e.kind.as_str()),
+        Some("call")
+    );
+}
+
+/// Each field a `call` run would never read, and each missing one it needs,
+/// is refused by name, with the fix.
+#[test]
+fn a_call_agent_refuses_what_it_would_not_read_or_cannot_run_without() {
+    let two_grants = CALL.replace(
+        "  execution: { kind: call }",
+        "    - ref: tool://ledger/read\n      mutates: false\n  execution: { kind: call }",
+    );
+    let no_grant = CALL.replace(
+        "  tools:\n    - ref: tool://ledger/transfer\n      mutates: true\n      protected_fields:\n        - path: /recipient\n          allowed_sources: [\"peer:bot\"]\n",
+        "",
+    );
+    let no_input = CALL.replace(
+        "  input:\n    schema:\n      type: object\n      additionalProperties: false\n      properties:\n        recipient: { type: string }\n",
+        "",
+    );
+    let with = |block: &str| {
+        CALL.replace(
+            "  execution: { kind: call }",
+            &format!("{block}\n  execution: {{ kind: call }}"),
+        )
+    };
+    let cases = [
+        (two_grants, "spec.tools", "exactly one grant"),
+        (no_grant, "spec.tools", "exactly one grant"),
+        (no_input, "spec.input", "declare the shape"),
+        (
+            with("  models: { privileged: { provider: fake, model: m-1 } }"),
+            "spec.models",
+            "remove `spec.models`",
+        ),
+        (
+            with("  memory: { recall: { subject: team/support, limit: 3 } }"),
+            "spec.memory",
+            "remove `spec.memory`",
+        ),
+        (
+            with("  output: { schema: { type: object, properties: { ok: { type: boolean } } } }"),
+            "spec.output",
+            "remove `spec.output`",
+        ),
+    ];
+    for (yaml, field, fix) in cases {
+        let said = call_refusal(&yaml);
+        assert!(
+            said.contains(field) && said.contains(fix),
+            "the refusal must name `{field}` and the fix `{fix}`, got: {said}"
+        );
+    }
+}
+
+/// **A `call` agent's input is its tool's arguments, so it must be closed**:
+/// an open object would let a caller send arguments nobody reviewed.
+#[test]
+fn a_call_agent_with_an_open_input_is_refused() {
+    let open = CALL.replace(
+        "      additionalProperties: false\n      properties:\n        recipient",
+        "      properties:\n        recipient",
+    );
+    let said = call_refusal(&open);
+    assert!(
+        said.contains("spec.input.schema") && said.contains("additionalProperties: false"),
+        "the refusal must name the open input and the fix, got: {said}"
+    );
+}
+
+/// **A mutating grant with no field rules cannot fire for a served caller**,
+/// whose input is untrusted — refused at parse, as for `tool-calling`.
+#[test]
+fn a_call_with_an_ungated_mutating_grant_is_refused() {
+    let ungated = CALL.replace(
+        "      protected_fields:\n        - path: /recipient\n          allowed_sources: [\"peer:bot\"]\n",
+        "",
+    );
+    let said = call_refusal(&ungated);
+    assert!(
+        said.contains("protected_fields") && said.contains("execution.kind: call"),
+        "the refusal must name the missing field rules and the kind, got: {said}"
+    );
+}
+
+/// **Whether a run may suspend is judged from the declaration, conservatively.**
+#[test]
+fn may_suspend_holds_for_every_declaration_that_can_wait() {
+    let call = Manifest::parse(CALL).expect("call");
+    assert!(!call.may_suspend(|_| false), "a plain `call` cannot wait");
+    assert!(
+        call.may_suspend(|server| server == "ledger"),
+        "a grant whose server is a peer may return a task the run waits on"
+    );
+    let gated = Manifest::parse(&CALL.replace(
+        "      mutates: true\n",
+        "      mutates: true\n      requires_approval: true\n",
+    ).replace(
+        "  execution: { kind: call }",
+        "  oversight:\n    approval: tools-only\n    deadline: { name: review, kind: hours, params: { n: 4 } }\n  execution: { kind: call }",
+    ))
+    .expect("gated");
+    assert!(gated.may_suspend(|_| false), "an approval opens a task");
+    let coded = Manifest::parse(GOOD).expect("coded");
+    assert!(
+        coded.may_suspend(|_| false),
+        "a coded skill may do anything"
+    );
+}
+
+/// A data subject is read from the run; a constant would attribute every
+/// run's intake to one party.
+#[test]
+fn a_literal_data_subject_is_refused() {
+    let declared =
+        |binding: &str| Manifest::parse(&format!("{BOUND}  data_subjects: [\"{binding}\"]\n"));
+    let refused = declared("acme-customer").expect_err("a literal is refused");
+    assert!(refused.to_string().contains("is a literal"), "{refused}");
+    for binding in ["$input/customer/id", "$case"] {
+        let m = declared(binding).unwrap_or_else(|e| panic!("{binding}: {e}"));
+        assert_eq!(m.spec.data_subjects[0].to_string(), binding);
+    }
+}
+
+/// **A correlation key is refused as a data subject.** Every case record holds
+/// the key in the clear, so a subject read from one could be neither sealed
+/// nor erased.
+#[test]
+fn a_correlation_data_subject_is_refused() {
+    let refused = Manifest::parse(&format!(
+        "{BOUND}  data_subjects: [\"$correlation/customer\"]\n"
+    ))
+    .expect_err("a correlation key is refused");
+    assert!(refused.to_string().contains("in the clear"), "{refused}");
+}
+
+/// **A refused binding opens no case.** Bindings resolve before the run is
+/// correlated, so a message its agent cannot read a subject from leaves the
+/// case store as it found it; a `$case` binding still names the case the run
+/// was bound to.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_refused_subject_binding_opens_no_case() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::CorrelationKey;
+    use agentplane::journal::{JournalStore, RecordKind};
+    use agentplane::runtime::{Agent, RunTerms, Runtime};
+    use serde_json::json;
+
+    let m = Manifest::parse(&format!(
+        "{BOUND}  data_subjects: [\"$input/customer/id\", \"$case\"]\n"
+    ))
+    .expect("parse");
+    let store = std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let runtime =
+        Runtime::builder(std::sync::Arc::clone(&store) as std::sync::Arc<dyn JournalStore>)
+            .cases(std::sync::Arc::clone(&store) as std::sync::Arc<dyn CaseStore>)
+            .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
+            .build();
+    let key = [CorrelationKey::new("document", "D-1")];
+
+    let refused = runtime
+        .run_under(
+            "work.do",
+            Tainted::trusted(json!({ "customer": {} })),
+            RunTerms::default().correlated("work", &key),
+        )
+        .await
+        .expect_err("an unresolvable binding refuses the run");
+    assert!(
+        matches!(&refused, agentplane::RuntimeError::SubjectUnbound { .. }),
+        "{refused}"
+    );
+    assert!(
+        CaseStore::cases(store.as_ref(), None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused admission opened a case"
+    );
+
+    let admitted = runtime
+        .run_under(
+            "work.do",
+            Tainted::trusted(json!({ "customer": { "id": "cust-17" } })),
+            RunTerms::default().correlated("work", &key),
+        )
+        .await
+        .expect("a resolvable binding admits the run");
+    let run = admitted.outcome().expect("fresh").run_id;
+    let records = JournalStore::read(store.as_ref(), run, 1).await.unwrap();
+    let case = records
+        .iter()
+        .find_map(|r| r.body.case)
+        .expect("the run is case-bound");
+    let bound = records
+        .iter()
+        .find_map(|r| match &r.body.kind {
+            RecordKind::DataSubjectBound { bindings } => Some(bindings.clone()),
+            _ => None,
+        })
+        .expect("the run recorded its bindings");
+    assert_eq!(bound[1].subject, case.to_string());
+}
+
+/// **A binding that resolves to nothing refuses the run**, naming the binding,
+/// and nothing is journaled; one that resolves records the subject.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_subject_binding_that_cannot_resolve_fails_the_run() {
+    use agentplane::journal::{JournalStore, RecordKind};
+    use agentplane::runtime::{Agent, Runtime};
+    use serde_json::json;
+
+    let m = Manifest::parse(&format!(
+        "{BOUND}  data_subjects: [\"$input/customer/id\"]\n"
+    ))
+    .expect("parse");
+    let store = std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let runtime =
+        Runtime::builder(std::sync::Arc::clone(&store) as std::sync::Arc<dyn JournalStore>)
+            .agent(Agent::new(&m).skill(Claims("worker", "work.do")))
+            .build();
+
+    let refused = runtime
+        .run("work.do", Tainted::trusted(json!({ "customer": {} })))
+        .await
+        .expect_err("an unresolvable binding refuses the run");
+    assert!(
+        matches!(
+            &refused,
+            agentplane::RuntimeError::SubjectUnbound { binding, .. } if binding == "$input/customer/id"
+        ),
+        "{refused}"
+    );
+
+    let out = runtime
+        .run(
+            "work.do",
+            Tainted::trusted(json!({ "customer": { "id": "cust-17" } })),
+        )
+        .await
+        .expect("a resolvable binding admits the run");
+    let records = JournalStore::read(store.as_ref(), out.run_id, 1)
+        .await
+        .unwrap();
+    let bound = records
+        .iter()
+        .find_map(|r| match &r.body.kind {
+            RecordKind::DataSubjectBound { bindings } => Some(bindings.clone()),
+            _ => None,
+        })
+        .expect("the run recorded its binding");
+    assert_eq!(bound[0].subject, "cust-17");
+    assert!(bound[0].trusted);
 }

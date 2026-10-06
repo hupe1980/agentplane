@@ -23,7 +23,7 @@ and pinned by machine-readable vectors.
 
 ## 1. Versioning {#versioning}
 
-Four version numbers, each answering a different question. A reader that cannot
+Each version number answers a different question. A reader that cannot
 interpret one **refuses**; it never guesses, and it never treats an
 unrecognised value as the current one.
 
@@ -33,13 +33,22 @@ unrecognised value as the current one.
 | `v` | every record body | The record body's own shape |
 | export `version` | export header | The export file's framing |
 | envelope byte 0 | every sealed payload | The sealed-envelope layout |
+| sidecar `version` | a [grader-verdict sidecar](#grader-verdict) | The sidecar's own shape |
 
-All four are **1** in this specification.
+Each is **1** in this specification.
 
 They are deliberately independent. A run written under another `canon` is
 *unverifiable by this reader*, which is a different finding from *this run
 diverged* — an audit must report unknown scope as prominently as corruption and
 never as corruption.
+
+**A record's hash covers its bytes at whatever `v` they carry.** A reader
+compares `v` before it believes the shape: a record at an older `v` is lifted
+to the shape the reader knows, or refused as a version skew — never as an edit,
+since its bytes still hash as written. A restore writes each record back byte
+for byte, so a chain restored across a shape change hashes as the exported one.
+The order a deployment takes a new `v` in is
+[readers before writers](@/docs/upgrading.md#readers-first).
 
 ## 2. Primitives {#primitives}
 
@@ -235,6 +244,62 @@ irNutGGI+kpEEwQrBb3xjEEWKohYs7xnm603736/WBQ=
 The size is a canonical decimal number: no sign, no leading zero, no
 surrounding space, because each of those is a second spelling of one log.
 
+### Cosignature {#cosignature}
+
+A witness vouches that it saw a checkpoint by cosigning its note body. A
+cosigned checkpoint travels as a C2SP
+[`signed-note`](https://github.com/C2SP/C2SP/blob/main/signed-note.md): the
+body, one blank line, then one line per signature.
+
+```
+<body>
+                                         ← the blank line; not part of the body
+— <name> <base64( key_id ‖ payload )>
+```
+
+Each signature line begins with an em dash (U+2014) and a space; the name ends
+at the next space; the rest is standard base64 with padding. A note with
+several lines carries several signatures over the same body.
+
+For an Ed25519 cosigner (C2SP
+[`tlog-cosignature`](https://github.com/C2SP/C2SP/blob/main/tlog-cosignature.md)):
+
+```
+key_id    = SHA-256( name ‖ 0x0A ‖ 0x04 ‖ public key )[0..4]
+payload   = timestamp (8 bytes, big-endian, seconds since the Unix epoch)
+          ‖ signature (64 bytes)                         — exactly 72 bytes
+message   = "cosignature/v1\n" ‖ "time " ‖ decimal(timestamp) ‖ "\n" ‖ body
+signature = Ed25519( message )
+```
+
+`body` is the checkpoint note above, including its final newline and
+excluding the blank line and every signature line. The timestamp in the
+message is the payload's own, in canonical decimal. There is no domain hash:
+the `cosignature/v1` header is the domain separation, and it is what keeps a
+cosignature from being read as the log's own note signature (type `0x01`),
+which covers the body alone.
+
+A line is a cosignature only when all of these hold:
+
+- its name **and** its four-byte key id both match one trusted key — a line
+  whose name matches and whose id does not, or the reverse, is ignored;
+- its payload is exactly 72 bytes;
+- its timestamp is not zero and is at most 2^63 − 1;
+- the signature verifies over the message under that key.
+
+A note none of whose lines is a cosignature is a checkpoint the operator could
+have produced, however many lines it carries.
+
+**Freshness.** The timestamp is the witness's own claim about when it saw the
+log, covered by its signature. A verifier holding a maximum age judges it per
+witness key: the latest timestamp among that key's verified cosignatures over
+every anchor it was given. Older than the maximum before the verifier's clock,
+or ahead of the verifier's clock by more than the maximum, is a finding naming
+the key. Keys are never compared with each other. Only a timestamp whose
+cosignature verified is judged; an unverified one is an unauthenticated number.
+A suffix appended and removed after a key's latest time is not detectable —
+freshness bounds *when* truncation could have happened, not *whether*.
+
 ## 8. Sealed payloads {#sealed-payloads}
 
 Where a key ring is configured, a payload is replaced in the record **before**
@@ -303,8 +368,9 @@ JSON Lines, UTF-8, one object per line, in this order:
 
 **Framing lines carry a `kind` member; record lines do not.** That is the
 dispatch rule, and it is the only one: a line whose top-level `kind` is one of
-the four framing names is that kind of frame, and a line with no top-level
-`kind` is a record belonging to the run block above it. A record's *own* kind
+the framing names is that kind of frame, and a line with no top-level
+`kind` is a record belonging to the run block above it. A
+[disclosure package](#package) is the same file with its own first line. A record's *own* kind
 is inside its body, one level down, and must not be mistaken for the frame's.
 
 **A framing member this reader does not know bounds the verdict; it does not
@@ -345,6 +411,7 @@ Both implementations of this specification do so.
 | `run` | id string, `run_` + ULID | always |
 | `index` | integer, the position in the Merkle log | omitted for an open run |
 | `seal` | digest hex, the run's terminal chain hash | omitted for an open run |
+| `proof` | array of digest hex, leaf-upwards | in a [package](#package) only, with `index` |
 
 `index` and `seal` are present together or not at all. Their absence means the
 run is not in the log, which is a state and not a gap.
@@ -400,14 +467,14 @@ than trusting either alone.
 | `case` | the case: `id`, `kind`, `status`, `correlation`, `state`, `version`, `opened_at`, `runs` |
 | `deadlines` | the case's obligations, each with `case`, `name`, `resolved_at`, `calendar_digest`, `state` and optionally `warn_at` and `acknowledged` |
 | `blobs` | digest hex strings |
-| `hold` | `null`, or the legal hold on the matter: `placed_at`, `reason`, and `by` — the operator who placed it, as `actor` and `basis` (`authenticated`, `asserted` or `connected`) |
+| `hold` | `null`, or the legal hold on the matter, with exactly these members: `placed_at` (an RFC 3339 instant), `reason`, and `by` — the operator who placed it, as `actor` and `basis` (`authenticated`, `asserted` or `connected`) |
 
 `hold` is required. A restore places it again with its original instant, reason
 and operator; a reader that finds it missing or malformed reports a finding and a
 restore refuses the file, because a matter restored without its hold is one the
 next retention pass erases.
 
-`case.id` is the bare ULID — the same spelling a record body's `case` member
+`case.id` is `case_<ulid>` — the same spelling a record body's `case` member
 carries, which is what makes the cross-layer check a string comparison.
 
 `state` travels **as stored**: sealed on a sealed plane. Exporting plaintext
@@ -416,8 +483,9 @@ would quietly undo erasure.
 The case layer is mandatory rather than an optional extension — a reader that
 tolerated its absence could not tell *this plane has no cases* from *the case
 layer was dropped from this file*, and the second is the finding that matters.
-A plane with no case store exports zero case blocks and says `"cases":0` in the
-trailer.
+A writer always reads the plane's case store; one holding no cases exports zero
+case blocks and says `"cases":0` in the trailer. Records naming a case in a file
+with no case block are a finding like any other missing case.
 
 Blob **bytes** are never in the file. Presence and integrity of bytes are a
 question about a live store, which an offline file honestly reports as
@@ -447,23 +515,73 @@ crash, a full disk or a killed pipe ends without one, so a reader tells a
 prefix from a whole file without comparing counts against a source it does not
 have.
 
+### Disclosure package {#package}
+
+A **disclosure package** is an export of chosen runs — one matter, not the
+plane — that says so in its first line:
+
+```json
+{"kind":"agentplane.disclosure","version":1,
+ "checkpoint":{"origin":"…","size":3,"root":"<hex>"},"canon":1,
+ "selection":{"cases":["case_<ulid>"],"runs":[]}}
+```
+
+| Member | Type |
+|---|---|
+| `kind` | `"agentplane.disclosure"` |
+| `version` | the export format's version, `1` — a package moves with the export format |
+| `checkpoint` | the checkpoint every `proof` in the file is against |
+| `canon` | as in the [header](#header) |
+| `selection` | `cases` and `runs`, arrays of ids, as asked; at least one is non-empty |
+
+The rest of the file is an export's lines, with three differences:
+
+- each sealed run block carries `proof`, the sibling hashes that prove its
+  `seal` at `index` in the tree of `checkpoint.size` leaves;
+- the case layer is the selected cases plus every case a carried record names —
+  not every case the plane holds. Each carried case travels as its whole
+  block: state, deadlines, blob digests, hold reason, and the ids of every run
+  it holds, including runs the package does not carry;
+- `runs_requested` counts the runs the selection resolved to.
+
+Every run the package carries whose conclusion seals is placed: one sealed
+after the writer's checkpoint is written again against a later one, and a
+writer that cannot place it refuses rather than carry it open.
+
+A case contributes the runs it held when the package was written. Records
+travel as stored, sealed where the plane seals; a package carries no key
+material. A reader that rebuilds or re-derives over a whole file — a restore, a
+replay, a policy check, a grant report — refuses a package by name.
+
 ## 10. Verifying an export {#verifying}
 
 An implementation that does the following has verified the file.
 
-1. **Header.** Refuse an unknown `version`. Record `canon`; if it is not a rule
-   this reader implements, every digest below is *unverifiable* rather than
-   *wrong*, and the report must say which. A `size` of 0 beside any root other
+1. **Header.** Refuse an unknown `version`. If `canon` is not a rule this
+   reader implements, stop here: every digest below is *unverifiable* rather
+   than *wrong*, so the report is neither sound nor a finding, and says
+   `unverifiable (unknown canon)`. `agentplane verify` and
+   `tools/verify_export.py` both exit `6` for it, and `agentplane restore`
+   refuses such a file with the same status before opening the store. A `size` of 0 beside any root other
    than the empty root is a checkpoint describing a log that cannot exist.
+   The header is the first non-empty line and only it: a header of either kind
+   on a later line is a finding and is ignored, because it would re-choose the
+   checkpoint and the rules for every run after it.
 2. **Per record.** Recompute `SHA-256(prev_hash ‖ raw)` and compare with
    `hash` **before parsing `raw`**. Bytes that do not hash to their claim were
-   edited, whatever they parse as. Only bytes that do may make a parse failure
+   edited, whatever they parse as. Bytes that do must be canonical under the
+   header's `canon`: parse them as a JSON value and canonicalize it, and bytes
+   that differ — a space, a member out of order, a member written twice — are a
+   finding, which a restore refuses. Only canonical bytes that hash to their
+   claim may make a parse failure
    a *build skew* — a newer writer's shape — rather than damage. Then parse
-   `raw` and compare the result with `body` — the two must agree, or the
-   file's readable half is saying something its hashed half does not.
-3. **Per run.** `prev_hash` of the first record is 32 zero bytes; every later
-   record's `prev_hash` is its predecessor's `hash`; `seq` is contiguous and
-   ascending; and every record's own `body.run` is the run its block claims.
+   `raw` and compare the result with `body` — the two must agree, type for
+   type (`1`, `1.0` and `true` differ), or the file's readable half is saying
+   something its hashed half does not. A line escaping a lone surrogate is not
+   JSON this format admits.
+3. **Per run.** `prev_hash` of the first record is 32 zero bytes and its
+   `seq` is 1; every later record's `prev_hash` is its predecessor's `hash`;
+   `seq` is contiguous and ascending; and every record's own `body.run` is the run its block claims.
    That last one is not redundant: without it an export could file run B's
    records and B's leaf under A's id, and chain, seal and root would all verify
    B's bytes. Only the *label* lied, and the label is what a reader looks a run
@@ -476,9 +594,33 @@ An implementation that does the following has verified the file.
    record with no signature is unsigned, which is a state; a *strict*
    verification refuses it, and stripping signatures must not be a way to
    pass. A verifier that does not check signatures must say so in its report.
+
+   The format publishes three signatures, and both readers check all three
+   against keys the auditor supplies, in three disjoint sets:
+
+   | Signature | `agentplane verify` | `tools/verify_export.py` |
+   |---|---|---|
+   | [Record](#signature) | `--key KEY_ID=HEX` | `--key KEY_ID=HEX` |
+   | [Witness cosignature](#cosignature) on a note anchor | `--checkpoint NOTE --witness-key NAME=BASE64`, or a `--witness` fetch | the note as an anchor argument, `--witness-key NAME=BASE64` |
+   | [Grader verdict](#grader-verdict) | `--grader-verdict FILE --grader-key KEY_ID=HEX` | `--grader-verdict FILE --grader-key KEY_ID=HEX` |
+
+   A key is resolved by the `key_id` (or name and key id) the artifact names,
+   never by trying every supplied key. Without a set's keys, each reader says
+   that signature was not checked. [Freshness](#cosignature) is judged by the
+   second reader under `--max-checkpoint-age SECS`, and on the Rust side by
+   `agentplane audit`, not `verify`. Checking costs one Ed25519 verification
+   per signed record, cosignature line and sidecar: linear in signed records,
+   milliseconds each in the second reader.
 5. **The log.** For each sealed run, `seal` must equal the run's terminal
    `hash`. Then leaf-hash every `seal` in `index` order and compute the root as
    [the log](#merkle-log) describes.
+
+   A block is sealed only when it carries both an integer `index` and a `seal`
+   that parses. One carrying either alone, or a `seal` that does not parse,
+   claims a position nothing can check: a finding, and the run is not sound.
+   A run carried in two blocks is a finding and the run is not sound; one
+   `index` claimed by two blocks is a finding and the later claimant is not
+   sound. Both hold in a whole export and a package alike.
 
    Three ways the set can fail to be checkable, and they are different
    findings:
@@ -558,24 +700,111 @@ An implementation that does the following has verified the file.
    verify, because an empty block has no terminal hash to compare with its
    `seal`.
 
+### Verifying a package {#verifying-package}
+
+A [package](#package) is verified by steps 1–4, 7 and 8 as written, and by
+these in place of 5 and 6:
+
+5. **Each leaf by its path.** For each sealed run, `seal` must equal the run's
+   terminal `hash`, and `proof` must prove `leaf(seal)` at `index` in the tree
+   of `checkpoint.size` leaves whose root is `checkpoint.root` — the inclusion
+   check of [RFC 9162 §2.1.3.2](https://www.rfc-editor.org/rfc/rfc9162#section-2.1.3.2)
+   over [this log's hashes](#merkle-log). A run whose path is missing or does
+   not prove its leaf is a finding about that run. No count, contiguity or root
+   rebuild applies: the leaves a package leaves out are its purpose, not a
+   deletion.
+6. **The header against a checkpoint from somewhere else.** At the header's
+   size the roots must be equal; of another origin it is a finding. At another
+   size the package carries no consistency proof, so the reader reports that
+   checkpoint as **not compared**. Without one, the paths were proved against
+   the file's own header, and the report says so.
+
+The report states that the file is a package, how many leaves the log holds,
+and how many the package proves — nothing about the others is in the file.
+A cosignature on the outside checkpoint is checked as for a whole export.
+
+Also, in a package:
+
+- a run whose last `RunConcluded` names an outcome that seals, under a block
+  carrying no `index` and `seal`, is a finding — the writer places every sealed
+  run it carries, so a missing leaf was removed;
+- a case the header's `selection` names and the case layer does not carry is a
+  finding.
+
+A package proves the **inclusion** of what it carries, never its
+**completeness**: a run of the matter left out of the file, or a case the
+selection did not name, is not visible in it. Only the plane's own register and
+journal can say what a matter held.
+
+Only the first line decides which rules a file is read under. A file whose
+first line is an export header is never read under these rules, and a run
+block carrying `proof` there is a member this format does not know; a
+disclosure header on a later line is a finding and is ignored.
+
+### A grader's verdict beside an export {#grader-verdict}
+
+A **grader-verdict sidecar** binds a verdict from outside the plane to a prefix
+of one run. It is a file beside an export, never a record, and one JSON object:
+
+| Member | Type | Meaning |
+|---|---|---|
+| `kind` | string | always `agentplane.grader-verdict` |
+| `version` | integer | `1` |
+| `run` | string | the run judged |
+| `last_seq` | integer | the last record of the judged prefix |
+| `last_hash` | hex | the chain hash of the record at `last_seq` |
+| `open` | boolean | `false` claims the run was sealed with `last_seq` as its last record |
+| `content` | base64 | the verdict, never interpreted |
+| `signature` | object, optional | `{key_id, signature}` — Ed25519 over the signing input below |
+
+Any other member refuses the file. `last_hash` commits to records
+`1..=last_seq` and to nothing after them, so the binding is a **prefix
+commitment**: an edit anywhere at or before `last_seq` refuses it, and records
+appended later do not. The admission the run was judged under — declaration,
+policy bundle, `canon` — is inside that prefix and is read from the export, not
+carried twice.
+
+```text
+signing input = SHA-256( domain ‖ 0x00 ‖ SHA-256( canonical(sidecar without signature) ) )
+domain        = "io.github.hupe1980.agentplane/grader-verdict/v1"
+```
+
+A reader refuses a sidecar whose run is absent or does not verify, whose
+`last_seq` names no record present, whose `last_hash` differs from that record's
+chain hash, or that claims `open: false` for a run the export does not show
+sealed at `last_seq`. `open: true` is the weaker claim and is never refused on
+the flag. `agentplane verify --grader-verdict` also checks the signature against
+`--grader-key`, and says *not checked* without one; `tools/verify_export.py`
+does the same under its own `--grader-key`. A bound sidecar proves which records
+a verdict names and which key signed it — not what the grader saw, and not that
+the verdict is right.
+
 ## 11. Conformance vectors {#vectors}
 
-Two machine-readable corpora ship in the repository:
+Machine-readable conformance files ship in the repository:
 
 | File | What it pins |
 |---|---|
 | `tests/golden/records.jsonl` | One canonical record per kind, with its chain digest under `prev = 0` |
 | `tests/golden/export.jsonl` | A complete sealed export that every build must still verify offline |
+| `tests/golden/package.jsonl` | That journal's case disclosed from a log of three runs: one leaf, two siblings |
+| `tests/golden/export.signed.jsonl` | The same journal with every record signed |
+| `tests/golden/checkpoint.cosigned.note` | That export's checkpoint, cosigned by one witness at a fixed time |
+| `tests/golden/export.grader-verdict.json` | A signed grader verdict bound to a prefix of its run |
+| `tests/golden/keys.txt` | The public half of each fixed test key, in the form each reader's flag takes |
 
-Both are produced by the functions the runtime writes through, and regenerated
+Each is produced by the functions the runtime writes through, and regenerated
 deliberately with `AGENTPLANE_BLESS_GOLDEN=1 cargo test --test trust format::` —
 a typed command, because a shape change is a hard cut rather than a diff.
 
 They are this build checking itself, which catches drift and cannot catch a
 shared misunderstanding. `tools/verify_export.py` is the second reader: it
 implements this document, reads none of the crate's Rust, verifies the export
-and **re-derives** every record vector from its parsed value. `just
-verify-golden` runs it.
+and **re-derives** every record vector from its parsed value. It verifies the
+signed files' signatures with its own Ed25519, written from RFC 8032 §5.1, and
+checks that verifier against RFC 8032's own test vectors. `just verify-golden`
+runs it. The signing keys behind the signed files are fixed test material, never
+a deployment key.
 
 ## 12. Algorithm agility {#algorithm-agility}
 
@@ -662,7 +891,7 @@ re-addressing, because a record names the digest it always named and that run's
 
 ## Vocabulary {#vocabulary}
 
-There are 30 record kinds. A verifier does not interpret them; a reader that
+There are 33 record kinds. A verifier does not interpret them; a reader that
 does must refuse one it has never heard of, for the reason
 [the record body](#record-body) gives.
 
@@ -670,9 +899,10 @@ does must refuse one it has never heard of, for the reason
 `Note`, `EffectStarted`, `EffectDone`, `EffectFailed`, `EffectReconciled`,
 `StepCompensated`, `QuarantineDecided`, `GroupOpened`, `GroupSettled`,
 `BudgetRefused`, `BudgetReadmitted`, `AuthorityWithheld`, `AuthorityRestored`,
-`IdentityBound`, `PolicyDenied`, `RunSuspended`, `CaseBound`,
-`DeadlineRegistered`, `DeadlineTransition`, `Released`, `RunCancelled`,
-`RunConcluded`, `BreakGlass`, `Swept`, `Observed`.
+`IdentityBound`, `DataSubjectBound`, `PolicyDenied`, `RunSuspended`,
+`CaseBound`, `DeadlineRegistered`, `DeadlineTransition`, `Released`,
+`RunCancelled`, `RunConcluded`, `BreakGlass`, `HaltLifted`, `HoldReleased`,
+`Swept`, `Observed`.
 
 **One of them is not this plane's own work, and a reader must not treat it as
 such.** `Observed` records what an agent this plane does **not** execute
@@ -686,10 +916,43 @@ does not support. Such records live in a run of their own with no `RunAdmitted`
 at all, sealed under the outcome `observed` — the shape a sweep's run already
 has.
 
+**A label may name data subjects, and never a person.** A label's
+`data_subjects` member — omitted when empty — lists `{run, index}` references
+to entries of a run's `DataSubjectBound`, whose `subject` is a sealed payload
+field. The reference is attribution: no gate reads it, and a policy request
+carries none — not under `context.label`, and not in a label embedded in
+`context.args`, such as `task.open`'s justification, though the journaled
+descriptor keeps them.
+
+**A content verdict is on the record; matched text never is.** Where a
+declared [content rule](@/docs/security.md#content-rules) matched an arriving
+output, `EffectDone.content` holds the rules that matched, the raised
+sensitivity and the refusal — a rule id and a JSON pointer whose matched object
+keys read `*`. `EffectStarted.content_rules` lists the rules a sent value was
+judged by, matched or not. A refusal at a sink is a `PolicyDenied` whose
+`action` is `effect:content`, which no policy engine is ever asked. All three
+are clear: they are the deployment's declaration, not the caller's data.
+
+**How long a call took is on its outcome.** `EffectDone.elapsed_ms` and
+`EffectFailed.elapsed_ms` are the wall time this process measured around the
+call — clear, absent where nothing was performed live, and read by nothing a
+run decides.
+
+**Whom a hop's credential named is on the record; the credential never is.**
+`EffectStarted.credential`, on a call to another party, is `{kind, audience}`
+with `kind` one of `subject` (with a `subject` member: the principal id the
+credential was obtained for), `unbound` (a credential held for the peer, naming
+nobody) or `plane` (the plane's own credential, for a run admitted as the
+plane). It is clear: an audience and a principal id already clear on the run's
+chain.
+
 **Two pairs supersede rather than replace.** `BudgetReadmitted` follows a
 `BudgetRefused` and `AuthorityRestored` follows an `AuthorityWithheld`; in both
 cases the earlier record stays in the chain and the later one says it was
-overturned. A reader reconstructing a run's state takes the **last word** — a
+overturned. An `AuthorityWithheld` is run-level when a step boundary wrote it,
+and carries an effect key when a hop about to present a credential did; that
+hop's later `EffectStarted` at the same key supersedes it. A reader
+reconstructing a run's state takes the **last word** — a
 refusal followed by a continuation is a decision somebody made, not a
 contradiction, and treating the earlier record as final reports a run as stopped
 whose own later records show it finishing.
@@ -710,3 +973,10 @@ silence. What a store writes beside the data it indexes is its own business:
 the object store's erasure tombstone, for one, does carry a version, because it
 outlives the bytes it describes and a reader that cannot interpret one must say
 so rather than report an erasure it invented.
+
+**A signature names who vouched, not when or that it is true.** A verified
+record signature says a key signed that chain hash; a verified cosignature says
+a witness saw that checkpoint at the time it signed; a verified grader
+signature says a grader signed that verdict. Both readers check all three
+([step 4](#verifying)); neither says whether the signer was right. Truncation
+after a witness's latest time is bounded by freshness, not ruled out.

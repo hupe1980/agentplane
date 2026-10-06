@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! AGENTPLANE_LIVE=1 AWS_REGION=eu-west-1 \
-//! AGENTPLANE_BEDROCK_MODEL=anthropic.claude-3-5-sonnet-20241022-v2:0 \
+//! AGENTPLANE_BEDROCK_MODEL=anthropic.claude-sonnet-5 \
 //! cargo run --example bedrock_live --features bedrock
 //! ```
 

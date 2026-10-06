@@ -130,6 +130,32 @@ pub struct Label {
     /// How far this value may travel. Escalates on join to the most sensitive
     /// contributor, and gates every sink that declares a ceiling.
     pub sensitivity: Sensitivity,
+    /// Which data-subject bindings this value was influenced by, unioned
+    /// through each join.
+    ///
+    /// **Attribution only: no gate reads it**, and no policy request carries
+    /// it — neither as `context.label` nor inside a label an effect's arguments
+    /// embed, which the request builder projects the same way. It is not a member of [`provenance`](Self::provenance)
+    /// because provenance *is* a gate input — a protected field's
+    /// `allowed_sources` refuses any unlisted source — so a subject there
+    /// would refuse every subject-bound value. A reference names a binding,
+    /// never the person: the subject itself is sealed in the run's
+    /// `DataSubjectBound` record. A reference in a label an embedder supplied
+    /// with a run's input is the embedder's claim, which nothing checks.
+    /// Omitted from the wire when empty.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub data_subjects: BTreeSet<SubjectRef>,
+}
+
+/// One entry of a run's `DataSubjectBound` record, by position: opaque and
+/// non-identifying, so it may travel in every clear label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubjectRef {
+    /// The run whose `DataSubjectBound` holds the binding.
+    pub run: crate::core::RunId,
+    /// The binding's position in that record.
+    pub index: u16,
 }
 
 /// One destination-scoped improvement a [`Release`] granted, carried on the
@@ -281,8 +307,12 @@ pub struct ProtectedField {
 /// runtime supplies the releaser identity, asks policy, and journals all of it.
 /// This prevents a reason string from serving as an unstructured universal
 /// escape hatch.
+///
+/// Deserialization takes the same door as the constructors: a release read from
+/// a journal, a wire or a file is refused unless [`validate`](Self::validate)
+/// accepts it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "ReleaseWire")]
 pub struct Release {
     scope: ReleaseScope,
     basis: String,
@@ -291,13 +321,65 @@ pub struct Release {
     evidence: BTreeSet<String>,
 }
 
-/// Which label dimensions an authorized release may improve.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// The wire form of a [`Release`], before [`Release::validate`] has seen it.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ReleaseWire {
+    scope: ReleaseScope,
+    basis: String,
+    destination: String,
+    fields: BTreeSet<String>,
+    evidence: BTreeSet<String>,
+}
+
+impl TryFrom<ReleaseWire> for Release {
+    type Error = &'static str;
+
+    fn try_from(w: ReleaseWire) -> Result<Self, Self::Error> {
+        let release = Self {
+            scope: w.scope,
+            basis: w.basis,
+            destination: w.destination,
+            fields: w.fields,
+            evidence: w.evidence,
+        };
+        release.validate().map(|()| release)
+    }
+}
+
+/// Which label dimensions an authorized release may improve.
+///
+/// At least one: a scope improving nothing is refused on deserialization as
+/// the constructors cannot express it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, try_from = "ReleaseScopeWire")]
 pub struct ReleaseScope {
     trust: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sensitivity: Option<Sensitivity>,
+}
+
+/// The wire form of a [`ReleaseScope`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseScopeWire {
+    trust: bool,
+    #[serde(default)]
+    sensitivity: Option<Sensitivity>,
+}
+
+impl TryFrom<ReleaseScopeWire> for ReleaseScope {
+    type Error = &'static str;
+
+    fn try_from(w: ReleaseScopeWire) -> Result<Self, Self::Error> {
+        if !w.trust && w.sensitivity.is_none() {
+            return Err("scope must improve trust, sensitivity, or both");
+        }
+        Ok(Self {
+            trust: w.trust,
+            sensitivity: w.sensitivity,
+        })
+    }
 }
 
 impl ReleaseScope {
@@ -656,6 +738,7 @@ impl Label {
             provenance: BTreeSet::new(),
             trust: Trust::Trusted,
             sensitivity: Sensitivity::Public,
+            data_subjects: BTreeSet::new(),
         }
     }
 
@@ -668,6 +751,7 @@ impl Label {
             provenance: BTreeSet::from([source]),
             trust: Trust::Untrusted,
             sensitivity: Sensitivity::Internal,
+            data_subjects: BTreeSet::new(),
         }
     }
 
@@ -678,7 +762,7 @@ impl Label {
     }
 
     /// Bounded join-semilattice: trust degrades, sensitivity escalates,
-    /// provenance accumulates.
+    /// provenance and data-subject references accumulate.
     ///
     /// Nothing else rides a join. In particular a join can never transport a
     /// release: marks live on [`Tainted`], not here, so combining labels —
@@ -690,7 +774,21 @@ impl Label {
             provenance: self.provenance.union(&other.provenance).cloned().collect(),
             trust: self.trust.max(other.trust),
             sensitivity: self.sensitivity.max(other.sensitivity),
+            data_subjects: self
+                .data_subjects
+                .union(&other.data_subjects)
+                .copied()
+                .collect(),
         }
+    }
+
+    /// This label as a policy request carries it: without
+    /// [`data_subjects`](Self::data_subjects), which no gate reads.
+    #[must_use]
+    pub fn for_policy(&self) -> Self {
+        let mut label = self.clone();
+        label.data_subjects.clear();
+        label
     }
 
     #[must_use]
@@ -801,6 +899,23 @@ impl<T> Tainted<T> {
         }
     }
 
+    /// This value, attributed to `subjects` at its root and at every labelled
+    /// field, so a projection keeps the attribution.
+    ///
+    /// Release marks survive: a reference is read by no gate, so adding one
+    /// changes no answer a mark was granted against.
+    #[must_use]
+    pub(crate) fn attributed(mut self, subjects: &BTreeSet<SubjectRef>) -> Self {
+        if subjects.is_empty() {
+            return self;
+        }
+        self.label.data_subjects.extend(subjects.iter().copied());
+        for label in self.fields.values_mut() {
+            label.data_subjects.extend(subjects.iter().copied());
+        }
+        self
+    }
+
     /// Take the value, dropping the label.
     ///
     /// Deliberately *not* named `unwrap` or `into_inner`: this is the one
@@ -820,6 +935,21 @@ impl<T> Tainted<T> {
     /// value may *go*, not whether it may be inspected.
     pub fn peek(&self) -> &T {
         &self.value
+    }
+
+    /// This value with its string leaves rewritten and every label kept.
+    ///
+    /// Sound only for a rewrite that keeps the shape — a declared redaction
+    /// replaces text inside strings and nothing else — so every field path,
+    /// its label and its release marks still name what they named.
+    #[cfg(feature = "manifest")]
+    pub(crate) fn redacted(&self, value: T) -> Self {
+        Self {
+            value,
+            label: self.label.clone(),
+            fields: self.fields.clone(),
+            releases: self.releases.clone(),
+        }
     }
 
     /// Transform in place; the whole-value label rides along.
@@ -1148,10 +1278,19 @@ mod tests {
         assert_eq!(a.join(&b).join(&c), a.join(&b.join(&c)), "associative");
     }
 
-    /// Every label over a two-source universe: 2 trusts × 4 sensitivities ×
-    /// 4 provenance subsets. Small enough to quantify over exhaustively,
-    /// which is what turns the sampled laws above into a checked model.
+    /// Every label over a two-source, two-reference universe: 2 trusts × 4
+    /// sensitivities × 4 provenance subsets × 4 data-subject subsets. Small
+    /// enough to quantify over exhaustively, which is what turns the sampled
+    /// laws above into a checked model.
     fn every_label() -> Vec<Label> {
+        let run = crate::core::RunId::generate();
+        let r = |index| SubjectRef { run, index };
+        let subject_sets = [
+            BTreeSet::new(),
+            BTreeSet::from([r(0)]),
+            BTreeSet::from([r(1)]),
+            BTreeSet::from([r(0), r(1)]),
+        ];
         let mut out = Vec::new();
         for trust in [Trust::Trusted, Trust::Untrusted] {
             for sensitivity in [
@@ -1166,11 +1305,14 @@ mod tests {
                     BTreeSet::from([src("b")]),
                     BTreeSet::from([src("a"), src("b")]),
                 ] {
-                    out.push(Label {
-                        provenance,
-                        trust,
-                        sensitivity,
-                    });
+                    for data_subjects in &subject_sets {
+                        out.push(Label {
+                            provenance: provenance.clone(),
+                            trust,
+                            sensitivity,
+                            data_subjects: data_subjects.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -1182,7 +1324,8 @@ mod tests {
     ///
     /// This is the algebraic core of the required field-level information-flow
     /// model, discharged as an exhaustive check rather than a state-space
-    /// search: the domain is finite (32 labels over a two-source universe)
+    /// search: the domain is finite (128 labels over two sources and two
+    /// subject references)
     /// and the laws are equations, so quantifying over every pair and triple
     /// *is* the model. What it proves is what every gate assumes — that no
     /// order of combination, no repetition, and no association of joins can
@@ -1207,6 +1350,8 @@ mod tests {
                 assert!(ab.sensitivity >= a.sensitivity && ab.sensitivity >= b.sensitivity);
                 assert!(ab.provenance.is_superset(&a.provenance));
                 assert!(ab.provenance.is_superset(&b.provenance));
+                assert!(ab.data_subjects.is_superset(&a.data_subjects));
+                assert!(ab.data_subjects.is_superset(&b.data_subjects));
                 for c in &labels {
                     assert_eq!(
                         a.join(b).join(c),
@@ -1839,6 +1984,37 @@ mod release_validation_tests {
         sound()
             .validate()
             .expect("the baseline must pass, or every case below rejects for the wrong reason");
+    }
+
+    /// Deserialization is the same door as the constructors.
+    #[test]
+    fn a_deserialized_release_is_validated() {
+        let wire = serde_json::to_value(sound()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Release>(wire.clone()).unwrap(),
+            sound()
+        );
+        for (what, field, value) in [
+            ("no fields", "fields", serde_json::json!([])),
+            ("no evidence", "evidence", serde_json::json!([])),
+            ("an empty basis", "basis", serde_json::json!(" ")),
+            (
+                "a scope improving nothing",
+                "scope",
+                serde_json::json!({ "trust": false }),
+            ),
+        ] {
+            let mut broken = wire.clone();
+            broken[field] = value;
+            assert!(
+                serde_json::from_value::<Release>(broken).is_err(),
+                "a release with {what} deserialized"
+            );
+        }
+        assert!(
+            serde_json::from_value::<ReleaseScope>(serde_json::json!({ "trust": false })).is_err(),
+            "a scope improving nothing deserialized"
+        );
     }
 
     /// A release that improves nothing is a decision record for a non-decision.

@@ -40,7 +40,7 @@
 //! none may change which recorded answer a replay reads back.
 
 use async_trait::async_trait;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::core::{
@@ -241,6 +241,25 @@ pub enum Recovery {
     RequiresOperator,
 }
 
+/// What a hop's credential named, as its announcement records it.
+///
+/// Never the credential: not its bytes, its digest or its expiry. What this
+/// plane asked the credential to be for and checked on the credential's own
+/// statement — not what the issuer signed or the far side verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CredentialBinding {
+    /// Issued for the person the run acts for — its chain's owner — with this
+    /// plane as the actor, valid only at `audience`.
+    Subject { audience: String, subject: String },
+    /// The credential held for the peer, which names no subject: the far side
+    /// sees this plane as its caller, whichever run called.
+    Unbound { audience: String },
+    /// The plane's own credential, presented for a run admitted under the
+    /// plane's own chain: the plane is the party that asked.
+    Plane { audience: String },
+}
+
 /// Anything non-deterministic or externally visible.
 ///
 /// Implemented by *drivers* (clock, RNG, MCP, A2A, model, timer) — never by
@@ -387,6 +406,17 @@ pub trait Effect: Send + Sync {
         None
     }
 
+    /// Bind `arguments` in place of the ones this effect was built over,
+    /// where it can — what a declared redaction at a sink needs.
+    ///
+    /// `false`, the default, means the arguments are fixed at construction: a
+    /// redaction that would have to change them refuses the call rather than
+    /// sending it whole. An implementation that answers `true` binds exactly
+    /// `arguments`, so [`sink_arguments`](Self::sink_arguments) answers them.
+    fn rebind(&mut self, _arguments: Value) -> bool {
+        false
+    }
+
     /// How many bytes dispatching this effect sends out of the plane.
     ///
     /// What an egress ceiling counts. Defaults to the canonical size of
@@ -403,6 +433,17 @@ pub trait Effect: Send + Sync {
         self.sink_arguments().map_or(0, |args| {
             crate::core::canon::to_bytes(args).map_or(0, |b| b.len() as u64)
         })
+    }
+
+    /// Whom the credential this effect presents names, for an effect that
+    /// presents one to another party.
+    ///
+    /// Recorded on the effect's announcement, so a reader can tell a hop the
+    /// far side could check *who asked* from one it could not. Stated from
+    /// the effect as constructed, never from I/O: the credential itself is
+    /// obtained when the call is performed, and is never recorded.
+    fn credential_binding(&self) -> Option<CredentialBinding> {
+        None
     }
 
     /// Field-specific source and sensitivity rules for a structured sink.
@@ -624,7 +665,9 @@ pub trait AnyEffect: Send + Sync {
     fn retries_landed(&self) -> bool;
     fn max_sensitivity(&self) -> Sensitivity;
     fn sink_arguments(&self) -> Option<&Value>;
+    fn rebind_erased(&mut self, arguments: Value) -> bool;
     fn outbound_bytes(&self) -> u64;
+    fn credential_binding(&self) -> Option<CredentialBinding>;
     fn protected_fields(&self) -> &[ProtectedField];
     fn delegation_depth(&self) -> Option<usize>;
     fn source(&self) -> SourceId;
@@ -667,8 +710,14 @@ where
     fn sink_arguments(&self) -> Option<&Value> {
         Effect::sink_arguments(self)
     }
+    fn rebind_erased(&mut self, arguments: Value) -> bool {
+        Effect::rebind(self, arguments)
+    }
     fn outbound_bytes(&self) -> u64 {
         Effect::outbound_bytes(self)
+    }
+    fn credential_binding(&self) -> Option<CredentialBinding> {
+        Effect::credential_binding(self)
     }
     fn protected_fields(&self) -> &[ProtectedField] {
         Effect::protected_fields(self)
@@ -765,8 +814,14 @@ impl Effect for Box<dyn AnyEffect + '_> {
     fn sink_arguments(&self) -> Option<&Value> {
         (**self).sink_arguments()
     }
+    fn rebind(&mut self, arguments: Value) -> bool {
+        (**self).rebind_erased(arguments)
+    }
     fn outbound_bytes(&self) -> u64 {
         (**self).outbound_bytes()
+    }
+    fn credential_binding(&self) -> Option<CredentialBinding> {
+        (**self).credential_binding()
     }
     fn protected_fields(&self) -> &[ProtectedField] {
         (**self).protected_fields()

@@ -20,6 +20,9 @@
 //!   than return. The built-in calendar had exactly this defect: a plane
 //!   hosting many agents aborted, taking every other tenant's in-flight run
 //!   with it, to report one document's typo.
+//! * **a deadline is after the instant it was measured from.** A zero or
+//!   negative count is refused or resolves later; an obligation due the moment
+//!   it is registered, or before, is breached on arrival.
 //! * **the digest identifies the ruleset**, because it is the only record of
 //!   which rules produced an instant somebody will be held to.
 
@@ -50,6 +53,7 @@ pub fn check(calendar: &dyn Calendar, supported: &[DeadlineSpec], report: &mut R
     for spec in supported {
         resolution_is_pure(calendar, from, spec, report);
         a_count_at_the_edge_of_its_type_is_refused(calendar, from, spec, report);
+        a_deadline_is_after_its_start(calendar, from, spec, report);
     }
     a_rule_it_does_not_know_is_refused(calendar, from, report);
 }
@@ -125,32 +129,59 @@ fn a_count_at_the_edge_of_its_type_is_refused(
     }
 }
 
+/// The spec itself, and with every integer parameter at zero and at minus one,
+/// resolves strictly after `from` or is refused.
+fn a_deadline_is_after_its_start(
+    calendar: &dyn Calendar,
+    from: Timestamp,
+    spec: &DeadlineSpec,
+    r: &mut Report,
+) {
+    let mut probes = vec![spec.clone()];
+    probes.extend(with_every_count(spec, 0));
+    probes.extend(with_every_count(spec, -1));
+    for probe in probes {
+        r.checked += 1;
+        if let Ok(at) = calendar.resolve(from, &probe)
+            && at <= from
+        {
+            r.record(
+                "a deadline is after its start",
+                format!(
+                    "'{}' with {} resolved to {at}, not after {from}; an obligation \
+                         due when it is registered is breached before anyone is warned",
+                    probe.kind, probe.params
+                ),
+            );
+        }
+    }
+}
+
+/// `spec` with every integer parameter set to `count`, if it has one.
+fn with_every_count(spec: &DeadlineSpec, count: i64) -> Option<DeadlineSpec> {
+    let serde_json::Value::Object(params) = &spec.params else {
+        return None;
+    };
+    let mut probe = params.clone();
+    let mut touched = false;
+    for value in probe.values_mut() {
+        if value.is_i64() || value.is_u64() {
+            *value = serde_json::Value::from(count);
+            touched = true;
+        }
+    }
+    touched.then(|| DeadlineSpec::new(spec.kind.clone(), serde_json::Value::Object(probe)))
+}
+
 /// The same spec with every integer parameter driven to the edge of its type.
 ///
 /// Derived from the caller's own spec rather than supplied, so an implementer
 /// cannot hand the battery the inputs their code already handles.
 fn hostile_variants(spec: &DeadlineSpec) -> Vec<DeadlineSpec> {
-    let serde_json::Value::Object(params) = &spec.params else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for extreme in [i64::MAX, i64::MIN] {
-        let mut hostile = params.clone();
-        let mut touched = false;
-        for value in hostile.values_mut() {
-            if value.is_i64() || value.is_u64() {
-                *value = serde_json::Value::from(extreme);
-                touched = true;
-            }
-        }
-        if touched {
-            out.push(DeadlineSpec::new(
-                spec.kind.clone(),
-                serde_json::Value::Object(hostile),
-            ));
-        }
-    }
-    out
+    [i64::MAX, i64::MIN]
+        .into_iter()
+        .filter_map(|extreme| with_every_count(spec, extreme))
+        .collect()
 }
 
 /// A rule the calendar does not implement is named, not approximated.

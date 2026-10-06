@@ -10,12 +10,14 @@ Both of this project's specs started out that way. The effect protocol modelled
 the action landed, the record did not — was unreachable, and `ExactlyOnce` was
 true by construction. It passed. It meant nothing.
 
-Each mutation also names the ONE invariant it must trip. The generated config
-checks only that invariant, so a mutation cannot pass by accident — tripping
-`Safety` proves only that *something* broke, not that the invariant written to
-catch this bug is the one that caught it.
+Each mutation also names the ONE invariant or temporal property it must trip.
+The generated config checks only that one, so a mutation cannot pass by
+accident — tripping `Safety` proves only that *something* broke, not that the
+check written to catch this bug is the one that caught it. A row whose sixth
+element is "property" names a temporal property: a liveness claim is only
+evidence if dropping the fairness it rests on breaks it.
 
-Usage:  mutations.py --list          (tab-separated: mutant, spec, invariant, description)
+Usage:  mutations.py --list          (tab-separated: mutant, spec, check, description, kind)
         mutations.py <mutant> <dir>  (writes <mutant>.tla and <mutant>.cfg)
 """
 
@@ -26,12 +28,24 @@ import sys
 
 SPEC_DIR = pathlib.Path(__file__).parent
 
-# mutant name -> (source spec, invariant it must trip, description, find, replace)
+# mutant name -> (source spec, check it must trip, description, find, replace[, kind])
+#
+# `kind` is "invariant" (the default) or "property".
 #
 # `find` must appear verbatim in the spec. If it stops matching, the spec has
 # moved and the mutation is silently doing nothing — which is an error here,
 # because a mutation that changes nothing tests nothing.
-MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
+MUTATIONS: dict[str, tuple[str, ...]] = {
+    # Dropping the fairness a liveness claim rests on. If `Terminates` still
+    # held, it would be holding for some other reason than the one stated.
+    "WeakFairnessDropped": (
+        "EffectProtocol",
+        "Terminates",
+        "the effect protocol is checked without the fairness its termination needs",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)",
+        "Spec == Init /\\ [][Next]_vars",
+        "property",
+    ),
     # Retrying an orphaned effect instead of escalating: the tempting,
     # helpful-looking bug that issues the invoice twice.
     "BlindRetry": (
@@ -481,6 +495,366 @@ MUTATIONS: dict[str, tuple[str, str, str, str, str]] = {
         """    /\\ seen' = [seen EXCEPT ![w] = store]""",
         """    /\\ UNCHANGED seen""",
     ),
+    # ── Quota ───────────────────────────────────────────────────────────────
+    # Counting only the runs still executing: a crashed run's slot row, or a
+    # sealed run's not yet given back, stops counting and a second run is
+    # admitted beside it.
+    "SlotCountIgnoresStoppedRuns": (
+        "Quota",
+        "AdmissionsWithinCeiling",
+        "the slot count skips a crashed or sealed run still holding its row",
+        "SlotRoom(t) == Cardinality({r \\in RunsOf(t) : slot[r]}) < MaxConc",
+        "SlotRoom(t) == Cardinality({r \\in RunsOf(t) : slot[r] /\\ st[r] = \"exec\" /\\ alive[r]}) < MaxConc",
+    ),
+    # Settling from the marker alone: the sweep settles a sealed run's
+    # recorded passes again after its conclusion already did.
+    "RecoverySettlesWithoutTheReceipt": (
+        "Quota",
+        "PassSettledOnce",
+        "a recorded pass is settled again without checking its receipt",
+        "Settles(r) == marker[r][passNo[r]] /\\ ~receipt[r][passNo[r]]",
+        "Settles(r) == marker[r][passNo[r]]",
+    ),
+    # Charging the period that is open at settlement rather than the one the
+    # pass was authorized in: midnight passes mid-run and both ledgers are
+    # wrong.
+    "SettleIntoTheClosingPeriod": (
+        "Quota",
+        "SpendInAdmittedPeriod",
+        "a pass is settled into the current period, not the one it started in",
+        "SettlePeriod(r) == startedIn[r][passNo[r]]",
+        "SettlePeriod(r) == period",
+    ),
+    # One counter for the whole plane: a tenant at its ceiling refuses
+    # another tenant's admission.
+    "SharedCounter": (
+        "Quota",
+        "TenantsIndependent",
+        "the slot count is shared between tenants",
+        "SlotRoom(t) == Cardinality({r \\in RunsOf(t) : slot[r]}) < MaxConc",
+        "SlotRoom(t) == Cardinality({r \\in Runs : slot[r]}) < MaxConc",
+    ),
+    # The check the reservation replaced: settled spend alone, so suspended
+    # runs' holds are invisible and the period is admitted twice over.
+    "SettledOnlyCheck": (
+        "Quota",
+        "PeriodSpendWithinCeiling",
+        "admission checks settled spend and ignores outstanding holds",
+        "SpendRoom(t) == Settled(t, period) + Reserved(t, period) + Worst <= Ceiling",
+        "SpendRoom(t) == Settled(t, period) + Worst <= Ceiling",
+    ),
+    # A resume in a later period that leaves its remainder counted in the old
+    # one: the new period admits against a hold it cannot see.
+    "ResumeLeavesItsHoldBehind": (
+        "Quota",
+        "CarriedHoldFollowsTheResume",
+        "a resume does not carry its remainder into the period it resumes in",
+        """    /\\ holdPeriod' = [holdPeriod EXCEPT ![r] = period]
+    /\\ carried' = [carried EXCEPT ![r] = @ \\/ holdPeriod[r] # period]
+    /\\ UNCHANGED <<alive, hold, pending, wrote, marker, receipt, twice, misfiled,""",
+        """    /\\ carried' = [carried EXCEPT ![r] = @ \\/ holdPeriod[r] # period]
+    /\\ UNCHANGED <<holdPeriod, alive, hold, pending, wrote, marker, receipt, twice, misfiled,""",
+    ),
+    # Writing the pass marker when the pass starts rather than with its first
+    # record: a pass that writes nothing is still settled.
+    "MarkerWrittenEagerly": (
+        "Quota",
+        "NoMarkerNoSettlement",
+        "a resumed pass writes its marker before it has written anything",
+        """    /\\ UNCHANGED <<alive, hold, pending, wrote, marker, receipt, twice, misfiled,""",
+        """    /\\ marker' = [marker EXCEPT ![r][passNo[r] + 1] = TRUE]
+    /\\ UNCHANGED <<alive, hold, pending, wrote, receipt, twice, misfiled,""",
+    ),
+    # Gating a resume on a free slot: a suspended run waits on work that may
+    # never finish, stranded mid-saga.
+    "ResumeIsGated": (
+        "Quota",
+        "SuspendedRunsResume",
+        "a resume waits for a free slot",
+        """    /\\ st[r] = "susp" /\\ passNo[r] < MaxPasses""",
+        """    /\\ st[r] = "susp" /\\ passNo[r] < MaxPasses /\\ SlotRoom(Owner[r])""",
+        "property",
+    ),
+    # A sweep that never looks at sealed runs: an instance that died after
+    # sealing keeps its tenant's slot forever.
+    "SweepSkipsSealedSlots": (
+        "Quota",
+        "SealedSlotEventuallyReleased",
+        "the sweep never releases a sealed run's slot",
+        """    /\\ slot[r] /\\ ~alive[r]
+    /\\ Settle(r)""",
+        """    /\\ slot[r] /\\ ~alive[r] /\\ FALSE
+    /\\ Settle(r)""",
+        "property",
+    ),
+    # ── Rate window ─────────────────────────────────────────────────────────
+    # A fixed bucket instead of a sliding window: the end of one bucket and
+    # the start of the next each admit the ceiling.
+    "FixedBucket": (
+        "RateWindow",
+        "RateWithinWindow",
+        "the count is a fixed bucket rather than the window ending now",
+        "InWindow(e) == Cardinality({x \\in rows : x.at > e - Window /\\ x.at <= e})",
+        "InWindow(e) == Cardinality({x \\in rows : x.at \\div Window = e \\div Window})",
+    ),
+    # Keying the row by the attempt: every retry spends again.
+    "RateKeyNamesTheAttempt": (
+        "RateWindow",
+        "RetrySpendsOnce",
+        "the reservation is keyed by the attempt, not the dispatch",
+        "Reserved(r) == \\E x \\in rows : x.run = r",
+        "Reserved(r) == \\E x \\in rows : x.run = r /\\ x.a = attempts[r] + 1",
+    ),
+    # Keying the row by the call alone: a second run's call reads as a retry.
+    "RateKeyOmitsTheRun": (
+        "RateWindow",
+        "EveryDispatchCounted",
+        "the reservation is keyed by the call, so two runs share a row",
+        "Reserved(r) == \\E x \\in rows : x.run = r",
+        "Reserved(r) == rows # {}",
+    ),
+    # Handing a failed call's row back: the call may well have landed.
+    "RefundOnFailure": (
+        "RateWindow",
+        "RowsNeverRefunded",
+        "a failed call's reservation is refunded",
+        """    /\\ done' = [done EXCEPT ![r] = "none"]
+    /\\ UNCHANGED <<rows, kept, now, attempts>>""",
+        """    /\\ done' = [done EXCEPT ![r] = "none"]
+    /\\ rows' = {x \\in rows : x.run # r}
+    /\\ UNCHANGED <<kept, now, attempts>>""",
+    ),
+    # Waiting for room instead of refusing: a dispatch that never answers.
+    "RateWaitsForRoom": (
+        "RateWindow",
+        "EveryDispatchAnswered",
+        "a full window makes the dispatch wait rather than refuse",
+        """            ELSE /\\ done' = [done EXCEPT ![r] = "refused"]
+                 /\\ UNCHANGED <<now, rows, kept>>""",
+        """            ELSE /\\ FALSE
+                 /\\ UNCHANGED <<now, rows, kept, done>>""",
+        "property",
+    ),
+    # ── Sink gate ───────────────────────────────────────────────────────────
+    # Keying the gates on the mode: a resume is "replaying", so the whole live
+    # tail past its frontier dispatches unjudged.
+    "GatesKeyedOnTheMode": (
+        "SinkGate",
+        "NoSinkWithoutCoveringRelease",
+        "the gate is skipped for the whole of a resumed pass",
+        "       THEN IF Covered(pc)\n",
+        "       THEN IF Covered(pc) \\/ crashes > 0\n",
+    ),
+    # Re-judging a recorded refusal against today's configuration: a loosened
+    # catalogue sends what the run was refused.
+    "ReplayReJudges": (
+        "SinkGate",
+        "ReplayReproducesRefusal",
+        "a replay re-judges a recorded refusal against the current configuration",
+        "       ELSE UNCHANGED <<journal, world, allowed>>\n",
+        "       ELSE IF journal[pc] = \"refused\" /\\ Covered(pc)\n"
+        "            THEN /\\ world' = [world EXCEPT ![pc] = @ + 1]\n"
+        "                 /\\ UNCHANGED <<journal, allowed>>\n"
+        "            ELSE UNCHANGED <<journal, world, allowed>>\n",
+    ),
+    # Sending a recorded send again instead of reading it back.
+    "ReplayResends": (
+        "SinkGate",
+        "SentOnce",
+        "a replay sends a recorded send again",
+        "       ELSE UNCHANGED <<journal, world, allowed>>\n",
+        "       ELSE /\\ world' = [world EXCEPT ![pc] = IF journal[pc] = \"performed\" THEN @ + 1 ELSE @]\n"
+        "            /\\ UNCHANGED <<journal, allowed>>\n",
+    ),
+    # A refusal that halts the step instead of answering it: the steps after
+    # it are never decided.
+    "RefusalStallsTheRun": (
+        "SinkGate",
+        "EverySendIsDecided",
+        "a refused send leaves the run stuck at that step",
+        "    /\\ pc' = pc + 1\n    /\\ UNCHANGED <<ceiling, released, crashes>>",
+        "    /\\ pc' = IF journal'[pc] = \"refused\" THEN pc ELSE pc + 1\n    /\\ UNCHANGED <<ceiling, released, crashes>>",
+        "property",
+    ),
+    # ── Key lifecycle ───────────────────────────────────────────────────────
+    # Reading an unreachable key ring as an erased scope: an outage discharges
+    # an erasure request nobody carried out.
+    "OutageTreatedAsDestroyed": (
+        "KeyLifecycle",
+        "OutageIsNotErasure",
+        "an outage is answered as a destroyed scope",
+        """    /\\ verdict' = IF ~reachable THEN "unavailable\"""",
+        """    /\\ verdict' = IF ~reachable THEN "destroyed\"""",
+    ),
+    # A rotation that admits only the newest version: every older payload
+    # reads as retired, a policy change no operator made.
+    "RotationDropsANamedVersion": (
+        "KeyLifecycle",
+        "NamedVersionAdmitted",
+        "a rotation stops admitting the versions before it",
+        "    /\\ admitted' = admitted \\cup {current + 1}",
+        "    /\\ admitted' = {current + 1}",
+    ),
+    # A retried erasure that overwrites the first one's reason.
+    "SecondErasureRewritesReason": (
+        "KeyLifecycle",
+        "ErasureIdempotent",
+        "a second destruction rewrites the first one's reason",
+        "    /\\ reason' = IF destroyed THEN reason ELSE r",
+        "    /\\ reason' = r",
+    ),
+    # A data key handed out for a destroyed scope: a live run's late write
+    # lands in a unit the erasure reported gone.
+    "LateWriteReopensScope": (
+        "KeyLifecycle",
+        "NoWriteIntoErasedScope",
+        "a destroyed scope still hands out a data key",
+        "    /\\ reachable\n    /\\ ~destroyed\n    /\\ sealed'",
+        "    /\\ reachable\n    /\\ sealed'",
+    ),
+    # A reader that gives up on the first outage: the read ends at
+    # *unavailable*, which is no answer about the payload.
+    "GiveUpOnOutage": (
+        "KeyLifecycle",
+        "OutageEventuallyAnswered",
+        "a read abandons its payload on the first outage",
+        "    /\\ asking' = ~reachable",
+        "    /\\ asking' = FALSE",
+        "property",
+    ),
+    # ── Delivery ────────────────────────────────────────────────────────────
+    "ConsumedMessageClaimedAgain": (
+        "Delivery",
+        "ConsumedExactlyOnce",
+        "a wait recovers any claim of its run, consumed or not",
+        "    /\\ m \\in stored /\\ ~dead[m] /\\ ~consumed[m] /\\ Accepts(r, m)\n"
+        "    /\\ \\/ claim[m] = NoRun /\\ ~parked[r]\n"
+        "       \\/ claim[m] = Me(r)",
+        "    /\\ m \\in stored /\\ ~dead[m] /\\ Accepts(r, m)\n"
+        "    /\\ \\/ claim[m] = NoRun /\\ ~parked[r]\n"
+        "       \\/ claim[m].run = r",
+    ),
+    "ParkedWaitClaimsASecondMessage": (
+        "Delivery",
+        "EveryMessageReachesAWaiter",
+        "a wait already holding a claim takes another, which its retirement sheds",
+        "    /\\ \\/ claim[m] = NoRun /\\ ~parked[r]\n",
+        "    /\\ \\/ claim[m] = NoRun\n",
+        "property",
+    ),
+    "TargetedDeliveryBuffers": (
+        "Delivery",
+        "TargetedReachesOnlyItsRun",
+        "a message for a run not waiting is buffered for whoever waits",
+        "       ELSE UNCHANGED <<stored, claim, parked>>",
+        "       ELSE /\\ stored' = stored \\cup {m}\n            /\\ UNCHANGED <<claim, parked>>",
+    ),
+    "AddressedMessageReleased": (
+        "Delivery",
+        "TargetedReachesOnlyItsRun",
+        "a closed run's unconsumed addressed message is offered to another run",
+        "                  dead[m] \\/ (Unconsumed(r, m) /\\ targetOf[m] = r)]\n"
+        "    /\\ attempt' = [m \\in Msgs |->\n"
+        "                     IF Unconsumed(r, m) /\\ targetOf[m] # r THEN \"matching\"",
+        "                  dead[m]]\n"
+        "    /\\ attempt' = [m \\in Msgs |->\n"
+        "                     IF Unconsumed(r, m) THEN \"matching\"",
+    ),
+    "AnswerAfterConclusion": (
+        "Delivery",
+        "NoAnswerAfterConclusion",
+        "a delivery journals an answer for a run whose conclusion is durable",
+        "    /\\ parked[r] /\\ ~concluded[r]\n",
+        "    /\\ parked[r]\n",
+    ),
+    "MatchBeforeDurable": (
+        "Delivery",
+        "DurableBeforeMatch",
+        "a targeted delivery claims a message it never stored",
+        "       THEN /\\ stored' = stored \\cup {m}\n            /\\ claim' = [claim EXCEPT ![m] = Me(r)]",
+        "       THEN /\\ UNCHANGED stored\n            /\\ claim' = [claim EXCEPT ![m] = Me(r)]",
+    ),
+    "DedupKeyIgnoresSource": (
+        "Delivery",
+        "CollidingIdsAreDistinct",
+        "the dedup key is the id alone, so another producer's message is a duplicate",
+        "Key(m) == <<m.src, m.id>>",
+        "Key(m) == m.id",
+    ),
+    "SenderFilterIgnored": (
+        "Delivery",
+        "SenderFilterHolds",
+        "the matching path ignores a wait's named sender",
+        "    /\\ Open(r) /\\ Accepts(r, m)\n    /\\ claim' = [claim EXCEPT ![m] = Me(r)]\n    /\\ parked' = [parked EXCEPT ![r] = TRUE]\n    /\\ attempt'",
+        "    /\\ Open(r)\n    /\\ claim' = [claim EXCEPT ![m] = Me(r)]\n    /\\ parked' = [parked EXCEPT ![r] = TRUE]\n    /\\ attempt'",
+    ),
+    "WakeAppendedTwice": (
+        "Delivery",
+        "OneWakePerTimer",
+        "a re-fired timer records its wake again",
+        "IF @ = 0 /\\ ~concluded[r] THEN @ + 1 ELSE @",
+        "IF ~concluded[r] THEN @ + 1 ELSE @",
+    ),
+    "WakeAfterConclusion": (
+        "Delivery",
+        "NoWakeAfterConclusion",
+        "a timer wakes a run whose conclusion is durable",
+        "IF @ = 0 /\\ ~concluded[r] THEN @ + 1 ELSE @",
+        "IF @ = 0 THEN @ + 1 ELSE @",
+    ),
+    "RetryAnsweredFromDedup": (
+        "Delivery",
+        "EveryMessageReachesAWaiter",
+        "a counterparty's retry is answered from the dedup and never matched",
+        "    /\\ attempt[m] = \"died\"\n    /\\ attempt' = [attempt EXCEPT ![m] = \"matching\"]",
+        "    /\\ attempt[m] = \"died\"\n    /\\ attempt' = [attempt EXCEPT ![m] = \"done\"]",
+        "property",
+    ),
+    "ClosedRunShedsItsMessage": (
+        "Delivery",
+        "EveryMessageReachesAWaiter",
+        "a closed run's unconsumed message stays claimed for it",
+        "    /\\ claim' = [m \\in Msgs |-> IF Unconsumed(r, m) THEN NoRun ELSE claim[m]]",
+        "    /\\ claim' = claim",
+        "property",
+    ),
+    # ── Task delivery ───────────────────────────────────────────────────────
+    "DecisionReachesAConcludedRun": (
+        "TaskDelivery",
+        "NoDecisionReachesAConcludedRun",
+        "a decision is journaled for a run whose conclusion is durable",
+        "            /\\ IF concluded\n",
+        "            /\\ IF FALSE\n",
+    ),
+    "TaskDecidedTwice": (
+        "TaskDelivery",
+        "OneDecisionPerTask",
+        "a second answer to the task is journaled as another decision",
+        "       ELSE /\\ UNCHANGED <<answer, journaled, retired>>",
+        "       ELSE /\\ journaled' = journaled \\cup {d}\n            /\\ UNCHANGED <<answer, retired>>",
+    ),
+    "LostDecisionReportedDelivered": (
+        "TaskDelivery",
+        "DeciderToldTheTruth",
+        "a decision that lost to the run's conclusion is reported as delivered",
+        "                    /\\ UNCHANGED <<journaled, told>>",
+        "                    /\\ told' = told \\cup {d}\n                    /\\ UNCHANGED journaled",
+    ),
+    "DecisionAfterWithdrawal": (
+        "TaskDelivery",
+        "WithdrawnStaysWithdrawn",
+        "a settlement moves a task that is no longer pending",
+        "    /\\ state' = IF from = \"pending\" THEN to ELSE from",
+        "    /\\ state' = to",
+    ),
+    "WithdrawalNeverRuns": (
+        "TaskDelivery",
+        "NoTaskOutlivesItsRun",
+        "a concluded run's pending task is never withdrawn",
+        "    /\\ concluded /\\ ~retired\n    /\\ retired' = TRUE",
+        "    /\\ concluded /\\ ~retired /\\ FALSE\n    /\\ retired' = TRUE",
+        "property",
+    ),
 }
 
 
@@ -502,10 +876,18 @@ def _constants_of(cfg: pathlib.Path) -> str:
     return "\n".join(out) + "\n"
 
 
+def kind_of(row: tuple[str, ...]) -> str:
+    kind = row[5] if len(row) > 5 else "invariant"
+    if kind not in ("invariant", "property"):
+        raise SystemExit(f"unknown mutation kind '{kind}'")
+    return kind
+
+
 def main() -> int:
     if len(sys.argv) == 2 and sys.argv[1] == "--list":
-        for mutant, (spec, invariant, description, _, _) in MUTATIONS.items():
-            print(f"{mutant}\t{spec}\t{invariant}\t{description}")
+        for mutant, row in MUTATIONS.items():
+            spec, check, description = row[:3]
+            print(f"{mutant}\t{spec}\t{check}\t{description}\t{kind_of(row)}")
         return 0
 
     if len(sys.argv) != 3:
@@ -513,7 +895,9 @@ def main() -> int:
         return 2
 
     mutant, out_dir = sys.argv[1], pathlib.Path(sys.argv[2])
-    spec, invariant, _description, find, replace = MUTATIONS[mutant]
+    row = MUTATIONS[mutant]
+    spec, invariant, _description, find, replace = row[:5]
+    kind = kind_of(row)
 
     source = (SPEC_DIR / f"{spec}.tla").read_text()
     if find not in source:
@@ -538,7 +922,7 @@ def main() -> int:
             _constants_of(SPEC_DIR / f"{spec}.cfg"),
             "SPECIFICATION Spec",
             "",
-            f"INVARIANT {invariant}",
+            f"{'PROPERTY' if kind == 'property' else 'INVARIANT'} {invariant}",
             "",
         ]
     )

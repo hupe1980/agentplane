@@ -569,7 +569,9 @@ pub struct Consumed {
 /// exception twice over: an outbound size is known before dispatch, so that
 /// ceiling is exact rather than reached, and its message says what the refused
 /// call would have sent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error, schemars::JsonSchema,
+)]
 #[non_exhaustive]
 #[serde(tag = "limit", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BudgetExceeded {

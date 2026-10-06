@@ -748,6 +748,9 @@ impl JournalStore for BlindToKeys {
     fn is_shared(&self) -> bool {
         self.0.is_shared()
     }
+    fn seals(&self) -> bool {
+        self.0.seals()
+    }
     async fn read(
         &self,
         run: agentplane::RunId,
@@ -779,6 +782,13 @@ impl JournalStore for BlindToKeys {
     }
     async fn count_by_outcome(&self, outcome: &str) -> Result<u64, agentplane::core::StoreError> {
         self.0.count_by_outcome(outcome).await
+    }
+    async fn runs_by_id(
+        &self,
+        after: Option<agentplane::RunId>,
+        limit: usize,
+    ) -> Result<Vec<agentplane::RunId>, agentplane::core::StoreError> {
+        self.0.runs_by_id(after, limit).await
     }
     async fn recent_runs(
         &self,
@@ -1036,4 +1046,97 @@ async fn a_run_that_never_existed_has_no_recorded_outcome() {
             .unwrap()
             .is_none()
     );
+}
+
+// ── A pinned revision ───────────────────────────────────────────────────────
+
+/// **A run pinned to one declaration revision is not admitted under another.**
+///
+/// The pin is compared before authorization — the policy here denies
+/// everything, so a refusal that reached the gate would read as a denial — and
+/// nothing is recorded. A capability no declaration governs (a coded skill)
+/// is refused the same way: a pin cannot be met by the absence of a revision.
+#[cfg(all(feature = "manifest", feature = "testkit"))]
+#[tokio::test]
+async fn a_pinned_admission_refuses_another_digest() {
+    use agentplane::core::RuntimeError;
+    use agentplane::runtime::{Agent, RunTerms};
+
+    let manifest = agentplane::manifest::Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: pinned, version: "1.0.0" }
+spec:
+  capabilities: { provides: [demo.pinned] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: completion }
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+    let reviewed = manifest.digest().unwrap();
+    let other = Digest::of(b"a revision nobody reviewed");
+
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("done");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let gate = Arc::new(Gate::default());
+    gate.deny.store(true, Ordering::SeqCst);
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .policy(Arc::clone(&gate) as Arc<dyn PolicyEngine>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .skill(Counts(Arc::new(AtomicUsize::new(0))))
+        .build();
+
+    let refused = rt
+        .run_under(
+            "demo.pinned",
+            Tainted::trusted(json!({})),
+            RunTerms::default().expect_declaration(other),
+        )
+        .await;
+    match refused {
+        Err(RuntimeError::DeclarationPinMismatch {
+            expected, found, ..
+        }) => {
+            assert_eq!(expected, other);
+            assert_eq!(found, Some(reviewed));
+        }
+        other => panic!("a pin on another revision was not refused as one: {other:?}"),
+    }
+
+    let coded = rt
+        .run_under(
+            "demo.counts",
+            Tainted::trusted(json!({})),
+            RunTerms::default().expect_declaration(reviewed),
+        )
+        .await;
+    assert!(
+        matches!(
+            coded,
+            Err(RuntimeError::DeclarationPinMismatch { found: None, .. })
+        ),
+        "a pin was met by a capability no declaration governs: {coded:?}"
+    );
+    assert!(
+        store.recent_runs(None, 10).await.unwrap().is_empty(),
+        "a refused pin left records behind"
+    );
+
+    gate.deny.store(false, Ordering::SeqCst);
+    let admitted = rt
+        .run_under(
+            "demo.pinned",
+            Tainted::trusted(json!({})),
+            RunTerms::default().expect_declaration(reviewed),
+        )
+        .await
+        .expect("the reviewed revision is admitted");
+    assert!(admitted.is_fresh());
 }

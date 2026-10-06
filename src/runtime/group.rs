@@ -846,6 +846,8 @@ impl crate::journal::AtomicWork for GroupCommit {
                     // labelled value to bind on its behalf.
                     outbound_label: None,
                     outbound_bytes: None,
+                    content_rules: None,
+                    credential: None,
                 })
                 .effect(*key),
             );
@@ -863,6 +865,9 @@ impl crate::journal::AtomicWork for GroupCommit {
                     // deferred members' values. Recorded conservatively so the
                     // record is honest about a value nothing labelled.
                     declared: crate::core::DeclaredOutput::untrusted(),
+                    // A member's output reaches no step, so no rule judges it.
+                    content: None,
+                    elapsed_ms: None,
                 })
                 .effect(*key),
             );

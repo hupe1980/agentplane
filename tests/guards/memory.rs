@@ -227,6 +227,99 @@ async fn erase_subject_reaches_every_item_however_many() {
     }
 }
 
+/// A key ring whose destructions can be refused, as a KMS outage does.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[derive(Debug, Default)]
+struct RefusesDestroy {
+    inner: agentplane::testkit::MemoryKeyRing,
+    down: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[async_trait::async_trait]
+impl agentplane::keyring::KeyRing for RefusesDestroy {
+    async fn data_key(
+        &self,
+        scope: &str,
+    ) -> Result<
+        (
+            agentplane::keyring::DataKey,
+            agentplane::keyring::WrappedKey,
+        ),
+        agentplane::keyring::KeyError,
+    > {
+        self.inner.data_key(scope).await
+    }
+    async fn open(
+        &self,
+        wrapped: &agentplane::keyring::WrappedKey,
+    ) -> Result<agentplane::keyring::DataKey, agentplane::keyring::KeyError> {
+        self.inner.open(wrapped).await
+    }
+    async fn destroy(
+        &self,
+        scope: &str,
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<(), agentplane::keyring::KeyError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(agentplane::keyring::KeyError::Unavailable(
+                "the KMS did not answer".into(),
+            ));
+        }
+        self.inner.destroy(scope, at, reason).await
+    }
+}
+
+/// A key the ring refused to destroy after its rows went is destroyed later.
+///
+/// The expiry sweep erases rows and then destroys their keys. When the ring
+/// refuses, the rows are already gone, so the next sweep finds nothing to
+/// erase; unless the refused destruction is owed, the key — and every backup
+/// it opens — survives an erasure that was reported.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn a_key_the_ring_refused_after_an_expiry_is_destroyed_later() {
+    use agentplane::keyring::{EncryptedMemoryStore, KeyError, KeyRing};
+
+    let tenant = TenantId::new("owed-keys").expect("tenant");
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone()),
+    );
+    let ring = Arc::new(RefusesDestroy::default());
+    let encrypted = EncryptedMemoryStore::new(
+        Arc::clone(&inner) as Arc<dyn MemoryStore>,
+        Arc::clone(&ring) as Arc<dyn KeyRing>,
+        tenant.clone(),
+    );
+    let mut expiring = item("exp-1", "person-exp", json!({"x": 1}), Trust::Untrusted);
+    expiring.expires_at = Some(at(1_760_000_010));
+    encrypted.remember(&expiring).await.expect("write");
+
+    ring.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    encrypted
+        .sweep_expired(at(1_760_000_100))
+        .await
+        .expect_err("the ring refused the key, so the sweep cannot report success");
+
+    ring.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    encrypted
+        .sweep_expired(at(1_760_000_200))
+        .await
+        .expect("the next sweep pays what the last one owed");
+    let scope = agentplane::keyring::scope(&tenant, "memory-item/exp-1@1");
+    assert!(
+        matches!(
+            ring.inner.data_key(&scope).await,
+            Err(KeyError::Destroyed { .. })
+        ),
+        "the expired item's key survived: its rows went, the ring refused once, and \
+         nothing retried the destruction"
+    );
+}
+
 /// A destroyed subject key reads as absence; corruption stays loud.
 ///
 /// The scenario is a completed erasure whose ciphertext cleanup failed — the
@@ -553,6 +646,9 @@ struct Counted {
 
 #[async_trait::async_trait]
 impl MemoryStore for Counted {
+    fn seals(&self) -> bool {
+        self.inner.seals()
+    }
     async fn remember(&self, item: &MemoryItem) -> Result<u64, agentplane::core::StoreError> {
         self.inner.remember(item).await
     }
@@ -643,6 +739,9 @@ struct RejectsComposedCascade {
 
 #[async_trait::async_trait]
 impl MemoryStore for RejectsComposedCascade {
+    fn seals(&self) -> bool {
+        self.inner.seals()
+    }
     async fn remember(&self, item: &MemoryItem) -> Result<u64, agentplane::core::StoreError> {
         self.inner.remember(item).await
     }
@@ -836,6 +935,13 @@ impl SemanticRetriever for CountedRetriever {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.search(query).await
     }
+
+    async fn forget(
+        &self,
+        forgotten: &agentplane::memory::Forgotten,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.forget(forgotten).await
+    }
 }
 
 /// The one revision this test file's indexes accept.
@@ -851,8 +957,17 @@ impl Embedder for FixedEmbedder {
         self.0.to_owned()
     }
 
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agentplane::core::StoreError> {
-        Ok(vec![1.0, 0.0])
+    async fn embed(
+        &self,
+        _text: &str,
+    ) -> Result<agentplane::memory::Embedded, agentplane::core::StoreError> {
+        Ok(agentplane::memory::Embedded {
+            vector: vec![1.0, 0.0],
+            usage: agentplane::model::Usage {
+                input_tokens: 7,
+                ..Default::default()
+            },
+        })
     }
 }
 
@@ -2052,10 +2167,16 @@ impl agentplane::memory::Embedder for DriftingEmbedder {
         "stub-embed@1".to_owned()
     }
 
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agentplane::core::StoreError> {
+    async fn embed(
+        &self,
+        _text: &str,
+    ) -> Result<agentplane::memory::Embedded, agentplane::core::StoreError> {
         let nth = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         #[allow(clippy::cast_precision_loss)]
-        Ok(vec![1.0, nth as f32])
+        Ok(agentplane::memory::Embedded {
+            vector: vec![1.0, nth as f32],
+            usage: agentplane::model::Usage::default(),
+        })
     }
 }
 
@@ -2233,6 +2354,13 @@ impl SemanticRetriever for OverrunningRetriever {
         let mut wide = query.clone();
         wide.limit = usize::MAX;
         self.0.search(&wide).await
+    }
+
+    async fn forget(
+        &self,
+        forgotten: &agentplane::memory::Forgotten,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.0.forget(forgotten).await
     }
 }
 
@@ -2661,6 +2789,9 @@ struct Rewrites {
 
 #[async_trait::async_trait]
 impl MemoryStore for Rewrites {
+    fn seals(&self) -> bool {
+        self.inner.seals()
+    }
     async fn remember(&self, item: &MemoryItem) -> Result<u64, agentplane::core::StoreError> {
         self.inner.remember(item).await
     }
@@ -3182,6 +3313,9 @@ struct FailsSubjectCleanup(Arc<dyn MemoryStore>);
 #[cfg(all(feature = "keyring", feature = "testkit"))]
 #[async_trait::async_trait]
 impl MemoryStore for FailsSubjectCleanup {
+    fn seals(&self) -> bool {
+        self.0.seals()
+    }
     fn tenant(&self) -> &str {
         self.0.tenant()
     }
@@ -3302,5 +3436,393 @@ async fn a_subject_erasure_whose_cleanup_failed_is_not_reported_clean() {
             .expect("recall")
             .is_empty(),
         "the erased memory still reads"
+    );
+}
+
+/// Records every erasure it is told of; refuses them all when `refuse` is set.
+#[derive(Debug)]
+struct Recorder {
+    inner: InMemorySemanticRetriever,
+    told: std::sync::Mutex<Vec<agentplane::memory::Forgotten>>,
+    refuse: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl SemanticRetriever for Recorder {
+    fn profile(&self) -> Value {
+        self.inner.profile()
+    }
+
+    fn index(&self) -> IndexIdentity {
+        self.inner.index()
+    }
+
+    async fn search(
+        &self,
+        query: &SemanticQuery,
+    ) -> Result<Vec<SemanticHit>, agentplane::core::StoreError> {
+        self.inner.search(query).await
+    }
+
+    async fn forget(
+        &self,
+        forgotten: &agentplane::memory::Forgotten,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.told.lock().unwrap().push(forgotten.clone());
+        if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(agentplane::core::StoreError::Backend(
+                "index offline".to_owned(),
+            ));
+        }
+        self.inner.forget(forgotten).await
+    }
+}
+
+/// An index over every current item of `memories` the test names.
+async fn indexed(memories: &Arc<dyn MemoryStore>, ids: &[&str], refuse: bool) -> Arc<Recorder> {
+    let mut vectors = Vec::new();
+    for id in ids {
+        let stored = memories.version(id, 1).await.unwrap().expect("stored");
+        vectors.push(SemanticVector {
+            subject: stored.subject.clone(),
+            purpose: stored.purpose.clone(),
+            selected: agentplane::memory::Selected {
+                id: stored.id.clone(),
+                version: stored.version,
+                digest: stored.selection_digest(),
+            },
+            embedding: vec![1.0, 0.0],
+        });
+    }
+    Arc::new(Recorder {
+        inner: InMemorySemanticRetriever::new(
+            IndexIdentity {
+                snapshot: "snapshot-1".to_owned(),
+                query_revision: TEST_REVISION.to_owned(),
+            },
+            vectors,
+        ),
+        told: std::sync::Mutex::default(),
+        refuse: refuse.into(),
+    })
+}
+
+/// **Erasure reaches the semantic index.** An embedding left behind a
+/// forgotten item is reconstructible content, so every erasure verb tells the
+/// index what it removed — and an index that cannot be told is a failed
+/// erasure, not a successful one.
+#[tokio::test]
+async fn an_erasure_reaches_the_semantic_index() {
+    use agentplane::memory::{Forgotten, IndexedMemoryStore};
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    for (id, subject) in [("a-1", "acct-a"), ("a-2", "acct-a"), ("b-1", "acct-b")] {
+        memories
+            .remember(&item(id, subject, json!({"n": id}), Trust::Untrusted))
+            .await
+            .unwrap();
+    }
+    let index = indexed(&memories, &["a-1", "a-2", "b-1"], false).await;
+    let erasing = IndexedMemoryStore::new(
+        Arc::clone(&memories),
+        Arc::clone(&index) as Arc<dyn SemanticRetriever>,
+    );
+
+    assert_eq!(erasing.forget_subject("acct-a").await.unwrap(), 2);
+    erasing.forget("b-1").await.unwrap();
+    assert_eq!(
+        *index.told.lock().unwrap(),
+        vec![
+            Forgotten::Subject("acct-a".to_owned()),
+            Forgotten::Ids(vec!["b-1".to_owned()]),
+        ],
+        "the index must be told exactly what each erasure removed"
+    );
+    assert!(
+        index.inner.is_empty(),
+        "the index still holds erased vectors"
+    );
+
+    // An index that cannot be told fails the erasure it belongs to.
+    memories
+        .remember(&item("c-1", "acct-c", json!({}), Trust::Untrusted))
+        .await
+        .unwrap();
+    let offline = indexed(&memories, &["c-1"], true).await;
+    let erasing = IndexedMemoryStore::new(
+        Arc::clone(&memories),
+        Arc::clone(&offline) as Arc<dyn SemanticRetriever>,
+    );
+    let refused = erasing
+        .forget_subject("acct-c")
+        .await
+        .expect_err("an erasure the index missed reported success");
+    assert!(refused.to_string().contains("semantic index"), "{refused}");
+}
+
+/// **What an index missed is owed, not dropped.** A cascade and a sweep erase
+/// rows a retry will not find again, so what the index refused is delivered by
+/// the next erasure verb — here a sweep that erases nothing itself.
+#[tokio::test]
+async fn an_erasure_the_index_missed_is_delivered_by_the_next_one() {
+    use agentplane::memory::{Forgotten, IndexedMemoryStore};
+    use std::sync::atomic::Ordering;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let mut expired = item("gone-1", "acct-owed", json!({}), Trust::Untrusted);
+    expired.expires_at = Some(at(1));
+    memories.remember(&expired).await.unwrap();
+    memories
+        .remember(&item("cut-1", "acct-owed", json!({}), Trust::Untrusted))
+        .await
+        .unwrap();
+    let index = indexed(&memories, &["gone-1", "cut-1"], true).await;
+    let erasing = IndexedMemoryStore::new(
+        Arc::clone(&memories),
+        Arc::clone(&index) as Arc<dyn SemanticRetriever>,
+    );
+
+    erasing
+        .forget_cascading("cut-1")
+        .await
+        .expect_err("a cascade the index missed reported success");
+    erasing
+        .sweep_expired(at(1_760_000_200))
+        .await
+        .expect_err("a sweep the index missed reported success");
+    assert_eq!(index.inner.len(), 2, "the offline index dropped vectors");
+
+    index.refuse.store(false, Ordering::SeqCst);
+    index.told.lock().unwrap().clear();
+    assert!(
+        erasing
+            .sweep_expired(at(1_760_000_200))
+            .await
+            .expect("the index is back")
+            .is_empty(),
+        "the second sweep had nothing of its own to erase"
+    );
+    assert_eq!(
+        *index.told.lock().unwrap(),
+        vec![
+            Forgotten::Ids(vec!["cut-1".to_owned()]),
+            Forgotten::Ids(vec!["gone-1".to_owned()]),
+        ],
+        "what the offline index missed was never delivered"
+    );
+    assert!(
+        index.inner.is_empty(),
+        "the index still holds erased vectors"
+    );
+}
+
+/// **A person's erasure on a sealed plane reaches the semantic index.**
+///
+/// `erase_subject` is the sealed store's own verb and runs beneath anything
+/// the plane wraps around it, so only an index beneath the seal is told. The
+/// plane refuses the composition that would miss it, and the one it accepts
+/// tells the index what the erasure removed.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn a_sealed_planes_subject_erasure_reaches_the_semantic_index() {
+    use agentplane::core::TenantId;
+    use agentplane::keyring::{EncryptedMemoryStore, KeyRing};
+    use agentplane::memory::{Forgotten, IndexedMemoryStore};
+    use agentplane::runtime::BuildError;
+    use agentplane::testkit::MemoryKeyRing;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let inner = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let keys = Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
+    let index = indexed(&inner, &[], false).await;
+    let retriever = Arc::clone(&index) as Arc<dyn SemanticRetriever>;
+
+    let above = Arc::new(EncryptedMemoryStore::new(
+        Arc::clone(&inner),
+        Arc::clone(&keys),
+        TenantId::default(),
+    ));
+    let refused = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(above as Arc<dyn MemoryStore>)
+        .semantic_memory(
+            Arc::new(FixedEmbedder(TEST_REVISION)),
+            Arc::clone(&retriever),
+        )
+        .try_build();
+    assert!(
+        matches!(refused, Err(BuildError::SealedMemoryMissesIndex)),
+        "a sealed store whose subject erasure misses the index was accepted"
+    );
+
+    let sealed = Arc::new(EncryptedMemoryStore::new(
+        Arc::new(IndexedMemoryStore::new(
+            Arc::clone(&inner),
+            Arc::clone(&retriever),
+        )),
+        keys,
+        TenantId::default(),
+    ));
+    let _rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&sealed) as Arc<dyn MemoryStore>)
+        .semantic_memory(Arc::new(FixedEmbedder(TEST_REVISION)), retriever)
+        .try_build()
+        .expect("the index beneath the seal is the composition that reaches it");
+    sealed
+        .remember(&item("s-1", "acct-s", json!({}), Trust::Untrusted))
+        .await
+        .unwrap();
+    let erased = sealed
+        .erase_subject("acct-s", at(5), "erasure request")
+        .await
+        .expect("erased");
+    assert_eq!(erased.reached, 1);
+    assert_eq!(
+        *index.told.lock().unwrap(),
+        vec![Forgotten::Subject("acct-s".to_owned())],
+        "the subject's erasure did not reach the semantic index"
+    );
+}
+
+/// A store already telling another index is refused under that name.
+///
+/// Nothing here is sealed, so the refusal must not say it is: the store's
+/// erasures reach an index, just not the one the plane searches.
+#[tokio::test]
+async fn a_store_indexed_elsewhere_is_refused_as_such() {
+    use agentplane::memory::IndexedMemoryStore;
+    use agentplane::runtime::BuildError;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let inner = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let theirs = indexed(&inner, &[], false).await as Arc<dyn SemanticRetriever>;
+    let ours = indexed(&inner, &[], false).await as Arc<dyn SemanticRetriever>;
+    let refused = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::new(IndexedMemoryStore::new(inner, theirs)) as Arc<dyn MemoryStore>)
+        .semantic_memory(Arc::new(FixedEmbedder(TEST_REVISION)), ours)
+        .try_build();
+    assert!(
+        matches!(refused, Err(BuildError::MemoryIndexedElsewhere)),
+        "an unsealed store telling another index was refused as something else: {:?}",
+        refused.err()
+    );
+}
+
+/// The runtime's own erasure — the expiry sweep — reaches the wired index.
+#[tokio::test]
+async fn the_expiry_sweep_reaches_the_semantic_index() {
+    use agentplane::memory::Forgotten;
+
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let memories = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let mut expired = item("gone-1", "acct-sweep", json!({}), Trust::Untrusted);
+    expired.expires_at = Some(at(1));
+    memories.remember(&expired).await.unwrap();
+    memories
+        .remember(&item("kept-1", "acct-sweep", json!({}), Trust::Untrusted))
+        .await
+        .unwrap();
+    let index = indexed(&memories, &["gone-1", "kept-1"], false).await;
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(memories)
+        .semantic_memory(
+            Arc::new(FixedEmbedder(TEST_REVISION)),
+            Arc::clone(&index) as Arc<dyn SemanticRetriever>,
+        )
+        .skill(Sweeps)
+        .build();
+
+    let out = rt
+        .run("sweeps-memory", Tainted::trusted(json!({})))
+        .await
+        .expect("sweep");
+    assert_eq!(out.status, RunStatus::Succeeded);
+    assert_eq!(
+        *index.told.lock().unwrap(),
+        vec![Forgotten::Ids(vec!["gone-1".to_owned()])],
+        "the sweep erased an item and the index was not told"
+    );
+    assert_eq!(index.inner.len(), 1, "only the unexpired vector remains");
+}
+
+/// Embeds the same query twice.
+#[derive(Debug)]
+struct EmbedsTwice;
+
+#[async_trait::async_trait]
+impl Skill for EmbedsTwice {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("embeds-twice").provides("embeds-twice")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        for _ in 0..2 {
+            cx.embed(
+                Tainted::trusted("refund policy".to_owned()),
+                Sensitivity::Internal,
+            )
+            .await?;
+        }
+        Ok(Outcome::done(Tainted::trusted(json!({}))))
+    }
+}
+
+/// **An embedding is metered.** The service's reported tokens count against
+/// the run's ceiling like a model call's: seven tokens under a ceiling of five
+/// leave no room for a second call.
+#[tokio::test]
+async fn an_embedding_counts_against_the_token_ceiling() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .semantic_memory(
+            Arc::new(FixedEmbedder(TEST_REVISION)),
+            empty_index(TEST_REVISION),
+        )
+        .budget(agentplane::core::Budget {
+            max_tokens: Some(5),
+            ..agentplane::core::Budget::unlimited()
+        })
+        .skill(EmbedsTwice)
+        .build();
+
+    let out = rt
+        .run("embeds-twice", Tainted::trusted(json!({})))
+        .await
+        .expect("the run concludes");
+    assert!(
+        matches!(out.status, RunStatus::Exhausted(_)),
+        "two embeddings of seven tokens each ran under a ceiling of five: {:?}",
+        out.status
+    );
+}
+
+/// A money ceiling beside an embedder that states no price is refused at build:
+/// its calls would report no cost, and the ceiling would never bind on them.
+#[test]
+fn an_unpriced_embedder_is_refused_beside_a_money_ceiling() {
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let built = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
+        .semantic_memory(
+            Arc::new(FixedEmbedder(TEST_REVISION)),
+            empty_index(TEST_REVISION),
+        )
+        .budget(agentplane::core::Budget {
+            max_minor_units: Some(100),
+            ..agentplane::core::Budget::unlimited()
+        })
+        .try_build();
+    assert!(
+        matches!(
+            built,
+            Err(agentplane::runtime::BuildError::UnpricedEmbedder { .. })
+        ),
+        "an embedder with no price was accepted under a money ceiling"
     );
 }

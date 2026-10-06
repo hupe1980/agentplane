@@ -1,0 +1,137 @@
+{{- $name := include "agentplane.fullname" . -}}
+{{- $redb := include "agentplane.redb" . | eq "true" -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "agentplane.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicas }}
+  {{- if $redb }}
+  # One writer: the old pod releases the redb file before the new one opens it.
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "agentplane.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "agentplane.selector" . | nindent 8 }}
+      annotations:
+        # A changed manifest or policy is a new pod: a running plane holds its
+        # declarations from start, so an upgrade is a rollout.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # `serve` reads the token file and the store once, at start. The
+        # Secrets are read from the cluster on install and upgrade, so a
+        # rotation followed by `helm upgrade` is a rollout too; a rotation
+        # with no upgrade needs `kubectl rollout restart`.
+        checksum/secrets: {{ include "agentplane.secrets" . | sha256sum }}
+    spec:
+      automountServiceAccountToken: false
+      # Longer than the drain, or the kubelet kills runs mid-effect.
+      terminationGracePeriodSeconds: {{ add (int .Values.drainSeconds) 10 }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: plane
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default (printf "%s-full" .Chart.AppVersion) }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - /work/agent.yaml
+            - --addr=0.0.0.0:8080
+            - --url={{ .Values.url | default (printf "http://%s:8080/a2a" $name) }}
+            - --mcp-addr=0.0.0.0:8081
+            - --mcp-allowed-host={{ $name }}:8081
+            {{- range .Values.mcp.allowedHosts }}
+            - --mcp-allowed-host={{ . }}
+            {{- end }}
+            - --operator-addr=0.0.0.0:9090
+            - --policy=/work/policy.cedar
+            - --tokens=/secrets/{{ .Values.tokens.key }}
+            {{- if not .Values.storeSecret.existingSecret }}
+            - --store={{ .Values.store }}
+            {{- end }}
+            {{- with .Values.tenant }}
+            - --tenant={{ . }}
+            {{- end }}
+            - --drain-secs={{ .Values.drainSeconds }}
+            - --log-format=json
+          {{- with .Values.storeSecret.existingSecret }}
+          # The connection string, password included, from a Secret: pod args
+          # are readable by anyone who can read the pod.
+          env:
+            - name: AGENTPLANE_STORE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.storeSecret.key }}
+          {{- end }}
+          ports:
+            - { name: a2a, containerPort: 8080 }
+            - { name: mcp, containerPort: 8081 }
+            - { name: operator, containerPort: 9090 }
+          # The image has no shell, so probes are HTTP; the card is served
+          # unauthenticated by design.
+          readinessProbe:
+            httpGet:
+              path: /.well-known/agent-card.json
+              port: a2a
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /.well-known/agent-card.json
+              port: a2a
+            periodSeconds: 20
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - { name: config, mountPath: /work, readOnly: true }
+            - { name: tokens, mountPath: /secrets, readOnly: true }
+            {{- if $redb }}
+            - { name: data, mountPath: /data }
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: tokens
+          secret:
+            secretName: {{ .Values.tokens.existingSecret }}
+            defaultMode: 0440
+        {{- if $redb }}
+        - name: data
+          {{- if .Values.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

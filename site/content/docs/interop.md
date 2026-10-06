@@ -84,8 +84,9 @@ the call.
 receives.** Depth, audience and expiry are checked before dispatch, and a chain
 with no room for another link refuses at the hand-off — so the bound is real and
 it is enforced on this side. What the peer gets is the credential, from which its
-own authenticator derives whatever chain it will act under. The message
-deliberately carries none: a chain a receiver reads from a body is the sender's
+own authenticator derives whatever chain it will act under — so whether the
+peer can tell *who asked* depends on which credential the hop presents (see
+below). The message deliberately carries no chain: a chain a receiver reads from a body is the sender's
 claim about its own authority, and the only safe use of one is to ignore it, so
 publishing it would offer an implementer a field that is either useless or a
 confused-deputy bug.
@@ -101,11 +102,41 @@ that could be two of them refuses the build.
 
 ### Obtaining the credential
 
-`PeerCredential` models a token already bound to one audience. Getting one is
-OAuth token exchange (RFC 8693) naming a `resource` (RFC 8707), behind the
-`TokenExchange` seam.
+`PeerCredential` models a token already bound to one audience. A peer is wired
+one of two ways, and the difference is what the peer can see:
 
-Three decisions there are worth stating.
+- **A held credential** (`PeerGrant::with_credential`, or the CLI's
+  `AGENTPLANE_PEER_TOKEN_<NAME>`). It names nobody: every run on the plane
+  presents the same token, so the peer sees the plane as its caller and cannot
+  tell one run's principal from another's.
+- **A credential source** (`PeerGrant::with_source`). Each hop presents a
+  credential for the run's owner — the person at the root of its chain — with
+  the plane as actor, valid only at that peer. A run acting for nobody is
+  refused; a run admitted as the plane presents the plane's own held
+  credential, or is refused if there is none.
+
+`peers::TokenEndpoint` (`a2a` feature) obtains such credentials by OAuth token
+exchange (RFC 8693) at the deployment's issuer: the owner's principal id as the
+subject token, under a token type the deployment names; the plane's own
+credential as the actor token; the peer as `audience`, and as the RFC 8707
+`resource` where one is mapped. Put `Cached` in front of it. The issuer takes
+the plane's word for the subject because it authenticated the plane — a
+resumed run holds no inbound token to present. A refusal reports the OAuth
+error code only.
+
+The call, the remote task read and the cancel all present the same run's
+credential. Which kind a hop presented is on its `EffectStarted` record
+(`credential`: `subject`, `unbound` or `plane`, with the audience and, for
+`subject`, the principal id) — never the token, its digest or its expiry.
+
+A withdrawn subject (`halt --scope subject:<id>`) is honoured at the hop, not
+only at the next step boundary: each live subject-bound hop reads the halts
+first, and on a match no credential is presented, every source drops what it
+holds for that subject, and the run is withheld exactly as a withdrawal at a
+step boundary withholds it. An undo is exempt, as it is from a budget's
+verdict.
+
+Four decisions there are worth stating.
 
 **A credential must never enter the journal.** The journal is append-only,
 hash-chained, permanent and read by auditors — a bearer token in an `EffectDone`
@@ -127,8 +158,16 @@ of *unknown* disposition — when it was really a refresh nobody scheduled.
 `Cached` refreshes at `expiry - skew`.
 
 **The issuer is not taken at its word.** An issuer that ignores `resource` hands
-back a token the peer can spend elsewhere, which defeats the binding entirely, so
-the returned audience is re-checked locally.
+back a token the peer can spend elsewhere, which defeats the binding entirely,
+and one that ignores the subject names the wrong person; both are re-checked
+locally on every credential before it is presented, whichever source produced
+it. `Cached` holds a credential per audience **and** subject, so one person's
+token is never lent to another's run.
+
+**Obtained when the call is performed, never on replay.** A call is constructed
+on every pass; only performing it reaches the token endpoint, so a replay never
+does. An issuer that cannot be reached fails the call as *did not happen* —
+nothing was sent — rather than leaving it in doubt.
 
 Expiry is checked against a supplied `now` rather than a clock read, which keeps
 it testable at arbitrary instants and adds no escape to the determinism gate.
@@ -178,11 +217,18 @@ revision. The specification says the rest of it directly: removal from the
 specification does not oblige an implementation to drop a feature, and that
 timeline is the implementation's own.
 
-**Served, this plane accepts one revision.** It is `2026-07-28`, it is what
-`server/discover` advertises, and it bounds what a handshake may negotiate to.
-An older revision is refused there rather than downgraded into.
+**Served, this plane speaks two revisions, and the promise is per extension.**
+They are `2026-07-28` and `2025-11-25`, one constant with the calling half. A
+host holding the Tasks extension — `2026-07-28` with
+`io.modelcontextprotocol/tasks` declared — is offered every tool. A host
+without it, which is any `2025-11-25` session and any `2026-07-28` host that
+does not declare the extension, is offered only the tools whose runs can never
+suspend, and calling another by name is refused before anything is admitted.
+`2025-11-25`'s experimental tasks are not implemented: a tool there with no
+`taskSupport` is `forbidden`, which is what a never-suspending tool is. A
+revision older than `2025-11-25` is refused at the handshake, naming the two.
 
-**Calling out, it speaks two:** `2026-07-28`, and `2025-11-25` as the
+**Calling out, it speaks the same two:** `2026-07-28`, and `2025-11-25` as the
 handshake-era fallback — the pair it is exercised against. A handshake settling
 anywhere else is refused at construction, including a revision the SDK
 understands perfectly well: a dialect this host does not implement cannot be
@@ -276,7 +322,7 @@ there.
 The server provides `GetTask`, `ListTasks`, streaming/subscription,
 cancellation, durable push, and extended cards. A returned Task becomes a typed
 `PeerTask`; `PeerTaskCall` polls it as an untrusted journaled effect under the
-same peer grant and audience-bound credential, and `PeerTaskCancel` asks the
+same peer grant and the same run's credential, and `PeerTaskCancel` asks the
 peer to stop it, so a run that commissioned remote work and is itself cancelled
 propagates the stop rather than leaving the peer spending on an answer nobody
 will read. The cancel is cooperative and safely retryable: a repeat of one that
@@ -468,7 +514,10 @@ Further decisions are load-bearing.
 
 **The card describes the deployment, not compiled code.** `A2aServer::new`
 requires a typed bearer scheme and scopes, because a client cannot authenticate
-from an abstract `Authenticator` it cannot see. Push stays false and its methods
+from an abstract `Authenticator` it cannot see. A refused credential — including
+a valid one for a tenant this endpoint does not serve — is HTTP 401 with
+`WWW-Authenticate: Bearer`; every other error is HTTP 200 carrying a JSON-RPC
+error. Push stays false and its methods
 use `PushNotificationNotSupportedError` until `with_push` supplies durable
 registration/cursor storage and a governed transport. Configure before signing:
 the capability is in the signed payload. `push_worker()` returns the handle an
@@ -489,6 +538,11 @@ correlation matching would be wrong because two tasks may wait on the same
 business key. The authenticated peer and stable `messageId` form the dedup
 identity, a supplied `contextId` must match, and retrying the message after it
 completed the task returns the current Task rather than applying it twice.
+Policy is asked twice: `a2a:task.continue` on the task, and `a2a:event.deliver`
+on the kind the task awaits — the question `POST /events` asks as
+`api:event.deliver` — so a rule narrowing which kinds a peer may supply holds
+on both doors. The shipped bundle grants it on no kind; its commented rule is
+the shape for naming the kinds a peer may answer.
 
 **The 1.0 method names only.** 1.0 renamed every method; `message/send` was 0.3.
 A server that answers both accepts clients which have silently lost half the
@@ -629,6 +683,12 @@ The grant is re-checked **at delivery**, not only at registration. A
 registration outlives the configuration that permitted it, and the tasks that
 outlive a config change are exactly the long-running ones push exists for.
 
+**A task holds at most ten registrations, and an id is at most 128 bytes.**
+Every registration is a delivery per record, so a peer registering without
+limit would multiply the plane's outbound traffic by its own choice. An
+eleventh id is `INVALID_PARAMS`; re-registering an id the task already holds
+replaces it.
+
 The **journal is the outbox**. Each registration stores the first sequence not
 acknowledged by that receiver. Workers derive the same status and artifact
 `StreamResponse` payloads as SSE and advance only after HTTP 2xx. A crash after
@@ -744,7 +804,7 @@ failure the design is shaped to avoid. An idle stream may be reaped by
 an intermediary, which is the better failure, because a client can recover from a
 closed connection and cannot recover from one that never ends.
 
-### MCP, being served (`mcp-server`)
+### MCP, being served (`mcp-server`, `mcp-server-http`) {#mcp-being-served}
 
 Served: tools, prompts, the Tasks mapping, and one resource. A host calls a tool
 and a governed run happens, under the same admission an A2A message gets.
@@ -754,23 +814,74 @@ and an agent that declares none cannot be offered at all: the only honest
 argument shape to hand a model is one somebody reviewed. A prompt is the
 manifest's system prompt, served verbatim and taking no arguments. A capability
 nothing on the plane provides is refused when the catalogue is built rather than
-when a model first calls it.
+when a model first calls it. `McpServer::new` refuses a plane with no policy
+engine.
 
 **A suspension comes back as a Task, and its task id is the run id.** So
 `tasks/get` answers by reading the journal rather than a table beside it, and the
 handle still means something after a restart or from another instance.
 `tasks/cancel` is the runtime's own cancellation, recorded and honoured at the
-next step boundary. Both act only on runs this surface admitted — any other run
-id answers as no such task — and a completed task hands back the call's own
-result, a cancelled one reads `cancelled`. `McpServer::new` refuses a plane with
-no policy engine, and a call runs under no delegation chain, never the plane's.
-A host that sets `io.agentplane/idempotencyKey` in a call's `_meta` gets one run
-for every retry of that call **within its session**: this surface authenticates
-no host, so the session is what says whose key it is, and a key honoured across
-sessions would hand one host another's run. Each session — each clone of the
-server a transport makes — keys its calls apart from every other's. Revisions older than `2026-07-28` are refused at the
-handshake: they carry no Tasks extension, so a suspension would have no way to
-say so — the reason [the promise is stated per extension](#protocol-revisions).
+next step boundary. Both act only on runs the asker admitted — any other run id
+answers as no such task — and a completed task hands back the call's own result,
+a cancelled one reads `cancelled`.
+
+**A host that cannot hold a task is offered only what never needs one.** A run
+may suspend when its agent declares oversight, a grant asks for approval, a
+grant is another agent or an A2A peer, or the agent is a coded skill, which
+nothing can see into. Such a tool is offered only to a host holding the Tasks
+extension ([revisions](#protocol-revisions)). If a run judged unable to suspend
+waits anyway, the call answers an error naming the run and saying it is waiting
+on this plane; the run stays among the waiting runs, never reported failed or
+succeeded.
+
+**Over HTTP the caller is authenticated.** `agentplane serve --mcp-addr` (or
+`McpHttp` in the library) serves the catalogue at `/mcp`. Before the MCP layer
+sees a request, in order:
+
+- **`Host` and `Origin`.** `Host` must be loopback or listed with
+  `--mcp-allowed-host`, and a non-loopback bind with none listed is refused at
+  startup. An `Origin`, when present, must be listed with
+  `--mcp-allowed-origin`. Either refusal is `403`. Server-side frameworks send no
+  `Origin`.
+- **The credential, then the tenant.** One `401` with `WWW-Authenticate: Bearer`
+  for a missing, unknown or other-tenant token. An authenticator that cannot
+  answer also reads as `401`; the reason is logged on the plane's side.
+- **The session's owner.** A `2025-11-25` session (`Mcp-Session-Id`) belongs to
+  the caller whose `initialize` created it. A `GET`, `POST` or `DELETE` naming
+  it from another caller is `404`, as an unknown session is, so nobody else can
+  resume its stream, post into it or close it. A caller holds at most eight
+  live sessions (`MAX_SESSIONS_PER_CALLER`); an `initialize` past that is `429`.
+
+A call is admitted as that caller: keyed under it, under its own chain or none
+(never the plane's), `admitted_by` the actor, and its input labelled untrusted
+from `peer:<actor>` — the spelling A2A uses, so a protected field naming a
+counterparty matches through either door. Each action is asked of policy first:
+`mcp:tool.list`, `mcp:tool.call` (on the tool's name), `mcp:task.read`,
+`mcp:task.cancel`, `mcp:prompt.read` and `mcp:resource.read`. A denied list is
+an error, never an empty list. `io.agentplane/idempotencyKey` in a call's
+`_meta` makes every retry of that tool one run for that caller on any request;
+another caller's same key, or the same key sent to another tool, is another
+run. A task answers only the caller whose key admitted it.
+
+`--mcp-addr` serves every agent in the file, and each must declare `spec.input`
+or the listener refuses to start; `--mcp-agent NAME` (repeatable) serves only
+the agents it names. An embedder who mounts `McpServer` in a Streamable HTTP
+service of their own, without `McpHttp`, gets no anonymous host: a request that
+arrived over HTTP with no authenticated caller is refused.
+
+The binary authenticates the static bearer tokens of `--tokens` and publishes no
+protected-resource metadata. An embedder whose `Authenticator` verifies an
+authorization server's tokens names that server with
+`HttpConfig::protected_resource`; the metadata is then served at
+`/.well-known/oauth-protected-resource/mcp` and the `401` carries
+`resource_metadata`.
+
+**Over stdio no host is authenticated.** A call runs under no delegation chain,
+and `io.agentplane/idempotencyKey` deduplicates within the session, because the
+session is the only thing that says whose key it is. **A task id is a bearer
+capability** there: a task outlives the session that started it, so whoever
+holds the id — eighty random bits — may read or cancel it. Keep it where you
+would keep a credential.
 
 #### One resource is served, and it is the declaration
 
@@ -799,6 +910,32 @@ erasure would have destroyed.** That falls out of the same rule — a kind with
 no caller payload has nothing crypto-erasure reaches. So the cache you cannot
 follow holds a reviewed document and a digest, which is why it is tolerable
 here and would not be for the refused kinds above.
+
+#### Frameworks {#frameworks}
+
+Each framework below reaches the served starter through its own client, with a
+static bearer header and nothing of this project imported; the quickstarts are
+in `examples/frameworks/`,
+walked by [getting started](@/docs/getting-started.md#zero-to-governed), and
+run against the `:full` image built from every push to `main` (`just frameworks`).
+
+| Framework (pinned) | MCP client | `mcp` (locked) | Revision negotiated | A2A client |
+|---|---|---|---|---|
+| `openai-agents` 0.22.3 | `MCPServerStreamableHttp` | 2.2.0 | `2026-07-28` | — |
+| `langgraph` 1.2.12, `langchain-mcp-adapters` 0.3.2 | `MultiServerMCPClient` | 1.30.0 | `2025-11-25` | — |
+| `pydantic-ai-slim[mcp]` 2.53.0 | `MCPToolset` | 2.2.0 | `2026-07-28` | — |
+| `google-adk[a2a,mcp]` 2.11.0 | `McpToolset` + `StreamableHTTPConnectionParams` | 2.2.0 | `2026-07-28` | `RemoteA2aAgent` (`use_legacy=False`) |
+| `agent-framework` 1.19.0, `agent-framework-a2a` 1.0.0b260918 | `MCPStreamableHTTPTool` (`static_headers`) | 1.30.0 | `2025-11-25` | `A2AAgent` (`a2a-sdk` 1.2.1) |
+
+The revision is the one the locked `mcp` offers: each quickstart's
+`requirements.lock` pins the whole dependency closure with hashes, so the
+column holds for anyone installing from the lock, and `just frameworks` refuses
+a lock that its `requirements.txt` no longer resolves to. A framework on
+`2025-11-25`, or on `2026-07-28` without the Tasks extension, is offered only
+tools that cannot suspend, which the starter's is.
+An A2A client follows the card's interface URL, so `serve --url` is the
+endpoint — `/a2a` under the public address — and `serve` refuses one that does
+not end in `/a2a`, naming the URL to pass instead.
 
 ### Model providers (`providers`, `bedrock`)
 

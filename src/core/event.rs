@@ -197,6 +197,10 @@ pub struct AwaitSpec {
     /// with nothing to notice it — the failure mode that presents as "the
     /// process just stalled" and is invisible until someone asks.
     pub deadline: String,
+    /// The one producer whose event satisfies this wait, matched against
+    /// [`InboundEvent::source`]. Absent, any producer may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 impl AwaitSpec {
@@ -205,12 +209,31 @@ impl AwaitSpec {
             kind: kind.into(),
             correlation: Vec::new(),
             deadline: deadline.into(),
+            from: None,
         }
     }
 
     #[must_use]
     pub fn correlate(mut self, key: CorrelationKey) -> Self {
         self.correlation.push(key);
+        self
+    }
+
+    /// Accept the event only from `source`, compared verbatim with
+    /// [`InboundEvent::source`].
+    ///
+    /// Correlation keys are business values another producer may know; a wait
+    /// that names its sender cannot be consumed by an authenticated producer
+    /// that merely guessed the kind and the key.
+    ///
+    /// An event that arrives over the served API or A2A carries
+    /// `peer:<actor>`, the authenticated caller's actor as the deployment's
+    /// authenticator names it — a `CloudEvent`'s own `source` attribute is not
+    /// used. An event passed to [`Runtime::deliver`](crate::runtime::Runtime::deliver)
+    /// in process carries whatever source its caller built it with.
+    #[must_use]
+    pub fn from(mut self, source: impl Into<String>) -> Self {
+        self.from = Some(source.into());
         self
     }
 }
@@ -240,6 +263,18 @@ pub struct Subscription {
     pub phase: crate::core::Phase,
     pub kind: String,
     pub correlation: Vec<CorrelationKey>,
+    /// The one [`InboundEvent::source`] this wait accepts; `None` accepts any.
+    /// Every delivery path — broadcast, buffered and targeted — holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+}
+
+impl Subscription {
+    /// Whether an event from `source` may satisfy this wait.
+    #[must_use]
+    pub fn accepts_source(&self, source: &str) -> bool {
+        self.from.as_deref().is_none_or(|from| from == source)
+    }
 }
 
 /// A run's durable wake-up.
@@ -270,7 +305,7 @@ pub struct Timer {
 }
 
 /// Why a run stopped without finishing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
 pub enum SuspendReason {
@@ -279,6 +314,7 @@ pub enum SuspendReason {
         kind: String,
         correlation: Vec<CorrelationKey>,
         #[serde(with = "time::serde::rfc3339")]
+        #[schemars(with = "String")]
         until: Timestamp,
     },
     /// Waiting for an instant to arrive.
@@ -289,6 +325,7 @@ pub enum SuspendReason {
     /// instant that has not arrived yet is the system working.
     AwaitingTime {
         #[serde(with = "time::serde::rfc3339")]
+        #[schemars(with = "String")]
         until: Timestamp,
     },
 }

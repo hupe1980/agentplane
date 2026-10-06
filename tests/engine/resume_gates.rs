@@ -759,6 +759,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 ),
                 Append::new(
@@ -785,6 +786,8 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         backoff_ms: 0,
                         outbound_label: None,
                         outbound_bytes: None,
+                        content_rules: None,
+                        credential: None,
                     },
                 )
                 .step(StepId(0))
@@ -797,6 +800,8 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         source: None,
                         by: None,
                         spend: agentplane::core::Spend::default(),
+                        content: None,
+                        elapsed_ms: None,
                     },
                 )
                 .step(StepId(0))
@@ -825,6 +830,8 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         backoff_ms: 0,
                         outbound_label: None,
                         outbound_bytes: None,
+                        content_rules: None,
+                        credential: None,
                     },
                 )
                 .step(StepId(1))
@@ -836,6 +843,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         disposition: Disposition::InDoubt,
                         spend: agentplane::core::Spend::default(),
                         permanent: false,
+                        elapsed_ms: None,
                     },
                 )
                 .step(StepId(1))
@@ -1935,6 +1943,8 @@ async fn a_refused_recovery_stays_findable(moved: Moved) {
             by: None,
             spend: agentplane::core::Spend::default(),
             declared: agentplane::core::DeclaredOutput::trusted(),
+            content: None,
+            elapsed_ms: None,
         },
     )
     .effect(timer.effect)
@@ -2087,5 +2097,129 @@ async fn a_resume_that_fails_mid_flight_is_left_for_recovery() {
             .unwrap()
             .contains(&out.run_id),
         "recovery finished the run the failed resume left behind"
+    );
+}
+
+// ── A case-bound run resumes only where its case can be named ───────────────
+
+/// **A plane with no case store does not resume a run bound to a case.**
+///
+/// Everything the resume would write belongs to the case, and a plane with no
+/// case store cannot stamp it so: the records land under the run alone, and
+/// erasing the case later misses them. Refused before anything is written, on
+/// a plane that holds everything else the run needs; the plane with the case
+/// store then resumes it with every record stamped.
+#[tokio::test]
+async fn a_case_bound_run_is_refused_a_resume_on_a_plane_with_no_case_store() {
+    let store = store();
+    let fixed = Arc::new(AtomicBool::new(false));
+    let with_cases = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("with-cases")
+        .cases(store.clone() as Arc<dyn agentplane::case::CaseStore>)
+        .skill(FailsUntilFixed {
+            fixed: Arc::clone(&fixed),
+        })
+        .build();
+    let out = with_cases
+        .run_correlated(
+            "demo.flaky",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[agentplane::core::CorrelationKey::new("matter", "M-1")],
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "got {:?}",
+        out.status
+    );
+    fixed.store(true, Ordering::SeqCst);
+
+    let without_cases = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("without-cases")
+        .skill(FailsUntilFixed {
+            fixed: Arc::clone(&fixed),
+        })
+        .build();
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    let before = journal.read(out.run_id, 1).await.unwrap().len();
+    let refused = without_cases
+        .replay(out.run_id, Mode::Resume)
+        .await
+        .expect_err("a plane that cannot name the run's case resumed it");
+    assert!(
+        refused.to_string().contains("case store"),
+        "the refusal does not say what the plane lacks: {refused}"
+    );
+    assert_eq!(
+        journal.read(out.run_id, 1).await.unwrap().len(),
+        before,
+        "the refused resume wrote records the case cannot reach"
+    );
+
+    let done = with_cases.replay(out.run_id, Mode::Resume).await.unwrap();
+    assert_eq!(done.status, RunStatus::Succeeded);
+    let records = journal.read(out.run_id, 1).await.unwrap();
+    let case = records[0].body.case;
+    assert!(
+        case.is_some() && records.iter().all(|r| r.body.case == case),
+        "every record of a case-bound run carries its case"
+    );
+}
+
+// ── A successor plan is read or the resume stops ────────────────────────────
+
+/// **A successor plan this build cannot read refuses the resume.**
+///
+/// Every `PlanFrozen` after the first is a successor, walked in order by
+/// position. Skipping one that does not parse shifts every later replan onto
+/// the wrong plan, and the resume then freezes a fresh successor in the
+/// middle of a history that already holds one.
+#[tokio::test]
+async fn an_unreadable_successor_plan_refuses_the_resume() {
+    let store = store();
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(FailsUntilFixed {
+            fixed: Arc::new(AtomicBool::new(false)),
+        })
+        .build();
+    let out = rt
+        .run("demo.flaky", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(matches!(out.status, RunStatus::Failed(_)));
+
+    let journal = store.clone() as Arc<dyn JournalStore>;
+    let lease = journal
+        .acquire(out.run_id, "writer", std::time::Duration::from_mins(1))
+        .await
+        .unwrap();
+    journal
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                out.run_id,
+                RecordKind::PlanFrozen {
+                    steps: vec![],
+                    plan: json!({ "not": "a plan" }),
+                },
+            )],
+        )
+        .await
+        .unwrap();
+    journal
+        .release_lease(out.run_id, lease.epoch)
+        .await
+        .unwrap();
+
+    let refused = rt
+        .replay(out.run_id, Mode::Resume)
+        .await
+        .expect_err("a resume skipped a successor plan it could not read");
+    assert!(
+        matches!(refused, agentplane::core::RuntimeError::Encoding(_)),
+        "refused, but not as an unreadable record: {refused}"
     );
 }

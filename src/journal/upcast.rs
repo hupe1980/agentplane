@@ -33,10 +33,21 @@ pub trait Upcaster: Send + Sync + std::fmt::Debug {
     fn upcast(&self, kind: &str, version: u16, payload: Value) -> Result<Value, StoreError>;
 }
 
+/// The upcaster this build ships, which every shipped reader defaults to.
+///
+/// The redb and Postgres stores, `export::verify` and `export::from_jsonl` all
+/// read through this unless their caller supplies another, so a shape change
+/// is one edit here and every reader follows it.
+#[must_use]
+pub fn current_upcaster() -> std::sync::Arc<dyn Upcaster> {
+    std::sync::Arc::new(Identity)
+}
+
 /// The identity upcaster: every kind is at v1 and nothing needs lifting.
 ///
 /// Kept as a real type rather than an `Option<Box<dyn Upcaster>>` so the call
-/// site has no branch and the first genuine migration is a one-line swap.
+/// site has no branch, and so the first genuine migration replaces it in
+/// [`current_upcaster`] alone.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Identity;
 

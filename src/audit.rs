@@ -151,6 +151,31 @@ pub struct AuditReport {
     /// The runs that carry no admission record — the complement of
     /// [`warrants`](Self::warrants). See [`Unadmitted`].
     pub unadmitted: Vec<Unadmitted>,
+    /// Per witness key, the time since it last saw the log, when freshness
+    /// was judged. A suffix removed inside a window is undetectable: the
+    /// window bounds *when* truncation could have happened, not *whether*.
+    pub unwitnessed: Vec<UnwitnessedWindow>,
+}
+
+/// How long one witness key has gone without seeing the log.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UnwitnessedWindow {
+    /// The cosigning key.
+    pub key_id: crate::core::KeyId,
+    /// Its latest signed timestamp, in seconds since the Unix epoch.
+    pub since: u64,
+    /// Seconds from `since` to the auditor's `now`; zero when `since` is ahead.
+    pub seconds: u64,
+}
+
+/// The auditor's bound on how old a witness's latest timestamp may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Freshness {
+    /// The auditor's clock — never the plane's.
+    pub now: crate::core::Timestamp,
+    /// The oldest a witness key's latest timestamp may be at `now`, and the
+    /// furthest ahead of `now` one may be.
+    pub max_age: std::time::Duration,
 }
 
 /// What authorized one run.
@@ -386,9 +411,37 @@ pub enum Finding {
         now: u64,
         obtained_from: String,
     },
+
+    /// A witness key has not seen the log for longer than the auditor allows.
+    /// Not attributed: plane silence, a failed submission and a witness
+    /// outage look the same from outside.
+    #[error(
+        "witness key {key_id} ({obtained_from}) last saw this log at {timestamp}, \
+         {age_secs}s ago — older than the maximum age, so anything appended and \
+         removed since is invisible to it"
+    )]
+    StaleWitness {
+        key_id: crate::core::KeyId,
+        obtained_from: String,
+        timestamp: u64,
+        age_secs: u64,
+    },
+
+    /// A witness key's signed time is ahead of the auditor's clock by more
+    /// than the maximum age, so it cannot be read as fresh.
+    #[error(
+        "witness key {key_id} ({obtained_from}) signed time {timestamp}, {ahead_secs}s \
+         ahead of this audit's clock — more than the maximum age, so it is not read as fresh"
+    )]
+    WitnessTimeAhead {
+        key_id: crate::core::KeyId,
+        obtained_from: String,
+        timestamp: u64,
+        ahead_secs: u64,
+    },
 }
 
-pub use crate::journal::Anchor;
+pub use crate::journal::{Anchor, WitnessTime};
 
 /// What an auditor brought with them.
 ///
@@ -414,6 +467,9 @@ pub struct Evidence<'a> {
     /// legitimately unsigned, and an auditor who does not know that would read a
     /// wall of failures for a plane that is fine.
     pub require_signatures: bool,
+    /// The auditor's clock and maximum age, against which each witness key's
+    /// latest signed timestamp is judged. `None` judges nothing.
+    pub freshness: Option<Freshness>,
 }
 
 impl std::fmt::Debug for Evidence<'_> {
@@ -422,6 +478,7 @@ impl std::fmt::Debug for Evidence<'_> {
             .field("anchors", &self.anchors)
             .field("verifier", &self.verifier.is_some())
             .field("require_signatures", &self.require_signatures)
+            .field("freshness", &self.freshness)
             .finish()
     }
 }
@@ -513,7 +570,7 @@ async fn placement(
 /// not a re-spelling of it: two copies of *which conclusions close* is the
 /// duplicate-rule shape, and the copy in an offline checker is the one that
 /// drifts.
-fn has_sealing_conclusion(records: &[Record]) -> bool {
+pub(crate) fn has_sealing_conclusion(records: &[Record]) -> bool {
     concluded_outcome(records).is_some_and(|o| crate::runtime::SEALED_OUTCOMES.contains(&o))
 }
 
@@ -650,6 +707,80 @@ fn warrant_in(run: RunId, records: &[Record]) -> Option<Warrant> {
         }),
         _ => None,
     })
+}
+
+/// Each witness key's latest signed timestamp, judged on its own against the
+/// auditor's clock. Keys are never compared with each other.
+fn judge_freshness(
+    evidence: &Evidence<'_>,
+    findings: &mut Vec<Finding>,
+    not_checked: &mut Vec<String>,
+) -> Vec<UnwitnessedWindow> {
+    let mut latest: std::collections::BTreeMap<&str, (u64, &str)> =
+        std::collections::BTreeMap::default();
+    for held in evidence.anchors {
+        for time in &held.witnessed {
+            let entry = latest
+                .entry(time.key_id.as_str())
+                .or_insert((time.timestamp, held.obtained_from.as_str()));
+            if time.timestamp > entry.0 {
+                *entry = (time.timestamp, held.obtained_from.as_str());
+            }
+        }
+    }
+    let Some(freshness) = evidence.freshness else {
+        if !latest.is_empty() {
+            not_checked.push(
+                "freshness — the anchors carry witness times and no maximum age was \
+                 supplied, so how long each witness has gone without seeing this log \
+                 was not judged"
+                    .to_owned(),
+            );
+        }
+        return Vec::new();
+    };
+    if latest.is_empty() {
+        not_checked.push(
+            "freshness — a maximum age was supplied and no anchor came from a witness, \
+             so there is no signed time to judge"
+                .to_owned(),
+        );
+        return Vec::new();
+    }
+    let now = u64::try_from(freshness.now.unix_timestamp()).unwrap_or(0);
+    let max_age = freshness.max_age.as_secs();
+    let mut windows = Vec::new();
+    for (key_id, (timestamp, obtained_from)) in latest {
+        let age = now.saturating_sub(timestamp);
+        let ahead = timestamp.saturating_sub(now);
+        if ahead > max_age {
+            findings.push(Finding::WitnessTimeAhead {
+                key_id: key_id.to_owned(),
+                obtained_from: obtained_from.to_owned(),
+                timestamp,
+                ahead_secs: ahead,
+            });
+        } else if age > max_age {
+            findings.push(Finding::StaleWitness {
+                key_id: key_id.to_owned(),
+                obtained_from: obtained_from.to_owned(),
+                timestamp,
+                age_secs: age,
+            });
+        }
+        windows.push(UnwitnessedWindow {
+            key_id: key_id.to_owned(),
+            since: timestamp,
+            seconds: age,
+        });
+    }
+    not_checked.push(
+        "truncation inside the unwitnessed window — a suffix appended and removed after \
+         each witness key's latest time is undetectable; the window bounds when \
+         truncation could have happened, not whether"
+            .to_owned(),
+    );
+    windows
 }
 
 /// What an audit cannot conclude from the evidence it was given.
@@ -937,6 +1068,7 @@ pub async fn audit(
     for anchor in evidence.anchors {
         check_append_only(store, anchor, &mut current, &mut findings, &mut not_checked).await?;
     }
+    let unwitnessed = judge_freshness(evidence, &mut findings, &mut not_checked);
 
     Ok(AuditReport {
         current,
@@ -947,5 +1079,6 @@ pub async fn audit(
         releases,
         warrants,
         unadmitted,
+        unwitnessed,
     })
 }

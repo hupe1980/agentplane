@@ -30,6 +30,16 @@ pub enum TargetedDelivery {
     NotWaiting,
 }
 
+/// What retiring a closed run's waits did.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Retired {
+    /// How many waits were retired.
+    pub waits: usize,
+    /// Messages claimed for a wait the run never answered, back in the buffer
+    /// unclaimed, for the caller to offer to the next waiter.
+    pub released: Vec<InboundEvent>,
+}
+
 /// Who minted a buffered event: an operator on this plane, or nobody.
 ///
 /// Read back by [`EventStore::minter`]. `Nobody` is every message that
@@ -52,6 +62,12 @@ pub enum Minter {
 /// wait forever for something that already happened.
 /// The dead-letter reason of an unclaimed event whose payload was erased.
 pub const ERASED_REASON: &str = "erased";
+
+/// The dead-letter reason of a message delivered to one run by name, which
+/// that run concluded without consuming. It was that run's alone, so it is
+/// offered to no other.
+pub const ADDRESSEE_CONCLUDED_REASON: &str =
+    "the run it was addressed to concluded without consuming it";
 
 #[async_trait]
 pub trait EventStore: Send + Sync + Debug {
@@ -156,15 +172,27 @@ pub trait EventStore: Send + Sync + Debug {
     /// [`erase_payload`](Self::erase_payload) instead.
     async fn unsubscribe(&self, run: RunId, effect: EffectKey) -> Result<(), StoreError>;
 
-    /// Drop every subscription a run holds, returning how many waits were
-    /// retired.
+    /// Drop every subscription a run holds, and hand back what it held
+    /// claimed for a wait it never answered.
     ///
     /// Called when the run concludes closed. Left registered, a closed run's
     /// wait is the oldest waiter on its key, and the next matching event is
     /// claimed for a run that will never consume it — while a live run
-    /// waiting on the same key starves. Payloads the run holds claimed are
-    /// shed exactly as [`unsubscribe`](Self::unsubscribe) sheds them.
-    async fn unsubscribe_run(&self, run: RunId) -> Result<usize, StoreError>;
+    /// waiting on the same key starves.
+    ///
+    /// `unanswered` names the run's waits whose answer its journal does not
+    /// hold. A message claimed for one of them reached nobody: it goes back to
+    /// the buffer unclaimed, with its payload, and is returned so the caller
+    /// can offer it to the next waiter. Shedding it would lose a message that
+    /// arrived in time for a run that happened to conclude first. What the run
+    /// holds claimed for an answered wait is shed, as
+    /// [`unsubscribe`](Self::unsubscribe) sheds it — releasing that would let a
+    /// second run consume a message the first already journaled.
+    async fn unsubscribe_run(
+        &self,
+        run: RunId,
+        unanswered: &[EffectKey],
+    ) -> Result<Retired, StoreError>;
 
     /// Register a wait that already holds a claimed event, and mark it for
     /// redelivery.

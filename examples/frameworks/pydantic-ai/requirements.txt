@@ -1,0 +1,1 @@
+pydantic-ai-slim[mcp]==2.53.0

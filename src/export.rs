@@ -91,6 +91,72 @@ pub struct Header {
     pub canon: u16,
 }
 
+/// The first line of a disclosure package: an export of chosen runs, which
+/// says so.
+pub const DISCLOSURE_KIND: &str = "agentplane.disclosure";
+
+/// What a disclosure package was asked for: whole cases, single runs, or both.
+///
+/// A package carries the runs these resolve to, each sealed one with its path
+/// against the header's checkpoint, and only the cases those runs belong to.
+/// Nothing about the log's other leaves is disclosed, and no reader may take
+/// the package for a whole export: its header has its own `kind`, and the
+/// run blocks carry `proof`, a member a whole export never has.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Selection {
+    pub cases: Vec<crate::core::CaseId>,
+    pub runs: Vec<RunId>,
+}
+
+/// A disclosure package's first line: the export header plus its selection.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageHeader {
+    /// Always [`DISCLOSURE_KIND`].
+    pub kind: String,
+    /// [`FORMAT_VERSION`]: a package is a framing of the export format and
+    /// moves with it.
+    pub version: u32,
+    /// The checkpoint every path in the file is against.
+    pub checkpoint: Checkpoint,
+    pub canon: u16,
+    pub selection: Selection,
+}
+
+impl PackageHeader {
+    /// Read a package's first line, refusing another kind, another version or
+    /// an unknown member by name.
+    ///
+    /// # Errors
+    ///
+    /// When the line is not a package header this build reads.
+    pub fn parse(line: &str) -> Result<Self, String> {
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(|e| format!("not JSON: {e}"))?;
+        let kind = value.get("kind").and_then(serde_json::Value::as_str);
+        if kind != Some(DISCLOSURE_KIND) {
+            return Err(format!(
+                "the line is a {kind:?}, not a {DISCLOSURE_KIND} header"
+            ));
+        }
+        let version = value.get("version").and_then(serde_json::Value::as_u64);
+        if version != Some(FORMAT_VERSION.into()) {
+            return Err(format!(
+                "the package is at format version {version:?}, and this build reads \
+                 {FORMAT_VERSION}"
+            ));
+        }
+        serde_json::from_value(value).map_err(|e| format!("the package header is malformed: {e}"))
+    }
+}
+
+/// Why a reader that rebuilds or re-derives over a whole file refuses a
+/// package, in one sentence every such reader uses.
+const PACKAGE_REFUSED: &str = "the file is a disclosure package — the runs of one matter with \
+     their inclusion paths, not the plane's whole log — so nothing can be rebuilt or derived \
+     from it as if it were whole; verify it with `agentplane verify`";
+
 /// One journal record, as an export line.
 ///
 /// Written out explicitly rather than by deriving `Serialize` on
@@ -120,7 +186,7 @@ pub struct ExportedRecord<'r> {
     /// hashed bytes makes body-matches-wire true by construction and keeps
     /// sealed payloads sealed, which is the same rule the case layer's export
     /// read states in prose.
-    pub body: crate::journal::RecordBody,
+    pub body: DisplayBody,
     pub prev_hash: &'r crate::core::Digest,
     pub hash: &'r crate::core::Digest,
     /// The plane's workload-key signature over this record's chain hash — who
@@ -140,6 +206,17 @@ pub struct ExportedRecord<'r> {
     pub raw: std::borrow::Cow<'r, str>,
 }
 
+/// A record line's display copy, which says what the hashed bytes say.
+///
+/// This build's typed view of bytes at the shape it writes, and the bytes' own
+/// JSON for a record at an older one; `verify` holds either to the bytes.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub enum DisplayBody {
+    Current(Box<crate::journal::RecordBody>),
+    Written(serde_json::Value),
+}
+
 impl<'r> ExportedRecord<'r> {
     /// Build an export line from a stored record, deriving the display copy
     /// from the wire bytes.
@@ -150,8 +227,15 @@ impl<'r> ExportedRecord<'r> {
     /// exists to keep out of the file — a silent fallback on the one value two
     /// mechanisms must agree about.
     fn from_stored(r: &'r crate::journal::Record) -> Result<Self, String> {
-        let body = serde_json::from_slice::<crate::journal::RecordBody>(r.raw())
-            .map_err(|e| format!("record {}'s wire bytes do not parse: {e}", r.seq()))?;
+        let unparsed =
+            |e: serde_json::Error| format!("record {}'s wire bytes do not parse: {e}", r.seq());
+        // The record was read through the store's upcaster, so its `body` is at
+        // this build's version; bytes at another are an older shape, and only
+        // their own JSON says what they say.
+        let body = match serde_json::from_slice::<crate::journal::RecordBody>(r.raw()) {
+            Ok(body) if body.v == r.body.v => DisplayBody::Current(Box::new(body)),
+            _ => DisplayBody::Written(serde_json::from_slice(r.raw()).map_err(unparsed)?),
+        };
         Ok(Self {
             seq: r.seq(),
             body,
@@ -186,6 +270,11 @@ pub struct RunBlock {
     /// The leaf value: this run's terminal chain hash.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seal: Option<crate::core::Digest>,
+    /// In a disclosure package only: the sibling hashes, leaf-upwards, that
+    /// prove `seal` at `index` against the header's checkpoint. A whole export
+    /// never carries it, because it carries every leaf and rebuilds the root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Vec<crate::core::Digest>>,
 }
 
 /// One case, as an export line — the case layer's whole account of one matter.
@@ -234,9 +323,8 @@ pub struct Trailer {
     pub records: usize,
     /// How many cases the case layer contributed.
     ///
-    /// Zero means this plane has no case store — a state, not a gap. A plane
-    /// *with* one exports every case it holds, so a record stamped with a case
-    /// this file does not carry is a finding the verifier makes.
+    /// Every case the case store holds is exported, so a record stamped with a
+    /// case this file does not carry is a finding the verifier makes.
     pub cases: usize,
     /// Runs that could not be read, and why.
     ///
@@ -260,6 +348,10 @@ pub struct Unreadable {
 /// land — an export function that chose the destination would be one an
 /// operator has to work around.
 ///
+/// `cases` is the plane's case store, and every case it holds is written: a
+/// file whose records name a matter it does not carry is a finding to every
+/// reader of the format.
+///
 /// A run that cannot be read is recorded in the trailer and the export
 /// continues. Aborting instead would make one damaged run withhold every
 /// healthy one, which is the opposite of what an export is for; the trailer is
@@ -272,11 +364,159 @@ pub struct Unreadable {
 /// it was given, and an auditor needs the part that survived.
 pub async fn to_jsonl<W: std::io::Write>(
     store: &Arc<dyn JournalStore>,
-    cases: Option<&Arc<dyn crate::case::CaseStore>>,
+    cases: &Arc<dyn crate::case::CaseStore>,
     runs: &[RunId],
-    mut out: W,
+    out: W,
 ) -> Result<Trailer, std::io::Error> {
+    write_file(store, cases, runs, None, out)
+        .await
+        .map(|written| written.trailer)
+}
+
+/// What a disclosure package carried, for the act that records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Package {
+    /// The checkpoint every path in the file is against.
+    pub checkpoint: Checkpoint,
+    /// The runs the selection resolved to, in file order.
+    pub runs: Vec<RunId>,
+    /// The cases whose blocks the file carries.
+    pub cases: Vec<crate::core::CaseId>,
+    /// Whether any record carried a sealed payload.
+    pub sealed: bool,
+    pub trailer: Trailer,
+}
+
+/// Write a disclosure package: the runs `selection` names, each sealed one
+/// with its inclusion path against the header's checkpoint, and only the cases
+/// those runs belong to.
+///
+/// A case contributes the runs [`Case::runs`](crate::core::Case::runs) holds at
+/// the moment of the call. The case layer is the selection's cases plus every
+/// case a carried record is stamped with, so the coverage rule holds over the
+/// package as over a whole export.
+///
+/// This writes bytes and records nothing: a package that leaves the plane is a
+/// disclosure, and [`crate::disclosure::disclose`] is what records it before
+/// any byte reaches its destination.
+///
+/// # Errors
+///
+/// `NotFound` for a named case or run the plane does not hold — never a
+/// fall-back to the whole plane — an empty selection, a failure to write or
+/// to prove a sealed run at the header's size, or a run whose conclusion seals
+/// and which is still not in the log after the file was written against
+/// three successive checkpoints. The file is built in memory and written
+/// to `out` whole, so a refusal writes nothing.
+pub async fn package_to_jsonl<W: std::io::Write>(
+    store: &Arc<dyn JournalStore>,
+    cases: &Arc<dyn crate::case::CaseStore>,
+    selection: &Selection,
+    mut out: W,
+) -> Result<Package, std::io::Error> {
+    let runs = resolve(store, cases, selection).await?;
+    // A run concluded and sealed after the header's checkpoint was taken
+    // would travel open with its conclusion, which a reader of a package
+    // must take for a stripped leaf. So the file is written again against a
+    // later checkpoint until every sealing conclusion it carries is placed.
+    let mut attempts = 0;
+    let (bytes, written) = loop {
+        let mut bytes = Vec::new();
+        let written = write_file(store, cases, &runs, Some(selection), &mut bytes).await?;
+        attempts += 1;
+        match written.unplaced.first() {
+            None => break (bytes, written),
+            Some(run) if attempts >= PACKAGE_ATTEMPTS => {
+                return Err(std::io::Error::other(format!(
+                    "run {run} concluded under an outcome that seals and is not in the log — \
+                     the seal follows the conclusion, and recovery completes one a crash \
+                     interrupted; no package was written, so retry once it is sealed"
+                )));
+            }
+            Some(_) => {}
+        }
+    };
+    out.write_all(&bytes)?;
+    out.flush()?;
+    Ok(Package {
+        checkpoint: written.checkpoint,
+        runs,
+        cases: written.cases,
+        sealed: written.sealed,
+        trailer: written.trailer,
+    })
+}
+
+/// How many checkpoints a package is written against before a sealing
+/// conclusion with no leaf is refused rather than raced.
+const PACKAGE_ATTEMPTS: usize = 3;
+
+/// The runs a selection names, each once, in the order named: a case's runs
+/// first, then the runs named alone.
+async fn resolve(
+    store: &Arc<dyn JournalStore>,
+    cases: &Arc<dyn crate::case::CaseStore>,
+    selection: &Selection,
+) -> Result<Vec<RunId>, std::io::Error> {
+    use std::io::{Error, ErrorKind};
+    if selection.cases.is_empty() && selection.runs.is_empty() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "a disclosure package names at least one case or run",
+        ));
+    }
+    let mut runs: Vec<RunId> = Vec::new();
+    for &id in &selection.cases {
+        let case = cases
+            .case(id)
+            .await
+            .map_err(|e| as_io(&e))?
+            .ok_or_else(|| {
+                Error::new(ErrorKind::NotFound, format!("no case {id} on this plane"))
+            })?;
+        for run in case.runs {
+            if !runs.contains(&run) {
+                runs.push(run);
+            }
+        }
+    }
+    for &run in &selection.runs {
+        if store.read(run, 1).await.map_err(|e| as_io(&e))?.is_empty() {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                format!("no run {run} on this plane"),
+            ));
+        }
+        if !runs.contains(&run) {
+            runs.push(run);
+        }
+    }
+    Ok(runs)
+}
+
+/// What one pass of the writer produced.
+struct Written {
+    checkpoint: Checkpoint,
+    cases: Vec<crate::core::CaseId>,
+    sealed: bool,
+    trailer: Trailer,
+    /// A package's runs that concluded under an outcome that seals and have
+    /// no leaf below the header's size.
+    unplaced: Vec<RunId>,
+}
+
+/// The one writer behind a whole export and a package; `package` is the
+/// selection for a package and `None` for a whole export.
+#[allow(clippy::too_many_lines)]
+async fn write_file<W: std::io::Write>(
+    store: &Arc<dyn JournalStore>,
+    cases: &Arc<dyn crate::case::CaseStore>,
+    runs: &[RunId],
+    package: Option<&Selection>,
+    mut out: W,
+) -> Result<Written, std::io::Error> {
     let checkpoint = store.checkpoint().await.map_err(|e| as_io(&e))?;
+    let taken = checkpoint.clone();
     // Held out of the header for the one comparison below: the header owns the
     // checkpoint from here on, and the log size is the half of it every run
     // block is checked against.
@@ -286,25 +526,47 @@ pub async fn to_jsonl<W: std::io::Write>(
     // a header any embedder could make lie — every caller passed
     // `canon::VERSION` verbatim, which is what a fact looks like when it is
     // asked for as an argument.
-    let header = Header {
-        kind: "agentplane.export",
-        version: FORMAT_VERSION,
-        checkpoint,
-        canon: crate::core::canon::VERSION,
-    };
-    writeln!(out, "{}", to_line(&header)?)?;
+    match package {
+        None => {
+            let header = Header {
+                kind: "agentplane.export",
+                version: FORMAT_VERSION,
+                checkpoint,
+                canon: crate::core::canon::VERSION,
+            };
+            writeln!(out, "{}", to_line(&header)?)?;
+        }
+        Some(selection) => {
+            let header = PackageHeader {
+                kind: DISCLOSURE_KIND.to_owned(),
+                version: FORMAT_VERSION,
+                checkpoint,
+                canon: crate::core::canon::VERSION,
+                selection: selection.clone(),
+            };
+            writeln!(out, "{}", to_line(&header)?)?;
+        }
+    }
+    let mut sealed = false;
+    let mut stamped: std::collections::BTreeSet<crate::core::CaseId> = package
+        .map(|s| s.cases.iter().copied().collect())
+        .unwrap_or_default();
 
     let mut records = 0usize;
     let mut exported = 0usize;
     let mut unreadable = Vec::new();
+    let mut unplaced = Vec::new();
 
-    for &run in runs {
-        // Asked before the records so the block heads them, and asked at all
-        // because the log position is the half of the evidence the records do
-        // not carry. A store that cannot answer leaves the run unsealed rather
-        // than failing the export: the position is missing, and the verifier
-        // says so, which is better than no export.
-        let placed = store.inclusion_proof(run).await.ok().flatten();
+    // Asked before the records so each block heads them, and asked at all
+    // because the log position is the half of the evidence the records do not
+    // carry. A store that cannot answer leaves the runs unsealed rather than
+    // failing the export: the position is missing, and the verifier says so,
+    // which is better than no export.
+    let positions = store
+        .log_positions(runs)
+        .await
+        .unwrap_or_else(|_| vec![None; runs.len()]);
+    for (&run, placed) in runs.iter().zip(positions) {
         // A run sealed *after* the header's checkpoint was taken is not in that
         // checkpoint. Stamping its position anyway would make the export
         // disagree with its own first line: the verifier rebuilds a tree one
@@ -312,15 +574,27 @@ pub async fn to_jsonl<W: std::io::Write>(
         // where there was only time. Such a run is exported as still open —
         // true relative to the moment this export describes — and the next
         // export carries it sealed.
-        let placed = placed.filter(|i| i.index < log_size);
+        let placed = placed.filter(|&(index, _)| index < log_size);
+        // A package proves each leaf on its own, against the header's size: a
+        // path against the live log would fail against the header's root for
+        // every run sealed while the file is written.
+        let proof = match (package, placed) {
+            (Some(_), Some(_)) => store
+                .inclusion_proof_at(run, log_size)
+                .await
+                .map_err(|e| as_io(&e))?
+                .map(|inclusion| inclusion.proof),
+            _ => None,
+        };
         writeln!(
             out,
             "{}",
             to_line(&RunBlock {
                 kind: "agentplane.export.run",
                 run,
-                index: placed.as_ref().map(|i| i.index),
-                seal: placed.as_ref().map(|i| i.seal),
+                index: placed.map(|(index, _)| index),
+                seal: placed.map(|(_, seal)| seal),
+                proof,
             })?
         )?;
 
@@ -354,6 +628,13 @@ pub async fn to_jsonl<W: std::io::Write>(
                             records += 1;
                         }
                         exported += 1;
+                        if package.is_some() {
+                            if placed.is_none() && crate::audit::has_sealing_conclusion(&found) {
+                                unplaced.push(run);
+                            }
+                            stamped.extend(found.iter().filter_map(|r| r.body.case));
+                            sealed |= found.iter().any(|r| carries_sealed(r.raw()));
+                        }
                     }
                     Err(reason) => unreadable.push(Unreadable { run, reason }),
                 }
@@ -368,40 +649,34 @@ pub async fn to_jsonl<W: std::io::Write>(
     // The case layer, after the runs and before the trailer. Every case, not
     // the cases these runs touch: a case is the unit an erasure request or a
     // regulator names, and a subset chosen by run membership would silently
-    // drop the matter whose runs happened not to be asked for.
-    let mut case_count = 0usize;
-    if let Some(case_store) = cases {
+    // drop the matter whose runs happened not to be asked for. A package is
+    // the one file that is a subset on purpose, and says so in its header, so
+    // it carries the cases it was asked for and every case its records name.
+    let mut written_cases = Vec::new();
+    if package.is_some() {
+        for id in stamped {
+            if let Some(case) = cases.case(id).await.map_err(|e| as_io(&e))? {
+                write_case(cases, case, &mut out).await?;
+                written_cases.push(id);
+            }
+        }
+    } else {
         let mut after: Option<crate::core::CaseId> = None;
         loop {
-            let page = case_store
-                .cases(after, CASE_PAGE)
-                .await
-                .map_err(|e| as_io(&e))?;
+            let page = cases.cases(after, CASE_PAGE).await.map_err(|e| as_io(&e))?;
             let Some(last) = page.last() else { break };
             after = Some(last.id);
             let full = page.len() >= CASE_PAGE;
             for case in page {
-                let deadlines = case_store.deadlines(case.id).await.map_err(|e| as_io(&e))?;
-                let blobs = case_store.blobs_of(case.id).await.map_err(|e| as_io(&e))?;
-                let hold = case_store.hold(case.id).await.map_err(|e| as_io(&e))?;
-                writeln!(
-                    out,
-                    "{}",
-                    to_line(&CaseBlock {
-                        kind: "agentplane.export.case",
-                        case,
-                        deadlines,
-                        blobs,
-                        hold,
-                    })?
-                )?;
-                case_count += 1;
+                written_cases.push(case.id);
+                write_case(cases, case, &mut out).await?;
             }
             if !full {
                 break;
             }
         }
     }
+    let case_count = written_cases.len();
 
     let trailer = Trailer {
         kind: "agentplane.export.end",
@@ -413,7 +688,50 @@ pub async fn to_jsonl<W: std::io::Write>(
     };
     writeln!(out, "{}", to_line(&trailer)?)?;
     out.flush()?;
-    Ok(trailer)
+    Ok(Written {
+        checkpoint: taken,
+        cases: written_cases,
+        sealed,
+        trailer,
+        unplaced,
+    })
+}
+
+/// Whether a record's wire bytes carry a sealed payload anywhere in them.
+fn carries_sealed(raw: &[u8]) -> bool {
+    fn walk(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::String(text) => crate::journal::payload::is_sealed_text(text),
+            serde_json::Value::Array(items) => items.iter().any(walk),
+            serde_json::Value::Object(members) => {
+                crate::journal::payload::is_sealed(value) || members.values().any(walk)
+            }
+            _ => false,
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|value| walk(&value))
+}
+
+/// One case block: the case, its deadlines, its blob digests and its hold.
+async fn write_case<W: std::io::Write>(
+    cases: &Arc<dyn crate::case::CaseStore>,
+    case: crate::core::Case,
+    out: &mut W,
+) -> Result<(), std::io::Error> {
+    let deadlines = cases.deadlines(case.id).await.map_err(|e| as_io(&e))?;
+    let blobs = cases.blobs_of(case.id).await.map_err(|e| as_io(&e))?;
+    let hold = cases.hold(case.id).await.map_err(|e| as_io(&e))?;
+    writeln!(
+        out,
+        "{}",
+        to_line(&CaseBlock {
+            kind: "agentplane.export.case",
+            case,
+            deadlines,
+            blobs,
+            hold,
+        })?
+    )
 }
 
 /// How many cases one enumeration page holds — shared with the live drill
@@ -460,13 +778,25 @@ pub struct VerifyReport {
     /// A truncated export is otherwise a valid prefix: every line parses, every
     /// chain link joins, and the only thing wrong is what is missing.
     pub complete: bool,
+    /// Why this reader could check nothing past the header, when it could not.
+    ///
+    /// Set for a `canon` this build does not implement: the rule names the
+    /// digest algorithm too, so every hash in the file is one this reader
+    /// cannot recompute. Neither a finding nor corruption — another build may
+    /// verify the file.
+    pub unverifiable: Option<String>,
+    /// What the file selected, when it is a disclosure package: the runs of
+    /// one matter, each proved by its own path, and nothing about the log's
+    /// other leaves. `None` for a whole export.
+    pub selection: Option<Selection>,
 }
 
 impl VerifyReport {
-    /// Whether every check that ran, passed. See [`Self::not_checked`].
+    /// Whether every check that ran, passed, and the checks could run. See
+    /// [`Self::not_checked`] and [`Self::unverifiable`].
     #[must_use]
     pub fn is_sound(&self) -> bool {
-        self.findings.is_empty() && self.complete
+        self.findings.is_empty() && self.complete && self.unverifiable.is_none()
     }
 }
 
@@ -526,6 +856,48 @@ pub fn verify<R: std::io::BufRead>(
     verifier: Option<&dyn crate::core::Verifier>,
     anchors: &[crate::journal::Anchor],
 ) -> Result<VerifyReport, std::io::Error> {
+    let upcaster = crate::journal::current_upcaster();
+    verify_with(input, verifier, anchors, upcaster.as_ref())
+}
+
+/// [`verify`], reading each record through `upcaster` rather than the one this
+/// build ships.
+///
+/// The hash is held to the bytes as written either way; the upcaster decides
+/// only which record versions this reader can read, and a version it cannot
+/// reach is a build skew, never an edit.
+///
+/// # Errors
+///
+/// As [`verify`].
+pub fn verify_with<R: std::io::BufRead>(
+    input: R,
+    verifier: Option<&dyn crate::core::Verifier>,
+    anchors: &[crate::journal::Anchor],
+    upcaster: &dyn crate::journal::Upcaster,
+) -> Result<VerifyReport, std::io::Error> {
+    verify_observed(input, verifier, anchors, upcaster, &mut |_| {})
+}
+
+/// One run block as the verification pass closed it.
+pub(crate) struct ClosedRun<'a> {
+    pub(crate) run: RunId,
+    /// Whether the block declared a log position and a seal.
+    pub(crate) sealed: bool,
+    /// The records as the pass recomputed them. Whether they are sound is
+    /// [`VerifyReport::sound`] once the pass returns.
+    pub(crate) records: &'a [crate::journal::Record],
+}
+
+/// [`verify`], handing each run block to `observe` as it closes.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn verify_observed<R: std::io::BufRead>(
+    input: R,
+    verifier: Option<&dyn crate::core::Verifier>,
+    anchors: &[crate::journal::Anchor],
+    upcaster: &dyn crate::journal::Upcaster,
+    observe: &mut dyn FnMut(ClosedRun<'_>),
+) -> Result<VerifyReport, std::io::Error> {
     use crate::core::Digest;
     use serde_json::Value;
 
@@ -541,6 +913,8 @@ pub fn verify<R: std::io::BufRead>(
         records: 0,
         cases: 0,
         complete: false,
+        unverifiable: None,
+        selection: None,
     };
     unanswerable(&mut report, verifier.is_some());
 
@@ -568,12 +942,20 @@ pub fn verify<R: std::io::BufRead>(
     let mut carried: std::collections::BTreeSet<crate::core::CaseId> =
         std::collections::BTreeSet::new();
     let mut blob_digests = 0usize;
+    // Every run a block names and every position a block claims, so a run
+    // carried twice or a position claimed twice is named, whatever the mode.
+    let mut blocks_of: std::collections::BTreeSet<RunId> = std::collections::BTreeSet::new();
+    let mut positions: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
 
+    // Only the first non-empty line may be a header: it alone fixes which
+    // checkpoint every path is held to and which rules the file is read under.
+    let mut first = true;
     for line in input.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
+        let is_first = std::mem::replace(&mut first, false);
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             report
                 .findings
@@ -581,12 +963,29 @@ pub fn verify<R: std::io::BufRead>(
             break;
         };
         if let Some(kind) = value.get("kind").and_then(Value::as_str) {
-            note_unknown_members(kind, &value, &mut report);
+            note_unknown_members(kind, report.selection.is_some(), &value, &mut report);
         }
         match value.get("kind").and_then(Value::as_str) {
-            Some("agentplane.export") => {
+            // A package is read by the same pass, with its own settlement: each
+            // leaf is proved by its path, and nothing counts the log.
+            Some(kind @ ("agentplane.export" | DISCLOSURE_KIND)) => {
+                if !is_first {
+                    report.findings.push(format!(
+                        "a '{kind}' header appears past the first line and was ignored — the \
+                         first line alone names the checkpoint and the rules this file is \
+                         read under, and a later one would re-choose them for every run \
+                         after it"
+                    ));
+                    continue;
+                }
                 header_seen = true;
                 read_header(&value, &mut report);
+                if report.unverifiable.is_some() {
+                    return Ok(report);
+                }
+                if kind == DISCLOSURE_KIND {
+                    read_selection(&value, &mut report);
+                }
             }
             Some("agentplane.export.case") => {
                 read_case_block(&value, &mut report, &mut carried, &mut blob_digests);
@@ -599,8 +998,12 @@ pub fn verify<R: std::io::BufRead>(
                     verifier,
                     &mut read_runs,
                     &mut empty_blocks,
+                    observe,
                 );
-                pass = open_run_block(&value, &mut leaves);
+                pass = open_run_block(&value, &mut leaves, &mut report);
+                if let Some(opened) = pass.as_mut() {
+                    claim_once(opened, &mut blocks_of, &mut positions, &mut report);
+                }
             }
             Some("agentplane.export.end") => read_trailer(&value, &mut report, &mut claims),
             _ => {
@@ -613,7 +1016,7 @@ pub fn verify<R: std::io::BufRead>(
                     );
                     continue;
                 };
-                read_record(&value, pass, &mut report, &mut stamped);
+                read_record(&value, pass, &mut report, &mut stamped, upcaster);
             }
         }
     }
@@ -623,6 +1026,7 @@ pub fn verify<R: std::io::BufRead>(
         verifier,
         &mut read_runs,
         &mut empty_blocks,
+        observe,
     );
 
     // Open runs are the blocks that contributed no leaf. Computed here because
@@ -874,11 +1278,13 @@ fn unanswerable(report: &mut VerifyReport, verifier_supplied: bool) {
 /// these are properties of the *format* — a reader meeting a minimal artifact is
 /// the one most likely to assume a clean report means a total restore.
 ///
-/// Both losses degrade safely, which is the argument for leaving them out: a
-/// cursor costs repetition against receivers that already deduplicate, and a
-/// decision is taken again under the same four-eyes and expiry. Stating the
-/// argument is what stops it from being a silence.
-const UNCARRIED: [&str; 2] = [
+/// Cursors and unconsumed decisions degrade safely, which is the argument for
+/// leaving them out: a cursor costs repetition against receivers that already
+/// deduplicate, and a decision is taken again under the same four-eyes and
+/// expiry. The disclosure register is left out for its recipients' sake, and
+/// its loss is that a restored plane's erasures name no earlier copy. Stating
+/// each argument is what stops it from being a silence.
+const UNCARRIED: [&str; 3] = [
     "webhook delivery cursors — this file carries no push registrations, so a restored plane \
      re-delivers from the start of each subscriber's history rather than from where it got \
      to. Receivers deduplicate on the event's own identity, so the cost is repetition rather \
@@ -886,45 +1292,49 @@ const UNCARRIED: [&str; 2] = [
     "worklist decisions no run has consumed — a decision recorded against a task and not yet \
      read back by the run it answers is a store row, not a record, so it does not survive \
      here. The task re-opens and is decided again under the same four-eyes and expiry",
+    "the disclosure register — which matters left the plane, and to whom, is an operator \
+     row, not a record, so a restored plane names no earlier disclosure in its erasures. \
+     Carrying it would tell every recipient of an export who else received what",
 ];
 
 /// The case layer's own settlement: coverage, and what a file cannot check.
 ///
 /// The coverage rule has a deliberate asymmetry. A record stamped with a case
 /// the file does not carry is a **finding** — this plane had a case layer (the
-/// stamp proves it) and the export is missing a matter the journal names. The
-/// reverse is not: a case whose runs are absent is the ordinary result of
-/// exporting a subset of runs, and every case travels regardless of which runs
-/// were asked for.
-///
-/// A file with records stamped and **no** case blocks at all is reported as
-/// unchecked rather than as a finding, because the export may honestly have
-/// been taken from a plane whose journal was written by a case-configured
-/// runtime while the export ran without the case store — the CLI wires it when
-/// present, but the library caller may not. The trailer's `cases` count is
-/// what distinguishes *none existed* from *none were asked for*.
+/// stamp proves it) and the export is missing a matter the journal names,
+/// whether one case block is missing or all of them. The reverse is not: a
+/// case whose runs are absent is the ordinary result of exporting a subset of
+/// runs, and every case travels regardless of which runs were asked for.
 fn settle_cases(
     report: &mut VerifyReport,
     stamped: &std::collections::BTreeSet<crate::core::CaseId>,
     carried: &std::collections::BTreeSet<crate::core::CaseId>,
     blob_digests: usize,
 ) {
-    if carried.is_empty() {
-        if !stamped.is_empty() {
-            report.not_checked.push(format!(
-                "the case layer — {} case(s) are stamped on records and this file carries no \
-                 case blocks, so either the plane's case store was not supplied to the export \
-                 or the layer was dropped; the two cannot be told apart from the file alone",
-                stamped.len()
-            ));
-        }
-        return;
-    }
     for case in stamped.difference(carried) {
         report.findings.push(format!(
             "case {case} is stamped on exported records and missing from the case layer — \
              the journal names a matter this file does not carry"
         ));
+    }
+    // A package proves the inclusion of what it carries, never completeness:
+    // a matter its own header names and its case layer omits is the one
+    // omission the file itself can show.
+    let selected: Vec<crate::core::CaseId> = report
+        .selection
+        .as_ref()
+        .map(|s| s.cases.clone())
+        .unwrap_or_default();
+    for case in selected {
+        if !carried.contains(&case) {
+            report.findings.push(format!(
+                "case {case} is named by the package's selection and missing from its case \
+                 layer — the package does not carry a matter it says it discloses"
+            ));
+        }
+    }
+    if carried.is_empty() {
+        return;
     }
     if blob_digests > 0 {
         report.not_checked.push(format!(
@@ -944,37 +1354,82 @@ fn settle_cases(
 /// the tree rebuild. Returns `None` for a block whose run id does not parse —
 /// the records under it are then flagged as belonging to no run, which is the
 /// honest reading of a block nothing can be looked up by.
+///
+/// A block is placed only when it carries both an integer `index` and a
+/// `seal` that parses; one carrying either alone, or a seal that does not
+/// parse, claims a position nothing can check, and is a finding rather than
+/// an open run.
 fn open_run_block(
     value: &serde_json::Value,
     leaves: &mut Vec<(u64, crate::core::merkle::LeafHash)>,
+    report: &mut VerifyReport,
 ) -> Option<RunPass> {
     use crate::core::{Digest, merkle};
     use serde_json::Value;
 
-    let pass = value
+    let run = value
         .get("run")
         .and_then(Value::as_str)
-        .and_then(|s| RunId::parse(s).ok())
-        .map(|run| RunPass {
-            run,
-            declared_seal: value
-                .get("seal")
-                .and_then(|s| serde_json::from_value::<Digest>(s.clone()).ok()),
-            prev: Digest::ZERO,
-            last_seq: 0,
-            records: 0,
-            resealed: Vec::new(),
-            clean: true,
-        });
-    if let Some(pass) = &pass
-        && let (Some(index), Some(seal)) = (
-            value.get("index").and_then(Value::as_u64),
-            pass.declared_seal,
-        )
-    {
+        .and_then(|s| RunId::parse(s).ok())?;
+    let index = value.get("index").and_then(Value::as_u64);
+    let declared_seal = value
+        .get("seal")
+        .and_then(|s| serde_json::from_value::<Digest>(s.clone()).ok());
+    let placed = index.zip(declared_seal);
+    let claims_place = value.get("index").is_some() || value.get("seal").is_some();
+    let malformed = claims_place && placed.is_none();
+    if malformed {
+        report.findings.push(format!(
+            "run {run}: its block claims a log position without both an integer index and a \
+             seal that parses, so nothing can place it"
+        ));
+    }
+    if let Some((index, seal)) = placed {
         leaves.push((index, merkle::leaf_hash(&seal)));
     }
-    pass
+    Some(RunPass {
+        run,
+        declared_seal: placed.map(|(_, seal)| seal),
+        sealed: placed.is_some(),
+        index,
+        proof: value
+            .get("proof")
+            .and_then(|p| serde_json::from_value::<Vec<Digest>>(p.clone()).ok()),
+        prev: Digest::ZERO,
+        last_seq: 0,
+        records: 0,
+        resealed: Vec::new(),
+        clean: !malformed,
+    })
+}
+
+/// Hold a run block to the ones before it: a run is carried once and a log
+/// position is claimed by one run. Either repeated leaves the block unsound,
+/// and a run carried twice is withdrawn from the sound list its first block
+/// earned, since neither block is the run's one history.
+fn claim_once(
+    pass: &mut RunPass,
+    blocks_of: &mut std::collections::BTreeSet<RunId>,
+    positions: &mut std::collections::BTreeSet<u64>,
+    report: &mut VerifyReport,
+) {
+    if !blocks_of.insert(pass.run) {
+        report.findings.push(format!(
+            "run {}: the file carries it in two blocks, so neither is the run's one history",
+            pass.run
+        ));
+        report.sound.retain(|run| *run != pass.run);
+        pass.clean = false;
+    }
+    if pass.sealed
+        && let Some(index) = pass.index
+        && !positions.insert(index)
+    {
+        report.findings.push(format!(
+            "log index {index} is claimed by two runs — one position in the log holds one leaf"
+        ));
+        pass.clean = false;
+    }
 }
 
 /// The verifier's working state for the run block it is inside.
@@ -985,6 +1440,11 @@ fn open_run_block(
 struct RunPass {
     run: RunId,
     declared_seal: Option<crate::core::Digest>,
+    /// Whether the block declared both a log position and a seal.
+    sealed: bool,
+    index: Option<u64>,
+    /// A package's path for this leaf against the header's checkpoint.
+    proof: Option<Vec<crate::core::Digest>>,
     prev: crate::core::Digest,
     last_seq: u64,
     /// How many record lines this block carried. Zero is a state the trailer
@@ -1111,6 +1571,18 @@ fn settle(
 ) {
     use crate::core::merkle;
 
+    if anchors.iter().any(|a| !a.witnessed.is_empty()) {
+        report.not_checked.push(
+            "freshness — the anchors carry witness times and verify does not judge them; \
+             `agentplane audit --max-checkpoint-age` does"
+                .to_owned(),
+        );
+    }
+    if report.selection.is_some() {
+        settle_package(report, header_seen, leaves.len(), anchors);
+        return;
+    }
+
     // Which checkpoint the rebuild is held to, and everything below turns on
     // it. The header's own is a claim by whoever wrote the file; an anchor is
     // one the reader was given by somebody else — printed by an earlier audit,
@@ -1200,6 +1672,130 @@ fn settle(
     }
 }
 
+/// A package's settlement: its header against each outside checkpoint, and
+/// what the file does not disclose.
+///
+/// Each leaf was proved by its own path in [`finish_run`], so no tree is
+/// rebuilt and no count is held to the checkpoint's size — the leaves a
+/// package leaves out are the point of it, not a deletion. An outside
+/// checkpoint of the header's size is compared by root; one of another size
+/// would need a consistency proof the package does not carry, and is said to
+/// be uncompared rather than judged.
+fn settle_package(
+    report: &mut VerifyReport,
+    header_seen: bool,
+    disclosed: usize,
+    anchors: &[crate::journal::Anchor],
+) {
+    if !header_seen {
+        report
+            .findings
+            .push("the export has no header, so nothing says which log it came from".into());
+    }
+    let header = report.checkpoint.clone();
+    for anchor in anchors {
+        let given = &anchor.checkpoint;
+        if given.origin != header.origin {
+            report.findings.push(format!(
+                "the package's header names log '{}', and the checkpoint held by {} names \
+                 '{}' — the file describes a different history than the one it is being \
+                 checked against",
+                header.origin, anchor.obtained_from, given.origin,
+            ));
+        } else if given.size != header.size {
+            report.not_checked.push(format!(
+                "the checkpoint held by {} is at size {} and the package's header at {}; a \
+                 package carries no consistency proof, so the two were not compared",
+                anchor.obtained_from, given.size, header.size,
+            ));
+        } else if given.root != header.root {
+            report.findings.push(format!(
+                "the package's header names log '{}' at size {} with root {}, and the \
+                 checkpoint held by {} holds that same size with root {} — one tree of a \
+                 given size has one root, so these are two histories",
+                header.origin,
+                header.size,
+                header.root.to_hex(),
+                anchor.obtained_from,
+                given.root.to_hex(),
+            ));
+        }
+    }
+    if anchors.is_empty() {
+        report.not_checked.push(
+            "the header's checkpoint — no outside checkpoint was supplied, so each path was \
+             proved against the file's own header, which whoever wrote the file chose. Pass \
+             the checkpoint the plane published or a witness cosigned"
+                .to_owned(),
+        );
+    }
+    report.not_checked.push(format!(
+        "the rest of the log — this file is a disclosure package: the log holds {} sealed \
+         run(s) and the package proves {disclosed} of them; nothing about the others is in \
+         the file or was checked",
+        header.size
+    ));
+    if !report.complete {
+        report.findings.push(
+            "the export has no trailer, so it was cut short — every line in it is still valid, \
+             which is why the frame is the signal"
+                .to_owned(),
+        );
+    }
+}
+
+/// Why no digest in an export written under `canon` can be recomputed here,
+/// when this build does not implement that rule.
+///
+/// The rule names the digest algorithm as well as the canonical form, so under
+/// another one no hash in the file is one this build can check or rebuild.
+fn canon_unverifiable(canon: Option<u64>) -> Option<String> {
+    (canon != Some(u64::from(crate::core::canon::VERSION))).then(|| {
+        format!(
+            "unknown canon — the export was written under rule {canon:?} and this build \
+             implements {}, so no digest in it can be recomputed here. Not a finding: a \
+             build implementing that rule can verify and restore it",
+            crate::core::canon::VERSION
+        )
+    })
+}
+
+/// Why this build cannot hold an export to its digests, when its header line
+/// names a canon this build does not implement.
+///
+/// What `verify` reports as `unverifiable` and `restore` refuses before
+/// writing, for a caller that must tell that answer apart from damage or an
+/// outage before reading the whole file. Checked in `verify`'s order: a line
+/// that is not this format's header, or names another format version, answers
+/// `None`, and refusing it is the parser's.
+#[must_use]
+pub fn foreign_canon(header: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(header).ok()?;
+    let ours = value.get("kind").and_then(serde_json::Value::as_str) == Some("agentplane.export")
+        && value.get("version").and_then(serde_json::Value::as_u64)
+            == Some(u64::from(FORMAT_VERSION));
+    if !ours {
+        return None;
+    }
+    canon_unverifiable(value.get("canon").and_then(serde_json::Value::as_u64))
+}
+
+/// Read a package header's selection; one naming nothing is a finding.
+fn read_selection(value: &serde_json::Value, report: &mut VerifyReport) {
+    let selection = value
+        .get("selection")
+        .and_then(|s| serde_json::from_value::<Selection>(s.clone()).ok())
+        .filter(|s| !(s.cases.is_empty() && s.runs.is_empty()));
+    if selection.is_none() {
+        report.findings.push(
+            "the package header names no case and no run, so nothing says what it was a \
+             disclosure of"
+                .to_owned(),
+        );
+    }
+    report.selection = Some(selection.unwrap_or_default());
+}
+
 /// Read the header line: which format, which log, at what size, under which rule.
 fn read_header(value: &serde_json::Value, report: &mut VerifyReport) {
     let version = value.get("version").and_then(serde_json::Value::as_u64);
@@ -1210,28 +1806,8 @@ fn read_header(value: &serde_json::Value, report: &mut VerifyReport) {
              be all of them"
         ));
     }
-    // A foreign canonicalization rule is a statement about coverage, not a
-    // finding — nothing this pass checks depends on the rule. The chain
-    // rehash, the leaf comparison, the Merkle root and the signatures all run
-    // over the wire bytes **as written** (`Digest::chain` is plain hashing;
-    // it never re-canonicalizes), so they hold under any rule; the counts,
-    // the body-vs-wire comparison and the case coverage are byte and value
-    // comparisons with no rule in them at all. What a foreign rule *does*
-    // take off the table is re-deriving the digests inside the bodies —
-    // effect keys, manifest and plan digests — which this pass never
-    // recomputes anyway, and which a replaying build would. Filing it as a
-    // finding made an honest cross-build export read as tampered, which
-    // teaches a reader to ignore the finding that means it.
-    let canon = value.get("canon").and_then(serde_json::Value::as_u64);
-    if canon != Some(u64::from(crate::core::canon::VERSION)) {
-        report.not_checked.push(format!(
-            "derived digests — the export was written under canonicalization rule {canon:?} \
-             and this build implements {}. The chain, leaf, root and signature checks still \
-             ran and still hold (they hash the bytes as written, never a re-serialization); \
-             what this build cannot do is re-derive the digests inside the bodies, such as \
-             effect keys, under the rule that produced them",
-            crate::core::canon::VERSION
-        ));
+    if let Some(why) = canon_unverifiable(value.get("canon").and_then(serde_json::Value::as_u64)) {
+        report.unverifiable = Some(why);
     }
     match value
         .get("checkpoint")
@@ -1261,6 +1837,7 @@ fn read_record(
     pass: &mut RunPass,
     report: &mut VerifyReport,
     stamped: &mut std::collections::BTreeSet<crate::core::CaseId>,
+    upcaster: &dyn crate::journal::Upcaster,
 ) {
     let current = pass.run;
     pass.records += 1;
@@ -1284,12 +1861,36 @@ fn read_record(
     if crate::core::Digest::chain(pass.prev, raw_bytes) != claimed {
         return edited_record(raw_bytes, pass, report);
     }
-    // The body verification reads is parsed from the wire bytes — the one
-    // source the hash actually covers.
-    let body = match serde_json::from_slice::<crate::journal::RecordBody>(raw_bytes) {
-        Ok(body) => body,
-        Err(parse) => return unparsed_record(raw_bytes, parse, pass, report),
+    // Then the spelling, before a parse failure is believed: bytes that hash
+    // to their claim and that no writer under this canon produces — a space, a
+    // member out of order, a member written twice — are a statement about the
+    // file, and the last would otherwise fail the parse and read as a skew.
+    // Compared as values, so a record from another shape is held to the rule.
+    if serde_json::from_slice::<serde_json::Value>(raw_bytes)
+        .is_ok_and(|wire| crate::core::canon::value_bytes(&wire) != raw_bytes)
+    {
+        return uncanonical_record(raw_bytes, pass, report);
+    }
+    // The body verification reads is read from the wire bytes — the one
+    // source the hash actually covers — through the upcaster, which compares
+    // the record's version before its shape is believed: a record from another
+    // shape is lifted, or refused as a skew, rather than failing a parse into
+    // this build's struct and being judged by that.
+    let signature = value
+        .get("signature")
+        .and_then(|a| serde_json::from_value::<Option<crate::core::KeySignature>>(a.clone()).ok())
+        .flatten();
+    let record = match crate::journal::Record::from_stored_with(
+        upcaster,
+        raw_bytes.to_vec(),
+        pass.prev,
+        claimed,
+        signature,
+    ) {
+        Ok(record) => record,
+        Err(unread) => return unread_record(raw_bytes, &unread, pass, report),
     };
+    let body = &record.body;
     // The readable `body` is a courtesy copy, and it is held to the bytes: a
     // file whose display half says something its hashed half does not is the
     // quiet edit — every hash verifies, and the reader was shown a lie.
@@ -1352,49 +1953,8 @@ fn read_record(
         pass.clean = false;
     }
 
-    let signature = value
-        .get("signature")
-        .and_then(|a| serde_json::from_value::<Option<crate::core::KeySignature>>(a.clone()).ok())
-        .flatten();
-    // **Why the failure is matched on rather than summarised.** Not every way
-    // this read fails is an incident. The hash was checked before the body was
-    // parsed, at the top of this function, so every record reaching this point
-    // has bytes the chain commits to — a version
-    // this build does not read is then a statement about the reader, not about
-    // the file. Collapsing the two spends a tampering verdict on the one
-    // artifact this project hands to somebody who does not run it, and an
-    // export carries the incident kinds most often: a cancelled run, a
-    // withheld authority, a decided quarantine.
-    //
-    // A *shape* skew cannot arrive here, and the reason is checkable rather
-    // than assumed: the body above is parsed from these same bytes into the
-    // same struct, so a body this build cannot read has already returned
-    // through `unparsed_record`. Only the version survives that gate, because
-    // nothing above compares it.
-    match crate::journal::Record::from_stored_signed(
-        raw_bytes.to_vec(),
-        pass.prev,
-        claimed,
-        signature,
-    ) {
-        Ok(record) => {
-            pass.prev = record.hash;
-            pass.resealed.push(record);
-        }
-        // The hash was verified and the body parsed above, so the version is
-        // the one question left unanswered: every failure here is a record at
-        // a version this build does not read.
-        Err(skew) => {
-            report.findings.push(format!(
-                "run {current}: record {} is at a version this build does not read, and \
-                 its bytes hash as written — this is a build skew rather than an edit: \
-                 {skew}",
-                pass.last_seq
-            ));
-            pass.clean = false;
-            pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
-        }
-    }
+    pass.prev = record.hash;
+    pass.resealed.push(record);
 }
 
 /// Members of a framing line this build does not know, reported as unchecked.
@@ -1410,9 +1970,16 @@ fn read_record(
 /// evidence the reader did not see. A framing line is not hashed and carries no
 /// evidence of its own, so an unknown member does not falsify anything already
 /// checked — it bounds what the check covered, which is what this field is for.
-fn note_unknown_members(kind: &str, value: &serde_json::Value, report: &mut VerifyReport) {
+fn note_unknown_members(
+    kind: &str,
+    package: bool,
+    value: &serde_json::Value,
+    report: &mut VerifyReport,
+) {
     let known: &[&str] = match kind {
         "agentplane.export" => &["kind", "version", "checkpoint", "canon"],
+        DISCLOSURE_KIND => &["kind", "version", "checkpoint", "canon", "selection"],
+        "agentplane.export.run" if package => &["kind", "run", "index", "seal", "proof"],
         "agentplane.export.run" => &["kind", "run", "index", "seal"],
         "agentplane.export.case" => &["kind", "case", "deadlines", "blobs", "hold"],
         "agentplane.export.end" => &[
@@ -1467,25 +2034,56 @@ fn edited_record(raw_bytes: &[u8], pass: &mut RunPass, report: &mut VerifyReport
     pass.last_seq = seq;
 }
 
-/// A record line this reader cannot parse, filed under what that means.
+/// A record whose bytes hash to their claim and are not canonical, filed as a
+/// finding, with the head and sequence walked forward over the bytes present.
+fn uncanonical_record(raw_bytes: &[u8], pass: &mut RunPass, report: &mut VerifyReport) {
+    let seq = serde_json::from_slice::<serde_json::Value>(raw_bytes)
+        .ok()
+        .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64))
+        .unwrap_or(pass.last_seq + 1);
+    report.findings.push(format!(
+        "run {}: record {seq}'s wire bytes are not canonical — they hash to their claim, \
+         and no writer under the export's canon produces them",
+        pass.run
+    ));
+    pass.clean = false;
+    pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
+    pass.last_seq = seq;
+}
+
+/// A record line this reader cannot read, filed under what that means.
 ///
-/// **A line this reader cannot parse is not the same as a line nobody can.**
-/// This is the first gate a record from a newer build meets, so answering
-/// *malformed* for both would report an export written one hard cut ahead as a
-/// damaged file, record by record, to the one audience that has no other copy.
-fn unparsed_record(
+/// **A line this reader cannot read is not the same as a line nobody can.**
+/// The hash was verified before this is reached, so the bytes are the ones the
+/// chain committed to and a failure is a statement about the reader. A record
+/// at a version the upcaster cannot reach, or at this build's version in a
+/// shape it does not parse, is a build skew; answering *edited* or *malformed*
+/// for either would report an export written by another build as a damaged
+/// file, record by record, to the one audience that has no other copy. Only
+/// bytes that are not a record at all are malformed.
+fn unread_record(
     raw_bytes: &[u8],
-    parse: serde_json::Error,
+    unread: &crate::core::StoreError,
     pass: &mut RunPass,
     report: &mut VerifyReport,
 ) {
     let current = pass.run;
-    let classified = crate::journal::unreadable(raw_bytes, parse);
-    match &classified {
+    let at = serde_json::from_slice::<serde_json::Value>(raw_bytes)
+        .ok()
+        .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64));
+    match unread {
+        crate::core::StoreError::UnknownRecordVersion { .. } => {
+            report.findings.push(format!(
+                "run {current}: record {} is at a version this build does not read, and \
+                 its bytes hash as written — this is a build skew rather than an edit: \
+                 {unread}",
+                at.unwrap_or(pass.last_seq + 1)
+            ));
+        }
         crate::core::StoreError::UnreadableRecordShape { .. } => {
             report.findings.push(format!(
                 "run {current}: a record is at a shape this build does not read — a build \
-                 skew rather than a damaged file: {classified}"
+                 skew rather than a damaged file: {unread}"
             ));
         }
         _ => report
@@ -1499,10 +2097,7 @@ fn unparsed_record(
     // block report a broken link and a gap — a cascade of incident-shaped
     // findings from one old reader.
     pass.prev = crate::core::Digest::chain(pass.prev, raw_bytes);
-    if let Some(seq) = serde_json::from_slice::<serde_json::Value>(raw_bytes)
-        .ok()
-        .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64))
-    {
+    if let Some(seq) = at {
         pass.last_seq = seq;
     }
 }
@@ -1515,6 +2110,7 @@ fn finish_run(
     verifier: Option<&dyn crate::core::Verifier>,
     read_runs: &mut usize,
     empty_blocks: &mut Vec<RunId>,
+    observe: &mut dyn FnMut(ClosedRun<'_>),
 ) {
     let Some(pass) = pass else {
         return;
@@ -1531,6 +2127,11 @@ fn finish_run(
     // walk, not about the history.
     if pass.records == 0 {
         empty_blocks.push(run);
+        observe(ClosedRun {
+            run,
+            sealed: pass.sealed,
+            records: &[],
+        });
         return;
     }
     *read_runs += 1;
@@ -1545,6 +2146,33 @@ fn finish_run(
         report.findings.push(format!(
             "run {run}: the log's leaf is not this run's terminal hash, so the chain in this \
              file is not the chain the checkpoint committed to"
+        ));
+        ok = false;
+    }
+
+    // A package places every sealed run it carries, so a conclusion that
+    // seals under a block with no leaf is a leaf stripped from the file.
+    if report.selection.is_some()
+        && !pass.sealed
+        && crate::audit::has_sealing_conclusion(&pass.resealed)
+    {
+        report.findings.push(format!(
+            "run {run}: it concluded under an outcome that seals and its block carries no \
+             leaf — a package places every sealed run it carries, so this one's place in the \
+             log was removed"
+        ));
+        ok = false;
+    }
+
+    // In a package no tree is rebuilt, so the path is the whole of the
+    // evidence that this leaf is in the history the header names.
+    if report.selection.is_some()
+        && let Some(seal) = pass.declared_seal
+        && !leaf_is_proved(seal, pass.index, pass.proof.as_deref(), &report.checkpoint)
+    {
+        report.findings.push(format!(
+            "run {run}: its path does not prove its leaf against the header's checkpoint, so \
+             nothing ties this run to the history the package names"
         ));
         ok = false;
     }
@@ -1568,6 +2196,33 @@ fn finish_run(
     if ok {
         report.sound.push(run);
     }
+    observe(ClosedRun {
+        run,
+        sealed: pass.sealed,
+        records: &pass.resealed,
+    });
+}
+
+/// Whether `proof` proves `seal` at `index` in the tree `checkpoint` commits to.
+fn leaf_is_proved(
+    seal: crate::core::Digest,
+    index: Option<u64>,
+    proof: Option<&[crate::core::Digest]>,
+    checkpoint: &Checkpoint,
+) -> bool {
+    let (Some(index), Some(proof)) = (index, proof) else {
+        return false;
+    };
+    let (Ok(index), Ok(size)) = (usize::try_from(index), usize::try_from(checkpoint.size)) else {
+        return false;
+    };
+    crate::core::merkle::verify_inclusion(
+        crate::core::merkle::leaf_hash(&seal),
+        index,
+        size,
+        proof,
+        &checkpoint.root,
+    )
 }
 
 /// What a restore loses beyond the case layer, as sentences a reader can act
@@ -1579,16 +2234,6 @@ fn finish_run(
 /// does.
 fn losses(parsed: &Parsed) -> Vec<String> {
     let mut out = Vec::new();
-    if parsed.canon != Some(u64::from(crate::core::canon::VERSION)) {
-        out.push(format!(
-            "the digests — the export was written under canonicalization rule {:?} and this \
-             build implements {}, so the rebuilt store re-derives every digest under the new \
-             rule and its checkpoint cannot match the export's. The data is restored; \
-             `is_faithful` is unprovable, not false",
-            parsed.canon,
-            crate::core::canon::VERSION
-        ));
-    }
     if parsed.signed > 0 && !parsed.runs.is_empty() {
         out.push(format!(
             "{} record(s) carried a signature that this store did not reproduce — `append` \
@@ -1661,16 +2306,11 @@ async fn awaiting_runs(
 /// run restores to an equal root at an equal size and reports itself faithful.
 ///
 /// **Paged, and bounded by `limit` like every other listing here.** It walks
-/// the activity index — the only one that names a run before it ends — and
-/// keeps the runs whose history has not concluded, reading **one record** per
-/// candidate to decide: the head's sequence, then that record. A run whose
-/// records cannot be read is not silently dropped; it is returned in
-/// `unreadable` for the caller to report, on the same principle as the
-/// export's own trailer.
-///
-/// The order is the activity index's, which is rebuilt at restore time and
-/// derives no decision. Selection is not a decision about a run — it is which
-/// rows to read — so using it here does not widen what that index is for.
+/// every run by id ([`JournalStore::runs_by_id`]) and keeps the runs whose
+/// history has not concluded, reading **one record** per candidate to decide:
+/// the head's sequence, then that record. A run whose records cannot be read
+/// is not silently dropped; it is returned in `unreadable` for the caller to
+/// report, on the same principle as the export's own trailer.
 ///
 /// # Errors
 ///
@@ -1682,17 +2322,18 @@ pub async fn runs_in_flight(
     limit: usize,
 ) -> Result<InFlight, StoreError> {
     let mut found = InFlight::default();
-    let mut after: Option<(u64, RunId)> = None;
-    // Pages of the activity index, not of the answer: most runs in a healthy
-    // plane have concluded, so the page that yields one in-flight run may have
-    // held five hundred that had ended.
+    // Pages of every run, not of the answer: most runs in a healthy plane have
+    // concluded, so the page that yields one in-flight run may have held five
+    // hundred that had ended. By id, because an id never moves: a run that
+    // writes during the walk stays where the cursor will reach it.
+    let mut after: Option<RunId> = None;
     while found.runs.len() < limit {
-        let page = store.recent_runs(after, CASE_PAGE).await?;
+        let page = store.runs_by_id(after, CASE_PAGE).await?;
         if page.is_empty() {
             break;
         }
-        after = page.last().map(|(run, at)| (*at, *run));
-        for (run, _) in page {
+        after = page.last().copied();
+        for run in page {
             if found.runs.len() == limit {
                 found.truncated = true;
                 return Ok(found);
@@ -1732,12 +2373,189 @@ pub async fn runs_in_flight(
 /// What [`runs_in_flight`] found, and what it could not read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InFlight {
-    /// Runs that had not concluded, newest activity first.
+    /// Runs that had not concluded, by run id.
     pub runs: Vec<RunId>,
     /// The limit was reached, so this is a page rather than the set.
     pub truncated: bool,
     /// Runs the activity index names and whose records would not read.
     pub unreadable: Vec<(RunId, String)>,
+}
+
+/// The runs an offline reader of one tenant reads, and what it could not reach.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunsToRead {
+    /// The runs, concluded ones by outcome first, then those in flight.
+    pub runs: Vec<RunId>,
+    /// Each outcome whose listing overflowed `limit`, and `"in-flight runs"`
+    /// when that listing did.
+    pub reached: Vec<String>,
+    /// Runs the activity index names and whose records would not read.
+    pub unreadable: Vec<(RunId, String)>,
+    /// How many of `runs` are in flight.
+    pub in_flight: usize,
+}
+
+/// The runs under `outcomes`, at most `limit` per outcome, plus the runs still
+/// in flight when `include_in_flight`.
+///
+/// Each outcome is asked for one more than `limit`, so a full page and an
+/// overflowing one are distinguishable and the overflow is named in
+/// [`RunsToRead::reached`].
+///
+/// # Errors
+///
+/// If an index cannot be paged.
+pub async fn runs_to_read(
+    store: &Arc<dyn JournalStore>,
+    outcomes: &[String],
+    include_in_flight: bool,
+    limit: usize,
+) -> Result<RunsToRead, StoreError> {
+    let mut found = RunsToRead::default();
+    for outcome in outcomes {
+        let runs = store.runs_by_outcome(outcome, limit + 1).await?;
+        if runs.len() > limit {
+            found.reached.push(outcome.clone());
+        }
+        found.runs.extend(runs.into_iter().take(limit));
+    }
+    if include_in_flight {
+        let flight = runs_in_flight(store, limit).await?;
+        if flight.truncated {
+            found.reached.push("in-flight runs".to_owned());
+        }
+        found.in_flight = flight.runs.len();
+        found.runs.extend(flight.runs);
+        found.unreadable = flight.unreadable;
+    }
+    Ok(found)
+}
+
+/// One export file's runs, parsed from each record's `raw`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ExportRuns {
+    pub(crate) runs: Vec<(RunId, Vec<crate::journal::RecordBody>)>,
+    pub(crate) unreadable: Vec<RunId>,
+    /// The `agentplane.export.end` line was read.
+    pub(crate) trailer: bool,
+}
+
+/// Why an export file could not be read.
+#[derive(Debug)]
+pub(crate) enum ReadError {
+    Io(std::io::Error),
+    NotAnExport(String),
+}
+
+/// Read an export's runs for an offline consumer.
+///
+/// Parsed from each record's `raw` — the bytes the chain hashed — never from
+/// the display copy beside them. Integrity is not checked here; that is
+/// [`verify`]'s, so a record that does not parse is reported as unreadable and
+/// never named a build skew, which only hash-verified bytes can be.
+pub(crate) fn read_runs<R: std::io::BufRead>(input: R) -> Result<ExportRuns, ReadError> {
+    use serde_json::Value;
+    let mut out = ExportRuns::default();
+    let mut header = false;
+    for (index, line) in input.lines().enumerate() {
+        let line = line.map_err(ReadError::Io)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&line)
+            .map_err(|e| ReadError::NotAnExport(format!("line {} is not JSON: {e}", index + 1)))?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("agentplane.export") => {
+                let version = value.get("version").and_then(Value::as_u64);
+                if Some(u64::from(FORMAT_VERSION)) != version {
+                    return Err(ReadError::NotAnExport(format!(
+                        "the export is at format version {version:?}, and this build reads \
+                         {FORMAT_VERSION}"
+                    )));
+                }
+                header = true;
+            }
+            Some(DISCLOSURE_KIND) if !header => {
+                return Err(ReadError::NotAnExport(PACKAGE_REFUSED.to_owned()));
+            }
+            _ if !header => {
+                return Err(ReadError::NotAnExport(
+                    "the first line is not an agentplane export header".into(),
+                ));
+            }
+            Some("agentplane.export.run") => {
+                let run = value
+                    .get("run")
+                    .cloned()
+                    .and_then(|r| serde_json::from_value::<RunId>(r).ok())
+                    .ok_or_else(|| {
+                        ReadError::NotAnExport(format!("line {} names no run", index + 1))
+                    })?;
+                out.runs.push((run, Vec::new()));
+            }
+            Some("agentplane.export.end") => {
+                out.trailer = true;
+                if let Some(list) = value.get("unreadable").and_then(Value::as_array) {
+                    out.unreadable.extend(list.iter().filter_map(|u| {
+                        u.get("run")
+                            .cloned()
+                            .and_then(|r| serde_json::from_value::<RunId>(r).ok())
+                    }));
+                }
+            }
+            Some(_) => {}
+            None => {
+                let raw = value.get("raw").and_then(Value::as_str).ok_or_else(|| {
+                    ReadError::NotAnExport(format!("line {} carries no wire bytes", index + 1))
+                })?;
+                let upcaster = crate::journal::current_upcaster();
+                let body =
+                    crate::journal::RecordBody::read_through(upcaster.as_ref(), raw.as_bytes())
+                        .map_err(|e| {
+                            // No hash is checked here, so a parse failure is
+                            // not evidence that another build wrote the bytes,
+                            // and the skew's own wording would claim it was.
+                            let why = match e {
+                                StoreError::UnreadableRecordShape {
+                                    kind,
+                                    version,
+                                    detail,
+                                } => {
+                                    format!(
+                                        "its bytes name {kind} at v{version} and do not parse \
+                                         as that shape ({detail}); this reader checks no hash, \
+                                         so whether another build wrote them or they were \
+                                         edited is `verify`'s to say"
+                                    )
+                                }
+                                other => other.to_string(),
+                            };
+                            ReadError::NotAnExport(format!(
+                                "line {} holds a record this build does not read: {why}",
+                                index + 1
+                            ))
+                        })?;
+                let Some((run, records)) = out.runs.last_mut() else {
+                    return Err(ReadError::NotAnExport(format!(
+                        "line {} is a record before any run block",
+                        index + 1
+                    )));
+                };
+                if body.run != *run {
+                    return Err(ReadError::NotAnExport(format!(
+                        "line {} belongs to run {}, filed under {run}",
+                        index + 1,
+                        body.run
+                    )));
+                }
+                records.push(body);
+            }
+        }
+    }
+    if !header {
+        return Err(ReadError::NotAnExport("the input is empty".into()));
+    }
+    Ok(out)
 }
 
 // ── Putting one back ────────────────────────────────────────────────────────
@@ -1816,8 +2634,12 @@ impl RestoreReport {
 /// maintains, a restore maintains.
 ///
 /// So this replays the ordinary write path, and every constraint the store
-/// enforces is enforced here too. Three properties make that reproduce the
-/// original bytes rather than merely similar ones:
+/// enforces is enforced here too. What travels through it is each record's
+/// written bytes with its body ([`Append::restored`]): the store indexes the
+/// body, lifted through the upcaster if the record is from an older shape, and
+/// stores the bytes as written, so a restore across a shape change rebuilds
+/// the chain that was exported rather than a re-seal of it. Three properties
+/// make each record land at the position its bytes name:
 ///
 /// * **`seq` is re-derived and lands identically**, because a run restored into
 ///   an empty store starts from the same genesis and receives the same records
@@ -1843,15 +2665,37 @@ impl RestoreReport {
 ///
 /// # Errors
 ///
-/// If the export cannot be read, or if the store refuses a write. A store that
-/// already holds any of these runs will refuse: this rebuilds a history, it does
-/// not merge one.
+/// If the export cannot be read, if the store seals payloads as it writes,
+/// or if the store already holds any of its runs — each refused before
+/// anything is written: this rebuilds a history, it does not merge one. Also
+/// if the store refuses a write, or if a rebuilt record's hash is not the one
+/// the file claims; those land mid-restore and leave a partial store that a
+/// retry refuses, so discard it and restore into a fresh one.
 pub async fn from_jsonl<R: std::io::BufRead>(
     store: &Arc<dyn JournalStore>,
     cases: Option<&Arc<dyn crate::case::CaseStore>>,
     input: R,
 ) -> Result<RestoreReport, StoreError> {
-    let parsed = parse(input).map_err(|e| StoreError::Backend(e.to_string()))?;
+    let upcaster = crate::journal::current_upcaster();
+    from_jsonl_with(store, cases, input, upcaster.as_ref()).await
+}
+
+/// [`from_jsonl`], reading each record through `upcaster` rather than the one
+/// this build ships.
+///
+/// A record at a version `upcaster` cannot reach is refused before anything is
+/// written.
+///
+/// # Errors
+///
+/// As [`from_jsonl`].
+pub async fn from_jsonl_with<R: std::io::BufRead>(
+    store: &Arc<dyn JournalStore>,
+    cases: Option<&Arc<dyn crate::case::CaseStore>>,
+    input: R,
+    upcaster: &dyn crate::journal::Upcaster,
+) -> Result<RestoreReport, StoreError> {
+    let parsed = parse(input, upcaster).map_err(|e| StoreError::Backend(e.to_string()))?;
     restore_parsed(store, cases, parsed).await
 }
 
@@ -1877,7 +2721,8 @@ pub struct ReplaySource {
 /// rebuilt store does not commit to the history the file claims.
 #[cfg(feature = "redb")]
 pub async fn open_for_replay<R: std::io::BufRead>(input: R) -> Result<ReplaySource, StoreError> {
-    let parsed = parse(input).map_err(|e| StoreError::Backend(e.to_string()))?;
+    let upcaster = crate::journal::current_upcaster();
+    let parsed = parse(input, upcaster.as_ref()).map_err(|e| StoreError::Backend(e.to_string()))?;
     let runs = parsed.runs.iter().map(|r| r.run).collect();
     let store = Arc::new(crate::store::RedbStore::open_in_memory()?);
     let journal = Arc::clone(&store) as Arc<dyn JournalStore>;
@@ -1902,51 +2747,32 @@ async fn restore_parsed(
     cases: Option<&Arc<dyn crate::case::CaseStore>>,
     parsed: Parsed,
 ) -> Result<RestoreReport, StoreError> {
-    // A check `parse` leaves to its caller, because it is not about any one
-    // line: a format this build does not read cannot be
-    // *parsed* completely, and `parse` skips what it does not recognise — so
-    // proceeding would restore whatever subset happened to look familiar and
-    // report it as the whole file.
-    if parsed.version != Some(u64::from(FORMAT_VERSION)) {
-        return Err(StoreError::Backend(format!(
-            "the export claims format version {:?} and this build reads {FORMAT_VERSION} — \
-             restoring a format this build cannot fully parse would rebuild an unknowable \
-             subset and call it a history",
-            parsed.version
-        )));
-    }
-
-    // The frame is the completeness signal, and the restore is the reader most
-    // exposed to its absence: a truncated export is a *prefix* in which every
-    // line is valid, so replaying one rebuilds a partial history shaped
-    // exactly like a whole one. The quietest cut is the worst — a file cut
-    // after the last record but before the case layer restores a journal that
-    // is byte-perfect and `is_faithful`, with every matter it names missing.
-    // Refused before any write lands, so a refused restore leaves nothing to
-    // clean up. What this does NOT cover: a file truncated *and* given a
-    // forged trailer — that is `verify`'s count settlement, and the right
-    // order is restore, then verify.
-    if !parsed.complete {
-        return Err(StoreError::Backend(
-            "the export has no trailer, so it was cut short — every line in it is a valid \
-             prefix, and restoring a prefix would rebuild a partial history shaped exactly \
-             like a whole one. Re-take the export"
-                .to_owned(),
-        ));
-    }
+    refuse_before_writing(store, &parsed).await?;
 
     let mut records = 0usize;
     for run in &parsed.runs {
+        let mut claimed = run.hashes.iter();
         // Grouped by epoch, in order. Each group is one `append` carrying that
         // group's own epoch, which is what reproduces the hashed bodies of a run
         // that changed owner mid-flight.
-        for batch in run.bodies.chunk_by(|a, b| a.epoch == b.epoch) {
-            let Some(epoch) = batch.first().map(|b| b.epoch) else {
+        for batch in run.records.chunk_by(|a, b| a.body.epoch == b.body.epoch) {
+            let Some(epoch) = batch.first().map(|r| r.body.epoch) else {
                 continue;
             };
-            let appends: Vec<Append> = batch.iter().cloned().map(Append::from_body).collect();
+            let appends: Vec<Append> = batch.iter().cloned().map(Append::restored).collect();
             records += appends.len();
-            store.append(epoch, appends).await?;
+            for (written, want) in store.append(epoch, appends).await?.iter().zip(&mut claimed) {
+                if written.hash != *want {
+                    return Err(StoreError::Backend(format!(
+                        "run {} seq {} rebuilt to hash {} and the file claims {want} — the \
+                         store is not reproducing the history it was handed, so the restore \
+                         stopped there",
+                        run.run,
+                        written.seq(),
+                        written.hash
+                    )));
+                }
+            }
         }
     }
 
@@ -1961,9 +2787,10 @@ async fn restore_parsed(
         .collect::<Vec<_>>();
     sealed.sort_by_key(|r| r.index);
     for run in sealed {
-        let (Some(outcome), Some(epoch)) =
-            (run.outcome.as_deref(), run.bodies.last().map(|b| b.epoch))
-        else {
+        let (Some(outcome), Some(epoch)) = (
+            run.outcome.as_deref(),
+            run.records.last().map(|r| r.body.epoch),
+        ) else {
             continue;
         };
         store.seal(run.run, epoch, outcome).await?;
@@ -2028,35 +2855,167 @@ async fn restore_parsed(
     })
 }
 
+/// Every refusal a restore makes before its first write, so a refused restore
+/// leaves nothing to clean up.
+async fn refuse_before_writing(
+    store: &Arc<dyn JournalStore>,
+    parsed: &Parsed,
+) -> Result<(), StoreError> {
+    // A check `parse` leaves to its caller, because it is not about any one
+    // line: a format this build does not read cannot be
+    // *parsed* completely, and `parse` skips what it does not recognise — so
+    // proceeding would restore whatever subset happened to look familiar and
+    // report it as the whole file.
+    if parsed.version != Some(u64::from(FORMAT_VERSION)) {
+        return Err(StoreError::Backend(format!(
+            "the export claims format version {:?} and this build reads {FORMAT_VERSION} — \
+             restoring a format this build cannot fully parse would rebuild an unknowable \
+             subset and call it a history",
+            parsed.version
+        )));
+    }
+
+    if let Some(why) = canon_unverifiable(parsed.canon) {
+        return Err(StoreError::Backend(why));
+    }
+
+    // The frame is the completeness signal, and the restore is the reader most
+    // exposed to its absence: a truncated export is a *prefix* in which every
+    // line is valid, so replaying one rebuilds a partial history shaped
+    // exactly like a whole one. The quietest cut is the worst — a file cut
+    // after the last record but before the case layer restores a journal that
+    // is byte-perfect and `is_faithful`, with every matter it names missing.
+    // Refused before any write lands, so a refused restore leaves nothing to
+    // clean up. What this does NOT cover: a file truncated *and* given a
+    // forged trailer — that is `verify`'s count settlement, and the right
+    // order is restore, then verify.
+    if !parsed.complete {
+        return Err(StoreError::Backend(
+            "the export has no trailer, so it was cut short — every line in it is a valid \
+             prefix, and restoring a prefix would rebuild a partial history shaped exactly \
+             like a whole one. Re-take the export"
+                .to_owned(),
+        ));
+    }
+
+    if store.seals() {
+        return Err(StoreError::Backend(
+            "the target store seals payloads as it writes them, and a restore must write \
+             each record exactly as it was recorded — sealed payloads stay sealed under \
+             their original keys. Restore into the unwrapped store, then open it with the \
+             keyring"
+                .to_owned(),
+        ));
+    }
+
+    refuse_foreign_seals(parsed, store.tenant())?;
+    // `append` re-derives `seq`, so a run this store already holds would be
+    // appended to rather than rebuilt — a retried partial restore doubling it.
+    for run in &parsed.runs {
+        if store.head(run.run).await?.seq != 0 {
+            return Err(StoreError::Backend(format!(
+                "this store already holds run {} — a restore rebuilds a history into an \
+                 empty store, it does not merge one, so nothing was written",
+                run.run
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a file whose sealed payloads or case states name another tenant.
+///
+/// An envelope's associated data and erasure scope both name the tenant that
+/// sealed it, so under another tenant it opens for nobody and `erase_case`
+/// there destroys a key that wraps none of it. Moving sealed history between
+/// tenants needs a re-seal, which a restore cannot do.
+fn refuse_foreign_seals(parsed: &Parsed, tenant: &str) -> Result<(), StoreError> {
+    use crate::journal::payload::{self, SealedField};
+
+    let foreign = |envelope: Option<Vec<u8>>, whose: &dyn std::fmt::Display| match envelope
+        .as_deref()
+        .and_then(payload::sealed_tenant)
+    {
+        Some(sealer) if sealer == tenant => Ok(()),
+        sealer => Err(StoreError::Backend(format!(
+            "{whose} carries a payload sealed for tenant '{}', and this store serves \
+                 '{tenant}' — under another tenant it opens for nobody and an erasure \
+                 there would not reach it, so the file is refused before anything is written",
+            sealer.as_deref().unwrap_or("(unreadable envelope)")
+        ))),
+    };
+    for run in &parsed.runs {
+        for record in &run.records {
+            let mut kind = record.body.kind.clone();
+            for field in payload::payloads(&mut kind) {
+                match field {
+                    SealedField::Value(v) if payload::is_sealed(v) => {
+                        foreign(payload::unwrap(v), &format!("run {}", run.run))?;
+                    }
+                    SealedField::Text(t) if payload::is_sealed_text(t) => {
+                        foreign(payload::unwrap_text(t), &format!("run {}", run.run))?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for block in &parsed.cases {
+        if payload::is_sealed(&block.case.state) {
+            foreign(
+                payload::unwrap(&block.case.state),
+                &format!("case {}", block.case.id),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// One run, as an export describes it.
 struct RestoredRun {
     run: RunId,
     /// Position in the Merkle log; `None` for a run that was still open.
     index: Option<u64>,
     outcome: Option<String>,
-    bodies: Vec<crate::journal::RecordBody>,
+    /// Each record as verified, carrying the bytes the restore writes back.
+    records: Vec<crate::journal::Record>,
+    /// Each body's hash as the file claims it, which the rebuilt record must
+    /// reproduce.
+    hashes: Vec<crate::core::Digest>,
     /// The chain head over the records read so far, which the next record's
     /// hash must extend.
     prev: crate::core::Digest,
 }
 
-/// One record line's body, once its bytes are known to be the ones the chain
-/// committed to and at the version this build writes.
+/// One record line, once its bytes are known to be the ones the chain
+/// committed to and at a version `upcaster` reads.
 ///
-/// Both are conditions of replay rather than verification. `append` re-derives
-/// each hash from what it is handed and stamps this build's version, so bytes
-/// the claimed hash does not cover would rebuild a history the file never
-/// committed to, and a record at another version would be silently rewritten
-/// at this one — either way into a populated store, before the checkpoint
-/// comparison could say so.
+/// Both are conditions of replay rather than verification. Bytes the claimed
+/// hash does not cover would rebuild a history the file never committed to,
+/// and a record at a version no upcaster reaches has no body the store can
+/// index — either way into a populated store, before the checkpoint comparison
+/// could say so.
 fn replayable(
     raw: &[u8],
     prev: crate::core::Digest,
     claimed: crate::core::Digest,
-) -> Result<crate::journal::RecordBody, std::io::Error> {
-    crate::journal::Record::from_stored_signed(raw.to_vec(), prev, claimed, None)
-        .map(|record| record.body)
-        .map_err(|e| {
+    upcaster: &dyn crate::journal::Upcaster,
+) -> Result<crate::journal::Record, std::io::Error> {
+    // A store keeps these bytes as they stand, so bytes that hash correctly
+    // and are not canonical would land a record no writer under this canon
+    // produces. Compared as values rather than as this build's record shape,
+    // so a record from another shape is held to the same rule.
+    if serde_json::from_slice::<serde_json::Value>(raw)
+        .is_ok_and(|value| crate::core::canon::value_bytes(&value) != raw)
+    {
+        return Err(std::io::Error::other(
+            "a record's wire bytes are not canonical — no writer under the export's canon \
+             produces them, and a store would keep them as they stand, so the file is \
+             refused before anything is written",
+        ));
+    }
+    crate::journal::Record::from_stored_with(upcaster, raw.to_vec(), prev, claimed, None).map_err(
+        |e| {
             std::io::Error::other(match e {
                 StoreError::Corrupt { .. } => format!(
                     "a record's claimed hash does not cover its wire bytes and the chain \
@@ -2064,16 +3023,17 @@ fn replayable(
                      committed to, so the file is refused before anything is written"
                 ),
                 StoreError::UnknownRecordVersion { .. } => format!(
-                    "a record is at a version this build does not restore ({e}) — `append` \
-                     would rewrite it at this build's version, so the file is refused before \
-                     anything is written"
+                    "a record is at a version this build does not restore ({e}) — no \
+                     upcaster reaches it, so the store could not index it as written, and \
+                     the file is refused before anything is written"
                 ),
                 other => format!(
                     "a record line's wire bytes do not parse ({other}) — the record cannot be \
                      replayed as written, and its display copy is not a substitute"
                 ),
             })
-        })
+        },
+    )
 }
 
 struct Parsed {
@@ -2167,7 +3127,10 @@ fn restored_case(value: &serde_json::Value) -> Result<Option<RestoredCase>, std:
 /// and they must be the bytes its hash covers, at the version this build
 /// writes; see [`replayable`]. All of it is decided here, before
 /// [`from_jsonl`] writes anything.
-fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
+fn parse<R: std::io::BufRead>(
+    input: R,
+    upcaster: &dyn crate::journal::Upcaster,
+) -> Result<Parsed, std::io::Error> {
     use serde_json::Value;
 
     let mut parsed = Parsed {
@@ -2209,7 +3172,8 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                         run,
                         index: value.get("index").and_then(Value::as_u64),
                         outcome: None,
-                        bodies: Vec::new(),
+                        records: Vec::new(),
+                        hashes: Vec::new(),
                         prev: crate::core::Digest::ZERO,
                     });
                 }
@@ -2220,6 +3184,7 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                 }
             }
             Some("agentplane.export.end") => parsed.complete = true,
+            Some(DISCLOSURE_KIND) => return Err(std::io::Error::other(PACKAGE_REFUSED)),
             // A line carrying a `kind` this build does not recognise is not a
             // record — record lines are the only unkinded lines in the format
             // — so it is skipped per the no-checking rule rather than held to
@@ -2258,12 +3223,14 @@ fn parse<R: std::io::BufRead>(input: R) -> Result<Parsed, std::io::Error> {
                 let Some(current) = parsed.runs.last_mut() else {
                     continue;
                 };
-                let body = replayable(raw.as_bytes(), current.prev, claimed)?;
+                let record = replayable(raw.as_bytes(), current.prev, claimed, upcaster)?;
                 current.prev = claimed;
-                if let crate::journal::RecordKind::RunConcluded { outcome, .. } = &body.kind {
+                if let crate::journal::RecordKind::RunConcluded { outcome, .. } = &record.body.kind
+                {
                     current.outcome = Some(outcome.clone());
                 }
-                current.bodies.push(body);
+                current.records.push(record);
+                current.hashes.push(claimed);
             }
         }
     }

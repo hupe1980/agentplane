@@ -113,9 +113,15 @@ pub struct Label {""",
         "a decision recorded by a plane holding no agent for the run (an "
         "operator's terminal) fails after the record, so the task stays claimed "
         "and the decider is told the answer was lost",
-        """            Err(RuntimeError::NoProvider { .. } | RuntimeError::PayloadsSealed { .. }) => {
+        """                RuntimeError::NoProvider { .. }
+                | RuntimeError::NoCaseStore { .. }
+                | RuntimeError::PayloadsSealed { .. },
+            ) => {
                 return Ok(Delivery::Buffered);""",
-        """            Err(e @ (RuntimeError::NoProvider { .. } | RuntimeError::PayloadsSealed { .. })) => {
+        """                e @ (RuntimeError::NoProvider { .. }
+                | RuntimeError::NoCaseStore { .. }
+                | RuntimeError::PayloadsSealed { .. }),
+            ) => {
                 return Err(e);""",
     ),
     "APlaneThatCannotDriveARunJudgesIt": (
@@ -124,8 +130,8 @@ pub struct Label {""",
         "a plane holding no provider for a run (an operator's terminal) compares "
         "its own empty policy with the run's before finding it cannot drive the "
         "run, and quarantines a governed run it could never have continued",
-        "            self.refuse_undrivable(&records)?;",
-        "            let _ = self.refuse_undrivable(&records);",
+        "            self.refuse_undrivable(std::iter::once(&plan).chain(&successors))?;",
+        "            let _ = self.refuse_undrivable(std::iter::once(&plan).chain(&successors));",
     ),
     "ATerminalStopIsReportedAsAFailure": (
         "src/runtime/executor.rs",
@@ -135,8 +141,9 @@ pub struct Label {""",
         "standing stop failed",
         """                    RuntimeError::LeaseHeld { .. }
                     | RuntimeError::NoProvider { .. }
-                    | RuntimeError::PayloadsSealed { .. },""",
-        """                    RuntimeError::LeaseHeld { .. } | RuntimeError::PayloadsSealed { .. },""",
+                    | RuntimeError::NoCaseStore { .. }""",
+        """                    RuntimeError::LeaseHeld { .. }
+                    | RuntimeError::NoCaseStore { .. }""",
     ),
     "ATaskIdRefusesItsOwnDisplayForm": (
         "src/core/task.rs",
@@ -158,42 +165,23 @@ pub struct Label {""",
         "src/runtime/ctx.rs",
         "a_committed_but_lost_effect_record_is_not_performed_again",
         "replay re-performs a completed effect instead of reading it back",
-        """                self.replayed_done(
-                    &descriptor.kind,
-                    attempt,
-                    spend,
-                    Self::outbound_size(effect),
-                );
+        """                self.arrival_refusal(content.as_ref())?;
+                declared.sensitivity =
+                    crate::core::ContentVerdict::raise(content.as_ref(), declared.sensitivity);
                 Ok(Replayed::Answered(
                     serde_json::from_value(output)?,
                     declared,
                 ))""",
-        """                self.replayed_done(
-                    &descriptor.kind,
-                    attempt,
-                    spend,
-                    Self::outbound_size(effect),
-                );
-                let _ = (output, declared);
+        """                let _ = (output, declared, content);
                 Ok(Replayed::Live)""",
     ),
     "MediaReplayRePerforms": (
         "src/runtime/ctx.rs",
         "strict_replay_does_not_read_media_blobs_or_call_the_model",
         "strict replay re-materializes a media blob and calls the model again",
-        """                self.replayed_done(
-                    &descriptor.kind,
-                    attempt,
-                    spend,
-                    Self::outbound_size(effect),
-                );
+        """                    crate::core::ContentVerdict::raise(content.as_ref(), declared.sensitivity);
                 Ok(Replayed::Answered(""",
-        """                self.replayed_done(
-                    &descriptor.kind,
-                    attempt,
-                    spend,
-                    Self::outbound_size(effect),
-                );
+        """                    crate::core::ContentVerdict::raise(content.as_ref(), declared.sensitivity);
                 if descriptor.kind == "model.complete" {
                     let _ = effect.perform().await;
                 }
@@ -292,17 +280,114 @@ pub struct Label {""",
         "strict_replay_wires_only_replay_only_drivers",
         "`replay --strict` builds the manifest's live drivers, so a CI job with "
         "no provider credential cannot verify a pass that calls no provider",
-        """    let mut builder = agentplane::runtime::replay_only::wire(
-        Runtime::builder_with(stores.clone()).tenant(tenant.clone()),
-        manifests,
-        &history,
-    );""",
+        """    let mut builder = agentplane::runtime::replay_only::wire(backend.plane(), manifests, &history);""",
         """    let _ = &history;
-    let mut builder = with_providers(
-        Runtime::builder_with(stores.clone()).tenant(tenant.clone()),
-        manifests,
-    )
-    .await?;""",
+    let mut builder = with_providers(backend.plane(), manifests).await?;""",
+    ),
+    "AVerbBuildsItsOwnPlane": (
+        "src/bin/agentplane.rs",
+        "every_plane_this_binary_builds_comes_through_backend_plane",
+        "a verb starts its runtime builder itself, so whether it wires the quota "
+        "store the operator's halts live in is that verb's choice to forget",
+        """        let plane = backend.plane().build();
+        let first = plane""",
+        """        let plane = Runtime::builder_with(backend.stores())
+            .tenant(backend.tenant())
+            .build();
+        let first = plane""",
+    ),
+    "AContinuationSkipsTheKindGate": (
+        "src/api/a2a.rs",
+        "a_continuation_is_refused_the_kind_policy_refuses",
+        "an A2A continuation delivers whatever kind its task awaits without "
+        "asking whether the peer may supply that kind, so a rule `POST /events` "
+        "enforces is bypassed by addressing the task instead",
+        "    server.authorize(caller, action::EVENT_DELIVER, &kind, Some(&caller.actor))?;",
+        "    let _ = action::EVENT_DELIVER;",
+    ),
+    "TheReleaseRouteBypassesTheRuntime": (
+        "src/api/mod.rs",
+        "a_hold_release_and_a_halt_lift_name_who_made_them",
+        "the release route removes the hold through the case store directly, so "
+        "a release over the wire answers with a record that was never written",
+        """    let record = s
+        .plane
+        .release_hold(case, &by, now_for_account())
+        .await""",
+        """    let record = s
+        .plane
+        .cases()
+        .ok_or_else(|| unavailable("case"))?
+        .release_hold(case)
+        .await
+        .map(|lifted| {
+            lifted.then(|| crate::runtime::ControlLifted {
+                record: crate::core::RunId::generate(),
+                removed: true,
+            })
+        })
+        .map_err(crate::core::RuntimeError::Store)""",
+    ),
+    "APushRegistrationIsUnbounded": (
+        "src/api/a2a.rs",
+        "push_registrations_are_bounded_per_task_and_by_id_length",
+        "a peer registers push configurations on its task without limit, each "
+        "one a delivery per record, multiplying the plane's outbound traffic",
+        "    if held.len() >= MAX_PUSH_CONFIGS_PER_TASK && !held.contains(&config.id) {",
+        "    if held.len() >= usize::MAX && !held.contains(&config.id) {",
+    ),
+    "APushIdIsUnbounded": (
+        "src/api/a2a.rs",
+        "push_registrations_are_bounded_per_task_and_by_id_length",
+        "a push configuration id of any length is stored and echoed back",
+        "            .is_some_and(|id| id.len() > MAX_PUSH_ID_LEN)",
+        "            .is_some_and(|id| id.len() > usize::MAX - 1)",
+    ),
+    "ATruncatedListingExitsZero": (
+        "src/bin/agentplane.rs",
+        "a_listing_cut_short_by_its_limit_exits_partial",
+        "`tasks` and `waiting` exit 0 on a page `--limit` cut short, so a "
+        "script takes the page for the whole worklist",
+        "    ExitCode::from(if truncated { exit::PARTIAL } else { exit::OK })",
+        "    ExitCode::from(if truncated { exit::OK } else { exit::OK })",
+    ),
+    "AnUnauthenticatedPeerIsToldItsRequestWasMalformed": (
+        "src/api/a2a.rs",
+        "every_method_is_authenticated",
+        "a refused credential answers HTTP 200 with INVALID_REQUEST, so an A2A "
+        "client is told its body was malformed rather than to authenticate",
+        "        if self.unauthenticated {",
+        "        if !self.unauthenticated && self.code == i32::MIN {",
+    ),
+    "TheOperatorApiEchoesAnUnevaluablePolicy": (
+        "src/api/mod.rs",
+        "an_unevaluable_policy_set_is_a_fixed_sentence_to_the_caller",
+        "a policy set that cannot evaluate hands the caller the engine's reason, "
+        "naming the policy ids and attributes it keys on",
+        "                    POLICY_UNEVALUABLE.to_owned(),",
+        "                    reason,",
+    ),
+    "AnUnwiredQuotaStoreIsAServerFault": (
+        "src/api/mod.rs",
+        "a_missing_store_does_not_describe_the_plane",
+        "the halt and live-run routes on a plane with no quota store answer "
+        "500, the status of an outage, instead of 501 naming what is not wired",
+        """        .ok_or_else(|| unavailable("quota"))""",
+        """        .or(Some(()))
+        .ok_or_else(|| unavailable("quota"))""",
+    ),
+    "APlaintextRefusalQuotesTheUrl": (
+        "src/peers/a2a.rs",
+        "a_plaintext_peer_endpoint_and_card_url_are_refused",
+        "the plaintext-peer refusal quotes the endpoint URL, carrying whatever "
+        "credential its path or query holds into logs and records",
+        """                    "the peer endpoint on '{host}' is not https — a bearer credential and \\
+                     the run's payload must not cross the network in cleartext"
+                ),""",
+        """                    "the peer endpoint on '{host}' ({}) is not https — a bearer credential and \\
+                     the run's payload must not cross the network in cleartext",
+                    self.endpoint.url
+                ),""",
     ),
     "IgnoreKeyMismatch": (
         "src/journal/replay.rs",
@@ -740,8 +825,12 @@ pub struct Label {""",
         "the effect gate lets one kind past the bundle, so a transfer the bundle "
         "forbids reaches the world — and the offline check over the export is "
         "what reports it",
-        "        if !self.phase.is_forward() || self.reversing {",
-        '        if !self.phase.is_forward() || self.reversing || descriptor.kind == "ledger.transfer" {',
+        """        self.authorize(key, descriptor, mutates, outbound.map(|o| o.label))
+            .await?;""",
+        """        if descriptor.kind != "ledger.transfer" {
+            self.authorize(key, descriptor, mutates, outbound.map(|o| o.label))
+                .await?;
+        }""",
     ),
     "TheCheckSkipsEffectStarted": (
         "src/policy/check.rs",
@@ -836,15 +925,9 @@ pub struct Label {""",
     "AnErasedArgumentReadsAsSealed": (
         "src/keyring/journal.rs",
         "a_sealed_and_an_erased_run_are_not_evaluable_for_their_own_reasons",
-        "the shared opener stops counting a destroyed key, so an erased payload "
-        "reads as one merely sealed and an auditor is told to find a key that "
-        "no longer exists",
-        "                        found.opened += 1;\n"
-        "                    }\n"
-        "                    None => found.erased += 1,",
-        "                        found.opened += 1;\n"
-        "                    }\n"
-        "                    None => {}",
+        "the shared opener stops counting a destroyed key, so an erased payload reads as one merely sealed and an auditor is told to find a key that no longer exists",
+        "                        *field = serde_json::from_slice(&plain)?;\n                        found.opened += 1;\n                    }\n                    None => found.erased += 1,",
+        "                        *field = serde_json::from_slice(&plain)?;\n                        found.opened += 1;\n                    }\n                    None => {}",
     ),
     "ABundleDirectoryReadsAroundAStrayFile": (
         "src/bin/agentplane.rs",
@@ -962,8 +1045,8 @@ pub struct Label {""",
         "a_steps_policy_context_names_the_runs_chain_live_and_on_replay",
         "every step's policy context carries the plane's chain rather than the "
         "run's, so a served run's effects are judged as the operator's",
-        "                identity: identity.cloned(),\n                agent: agent.to_owned(),",
-        "                identity: self.identity.clone(),\n                agent: agent.to_owned(),",
+        "                identity: identity.cloned(),\n                subjects: subjects.clone(),\n                agent: agent.to_owned(),",
+        "                identity: self.identity.clone(),\n                subjects: subjects.clone(),\n                agent: agent.to_owned(),",
     ),
     "AResumedRunActsAsThePlane": (
         "src/runtime/executor.rs",
@@ -1182,8 +1265,8 @@ pub struct Label {""",
         "src/peers/credentials.rs",
         "a_token_bound_to_the_wrong_audience_is_refused",
         "the issuer is trusted about which audience it bound a token to",
-        "        if fresh.audience() != audience {",
-        "        if false && fresh.audience() != audience {",
+        "    if credential.audience() != audience {",
+        "    if false && credential.audience() != audience {",
     ),
     # ── Peer hops ───────────────────────────────────────────────────────────
     # Handing a peer a credential minted for someone else. The peer can then
@@ -1502,6 +1585,218 @@ pub struct Label {""",
         "            cedar_policy::Decision::Deny if !errors.is_empty() => {",
         "            cedar_policy::Decision::Deny if false => {",
     ),
+    "CapabilityReadsAsSubject": (
+        "src/policy/cedar.rs",
+        "a_subject_rule_does_not_match_a_capability_of_the_same_name",
+        "a chainless run's capability and a chain subject share one Cedar entity "
+        "type, so a rule granting the person `alice` admits every run of a "
+        "capability someone named `alice`",
+        "        let principal = uid(r.principal_kind.entity_type(), r.principal)?;",
+        '        let principal = uid("Subject", r.principal)?;',
+    ),
+    "RatePruneFollowsTheReservation": (
+        "src/quota/mod.rs",
+        "redb_satisfies_the_quota_store_contract",
+        'the reservation prunes rate rows older than one minute instead of older than the widest window any declaration may state, so the rows an hourly ceiling counts are deleted after sixty seconds and it admits like a per-minute one',
+        '    rate_window_start(at.unix_timestamp(), MAX_RATE_WINDOW_SECONDS)',
+        '    rate_window_start(at.unix_timestamp(), 60)',
+    ),
+    "ACodeBuiltRateWindowOutlivesItsRows": (
+        "src/quota/mod.rs",
+        "redb_satisfies_the_quota_store_contract",
+        'a ceiling built in code with a window wider than a store keeps its rows is counted, so it sees only what retention left and admits more than it states',
+        '        .find(|c| c.window_seconds == 0 || c.window_seconds > MAX_RATE_WINDOW_SECONDS)',
+        '        .find(|c| c.window_seconds == 0)',
+    ),
+    "ARateWindowOutlivesItsRows": (
+        "src/manifest/mod.rs",
+        "a_rate_ceiling_that_admits_nothing_is_refused",
+        'a rate window longer than a store keeps the count parses, so the ceiling counts only the rows retention left and admits more than it states',
+        '                || rate.window_seconds > crate::quota::MAX_RATE_WINDOW_SECONDS',
+        '                || rate.window_seconds > crate::core::MAX_WINDOW_SECONDS',
+    ),
+    "ABroadcastIgnoresTheWaitsSender": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "an arriving event is matched to a wait that names another sender, so any producer knowing the kind and the correlation key consumes another run's wait",
+        '                if from.is_some_and(|from| from != source) {',
+        '                if false {',
+    ),
+    "ABufferedEventIgnoresTheWaitsSender": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        'a registering wait claims a buffered event from a sender it does not accept, so a producer that answers first consumes the wait',
+        '                            && wait.accepts_source(&row.5)',
+        '                            && true',
+    ),
+    "ATargetedEventIgnoresTheWaitsSender": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        'a targeted delivery resumes a wait that names another sender, so the one path that names the run bypasses the sender the run asked for',
+        '                        && from.is_none_or(|from| from == source)',
+        '                        && true',
+    ),
+    "ABufferedEventNeverReachesANamedWait": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        'a wait naming its sender never claims a buffered event, even the sender\'s own, so a reply that arrived first leaves the run waiting for something that already happened',
+        '                            && wait.accepts_source(&row.5)',
+        '                            && wait.from.is_none()',
+    ),
+    "ATargetedEventNeverReachesANamedWait": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        'a targeted delivery never resumes a wait naming its sender, even from that sender, so every sender-named A2A continuation is refused as not waiting',
+        '                        && from.is_none_or(|from| from == source)',
+        '                        && from.is_none()',
+    ),
+    "PostgresBroadcastIgnoresTheWaitsSender": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        "an arriving event is matched to a wait that names another sender, so any producer knowing the kind and the correlation key consumes another run's wait",
+        '                        AND (from_source IS NULL OR from_source = $5)',
+        '                        AND (from_source IS NULL OR TRUE)',
+    ),
+    "PostgresBufferedEventIgnoresTheWaitsSender": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        'a registering wait claims a buffered event from a sender it does not accept, so a producer that answers first consumes the wait',
+        '                             AND ($7::TEXT IS NULL OR e.source = $7)',
+        '                             AND ($7::TEXT IS NULL OR TRUE)',
+    ),
+    "PostgresTargetedEventIgnoresTheWaitsSender": (
+        "src/store/postgres_cases.rs",
+        "postgres_satisfies_the_case_layer_contracts",
+        'a targeted delivery resumes a wait that names another sender, so the one path that names the run bypasses the sender the run asked for',
+        '                    AND (from_source IS NULL OR from_source = $4)',
+        '                    AND (from_source IS NULL OR TRUE)',
+    ),
+    "AnOlderSubscriptionsTableLacksTheSender": (
+        "src/store/postgres_cases.rs",
+        "postgres_an_older_subscriptions_table_gains_the_sender_at_open",
+        'a subscriptions table an older build created opens without from_source, and the first wait that names its sender fails at the database instead of at open',
+        'ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS from_source TEXT;',
+        '-- no from_source column',
+    ),
+    "AnOldSubscriptionRowOpens": (
+        "src/store/redb_events.rs",
+        "a_store_with_the_old_subscription_row_refuses_to_open",
+        'the subscriptions table is not opened at store open, so a file holding the older row shape opens and fails only at the first wait or delivery',
+        '    w.open_table(SUBS).map_err(|e| be(&e))?;',
+        '    let _ = SUBS;',
+    ),
+    "ADeadlineOfNoTimeResolves": (
+        "src/core/calendar.rs",
+        "the_built_in_calendar_satisfies_the_contract",
+        'a count of zero or less resolves to the registration instant or before it, so an obligation is breached before anybody is warned',
+        '            .filter(|n| *n > 0)',
+        '            .filter(|n| *n > i64::MIN)',
+    ),
+    "AnOversightDeadlineOfNoTimeParses": (
+        "src/manifest/mod.rs",
+        "an_oversight_deadline_counts_at_least_one_unit",
+        'a declared deadline of zero or negative units parses, and every run registers an obligation already due',
+        '            Some(n) if n.as_i64().is_none_or(|n| n <= 0) => Err(ManifestError::Syntax(format!(',
+        '            Some(n) if false && n.as_i64().is_none_or(|n| n <= 0) => Err(ManifestError::Syntax(format!(',
+    ),
+    "AJudgeCountsTwice": (
+        "src/core/quorum.rs",
+        "a_lens_judged_twice_is_refused",
+        "one lens's verdict is counted as often as it is repeated, so a single judge reaches a quorum meant for three",
+        '            if !seen.insert(*lens) {',
+        '            if !seen.insert(*lens) && false {',
+    ),
+    "ADeserializedReleaseSkipsValidation": (
+        "src/core/label.rs",
+        "a_deserialized_release_is_validated",
+        'a release read from a journal or a wire is not validated, so one with no fields reads as a successful no-op and one with no evidence is recorded as a decision',
+        '        release.validate().map(|()| release)',
+        '        Ok(release)',
+    ),
+    "AnErasureLeavesTheIndex": (
+        "src/memory/indexed.rs",
+        "an_erasure_reaches_the_semantic_index",
+        'forgetting a subject leaves its embeddings in the semantic index, where a vector hidden from search is still reconstructible content',
+        '        self.tell(vec![Forgotten::Subject(subject.to_owned())])\n            .await?;',
+        '        let _ = Forgotten::Subject(subject.to_owned());',
+    ),
+    "AForgottenIdLeavesTheIndex": (
+        "src/memory/indexed.rs",
+        "an_erasure_reaches_the_semantic_index",
+        'forgetting one memory leaves its embedding in the semantic index, where a vector hidden from search is still reconstructible content',
+        '        self.tell(vec![Forgotten::Ids(vec![id.to_owned()])]).await',
+        '        Ok(())',
+    ),
+    "ACascadeLeavesTheIndex": (
+        "src/memory/indexed.rs",
+        "an_erasure_the_index_missed_is_delivered_by_the_next_one",
+        'a cascading erasure removes rows and never tells the index, so every derivative it erased keeps its embedding',
+        '        self.tell(forgotten).await?;\n        Ok(cascade)',
+        '        let _ = forgotten;\n        Ok(cascade)',
+    ),
+    "AnExpirySweepLeavesTheIndex": (
+        "src/memory/indexed.rs",
+        "the_expiry_sweep_reaches_the_semantic_index",
+        'the expiry sweep removes rows and never tells the index, so every expired memory keeps its embedding',
+        '        self.tell(forgotten).await?;\n        Ok(swept)',
+        '        let _ = forgotten;\n        Ok(swept)',
+    ),
+    "WhatTheIndexMissedIsDropped": (
+        "src/memory/indexed.rs",
+        "an_erasure_the_index_missed_is_delivered_by_the_next_one",
+        'an erasure the index refused is forgotten with the call, and since the rows are gone no retry finds it again, so the embedding stays for good',
+        '        let mut owed = self.owed.lock().await;',
+        '        let mut owed = Vec::new();',
+    ),
+    "TheSweepLeavesTheIndex": (
+        "src/runtime/executor.rs",
+        "the_expiry_sweep_reaches_the_semantic_index",
+        "the plane's memory is not wrapped when a semantic index is wired, so the expiry sweep erases items and leaves their vectors",
+        "                None => Arc::new(crate::memory::IndexedMemoryStore::new(\n                    Arc::clone(&memories),\n                    Arc::clone(&semantic.retriever),\n                )),",
+        "                None => memories,",
+    ),
+    "AnEmbeddingIsFree": (
+        "src/runtime/effects.rs",
+        "an_embedding_counts_against_the_token_ceiling",
+        'an embedding reports no spend, so no token or money ceiling binds on the calls a semantic tier makes',
+        '        output.usage.spend()',
+        '        crate::core::Spend::default()',
+    ),
+    "AnUnpricedEmbedderUnderAMoneyCeiling": (
+        "src/runtime/executor.rs",
+        "an_unpriced_embedder_is_refused_beside_a_money_ceiling",
+        'a plane caps money beside an embedder with no price, so every embedding reports no cost and the ceiling never binds on them',
+        '            if semantic.embedder.pricing().is_none() && self.states_a_money_ceiling() {',
+        '            if semantic.embedder.pricing().is_none() && self.states_a_money_ceiling() && false {',
+    ),
+    "AGeminiIntakeRefusalIsFree": (
+        "src/model/gemini.rs",
+        "gemini_a_stream_past_the_ceiling_reports_what_it_burned",
+        'a stream refused at the intake ceiling drops the usage its chunks already reported, so a token ceiling counts nothing for a call that generated',
+        '                return Err(super::wire::classify_intake(model, usage, &e));',
+        '                return Err(super::wire::classify_intake(model, Usage::default(), &e));',
+    ),
+    "AGeminiResultLosesItsCallId": (
+        "src/model/gemini.rs",
+        "gemini_answers_a_provider_identified_call_under_its_id",
+        'a function result omits the id of the call the provider issued, so parallel calls to one function cannot be told apart',
+        '                    if !is_synthesized_id(&e.call.name, &e.call.id) {',
+        '                    if false {',
+    ),
+    "TheAuthBatteryUnwindsWithIt": (
+        "src/testkit/conformance_auth.rs",
+        "the_auth_battery_records_a_panicking_authenticator",
+        "an authenticator that panics is not recorded, so the battery's doc claims a check it never makes",
+        '    if answer.is_err() {',
+        '    if false {',
+    ),
+    "TheAuthBatterySendsNoMalformedHeader": (
+        "src/testkit/conformance_auth.rs",
+        "the_auth_battery_records_a_panicking_authenticator",
+        'the battery never sends a malformed credential, so an authenticator that indexes a missing token passes it',
+        '    a_malformed_header_is_refused(auth, report).await;',
+        '    let _ = a_malformed_header_is_refused;',
+    ),
     "CedarBundleIgnoresRules": (
         "src/policy/cedar.rs",
         "the_digest_follows_the_policy_text",
@@ -1761,8 +2056,13 @@ pub struct Label {""",
             // request: 500 rather than 403, because 403 tells an operator to
             // fix their credentials and this one is fixed in the policy set.
             PolicyDecision::Malformed { reason } => {
+                // The engine's reason names rules, attributes and entity
+                // types; it is the operator's, and the caller gets a sentence.
                 tracing::error!(target: "agentplane::api", policy_error = true, reason, "the policy set could not be evaluated");
-                Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, reason))
+                Err(ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    POLICY_UNEVALUABLE.to_owned(),
+                ))
             }
         }""",
         """        let _ = decision;
@@ -1877,8 +2177,12 @@ pub struct Label {""",
         "the_caller_who_started_a_run_cannot_approve_it",
         "the caller who started a run is not excluded from deciding its tasks, so "
         "one person holding the approver role both asks and approves",
-        """            spec.excluded_actors.push(initiator);""",
-        """            let _ = initiator;""",
+        """        let parties = self
+            .initiator()
+            .await?
+            .into_iter()""",
+        """        let parties = None::<String>
+            .into_iter()""",
     ),
     "AnyRunMayDrawAnyAuthority": (
         "src/runtime/effects.rs",
@@ -1902,8 +2206,8 @@ pub struct Label {""",
         "a_tenant_mandate_is_drawn_only_by_the_planes_own_runs",
         "a run admitted for a chainless served caller is recorded like one the "
         "plane started for itself, so it draws on the tenant's mandates",
-        """                    matches!(acting_as, Acting::Nobody),""",
-        """                    false,""",
+        """            served_unchained: matches!(acting_as, Acting::Nobody),""",
+        """            served_unchained: false,""",
     ),
     "AnUntrustedAuthorityIdIsDrawn": (
         "src/runtime/ctx.rs",
@@ -2064,10 +2368,12 @@ pub struct Label {""",
         "an_argument_spelled_like_the_marker_is_approvable",
         "whether a proposal is withheld is read from its shape, so untrusted "
         "input spelling `{\"$sealed\": …}` makes a task nobody can approve",
-        """            && let Some(reason) = task.withheld""",
-        """            && let Some(reason) = task.withheld.or_else(|| {
-                crate::journal::payload::is_sealed(&task.justification.proposed_action)
-                    .then_some(crate::core::Withheld::Sealed)
+        """            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)""",
+        """            && let Some(reason) = current.as_ref().and_then(|task| {
+                task.withheld.or_else(|| {
+                    crate::journal::payload::is_sealed(&task.justification.proposed_action)
+                        .then_some(crate::core::Withheld::Sealed)
+                })
             })""",
     ),
     "ASealedRunsTerminalDecisionIsLost": (
@@ -2076,8 +2382,15 @@ pub struct Label {""",
         "a decision recorded on a terminal holding no key ring for a sealed run "
         "fails after the record, so a rejection that needed no proposal is "
         "reported lost",
-        """            Err(RuntimeError::NoProvider { .. } | RuntimeError::PayloadsSealed { .. }) => {""",
-        """            Err(RuntimeError::NoProvider { .. }) => {""",
+        """                RuntimeError::NoProvider { .. }
+                | RuntimeError::NoCaseStore { .. }
+                | RuntimeError::PayloadsSealed { .. },
+            ) => {
+                return Ok(Delivery::Buffered);""",
+        """                RuntimeError::NoProvider { .. }
+                | RuntimeError::NoCaseStore { .. },
+            ) => {
+                return Ok(Delivery::Buffered);""",
     ),
     "TheRenderingPassesInvisibleCodePoints": (
         "src/core/visible.rs",
@@ -2109,9 +2422,9 @@ pub struct Label {""",
         "a plane that cannot open a sealed proposal records an approval of it "
         "anyway, so a terminal with no key approves arguments nobody was shown",
         """        if decision.approved
-            && let Some(task) = tasks.task(id).await.map_err(RuntimeError::from_store)?""",
+            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)""",
         """        if false
-            && let Some(task) = tasks.task(id).await.map_err(RuntimeError::from_store)?""",
+            && let Some(reason) = current.as_ref().and_then(|task| task.withheld)""",
     ),
     "ACaseHistoryPageCannotSeePastItself": (
         "src/api/mod.rs",
@@ -2208,8 +2521,8 @@ pub struct Label {""",
         "src/store/redb.rs",
         "only_an_outside_checkpoint_detects_a_deletion",
         "a removed run still advances the tree position, so every later run's inclusion proof is off by one",
-        "                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    continue;\n                };\n                if run_id.value() == key {",
-        "                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    rank += 1;\n                    continue;\n                };\n                if run_id.value() == key {",
+        "                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    continue;\n                };\n                if let Some(slot) = wanted.get_mut(run_id.value()) {",
+        "                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    rank += 1;\n                    continue;\n                };\n                if let Some(slot) = wanted.get_mut(run_id.value()) {",
     ),
     "ConsistencyProofsAreVacuous": (
         "src/core/merkle.rs",
@@ -2647,15 +2960,8 @@ pub struct Label {""",
         "clean, so `agentplane validate` approves a document that can never "
         "assemble a plane — and the refusal arrives from whichever process "
         "first tried to build one, after the review it should have failed",
-        """        if self.spec.execution.is_some()
-            && self
-                .spec
-                .models
-                .as_ref()
-                .and_then(|m| m.privileged.as_ref())
-                .is_none()
-        {""",
-        """        if false {""",
+        "            .is_some_and(|e| e.kind != ExecutionKind::Call)",
+        "            .is_some_and(|_| false)",
     ),
     "AnUndeclaredCapabilityIsServed": (
         "src/runtime/executor.rs",
@@ -2782,8 +3088,8 @@ pub struct Label {""",
         "a declarative agent falls back to whatever driver is registered when "
         "the one its manifest names is absent, running the agent on a model its "
         "own declaration never mentioned",
-        "                let provider = self\n                    .providers\n                    .get(&model.provider)",
-        "                let provider = self\n                    .providers\n                    .values()\n                    .next()\n                    .map(|p| p)",
+        "        providers\n            .get(&model.provider)",
+        "        providers\n            .values()\n            .next()\n            .map(|p| p)",
     ),
     "AFencedCallerCanReleaseTheLease": (
         "src/store/redb.rs",
@@ -2927,7 +3233,7 @@ pub struct Label {""",
         "run that had changed hands a second ownership period wearing the "
         "number of its first, and quota settlement matches passes to spend by "
         "exactly that number",
-        """                        None => epoch_after_history(&w, key.as_str())?,""",
+        """                        None => epoch_after_history(&w, key.as_str(), upcaster.as_ref())?,""",
         """                        None => 1,""",
     ),
     "APostgresLeaseForgetsTheHistory": (
@@ -3001,13 +3307,13 @@ pub struct Label {""",
                 .take(usize::MAX)""",
     ),
     "ARecordArrivesWithoutItsEnvelope": (
-        "src/api/mod.rs",
+        "src/journal/view.rs",
         "a_runs_journal_is_readable_and_pages_from_a_cursor",
         "an operator surface serves a record's payload and drops the identity "
         "it belongs to, so a reader sees that an effect started and not which "
         "one, and cannot pair a start with its outcome",
-        """        "effect_key": r.effect_key().map(|k| k.to_string()),""",
-        """        "effect_key": Value::Null,""",
+        """        effect_key: r.effect_key().map(|k| k.to_string()),""",
+        """        effect_key: None,""",
     ),
     "AnErasedEffectLosesItsTarget": (
         "src/core/effect.rs",
@@ -3216,8 +3522,8 @@ pub struct Label {""",
         "the Postgres erasure of a claimed, undelivered message keeps its "
         "claim, so the recovery hands the run an emptied row or the message "
         "never reaches the dead-letter list",
-        "        let undelivered = claimed_by.is_none() || holds_payload;",
-        "        let undelivered = claimed_by.is_none() || (holds_payload && false);",
+        "        let undelivered = claimed_by.is_none() || standing;",
+        "        let undelivered = claimed_by.is_none() || (standing && false);",
     ),
     "AnErasedClaimKeepsItsWaitParked": (
         "src/store/redb_events.rs",
@@ -3236,8 +3542,11 @@ pub struct Label {""",
         "the same satisfied waiter — sequentially, no race required — and is "
         "parked under a claim nobody consumes, invisible to dead-lettering "
         "and to every listing an operator reads",
-        """                            for (ns, val, sub_kind, created) in retired {""",
-        """                            for (ns, val, sub_kind, created) in retired.into_iter().take(0) {""",
+        """                            w.open_table(PARKED)
+                                .map_err(|e| be(&e))?
+                                .insert((tenant.as_str(), run.as_str(), effect.as_str()), ts(at))
+                                .map_err(|e| be(&e))?;""",
+        """                            let _ = at;""",
     ),
     "AParkedWaitIsMatchedAgain": (
         "src/store/redb_events.rs",
@@ -3284,8 +3593,8 @@ pub struct Label {""",
         "counterparty's retry is answered Duplicate, the resumed wait finds "
         "nothing, and a message that arrived in time is lost to a deadline "
         "breach",
-        "                        if row.0 == kind && (row.3 == 0 || row.7 == run) && row.4 == 0 && !erased {",
-        "                        if row.0 == kind && row.3 == 0 && row.4 == 0 && !erased {",
+        "                            && ((row.3 == 0 && !parked_here) || own_claim)",
+        "                            && (row.3 == 0 && !parked_here)",
     ),
     "ARevokedDrawReadsAsADoubt": (
         "src/runtime/effects.rs",
@@ -3326,12 +3635,371 @@ pub struct Label {""",
         "        if runtime.policy().is_none() {",
         "        if runtime.policy().is_none() && false {",
     ),
+    "TheMcpListenerSkipsTheAuthenticator": (
+        "src/tools/serve_http.rs",
+        "an_unauthenticated_mcp_request_is_refused_and_admits_nothing",
+        "the HTTP listener lets a request with no valid credential through as "
+        "somebody, so anyone who can reach the port lists and calls tools",
+        "    let Some(caller) = caller else {",
+        "    let Some(caller) = caller.or_else(|| Some(crate::api::Caller::new(\"anyone\", vec![]))) else {",
+    ),
+    "AnHttpCallIsAdmittedAsNobody": (
+        "src/tools/serve.rs",
+        "an_http_tool_call_is_admitted_as_its_caller",
+        "a call over HTTP is admitted under no chain and names no admitter, so "
+        "the journal cannot say who started the run and the caller's own "
+        "authority never bounds it",
+        """            Some(caller) => RunTerms::default()
+                .once(&key)
+                .served(caller.acting_as.clone())
+                .admitted_by(&caller.actor),""",
+        """            Some(_) => RunTerms::default().once(&key).served(None),""",
+    ),
+    "AnHttpCallIsKeyedAsNobody": (
+        "src/tools/serve.rs",
+        "an_http_tool_call_is_admitted_as_its_caller",
+        "every HTTP caller's admissions are keyed under the anonymous stdio "
+        "source, so ownership of a task cannot be read back from the run",
+        """                admission: format!("{CALLER_NAMESPACE}{}", caller.source),""",
+        """                admission: ADMISSION_SOURCE.to_owned(),""",
+    ),
+    "AnyCallerReadsAnHttpTask": (
+        "src/tools/serve.rs",
+        "another_callers_task_is_no_such_task",
+        "any authenticated caller reads and cancels any other caller's task by "
+        "its id, because ownership is checked against the surface, not the caller",
+        "            != Some(asker.admission.as_str())",
+        "            .is_none_or(|s| !s.starts_with(\"mcp/\"))",
+    ),
+    "TheHttpKeyIsScopedToTheSession": (
+        "src/tools/serve.rs",
+        "an_http_retry_with_the_same_key_is_one_run",
+        "an HTTP caller's idempotency key is scoped to the transport session, "
+        "which is fresh per request, so every retry is a second run",
+        """            Some(key) if asker.caller.is_some() => format!("host:{key}"),""",
+        """            Some(key) if asker.caller.is_some() => format!("host:{}/{key}", self.session),""",
+    ),
+    "TheMcpGateAlwaysPermits": (
+        "src/tools/serve.rs",
+        "a_tool_call_the_policy_does_not_permit_is_declined_and_admits_nothing",
+        "no MCP action is asked of policy, so a caller the rules refuse lists, "
+        "calls and reads whatever is served",
+        "        let Some(caller) = asker.caller.as_ref() else {",
+        "        let Some(caller) = asker.caller.as_ref().filter(|_| false) else {",
+    ),
+    "OriginValidationIsLeftAtTheCrateDefault": (
+        "src/api/rebinding.rs",
+        "a_foreign_origin_is_refused_before_authentication",
+        "a request carrying a foreign Origin reaches the credential check, so a "
+        "browser page on another site can drive the listener through DNS "
+        "rebinding with whatever credential the browser holds",
+        "    if let Some(origin) = origin\n",
+        "    if let Some(origin) = origin.filter(|_| false)\n",
+    ),
+    "AForeignHostIsServed": (
+        "src/api/rebinding.rs",
+        "a_foreign_origin_is_refused_before_authentication",
+        "a request naming a foreign Host reaches the credential check — the "
+        "DNS-rebinding shape the Host allow-list exists to refuse",
+        "    if !host\n        .as_deref()",
+        "    if false && !host\n        .as_deref()",
+    ),
+    "TheServerSpeaksOneRevision": (
+        "src/tools/serve.rs",
+        "a_host_without_tasks_is_offered_only_tools_that_cannot_suspend",
+        "the served revisions drift from the spoken ones, and every host on "
+        "2025-11-25 — most frameworks — is refused at the handshake",
+        "        Cow::Owned(crate::tools::McpClient::SPOKEN_REVISIONS.to_vec())",
+        "        Cow::Owned(vec![crate::tools::MCP_REVISION])",
+    ),
+    "EverythingIsSafeWithoutTasks": (
+        "src/manifest/mod.rs",
+        "a_host_without_tasks_is_offered_only_tools_that_cannot_suspend",
+        "every tool is judged unable to suspend, so a host that cannot hold a "
+        "task is offered calls that will wait on a person with no way to say so",
+        "    pub fn may_suspend(&self, is_peer: impl Fn(&str) -> bool) -> bool {",
+        "    pub fn may_suspend(&self, is_peer: impl Fn(&str) -> bool) -> bool {\n        if !self.spec.tools.is_empty() || self.spec.tools.is_empty() { return false; }",
+    ),
+    "AMaySuspendCallIsAdmittedWithoutTasks": (
+        "src/tools/serve.rs",
+        "a_host_without_tasks_is_offered_only_tools_that_cannot_suspend",
+        "a host without the Tasks extension that names a tool it was not "
+        "offered gets a run admitted anyway",
+        "        if served.may_suspend && !tasks {",
+        "        if false && served.may_suspend && !tasks {",
+    ),
+    "ASuspensionWithoutTasksReadsAsSuccess": (
+        "src/tools/serve.rs",
+        "a_suspension_for_a_host_without_tasks_is_an_error_naming_the_run",
+        "a run that waits for a host that cannot hold a task is answered as a "
+        "success, so the host reports a call that has not happened",
+        "fn waiting_without_tasks(run: RunId) -> CallToolResult {",
+        "fn waiting_without_tasks(run: RunId) -> CallToolResult {\n    if run.to_string().is_empty() || !run.to_string().is_empty() { return CallToolResult::structured(serde_json::json!({ \"run\": run.to_string() })); }",
+    ),
+    "ACallAgentAsksAModel": (
+        "src/runtime/declarative.rs",
+        "a_call_agent_dispatches_its_one_grant_and_no_model",
+        "a `call` agent is run as a completion, so it needs a model it does not "
+        "declare and never dispatches its one grant",
+        "        match self.kind {\n            ExecutionKind::Completion => {",
+        "        match if self.kind == ExecutionKind::Call { ExecutionKind::Completion } else { self.kind } {\n            ExecutionKind::Completion => {",
+    ),
+    "ACallSkipsItsInputSchema": (
+        "src/runtime/declarative.rs",
+        "a_call_whose_input_fails_its_schema_performs_nothing",
+        "a `call` dispatches input its declared `spec.input` refuses, so the "
+        "reviewed argument shape is offered and enforced by nobody",
+        "        if let Err(detail) = crate::model::validate_schema(&schema, input.peek()) {",
+        "        if let Err(detail) = crate::model::validate_schema(&json!({}), input.peek()) {",
+    ),
+    "ACallSkipsItsToolsDeclaration": (
+        "src/runtime/declarative.rs",
+        "a_call_holds_its_arguments_to_the_tools_declaration",
+        "a `call` holds its input to `spec.input` only, so a caller adds an "
+        "argument the tool's reviewed declaration leaves out — a fee waiver on "
+        "a transfer — and it is dispatched as written",
+        "                if let Err(detail) = crate::model::validate_schema(declared, input.peek()) {",
+        "                if let Err(detail) = crate::model::validate_schema(&json!({}), input.peek()) {",
+    ),
+    "ACallAcceptsAnOpenInput": (
+        "src/manifest/mod.rs",
+        "a_call_agent_with_an_open_input_is_refused",
+        "a `call` agent parses with an open `spec.input`, so its caller-facing "
+        "shape admits arguments nobody reviewed and validating against it "
+        "refuses none of them",
+        """            Self::refuse_open_objects(&input.schema, "spec.input.schema")""",
+        """            Self::refuse_open_objects(&serde_json::Value::Null, "spec.input.schema")""",
+    ),
+    # ── The dev page ────────────────────────────────────────────────────────
+    "ADevRouteSkipsTheToken": (
+        "src/api/dev.rs",
+        "every_dev_route_refuses_a_request_without_the_token",
+        "a dev route answers a request that carries no token, so any page the "
+        "author's browser opens starts runs and exports the store",
+        "        let caller = self.auth.authenticate(headers).await?;",
+        "        let caller = crate::api::Caller::new(\"dev:anyone\", Vec::new()).in_tenant(crate::core::TenantId::new(TENANT).expect(\"a tenant\"));",
+    ),
+    "TheDevPageServesAForeignHost": (
+        "src/api/dev.rs",
+        "a_request_naming_a_foreign_host_is_refused",
+        "the dev page's own allow-list names a host other than loopback, so a "
+        "hostile name rebound to 127.0.0.1 reaches its token check from "
+        "another site",
+        "    let authorities = [\n        format!(\"127.0.0.1:{port}\"),",
+        "    let authorities = [\n        format!(\"evil.example:{port}\"),\n        format!(\"127.0.0.1:{port}\"),",
+    ),
+    "ACrossOriginPostIsServed": (
+        "src/api/rebinding.rs",
+        "a_cross_origin_post_is_refused",
+        "a dev request that changes state is served without naming its Origin, "
+        "so the page's one check against a cross-site write is the token alone",
+        "    if guard.origin_on_writes && origin.is_none() && !request.method().is_safe() {",
+        "    if false && guard.origin_on_writes && origin.is_none() && !request.method().is_safe() {",
+    ),
+    "TheFallbackCarriesNoPolicy": (
+        "src/api/dev.rs",
+        "every_dev_response_carries_the_content_security_policy",
+        "the security headers wrap matched routes only, so the fallback's "
+        "answer to a path no route serves carries no content security policy",
+        "        .layer(axum::middleware::from_fn(security_headers))",
+        "        .route_layer(axum::middleware::from_fn(security_headers))",
+    ),
+    "TheDevListenerBindsEverywhere": (
+        "src/bin/agentplane.rs",
+        "the_dev_listener_binds_loopback_only",
+        "the dev page listens on every interface, so another host on the "
+        "author's network reaches a page that starts runs",
+        "    tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))",
+        "    tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))",
+    ),
+    "ThePageParsesHtml": (
+        "src/api/dev/app.js",
+        "the_dev_page_script_inserts_text_only",
+        "the dev page inserts plane data through an HTML sink: under the "
+        "page's policy Trusted Types make it throw and the page renders "
+        "nothing, and with the policy gone a recorded `<img onerror>` becomes "
+        "an element whose handler only script-src still blocks",
+        "  if (text !== undefined && text !== null) node.textContent = String(text);",
+        "  if (text !== undefined && text !== null) node.innerHTML = String(text);",
+    ),
+    "AnUnmarkedStoreIsOpened": (
+        "src/bin/agentplane.rs",
+        "dev_refuses_a_store_it_did_not_create",
+        "dev opens a directory it did not create, so a deployment's store is "
+        "one a page that starts runs over HTTP writes to",
+        "    } else if !ours {",
+        "    } else if false {",
+    ),
+    "AScratchLinkIsFollowed": (
+        "src/bin/agentplane.rs",
+        "dev_refuses_a_store_it_did_not_create",
+        "dev follows a symbolic link named as --scratch, so a link into any "
+        "marked-looking directory is a store a page that starts runs writes to",
+        "    if let Ok(found) = kind(dir) {",
+        "    if let Ok(found) = std::fs::metadata(dir).map(|m| m.file_type()) {",
+    ),
+    "ALinkedDevStoreIsOpened": (
+        "src/bin/agentplane.rs",
+        "dev_refuses_a_store_it_did_not_create",
+        "dev opens a dev.redb that is a link, so a marked directory points the "
+        "page's runs at a deployment's store",
+        "    } else if kind(&dir.join(DEV_STORE)).is_ok_and(|k| !k.is_file()) {",
+        "    } else if false {",
+    ),
+    "AnyMarkerIsTrusted": (
+        "src/bin/agentplane.rs",
+        "dev_refuses_a_store_it_did_not_create",
+        "dev trusts any file named as its marker, so a directory somebody else "
+        "marked is one it writes to",
+        "        && std::fs::read(&marker).is_ok_and(|bytes| bytes == DEV_MARKER_TEXT.as_bytes());",
+        "        && std::fs::read(&marker).is_ok();",
+    ),
+    "TheActingAsChainIsNotTheSavedFiles": (
+        "src/bin/agentplane/dev.rs",
+        "a_rebuild_scopes_the_acting_as_chain_to_the_saved_file",
+        "the --acting-as chain is scoped to less than the file the plane was "
+        "rebuilt from, so a capability added on save is refused as out of "
+        "scope until the process restarts",
+        "            .map(|subject| super::chain_for(subject, manifests, &wiring.peer))",
+        "            .map(|subject| super::chain_for(subject, &manifests[..1], &wiring.peer))",
+    ),
+    "TheTimelineShowsHiddenCharactersRaw": (
+        "src/api/dev.rs",
+        "the_dev_timeline_escapes_hidden_characters",
+        "the page's timeline serves records unescaped, so a bidi override or "
+        "zero-width character recorded by a model reorders or hides what the "
+        "author reads",
+        "        *inner = escape_strings(inner.take(), &mut escaped);",
+        "        *inner = inner.take();",
+    ),
+    "TheTimelineShowsAKeyRaw": (
+        "src/api/dev.rs",
+        "the_dev_timeline_escapes_hidden_characters",
+        "the page's timeline escapes values but not object keys, so a hidden "
+        "character in a recorded key reaches the author raw",
+        "                    let (key, hit) = crate::core::visible::escape(&key);",
+        "                    let (key, hit) = (key, false);",
+    ),
+    "AnUnknownRunReadFromLaterExists": (
+        "src/bin/agentplane.rs",
+        "history_prints_a_hostile_record_escaped",
+        "`history --from N` on a run the store does not hold prints nothing "
+        "and exits 0, so a mistyped run id reads as one that has caught up",
+        "        && (start == 1\n            || journal",
+        "        && (start == 1\n            || false && journal",
+    ),
+    "APublishedImageServesTheDevPage": (
+        ".github/workflows/release.yml",
+        "no_published_image_enables_dev",
+        "a published image is built with `dev`, so a deployment ships the page "
+        "that starts runs over HTTP",
+        "            features: cli\n",
+        "            features: cli,dev\n",
+    ),
+    "LiveTransportsNeedNoConsent": (
+        "src/bin/agentplane.rs",
+        "dev_refuses_live_transports_without_consent",
+        "dev wires real tool servers and peers unasked, so an approval on the "
+        "page performs a real effect on a system nobody said was the author's",
+        "    if !opts.allow_live && (!opts.mcp.is_empty() || !opts.peer.is_empty()) {",
+        "    if false && !opts.allow_live && (!opts.mcp.is_empty() || !opts.peer.is_empty()) {",
+    ),
+    "TheDevPolicyPermitsAnyone": (
+        "src/api/dev.rs",
+        "the_dev_policy_permits_only_its_own_actor",
+        "the dev engine permits any actor on tenant dev, so any credential "
+        "that reaches the plane decides its tasks",
+        "            if request.principal == self.actor && tenant == Some(TENANT) {",
+        "            if tenant == Some(TENANT) {",
+    ),
+    "TheTimelinePrintsRawText": (
+        "src/bin/agentplane.rs",
+        "history_prints_a_hostile_record_escaped",
+        "history prints recorded strings raw, so a bidi override or an escape "
+        "sequence in a run's input drives the terminal reading it",
+        "    agentplane::core::visible::escape(&line).0",
+        "    line",
+    ),
+    "AnyCallerUsesAnHttpSession": (
+        "src/tools/serve_http.rs",
+        "another_callers_session_is_no_session",
+        "a 2025-11-25 session answers whoever names its id, so another caller "
+        "replays its stream, posts into it, or closes it",
+        "        && guard.sessions.owner(id).is_some_and(|owner| owner != actor)",
+        "        && guard.sessions.owner(id).is_some_and(|_| false)",
+    ),
+    "HttpSessionsAreUnbounded": (
+        "src/tools/serve_http.rs",
+        "a_caller_holds_a_bounded_number_of_sessions",
+        "one credential opens sessions without bound, each server memory held "
+        "until it idles out, so a caller spends the plane's memory at will",
+        "        if held >= MAX_SESSIONS_PER_CALLER {",
+        "        if held >= usize::MAX {",
+    ),
+    "AnUnguardedHttpRequestIsTheStdioHost": (
+        "src/tools/serve.rs",
+        "a_catalogue_mounted_over_http_without_its_guard_admits_nothing",
+        "a catalogue mounted over HTTP without its guard treats every request "
+        "as the anonymous stdio host, so anyone who reaches the port calls "
+        "tools with no policy asked",
+        "        if self.authenticated || over_http {",
+        "        if self.authenticated || (over_http && false) {",
+    ),
+    "OneKeyServesEveryTool": (
+        "src/tools/serve.rs",
+        "one_key_sent_to_two_tools_is_two_calls",
+        "an idempotency key is not bound to the tool, so the same key sent to a "
+        "second tool is answered with a replay of the first tool's run",
+        "        let id = crate::core::origin_key(capability, &id);",
+        "        let id = crate::core::origin_key(&capability[..0], &id);",
+    ),
+    "APromptIsListedPerCapability": (
+        "src/tools/serve.rs",
+        "an_agent_serving_two_capabilities_is_one_prompt",
+        "an agent serving two capabilities is listed as two prompts under one "
+        "name, the same reviewed instruction offered twice",
+        "                    .filter(|s| listed.insert(s.agent.clone()))",
+        "                    .filter(|s| listed.insert(s.capability.clone()))",
+    ),
+    "McpAgentServesEveryAgent": (
+        "src/bin/agentplane.rs",
+        "mcp_agent_serves_only_the_agents_it_names",
+        "`--mcp-agent` selects nothing, so one agent without `spec.input` in "
+        "the file still fails the whole MCP listener at startup",
+        "        .filter(|m| named.contains(&m.metadata.name))",
+        "        .filter(|_| true)",
+    ),
+    "ServedInputIsTrusted": (
+        "src/tools/serve.rs",
+        "a_served_caller_cannot_fill_a_trusted_field",
+        "a served caller's arguments arrive trusted, so they fill fields a "
+        "reviewer reserved for trusted input and the field gate admits anyone",
+        """        let input = Tainted::from_source(
+            serde_json::Value::Object(request.arguments.unwrap_or_default()),
+            SourceId::new(asker.input.clone()),
+        );""",
+        """        let input = Tainted::trusted(serde_json::Value::Object(
+            request.arguments.unwrap_or_default(),
+        ));""",
+    ),
+    "ACallMayDeclareAnUngatedMutation": (
+        "src/manifest/mod.rs",
+        "a_call_with_an_ungated_mutating_grant_is_refused",
+        "a `call` agent's mutating grant with no field rules parses, and every "
+        "served call to it is refused by the taint gate — a grant that reads as "
+        "a capability and is decoration",
+        """        if !matches!(
+            execution.kind,
+            ExecutionKind::ToolCalling | ExecutionKind::Call
+        ) {""",
+        """        if !matches!(execution.kind, ExecutionKind::ToolCalling) {""",
+    ),
     "AnMcpTaskIdReachesAnyRun": (
         "src/tools/serve.rs",
         "a_run_this_surface_did_not_admit_is_no_task_of_its_own",
         "tasks/get and tasks/cancel act on whatever run the id names, so a host "
         "reads and stops the embedder's runs and other surfaces' tasks",
-        "            != Some(ADMISSION_SOURCE)",
+        "            != Some(asker.admission.as_str())",
         "            == Some(\"nobody\")",
     ),
     "AnMcpRetryIsASecondRun": (
@@ -3339,8 +4007,8 @@ pub struct Label {""",
         "a_retried_call_with_the_same_key_is_one_run",
         "tools/call admits under no key, so a host that resends a call after "
         "losing the response runs the agent twice",
-        "        let terms = RunTerms::default().once(&key).served(None);",
-        "        let terms = RunTerms::default().served(None);",
+        "            None => RunTerms::default().once(&key).served(None),",
+        "            None => RunTerms::default().served(None),",
     ),
     "AnMcpCloneSharesItsSession": (
         "src/tools/serve.rs",
@@ -3358,8 +4026,8 @@ pub struct Label {""",
         "two_sessions_with_the_same_request_id_and_key_are_two_runs",
         "a host's idempotency key is honoured across sessions, so any host that "
         "guesses another's key is handed that host's run",
-        """            |key| format!("host:{}/{key}", self.session),""",
-        """            |key| format!("host:{key}"),""",
+        """            Some(key) => format!("host:{}/{key}", self.session),""",
+        """            Some(key) => format!("host:{key}"),""",
     ),
     "ACompletedMcpTaskLosesItsResult": (
         "src/tools/serve.rs",
@@ -3785,6 +4453,30 @@ pub struct Label {""",
     ),
 
     # ── Wire drivers ────────────────────────────────────────────────────────
+    "AnUnreportedEmbeddingIsFree": (
+        "src/model/embeddings.rs",
+        "a_priced_reply_without_a_token_count_is_refused",
+        "a priced embedder whose reply reports no input tokens meters the call "
+        "as zero, so it passes a money ceiling for free",
+        "        (None, None) => 0,",
+        "        (None, _) => 0,",
+    ),
+    "OpenAiEmbeddingUsageIgnoresPricing": (
+        "src/model/embeddings.rs",
+        "a_priced_embedder_refuses_a_reply_without_usage",
+        "the OpenAI-wire embedder meters as if unpriced, so a reply with no "
+        "usage costs nothing against a money ceiling",
+        "                reply.usage.and_then(|u| u.prompt_tokens),\n                self.pricing,",
+        "                reply.usage.and_then(|u| u.prompt_tokens),\n                None,",
+    ),
+    "GeminiEmbeddingUsageIgnoresPricing": (
+        "src/model/embeddings.rs",
+        "a_priced_embedder_refuses_a_reply_without_usage",
+        "the Gemini embedder meters as if unpriced, so a reply with no "
+        "usageMetadata costs nothing against a money ceiling",
+        "            usage: metered(tokens, self.pricing, &url)?,",
+        "            usage: metered(tokens, None, &url)?,",
+    ),
     "ATruncatedVectorStaysUnnormalised": (
         "src/model/embeddings.rs",
         "gemini_embeds_a_query_and_renormalises_a_truncated_vector",
@@ -3954,16 +4646,16 @@ pub struct Label {""",
         "a panel that failed to reach its threshold reports whichever side had "
         "more votes, turning 'we do not know' into a decision",
         """        if tally.passed >= self.need {
-            return Outcome::Reached(Verdict::Pass, tally);
+            return Ok(PanelOutcome::Reached(Verdict::Pass, tally));
         }
         if tally.failed >= self.need {
-            return Outcome::Reached(Verdict::Fail, tally);
+            return Ok(PanelOutcome::Reached(Verdict::Fail, tally));
         }""",
         """        if tally.passed >= self.need || tally.passed > tally.failed {
-            return Outcome::Reached(Verdict::Pass, tally);
+            return Ok(PanelOutcome::Reached(Verdict::Pass, tally));
         }
         if tally.failed >= self.need {
-            return Outcome::Reached(Verdict::Fail, tally);
+            return Ok(PanelOutcome::Reached(Verdict::Fail, tally));
         }""",
     ),
     "IdenticalJudgesArePermitted": (
@@ -4346,10 +5038,11 @@ pub struct Label {""",
             .lock()
             .expect("budget mutex")
             .admit_policy_check()
+            && !undoing
         {
             return Err(StepError::Budget(exceeded));
         }''',
-        "        let _ = &self.ledger;",
+        "        let _ = (&self.ledger, undoing);",
     ),
     # Streaming exists for exactly one reason — a severed call can still say what
     # it burned — and every mutation below silently restores the behaviour that
@@ -5088,8 +5781,8 @@ pub struct Label {""",
         "compaction does not bound what the summarising model may be shown, so "
         "summarising becomes the route by which confidential memories reach a "
         "model that may not see them — while looking like housekeeping",
-        "                crate::model::ModelCall::new(provider, model, value)\n                    .with_max_sensitivity(max_sensitivity)",
-        "                crate::model::ModelCall::new(provider, model, value)\n                    .with_max_sensitivity(crate::core::Sensitivity::Secret)",
+        "                    .observed_by(stream.clone())\n                    .with_max_sensitivity(max_sensitivity)",
+        "                    .observed_by(stream.clone())\n                    .with_max_sensitivity(crate::core::Sensitivity::Secret)",
     ),
     "ASummaryForgetsWhatItWasMadeFrom": (
         "src/store/redb_memory.rs",
@@ -5344,8 +6037,8 @@ pub struct Label {""",
         "its ceiling mid-group cannot release the hold it already placed — a "
         "charged card and no order, reached through the budget rather than "
         "through a bug",
-        "        if !self.phase.is_forward() || self.reversing {",
-        "        if !self.phase.is_forward() {",
+        "        !self.phase.is_forward() || self.reversing",
+        "        !self.phase.is_forward()",
     ),
     "AReportedFailureIsCalledSuccess": (
         "src/runtime/executor.rs",
@@ -5372,7 +6065,7 @@ pub struct Label {""",
         "authorization are two graphs that only meet in checks written in this "
         "crate — a deployment can say 'amounts over 5000 need approval' but not "
         "'not with data that passed through that peer'",
-        "    if let Some(label) = label {\n        context[\"label\"] = serde_json::to_value(label).unwrap_or(Value::Null);\n    }",
+        "    if let Some(label) = label {\n        context[\"label\"] = serde_json::to_value(label.for_policy()).unwrap_or(Value::Null);\n    }",
         "    let _ = label;",
     ),
     "ASinkBoundMemberIsAcceptedSilently": (
@@ -5391,12 +6084,12 @@ pub struct Label {""",
         "the instruction slot is not protected, so text that arrived as *data* "
         "can be handed to the model as the order it reasons under — and the "
         "agent follows instructions written by whoever authored the page it read",
-        "        self.protected = if self.prompt.get(\"system\").is_some_and(|s| !s.is_null()) {\n"
+        "        if prompt.get(\"system\").is_some_and(|s| !s.is_null()) {\n"
         "            vec![crate::core::ProtectedField::trusted(\"/system\")]\n"
         "        } else {\n"
         "            Vec::new()\n"
-        "        };",
-        "        self.protected = Vec::new();",
+        "        }",
+        "        let _ = prompt;\n        Vec::new()",
     ),
     "ARecalledMemoryEntersThePromptTrusted": (
         "src/runtime/declarative.rs",
@@ -5660,6 +6353,15 @@ pub struct Label {""",
         "    if state == DeadlineState::Warned.as_str() {",
         "    if false {",
     ),
+    "AConditionalReleaseIgnoresTheReadHold": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a release naming the hold it read removes whatever stands, so a hold "
+        "placed since that read is lifted under a record naming the old one and "
+        "the matter it preserves is open to erasure",
+        "                        same.then_some(at)",
+        "                        Some(at)",
+    ),
     "ABreachedObligationIsNotListed": (
         "src/store/redb_cases.rs",
         "redb_satisfies_the_case_layer_contracts",
@@ -5810,7 +6512,7 @@ pub struct Label {""",
         "record it, so the decision cannot be re-derived by anyone who was not "
         "there — an auditor must take the runtime's word that the right label "
         "was presented",
-        "                    outbound_label: outbound.cloned(),",
+        "                    outbound_label: outbound.map(|o| o.label.clone()),",
         "                    outbound_label: None,",
     ),
     "InPlaneHandoffIsUngoverned": (
@@ -5873,9 +6575,10 @@ pub struct Label {""",
         "quarantines itself with nothing on the record explaining why",
         "        self.sink_with(&arguments, |value| crate::runtime::effects::Embed {",
         "        {\n"
-        "            let vector = embedder.embed(&plain).await.map_err(StepError::Store)?;\n"
+        "            let crate::memory::Embedded { vector, usage } =\n"
+        "                embedder.embed(&plain).await.map_err(StepError::Store)?;\n"
         "            let revision = embedder.revision();\n"
-        "            return Ok(Tainted::trusted(crate::memory::Embedding { vector, revision }));\n"
+        "            return Ok(Tainted::trusted(crate::memory::Embedding { vector, revision, usage }));\n"
         "        }\n"
         "        #[allow(unreachable_code)]\n"
         "        self.sink_with(&arguments, |value| crate::runtime::effects::Embed {",
@@ -5955,8 +6658,8 @@ pub struct Label {""",
         "a grant naming a dry run opens its approval task without one, so a "
         "reviewer approves the instruction while the file says they were shown "
         "its consequences",
-        "                    let mut task = spec.approve_call(&reference, &asked.arguments);",
-        "                    #[allow(unused_mut)]\n                    let mut task = spec.approve_call(&reference, &asked.arguments);\n                    let grant = &crate::manifest::ToolGrant { preview: None, ..grant.clone() };",
+        "                    approved = reach;\n                    // Consequences beside the instruction, when the grant names",
+        "                    approved = reach;\n                    let grant = &crate::manifest::ToolGrant { preview: None, ..grant.clone() };\n                    // Consequences beside the instruction, when the grant names",
     ),
     "AHighImpactCallSkipsItsApproval": (
         "src/runtime/declarative.rs",
@@ -5964,9 +6667,9 @@ pub struct Label {""",
         "a tool grant asking for a human is dispatched without asking, so the "
         "mutation happens and the only review left is of the answer — which "
         "arrives after the money moved",
-        """                // not the answer they will produce.
+        """                let mut approved: Option<crate::core::Reach> = None;
                 if grant.requires_approval {""",
-        """                // not the answer they will produce.
+        """                let mut approved: Option<crate::core::Reach> = None;
                 if false && grant.requires_approval {""",
     ),
     "APlannedCallSkipsItsApproval": (
@@ -5974,10 +6677,10 @@ pub struct Label {""",
         "a_planned_step_waits_for_its_approval",
         "a planned step whose grant asks for a human dispatches without asking "
         "— the plan was reviewed by nobody and the call by nobody either",
-        """                    // report it to.
-                    if grant.requires_approval {""",
-        """                    // report it to.
-                    if false && grant.requires_approval {""",
+        """    let mut approved: Option<crate::core::Reach> = None;
+    if grant.requires_approval {""",
+        """    let mut approved: Option<crate::core::Reach> = None;
+    if false && grant.requires_approval {""",
     ),
     "TheAuditIsSilentAboutReleases": (
         "src/audit.rs",
@@ -7076,34 +7779,26 @@ pub struct Label {""",
         "rather than the caller's, so a withdrawn credential is compared with "
         "the operator's own subject and never matches — a refusal that does not "
         "happen, writing no record and raising no error",
-        """                terms
-                    .acting_as
-                    .resolve(self.identity.as_ref())
-                    .map(|c| c.subject().id.as_str()),""",
-        """                self.identity.as_ref().map(|c| c.subject().id.as_str()),""",
+        """            terms.acting_as.resolve(self.identity.as_ref()),""",
+        """            self.identity.as_ref(),""",
     ),
     "AnAdmittedRunSkipsItsQuota": (
         "src/runtime/executor.rs",
         "a_refused_run_writes_nothing",
         "admission never consults the tenant's ceiling, so a caller that can "
         "start runs can start a thousand of them, each within its own budget",
-        """        let quota = match Box::pin(
-            self.check_quota(
-                run,
-                governed_by.as_ref(),
-                // **The chain this run acts under, not the plane's.** A served
-                // surface admits each run under its caller's chain, so reading
-                // the plane's here would check a withdrawal against the
-                // operator's own subject and never match the caller's — a
-                // refusal that does not happen, which leaves no trace anywhere.
-                terms
-                    .acting_as
-                    .resolve(self.identity.as_ref())
-                    .map(|c| c.subject().id.as_str()),
-                now_for_admission(),
-                (&budget, reserved_width(&budget, &plan)),
-            ),
-        )
+        """        let quota = match Box::pin(self.check_quota(
+            run,
+            governed_by.as_ref(),
+            // **The chain this run acts under, not the plane's.** A served
+            // surface admits each run under its caller's chain, so reading
+            // the plane's here would check a withdrawal against the
+            // operator's own subject and never match the caller's — a
+            // refusal that does not happen, which leaves no trace anywhere.
+            terms.acting_as.resolve(self.identity.as_ref()),
+            now_for_admission(),
+            (&budget, reserved_width(&budget, &plan)),
+        ))
         .await
         {""",
         "        let quota = match Ok::<_, RuntimeError>(QuotaPass::disabled()) {",
@@ -7887,10 +8582,10 @@ pub struct Label {""",
         "sealed into that tenant's journal, so the designed exception is "
         "indistinguishable from the breach it is meant to be",
         """        self.store
-            .seal(run, epoch, BREAK_GLASS_OUTCOME)
+            .seal(run, epoch, outcome)
             .await
             .map_err(RuntimeError::from_store)?;""",
-        """        let _ = BREAK_GLASS_OUTCOME;""",
+        """        let _ = (outcome, epoch);""",
     ),
     "AnUnexplainedCrossingIsRecorded": (
         "src/runtime/executor.rs",
@@ -8164,23 +8859,113 @@ pub struct Label {""",
         "claimed hash, so an edited record is rebuilt into the store — which "
         "re-derives every hash from what it is handed — before anything "
         "compares the result with the export",
-        """    crate::journal::Record::from_stored_signed(raw.to_vec(), prev, claimed, None)""",
-        """    crate::journal::Record::from_stored_signed(raw.to_vec(), prev, crate::core::Digest::chain(prev, raw), None)""",
+        """    crate::journal::Record::from_stored_with(upcaster, raw.to_vec(), prev, claimed, None).map_err(""",
+        """    crate::journal::Record::from_stored_with(upcaster, raw.to_vec(), prev, crate::core::Digest::chain(prev, raw), None).map_err(""",
     ),
     "ARestoreRewritesAForeignVersion": (
         "src/export.rs",
         "a_record_at_a_foreign_version_refuses_to_restore_before_any_write",
-        "a restore replays a record at a version this build does not write, "
-        "and `append` stamps this build's version on it — a different body and "
-        "a different hash, written into the store before anything compares "
-        "the result with the export",
-        """    crate::journal::Record::from_stored_signed(raw.to_vec(), prev, claimed, None)
-        .map(|record| record.body)""",
+        "a restore replays a record at a version no upcaster reaches, so the "
+        "store is handed bytes it cannot read back — written before anything "
+        "compares the result with the export",
+        """    crate::journal::Record::from_stored_with(upcaster, raw.to_vec(), prev, claimed, None).map_err(""",
         """    serde_json::from_slice::<crate::journal::RecordBody>(raw)
-        .map_err(|e| {
-            let _ = (prev, claimed);
-            StoreError::Encoding(e)
-        })""",
+        .map_err(StoreError::Encoding)
+        .and_then(|body| {
+            let _ = (claimed, upcaster);
+            crate::journal::Record::seal(body, prev)
+        })
+        .map_err(""",
+    ),
+    "RedbReadsThroughTheIdentity": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the embedded store reads every record through this build's own shapes "
+        "whatever upcaster it was built with, so the first shape change makes a "
+        "store refuse the history it holds — a migration that is also the "
+        "mechanism's first exercise",
+        """        Record::from_stored_with(
+            upcaster,
+            self.body,""",
+        """        Record::from_stored_with(
+            {
+                let _ = upcaster;
+                &crate::journal::Identity
+            },
+            self.body,""",
+    ),
+    "PostgresReadsThroughTheIdentity": (
+        "src/store/postgres.rs",
+        "postgres_satisfies_the_journal_store_contract",
+        "the shared backend's run read ignores its upcaster, so a store written "
+        "at an older shape refuses its own history on the first read after the "
+        "upgrade — the redb mutation cannot reach this copy of the read",
+        """            let signature = signature_of(seq.cast_unsigned(), key_id, signature)?;
+            out.push(Record::from_stored_with(
+                self.upcaster.as_ref(),""",
+        """            let signature = signature_of(seq.cast_unsigned(), key_id, signature)?;
+            out.push(Record::from_stored_with(
+                &crate::journal::Identity,""",
+    ),
+    "PostgresCaseReadsThroughTheIdentity": (
+        "src/store/postgres.rs",
+        "postgres_satisfies_the_journal_store_contract",
+        "the shared backend's case read ignores its upcaster, so a matter's "
+        "history written at an older shape reads by run and is refused by case",
+        """            let signature = signature_of(0, key_id, signature)?;
+            out.push(Record::from_stored_with(
+                self.upcaster.as_ref(),""",
+        """            let signature = signature_of(0, key_id, signature)?;
+            out.push(Record::from_stored_with(
+                &crate::journal::Identity,""",
+    ),
+    "VerifyParsesBeforeTheVersion": (
+        "src/export.rs",
+        "an_export_at_an_older_record_shape_verifies_under_an_upcaster",
+        "the verifier parses a record into this build's struct before its "
+        "version is compared, so a record at an older shape is filed as "
+        "malformed before the upcaster that reads it is ever asked",
+        """    let record = match crate::journal::Record::from_stored_with(""",
+        """    if let Err(parse) = serde_json::from_slice::<crate::journal::RecordBody>(raw_bytes) {
+        return unread_record(raw_bytes, &crate::core::StoreError::Encoding(parse), pass, report);
+    }
+    let record = match crate::journal::Record::from_stored_with(""",
+    ),
+    "VerifyReadsThroughTheIdentity": (
+        "src/export.rs",
+        "an_export_at_an_older_record_shape_verifies_under_an_upcaster",
+        "the verifier ignores the upcaster it is handed and reads through this "
+        "build's own shapes, so every export written before a shape change "
+        "reports a build skew on every record it carries",
+        """    let record = match crate::journal::Record::from_stored_with(
+        upcaster,""",
+        """    let record = match crate::journal::Record::from_stored_with(
+        {
+            let _ = upcaster;
+            &crate::journal::Identity
+        },""",
+    ),
+    "ARestoreResealsALiftedBody": (
+        "src/journal/record.rs",
+        "a_restored_chain_hashes_as_the_exported_one_under_an_upcaster",
+        "a restore hands the store the lifted body without the bytes it was "
+        "written with, so the store re-seals this build's serialization of it — "
+        "new bytes and a new hash, and the restored chain is not the exported one",
+        """            written: Some(record.raw),""",
+        """            written: {
+                let _ = record.raw;
+                None
+            },""",
+    ),
+    "AnExportWritesOnlyThisBuildsShape": (
+        "src/export.rs",
+        "two_builds_rehearse_the_upgrade_and_the_rollback_window",
+        "the export writer parses every record into this build's shape for its "
+        "display copy, so a store holding an older shape cannot be exported by "
+        "the build that reads it — the upgrade's own first step fails",
+        """            _ => DisplayBody::Written(serde_json::from_slice(r.raw()).map_err(unparsed)?),""",
+        """            Ok(body) => DisplayBody::Current(Box::new(body)),
+            Err(e) => return Err(unparsed(e)),""",
     ),
     "AnAuditKeepsOnlyTheHighestAnchor": (
         "src/audit.rs",
@@ -8265,8 +9050,8 @@ pub struct Label {""",
         "with witnesses is anchored nowhere outside itself while every report "
         "it prints stays clean — the shape this whole tier had before there "
         "was a door: the mechanism exists, so the requirement reads as met",
-        """            self.cosign_checkpoint(&mut report).await?;""",
-        """            let _ = &mut report;""",
+        """            self.cosign_checkpoint(now, &mut report).await?;""",
+        """            let _ = (now, &mut report);""",
     ),
     "AWitnessShortfallIsAQuietTick": (
         "src/runtime/sweeper.rs",
@@ -8570,26 +9355,16 @@ pub struct Label {""",
     "ARestoreFlattensTheEpoch": (
         "src/export.rs",
         "a_run_that_changed_hands_restores_with_its_epochs",
-        "a restore writes every record under one epoch instead of the epoch it "
-        "was sealed with, so any run that ever changed hands rehashes — and "
-        "those are exactly the runs a failover produced, which is the history a "
-        "disaster recovery is most likely to be carrying",
-        """            let appends: Vec<Append> = batch.iter().cloned().map(Append::from_body).collect();
-            records += appends.len();
-            store.append(epoch, appends).await?;""",
-        """            let appends: Vec<Append> = batch.iter().cloned().map(Append::from_body).collect();
-            records += appends.len();
-            store.append(1, appends).await?;""",
+        "a restore writes every record under one epoch instead of the epoch it was sealed with, so any run that ever changed hands rehashes — and those are exactly the runs a failover produced, which is the history a disaster recovery is most likely to be carrying",
+        "            for (written, want) in store.append(epoch, appends).await?.iter().zip(&mut claimed) {",
+        "            for (written, want) in store.append(1, appends).await?.iter().zip(&mut claimed) {",
     ),
     "AnExportOmitsItsLogPositions": (
         "src/export.rs",
         "a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root",
-        "the export carries no Merkle log position for a sealed run, so a "
-        "verifier can walk every chain and still not notice a whole run deleted "
-        "from the middle — each surviving chain is internally consistent, and "
-        "only the rebuilt tree can see the gap",
-        """        let placed = store.inclusion_proof(run).await.ok().flatten();""",
-        """        let placed: Option<crate::journal::Inclusion> = None;""",
+        "the export carries no Merkle log position for a sealed run, so a verifier can walk every chain and still not notice a whole run deleted from the middle — each surviving chain is internally consistent, and only the rebuilt tree can see the gap",
+        "    let positions = store\n        .log_positions(runs)\n        .await\n        .unwrap_or_else(|_| vec![None; runs.len()]);",
+        "    let positions: Vec<Option<(u64, crate::core::Digest)>> = vec![None; runs.len()];",
     ),
     "AVerifiedExportSkipsTheRehash": (
         "src/export.rs",
@@ -8659,12 +9434,9 @@ pub struct Label {""",
     "AnExportStampsALeafPastItsCheckpoint": (
         "src/export.rs",
         "a_run_sealed_after_the_checkpoint_exports_as_still_open",
-        "a run sealed after the export's checkpoint was taken is stamped with a "
-        "log position the header does not commit to, so the export disagrees "
-        "with its own first line and the verifier reports tampering where there "
-        "was only time — a race every busy plane hits",
-        """        let placed = placed.filter(|i| i.index < log_size);""",
-        """        let placed = placed.filter(|i| i.index <= u64::MAX);""",
+        "a run sealed after the export's checkpoint was taken is stamped with a log position the header does not commit to, so the export disagrees with its own first line and the verifier reports tampering where there was only time — a race every busy plane hits",
+        "        let placed = placed.filter(|&(index, _)| index < log_size);",
+        "        let placed = placed.filter(|&(index, _)| index <= u64::MAX);",
     ),
     "AnOpenRunsFindingsNeverReachItsVerdict": (
         "src/export.rs",
@@ -8811,6 +9583,8 @@ pub struct Label {""",
                 | Self::Abandoned { .. }
                 | Self::Swept
                 | Self::BrokeGlass { .. }
+                | Self::HaltLifted { .. }
+                | Self::HoldReleased { .. }
                 | Self::Observed
         )""",
         """        matches!(
@@ -8820,6 +9594,8 @@ pub struct Label {""",
                 | Self::Abandoned { .. }
                 | Self::Swept
                 | Self::BrokeGlass { .. }
+                | Self::HaltLifted { .. }
+                | Self::HoldReleased { .. }
                 | Self::Failed(_)
         )""",
     ),
@@ -8931,6 +9707,141 @@ pub struct Label {""",
         "chain readable, verifiable and auditable, and nothing reports the loss",
         """        self.by = Some(by);""",
         """        let _: crate::core::Operator = by;""",
+    ),
+    "TheInitiatorIsSealedWithTheInput": (
+        "src/journal/payload.rs",
+        "the_initiator_outlives_an_erasure",
+        "who asked for a run is sealed beside its input, so erasing the case "
+        "destroys the name the four-eyes exclusion reads on every task the "
+        "run opens, and the chain stays verifiable with the initiator gone",
+        """            admitted_by: _,
+            // Clear: which holder a run draws as is control-plane.
+            served_unchained: _,
+            plane_chain: _,
+        } => vec![SealedField::Value(input)],""",
+        """            admitted_by,
+            served_unchained: _,
+            plane_chain: _,
+        } => {
+            let mut v = vec![SealedField::Value(input)];
+            v.extend(admitted_by.iter_mut().map(SealedField::Text));
+            v
+        }""",
+    ),
+    "AnAdmissionKeyIsUndocumented": (
+        "src/policy/requests.rs",
+        "the_security_page_documents_every_runtime_gate_s_context",
+        "the admission gate asks with an attribute the security page never "
+        "names, so the page a rule author writes from describes a request the "
+        "plane does not send",
+        """    let context = serde_json::json!({ "input": input, "tenant": acting.tenant });""",
+        """    let context = serde_json::json!({ "input": input, "tenant": acting.tenant, "capability": acting.capability });""",
+    ),
+    "AdmissionIgnoresThePinnedDigest": (
+        "src/runtime/executor.rs",
+        "a_pinned_admission_refuses_another_digest",
+        "a run pinned to the revision its scheduler reviewed is admitted under "
+        "whichever revision this plane holds, so an edited declaration runs "
+        "work that was approved against another one",
+        """            if found != Some(expected) {""",
+        """            if found.is_none() {""",
+    ),
+    "ADecisionIsNotComparedToTheRow": (
+        "src/runtime/sweeper.rs",
+        "a_stale_digest_is_refused_and_nothing_is_recorded",
+        "a decision naming a version of its task the row no longer holds is "
+        "recorded anyway, so a client deciding on a row that changed since it "
+        "read it is answered as if it had read the current one",
+        """    expected.is_some_and(|digest| digest != row.justification.digest())""",
+        """    let _ = (expected, row);
+    false""",
+    ),
+    "ARowChangedUnderTheClaimKeepsTheClaim": (
+        "src/runtime/sweeper.rs",
+        "a_row_changed_under_the_claim_is_refused_and_released",
+        "a decision refused because the row changed under its claim leaves the "
+        "claim behind, so the task sits assigned to somebody whose decision "
+        "was never recorded — or a claim the decider already held is taken away",
+        """            if !held && let Err(error) = tasks.release(id, by.actor()).await {""",
+        """            if held && let Err(error) = tasks.release(id, by.actor()).await {""",
+    ),
+    "TheServedDigestIsOfTheShownJustification": (
+        "src/api/mod.rs",
+        "a_served_digest_is_of_the_stored_row",
+        "the served digest is of the withheld view rather than the stored row, "
+        "so every decision naming it on a proposal this plane cannot open is "
+        "refused as stale",
+        """            digest: task.justification.digest(),""",
+        """            digest: task.shown_justification().digest(),""",
+    ),
+    "TheDecideRouteDropsTheDigest": (
+        "src/api/mod.rs",
+        "a_stale_digest_is_refused_with_412",
+        "the decide route accepts a digest and never passes it on, so a "
+        "decision on a stale version is recorded while the client believes it "
+        "was conditional",
+        """        .decide_task_at(id, &decision, &s.caller.roles, body.digest)""",
+        """        .decide_task_at(id, &decision, &s.caller.roles, None)""",
+    ),
+    "TheTerminalDropsTheDigest": (
+        "src/bin/agentplane.rs",
+        "a_stale_digest_at_the_terminal_is_refused",
+        "`decide --digest` parses the digest and never passes it on, so a "
+        "decision on a stale version is recorded from the terminal",
+        """            .decide_task_at(id, &decision, &opts.roles, expected)""",
+        """            .decide_task_at(id, &decision, &opts.roles, { let _ = expected; None })""",
+    ),
+    "TheReleaseDigestHidesItsValue": (
+        "src/runtime/ctx.rs",
+        "an_erased_low_entropy_value_is_recoverable_from_the_export",
+        "the release digest stops being the public unkeyed derivation the "
+        "erasure guide describes, so the page states a residual the runtime "
+        "no longer leaves and nothing asks for the page to change",
+        """        let value_digest = crate::core::Digest::of(&value_bytes);""",
+        """        let value_digest = crate::core::Digest::of(&[b"salt".as_slice(), &value_bytes].concat());""",
+    ),
+    "TheEffectKeyHidesItsArguments": (
+        "src/runtime/ctx.rs",
+        "an_erased_low_entropy_value_is_recoverable_from_the_export",
+        "an effect's key stops being the public unkeyed derivation over its "
+        "arguments, so the erasure guide states a residual the runtime no "
+        "longer leaves and nothing asks for the page to change",
+        """            let key = EffectKey::derive(
+                self.step,
+                self.phase,
+                ordinal,
+                attempt,
+                &descriptor.kind,
+                &canon::value_bytes(&descriptor.args),
+            );""",
+        """            let key = EffectKey::derive(
+                self.step,
+                self.phase,
+                ordinal,
+                attempt,
+                &descriptor.kind,
+                &[canon::value_bytes(&descriptor.args), b"salt".to_vec()].concat(),
+            );""",
+    ),
+    "TheErasureStatementOmitsARecordKind": (
+        "site/content/docs/erasure.md",
+        "every_record_kind_is_placed_in_the_erasure_digest_statement",
+        "a record kind the erasure guide's digest statement does not place, so "
+        "an operator deciding what to seal cannot tell whether it leaves a "
+        "digest of erased content in the clear",
+        """`HoldReleased`,
+`Swept` and `Observed` carry""",
+        """`HoldReleased`,
+`Observed` carry""",
+    ),
+    "TheErasureStatementOmitsAStore": (
+        "site/content/docs/erasure.md",
+        "every_record_kind_is_placed_in_the_erasure_digest_statement",
+        "the erasure guide drops the logs' reason digest, so a deployment "
+        "believes an erased failure reason is gone from everywhere",
+        """| reason digest | every loud event in the deployment's logs, unkeyed and truncated | a failure, quarantine or compensation reason the journal seals |
+""",
+        "",
     ),
     "AWithdrawalIsUnrecognised": (
         "src/runtime/executor.rs",
@@ -9122,8 +10033,8 @@ pub struct Label {""",
         "a timer re-fired after a crash between append and disarm writes its "
         "wake into the journal a second time — and the journal is the one "
         "place a retry must never show up twice",
-        "        if !already_recorded {",
-        "        if true {",
+        "        if !already_recorded && !closed {",
+        "        if !closed {",
     ),
     "ACutCaseLayerReadsAsComplete": (
         "src/export.rs",
@@ -9881,15 +10792,24 @@ pub struct Label {""",
         "around it still parses",
         """                    } else {
                         // The front half of a codepoint. Kept for the next chunk.
-                        self.pending.drain(..valid);
+                        start += valid;
                         break;
                     }""",
         """                    } else {
                         // The front half of a codepoint. Kept for the next chunk.
                         text.push('\\u{FFFD}');
-                        self.pending.clear();
+                        start = self.pending.len();
                         break;
                     }""",
+    ),
+    "SseScanSkipsAHeldCarriageReturn": (
+        "src/model/sse.rs",
+        "a_crlf_split_across_chunks_is_still_one_terminator",
+        "the next search starts past a trailing carriage return held for its "
+        "line feed, so a CRLF split across chunks is read as a bare LF and the "
+        "CR stays in the line",
+        "        self.scanned = self.partial.len() - usize::from(self.partial.ends_with('\\r'));",
+        "        self.scanned = self.partial.len();",
     ),
     "AClientNeverNamesItsSkill": (
         "src/peers/a2a.rs",
@@ -10386,8 +11306,8 @@ pub struct Label {""",
         "a record's schema version is written on every append and never read "
         "back, so a journal written one shape ahead parses cleanly with the "
         "fields this build has never heard of dropped on the floor",
-        """            Ok(body) if body.v == upcaster.current_version(body.kind.kind_str()) => body,""",
-        """            Ok(body) => body,
+        """            Ok(body) if body.v == upcaster.current_version(body.kind.kind_str()) => Ok(body),""",
+        """            Ok(body) => Ok(body),
             #[allow(unreachable_patterns)]""",
     ),
     "AVersionSkewIsReportedAsTampering": (
@@ -10414,10 +11334,10 @@ pub struct Label {""",
         "saying it read part of it — on the artifact handed to somebody with no "
         "other copy",
         """        if let Some(kind) = value.get("kind").and_then(Value::as_str) {
-            note_unknown_members(kind, &value, &mut report);
+            note_unknown_members(kind, report.selection.is_some(), &value, &mut report);
         }""",
         """        if false {
-            note_unknown_members("", &value, &mut report);
+            note_unknown_members("", false, &value, &mut report);
         }""",
     ),
     "ADrillAssertsACauseItCannotEstablish": (
@@ -10618,8 +11538,117 @@ pub struct WrappedKey {""",
         "a_parked_registration_is_listed_and_re_armed",
         "re-arming a registration that was never parked answers the operator "
         "'done', so they wait for a sweep that has nothing to do",
-        """    Ok(Json(json!({ "rearmed": rearmed })))""",
-        """    Ok(Json(json!({ "rearmed": true, "_": rearmed })))""",
+        """    Ok(Json(RearmAnswer { rearmed }))""",
+        """    Ok(Json(RearmAnswer { rearmed: true || rearmed }))""",
+    ),
+    # The operator API's published document. The router and the document are
+    # built from one table, so a route can be served undocumented only by
+    # adding it beside the table, and documented unserved only by serving it
+    # under another method.
+    "ARouteIsServedBesideTheTable": (
+        "src/api/mod.rs",
+        "every_routed_operation_is_documented_and_no_other",
+        "a route is added to the operator router outside the table the OpenAPI "
+        "document is generated from, so it is served, gated and absent from the "
+        "document every generated client is built from",
+        "        router.with_state(self)",
+        '        router.route("/drills", axum::routing::get(last_drill)).with_state(self)',
+    ),
+    "TheDocumentNamesARouteTheRouterLacks": (
+        "src/api/mod.rs",
+        "every_documented_operation_answers_through_the_router",
+        "the router serves the dead-letter listing at a path the document does "
+        "not name, so a generated client's call to the documented path answers "
+        "404",
+        "            router = router.route(route.path, route.served());",
+        '            router = router.route(&route.path.replacen("/dead-letters", "/dead-letter", 1), route.served());',
+    ),
+    "DecidingWithoutATaskStoreIsAConflict": (
+        "src/api/mod.rs",
+        "a_missing_store_does_not_describe_the_plane",
+        "a decision posted to a plane built without a task store answers 409, "
+        "which tells the decider their verdict lost a race, where every other "
+        "task route says the store is missing",
+        """    s.plane.tasks().ok_or_else(|| unavailable("task"))?;
+    s.plane.events().ok_or_else(|| unavailable("event"))?;""",
+        """    s.plane.events().ok_or_else(|| unavailable("event"))?;""",
+    ),
+    "DeliveringWithoutAnEventStoreIsAConflict": (
+        "src/api/mod.rs",
+        "a_missing_store_does_not_describe_the_plane",
+        "an event posted to a plane built without an event store answers 409, "
+        "which a bus treats as permanent and drops, where the plane is missing "
+        "a store and the document says 501",
+        """    let s = api.authorize(caller, action::EVENT_DELIVER, input.kind())?;
+    s.plane.events().ok_or_else(|| unavailable("event"))?;""",
+        """    let s = api.authorize(caller, action::EVENT_DELIVER, input.kind())?;""",
+    ),
+    "AnOpenMemberSaysNothing": (
+        "src/core/case.rs",
+        "every_open_member_of_the_document_says_what_it_holds",
+        "a case's state reaches the document as `{}`, so a client author cannot "
+        "tell that the plane never reads it",
+        """    #[schemars(extend("x-agentplane-holds" = "The case's state as its adapter wrote it, validated per kind by the adapter; the plane does not read it."))]
+""",
+        "",
+    ),
+    "TheDocumentListsADispositionReconcileRefuses": (
+        "src/api/mod.rs",
+        "the_documented_dispositions_are_the_ones_reconcile_accepts",
+        "the document lists a disposition the handler refuses, so a client "
+        "validating against it sends a reconcile that answers 400",
+        """    #[schemars(extend("enum" = ["landed", "did_not_happen"]))]""",
+        """    #[schemars(extend("enum" = ["landed", "did_not_happen", "unknown"]))]""",
+    ),
+    "TheDocumentNamesAnotherAction": (
+        "src/api/openapi.rs",
+        "every_documented_operation_answers_through_the_router",
+        "the document says lifting a halt asks `api:halt.place`, so a deployment "
+        "writing rules from it grants the wrong capability for the lift",
+        "        action: action::HALT_LIFT,",
+        "        action: action::HALT_PLACE,",
+    ),
+    "AResponseMemberIsHiddenFromTheSchema": (
+        "src/api/mod.rs",
+        "a_response_validates_against_the_document",
+        "a task view serves `digest` and the document omits it, so a generated "
+        "client built against the closed schema rejects every task it reads",
+        "    pub digest: crate::core::Digest,",
+        "    #[schemars(skip)]\n    pub digest: crate::core::Digest,",
+    ),
+    "ARejectedBodyAnswersInPlainText": (
+        "src/api/mod.rs",
+        "a_refused_body_answers_with_the_documented_error",
+        "a halt body the extractor refuses answers axum's plain text instead of "
+        "the documented error object, so a client parsing the one error shape "
+        "crashes on the refusal it most needs to read",
+        "    Uniform(Json(body)): Uniform<Json<PlaceHaltRequest>>,",
+        "    Json(body): Json<PlaceHaltRequest>,",
+    ),
+    "AnErrorClassListsNoStatus": (
+        "src/api/openapi.rs",
+        "a_response_validates_against_the_document",
+        "the document lists no 501 on any operation while a plane built without "
+        "a store answers 501, so a generated client meets a status it was told "
+        "cannot happen",
+        "            Self::NotWired => 501,",
+        "            Self::NotWired => 500,",
+    ),
+    "TheGeneratorDriftsFromThePublishedFile": (
+        "src/api/openapi.rs",
+        "the_published_openapi_is_the_generated_document",
+        "the generated document moves and the file the site publishes does not, "
+        "so integrators generate clients from a description of another build",
+        """            "title": "agentplane operator API",""",
+        """            "title": "agentplane operator API (drifted)",""",
+    ),
+    "TheVerbPrintsSomethingElse": (
+        "src/bin/agentplane.rs",
+        "the_openapi_verb_prints_the_published_document",
+        "`agentplane openapi` prints an empty object, so a client generated from "
+        "the binary's own output has no operations",
+        "    serde_json::to_string_pretty(&agentplane::api::openapi::document())",
+        "    serde_json::to_string_pretty(&serde_json::json!({}))",
     ),
     "TheOfflineSweepSkipsTheQuarantineBacklog": (
         "src/runtime/executor.rs",
@@ -10660,8 +11689,7 @@ pub struct WrappedKey {""",
         """            RecordKind::Observed {
                 session: self.id.clone(),
                 reported: step,
-                // Labelled here, from the one source it can have had.
-                detail: detail.map(|d| Tainted::from_source(d, self.source()).peek().clone()),
+                detail,
             },""",
         """            RecordKind::Note {
                 text: format!("{}: {:?}", self.id, step),
@@ -10749,16 +11777,8 @@ pub struct WrappedKey {""",
         "a resume of a run whose payloads were erased falls through to the "
         "parser, which reports a missing field — sending an operator to look for "
         "a corrupt journal instead of telling them the data is gone",
-        """    if sealed_payload(&frozen) {
-        return Err(RuntimeError::PayloadsErased {
-            run: run.to_string(),
-        });
-    }""",
-        """    if false {
-        return Err(RuntimeError::PayloadsErased {
-            run: run.to_string(),
-        });
-    }""",
+        "            if sealed_payload(plan) {",
+        "            if false {",
     ),
     "AnErasureRunsUnderLiveWork": (
         "src/blob/mod.rs",
@@ -10940,8 +11960,2109 @@ pub struct WrappedKey {""",
         "            if concludes {\n                quotas.release(run).await.map_err(pending)?;\n            }",
         "            let _ = concludes;",
     ),
-}
+    "AStoppedResumeUnwindsBeforeItReplays": (
+        "src/runtime/executor.rs",
+        "a_stopped_resume_unwinds_with_the_recorded_outputs_in_reverse_completion_order",
+        "a cancellation on a resume unwinds before the recorded steps replay, so each compensation is handed null for the output it undoes and the steps are undone in id order rather than in reverse of the order they finished",
+        "            let at_frontier = ready.is_empty() || ready.iter().any(|s| !succeeded.contains(s));",
+        "            let at_frontier = { let _ = &succeeded; true };",
+    ),
+    "RecoveryRetriesAConclusionNoMarkerOpened": (
+        "src/runtime/executor.rs",
+        "recovery_hands_back_a_concluded_run_rather_than_resuming_it",
+        "recovery finishes a conclusion only when a quota pass marker opened it, so without a quota store a run that concluded and lost its owner is resumed — a failure retried by a crash's timing, and a compensated one refused and recovered every lease period for ever",
+        "        let Some(last) = records.last() else {\n            return Ok(None);\n        };\n        let RecordKind::RunConcluded {",
+        "        let Some(last) = records.last().filter(|l| records.iter().any(|r| r.body.epoch == l.body.epoch && matches!(r.kind(), RecordKind::QuotaPassStarted { .. }))) else {\n            return Ok(None);\n        };\n        let RecordKind::RunConcluded {",
+    ),
+    "AResumeRunsWithNoDestinationRegistered": (
+        "src/runtime/executor.rs",
+        "a_resume_registers_the_destinations_its_admission_could_not",
+        "a run whose admission failed to register its destinations is concluded failed, and resuming it executes the whole run with nothing watching its history",
+        "            self.register(run, recorded_case_id(&records))",
+        "            let _ = (run, &records);\n            std::future::ready(Ok::<(), crate::core::StoreError>(()))",
+    ),
+    "ACaselessPlaneResumesACaseBoundRun": (
+        "src/runtime/executor.rs",
+        "a_case_bound_run_is_refused_a_resume_on_a_plane_with_no_case_store",
+        "a plane with no case store resumes a case-bound run and writes its records under the run alone, where erasing the case misses them",
+        "            Some(case) if self.cases.is_none() => Err(RuntimeError::NoCaseStore {",
+        "            Some(case) if self.cases.is_none() && false => Err(RuntimeError::NoCaseStore {",
+    ),
+    "AnUndoPassesThePolicyUnjudged": (
+        "src/runtime/ctx.rs",
+        "a_compensation_the_policy_refuses_quarantines_instead_of_running",
+        "a compensation's effects skip the declaration and the policy along with the budget, so undo is a door to any effect the policy refuses",
+        "        self.declared(key, descriptor, ceilings).await?;",
+        "        if self.undoing() {\n            self.count_unadmitted(outbound_bytes);\n            return Ok(());\n        }\n        self.declared(key, descriptor, ceilings).await?;",
+    ),
+    "ACaseListsARunBeforeItExists": (
+        "src/runtime/executor.rs",
+        "a_crash_while_attaching_leaves_no_run_the_journal_lacks",
+        "the case row is written before the admission's append, so a process that dies between the two leaves a case listing a run no journal holds, and nothing can tell which case to take it off",
+        "            .append(lease.epoch, records)",
+        "            .append(lease.epoch, {\n                if let Some(ctx) = case_ctx.as_ref() {\n                    ctx.cases.attach_run(ctx.case_id, run).await.map_err(RuntimeError::from_store)?;\n                }\n                records\n            })",
+    ),
+    "ARunIsNeverPutOnItsCase": (
+        "src/runtime/executor.rs",
+        "a_crash_before_attaching_is_attached_by_the_recovery",
+        "a run's registration skips its case, so a case-bound run is missing from the matter's own list of what happened in it",
+        "            cases.attach_run(case, run).await?;",
+        "            let _ = (case, cases);",
+    ),
+    "AnUnreadableSuccessorIsSkipped": (
+        "src/runtime/executor.rs",
+        "an_unreadable_successor_plan_refuses_the_resume",
+        "a successor plan this build cannot parse is dropped, so every later replan lands on the wrong plan and the resume freezes a new successor mid-history",
+        "        .map(|plan| {",
+        "        .filter(|plan| sealed_payload(plan) || serde_json::from_value::<PlanIR>((*plan).clone()).is_ok())\n        .map(|plan| {",
+    ),
+    "TheOwnerMayApproveTheirOwnTask": (
+        "src/runtime/ctx.rs",
+        "the_person_a_run_acts_for_cannot_approve_it",
+        "only the admitting caller is barred from a run's tasks, so the person a served run acts for — or the workload acting as them — approves their own request",
+        "                Some([c.owner().id.clone(), c.subject().id.clone()])",
+        "                Some([String::new(), c.subject().id.clone()])",
+    ),
+    "AWithdrawnPersonsDelegatesCarryOn": (
+        "src/quota/mod.rs",
+        "a_halt_naming_a_person_reaches_the_work_delegated_from_them",
+        "a subject halt is matched against the acting workload alone, so withdrawing a person stops nothing a service is doing on their behalf",
+        "            .filter(|id| chain.links().any(|link| link.id == *id))",
+        "            .filter(|id| chain.subject().id == *id)",
+    ),
+    "ATaskIdIsReadBeforeTheCaller": (
+        "src/api/a2a.rs",
+        "every_method_is_authenticated",
+        "a task id is parsed before the caller is authenticated, so an unauthenticated caller with a malformed id is answered about tasks rather than challenged",
+        "        let caller = self.authenticate(headers).await?;\n        let run = task_id(params)?;",
+        "        let run = task_id(params)?;\n        let caller = self.authenticate(headers).await?;",
+    ),
+    "APlaneOnAFullBackendIgnoresHalts": (
+        "src/runtime/executor.rs",
+        "a_plane_on_a_full_backend_obeys_halts_without_being_told_to",
+        "a plane wired from one full backend and never told `.quota` holds no quota store, so it admits past every halt an operator throws",
+        "            .quota(stores.quotas, crate::quota::TenantQuota::default())\n",
+        "",
+    ),
+    "ASealedHistoryRestoresUnderAnyTenant": (
+        "src/export.rs",
+        "a_sealed_export_is_refused_by_a_tenant_its_envelopes_do_not_name",
+        "a sealed export restores under a tenant its envelopes do not name, so every payload opens for nobody and erase_case there destroys a key that wraps none of it while reporting success",
+        "        Some(sealer) if sealer == tenant => Ok(()),",
+        "        Some(_) => Ok(()),",
+    ),
+    "TheLogPlacesEveryRunFirst": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the one-pass log walk places every sealed run at index 0, so an export stamps each run block with a position the Merkle log does not hold and the verifier reports tampering",
+        "                    *slot = Some((rank, digest(head)?));",
+        "                    *slot = Some((0, digest(head)?));",
+    ),
+    "TheInFlightWalkPagesByActivity": (
+        "src/export.rs",
+        "a_run_writing_during_the_in_flight_walk_is_still_listed",
+        "the in-flight walk pages by last activity, so a run that appends during the walk jumps above the cursor and an export taken for recovery silently lacks it",
+        "    let mut after: Option<RunId> = None;\n    while found.runs.len() < limit {\n        let page = store.runs_by_id(after, CASE_PAGE).await?;\n        if page.is_empty() {\n            break;\n        }\n        after = page.last().copied();\n",
+        "    let mut after: Option<(u64, RunId)> = None;\n    while found.runs.len() < limit {\n        let rows = store.recent_runs(after, CASE_PAGE).await?;\n        if rows.is_empty() {\n            break;\n        }\n        after = rows.last().map(|(run, at)| (*at, *run));\n        let page: Vec<RunId> = rows.into_iter().map(|(run, _)| run).collect();\n",
+    ),
+    "ARestoreAppendsToARunItAlreadyHolds": (
+        "src/export.rs",
+        "a_restore_refuses_a_store_already_holding_one_of_its_runs",
+        "a restore into a store that already holds one of its runs appends that run's history a second time behind the first, so a retried partial restore doubles every open run",
+        "        if store.head(run.run).await?.seq != 0 {",
+        "        if store.head(run.run).await?.seq != 0 && false {",
+    ),
+    "ARestoreTrustsTheHashItRebuilt": (
+        "src/export.rs",
+        "a_restore_refuses_a_record_that_rebuilds_to_another_hash",
+        "a restore never compares a rebuilt record's hash with the file's, so an open run a store kept differently from what it was handed restores silently — no leaf covers it",
+        "                if written.hash != *want {",
+        "                if written.hash != *want && false {",
+    ),
+    "ASealedJournalLendsNoTransaction": (
+        "src/keyring/journal.rs",
+        "a_sealed_journal_commits_a_co_located_resource_sealed",
+        "a sealed journal answers that it has no transaction, so every atomic group on a sealed Postgres plane is refused at registration as if the backend were embedded",
+        "        self.inner.atomic().map(|_| self as &dyn AtomicJournal)",
+        "        None",
+    ),
+    "ASealedWriteReopensWhatItSealed": (
+        "src/keyring/journal.rs",
+        "a_sealed_append_hands_back_what_it_was_given_without_the_ring",
+        "a sealed append re-opens every payload it just sealed after the commit, so a key service failing in between reports a committed write as a backend error and the caller retries a write that landed",
+        "        let written = self.inner.append(epoch, sealed).await?;\n        self.reopened(written, plain).await",
+        "        let written = self.inner.append(epoch, sealed).await?;\n        drop(plain);\n        self.open_all(written).await",
+    ),
+    "NoCaseBlocksReadsAsNoCases": (
+        "src/export.rs",
+        "a_dropped_case_layer_is_a_finding_not_a_quiet_file",
+        "a file whose records name cases and which carries no case block at all, with a trailer claiming none, is filed as not checked rather than as a finding, so a stripped case layer reads as a plane that had no cases",
+        "    for case in stamped.difference(carried) {",
+        "    if carried.is_empty() {\n        return;\n    }\n    for case in stamped.difference(carried) {",
+    ),
+    "AForeignCanonIsCheckedAnyway": (
+        "src/export.rs",
+        "a_foreign_canon_rule_is_unverifiable_not_a_finding",
+        "the offline pass reads past a header naming a canon this build does not implement and rehashes every record with its own algorithm, so a file from another build reads as tampered",
+        "                if report.unverifiable.is_some() {\n                    return Ok(report);\n                }\n",
+        "",
+    ),
+    "AnUnverifiableExportIsAFinding": (
+        "src/bin/agentplane.rs",
+        "the_exit_statuses_are_one_table",
+        "verify exits 1 for an export under a canon this build does not implement, so a script pages somebody about tampering where there is only another build",
+        "    } else if report.unverifiable.is_some() {\n        exit::UNVERIFIABLE",
+        "    } else if report.unverifiable.is_some() {\n        exit::FINDING",
+    ),
+    "AHoldReadsPastAMemberItDoesNotKnow": (
+        "src/core/case.rs",
+        "a_legal_hold_survives_export_and_restore",
+        "a legal hold carrying a member this build does not know is read anyway, so the Rust reader passes a case block the second reader refuses",
+        "#[serde(deny_unknown_fields)]\npub struct LegalHold {",
+        "pub struct LegalHold {",
+    ),
+    "AnUnconcludedRunIsSealed": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "the embedded store seals a run with no records or one still mid-flight, so the log commits the zero digest or freezes a history that never ended",
+        "    if kind.as_deref() == Some(\"RunConcluded\") {",
+        "    if kind.as_deref() != Some(\"never\") {",
+    ),
+    "AnUnconcludedRunIsSealedOnPostgres": (
+        "src/store/postgres.rs",
+        "postgres_satisfies_the_journal_store_contract",
+        "the shared store seals a run with no records or one still mid-flight, so the log commits the zero digest or freezes a history that never ended",
+        "            Some(row) if row.get::<_, String>(1) == \"RunConcluded\" => {",
+        "            Some(row) => {",
+    ),
+    "NonUtf8TextStaysSealedUncounted": (
+        "src/keyring/journal.rs",
+        "a_text_payload_that_opens_to_non_utf8_is_an_error",
+        "a sealed text field whose plaintext is not UTF-8 is silently left sealed and counted neither opened nor erased, so a reader cannot tell it from an erasure it did not count",
+        "                        *field = String::from_utf8(plain).map_err(|e| {",
+        "                        let kept = field.clone();\n                        *field = String::from_utf8(plain).or_else(|_| Ok(kept)).map_err(|e: std::string::FromUtf8Error| {",
+    ),
+    "ANoOpResumeWritesAPassMarker": (
+        "src/runtime/executor.rs",
+        "a_no_op_resume_under_a_quota_repeats_no_conclusion",
+        "a resume writes its quota pass marker before it knows it will write anything, so a resume reaching the conclusion the record holds leaves a marker as the run's last record and every status reader reports a failed run as still working",
+        "        let through = self.marking_pass(run, &quota);",
+        "        if let Some(marker) = quota.started() {\n            self.store.append(lease.expect(\"resume holds a lease\").epoch, vec![Append::new(run, marker)]).await.map_err(RuntimeError::from_store)?;\n        }\n        let through = self.marking_pass(run, &quota);",
+    ),
+    "AMixedReadySetStopsBeforeItReplays": (
+        "src/runtime/executor.rs",
+        "a_stop_on_a_mixed_ready_set_unwinds_with_the_recorded_outputs",
+        "a resume whose ready set holds a recorded success beside new work checks for a stop before the recorded step replays, so the unwind hands its compensation null for the output it undoes",
+        "                && ready.iter().any(|s| succeeded.contains(s))\n                && ready.iter().any(|s| !succeeded.contains(s))",
+        "                && ready.is_empty()\n                && ready.iter().any(|s| !succeeded.contains(s))",
+    ),
+    "ARestoreReSealsWhatItRestores": (
+        "src/export.rs",
+        "a_restore_refuses_a_sealing_target_before_writing",
+        "a restore into a journal that seals as it writes is refused only by the journal's own append, which says that a sealed journal cannot store written bytes rather than what the target is and that the unwrapped store is then opened with the keyring",
+        "    if store.seals() {",
+        "    if store.seals() && store.tenant().is_empty() {",
+    ),
+    "ASealedJournalStoresWrittenBytes": (
+        "src/keyring/journal.rs",
+        "a_sealed_journal_refuses_written_bytes",
+        "a restored append into a sealed journal is stored as its bytes stand, so a payload from a plaintext export sits readable in a store whose every other record is sealed",
+        "            if entry.written().is_some() {",
+        "            if entry.written().is_some() && entry.case.is_some() {",
+    ),
+    "AnIndexTrustsTheCallersBody": (
+        "src/journal/record.rs",
+        "a_restored_append_is_indexed_by_its_bytes",
+        "a store indexes a restored append by its public fields, which a caller can change after Append::restored, so the by-case, exactly-once, admission and outcome indexes describe a record its own bytes contradict",
+        "        Ok((body, Some(raw)))",
+        "        Ok((fields, Some(raw)))",
+    ),
+    "ASealKeepsBytesNamingAnotherPosition": (
+        "src/journal/record.rs",
+        "a_store_refuses_written_bytes_naming_another_position",
+        "a store files written bytes naming seq 1 at seq 2, so the record's own body contradicts the chain position it is stored and read under",
+        "        if body.seq != seq || body.epoch != epoch || body.run != fields.run {",
+        "        if body.epoch != epoch || body.run != fields.run {",
+    ),
+    "ARestoreKeepsNonCanonicalBytes": (
+        "src/export.rs",
+        "non_canonical_record_bytes_are_refused_and_reported",
+        "a restore stores record bytes that hash to their claim and are not canonical, so the store holds a record no writer under the export's canon produces",
+        "        .is_ok_and(|value| crate::core::canon::value_bytes(&value) != raw)",
+        "        .is_ok_and(|value| crate::core::canon::value_bytes(&value) != raw && raw.is_empty())",
+    ),
+    "AVerifyPassesNonCanonicalBytes": (
+        "src/export.rs",
+        "non_canonical_record_bytes_are_refused_and_reported",
+        "verify passes record bytes that hash to their claim and are not canonical, and names a member written twice a build skew",
+        "        .is_ok_and(|wire| crate::core::canon::value_bytes(&wire) != raw_bytes)",
+        "        .is_ok_and(|wire| crate::core::canon::value_bytes(&wire) != raw_bytes && raw_bytes.is_empty())",
+    ),
+    "ACaselessPlaneFailsARecordedStop": (
+        "src/runtime/executor.rs",
+        "a_caseless_plane_records_a_stop_for_a_case_bound_run",
+        "a plane with no case store records an operator's stop for a case-bound run and then reports it as failed, though the plane with the case store will honour it",
+        "                    | RuntimeError::NoCaseStore { .. }\n                    | RuntimeError::PayloadsSealed { .. },\n                ) => {}",
+        "                    | RuntimeError::PayloadsSealed { .. },\n                ) => {}",
+    ),
+    "ThePlanesOwnChainBarsItsOperator": (
+        "src/runtime/ctx.rs",
+        "the_planes_own_principal_may_approve_a_run_the_embedder_started",
+        "four-eyes bars the principals of the plane's own chain from a run the embedder started, so the operator whose identity is the plane's root can approve none of the plane's tasks",
+        "            Some(c) if !self.plane_chain().await? => {",
+        "            Some(c) => {",
+    ),
+    "ACallerWithThePlanesChainIsThePlane": (
+        "src/runtime/executor.rs",
+        "a_caller_presenting_the_planes_chain_cannot_approve_its_run",
+        "whether a run acts as the plane is read off the chain it holds, so a served caller presenting a chain equal to the plane's approves the run it asked for",
+        "            plane_chain: matches!(acting_as, Acting::Plane) && self.identity.is_some(),",
+        "            plane_chain: self.identity.is_some() && acting_as.resolve(self.identity.as_ref()) == self.identity.as_ref(),",
+    ),
+    "AForeignCanonRestoreIsAnOutage": (
+        "src/bin/agentplane.rs",
+        "the_exit_statuses_are_one_table",
+        "restore reads past a header naming a canon this build does not implement and fails through the general error path, so a script pages the store's owner about an outage where there is only another build",
+        "    agentplane::export::foreign_canon(&header)",
+        "    agentplane::export::foreign_canon(&header).filter(|_| header.is_empty())",
+    ),
+    "RestoreReadsCanonBeforeKind": (
+        "src/export.rs",
+        "the_exit_statuses_are_one_table",
+        "restore reads a canon off a first line that is no export header, or one of another format version, and exits unverifiable where verify reports a finding",
+        "    if !ours {",
+        "    if false {",
+    ),
+    "AForeignTenantCredentialIsAParameterError": (
+        "src/api/a2a.rs",
+        "a_peer_cannot_name_a_tenant_its_credential_does_not_hold",
+        "a credential for another tenant is answered HTTP 200 with a parameter error, so the client reads a malformed request and retries it with the same credential rather than being told to authenticate",
+        "            return Err(RpcError::unauthenticated(\n                crate::api::AuthError::Rejected.to_string(),",
+        "            return Err(RpcError::new(\n                code::INVALID_PARAMS,\n                crate::api::AuthError::Rejected.to_string(),",
+    ),
+    "AForeignTenantRefusalNamesTheTenant": (
+        "src/api/a2a.rs",
+        "a_peer_cannot_name_a_tenant_its_credential_does_not_hold",
+        "a credential for another tenant is refused in words of its own, which tells a prober the token is valid elsewhere",
+        "                crate::api::AuthError::Rejected.to_string(),\n            ));\n        }\n        Ok(caller)",
+        "                \"this endpoint does not serve your tenant\",\n            ));\n        }\n        Ok(caller)",
+    ),
+    "ASealedPlaneMissesTheIndex": (
+        "src/runtime/executor.rs",
+        "a_sealed_planes_subject_erasure_reaches_the_semantic_index",
+        "the plane wraps its index around a sealed memory store, so the store's own subject erasure runs beneath the wrapper and leaves the person's embeddings in the index",
+        "                None if memories.seals() => {",
+        "                None if memories.seals() && memories.tenant().is_empty() => {",
+    ),
+    "AnIndexElsewhereIsCalledASeal": (
+        "src/runtime/executor.rs",
+        "a_store_indexed_elsewhere_is_refused_as_such",
+        "a plane refuses an unsealed store that tells another index as a sealed store missing its index, so the operator is sent to rewire a seal that does not exist",
+        "                Some(_) => return Err(BuildError::MemoryIndexedElsewhere),",
+        "                Some(_) => return Err(BuildError::SealedMemoryMissesIndex),",
+    ),
+    "ARefusedKeyDestructionIsDropped": (
+        "src/keyring/memory.rs",
+        "a_key_the_ring_refused_after_an_expiry_is_destroyed_later",
+        "a key the ring refuses after an expiry or cascade erased its rows is forgotten, so no retry finds it and every backup of the erased version still opens",
+        "        let mut owed = self.owed.lock().await;",
+        "        let mut owed: Vec<OwedKey> = Vec::new();\n        let _ = &self.owed;",
+    ),
+    "ASealDoesNotSayWhatItsErasureReaches": (
+        "src/keyring/memory.rs",
+        "a_sealed_planes_subject_erasure_reaches_the_semantic_index",
+        "a sealed memory store does not report the index beneath it, so the composition whose subject erasure reaches the index is refused with the one that misses it",
+        "        self.inner.erasure_index()",
+        "        None",
+    ),
+    "ANoLedgerPlaneRefusesEveryPass": (
+        "src/runtime/executor.rs",
+        "a_plane_with_no_ledger_resumes_what_no_pass_billed",
+        "a plane with no quota store refuses every run whose admission opened a pass, so it cannot resume anything a plane with the default unlimited ledger admitted",
+        "                    RecordKind::QuotaPassStarted {\n                        period: Some(_),\n                        ..\n                    }",
+        "                    RecordKind::QuotaPassStarted { .. }",
+    ),
+    "AConclusionAfterTheMarkerNamesTheHeadBeforeIt": (
+        "src/runtime/pass_journal.rs",
+        "a_resume_that_only_concludes_names_the_head_it_sits_on",
+        "a resume whose first write is its conclusion keeps the head it read before the pass marker landed, so a sound recovered run audits and verifies as a conclusion drawn over another history",
+        "                && *chain_head == marker.prev_hash",
+        "                && *chain_head == marker.hash",
+    ),
+    "ASealedRunKeepsItsSlot": (
+        "src/runtime/executor.rs",
+        "a_sealed_run_still_holding_a_slot_is_released",
+        "a run sealed by a plane with no quota store keeps its admission slot in the ledger forever, since no resume or recovery selects a sealed run again",
+        "            if sealed.is_none() {",
+        "            if sealed.is_some() {",
+    ),
 
+    # ── A checkpoint that says when it was seen ─────────────────────────────
+    "ACosignatureForgetsItsTime": (
+        "src/journal/witness.rs",
+        "a_cosignature_carries_the_time_its_signature_covers",
+        "the cosignature getter reports a time other than the one its witness "
+        "signed, so every freshness judgement measures from a number nobody's "
+        "signature covers",
+        """            .filter(|time| *time != 0)""",
+        """            .map(|_| 1)""",
+    ),
+    "AnIdleLogIsNeverResubmitted": (
+        "src/runtime/sweeper.rs",
+        "an_unchanged_log_is_resubmitted_once_the_interval_passes",
+        "the declared checkpoint interval is never reached, so an idle plane is "
+        "never re-submitted and its witnesses' latest time goes stale while it "
+        "is healthy",
+        """            (Some(interval), Some(last)) => now - last < interval,""",
+        """            (Some(_), Some(_)) => true,""",
+    ),
+    "AnIntervalWithoutWitnessesIsAccepted": (
+        "src/runtime/executor.rs",
+        "an_interval_without_witnesses_is_refused_at_build",
+        "a checkpoint interval with no witness to submit to builds, so a "
+        "declared interval is a promise nothing keeps",
+        """            return Err(BuildError::IntervalWithoutWitnesses);""",
+        """            let _ = BuildError::IntervalWithoutWitnesses;""",
+    ),
+    "FreshnessIsNotCompared": (
+        "src/audit.rs",
+        "a_stale_witness_is_a_finding_and_a_fresh_one_is_not",
+        "a witness key older than the auditor's maximum age is not a finding, "
+        "so a plane that went silent audits clean",
+        """        } else if age > max_age {""",
+        """        } else if false {""",
+    ),
+    "AnIntervalShorterThanTheSweepIsAccepted": (
+        "src/bin/agentplane.rs",
+        "serve_refuses_an_interval_shorter_than_its_sweep",
+        "serve accepts a checkpoint interval shorter than the sweep that keeps "
+        "it, so the declared interval is one the plane cannot meet",
+        """        if sweep != 0 && secs < u64::from(sweep) {""",
+        """        if false {""",
+    ),
+    "ServeSubmitsToNoWitness": (
+        "src/bin/agentplane.rs",
+        "serve_wires_its_submission_witnesses_into_the_sweep",
+        "serve parses its submission witnesses and never hands them to the "
+        "plane, so its sweep submits to nobody",
+        """    let mut builder = builder.witnesses(witnesses, quorum);""",
+        """    let mut builder = {
+        let _ = (witnesses, quorum);
+        builder
+    };""",
+    ),
+
+    # ── A verdict bound to the trajectory it was reached from ───────────────
+    "AGraderVerdictLastHashIsNotCompared": (
+        "src/grader_verdict.rs",
+        "a_grader_verdict_over_an_edited_prefix_is_refused_naming_the_last_hash",
+        "a sidecar is not held to the hash of the record it names, so a verdict "
+        "reached over one history stays bound after the records it judged are "
+        "rewritten and re-linked",
+        """    if at.hash != sidecar.last_hash {""",
+        """    if false {""",
+    ),
+    "AGraderVerdictSeqFallsBackToTheLastRecord": (
+        "src/grader_verdict.rs",
+        "a_grader_verdict_past_the_last_record_present_is_refused",
+        "a sidecar naming a seq the export does not hold is read against the "
+        "run's last record instead, so a verdict about records nobody can show "
+        "binds to whatever the file ends with",
+        """    let Some(at) = records.iter().find(|r| r.body.seq == sidecar.last_seq) else {""",
+        """    let Some(at) = records.iter().find(|r| r.body.seq == sidecar.last_seq).or(records.last()) else {""",
+    ),
+    "AClosedGraderVerdictIsNotHeldToTheSeal": (
+        "src/grader_verdict.rs",
+        "a_grader_verdict_claiming_a_sealed_run_is_refused_over_a_prefix_or_an_open_run",
+        "a sidecar claiming a sealed run is bound over a prefix or an unsealed "
+        "run, so a verdict about part of a run reads as a verdict about all of it",
+        """    if !sidecar.open && (!*sealed || last != sidecar.last_seq) {""",
+        """    if false {""",
+    ),
+    "AGraderVerdictIsBoundBeforeTheChainVerifies": (
+        "src/grader_verdict.rs",
+        "no_grader_verdict_is_bound_over_a_run_whose_chain_is_broken",
+        "a sidecar is checked against a run whose chain does not verify, so a "
+        "binding to bytes nobody can vouch for reads as a binding",
+        """    };
+    if !report.sound.contains(&run) {
+        return refuse(""",
+        """    };
+    if false {
+        return refuse(""",
+    ),
+    "AGraderVerdictSignatureIsNotChecked": (
+        "src/grader_verdict.rs",
+        "a_grader_verdict_signed_by_an_untrusted_key_is_refused",
+        "a grader signature is never verified, so any key id on any sidecar "
+        "reads as the trusted grader's",
+        """    if !graders.verify(""",
+        """    if false && !graders.verify(""",
+    ),
+    "TheBinderCallsEveryRunSealed": (
+        "src/grader_verdict.rs",
+        "a_bound_grader_verdict_over_an_open_run_states_it_open_and_verifies",
+        "the binder states every run sealed, so a verdict over an unfinished "
+        "run claims to be about the whole of it",
+        """    let open = !(*sealed && last_seq == last);""",
+        """    let open = !(*sealed || last_seq == last);""",
+    ),
+    "TheSubjectReportListsEveryOutboundEffect": (
+        "src/subject.rs",
+        "a_subject_report_lists_only_the_subjects_effects",
+        "the report drops its provenance filter, so every outbound effect reads as "
+        "carrying the subject's data",
+        """.filter(|(source, _)| names(label, source))""",
+        """.filter(|_| true)""",
+    ),
+    "TheSubjectReportMatchesByPrefix": (
+        "src/subject.rs",
+        "a_source_that_merely_contains_the_id_is_not_traced",
+        "the join matches any source starting with the item's, so another item's "
+        "effects are listed under this subject",
+        """    label.provenance.contains(source)""",
+        """    label.provenance.iter().any(|p| p.0.starts_with(source.0.trim_end_matches('x')) || p.0.contains(source.0.trim_start_matches("memory:")))""",
+    ),
+    "TheCoverageListOmitsAClass": (
+        "src/subject.rs",
+        "every_untraced_class_is_named_in_coverage",
+        "a class the report cannot trace is missing from its coverage list, so an "
+        "untraced flow reads as one that did not happen",
+        """        Self::CodedStep,\n""",
+        "",
+    ),
+    "TheCoverageNeverMarksATrustedItem": (
+        "src/subject.rs",
+        "every_untraced_class_is_named_in_coverage",
+        "a trusted item, whose recall leaves no source in any label, never marks "
+        "its class met, so the gap it opens is not flagged on the report it opens",
+        """Class::TrustedItem => items.iter().any(|i| i.trust == Some(Trust::Trusted)),""",
+        """Class::TrustedItem => items.iter().any(|i| i.trust == Some(Trust::Untrusted)) && false,""",
+    ),
+    "TheSubjectReportForgetsTheSubject": (
+        "src/subject.rs",
+        "a_subject_report_changes_no_store",
+        "the read-only report erases the subject's memory after selecting it",
+        """        let ids = memories.subject_ids(subject).await?;\n""",
+        """        let ids = memories.subject_ids(subject).await?;\n        memories.forget_subject(subject).await?;\n""",
+    ),
+    "TheAdmittedInputForgetsItsSubject": (
+        "src/runtime/executor.rs",
+        "a_subject_named_by_run_input_is_traced_to_the_tool_it_reached",
+        "a bound run's input carries no reference to its binding, so the effects "
+        "its input reached are listed for nobody",
+        """        let input = input.attributed(&subjects);""",
+        """        let input = input.attributed(&BTreeSet::new());""",
+    ),
+    "SubjectReferencesRideInProvenance": (
+        "src/core/label.rs",
+        "an_allowed_sources_field_answers_the_same_for_a_subject_bound_value",
+        "a subject binding lands in provenance, so every field allowed only from "
+        "its sender refuses every subject-bound value",
+        """        self.label.data_subjects.extend(subjects.iter().copied());""",
+        """        self.label.provenance.extend(subjects.iter().map(|r| SourceId::new(format!("subject:{}", r.index))));""",
+    ),
+    "ThePolicyContextCarriesSubjects": (
+        "src/core/label.rs",
+        "a_cedar_context_label_carries_no_subject_references",
+        "the policy context carries subject references, so a bound run's request "
+        "differs from the same request unbound and a strict schema refuses it",
+        """        label.data_subjects.clear();""",
+        """        let _ = &mut label;""",
+    ),
+    "TheEffectArgsCarrySubjects": (
+        "src/policy/requests.rs",
+        "a_cedar_context_args_label_carries_no_subject_references",
+        "a label embedded in an effect's arguments keeps its subject references, "
+        "so `task.open`'s justification puts them in front of every rule",
+        """                map.remove("data_subjects");""",
+        """                let _ = map.get("data_subjects");""",
+    ),
+    "TheJoinForgetsItsDataSubjects": (
+        "src/core/label.rs",
+        "the_join_is_a_bounded_semilattice_over_the_whole_domain",
+        "a join keeps only one side's subject references, so a value built from "
+        "a bound input is attributed to nobody",
+        """                .union(&other.data_subjects)\n""",
+        """                .union(&self.data_subjects)\n""",
+    ),
+    "TheSubjectLivesOnlyInTheLiveProcess": (
+        "src/runtime/executor.rs",
+        "a_bound_run_resumed_in_a_new_process_keeps_its_subject",
+        "a resumed run does not read its references back from `DataSubjectBound`, "
+        "so what it does after the resume is listed for nobody",
+        """                subjects: recorded_subjects(run, &records),""",
+        """                subjects: BTreeSet::new(),""",
+    ),
+    "AnInboundEventForgetsTheRunsSubject": (
+        "src/runtime/ctx.rs",
+        "an_event_forwarded_by_a_bound_run_is_traced",
+        "an event delivered to a bound run is not attributed to its subject, so "
+        "an effect forwarding it is listed for nobody",
+        """        Tainted::with_label(payload, label).attributed(&self.subjects)""",
+        """        Tainted::with_label(payload, label)""",
+    ),
+    "ACaseStateReadForgetsTheRunsSubject": (
+        "src/runtime/ctx.rs",
+        "case_state_forwarded_by_a_bound_run_is_traced",
+        "case state read by a bound run is not attributed to its subject, so an "
+        "effect forwarding it is listed for nobody",
+        """        let state = Tainted::with_label(snapshot.state, label).attributed(&self.subjects);""",
+        """        let state = Tainted::with_label(snapshot.state, label);""",
+    ),
+    "AnUnresolvedSubjectFallsBackToNone": (
+        "src/runtime/executor.rs",
+        "a_subject_binding_that_cannot_resolve_fails_the_run",
+        "a binding that selects nothing is skipped, so a declared run is admitted "
+        "attributed to nobody",
+        """                    return Err(refuse(&binding, "it selects nothing in the run's input"));""",
+        """                    continue;""",
+    ),
+    "ARefusedSubjectOpensACase": (
+        "src/runtime/executor.rs",
+        "a_refused_subject_binding_opens_no_case",
+        "the run is correlated before its bindings resolve, so every message its "
+        "agent cannot read a subject from opens a case nothing ever runs in",
+        """        let bound = bind_subjects(&declared, subjects, &input, case.is_some())?;""",
+        """        if let (Some(CaseBinding::Correlate { kind, keys }), Some(cases)) = (&case, self.cases.as_ref()) {
+            cases.correlate_or_open(kind, keys, now_for_admission()).await.map_err(RuntimeError::from_store)?;
+        }
+        let bound = bind_subjects(&declared, subjects, &input, case.is_some())?;""",
+    ),
+    "AnUnboundSubjectIsAServerFault": (
+        "src/api/a2a.rs",
+        "a_message_with_no_data_subject_is_invalid_params_and_opens_no_case",
+        "a message its agent cannot read a data subject from is answered "
+        "`-32603 Internal error`, so the caller retries a message that is refused "
+        "every time",
+        """        // reads its data subject from, and the same message is refused again.
+        Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) => {""",
+        """        // reads its data subject from, and the same message is refused again.
+        Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) if false => {""",
+    ),
+    "AnUnboundSubjectIsAServerFaultWhenImmediate": (
+        "src/api/a2a.rs",
+        "a_message_with_no_data_subject_is_invalid_params_and_opens_no_case",
+        "`returnImmediately` answers a message with no data subject as a server "
+        "fault while the blocking send answers it as invalid params",
+        """            Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) => Err(subject_unbound(&e)),""",
+        """            Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) if false => Err(subject_unbound(&e)),""",
+    ),
+    "AnUnboundSubjectIsAServerFaultWhenStreamed": (
+        "src/api/a2a.rs",
+        "a_message_with_no_data_subject_is_invalid_params_and_opens_no_case",
+        "a streamed message with no data subject is answered as a server fault "
+        "while the blocking send answers it as invalid params",
+        """                Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) => {
+                    return Err(subject_unbound(&e));""",
+        """                Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) if false => {
+                    return Err(subject_unbound(&e));""",
+    ),
+    "AnUnboundSubjectExitsAsAnOutage": (
+        "src/bin/agentplane.rs",
+        "an_unbound_subject_exits_as_usage",
+        "`agentplane run` reports an input its agent cannot read a subject from as "
+        "an operational failure, so a script retries an input that is refused "
+        "every time",
+        """        e @ agentplane::core::RuntimeError::SubjectUnbound { .. } => usage(e.to_string()),""",
+        """        e @ agentplane::core::RuntimeError::SubjectUnbound { .. } => e.to_string().into(),""",
+    ),
+    "ALiteralDataSubjectIsAccepted": (
+        "src/manifest/binding.rs",
+        "a_literal_data_subject_is_refused",
+        "a literal data subject parses, so every run's intake is attributed to one "
+        "party",
+        """            MemorySubject::Literal(_) => Err(format!(""",
+        """            MemorySubject::Literal(_) if false => Err(format!(""",
+    ),
+    "ACorrelationDataSubjectIsAccepted": (
+        "src/manifest/binding.rs",
+        "a_correlation_data_subject_is_refused",
+        "a correlation key parses as a data subject, so the subject is sealed in "
+        "one record and left in the clear in every case record, and an erasure "
+        "leaves the identifier behind",
+        """            MemorySubject::Correlation(_) => Err(format!(""",
+        """            MemorySubject::Correlation(_) if false => Err(format!(""",
+    ),
+    "TheBoundSubjectIsWrittenInTheClear": (
+        "src/journal/payload.rs",
+        "an_erased_binding_names_nobody_and_leaves_no_subject_in_the_clear",
+        "a run's data subject is not sealed, so it survives the erasure of the "
+        "run's case in the clear",
+        """            .map(|bound| {""",
+        """            .filter(|_| false).map(|bound| {""",
+    ),
+    "TheSubjectReportOmitsBoundRuns": (
+        "src/subject.rs",
+        "a_subject_report_names_the_runs_an_erasure_acts_on",
+        "the report lists no bound run, so an erasure request is not told which "
+        "runs and cases hold the subject's journaled data",
+        """                                    bound.push(entry);""",
+        """                                    drop(entry);""",
+    ),
+    "TheTraceMatchesOnlyItsOwnRunsReferences": (
+        "src/subject.rs",
+        "a_child_run_forwarding_a_parents_input_is_traced",
+        "a reference is matched only inside the run that bound it, so a "
+        "commissioned run forwarding its parent's input is listed for nobody",
+        """                            label.data_subjects.intersection(&refs).copied().collect();""",
+        """                            label.data_subjects.iter().filter(|r| r.run == run && refs.contains(*r)).copied().collect();""",
+    ),
+    "ACommissionedAnswerForgetsItsSubjects": (
+        "src/runtime/ctx.rs",
+        "a_subject_a_commissioned_run_bound_is_traced_in_its_parent",
+        "a commissioned answer comes back with its sensitivity and none of its "
+        "data-subject references, so what a specialist bound is listed for nobody "
+        "past the delegation boundary",
+        """            data_subjects: answer.label().data_subjects.clone(),""",
+        """            data_subjects: BTreeSet::new(),""",
+    ),
+    "AHandedRunIsUnboundIngress": (
+        "src/subject.rs",
+        "a_handed_run_counts_only_once_it_reads_beyond_its_input",
+        "a commissioned run handed the subject's references is counted as unbound "
+        "ingress though its whole intake is traced, so the class is marked on "
+        "every report a delegation appears in",
+        """            if admitted && !binds && (!handed_refs || reads_beyond_input) {""",
+        """            if admitted && !binds {""",
+    ),
+    "AHandedRunReadingCaseStateIsTraced": (
+        "src/subject.rs",
+        "a_handed_run_counts_only_once_it_reads_beyond_its_input",
+        "a handed run that reads case state is treated as fully traced, though "
+        "that read is attributed to its own bindings and it has none",
+        """                    RecordKind::EffectStarted { descriptor, .. }
+                        if descriptor.kind == CASE_STATE_READ =>
+                    {
+                        reads_beyond_input = true;
+                    }""",
+        """                    RecordKind::EffectStarted { descriptor, .. }
+                        if descriptor.kind == CASE_STATE_READ =>
+                    {
+                        let _ = &mut reads_beyond_input;
+                    }""",
+    ),
+    "ARememberedIntakeIsUnmarked": (
+        "src/subject.rs",
+        "a_handed_run_counts_only_once_it_reads_beyond_its_input",
+        "a memory write by a run taking in the subject is never marked, so data "
+        "that left the trace through memory reads as data that went nowhere",
+        """                        remembered |= takes_in && descriptor.kind == REMEMBER;""",
+        """                        remembered |= false && descriptor.kind == REMEMBER;""",
+    ),
+    "GrantUseIsCountedByKind": (
+        "src/grants.rs",
+        "only_the_uncalled_grant_is_unused",
+        "any tool call counts as use of every grant, so a grant nobody called "
+        "reads as used",
+        """    grant == Some(called)""",
+        """    let _ = (grant, called);\n    true""",
+    ),
+    "ASealedCallReadsAsNoCall": (
+        "src/grants.rs",
+        "every_args_dependent_figure_is_not_derivable_when_sealed",
+        "a call whose arguments are sealed reads as no call, so a grant the agent "
+        "did use is marked unused and proposed for removal",
+        """    } else if unread > 0 {""",
+        """    } else if unread > 0 && false {""",
+    ),
+    "TheProposalAddsAGrant": (
+        "src/grants.rs",
+        "the_proposal_never_adds_or_widens",
+        "the proposal carries a grant the input did not declare, so publishing it "
+        "widens the agent's authority",
+        """    let mut proposal = manifest.clone();""",
+        """    let mut proposal = manifest.clone();\n    proposal.spec.tools.extend(manifest.spec.tools.first().cloned().map(|mut g| {\n        g.reference = \"tool://extra/grant\".into();\n        g\n    }));""",
+    ),
+    "TheProposalWidensAKeptGrant": (
+        "src/grants.rs",
+        "the_proposal_never_adds_or_widens",
+        "the proposal drops a kept grant's protected fields and approval, so a "
+        "narrowing widens what the grants it keeps allow",
+        """        manifest: proposal,""",
+        """        manifest: {\n            let mut p = proposal;\n            for g in &mut p.spec.tools {\n                g.protected_fields.clear();\n                g.requires_approval = false;\n            }\n            p\n        },""",
+    ),
+    "TheGrantReportImportsAStore": (
+        "src/grants.rs",
+        "the_grant_report_imports_no_store_or_client",
+        "the export-only report names a store type, which is the first step to the "
+        "plane query it stands in for",
+        "use std::io::BufRead;\n",
+        "use std::io::BufRead;\n#[allow(unused_imports)]\nuse crate::journal::JournalStore;\n",
+    ),
+    "TheStarterWritesAFixedToken": (
+        "src/bin/agentplane.rs",
+        "init_serve_writes_three_distinct_accepted_tokens",
+        "init --serve writes the same tokens on every machine, so every plane "
+        "started from the getting-started page accepts a credential every "
+        "reader of this repository can compute",
+        """        .try_fill_bytes(&mut bytes)""",
+        """        .try_fill_bytes(&mut [0_u8; 0])""",
+    ),
+    "InitServeOverwritesAnExistingFile": (
+        "src/bin/agentplane.rs",
+        "init_serve_refuses_and_writes_nothing_when_a_file_exists",
+        "init --serve into a directory holding a reviewed file writes the "
+        "starter's files around it before stopping, so half a generated plane "
+        "sits beside the deployment's own",
+        """        .find(|name| dir.join(name).symlink_metadata().is_ok())""",
+        """        .find(|name| false && dir.join(name).symlink_metadata().is_ok())""",
+    ),
+    "TheTokenFileIsWrittenWithTheDefaultMode": (
+        "src/bin/agentplane.rs",
+        "init_serve_writes_three_distinct_accepted_tokens",
+        "the generated token file and the framework token are world-readable, "
+        "so any local user can act as the operator",
+        """            open.mode(if secret { 0o600 } else { 0o644 });""",
+        """            open.mode(0o644);""",
+    ),
+    "TheStarterCarriesItsOwnPolicy": (
+        "src/bin/agentplane.rs",
+        "init_serve_writes_the_shipped_policy",
+        "init --serve writes a policy of its own rather than the shipped "
+        "bundle, so the file CI and the guides reason about is not the one a "
+        "plane started from them enforces",
+        """    written.create(dir, SERVED_FILES[1], SERVED_POLICY, false)?;""",
+        """    written.create(dir, SERVED_FILES[1], "permit(principal, action, resource);\n", false)?;""",
+    ),
+    "TheBundleGrantsNoIncidentVerb": (
+        "examples/serve-policy.cedar",
+        "the_shipped_bundle_permits_the_on_call_verbs_to_operators_only",
+        "the shipped bundle stops granting the on-call verbs, so a deployment "
+        "started from it finds halt, abandon and reconcile denied during the "
+        "incident that needs them",
+        """@id("on-call verbs")\npermit(""",
+        """@id("on-call verbs")\nforbid(""",
+    ),
+    "TheStatedPathLengthDrifts": (
+        "site/content/docs/getting-started.md",
+        "the_zero_to_governed_count_is_the_block_it_counts",
+        "the getting-started page states a zero-to-governed path length the "
+        "block beside it does not hold, so the published figure is one "
+        "nothing re-derives",
+        """**Six commands** take""",
+        """**Seven commands** take""",
+    ),
+    "AQuickstartImportsThePlane": (
+        "examples/frameworks/openai-agents/quickstart.py",
+        "every_framework_quickstart_is_wire_level_and_short",
+        "a framework quickstart imports a package of this project, so the walk "
+        "an adopter copies needs an integration library rather than the wire",
+        """from agents.mcp import MCPServerStreamableHttp\n""",
+        """from agents.mcp import MCPServerStreamableHttp\nimport agentplane\n""",
+    ),
+    "ServeAcceptsABareUrl": (
+        "src/bin/agentplane.rs",
+        "serve_refuses_a_url_that_is_not_the_a2a_endpoint",
+        "serve publishes a --url that is not the A2A endpoint on its card, so "
+        "every client that follows the card is answered 404",
+        """    if url.ends_with("/a2a") {\n        return Ok(url);""",
+        """    if true || url.ends_with("/a2a") {\n        return Ok(url);""",
+    ),
+    "TheStarterPlaneRunsAsRoot": (
+        "src/bin/agentplane.rs",
+        "init_serve_runs_the_plane_as_the_token_files_owner_and_never_root",
+        "init --serve run under sudo writes a compose file that runs the plane "
+        "as root",
+        """    if uid == 0 {\n        return Err(usage(""",
+        """    if false && uid == 0 {\n        return Err(usage(""",
+    ),
+    "AFailedInitServeLeavesItsFiles": (
+        "src/bin/agentplane.rs",
+        "a_failed_init_serve_removes_what_it_wrote",
+        "init --serve failing partway leaves the files it wrote, and every "
+        "re-run is refused over them",
+        """        if !self.kept {""",
+        """        if false && !self.kept {""",
+    ),
+    "TheStarterPostgresTrustsTheNetwork": (
+        "examples/compose.yaml",
+        "init_serve_gives_postgres_a_password_off_the_command_line",
+        "the starter's Postgres takes no password, so on Linux any local "
+        "process reaches it over the bridge as the superuser",
+        """      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password\n""",
+        """      POSTGRES_HOST_AUTH_METHOD: trust\n""",
+    ),
+    "TheStarterPublishesMcpBeyondLoopback": (
+        "examples/compose.yaml",
+        "init_serve_gives_postgres_a_password_off_the_command_line",
+        "the starter publishes its MCP listener on every interface, so the "
+        "machine's network reaches a plane its owner started to try locally",
+        '      - "127.0.0.1:8081:8081"',
+        '      - "8081:8081"',
+    ),
+    "TheOperatorCannotListHalts": (
+        "examples/serve-policy.cedar",
+        "the_shipped_bundle_lets_an_operator_see_what_it_can_stop",
+        "the shipped bundle grants the halt switch and not the halt list, so "
+        "the on-call person is sent to lift a halt they cannot find",
+        """        Action::"api:halt.list",\n""",
+        """        // api:halt.list\n""",
+    ),
+    "APeerDeliversEveryKind": (
+        "examples/serve-policy.cedar",
+        "the_shipped_bundle_grants_a_peer_no_event_kind",
+        "the shipped bundle grants a peer a2a:event.deliver on every kind, so "
+        "a peer answers any wait its task reaches, whatever the wait is for",
+        """        Action::"a2a:task.continue",\n""",
+        """        Action::"a2a:task.continue",\n        Action::"a2a:event.deliver",\n""",
+    ),
+    "AQuickstartNeedsAModel": (
+        "examples/frameworks/langgraph/quickstart.py",
+        "every_framework_quickstart_is_wire_level_and_short",
+        "a quickstart reads a model name with no default, so the published "
+        "keyless block ends in a KeyError",
+        """    if not (model := os.environ.get("QUICKSTART_MODEL")):""",
+        """    if not (model := os.environ["QUICKSTART_MODEL"]):""",
+    ),
+    "TheLockMissesAPin": (
+        "examples/frameworks/microsoft-agent-framework/requirements.txt",
+        "every_framework_quickstart_is_wire_level_and_short",
+        "a quickstart pins a version its hashed lock does not, so CI installs "
+        "one closure and the requirements name another",
+        """a2a-sdk==1.2.1""",
+        """a2a-sdk==1.2.0""",
+    ),
+    "TheBlockNeedsAnUnnamedProgram": (
+        "site/content/docs/getting-started.md",
+        "the_zero_to_governed_count_is_the_block_it_counts",
+        "the zero-to-governed block runs a program the sentence stating what "
+        "the machine needs does not name",
+        """with `git`, `docker` and `uv`""",
+        """with `docker` and `uv`""",
+    ),
+    # ── The second reader's signatures ──────────────────────────────────────
+    "TheSecondReaderAcceptsAnyRecordSignature": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "the second reader counts a record signature as verified without "
+        "checking it, so a forged or altered signature passes the reader an "
+        "auditor runs without this crate",
+        """    if not ed25519_verify(public, record_signing_input(claimed), signature):""",
+        """    if not True:""",
+    ),
+    "TheSecondReaderSignsRecordsWithoutTheDomain": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "the second reader verifies a record signature over the bare chain "
+        "hash, so it accepts a signature made for another domain and refuses "
+        "every honest one",
+        """    return sha256(RECORD_DOMAIN + b"\\x00" + chain_hash)""",
+        """    return chain_hash""",
+    ),
+    "AnUnsignedRecordPassesTheSecondReader": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "with a key supplied, a record with no signature passes the second "
+        "reader, so stripping signatures is a way to pass",
+        """    if signed is None:
+        report.note(f"{where} is absent, inside a verification that required one")
+        return""",
+        """    if signed is None:
+        return""",
+    ),
+    "TheSecondReaderTriesEveryRecordKey": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "the second reader tries every supplied key instead of the one the "
+        "record's key_id names, so a record is attributed to a key that did "
+        "not sign it",
+        """    public = keys.get(key_id) if isinstance(key_id, str) else None""",
+        """    public = next(
+        (k for k in keys.values() if ed25519_verify(k, record_signing_input(claimed), signature)),
+        None,
+    )""",
+    ),
+    "TheSecondReaderDecodesAKeyAtOrAboveP": (
+        "tools/verify_export.py",
+        "the_second_readers_self_test_reports_every_case",
+        "the second reader decodes a point whose y is at or above p, so a key "
+        "spelled y = p + 1 — the identity, written a second way — verifies a "
+        "signature RFC 8032 §5.1.3 says must fail to decode",
+        """    if y >= ED_P:
+        return None""",
+        """    if False:
+        return None""",
+    ),
+    "TheSecondReaderDecodesNegativeZero": (
+        "tools/verify_export.py",
+        "the_second_readers_self_test_reports_every_case",
+        "the second reader decodes x = 0 with the sign bit set, so a second "
+        "spelling of a point with x = 0 verifies as the first",
+        """    if x == 0 and sign == 1:
+        return None""",
+        """    if False:
+        return None""",
+    ),
+    "TheSecondReaderHonoursAZeroTime": (
+        "tools/verify_export.py",
+        "the_second_readers_self_test_reports_every_case",
+        "the second reader honours a cosignature the witness signed at time 0, "
+        "which tlog-witness forbids and the Rust reader refuses, so the two "
+        "readers disagree on whether the checkpoint was cosigned",
+        """    if timestamp == 0:""",
+        """    if False:""",
+    ),
+    "TheSecondReaderHonoursATimePastTheLargest": (
+        "tools/verify_export.py",
+        "the_second_readers_self_test_reports_every_case",
+        "the second reader honours a cosignature signed at a time above 2^63-1, "
+        "which the format refuses and the Rust reader cannot even represent",
+        """    if timestamp > LARGEST_TIMESTAMP:""",
+        """    if False:""",
+    ),
+    "AWeakRecordKeyIsTrusted": (
+        "src/policy/signing.rs",
+        "a_small_order_key_is_not_trusted",
+        "a small-order public key is trusted as a record key, so a signature that "
+        "verifies under it without anybody's secret makes a forged record read "
+        "as signed",
+        """        if key.is_weak() {""",
+        """        if false {""",
+    ),
+    "TheSecondReaderAcceptsANonCanonicalS": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "the second reader's Ed25519 accepts S at or above the group order, "
+        "so one valid signature has a second spelling the Rust reader refuses",
+        """    if s >= ED_L:
+        return False""",
+        """    if False:
+        return False""",
+    ),
+    "ACosignatureLineMatchesOnNameAlone": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "the second reader honours a note line whose name matches a witness key "
+        "and whose key id does not, so the name a line carries — which anybody "
+        "can type — is what selects the key",
+        """    public = witnesses.get((name, decoded[:4]))""",
+        """    public = next((p for (n, _), p in witnesses.items() if n == name), None)""",
+    ),
+    "TheSecondReaderDropsTheCosignatureTimeLine": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "the second reader verifies a cosignature over the header and body "
+        "without the time line, so the signed time is not what the signature "
+        "covers and every honest cosignature fails",
+        """    return b"cosignature/v1\\ntime " + str(timestamp).encode("ascii") + b"\\n" + body""",
+        """    return b"cosignature/v1\\n" + body""",
+    ),
+    "TheSecondReaderNeverFindsAWitnessStale": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "under --max-checkpoint-age the second reader never finds a witness "
+        "older than the maximum, so a log a witness stopped seeing long ago "
+        "reads as fresh",
+        """        elif age > max_age:""",
+        """        elif False:""",
+    ),
+    "TheSecondReaderJudgesAnUnverifiedTime": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "the second reader judges freshness from the time a note line claims "
+        "whether or not its cosignature verified, so anybody who can write a "
+        "line makes a stale log read as fresh",
+        """        for name, timestamp in anchor.cosigned:
+            if name not in latest""",
+        """        for name, timestamp in [(n, claimed_time(d)) for n, d in anchor.lines]:
+            if timestamp is None:
+                continue
+            if name not in latest""",
+    ),
+    "TheSecondReaderAcceptsAnyGraderSignature": (
+        "tools/verify_export.py",
+        "the_second_reader_checks_every_signature_in_the_signed_golden_artifacts",
+        "under --grader-key the second reader holds a sidecar without checking "
+        "its signature, so a verdict whose content was swapped after signing "
+        "reads as the grader's",
+        """    if not ed25519_verify(public, sidecar_signing_input(sidecar), signature):""",
+        """    if not True:""",
+    ),
+    "AFileCheckpointsCosignaturesAreDropped": (
+        "src/bin/agentplane.rs",
+        "a_cosigned_note_file_names_its_witness_in_verify",
+        "verify reads a cosigned note handed as a --checkpoint file and checks "
+        "none of its lines, so the Rust reader says nobody vouched for an "
+        "anchor the second reader says a witness cosigned",
+        """    let cosignatures = agentplane::journal::cosignatures_in(&note, &trusted);""",
+        """    let cosignatures: Vec<agentplane::journal::Cosignature> = {
+        let _ = (&note, &trusted);
+        Vec::new()
+    };""",
+    ),
+    "APackageLeafIsAcceptedWithoutItsPath": (
+        "src/export.rs",
+        "a_package_with_a_damaged_path_is_not_sound",
+        "a disclosure package's leaf is sound whatever its path says, so a run "
+        "that is in no history the header names verifies as one of the matter's",
+        """        && !leaf_is_proved(seal, pass.index, pass.proof.as_deref(), &report.checkpoint)""",
+        """        && !leaf_is_proved(seal, pass.index, pass.proof.as_deref(), &report.checkpoint)
+        && false""",
+    ),
+    "APackageIsHeldToTheWholeLogCount": (
+        "src/export.rs",
+        "one_matter_verifies_sound_against_an_outside_anchor",
+        "a disclosure package is settled by the whole-log count, so every honest "
+        "package of one matter reads as runs deleted from the plane",
+        """    if report.selection.is_some() {
+        settle_package(""",
+        """    if false {
+        settle_package(""",
+    ),
+    "APackageProofIsTakenAtTheLiveSize": (
+        "src/export.rs",
+        "a_package_taken_while_runs_seal_verifies",
+        "a package's paths are taken against the live log, so a run sealed while "
+        "the file is written makes every path fail against the header's root",
+        """                .inclusion_proof_at(run, log_size)""",
+        """                .inclusion_proof(run)""",
+    ),
+    "APackageCarriesEveryCase": (
+        "src/export.rs",
+        "a_package_carries_only_its_runs_cases",
+        "a disclosure package carries every case the plane holds, so the "
+        "recipient of one matter receives the account of every other",
+        """    if package.is_some() {
+        for id in stamped {""",
+        """    if false {
+        for id in stamped {""",
+    ),
+    "RestoreReadsAPackage": (
+        "src/export.rs",
+        "restore_refuses_a_disclosure_package",
+        "restore and a strict replay read a package as an export and refuse it "
+        "only for its format version, so the operator is told the file is from "
+        "another build rather than that it is one matter",
+        """            Some(DISCLOSURE_KIND) => return Err(std::io::Error::other(PACKAGE_REFUSED)),""",
+        """            Some(DISCLOSURE_KIND) => {}""",
+    ),
+    "ReadRunsReadsAPackage": (
+        "src/export.rs",
+        "policy_check_refuses_a_disclosure_package",
+        "policy check and grants answer a package as a file that is no export, so "
+        "neither says it was handed one matter rather than the plane",
+        """            Some(DISCLOSURE_KIND) if !header => {""",
+        """            Some(DISCLOSURE_KIND) if false => {""",
+    ),
+    "APathProvedLeafIsNotSound": (
+        "src/export.rs",
+        "a_grader_verdict_binds_to_a_disclosed_run",
+        "a run proved by its path is left out of the sound list, so no grader's "
+        "verdict binds to a disclosed run",
+        """        report.sound.push(run);""",
+        """        if report.selection.is_none() {
+            report.sound.push(run);
+        }""",
+    ),
+    "TheSecondReaderSkipsThePackagePath": (
+        "tools/verify_export.py",
+        "a_frozen_package_verifies_by_its_paths_in_both_readers",
+        "the second reader accepts a package whose path does not prove its leaf, "
+        "so the independent reader passes a run in no history the header names",
+        """                or not path_proves(leaf_hash(seal), index, log_size, hashes, claimed_root)""",
+        """                or False""",
+    ),
+    "TheInclusionPrefixIgnoresTheSize": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a proof asked at a past size is taken over the live log, so a path "
+        "against an earlier checkpoint fails against that checkpoint's root",
+        """            proof: crate::core::merkle::inclusion_proof(prefix, at),""",
+        """            proof: crate::core::merkle::inclusion_proof(&leaves, at),""",
+    ),
+    "TheDisclosureIsDeliveredUnrecorded": (
+        "src/disclosure.rs",
+        "no_byte_is_emitted_when_the_disclosure_cannot_be_recorded",
+        "a package is delivered though its act could not be recorded, so a copy "
+        "leaves the plane that no later erasure can name",
+        """        .map_err(DiscloseError::Unrecorded)?;""",
+        """        .map_or(Ok(()), |_| Ok::<(), DiscloseError>(()))?;""",
+    ),
+    "AnErasureDoesNotReadTheDisclosureRegister": (
+        "src/blob/mod.rs",
+        "an_unsealed_disclosure_is_reported_not_reached",
+        "an erasure names no disclosure of what it erased, so the operator "
+        "believes the obligation discharged while a copy is outside the plane",
+        """        .disclosures(cases, runs)""",
+        """        .disclosures(&[], &[])""",
+    ),
+    "RetentionDropsTheDisclosures": (
+        "src/retention.rs",
+        "a_retention_pass_names_the_disclosures_of_what_it_erased",
+        "a retention pass erases a disclosed matter and its report names no copy",
+        """                    .extend(n.copies.iter().map(|copy| format!("case {case}: {copy}")));""",
+        """                    .extend(n.copies.iter().take(0).map(|copy| format!("case {case}: {copy}")));""",
+    ),
+    "EveryDisclosureIsReportedSealed": (
+        "src/disclosure.rs",
+        "an_unsealed_disclosure_is_reported_not_reached",
+        "an erasure reports a plaintext copy as sealed, so the operator reads "
+        "payloads as unopenable that the recipient holds in the clear",
+        """        let reach = if self.sealed {""",
+        """        let reach = if true {""",
+    ),
+    "TheDisclosureListingIgnoresTheRun": (
+        "src/disclosure.rs",
+        "a_disclosure_is_recorded_with_the_digest_of_what_left",
+        "a disclosure is found by its case only, so a case-less run's copy is "
+        "named by no erasure and no listing",
+        """        self.cases.iter().any(|c| cases.contains(c)) || self.runs.iter().any(|r| runs.contains(r))""",
+        """        self.cases.iter().any(|c| cases.contains(c)) || runs.is_empty() && false""",
+    ),
+    "ASealedPackageIsRecordedClear": (
+        "src/export.rs",
+        "an_erasure_names_the_disclosure_of_what_it_erased",
+        "a sealed plane's package is recorded as plaintext, so its erasure "
+        "claims a copy it reaches is out of reach",
+        """                            sealed |= found.iter().any(|r| carries_sealed(r.raw()));""",
+        """                            sealed |= found.is_empty() && carries_sealed(&[]);""",
+    ),
+    "ALaterHeaderReChoosesTheRules": (
+        "src/export.rs",
+        "a_later_header_is_a_finding_and_ignored",
+        "a header past the first line is read, so a whole export with runs "
+        "removed relabels itself a package and the deletion goes unreported",
+        """                if !is_first {
+                    report.findings.push(format!(""",
+        """                if false {
+                    report.findings.push(format!(""",
+    ),
+    "TheSecondReaderReadsALaterHeader": (
+        "tools/verify_export.py",
+        "a_later_header_is_a_finding_and_ignored",
+        "the second reader names a later header only as an unknown framing line, "
+        "so the two readers disagree on why the file is not sound",
+        """        if kind in (HEADER_KIND, PACKAGE_KIND):""",
+        """        if False:""",
+    ),
+    "AnIndexWithoutASealPlacesNothingSilently": (
+        "src/export.rs",
+        "a_block_with_an_index_and_no_seal_is_a_finding",
+        "a block claiming a log position with no seal is read as an open run, "
+        "so a stripped seal reads as a state rather than a removal",
+        """    let malformed = claims_place && placed.is_none();""",
+        """    let malformed = false && claims_place && placed.is_none();""",
+    ),
+    "AStrippedLeafReadsAsAnOpenRun": (
+        "src/export.rs",
+        "a_concluded_run_without_its_leaf_is_a_finding",
+        "a package run whose conclusion seals and whose leaf was removed reads as "
+        "open, so the path that would have failed is simply never checked",
+        """        && crate::audit::has_sealing_conclusion(&pass.resealed)""",
+        """        && crate::audit::has_sealing_conclusion(&pass.resealed)
+        && false""",
+    ),
+    "TheSecondReaderTakesAStrippedLeafAsOpen": (
+        "tools/verify_export.py",
+        "a_concluded_run_without_its_leaf_is_a_finding",
+        "the second reader reads a sealed run with its leaf removed as open, so "
+        "the independent reader passes a package whose path was deleted",
+        """            if outcome in SEALED_OUTCOMES and run not in leafed:""",
+        """            if False:""",
+    ),
+    "APackageWritesAConclusionWithoutItsLeaf": (
+        "src/export.rs",
+        "a_package_refuses_a_concluded_run_it_cannot_place",
+        "the writer carries a run that sealed after its checkpoint as open, so "
+        "an honest package reads to every verifier as a leaf stripped from it",
+        """                            if placed.is_none() && crate::audit::has_sealing_conclusion(&found) {""",
+        """                            if false && placed.is_none() && crate::audit::has_sealing_conclusion(&found) {""",
+    ),
+    "ARunCarriedTwiceStaysSound": (
+        "src/export.rs",
+        "a_repeated_run_or_index_is_a_finding",
+        "a run carried in two blocks keeps the sound verdict its first block "
+        "earned, so a file offering two histories for one run vouches for one",
+        """        report.sound.retain(|run| *run != pass.run);""",
+        """        let _ = &report.sound;""",
+    ),
+    "TheSecondReaderTakesARunTwice": (
+        "tools/verify_export.py",
+        "a_repeated_run_or_index_is_a_finding",
+        "the second reader keys a run's blocks by its id, so a run carried twice "
+        "is read as one and the second history overwrites the first",
+        """            if str(current_run) in report.blocks:
+                report.note(""",
+        """            if False:
+                report.note(""",
+    ),
+    "ASelectedCaseMayBeOmitted": (
+        "src/export.rs",
+        "a_selected_case_the_package_omits_is_a_finding",
+        "a package omits a matter its own header names and verifies sound, so a "
+        "recipient is told it holds a case the file does not carry",
+        """        if !carried.contains(&case) {""",
+        """        if false && !carried.contains(&case) {""",
+    ),
+    "TheSecondReaderIgnoresTheSelection": (
+        "tools/verify_export.py",
+        "a_selected_case_the_package_omits_is_a_finding",
+        "the second reader passes a package that omits a case its header names",
+        """    for case in sorted(set(map(str, selected_cases)) - carried):""",
+        """    for case in []:""",
+    ),
+    "ADisclosureIsRecordedForADestinationThatCannotReceive": (
+        "src/disclosure.rs",
+        "an_unreceivable_destination_is_refused_before_recording",
+        "a destination that is a directory is found only at the rename, after "
+        "the act is recorded, so the register names a copy that never left",
+        """    receivable(destination).map_err(DiscloseError::Write)?;""",
+        """    let _ = receivable;""",
+    ),
+    "APostgresInclusionPrefixIgnoresTheSize": (
+        "src/store/postgres.rs",
+        "postgres_satisfies_the_journal_store_contract",
+        "the shared backend proves at the live size whatever size it is asked "
+        "for, so a package path fails against its own header's root — the redb "
+        "mutation cannot reach this copy of the rule",
+        """            proof: crate::core::merkle::inclusion_proof(prefix, at),""",
+        """            proof: crate::core::merkle::inclusion_proof(&leaves, at),""",
+    ),
+    "AHaltLiftIsNotJournaled": (
+        "src/runtime/executor.rs",
+        "a_lifted_halt_names_who_lifted_it",
+        "lifting a halt removes the row and writes nothing, so who let the work "
+        "start again — and the stop they ended — is gone with the row",
+        """        let run = self
+            .seal_operator_record(
+                RecordKind::HaltLifted {
+                    scope: scope.key(),
+                    by: by.clone(),
+                    at,
+                    reason: halt.reason.clone(),
+                    thrown_by: halt.by.clone(),
+                    thrown_at: halt.at,
+                },
+                None,
+                HALT_LIFTED_OUTCOME,
+                None,
+            )
+            .await?;""",
+        """        let run = RunId::generate();
+        let _ = (by, at);""",
+    ),
+    "AHoldReleaseIsNotJournaled": (
+        "src/runtime/executor.rs",
+        "a_released_hold_names_who_released_it",
+        "releasing a hold removes the row and writes nothing, so the instruction "
+        "that let an erasure reach the matter names nobody",
+        """        let run = self
+            .seal_operator_record(
+                RecordKind::HoldReleased {
+                    by: by.clone(),
+                    at,
+                    placed_by: standing.by.clone(),
+                    placed_at: standing.placed_at,
+                },
+                Some(case),
+                HOLD_RELEASED_OUTCOME,
+                None,
+            )
+            .await?;""",
+        """        let run = RunId::generate();
+        let _ = (by, at, &standing);""",
+    ),
+    "ASinkContentRuleIsNotEvaluated": (
+        "src/runtime/ctx.rs",
+        "a_content_rule_refuses_a_value_at_its_sink",
+        "a declared content rule is evaluated at the sink and its refusal "
+        "discarded, so the value it names is sent",
+        """        let refused = outcome.refused.first().cloned();""",
+        """        let refused: Option<crate::content::Hit> = None;""",
+    ),
+    "ARedactedValueIsSentWhole": (
+        "src/runtime/ctx.rs",
+        "a_redacted_call_sends_and_records_only_the_redacted_bytes",
+        "a redaction is computed and the effect is never rebound, so the "
+        "value goes out whole while the gates judge the redacted copy",
+        """            Some(value) => effect.rebind(value.clone()),""",
+        """            Some(_) => true,""",
+    ),
+    "RedactionIsLiveOnly": (
+        "src/runtime/ctx.rs",
+        "a_redacted_call_sends_and_records_only_the_redacted_bytes",
+        "redaction is applied only where dispatch is live, so a replay keys the "
+        "effect over the unredacted value and cannot find the call it recorded",
+        """            Some(value) => effect.rebind(value.clone()),""",
+        """            Some(value) if self.writes_enabled() => effect.rebind(value.clone()),
+            Some(_) => false,""",
+    ),
+    "APrebuiltSinkSendsUnredacted": (
+        "src/runtime/ctx.rs",
+        "a_redact_rule_at_a_prebuilt_sink_refuses",
+        "an effect that cannot take a redaction is dispatched with the value "
+        "the redaction exists to keep from crossing",
+        """        if let Some(hit) = refused.or_else(|| redaction.filter(|_| !rebound))""",
+        """        if let Some(hit) = refused.or_else(|| redaction.filter(|_| false && !rebound))""",
+    ),
+    "AContentRefusalReplaysAsADenial": (
+        "src/runtime/ctx.rs",
+        "a_content_refusal_strict_replays_to_the_same_conclusion",
+        "a recorded content refusal replays as an authorization denial, so the "
+        "replay ends a run the original answered by asking again",
+        """            if action == crate::core::ACTION_EGRESS || action == crate::core::ACTION_CONTENT =>""",
+        """            if action == crate::core::ACTION_EGRESS =>""",
+    ),
+    "AContentRefusalIsNotCounted": (
+        "src/runtime/ctx.rs",
+        "a_content_refusal_counts_against_the_denial_ceiling",
+        "a content refusal is not counted toward max_denials, so a loop may "
+        "probe a rule without limit",
+        """        if let Err(exceeded) = self.ledger.lock().expect("budget mutex").record_denial() {
+            return StepError::Budget(exceeded);
+        }
+        denial.into()""",
+        """        if !matches!(denial, PolicyError::Content { .. })
+            && let Err(exceeded) = self.ledger.lock().expect("budget mutex").record_denial()
+        {
+            return StepError::Budget(exceeded);
+        }
+        denial.into()""",
+    ),
+    "AClassificationAssignsInsteadOfJoining": (
+        "src/core/content.rs",
+        "no_content_verdict_lowers_a_label",
+        "a classify rule sets the sensitivity it names instead of joining it, "
+        "so a rule naming a lower level lowers a secret value's label",
+        """    classified.map_or(declared, |raised| declared.max(raised))""",
+        """    classified.map_or(declared, |raised| raised)""",
+    ),
+    "TheTagBlockIsNotHidden": (
+        "src/core/visible.rs",
+        "the_invisible_matcher_refuses_hidden_code_points_and_passes_the_named_residue",
+        "the tag characters drop out of the hidden set, so text a model reads "
+        "and a reviewer cannot see passes an invisible rule",
+        """            | 0xE0000..=0xE007F
+""",
+        "",
+    ),
+    "TheMatchIsNamedInTheReason": (
+        "src/content/mod.rs",
+        "no_content_refusal_records_the_matched_text",
+        "a content refusal's pointer carries the matched text, so the record "
+        "of a refusal holds what the rule refused to let cross",
+        """                        pointer: shown.to_owned(),""",
+        """                        pointer: text.to_owned(),""",
+    ),
+    "ASourceVerdictIsNotRecorded": (
+        "src/runtime/ctx.rs",
+        "a_source_escalation_survives_strict_replay_without_the_rule",
+        "the verdict a source rule reached is not written beside the output, so "
+        "a replay labels the value as if no rule had matched",
+        """                            declared: crate::core::DeclaredOutput::of(effect),
+                            content: content.clone(),""",
+        """                            declared: crate::core::DeclaredOutput::of(effect),
+                            content: None,""",
+    ),
+    "ASourceClassificationIsNotJoined": (
+        "src/runtime/ctx.rs",
+        "a_source_escalation_survives_strict_replay_without_the_rule",
+        "a source rule's classification is recorded and not applied, so the "
+        "value reaches the next sink at the level its producer declared",
+        """                self.source_raise = content.and_then(|c| c.sensitivity);""",
+        """                self.source_raise = None;
+                let _ = content;""",
+    ),
+    "ReplayIgnoresTheRecordedVerdict": (
+        "src/runtime/ctx.rs",
+        "a_replayed_arrival_keeps_its_recorded_label",
+        "a replayed output's label ignores the recorded content verdict, so a "
+        "replay under a declaration without the rule re-judges the arrival",
+        """                declared.sensitivity =
+                    crate::core::ContentVerdict::raise(content.as_ref(), declared.sensitivity);
+                Ok(Replayed::Answered(""",
+        """                Ok(Replayed::Answered(""",
+    ),
+    "AReplayedSourceRefusalPasses": (
+        "src/runtime/ctx.rs",
+        "a_source_refusal_is_recorded_beside_the_output_and_replayed",
+        "a recorded source refusal is not handed to the step on replay, so the "
+        "replay continues past where the run was refused",
+        """                self.arrival_refusal(content.as_ref())?;
+                declared.sensitivity =""",
+        """                declared.sensitivity =""",
+    ),
+    "ADeliveredEventSkipsSourceRules": (
+        "src/runtime/executor.rs",
+        "a_source_rule_applies_to_an_event_delivered_while_suspended",
+        "an event delivered to a suspended run is recorded unjudged, so the "
+        "source rule covers only the event a waiting step claims itself",
+        """            let content = self.delivered_verdict(&history, &event.payload);""",
+        """            let content: Option<crate::core::ContentVerdict> = None;""",
+    ),
+    "ABufferedEventSkipsSourceRules": (
+        "src/runtime/ctx.rs",
+        "a_source_rule_applies_to_an_event_delivered_while_suspended",
+        "an event claimed from the buffer is recorded unjudged",
+        """            let content = self.source_verdict(AWAIT_KIND, &buffered.event.payload);""",
+        """            let content: Option<crate::core::ContentVerdict> = None;""",
+    ),
+    "AdmissionContentRulesAreSkipped": (
+        "src/runtime/executor.rs",
+        "an_admission_rule_refuses_hidden_code_points_with_nothing_recorded",
+        "admission rules are never evaluated, so a run is admitted over input "
+        "a declared rule refuses",
+        """        let input = self.admit_content(&agent, input)?;
+""",
+        "",
+    ),
+    "ACheckerErrorPasses": (
+        "src/runtime/ctx.rs",
+        "a_checker_outage_refuses_the_guarded_call",
+        "a checker that could not answer is read as one that found nothing, so "
+        "an outage of the classifier lets every value through",
+        """                Err(StepError::Effect(_) | StepError::Policy(_)) => {
+                    Some(crate::core::ContentVerdict {
+                        rules: vec![id.clone()],
+                        sensitivity: None,
+                        refused: Some(crate::core::ContentRefusal {
+                            rule: id.clone(),
+                            pointer: String::new(),
+                        }),
+                    })
+                }""",
+        """                Err(StepError::Effect(_) | StepError::Policy(_)) => None,""",
+    ),
+    "AnUnregisteredCheckerBuilds": (
+        "src/runtime/executor.rs",
+        "a_check_naming_an_unregistered_checker_refuses_the_build",
+        "a plane builds with a declared check nothing can run, so a reviewer's "
+        "control exists only in the file",
+        """                Self::check_content_checkers(&self.checkers, m)?;
+""",
+        "",
+    ),
+    "ASinkCheckIsNotRun": (
+        "src/runtime/ctx.rs",
+        "a_checker_outage_refuses_the_guarded_call",
+        "the declared checks at a sink are never dispatched, so the classifier "
+        "a deployment brought judges nothing",
+        """        let (checks, verdict) = self
+            .run_checks(crate::content::At::Sink(&kind), sent)
+            .await?;""",
+        """        let (checks, verdict): (Vec<String>, crate::core::ContentVerdict) =
+            (Vec::new(), crate::core::ContentVerdict { rules: Vec::new(), sensitivity: None, refused: None });
+        let _ = sent;""",
+    ),
+    "ASourceCheckIsNotRun": (
+        "src/runtime/ctx.rs",
+        "a_check_at_a_source_judges_what_the_call_returned",
+        "a check declared on a call's output never runs, so what a model "
+        "returned flows on at the level its producer declared",
+        """        let label = self.checked_arrival(&kind, &output, label).await?;
+""",
+        "",
+    ),
+    "ACheckCategoryOutsideTheDeclarationPasses": (
+        "src/content/mod.rs",
+        "a_checker_outage_refuses_the_guarded_call",
+        "a checker reporting a category it never declared is believed, so a "
+        "malformed answer is read as a clean one",
+        """        if let Some(unknown) = categories
+            .iter()
+            .find(|c| !self.checker.categories().contains(*c))""",
+        """        if let Some(unknown) = categories
+            .iter()
+            .find(|c| false && !self.checker.categories().contains(*c))""",
+    ),
+    "ASinkClassificationIsIgnored": (
+        "src/runtime/ctx.rs",
+        "a_sink_classification_raises_the_label_the_gates_judge",
+        "a sink rule that classifies parses and changes nothing, so the label "
+        "the gates judge is the one the producer declared",
+        """        let classified = [outcome.sensitivity, verdict.sensitivity]""",
+        """        let classified = [None, verdict.sensitivity]""",
+    ),
+    "JoinDropsProvenance": (
+        "src/core/label.rs",
+        "the_join_is_a_bounded_semilattice_over_the_whole_domain",
+        "a join keeps one side's provenance and forgets the other's, so a value "
+        "mixed from two sources answers for one",
+        """            provenance: self.provenance.union(&other.provenance).cloned().collect(),""",
+        """            provenance: self.provenance.clone(),""",
+    ),
+    "ProjectionTreatsAPrefixAsAnAncestor": (
+        "src/core/label.rs",
+        "rebase_and_projection_agree_with_the_pointer_model",
+        "a projection at `/a` carries a mark on `/ab` down, so a release reaches "
+        "a sibling field whose name merely starts the same",
+        """            .filter(|rest| rest.starts_with('/'))
+            .map(|rest| Self {""",
+        """            .filter(|rest| rest.starts_with('/') || !rest.is_empty())
+            .map(|rest| Self {""",
+    ),
+    "CaseStateWriteIgnoresVersion": (
+        "src/store/redb_cases.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a case-state write ignores the version it was read at, so of several "
+        "runs racing on one case every one wins and all but the last vanish",
+        """                    Some((kind, status, _, ver, at)) if ver == expected.0 => {""",
+        """                    Some((kind, status, _, ver, at)) if ver == expected.0 || ver != expected.0 => {""",
+    ),
+    "ForgetLeavesAVersionReadable": (
+        "src/store/redb_memory.rs",
+        "redb_satisfies_the_memory_store_contract",
+        "forgetting a memory removes its current entry and leaves its history "
+        "readable by id and version",
+        """                for version in doomed {""",
+        """                for version in doomed.into_iter().filter(|_| false) {""",
+    ),
+    "ARetriedErasureRewritesItsReason": (
+        "src/testkit/memory_keyring.rs",
+        "the_memory_key_ring_satisfies_the_key_ring_contract",
+        "a second destruction overwrites the first one's reason, so a retry "
+        "rewrites the account of why the data went",
+        """            .or_insert_with(|| (at, reason.to_owned()));""",
+        """            .and_modify(|first| *first = (at, reason.to_owned()))
+            .or_insert_with(|| (at, reason.to_owned()));""",
+    ),
+    "AConsumedMessageIsClaimedAgain": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a run's own claim is recovered whether or not its wait consumed it, so "
+        "the run's next wait on the same key is handed the first message again",
+        """                                .is_some_and(|claimed| claimed.value() == effect);""",
+        """                                .is_some_and(|_| true)
+                            || (row.3 == 1 && row.7 == run);""",
+    ),
+    "AnUnsubscribeShedsEveryWait": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "retiring one wait sheds every message its run holds claimed, so a "
+        "sibling wait's undelivered message is delivered as null",
+        """            shed_claimed(&w, &tenant, &run, Some(&effect))?;""",
+        """            shed_claimed(&w, &tenant, &run, None)?;""",
+    ),
+    "AnInStepClaimLeavesTheWaitMatchable": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a wait that claimed its message in step stays matchable, so a second "
+        "message is claimed for it and discarded by its delivery",
+        """                        w.open_table(PARKED)
+                            .map_err(|e| be(&e))?
+                            .insert((tenant.as_str(), run.as_str(), effect.as_str()), ts(at))
+                            .map_err(|e| be(&e))?;
+                        let corr_t""",
+        """                        let corr_t""",
+    ),
+    "ARetriedTargetedMessageIsANewTurn": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a peer's retry of a message the run already consumed is delivered to "
+        "the run's next wait as that turn's input",
+        """                        (Some(_), None) => false,""",
+        """                        (Some(_), None) => true,""",
+    ),
+    "ADuplicateIsNeverReoffered": (
+        "src/runtime/executor.rs",
+        "a_retried_delivery_offers_a_message_a_crash_left_unmatched",
+        "a counterparty's retry is answered from the dedup alone, so a message "
+        "stored by a delivery that died before matching is never offered",
+        """        if !fresh && !rematch {""",
+        """        if !fresh {""",
+    ),
+    "ALostDecisionReportsSuccess": (
+        "src/runtime/sweeper.rs",
+        "a_decision_that_lost_to_the_runs_conclusion_is_refused",
+        "a decision that lost to the run's conclusion is reported delivered, so "
+        "the decider believes an approval reached a run that never saw it",
+        """        if !settled && !matches!(delivery, crate::core::Delivery::Resumed { .. }) {""",
+        """        if false && !settled && !matches!(delivery, crate::core::Delivery::Resumed { .. }) {""",
+    ),
+    "AnAnswerLandsAfterTheConclusion": (
+        "src/runtime/executor.rs",
+        "a_message_for_a_concluded_run_goes_to_the_live_waiter_behind_it",
+        "a delivery appends an answer after a durable conclusion, leaving a run "
+        "its seal refuses and a message consumed by nobody",
+        """        let closed = resume_is_closed(&history).is_some();""",
+        """        let closed = resume_is_closed(&history).is_some() && false;""",
+    ),
+    "AWakeLandsAfterTheConclusion": (
+        "src/runtime/sweeper.rs",
+        "a_timer_for_a_concluded_run_finishes_it_rather_than_waking_it",
+        "a timer wake is appended after a durable conclusion, leaving a run its "
+        "seal refuses",
+        """        let closed = super::executor::resume_is_closed(&history).is_some();""",
+        """        let closed = super::executor::resume_is_closed(&history).is_some() && false;""",
+    ),
+    "AClosedRunsUnconsumedMessageIsShed": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "retiring a closed run sheds a message it claimed and never consumed, so "
+        "a message that arrived in time is lost to the run that concluded first",
+        """            let released = release_claimed(&w, &tenant, &run, &unanswered)?;""",
+        """            let released: Vec<InboundEvent> = Vec::new();
+            let _ = &unanswered;""",
+    ),
+    "AParkedWaitClaimsASecondMessage": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a wait that already holds a targeted message claims a buffered one "
+        "beside it, and retiring the wait sheds one of the two unread",
+        """                            && ((row.3 == 0 && !parked_here) || own_claim)""",
+        """                            && ((row.3 == 0 && (parked_here || !parked_here)) || own_claim)""",
+    ),
+    "AnAddressedMessageIsOfferedToAnother": (
+        "src/store/redb_events.rs",
+        "redb_satisfies_the_case_layer_contracts",
+        "a message sent to one run by name, which that run never consumed, is "
+        "offered to another run waiting on the same key",
+        """        if addressed {
+            // Its run's alone""",
+        """        if addressed && false {
+            // Its run's alone""",
+    ),
+    "TheSweepSkipsUnsealedConclusions": (
+        "src/runtime/sweeper.rs",
+        "a_lift_concluded_but_not_sealed_is_sealed_by_the_next_sweep",
+        "an operator record that concluded and crashed before its seal is never "
+        "finished, so it lists as a live run forever",
+        """            report.seals_finished = self.seal_unsealed_conclusions(RECOVERY_BATCH).await?;""",
+        """            report.seals_finished = 0;""",
+    ),
+    "TheHoldGoesBeforeTheRecord": (
+        "src/runtime/executor.rs",
+        "a_lift_whose_record_cannot_be_written_leaves_the_halt_standing",
+        "the hold row is removed before the release is recorded, so a journal "
+        "that refuses the record leaves the matter erasable with nobody named",
+        """            };
+        };
+        let run = self
+            .seal_operator_record(
+                RecordKind::HoldReleased {""",
+        """            };
+        };
+        cases.release_hold_if(case, &standing).await.map_err(RuntimeError::Store)?;
+        let run = self
+            .seal_operator_record(
+                RecordKind::HoldReleased {""",
+    ),
+    "ATerminalReleaseNeedsNoActor": (
+        "src/bin/agentplane.rs",
+        "a_terminal_lift_without_an_actor_is_refused",
+        "a terminal hold release with no --actor is recorded under a placeholder, "
+        "so the record that exists to name who released it names nobody",
+        """        let by = lifter(opts.actor.as_deref(), "release a hold")?;""",
+        """        let by = lifter(opts.actor.as_deref().or(Some("anonymous")), "release a hold")?;""",
+    ),
+    "TheRowGoesBeforeTheRecord": (
+        "src/runtime/executor.rs",
+        "a_lift_whose_record_cannot_be_written_leaves_the_halt_standing",
+        "the halt row is removed before the lift is recorded, so a journal that "
+        "refuses the record leaves the work started again with nobody named",
+        """            return Ok(None);
+        };
+        let run = self
+            .seal_operator_record(
+                RecordKind::HaltLifted {""",
+        """            return Ok(None);
+        };
+        quotas.lift_halt(scope).await.map_err(RuntimeError::Store)?;
+        let run = self
+            .seal_operator_record(
+                RecordKind::HaltLifted {""",
+    ),
+    "ALiftReadsBackAsAQuarantine": (
+        "src/runtime/executor.rs",
+        "every_outcome_this_build_writes_is_one_it_can_read_back",
+        "the reader loses the arm for a lift, so a run this plane sealed itself "
+        "reads back as quarantined instead of naming who lifted the halt",
+        """        HALT_LIFTED_OUTCOME => recorded_halt_lift(records).map_or_else(""",
+        """        "never-written-by-this-build" => recorded_halt_lift(records).map_or_else(""",
+    ),
+    "TheLiftRouteBypassesTheRuntime": (
+        "src/api/mod.rs",
+        "a_hold_release_and_a_halt_lift_name_who_made_them",
+        "the lift route removes the row through the quota store directly, so a "
+        "lift over the wire answers with a record that was never written",
+        """    let record = s
+        .plane
+        .lift_halt(&scope, &by, now_for_account())
+        .await
+        .map_err(|e| control_stands(&e))?;""",
+        """    let record = s
+        .plane
+        .quota_store_if_wired()
+        .ok_or_else(|| unavailable("quota"))?
+        .lift_halt(&scope)
+        .await
+        .map_err(|_| store_failed())?
+        .then(|| crate::runtime::ControlLifted {
+            record: crate::core::RunId::generate(),
+            removed: true,
+        });""",
+    ),
+    "ALiftRemovesWhateverStands": (
+        "src/runtime/executor.rs",
+        "a_halt_rethrown_during_a_lift_still_stands",
+        "the lift removes whatever row stands at the scope, so a halt re-thrown "
+        "after the lift read the old one is deleted under a record naming the old",
+        """            .lift_halt_if(&halt)""",
+        """            .lift_halt(scope)""",
+    ),
+    "ALiftSwallowsARethrow": (
+        "src/runtime/executor.rs",
+        "a_halt_rethrown_during_a_lift_still_stands",
+        "a lift whose conditional removal found a re-thrown halt answers success, "
+        "so the operator is told the scope is clear while the new halt stands",
+        """            if now.iter().any(|h| &h.scope == scope) {""",
+        """            if now.iter().any(|h| &h.scope == scope) && now.is_empty() {""",
+    ),
+    "ALiftClaimsARemovalItDidNotMake": (
+        "src/runtime/executor.rs",
+        "a_lift_beaten_by_another_answers_not_removed",
+        "a lift another lift beat to the row answers that it removed it, so two "
+        "operators are each told they cleared the same halt",
+        """                });
+            }
+        }
+        Ok(Some(ControlLifted {
+            record: run,
+            removed,
+        }))""",
+        """                });
+            }
+        }
+        let _ = removed;
+        Ok(Some(ControlLifted {
+            record: run,
+            removed: true,
+        }))""",
+    ),
+    "TheRedbConditionalLiftIgnoresTheRow": (
+        "src/store/redb_quota.rs",
+        "redb_satisfies_the_quota_store_contract",
+        "the redb conditional lift removes the row without comparing it, so a "
+        "halt re-thrown over the one a lifter read is deleted",
+        """                        super::halt_from_row(expected.scope.clone(), row) == expected""",
+        """                        let _ = super::halt_from_row(expected.scope.clone(), row);
+                        true""",
+    ),
+    "AStandingControlReadsAsAStoreFailure": (
+        "src/api/mod.rs",
+        "a_lift_whose_removal_fails_names_the_record_it_wrote",
+        "a lift recorded over a row that stayed answers a bare store failure, so "
+        "the operator retries without the run that holds the first record",
+        """        .map_err(|e| control_stands(&e))?;""",
+        """        .map_err(|_| store_failed())?;""",
+    ),
+    "ATerminalLiftNeedsNoActor": (
+        "src/bin/agentplane.rs",
+        "a_terminal_lift_without_an_actor_is_refused",
+        "a terminal lift with no --actor is recorded under a placeholder, so the "
+        "record that exists to name who lifted it names nobody in particular",
+        """        let by = lifter(opts.actor.as_deref(), "lift a halt")?;""",
+        """        let by = lifter(opts.actor.as_deref().or(Some("anonymous")), "lift a halt")?;""",
+    ),
+    "TheHaltListingDropsWhoThrewIt": (
+        "src/api/mod.rs",
+        "the_halt_and_hold_listings_name_who_now_and_before",
+        "the standing halt listing answers why and not who, so the person who "
+        "finds a plane stopped cannot ask the one person who knows",
+        """                reason: halt.reason,
+                by: halt.by.actor().to_owned(),""",
+        """                reason: halt.reason,
+                by: String::new(),""",
+    ),
+    "TheLiftHistoryIsOldestFirst": (
+        "src/runtime/executor.rs",
+        "the_halt_and_hold_listings_name_who_now_and_before",
+        "the lift history pages oldest first, so once it is longer than a page "
+        "the lift that just happened never appears",
+        """        self.operator_records(HALT_LIFTED_OUTCOME, limit).await""",
+        """        self.operator_records(HALT_LIFTED_OUTCOME, limit)
+            .await
+            .map(|mut page| {
+                page.reverse();
+                page
+            })""",
+    ),
+    "AReleaseIsNotInTheMattersHistory": (
+        "src/runtime/executor.rs",
+        "a_release_record_survives_the_erasure_it_authorized",
+        "the release record is not stamped with its case, so the matter's "
+        "history — what survives its erasure — lacks the instruction that "
+        "permitted the erasure",
+        """                Some(case),
+                HOLD_RELEASED_OUTCOME,""",
+        """                None,
+                HOLD_RELEASED_OUTCOME,""",
+    ),
+    "TheExchangeDropsTheSubject": (
+        "src/peers/mod.rs",
+        "a_peer_credential_names_the_run_s_subject",
+        "the exchange names one fixed subject for every run, so the peer sees "
+        "the same caller whoever the run acts for",
+        """                subject: chain.owner().id.clone(),""",
+        """                subject: "plane".to_owned(),""",
+    ),
+    "TheCacheKeysOnAudienceAlone": (
+        "src/peers/credentials.rs",
+        "a_cached_credential_is_never_lent_to_another_subject",
+        "the cache holds one credential per audience, so the first person's "
+        "credential is served to every later run that calls the same peer",
+        """        let key = (audience.clone(), subject.to_owned());""",
+        """        let key = (audience.clone(), String::new());""",
+    ),
+    "TheSubjectIsNotChecked": (
+        "src/peers/credentials.rs",
+        "a_credential_for_another_subject_is_refused_before_the_call",
+        "a credential the issuer minted for somebody else is presented, telling "
+        "the peer the call is for a person it is not for",
+        """    if credential.subject() != Some(subject) {""",
+        """    if credential.subject().is_none() {""",
+    ),
+    "ASubjectBoundDoorFallsBackToTheStaticCredential": (
+        "src/peers/mod.rs",
+        "a_chainless_served_run_is_refused_a_subject_bound_peer",
+        "a run acting for nobody reaches a subject-bound peer under the "
+        "credential held beside the source — the ambient authority the source "
+        "was wired to rule out",
+        """            Asker::Nobody => Err(PeerError::NoSubject { peer: peer.clone() }),""",
+        """            Asker::Nobody => Ok(Presentation::Held(held)),""",
+    ),
+    "ATaskPollPresentsThePlanesCredential": (
+        "src/peers/mod.rs",
+        "a_remote_task_poll_names_the_same_subject_as_its_call",
+        "a task read presents the credential held for the peer rather than the "
+        "run's owner's, so the peer is told nobody asked",
+        """    /// Prepare a task read under the same peer grant as the call that
+    /// created it, presenting the credential `asker` is owed.
+    ///
+    /// # Errors
+    ///
+    /// [`PeerError::Unknown`] for an unregistered peer,
+    /// [`PeerError::WrongAudience`] for a held credential bound elsewhere,
+    /// and, at a peer with a credential source, [`PeerError::NoSubject`] for
+    /// a run acting for nobody and [`PeerError::NoPlaneCredential`] for a run
+    /// admitted as the plane with no held credential.
+    pub fn prepare(
+        registry: &PeerRegistry,
+        client: Arc<dyn PeerClient>,
+        task: PeerTask,
+        asker: Asker<'_>,
+    ) -> Result<Self, PeerError> {
+        let Some(grant) = registry.grant(&task.peer).cloned() else {
+            return Err(PeerError::Unknown { peer: task.peer });
+        };
+        let presentation = registry.presentation(&task.peer, asker)?;""",
+        """    /// Prepare a task read under the same peer grant as the call that
+    /// created it, presenting the credential `asker` is owed.
+    ///
+    /// # Errors
+    ///
+    /// [`PeerError::Unknown`] for an unregistered peer,
+    /// [`PeerError::WrongAudience`] for a held credential bound elsewhere,
+    /// and, at a peer with a credential source, [`PeerError::NoSubject`] for
+    /// a run acting for nobody and [`PeerError::NoPlaneCredential`] for a run
+    /// admitted as the plane with no held credential.
+    pub fn prepare(
+        registry: &PeerRegistry,
+        client: Arc<dyn PeerClient>,
+        task: PeerTask,
+        asker: Asker<'_>,
+    ) -> Result<Self, PeerError> {
+        let Some(grant) = registry.grant(&task.peer).cloned() else {
+            return Err(PeerError::Unknown { peer: task.peer });
+        };
+        let _ = asker;
+        let presentation = Presentation::Held(registry.credential_for(&task.peer)?.cloned());""",
+    ),
+    "TheBindingIsNotRecorded": (
+        "src/runtime/ctx.rs",
+        "a_subject_bound_hop_records_its_subject_and_audience",
+        "a hop's announcement no longer says whom its credential named, so a "
+        "reader cannot tell a call the peer could check from one it could not",
+        """                    credential: effect.credential_binding(),""",
+        """                    credential: None,""",
+    ),
+    "AnIssuerOutageIsInDoubt": (
+        "src/peers/mod.rs",
+        "an_issuer_outage_fails_the_call_without_doubt",
+        "an issuer that could not be reached reads as a call in doubt, and a "
+        "mutating peer quarantines over a call that never left",
+        """                        Err(EffectError::Unavailable {
+                            driver: audience.to_string(),
+                            detail,
+                        })""",
+        """                        Err(EffectError::Interrupted {
+                            driver: audience.to_string(),
+                            detail,
+                        })""",
+    ),
+    "AWithdrawnSubjectsCredentialIsServed": (
+        "src/runtime/ctx.rs",
+        "a_withdrawn_subjects_credential_is_not_presented",
+        "a hop inside a step begun before a halt presents the withdrawn owner's "
+        "held credential, until the step ends",
+        """                self.withdrawal_at_hop(key).await?;""",
+        """                let _ = key;""",
+    ),
+    "AWithdrawnSubjectsCredentialStaysHeld": (
+        "src/runtime/ctx.rs",
+        "a_withdrawn_subjects_credential_is_not_presented",
+        "a withdrawal leaves the subject's credential in the source, served "
+        "again the moment the halt is lifted rather than obtained afresh",
+        """            wiring.registry.forget(&withdrawal.subject);""",
+        """            let _ = (wiring, &withdrawal.subject);""",
+    ),
+    "AHopWithholdingIsNeverSuperseded": (
+        "src/journal/replay.rs",
+        "a_withdrawn_subjects_credential_is_not_presented",
+        "a hop's later announcement does not supersede its withholding, so a "
+        "strict replay stops at a pause the run's own records show it resuming "
+        "from",
+        """        self.supersede_withheld(key);
+        self.effects.push(Journaled {""",
+        """        self.effects.push(Journaled {""",
+    ),
+    "AnOlderWithholdingStillStands": (
+        "src/journal/replay.rs",
+        "a_hop_withheld_twice_stands_withheld_once",
+        "a hop withheld twice keeps both withholdings, so every resume consumes "
+        "the older one, never reaches the frontier, and the run cannot resume",
+        """        self.supersede_withheld(key);
+        self.unannounced(""",
+        """        self.unannounced(""",
+    ),
+    "TheExchangeRequestOmitsTheActor": (
+        "src/peers/exchange.rs",
+        "the_exchange_request_carries_the_owner_and_the_actor",
+        "the exchange posts no actor token, so the issuer cannot tell which "
+        "plane is asserting the subject and must take the assertion from nobody",
+        """            ("actor_token", self.actor_token.expose()),""",
+        """            ("actor_token", ""),""",
+    ),
+    "AnIssuerRefusalCarriesItsProse": (
+        "src/peers/exchange.rs",
+        "an_issuer_refusal_is_final_and_names_only_its_code",
+        "an issuer's refusal reaches a journaled failure in the issuer's own "
+        "words, rather than the OAuth error code alone",
+        """                .map_or_else(|_| "no error code".to_owned(), |r| r.error);""",
+        """                .map_or_else(|_| "no error code".to_owned(), |_| String::from_utf8_lossy(&body).into_owned());""",
+    ),
+    "TheApprovalOmitsTheReach": (
+        "src/runtime/declarative.rs",
+        "an_approval_of_a_consultation_shows_the_callee_s_reach",
+        "an approval of a consultation shows the capability and the arguments "
+        "and not what the callee may do, so a reviewer authorizes a reach they "
+        "never saw and the digest covers no particular callee",
+        """        spec.justification.reach = reach;""",
+        """        let _ = reach;""",
+    ),
+    "TheReachDropsRequiresApproval": (
+        "src/runtime/reach.rs",
+        "an_approval_of_a_consultation_shows_the_callee_s_reach",
+        "every grant of the callee reads as unattended, so a reviewer cannot "
+        "tell a mutation the callee's own run asks a person about from one "
+        "nobody sees",
+        """            requires_approval: grant.requires_approval,""",
+        """            requires_approval: false,""",
+    ),
+    "TheReachHidesWhatTheCalleeConsults": (
+        "src/runtime/reach.rs",
+        "the_reach_names_but_does_not_expand_the_callee_s_agents",
+        "the agents and peers a callee may hand work on to are not marked, so "
+        "the reviewer cannot see the approval reaches further than one hop",
+        """                .is_some_and(|id| id.server == crate::tools::AGENT_SERVER || consults(&id.server)),""",
+        """                .is_some_and(|_| false),""",
+    ),
+    "AnUndeclaredCalleeShowsNoStatement": (
+        "src/runtime/declarative.rs",
+        "an_undeclared_callee_is_named_as_such",
+        "a consultation of an agent no declaration governs carries no reach at "
+        "all, so the approval is silent where it should say nothing bounds it",
+        """        cx.reach(&id.tool).await
+    } else {""",
+        """        Ok(cx.reach(&id.tool).await?.filter(|r| r.declaration.is_some()))
+    } else {""",
+    ),
+    "TheRenderingOmitsTheReach": (
+        "src/core/task.rs",
+        "the_rendering_shows_the_callee_s_reach",
+        "the reach is digested but no surface shows it, so the reviewer "
+        "approves a section they were never shown",
+        """            evidence,
+            reach,""",
+        """            evidence,
+            reach: reach.filter(|_| false),""",
+    ),
+    "TheReachIsReadFromThePlaneOnReplay": (
+        "src/runtime/ctx.rs",
+        "a_finished_consultation_replays_after_its_callee_is_redeployed",
+        "the reach an approval showed is re-derived from the plane on every "
+        "pass, so a redeployed callee rewrites the digest of an approval "
+        "already given and a finished run no longer replays",
+        """        Ok(read.peek().clone())""",
+        """        let _ = read;
+        Ok(self.plane.upgrade().and_then(|plane| plane.reach_of(capability)))""",
+    ),
+    "AnApprovedConsultationIsNotPinned": (
+        "src/runtime/declarative.rs",
+        "a_redeployed_callee_is_named_in_the_refusal",
+        "a consultation is dispatched to whichever revision answers now, not "
+        "the one its approval showed",
+        """            cx.commission_pinned(capability, input, declared.digest)""",
+        """            cx.commission(capability, input)""",
+    ),
+    "TheCommissionIgnoresThePin": (
+        "src/runtime/ctx.rs",
+        "a_changed_callee_is_refused_after_approval",
+        "a consultation pinned to an approved revision is dispatched to "
+        "whichever revision answers the capability now",
+        """            terms = terms.expect_declaration(pin);""",
+        """            let _ = pin;""",
+    ),
+    "APinMismatchIsInDoubt": (
+        "src/runtime/ctx.rs",
+        "a_changed_callee_is_refused_after_approval",
+        "a pinned consultation refused before any sub-run existed reads as in "
+        "doubt, and the run quarantines over a call that never ran",
+        """                crate::core::RuntimeError::DeclarationPinMismatch { .. } => {""",
+        """                crate::core::RuntimeError::DeclarationPinMismatch { .. } if false => {""",
+    ),
+    "ACommissionHidesItsSubRun": (
+        "src/runtime/ctx.rs",
+        "an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody",
+        "a consultation's journaled answer names no run, so a reader of the "
+        "delegating run's journal cannot follow the delegation to the work",
+        """            run: Some(out.run_id.to_string()),""",
+        """            run: None,""",
+    ),
+    "AnOutcomeRecordsNoDuration": (
+        "src/runtime/ctx.rs",
+        "an_effects_outcome_records_how_long_it_took",
+        "an effect's outcome says nothing of how long the call took, so a "
+        "reader of the journal cannot tell a slow provider from a slow plane",
+        """        let elapsed_ms = Some(u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX));""",
+        """        let elapsed_ms: Option<u64> = { let _ = began; None };""",
+    ),
+    "ThePlaneStreamsNothing": (
+        "src/model/mod.rs",
+        "the_plane_forwards_a_declarative_agents_live_output",
+        "a model call the plane builds ignores the plane's stream observer, so "
+        "a surface following a run sees nothing until the call has finished",
+        """            self.stream = observer;""",
+        """            let _ = observer;""",
+    ),
+    "AnIssuerRefusalIsRetried": (
+        "src/peers/exchange.rs",
+        "an_issuer_refusal_is_final_and_names_only_its_code",
+        "an issuer's 4xx refusal reads as an outage, so the call is retried "
+        "against an answer no retry changes",
+        """            let answered = status.is_client_error()""",
+        """            let answered = false && status.is_client_error()""",
+    ),
+    "APlaneRunNamesThePlanesOwner": (
+        "src/runtime/ctx.rs",
+        "a_run_admitted_as_the_plane_presents_no_subject_bound_credential",
+        "a run admitted as the plane is exchanged for its chain's owner, so the "
+        "plane's own authority reaches the peer dressed as a person's",
+        """        let prepare = if self.plane_chain().await? {""",
+        """        let prepare = if false {""",
+    ),
+}
 
 # Which constitutional invariant each guarantee serves.
 #

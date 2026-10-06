@@ -330,6 +330,9 @@ pub struct PostgresStore {
     origin: String,
     /// Whose rows this handle can name. Every statement carries it.
     tenant: crate::core::TenantId,
+    /// What every read lifts a stored record through. The bytes and their
+    /// hash are never touched; only the body this build reads is.
+    upcaster: Arc<dyn crate::journal::Upcaster>,
 }
 
 impl PostgresStore {
@@ -341,6 +344,17 @@ impl PostgresStore {
     #[must_use]
     pub fn signing_as(mut self, signer: Arc<dyn crate::core::Signer>) -> Self {
         self.signer = Some(signer);
+        self
+    }
+
+    /// Read records through this upcaster instead of the one this build ships.
+    ///
+    /// The default is [`current_upcaster`](crate::journal::current_upcaster),
+    /// which is what a deployment wants; another is for a reader that must
+    /// lift shapes this build's own does not.
+    #[must_use]
+    pub fn upcasting_with(mut self, upcaster: Arc<dyn crate::journal::Upcaster>) -> Self {
+        self.upcaster = upcaster;
         self
     }
 
@@ -749,11 +763,16 @@ impl PostgresStore {
             .batch_execute(super::postgres_memory::MEMORY_SCHEMA)
             .await
             .map_err(|e| be(&e))?;
+        client
+            .batch_execute(super::postgres_disclosures::DISCLOSURE_SCHEMA)
+            .await
+            .map_err(|e| be(&e))?;
         Ok(Self {
             pool,
             signer: None,
             origin: "agentplane".to_owned(),
             tenant: crate::core::TenantId::default(),
+            upcaster: crate::journal::current_upcaster(),
         })
     }
 }
@@ -859,7 +878,7 @@ impl PostgresStore {
         let mut waiting: Option<crate::core::SuspendReason> = None;
         for append in batch {
             seq += 1;
-            let body = append.into_body(seq, epoch);
+            let (body, written) = append.into_parts(seq, epoch, self.upcaster.as_ref())?;
             // One pass over the kind for all three derived indexes. `waiting`
             // is cleared first rather than only assigned on a suspension: that
             // is what makes it track the run's *last* record instead of
@@ -879,7 +898,7 @@ impl PostgresStore {
                 }
                 _ => {}
             }
-            let record = Record::seal_signed(body, prev, self.signer.as_deref())?;
+            let record = Record::seal_at(body, written, prev, self.signer.as_deref())?;
             prev = record.hash;
 
             let effect = record.effect_key().map(EffectKey::to_hex);
@@ -1091,6 +1110,9 @@ impl JournalStore for PostgresStore {
     fn is_shared(&self) -> bool {
         true
     }
+    fn seals(&self) -> bool {
+        false
+    }
 
     fn tenant(&self) -> &str {
         self.tenant.as_str()
@@ -1156,11 +1178,12 @@ impl JournalStore for PostgresStore {
             let raw: Vec<u8> = row.get(3);
             let key_id: Option<String> = row.get(4);
             let signature: Option<Vec<u8>> = row.get(5);
-            // `from_stored_signed` recomputes the hash from the bytes and
+            // `from_stored_with` recomputes the hash from the bytes and
             // refuses a mismatch, so tampering is caught at read time, per
             // record, before chain verification even runs.
             let signature = signature_of(seq.cast_unsigned(), key_id, signature)?;
-            out.push(Record::from_stored_signed(
+            out.push(Record::from_stored_with(
+                self.upcaster.as_ref(),
                 raw,
                 digest_from(&prev)?,
                 digest_from(&hash)?,
@@ -1256,6 +1279,33 @@ impl JournalStore for PostgresStore {
                     seq: 0,
                     detail: format!("run_outcome holds an unparsable run id '{id}': {e}"),
                 })
+            })
+            .collect()
+    }
+
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let cap = i64::try_from(limit).unwrap_or(i64::MAX);
+        // `run_id > ''` is every id, so one statement serves the first page too;
+        // the `(tenant, run_id)` primary key is the order and the seek.
+        let from = after.map(|run| run.to_string()).unwrap_or_default();
+        let rows = client
+            .query(
+                "SELECT run_id FROM run_activity
+                 WHERE tenant = $1 AND run_id > $2
+                 ORDER BY run_id LIMIT $3",
+                &[&self.tenant_name(), &from, &cap],
+            )
+            .await
+            .map_err(|error| be(&error))?;
+        rows.into_iter()
+            .map(|row| {
+                RunId::parse(&row.get::<_, String>(0))
+                    .map_err(|error| StoreError::Backend(error.to_string()))
             })
             .collect()
     }
@@ -1390,7 +1440,8 @@ impl JournalStore for PostgresStore {
             let key_id: Option<String> = row.get(3);
             let signature: Option<Vec<u8>> = row.get(4);
             let signature = signature_of(0, key_id, signature)?;
-            out.push(Record::from_stored_signed(
+            out.push(Record::from_stored_with(
+                self.upcaster.as_ref(),
                 raw,
                 digest_from(&prev)?,
                 digest_from(&hash)?,
@@ -1691,15 +1742,25 @@ impl JournalStore for PostgresStore {
         // a side table.
         let head_row = tx
             .query_opt(
-                "SELECT hash FROM journal
+                "SELECT hash, kind FROM journal
                   WHERE tenant = $1 AND run_id = $2 ORDER BY seq DESC LIMIT 1",
                 &[&self.tenant_name(), &run.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
+        // A seal is a leaf: an empty run would commit the zero digest, and a run
+        // mid-flight a history that never ended.
         let head = match head_row {
-            Some(row) => digest_from(&row.get::<_, Vec<u8>>(0))?,
-            None => Digest::ZERO,
+            Some(row) if row.get::<_, String>(1) == "RunConcluded" => {
+                digest_from(&row.get::<_, Vec<u8>>(0))?
+            }
+            last => {
+                return Err(StoreError::Backend(format!(
+                    "run {run} cannot be sealed: its last record is {} rather than its \
+                     conclusion",
+                    last.map_or_else(|| "absent".to_owned(), |row| row.get::<_, String>(1))
+                )));
+            }
         };
 
         // Enter the log at its end. The tenant's seal lock is held to commit,
@@ -1797,6 +1858,69 @@ impl JournalStore for PostgresStore {
             seal,
             proof: crate::core::merkle::inclusion_proof(&leaves, index),
         }))
+    }
+
+    async fn inclusion_proof_at(
+        &self,
+        run: RunId,
+        size: u64,
+    ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
+        let leaves = self.log_leaves().await?;
+        let prefix = usize::try_from(size)
+            .ok()
+            .and_then(|size| leaves.get(..size))
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "asked to prove at size {size} and the log holds {} leaves",
+                    leaves.len()
+                ))
+            })?;
+        let Some((index, seal)) = self.log_positions(&[run]).await?.pop().flatten() else {
+            return Ok(None);
+        };
+        let Some(at) = usize::try_from(index).ok().filter(|&at| at < prefix.len()) else {
+            return Ok(None);
+        };
+        Ok(Some(crate::journal::Inclusion {
+            index,
+            size,
+            seal,
+            proof: crate::core::merkle::inclusion_proof(prefix, at),
+        }))
+    }
+
+    async fn log_positions(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<Option<(u64, Digest)>>, StoreError> {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let ids: Vec<String> = runs.iter().map(ToString::to_string).collect();
+        let rows = client
+            .query(
+                "SELECT run_id, chain_head, rank FROM (
+                     SELECT run_id, chain_head,
+                            ROW_NUMBER() OVER (ORDER BY log_index) - 1 AS rank
+                       FROM run_seal WHERE tenant = $1
+                 ) ranked WHERE run_id = ANY($2)",
+                &[&self.tenant_name(), &ids],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut placed = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows {
+            let rank: i64 = row.get(2);
+            placed.insert(
+                row.get::<_, String>(0),
+                (
+                    u64::try_from(rank).unwrap_or(0),
+                    digest_from(&row.get::<_, Vec<u8>>(1))?,
+                ),
+            );
+        }
+        Ok(runs
+            .iter()
+            .map(|run| placed.get(&run.to_string()).copied())
+            .collect())
     }
 
     async fn request_cancel(

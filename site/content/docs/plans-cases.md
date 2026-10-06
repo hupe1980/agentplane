@@ -99,7 +99,7 @@ sequential dispatch deadlocks and the test cannot pass by accident on a fast
 machine.
 
 `plan.ready(&done)` returns every node whose dependencies are satisfied, in a
-**deterministic total order** (topological rank, then id). That ordering is what
+**deterministic total order** (ascending step id). That ordering is what
 admission and result-application follow, so a plan's stopping point does not
 depend on its schedule.
 
@@ -395,11 +395,29 @@ on — it is the failure that otherwise presents as a process silently never
 completing. `GET /dead-letters` is what the page leads to: it names each message
 and the keys it was filed under, so the mismatch is visible beside what the run
 subscribed to. The body is deliberately not there — the diagnosis is in the
-keys, and the payload is the counterparty's.
+keys, and the payload is the counterparty's. A message sent to one run by name,
+which that run concluded without consuming, is dead-lettered too, with a reason
+saying so — it was that run's alone, and is offered to no other.
 
-Delivery is deduplicated by event id, so a counterparty that retries — and they
-all retry — does not deliver twice. Claiming happens inside the transaction that
-selects, so two runs waiting on one key cannot both consume a single message.
+Delivery is deduplicated on the producer and its id, so a counterparty that
+retries — and they all retry — does not deliver twice, and two producers that
+happen to use one id are two messages. Storing and matching are two writes; a
+retry of a message stored by a delivery that died before matching is offered to
+the waiting run again rather than answered from the dedup alone.
+
+A claim happens inside the transaction that selects, names the one wait it is
+for, and parks that wait: two runs waiting on one key cannot both consume a
+message, and one wait never holds two. A wait recovers its own claim after a
+crash — and only while it stands: once its message is journaled and the wait
+retired, the run's next wait on the same key is never handed that message again.
+A message sent to one run by name (`deliver_to`) reaches that run or no one.
+
+**A run whose conclusion is durable consumes nothing.** A message or a timer
+that reaches it in the window between its conclusion and its seal is not
+journaled after the conclusion — a run its seal would then refuse — but finishes
+the run instead, and a message the run claimed and never consumed goes to the
+next run waiting on its key. These rules are model-checked
+(`tla/Delivery.tla`, `tla/TaskDelivery.tla`).
 
 ## Durable timers
 
@@ -682,7 +700,13 @@ Whoever **asked for the run** is barred without a line of code: a served surface
 admits each run with its authenticated caller (`RunTerms::admitted_by` for an
 embedder), the run's `RunAdmitted` record keeps the name, and every task the run
 opens excludes it — including the approvals of a declarative agent, which has no
-code in which to say so.
+code in which to say so. A run acting under a caller's delegation chain also
+bars the person at its root and the workload acting for them: a caller serving
+somebody else admits as itself, and the party the run acts for must not review
+it either. A run the embedder started acts under the plane's own chain, whose
+principals did not ask for it, so they are not barred. Which of the two a run is
+comes from its `RunAdmitted.plane_chain`, never from comparing chains: a caller
+presenting a chain equal to the plane's is still the caller.
 
 Claiming is also atomic: two reviewers opening one queue must not both believe
 they hold a task, and a check followed by a separate write has exactly that

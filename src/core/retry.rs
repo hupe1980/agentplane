@@ -228,12 +228,12 @@ impl RetryPolicy {
 
         // Saturating throughout: a large multiplier and a large attempt count
         // must produce `max_backoff`, not an overflow panic.
-        let steps = attempt - 2;
+        // A multiplier of one or less never grows the delay, so there is
+        // nothing to iterate.
+        let steps = if self.multiplier > 1 { attempt - 2 } else { 0 };
         let mut delay = self.initial_backoff;
         for _ in 0..steps {
-            delay = delay
-                .saturating_mul(self.multiplier.max(1))
-                .min(self.max_backoff);
+            delay = delay.saturating_mul(self.multiplier).min(self.max_backoff);
             if delay >= self.max_backoff {
                 break;
             }
@@ -351,6 +351,23 @@ mod tests {
         assert_eq!(at(5), Duration::from_millis(800));
         assert_eq!(at(6), Duration::from_millis(800), "ceiling holds");
         assert_eq!(at(50), Duration::from_millis(800), "and keeps holding");
+    }
+
+    /// A flat multiplier holds the initial delay, and answers without walking
+    /// every attempt to get there.
+    #[test]
+    fn a_flat_multiplier_holds_the_initial_delay() {
+        let p = RetryPolicy {
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(10),
+            multiplier: 1,
+            jitter: false,
+            ..RetryPolicy::default()
+        };
+        assert_eq!(
+            p.backoff(RunId::generate(), key(), u32::MAX),
+            Duration::from_millis(100)
+        );
     }
 
     #[test]

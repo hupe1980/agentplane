@@ -1,10 +1,24 @@
-//! Obtaining credentials that are bound to one audience.
+//! Obtaining credentials that are bound to one audience and one subject.
 //!
 //! [`PeerCredential`] models a token already minted for a single peer. Getting
-//! one is OAuth **token exchange** (RFC 8693): present a subject token, name the
-//! `resource` you intend to spend it at (RFC 8707), and receive a token the
-//! issuer has bound to that audience. Everyone else then refuses it, which is
-//! what makes handing it to a peer safe.
+//! one is OAuth **token exchange** (RFC 8693): name the subject the token is for
+//! and the plane as the actor, name the `resource` you intend to spend it at
+//! (RFC 8707), and receive a token the issuer has bound to both. Every other
+//! audience then refuses it, which is what makes handing it to a peer safe; and
+//! the peer sees who the call is for, rather than only the plane that carried
+//! it.
+//!
+//! # Whom the credential names
+//!
+//! The run's chain's **owner** — the person the run acts for, whom a commission
+//! shares with its parent — never the acting workload. The issuer accepts the
+//! plane's say-so about that subject on the strength of the plane's own
+//! authentication: the plane admitted the run, and the issuer trusts it to name
+//! the subjects it admitted. The plane never holds the caller's inbound token,
+//! which a run resumed a day later would not have.
+//!
+//! A credential is checked on arrival for both: an issuer is trusted to mint,
+//! not to say whom it minted for.
 //!
 //! # A credential must never enter the journal
 //!
@@ -68,32 +82,58 @@ pub enum CredentialError {
         issued_for: PeerId,
     },
 
+    /// The issuer returned a token for another subject, or for none.
+    ///
+    /// Presenting it would tell the peer the call is for somebody it is not
+    /// for — the one thing a subject-bound credential exists to state.
+    #[error(
+        "the issuer returned a credential for {} when '{subject}' was requested at \
+         '{audience}'",
+        issued_for.as_deref().map_or_else(|| "no subject".to_owned(), |s| format!("'{s}'"))
+    )]
+    WrongSubject {
+        audience: PeerId,
+        subject: String,
+        issued_for: Option<String>,
+    },
+
+    /// The issuer answered, and declined to mint for this subject or
+    /// audience. Final: asking again asks the same rule the same question.
+    #[error("the issuer refused a credential for '{audience}': {detail}")]
+    Refused { audience: PeerId, detail: String },
+
     /// The issuer returned a token that is already expired, or expires within
     /// the skew margin.
     #[error("the credential issued for '{audience}' is already spent")]
     Stale { audience: PeerId },
 }
 
-/// Exchanges one token for another bound to a named audience.
+/// Exchanges for a token bound to one audience and one subject.
 ///
 /// The RFC 8693 shape, reduced to what the runtime depends on. A real
-/// implementation posts to a token endpoint with `resource` set; a test
-/// implementation hands back whatever it was told to.
+/// implementation posts to the deployment's token endpoint with the subject
+/// as `subject_token`, the plane's own credential as `actor_token`, and
+/// `resource` set to the audience; a test implementation hands back whatever
+/// it was told to.
 #[async_trait]
 pub trait TokenExchange: Send + Sync + Debug {
-    /// Obtain a credential valid only at `audience`.
+    /// Obtain a credential naming `subject`, valid only at `audience`.
     ///
     /// # Errors
     ///
-    /// [`CredentialError`] if the issuer is unreachable, refuses, or returns a
-    /// token bound to the wrong audience.
-    async fn exchange(&self, audience: &PeerId) -> Result<PeerCredential, CredentialError>;
+    /// [`CredentialError`] if the issuer is unreachable or refuses.
+    async fn exchange(
+        &self,
+        audience: &PeerId,
+        subject: &str,
+    ) -> Result<PeerCredential, CredentialError>;
 }
 
-/// Supplies the credential for a peer at call time.
+/// Supplies the credential a call for `subject` presents to a peer.
 #[async_trait]
 pub trait CredentialSource: Send + Sync + Debug {
-    /// The credential to present to `audience`, fresh at `now`.
+    /// The credential naming `subject` to present to `audience`, fresh at
+    /// `now`.
     ///
     /// # Errors
     ///
@@ -101,48 +141,68 @@ pub trait CredentialSource: Send + Sync + Debug {
     async fn credential(
         &self,
         audience: &PeerId,
+        subject: &str,
         now: Timestamp,
     ) -> Result<PeerCredential, CredentialError>;
+
+    /// Drop everything held for `subject`, at every audience.
+    ///
+    /// Called when an operator withdraws the subject's authority: a held
+    /// credential outlives the halt until it expires, and must not be served
+    /// to the next run that asks once the halt is lifted and thrown again. A
+    /// source that holds nothing has nothing to drop.
+    fn forget(&self, _subject: &str) {}
 }
 
-/// A credential held for one audience, with no expiry.
+/// The wall clock, for a credential's freshness.
 ///
-/// For deployments that provision long-lived, audience-bound tokens out of band.
-/// The binding still holds — this is not a way to opt out of it.
-#[derive(Debug)]
-pub struct Fixed(PeerCredential);
-
-impl Fixed {
-    #[must_use]
-    pub const fn new(credential: PeerCredential) -> Self {
-        Self(credential)
-    }
+/// Transport metadata in the sense a lease is: read only where a call is
+/// performed, which replay never reaches, and never journaled — so it decides
+/// nothing a replay must reproduce.
+#[allow(clippy::disallowed_methods)]
+pub(super) fn now() -> Timestamp {
+    Timestamp::now_utc()
 }
 
-#[async_trait]
-impl CredentialSource for Fixed {
-    async fn credential(
-        &self,
-        audience: &PeerId,
-        _now: Timestamp,
-    ) -> Result<PeerCredential, CredentialError> {
-        if self.0.audience() != audience {
-            return Err(CredentialError::WrongAudience {
-                audience: audience.clone(),
-                issued_for: self.0.audience().clone(),
-            });
-        }
-        Ok(self.0.clone())
+/// `credential`, if it is for `audience` and `subject`.
+///
+/// The one check every credential crosses before it is presented, whichever
+/// source produced it.
+///
+/// # Errors
+///
+/// [`CredentialError::WrongAudience`] or [`CredentialError::WrongSubject`].
+pub(super) fn bound_to(
+    credential: PeerCredential,
+    audience: &PeerId,
+    subject: &str,
+) -> Result<PeerCredential, CredentialError> {
+    if credential.audience() != audience {
+        return Err(CredentialError::WrongAudience {
+            audience: audience.clone(),
+            issued_for: credential.audience().clone(),
+        });
     }
+    if credential.subject() != Some(subject) {
+        return Err(CredentialError::WrongSubject {
+            audience: audience.clone(),
+            subject: subject.to_owned(),
+            issued_for: credential.subject().map(ToOwned::to_owned),
+        });
+    }
+    Ok(credential)
 }
 
 /// Exchanges on demand and keeps the result until it is nearly expired.
+///
+/// Held per audience **and** subject: a credential obtained for one person is
+/// never lent to a run acting for another.
 #[derive(Debug)]
 pub struct Cached {
     exchange: std::sync::Arc<dyn TokenExchange>,
     /// How far before expiry a credential stops being used.
     skew: Duration,
-    held: Mutex<BTreeMap<PeerId, PeerCredential>>,
+    held: Mutex<BTreeMap<(PeerId, String), PeerCredential>>,
 }
 
 impl Cached {
@@ -173,31 +233,30 @@ impl CredentialSource for Cached {
     async fn credential(
         &self,
         audience: &PeerId,
+        subject: &str,
         now: Timestamp,
     ) -> Result<PeerCredential, CredentialError> {
+        let key = (audience.clone(), subject.to_owned());
         // Scoped so the guard is gone before the await below: a lock held across
         // a suspension is held on the *thread*, and this one would be held for
         // the length of a network round trip.
         {
             let held = self.held.lock().expect("credential cache");
-            if let Some(c) = held.get(audience)
+            if let Some(c) = held.get(&key)
                 && c.is_usable_at(now, self.skew)
             {
                 return Ok(c.clone());
             }
         }
 
-        let fresh = self.exchange.exchange(audience).await?;
-
         // The issuer is not taken at its word about who the token is for. An
         // issuer that ignores `resource` hands back something the peer can spend
-        // elsewhere, and that is the failure this whole design exists to avoid.
-        if fresh.audience() != audience {
-            return Err(CredentialError::WrongAudience {
-                audience: audience.clone(),
-                issued_for: fresh.audience().clone(),
-            });
-        }
+        // elsewhere, and one that ignores the subject names the wrong person.
+        let fresh = bound_to(
+            self.exchange.exchange(audience, subject).await?,
+            audience,
+            subject,
+        )?;
         if !fresh.is_usable_at(now, self.skew) {
             return Err(CredentialError::Stale {
                 audience: audience.clone(),
@@ -207,7 +266,14 @@ impl CredentialSource for Cached {
         self.held
             .lock()
             .expect("credential cache")
-            .insert(audience.clone(), fresh.clone());
+            .insert(key, fresh.clone());
         Ok(fresh)
+    }
+
+    fn forget(&self, subject: &str) {
+        self.held
+            .lock()
+            .expect("credential cache")
+            .retain(|(_, held_for), _| held_for != subject);
     }
 }

@@ -4,13 +4,12 @@
 //! [`TokenExchange`](crate::peers::TokenExchange) and
 //! [`CredentialSource`](crate::peers::CredentialSource) — look like they need a
 //! battery too, and they do not: the property that matters about a credential
-//! this plane *sends* is that it is spent only at the audience it names, and
-//! that is enforced at the boundary every implementation crosses rather than
-//! asked of each one. `PeerRegistry::credential_for` checks it on the held
-//! path and `PeerCall::prepare_with_credential` checks it again on the minted
-//! one, "regardless of where the credential came from". A battery asserting a
-//! property the runtime does not rely on the implementation for would measure
-//! the boundary.
+//! this plane *sends* is that it is spent only at the audience it names and
+//! names the subject it was asked for, and that is enforced at the boundary
+//! every implementation crosses rather than asked of each one. Every credential
+//! a source returns is checked for both before a peer effect presents it. A
+//! battery asserting a property the runtime does not rely on the implementation
+//! for would measure the boundary.
 //!
 //! Inbound is the other way round. An `Authenticator` *is* the decision: it
 //! returns a [`Caller`] and the surface believes it, because establishing who
@@ -30,7 +29,10 @@
 //! of reasons, and the kind nothing else notices, because every test a
 //! deployment writes asserts that a bad credential is refused — which it is.
 
+use std::panic::AssertUnwindSafe;
+
 use axum::http::HeaderMap;
+use futures_util::FutureExt as _;
 
 use super::conformance::Report;
 use crate::api::{AuthError, Authenticator, Caller};
@@ -67,8 +69,56 @@ pub struct Requests {
 /// spelled as a crash.
 pub async fn check(auth: &dyn Authenticator, requests: &Requests, report: &mut Report) {
     no_credentials_is_missing_not_anonymous(auth, report).await;
+    a_malformed_header_is_refused(auth, report).await;
     a_presented_credential_is_rejected_not_missing(auth, requests, report).await;
     an_accepted_request_names_its_actor(auth, requests, report).await;
+}
+
+/// Ask, recording an unwind as a violation of `rule` and returning `None`.
+async fn ask(
+    auth: &dyn Authenticator,
+    headers: &HeaderMap,
+    rule: &'static str,
+    what: &str,
+    r: &mut Report,
+) -> Option<Result<Caller, AuthError>> {
+    let answer = AssertUnwindSafe(auth.authenticate(headers))
+        .catch_unwind()
+        .await;
+    if answer.is_err() {
+        r.record(
+            rule,
+            format!(
+                "authenticate panicked on {what} — a refusal spelled as a crash, taken \
+                 down with it every request the process was serving"
+            ),
+        );
+    }
+    answer.ok()
+}
+
+/// A malformed credential is refused, not crashed on and not accepted.
+///
+/// `Bearer` with no token is what a client with an unset variable sends, and
+/// the parse an implementation writes first splits it and indexes the half
+/// that is not there.
+async fn a_malformed_header_is_refused(auth: &dyn Authenticator, r: &mut Report) {
+    const RULE: &str = "a malformed credential is refused";
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        axum::http::HeaderValue::from_static("Bearer"),
+    );
+    r.checked += 1;
+    if let Some(Ok(caller)) = ask(auth, &headers, RULE, "`authorization: Bearer`", r).await {
+        r.record(
+            RULE,
+            format!(
+                "`authorization: Bearer` with no token was authenticated as `{}`",
+                caller.actor
+            ),
+        );
+    }
 }
 
 /// An empty request is [`AuthError::Missing`], and never a caller.
@@ -80,7 +130,10 @@ pub async fn check(auth: &dyn Authenticator, requests: &Requests, report: &mut R
 async fn no_credentials_is_missing_not_anonymous(auth: &dyn Authenticator, r: &mut Report) {
     const RULE: &str = "no credentials is a refusal";
     r.checked += 1;
-    match auth.authenticate(&HeaderMap::new()).await {
+    let Some(answer) = ask(auth, &HeaderMap::new(), RULE, "an empty request", r).await else {
+        return;
+    };
+    match answer {
         Err(AuthError::Missing) => {}
         Err(AuthError::Rejected) => r.record(
             RULE,
@@ -119,7 +172,10 @@ async fn a_presented_credential_is_rejected_not_missing(
     const RULE: &str = "a presented credential is rejected, not missing";
     for (what, headers) in &requests.rejected {
         r.checked += 1;
-        match auth.authenticate(headers).await {
+        let Some(answer) = ask(auth, headers, RULE, what, r).await else {
+            continue;
+        };
+        match answer {
             Err(AuthError::Rejected) => {}
             Err(AuthError::Missing) => r.record(
                 RULE,
@@ -155,7 +211,10 @@ async fn an_accepted_request_names_its_actor(
         return;
     };
     r.checked += 1;
-    match auth.authenticate(headers).await {
+    let Some(answer) = ask(auth, headers, RULE, "the accepted request", r).await else {
+        return;
+    };
+    match answer {
         Ok(Caller { actor, .. }) if &actor == principal => {}
         Ok(caller) => r.record(
             RULE,

@@ -74,7 +74,7 @@ pub struct OpenAi {
     /// driver instance serves many models over one key and one connection pool;
     /// a capability setting on the driver would force a second instance per
     /// model, which is a strange thing to make somebody do to say that
-    /// `claude-haiku-3` cannot do what `claude-opus-4-5` can.
+    /// `gpt-3.5-turbo` cannot do what `gpt-5` can.
     schema_modes: std::collections::BTreeMap<String, SchemaMode>,
     /// Whether to ask for the response as a stream.
     ///
@@ -664,7 +664,8 @@ impl OpenAi {
             if effort == super::ReasoningEffort::Max {
                 return Err(ModelError::Refused {
                     model: model.clone(),
-                    detail: "OpenAI Responses has no reasoning effort 'max' — it names none,                              minimal, low, medium, high and xhigh"
+                    detail: "OpenAI Responses has no reasoning effort 'max' — it names none, \
+                             minimal, low, medium, high and xhigh"
                         .to_owned(),
                 });
             }

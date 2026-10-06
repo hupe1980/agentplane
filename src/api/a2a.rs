@@ -173,6 +173,10 @@ pub mod action {
     pub const CARD_EXTENDED: &str = "a2a:card.extended";
     /// Registering, reading or removing a webhook for a task.
     pub const TASK_PUSH: &str = "a2a:task.push";
+    /// Supplying an event of a kind, asked on the kind: a continuation is
+    /// delivered as the event its task awaits, so a peer may continue a task
+    /// only with input a rule lets it supply.
+    pub const EVENT_DELIVER: &str = "a2a:event.deliver";
 
     /// Every action this surface can ask about, so a deployment can enumerate
     /// what it must write rules for.
@@ -183,6 +187,7 @@ pub mod action {
         TASK_CANCEL,
         CARD_EXTENDED,
         TASK_PUSH,
+        EVENT_DELIVER,
     ];
 }
 
@@ -223,11 +228,13 @@ pub fn policy_problems(engine: &dyn crate::core::PolicyEngine) -> Vec<String> {
         (action::CARD_EXTENDED, &bare),
         (action::TASK_PUSH, &owned),
         (action::TASK_PUSH, &bare),
+        (action::EVENT_DELIVER, &owned),
     ];
     let requests: Vec<PolicyRequest<'_>> = shapes
         .iter()
         .map(|(action, context)| PolicyRequest {
             principal: &caller.actor,
+            principal_kind: crate::core::PrincipalKind::Subject,
             action,
             resource: "preflight.resource",
             context,
@@ -272,6 +279,13 @@ fn quota_refusal(e: &crate::quota::QuotaError) -> RpcError {
         crate::quota::QuotaError::Halted { .. } => RpcError::new(code::HALTED, HALTED_MESSAGE),
         _ => RpcError::new(code::QUOTA_EXHAUSTED, QUOTA_EXHAUSTED_MESSAGE),
     }
+}
+
+/// A message its agent cannot read a data subject from, on the wire: invalid
+/// params at every admission site. The error names the binding and why it
+/// did not resolve, never a subject.
+fn subject_unbound(e: &crate::core::RuntimeError) -> RpcError {
+    RpcError::new(code::INVALID_PARAMS, e.to_string())
 }
 
 /// A task's lifecycle state, as A2A names them.
@@ -391,9 +405,11 @@ fn state_of(status: &crate::runtime::RunStatus) -> TaskState {
         // executed it, and the only honest thing to tell a caller asking about
         // somebody else's agent is the answer they get for a run that is none
         // of their business.
-        RunStatus::Swept | RunStatus::BrokeGlass { .. } | RunStatus::Observed => {
-            TaskState::Rejected
-        }
+        RunStatus::Swept
+        | RunStatus::BrokeGlass { .. }
+        | RunStatus::HaltLifted { .. }
+        | RunStatus::HoldReleased { .. }
+        | RunStatus::Observed => TaskState::Rejected,
     }
 }
 
@@ -811,8 +827,21 @@ struct PushRequest {
     authentication: Option<PushAuthenticationRequest>,
 }
 
+/// The longest push configuration id a caller may choose, in bytes.
+const MAX_PUSH_ID_LEN: usize = 128;
+
+/// The most push configurations one task holds.
+///
+/// Every one is a delivery per record, so without a ceiling a peer multiplies
+/// the plane's outbound traffic and store rows by however many it registers.
+/// Checked before the write rather than inside it, so two registrations racing
+/// for the last slot can both land; the bound is on what a peer can build up,
+/// not an exact count.
+const MAX_PUSH_CONFIGS_PER_TASK: usize = 10;
+
 impl PushRequest {
-    /// Refuse an id in the namespace an operator destination owns.
+    /// Refuse an id in the namespace an operator destination owns, or one
+    /// longer than [`MAX_PUSH_ID_LEN`].
     ///
     /// A caller and the deployment share one push store, and the two are told
     /// apart by an id prefix. A caller allowed to write into that namespace could
@@ -822,6 +851,16 @@ impl PushRequest {
     /// to be no caller involved. This is the check that keeps that supposition
     /// true.
     fn validate(&self) -> Result<(), RpcError> {
+        if self
+            .id
+            .as_deref()
+            .is_some_and(|id| id.len() > MAX_PUSH_ID_LEN)
+        {
+            return Err(RpcError::new(
+                code::INVALID_PARAMS,
+                format!("a pushNotificationConfig id is at most {MAX_PUSH_ID_LEN} bytes"),
+            ));
+        }
         if self.id.as_deref().is_some_and(crate::push::is_operator_id) {
             return Err(RpcError::new(
                 code::INVALID_PARAMS,
@@ -933,6 +972,8 @@ pub struct RpcError {
     message: String,
     /// The id of the request being answered — `null` when it could not be read.
     id: Value,
+    /// Served as HTTP 401 with a bearer challenge rather than 200.
+    unauthenticated: bool,
 }
 
 impl RpcError {
@@ -941,6 +982,17 @@ impl RpcError {
             code,
             message: message.into(),
             id: Value::Null,
+            unauthenticated: false,
+        }
+    }
+
+    /// A caller whose credential was refused: HTTP 401 with
+    /// `WWW-Authenticate`, as A2A requires, so the status says *authenticate*
+    /// rather than the body saying *malformed*.
+    fn unauthenticated(message: impl Into<String>) -> Self {
+        Self {
+            unauthenticated: true,
+            ..Self::new(code::INVALID_REQUEST, message)
         }
     }
 
@@ -1013,20 +1065,26 @@ impl RpcError {
 
 impl IntoResponse for RpcError {
     fn into_response(self) -> Response {
-        // Always HTTP 200 with a JSON-RPC error body. JSON-RPC carries its own
-        // error channel, and a transport-level status for an application-level
-        // refusal is how a client ends up retrying a permanent decline: an
-        // A2A client reads `error.code`, and many treat a 5xx as retryable
-        // without ever parsing the body.
-        (
-            StatusCode::OK,
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": self.id,
-                "error": self.body(),
-            })),
-        )
-            .into_response()
+        // HTTP 200 with a JSON-RPC error body, except for a refused credential.
+        // JSON-RPC carries its own error channel, and a transport-level status
+        // for an application-level refusal is how a client ends up retrying a
+        // permanent decline: an A2A client reads `error.code`, and many treat
+        // a 5xx as retryable without ever parsing the body. Authentication is
+        // the transport's question, and A2A answers it with 401.
+        let body = Json(json!({
+            "jsonrpc": "2.0",
+            "id": self.id,
+            "error": self.body(),
+        }));
+        if self.unauthenticated {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+                body,
+            )
+                .into_response();
+        }
+        (StatusCode::OK, body).into_response()
     }
 }
 
@@ -1670,17 +1728,21 @@ impl A2aServer {
     /// this surface — answers exactly as a task that does not exist. Anything
     /// else tells a peer holding a guessed or leaked id that it is real.
     ///
+    /// The id is read only once the caller is authenticated, so a malformed
+    /// one earns an unauthenticated caller nothing but the challenge.
+    ///
     /// Hands back the task's journal, read once, because every caller of this
     /// was about to read it anyway.
     async fn gate_task(
         &self,
         headers: &HeaderMap,
         action: &str,
-        run: RunId,
-    ) -> Result<(Caller, Vec<crate::journal::Record>), RpcError> {
+        params: &CommonParams,
+    ) -> Result<(Caller, RunId, Vec<crate::journal::Record>), RpcError> {
         let caller = self.authenticate(headers).await?;
+        let run = task_id(params)?;
         let records = self.authorized_task(&caller, action, run).await?;
-        Ok((caller, records))
+        Ok((caller, run, records))
     }
 
     /// [`gate_task`](Self::gate_task) for a caller already authenticated, so
@@ -1707,22 +1769,23 @@ impl A2aServer {
 
     /// Who is calling, from the credential — and only if it is this tenant.
     async fn authenticate(&self, headers: &HeaderMap) -> Result<Caller, RpcError> {
-        let caller = self.auth.authenticate(headers).await.map_err(|e| {
-            // Refused, not "invalid request": a caller that cannot authenticate
-            // must not be told its request was malformed and try again with a
-            // different body.
-            RpcError::new(code::INVALID_REQUEST, e.to_string())
-        })?;
+        let caller = self
+            .auth
+            .authenticate(headers)
+            .await
+            .map_err(|e| RpcError::unauthenticated(e.to_string()))?;
         // The caller's tenant is the second half of the check `check_tenant`
         // starts. That one compares what the *request* asked for against what
         // the card advertises; this compares it against what the *credential*
         // says. A peer that authenticates into one tenant must not be served
         // from another's runs by naming it in a field, and a peer holding a
         // valid credential for a different tenant is exactly who would try.
+        // Refused as a credential, in the same sentence as any other this
+        // endpoint does not accept: naming the tenant would tell a prober the
+        // token is valid somewhere else.
         if caller.tenant != *self.runtime.tenant() {
-            return Err(RpcError::new(
-                code::INVALID_PARAMS,
-                "this endpoint does not serve your tenant",
+            return Err(RpcError::unauthenticated(
+                crate::api::AuthError::Rejected.to_string(),
             ));
         }
         Ok(caller)
@@ -1752,6 +1815,7 @@ impl A2aServer {
         let context = Self::context(caller, owner);
         match self.policy.authorize(&PolicyRequest {
             principal: &caller.actor,
+            principal_kind: crate::core::PrincipalKind::Subject,
             action,
             resource,
             context: &context,
@@ -1807,6 +1871,7 @@ impl A2aServer {
         matches!(
             self.policy.authorize(&PolicyRequest {
                 principal: &caller.actor,
+                principal_kind: crate::core::PrincipalKind::Subject,
                 action,
                 resource,
                 context: &context,
@@ -2061,6 +2126,9 @@ async fn stream_method(
                 }
                 Err(crate::core::RuntimeError::Draining) => {
                     return Err(RpcError::new(code::DRAINING, DRAINING_MESSAGE));
+                }
+                Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) => {
+                    return Err(subject_unbound(&e));
                 }
                 Err(e) => return Err(internal("admitting a streamed message", &e)),
             }
@@ -2340,6 +2408,9 @@ async fn continue_task(
             "message.contextId does not match the referenced task",
         ));
     }
+    // The task gate says this peer may continue its own task; this one says it
+    // may supply the kind the task awaits.
+    server.authorize(caller, action::EVENT_DELIVER, &kind, Some(&caller.actor))?;
 
     let event = crate::core::InboundEvent {
         // `peer:{actor}`, the one spelling a counterparty's provenance has on
@@ -2463,6 +2534,7 @@ async fn send_message(
             Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
                 Err(RpcError::new(code::TASK_NOT_FOUND, why))
             }
+            Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) => Err(subject_unbound(&e)),
             Err(e) => Err(internal("admitting a message", &e)),
         };
     }
@@ -2499,6 +2571,11 @@ async fn send_message(
         }
         Err(crate::core::RuntimeError::PlanContract(why)) if message.context_id.is_some() => {
             return Err(RpcError::new(code::TASK_NOT_FOUND, why));
+        }
+        // The message, not the server: it lacks what the agent's declaration
+        // reads its data subject from, and the same message is refused again.
+        Err(e @ crate::core::RuntimeError::SubjectUnbound { .. }) => {
+            return Err(subject_unbound(&e));
         }
         Err(e) => return Err(internal("admitting a message", &e)),
     };
@@ -2838,8 +2915,9 @@ async fn get_task(
     headers: &HeaderMap,
     params: CommonParams,
 ) -> Result<Value, RpcError> {
-    let id = task_id(&params)?;
-    let (_, records) = server.gate_task(headers, action::TASK_READ, id).await?;
+    let (_, id, records) = server
+        .gate_task(headers, action::TASK_READ, &params)
+        .await?;
     load_task(server, id, &records, params.history_length).await
 }
 
@@ -3292,10 +3370,14 @@ pub(super) fn sealed_state(outcome: &str) -> TaskState {
         "cancelled" => TaskState::Canceled,
         "suspended" => TaskState::InputRequired,
         // Not tasks at all: nobody submitted this plane's record of a sweep, of
-        // an operator crossing a tenant boundary, or of a session it merely
+        // an operator crossing a tenant boundary or lifting a control, or of a session it merely
         // watched somebody else's agent run. `state_of` decides that and this
         // agrees, which is the direction the test beside it enforces.
-        "swept" | "broke-glass" | crate::runtime::OBSERVED_OUTCOME => TaskState::Rejected,
+        "swept"
+        | "broke-glass"
+        | crate::runtime::HALT_LIFTED_OUTCOME
+        | crate::runtime::HOLD_RELEASED_OUTCOME
+        | crate::runtime::OBSERVED_OUTCOME => TaskState::Rejected,
         _ => TaskState::Failed,
     }
 }
@@ -3331,8 +3413,9 @@ async fn cancel_task(
     headers: &HeaderMap,
     params: CommonParams,
 ) -> Result<Value, RpcError> {
-    let id = task_id(&params)?;
-    let (caller, records) = server.gate_task(headers, action::TASK_CANCEL, id).await?;
+    let (caller, id, records) = server
+        .gate_task(headers, action::TASK_CANCEL, &params)
+        .await?;
     let Some(last) = records.last() else {
         return Err(task_not_found(id));
     };
@@ -3573,6 +3656,25 @@ async fn register_push(
     push.transport
         .validate(&config)
         .map_err(|error| RpcError::new(code::INVALID_PARAMS, error.to_string()))?;
+    // The deployment's own destinations are not the caller's to spend.
+    let held: Vec<String> = push
+        .store
+        .list(task)
+        .await
+        .map_err(|error| internal("listing push configurations", &error))?
+        .into_iter()
+        .map(|c| c.id)
+        .filter(|id| !crate::push::is_operator_id(id))
+        .collect();
+    if held.len() >= MAX_PUSH_CONFIGS_PER_TASK && !held.contains(&config.id) {
+        return Err(RpcError::new(
+            code::INVALID_PARAMS,
+            format!(
+                "a task holds at most {MAX_PUSH_CONFIGS_PER_TASK} push configurations; \
+                 delete one first"
+            ),
+        ));
+    }
     push.store
         .put(&config, next_seq)
         .await
@@ -3692,7 +3794,7 @@ mod state_agreement_tests {
         let statuses = crate::runtime::every_status();
         assert_eq!(
             statuses.len(),
-            12,
+            14,
             "a RunStatus variant was added or removed — decide which A2A state it \
              surfaces as, in `state_of` and in `sealed_state` both"
         );

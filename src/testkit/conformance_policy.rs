@@ -24,7 +24,7 @@ use std::panic::AssertUnwindSafe;
 
 use serde_json::{Value, json};
 
-use crate::core::{PolicyDecision, PolicyEngine, PolicyRequest};
+use crate::core::{PolicyDecision, PolicyEngine, PolicyRequest, PrincipalKind};
 
 use super::conformance::Report;
 
@@ -129,6 +129,7 @@ fn evaluation_is_total(engine: &dyn PolicyEngine, report: &mut Report) {
     for (what, principal, action, resource, context) in shapes() {
         let request = PolicyRequest {
             principal: &principal,
+            principal_kind: PrincipalKind::Subject,
             action: &action,
             resource: &resource,
             context: &context,
@@ -155,6 +156,7 @@ fn evaluation_is_pure(engine: &dyn PolicyEngine, report: &mut Report) {
     for (what, principal, action, resource, context) in shapes() {
         let request = PolicyRequest {
             principal: &principal,
+            principal_kind: PrincipalKind::Subject,
             action: &action,
             resource: &resource,
             context: &context,
@@ -188,6 +190,7 @@ fn evaluation_carries_no_state_between_requests(engine: &dyn PolicyEngine, repor
                 engine,
                 &PolicyRequest {
                     principal: p,
+                    principal_kind: PrincipalKind::Subject,
                     action: a,
                     resource: r,
                     context: c,
@@ -203,6 +206,7 @@ fn evaluation_carries_no_state_between_requests(engine: &dyn PolicyEngine, repor
                 engine,
                 &PolicyRequest {
                     principal: p,
+                    principal_kind: PrincipalKind::Subject,
                     action: a,
                     resource: r,
                     context: c,
@@ -237,6 +241,7 @@ fn a_refusal_says_which_rule(engine: &dyn PolicyEngine, report: &mut Report) {
     for (what, principal, action, resource, context) in shapes() {
         let request = PolicyRequest {
             principal: &principal,
+            principal_kind: PrincipalKind::Subject,
             action: &action,
             resource: &resource,
             context: &context,
@@ -300,6 +305,7 @@ fn preflight_is_total(engine: &dyn PolicyEngine, report: &mut Report) {
         .iter()
         .map(|(_, p, a, r, c)| PolicyRequest {
             principal: p,
+            principal_kind: PrincipalKind::Subject,
             action: a,
             resource: r,
             context: c,

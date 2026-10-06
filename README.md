@@ -60,86 +60,25 @@ only to satisfy an auditor always rots.
 ```sh
 cargo run --example hello_skill        # one skill, one run, one replay — start here
 cargo run --example durable_pipeline   # crash, resume, divergence
-cargo run --example clearing_case      # correlation, obligations, human tasks
-cargo run --example plan_graph         # multi-step plans, contract, provenance
-cargo run --example governed_transfer --features manifest
-                                        # field provenance, protected arguments
-cargo run --example saga_checkout      # reverse compensation, replay-safe unwind
-cargo run --example effect_group       # calls that take together, or not at all
-cargo run --example memory_run         # private/team memory, provenance, recall
-cargo run --example batch_run          # one act, many items: a resume that
-                                        # re-settles nothing, and partial failure
-                                        # as a terminal state
-cargo run --example budget_pause       # a ceiling pauses the run; a raise
-                                        # resumes it, on the record, nothing repeated
-cargo run --example answered_doubt     # a call nobody can account for: a person
-                                        # supplies the fact, the runtime keeps the
-                                        # verdict, and giving up leaves a finding
-cargo run --example operator_stop      # cancel a run and it unwinds; halt a
-                                        # tenant, an agent or one revision and
-                                        # nothing new starts; withdraw a
-                                        # credential and the runs acting for it
-                                        # pause, work intact, until you lift it
-cargo run --example observability      # the last mile: latency without replays,
-                                        # gauges from the census, one alert
-                                        # predicate — and the OTLP wiring
-cargo run --example recovered_run      # an instance dies mid-run; the survivor's
-                                        # sweep finds it and finishes it
-cargo run --example bedrock_live --features bedrock
-                                        # env-gated Amazon Bedrock Converse call
-cargo run --example openai_live --features providers
-                                        # env-gated OpenAI Responses call
-cargo run --example tool_loop --features redb,fake-model,manifest
-                                        # a model choosing tools, and four refusals
-cargo run --example approved_call --features redb,fake-model,manifest
-                                        # a person approves the exact call —
-                                        # suspend, worklist, approve or refuse
-cargo run --example planned_run --features redb,fake-model,manifest
-                                        # plan once, execute without the model —
-                                        # a prompt injection with no reader, and
-                                        # an invented recipient refused
-cargo run --example camel_live --features redb,providers,manifest
-                                        # the same, against two real models: a
-                                        # privileged planner and a quarantined
-                                        # extractor (env-gated)
-cargo run --example sealed_run --features redb,testkit,keyring
-                                        # erase a case: every copy unreadable,
-                                        # and the chain still verifies
+```
 
-# Calls a model and replays without calling it again — no API key, no network.
-cargo run --example model_run --features redb,fake-model
+`durable_pipeline` prints the whole claim in four steps: a live run, a strict
+replay that touches nothing, a crash that resumes without repeating work, and a
+changed build that is **quarantined instead of quietly rewriting history**.
+[`hello_skill`](https://github.com/hupe1980/agentplane/blob/main/examples/hello_skill.rs)
+is a first program: one `use agentplane::prelude::*;` and about forty lines.
+Every other example, by the question it answers and with the features it
+needs, is in
+[the example index](https://hupe1980.github.io/agentplane/docs/getting-started/#where-next).
 
-# Digest-only multimodal dispatch and zero-I/O replay — also fully offline.
-cargo run --example media_run --features redb,fake-model,media
+And when it goes wrong, the plane answers with what it *does* have rather than
+with a variant name — `fn main()` reports through `Debug`, so on the errors you
+hold, `Debug` is the message:
 
-# An agent whose prompt, model, result shape and ceilings come from a file.
-cargo run --example manifest_run --features redb,fake-model,manifest
-
-# A real MCP server in this process beside a typed Rust tool — one agent
-# reaching both, and a strict replay that calls neither.
-cargo run --example mcp_tools --features redb,fake-model,manifest,mcp
-
-# Four agents, one plane: a coded editor that dictates the sequence, and a
-# YAML desk that consults the same specialists as tool://agent/... grants.
-cargo run --example blog_room --features redb,fake-model,manifest
-
-# This plane served as an A2A 1.0 agent, called the way a peer would call it:
-# a public card, authenticated methods, and a message that arrives untrusted.
-cargo run --example a2a_peer --features redb,a2a-server,manifest
-
-# Two planes in one process: a served reviewer and a desk that consults it
-# through `cx.call_peer` — the hop is checked against the run's chain plus one
-# link, the reviewer binds to what its own authenticator established, and a
-# strict replay never reaches it.
-cargo run --example peer_call --features redb,testkit,manifest,a2a,a2a-server
-
-# Live tokens for a human, one journaled completion for the machine — and a
-# replay that performs neither.
-cargo run --example streaming_run --features redb,fake-model
-
-# One customer's approved €500, spent across two separate runs, then revoked —
-# with the terms still readable afterwards.
-cargo run --example standing_authority --features redb,fake-model
+```text
+Error: no skill provides capability 'demo.greeet' — this plane provides:
+demo.greet. `run` takes a capability, not a skill name; a skill declares its own
+with `SkillDescriptor::new(..).provides(..)`
 ```
 
 Or skip Rust entirely — a file and a key are the whole agent, and a file may
@@ -157,7 +96,8 @@ Or without a Rust toolchain at all — needing one to run a YAML file rather
 defeats the point of the file:
 
 ```sh
-docker run --rm -v "$PWD/examples:/work:ro" ghcr.io/hupe1980/agentplane \
+docker run --rm --read-only --network none \
+  -v "$PWD/examples:/work:ro" ghcr.io/hupe1980/agentplane \
   run /work/summariser.yaml --input '{"ticket": "printer on fire"}'
 ```
 
@@ -175,26 +115,6 @@ cosign verify ghcr.io/hupe1980/agentplane:slim \
   --certificate-identity-regexp 'https://github.com/hupe1980/agentplane/.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 gh attestation verify oci://ghcr.io/hupe1980/agentplane:slim -R hupe1980/agentplane
-```
-
-`durable_pipeline` prints the whole claim in four steps: a live run, a strict
-replay that touches nothing, a crash that resumes without repeating work, and a
-changed build that is **quarantined instead of quietly rewriting history**.
-
-A first program is one import and about forty lines:
-
-```rust
-use agentplane::prelude::*;
-```
-
-And when it goes wrong, the plane answers with what it *does* have rather than
-with a variant name — `fn main()` reports through `Debug`, so on the errors you
-hold, `Debug` is the message:
-
-```text
-Error: no skill provides capability 'demo.greeet' — this plane provides:
-demo.greet. `run` takes a capability, not a skill name; a skill declares its own
-with `SkillDescriptor::new(..).provides(..)`
 ```
 
 A declarative **tool loop** runs from a file too — the manifest grants
@@ -219,7 +139,7 @@ sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
     examples/serve-tokens.yaml > tokens.yaml
 
 agentplane serve examples/served.yaml \
-  --url http://localhost:8080 \
+  --url http://localhost:8080/a2a \
   --policy examples/serve-policy.cedar \
   --tokens tokens.yaml \
   --store ./served.redb
@@ -227,12 +147,21 @@ agentplane serve examples/served.yaml \
 
 `--store` takes a redb file or a `postgres://` connection string, and `--tenant`
 says whose plane — one flag apart, because on the shared store several instances
-coexist and so do an operator's verbs and a serving process.
+coexist and so do an operator's verbs and a serving process. A `postgres://`
+store needs `--features cli,postgres`, or the `:full` image
+([which verb needs which feature](https://hupe1980.github.io/agentplane/docs/operations/#cli-features)).
 
 Every verb exits by one table — `0` ok, `1` a finding or a negative answer, `2`
 a command it refuses, `3` a run waiting, `4` a store or network it could not
-use, `5` a partial answer — printed at the foot of `agentplane --help`
+use, `5` a partial answer, `6` an export under a `canon` this build does not
+implement — printed at the foot of `agentplane --help`
 ([exit statuses](https://hupe1980.github.io/agentplane/docs/operations/#exit-statuses)).
+
+Add `--mcp-addr 127.0.0.1:8081` and every agent in the file is an MCP tool at
+`/mcp` over Streamable HTTP, under the same tokens and policy — the URL and
+bearer header an agent framework in any language is configured with. A call is
+admitted as that caller, and `execution.kind: call` governs one tool call with
+no model of the plane's own.
 
 Add `--operator-addr 127.0.0.1:9090` and the operator surface is served too, on
 its **own** listener, off unless asked for, and separated from the peer surface
@@ -298,7 +227,9 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 
 A selection, not the inventory. The full surface — the export/audit/restore
 toolchain, `policy check` re-deriving an export's policy verdicts offline and
-measuring a candidate bundle against them, a durable manifest registry with an enumerable inventory, typed
+measuring a candidate bundle against them, `subject` saying where one memory
+subject's data went, `grants` naming the tool grants no run used, `bind` tying
+an outside grader's verdict to the records it judged, a durable manifest registry with an enumerable inventory, typed
 release, standing authorities, effect groups that commit with the journal,
 batch runs over 10⁵ items with per-item journals and an item-granular resume,
 the scoped emergency stop, the audited sweeper, a scheduled recovery drill, a
@@ -333,7 +264,7 @@ What is deliberately **not** built, and what will move →
 | 📐 | [Record format](https://hupe1980.github.io/agentplane/docs/format/) — the normative wire specification: canonical JSON, the chain, the Merkle log, the export file. Enough to verify a history without this crate |
 | 🔐 | [Security model](https://hupe1980.github.io/agentplane/docs/security/) — the trust boundary, and what it does not cover |
 | 🗝️ | [Erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) — erasure that reaches backups, key rotation and revocation, and how tenants are kept apart |
-| ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability |
+| ⚙️ | [Operations](https://hupe1980.github.io/agentplane/docs/operations/) — deploying, HA, retention, observability; the operator API's [OpenAPI document](https://hupe1980.github.io/agentplane/openapi.json) generates clients |
 | ⚖️ | [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) — EU AI Act obligation by obligation, and what is missing |
 | 📋 | [Status](https://hupe1980.github.io/agentplane/docs/status/) — what is pre-alpha, what to pin, what is deliberately absent |
 | ⬆️ | [Upgrading](https://hupe1980.github.io/agentplane/docs/upgrading/) — what a hard cut means, and moving a plane to a new build |
@@ -356,17 +287,19 @@ The unusual ones:
 
 **🔬 Formal specs.** TLA+ specifications are model-checked on every push — the
 effect protocol, effect groups, retry safety, sagas, fencing, authorization,
-delegation, and equivocation: showing two histories of one log, and which
-reader can still see it. And because a spec whose invariants cannot be violated proves
-nothing, each is re-checked against deliberately broken copies of itself; every
-mutant must be caught by the *specific* invariant written for it.
+delegation, equivocation (showing two histories of one log, and which reader
+can still see it), tenant quota scheduling, the rate window, the sink gate under
+replay and resume, the key lifecycle, and message, timer and task delivery. And
+because a spec whose invariants cannot be violated proves nothing, each is
+re-checked against deliberately broken copies of itself; every mutant must be
+caught by the *specific* invariant or liveness property written for it.
 
 **📐 A second reader of the record format.** The
 [format specification](https://hupe1980.github.io/agentplane/docs/format/) is
 normative prose, and `tools/verify_export.py` is written from it and reads none
 of this crate's Rust — enforced by a guard, because a verifier that consulted
 `src/` would agree with the implementation by construction. `just verify-golden`
-runs it: it **re-derives** all 30 record vectors from their parsed values with
+runs it: it **re-derives** all 33 record vectors from their parsed values with
 its own canonicalizer and chain digest, verifies the sealed export end to end,
 and then damages that export and asserts every damage is reported. Vectors a
 project generates and then checks are that project agreeing with itself; this
@@ -447,7 +380,7 @@ compiles. That is what `--verify` is for.
 | Replace a deterministic protocol engine | Keep it; agentplane sits *beside* it, never inside it |
 | Require Kubernetes | One static binary |
 | Train, fine-tune, or serve models | Permanently out of scope |
-| Grade output quality | It emits replayable traces; grade them elsewhere |
+| Grade output quality | It emits replayable traces; grade them elsewhere, and `agentplane bind` ties the verdict to the records it judged |
 | Interpret payload contents | Payloads are opaque, and labeled |
 | Claim regulatory compliance | It provides technical means; compliance is the deployer's |
 
@@ -469,9 +402,7 @@ Compliance attaches to a system in a context, assessed by its provider or
 deployer. What this gives you is the **technical means** to discharge EU AI Act
 Articles 12 and 14 — means that are already load-bearing for recovery and
 testing, and therefore cannot quietly rot. [Regulation](https://hupe1980.github.io/agentplane/docs/regulation/) maps
-obligation to mechanism, names what is *not* built, and notes that the Digital
-Omnibus moved the high-risk dates to December 2027 without amending the
-articles.
+obligation to mechanism and names what is *not* built.
 
 ## 📄 License
 

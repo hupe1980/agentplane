@@ -238,8 +238,7 @@ impl QuotaStore for RedbStore {
                     if held {
                         Ok(())
                     } else {
-                        let floor =
-                            crate::quota::rate_prune_floor(reservation.at, &reservation.ceilings);
+                        let floor = crate::quota::rate_prune_floor(reservation.at);
                         let (instants, stale) = rate_rows(&rate, &tenant, grant, floor)?;
                         for key in &stale {
                             rate.remove((tenant.as_str(), grant, key.0.as_str(), key.1.as_str()))
@@ -342,6 +341,44 @@ impl QuotaStore for RedbStore {
             };
             w.commit().map_err(|e| be(&e))?;
             Ok(standing)
+        })
+        .await
+    }
+
+    async fn lift_halt_if(&self, standing: &Halt) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let expected = standing.clone();
+        let scope = expected.scope.key();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let removed = {
+                let mut halted = w.open_table(HALTED).map_err(|e| be(&e))?;
+                let key = (tenant.as_str(), scope.as_str());
+                let current = halted
+                    .get(key)
+                    .map_err(|e| be(&e))?
+                    .map(|row| row.value().to_owned());
+                let matches = match current {
+                    None => false,
+                    Some(row) => {
+                        let row: super::HaltRow =
+                            serde_json::from_str(&row).map_err(|e| StoreError::Corrupt {
+                                seq: 0,
+                                detail: format!(
+                                    "quota_halted holds a row for '{scope}' this build cannot \
+                                     read ({e}) — refusing to remove a halt it cannot compare"
+                                ),
+                            })?;
+                        super::halt_from_row(expected.scope.clone(), row) == expected
+                    }
+                };
+                if matches {
+                    halted.remove(key).map_err(|e| be(&e))?;
+                }
+                matches
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(removed)
         })
         .await
     }

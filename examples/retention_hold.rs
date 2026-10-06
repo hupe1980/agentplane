@@ -108,6 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "keyring")]
         keys: None,
         tenant: &tenant,
+        disclosures: None,
     };
     let report = agentplane::retention::retain(&stores, at(CUTOFF), at(SWEPT), "7 years").await?;
     println!("\n3. the pass");
@@ -135,7 +136,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── 5. A pause, not an exemption ────────────────────────────────────────
-    cases.release_hold(*held).await?;
+    // Released through the runtime, which records who released it — a record
+    // that survives the erasure it now permits.
+    let plane = Runtime::builder(store.clone() as Arc<dyn agentplane::journal::JournalStore>)
+        .cases(Arc::clone(&cases))
+        .build();
+    let released = plane
+        .release_hold(*held, &operator("ops-dave"), at(SWEPT))
+        .await?
+        .expect("the matter was held")
+        .record;
+    println!("\n   released, recorded in run {released}");
     let after = agentplane::retention::retain(&stores, at(CUTOFF), at(SWEPT), "7 years").await?;
     println!("\n5. the hold is lifted and the same pass runs again");
     println!("   still held     → {}", after.held.len());

@@ -1,59 +1,42 @@
 #!/usr/bin/env python3
 """Hold the design constitution to the rules its own README states.
 
-`concepts/` is untracked and never ships, so no test in `tests/` can read it —
-which is exactly why its cross-references rot silently while every
-reader-visible page is guarded. This is the maintainer's equivalent of
-`zola check`, and it is a `just` recipe rather than a `ci` stage for one honest
-reason: a clean checkout does not have the folder, and a check that passes by
-finding nothing is the shape this project treats as a defect.
+`concepts/` is untracked and never ships, so no test in `tests/` can read it,
+and `cargo doc` never sees it. This is the maintainer's equivalent of `zola
+check`, run as `just _concepts-check`. A missing `concepts/` is a fault, since a
+check that passes by finding nothing is the shape this project treats as a
+defect; `--allow-missing` is for a checkout that deliberately has none.
 
-Three rules, all of them stated in `concepts/README.md`:
+This docstring is the one home of the rules; `concepts/README.md` points here.
 
 1. **Section numbers are global and stable**, so every `§N.M` resolves to a
-   heading somewhere in the folder. A reference to another *specification's*
-   sections must name it — `ACS §8.2` — because the syntax is otherwise
-   identical and `§8.2` already means something here.
-2. **Every cross-file link resolves**, file and anchor. An anchor that points at
-   a renamed heading is worse than a dangling one: it lands the reader
-   somewhere plausible.
+   heading in the folder. Another specification's section must be named —
+   `ACS §8.2` — because the syntax is otherwise identical.
+2. **Every cross-file link resolves**, file and anchor. An anchor pointing at a
+   renamed heading lands the reader somewhere plausible, which is worse than
+   dangling.
 3. **Open work lives in ROADMAP.md only.** Every other document describes
    current state.
-4. **A code reference resolves to code.** `Type::member` in backticks names
-   something this crate actually exposes. The constitution cites the code
-   constantly and nothing else can check it: `tests/` cannot read an untracked
-   folder, and `cargo doc` never sees these files. A renamed method leaves the
-   design document quietly describing a surface that no longer exists, which is
-   worse here than a dangling link — the reader has no reason to doubt it.
-6. **A published deferral is owned by the roadmap.** `site/content/docs/status.md`
-   tells an adopter what this project is waiting on, "so a reader can tell
-   whether their own need would move it". An entry there the roadmap does not
-   claim is a promise made outside the building with no work behind it — and it
-   happened: symbolic policy analysis was published as deferred and appeared
-   nowhere in this folder ([§10.5](SHAPES.md#105-shapes-of-mistake) shape 60).
-   Whatever claims it carries `**Published as deferred:**` with the entry's own
-   words, and both directions are checked. An *item* is the usual claimant and
-   not the only honest one: a wait that is prose rather than work — because
-   nothing here can start it — owns its deferral the same way, by naming it and
-   saying what would settle it.
-7. **Every open item is specified, and every specification is open.** The
-   roadmap is the direction and the only list of open work; the detail of what
-   an item must deliver lives in `specs/NNN-slug/spec.md`, written with Spec
-   Kit. Each `###` item carries `**Specified as:**` naming its folder, and each
-   folder directly under `specs/` is named by exactly one item — so a spec
-   whose item was discharged has moved to `specs/archive/`, and an item cannot
-   point at detail that does not exist. Rules 1 and 4 read the specifications
-   too: a spec cites the same sections and the same code the folder does, and
-   rots the same way.
-5. **A deferred cost is named where it will be paid.** A decision that parks a
-   durable-format change until the format freeze marks itself a *pre-freeze
-   record change*, and the freeze act is the one place that list is worth
-   reading — because the act is what converts "cheapest moment" into "upcaster
-   and a version bump, forever". Recorded only at the decision, each is
-   findable and the act is still priced by nobody
-   ([§10.5](SHAPES.md#105-shapes-of-mistake) shape 59). Both directions are
-   checked: a marked decision the freeze item does not name, and a cost the
-   freeze item names that no decision carries any more.
+4. **A code reference resolves to code.** `Type::member` and `module::item` in
+   backticks name something `src/` defines. Scoped to names this crate has, so
+   another specification's vocabulary is skipped without an exemption list.
+5. **A deferred format cost is named where it will be paid.** The freeze item
+   (`### Perform the freeze`) collects, in both directions: every decision in
+   DECISIONS.md marked *pre-freeze record change*, by its bolded subject; and
+   every live specification that says it moves a durable format (*pre-freeze
+   record change*, or *before the freeze as a hard cut*), by its folder name in
+   a `` - `NNN-slug` `` bullet. A listed folder must be a live specification. A
+   cost recorded only where it was deferred is priced by nobody at the act that
+   pays it ([§10.5](SHAPES.md#105-shapes-of-mistake) shape 59).
+6. **A published deferral is owned by the roadmap.** Each entry under
+   `### Deferred` in `site/content/docs/status.md` is claimed by a
+   `**Published as deferred:**` line with the entry's own words — on an item, or
+   on prose that says why nothing here can start it — and each claim names a
+   published entry (shape 60).
+7. **Every open item is specified, and every specification is open.** Each
+   `###` item carries one `**Specified as:**` naming a folder directly under
+   `specs/`, each such folder is named by exactly one item, and a discharged
+   one lives in `specs/archive/`. Rules 1 and 4 read the specifications too.
 """
 
 from __future__ import annotations
@@ -68,7 +51,7 @@ SPEC_DIR = re.compile(r"^\d{3}-[a-z0-9-]+$")
 
 # Reference to somebody else's specification, which this folder's numbering
 # says nothing about. Anything else is a claim about a heading here.
-FOREIGN = re.compile(r"\b(ACS|ACP|RFC|MCP|A2A|OCSF)\s+§")
+FOREIGN = re.compile(r"\b(ACS|ACP|RFC(?:\s+\d+)?|MCP|A2A|OCSF)\s+§")
 
 # Phrases that mean "not done" outside the one document allowed to say so.
 UNFINISHED = re.compile(
@@ -105,8 +88,11 @@ def anchors(text: str) -> set[str]:
 
 def main() -> int:
     if not ROOT.is_dir():
-        print(f"no {ROOT} — nothing to check")
-        return 0
+        if "--allow-missing" in sys.argv[1:]:
+            print(f"no {ROOT} — nothing to check (--allow-missing)")
+            return 0
+        print(f"no {ROOT}: a check that finds nothing has checked nothing; pass --allow-missing where that is intended")
+        return 1
     docs = {p.name: p.read_text() for p in sorted(ROOT.glob("*.md"))}
     if not docs:
         print(f"{ROOT} holds no documents")
@@ -261,6 +247,38 @@ def main() -> int:
             faults.append(
                 f"ROADMAP.md: the freeze item names {subject!r}, and no decision "
                 f"carries it as a pre-freeze record change any more"
+            )
+
+    # 5b. Open specifications that would move a durable format.
+    #
+    # An open item carries no decision for the join above to read, so its
+    # specification is what says it moves a record — and the freeze item names
+    # it by folder. The negated forms ("no …", "not a pre-freeze record change")
+    # are a spec saying the opposite and are skipped.
+    if freeze:
+        own = re.search(r"^\*\*Specified as:\*\*\s+`([^`]+)`", freeze.group(1), re.M)
+        own_spec = own.group(1) if own else None
+        named = set(re.findall(r"^- `(\d{3}-[a-z0-9-]+)`", freeze.group(1), re.M))
+        marks = re.compile(
+            r"(?<!\bno )(?<!\bnot a )pre-freeze record change|before the freeze as a hard cut", re.I
+        )
+        moving = set()
+        for path, text in specs.items():
+            folder = path.split("/")[1]
+            if folder == own_spec:
+                continue
+            if marks.search(" ".join(text.replace("*", "").split())):
+                moving.add(folder)
+        live_folders = {path.split("/")[1] for path in specs}
+        for folder in sorted(moving - named):
+            faults.append(
+                f"specs/{folder}: says it moves a durable format and the freeze item "
+                f"does not name it. List it as a `- `{folder}`` bullet under what the act costs"
+            )
+        for folder in sorted(named - live_folders):
+            faults.append(
+                f"ROADMAP.md: the freeze item names {folder!r} as a cost, and it is not a "
+                f"live specification — discharged or archived costs leave the list"
             )
 
     # 6. Published deferrals, owned by an item.

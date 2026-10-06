@@ -766,6 +766,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         idempotency_key: None,
                         admitted_by: None,
                         served_unchained: false,
+                        plane_chain: false,
                     },
                 ),
                 Append::new(
@@ -792,6 +793,8 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         backoff_ms: 0,
                         outbound_label: None,
                         outbound_bytes: None,
+                        content_rules: None,
+                        credential: None,
                     },
                 )
                 .step(StepId(0))
@@ -805,6 +808,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         disposition: Disposition::DidNotHappen,
                         spend: agentplane::core::Spend::default(),
                         permanent: false,
+                        elapsed_ms: None,
                     },
                 )
                 .step(StepId(0))

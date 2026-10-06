@@ -34,7 +34,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::BufRead;
 
 use serde::Serialize;
-use serde_json::Value;
 
 use crate::core::{
     ACTIONS, Delegation, Digest, EffectKey, GroupOutcome, PolicyBundleIdentity, PolicyDecision,
@@ -581,6 +580,7 @@ fn push(
     request: GatedRequest,
 ) {
     let identity = crate::core::canon::value_bytes(&serde_json::json!([
+        request.principal_kind.entity_type(),
         request.principal,
         request.action,
         request.resource,
@@ -686,89 +686,13 @@ fn disagreement(rebuilt: &Rebuilt, decision: &PolicyDecision) -> Option<Finding>
 }
 
 /// The export's runs, in file order, each with its records' bodies.
-///
-/// Parsed from each record's `raw` — the bytes the chain hashed — never from
-/// the display copy beside them. Integrity is not checked here; that is
-/// `export::verify`'s.
 #[allow(clippy::type_complexity)]
 fn read_export<R: BufRead>(
     input: R,
 ) -> Result<(Vec<(RunId, Vec<RecordBody>)>, Vec<RunId>), CheckError> {
-    let mut runs: Vec<(RunId, Vec<RecordBody>)> = Vec::new();
-    let mut unreadable = Vec::new();
-    let mut header = false;
-    for (index, line) in input.lines().enumerate() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(&line)
-            .map_err(|e| CheckError::NotAnExport(format!("line {} is not JSON: {e}", index + 1)))?;
-        match value.get("kind").and_then(Value::as_str) {
-            Some("agentplane.export") => {
-                let version = value.get("version").and_then(Value::as_u64);
-                if version != Some(u64::from(crate::export::FORMAT_VERSION)) {
-                    return Err(CheckError::NotAnExport(format!(
-                        "the export is at format version {version:?}, and this build reads {}",
-                        crate::export::FORMAT_VERSION
-                    )));
-                }
-                header = true;
-            }
-            _ if !header => {
-                return Err(CheckError::NotAnExport(
-                    "the first line is not an agentplane export header".into(),
-                ));
-            }
-            Some("agentplane.export.run") => {
-                let run = value
-                    .get("run")
-                    .cloned()
-                    .and_then(|r| serde_json::from_value::<RunId>(r).ok())
-                    .ok_or_else(|| {
-                        CheckError::NotAnExport(format!("line {} names no run", index + 1))
-                    })?;
-                runs.push((run, Vec::new()));
-            }
-            Some("agentplane.export.end") => {
-                if let Some(list) = value.get("unreadable").and_then(Value::as_array) {
-                    unreadable.extend(list.iter().filter_map(|u| {
-                        u.get("run")
-                            .cloned()
-                            .and_then(|r| serde_json::from_value::<RunId>(r).ok())
-                    }));
-                }
-            }
-            Some(_) => {}
-            None => {
-                let raw = value.get("raw").and_then(Value::as_str).ok_or_else(|| {
-                    CheckError::NotAnExport(format!("line {} carries no wire bytes", index + 1))
-                })?;
-                let body: RecordBody = serde_json::from_str(raw).map_err(|e| {
-                    CheckError::NotAnExport(format!(
-                        "line {} holds a record this build does not read: {e}",
-                        index + 1
-                    ))
-                })?;
-                let Some((run, records)) = runs.last_mut() else {
-                    return Err(CheckError::NotAnExport(format!(
-                        "line {} is a record before any run block",
-                        index + 1
-                    )));
-                };
-                if body.run != *run {
-                    return Err(CheckError::NotAnExport(format!(
-                        "line {} belongs to run {}, filed under {run}",
-                        index + 1,
-                        body.run
-                    )));
-                }
-                records.push(body);
-            }
-        }
-    }
-    if !header {
-        return Err(CheckError::NotAnExport("the input is empty".into()));
-    }
-    Ok((runs, unreadable))
+    let read = crate::export::read_runs(input).map_err(|e| match e {
+        crate::export::ReadError::Io(e) => CheckError::Io(e),
+        crate::export::ReadError::NotAnExport(e) => CheckError::NotAnExport(e),
+    })?;
+    Ok((read.runs, read.unreadable))
 }

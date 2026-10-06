@@ -151,11 +151,21 @@ pub enum RecordKind {
         /// same holder the live run did.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         served_unchained: bool,
+        /// Admitted as the plane itself, under the plane's own chain.
+        ///
+        /// Nobody on that chain asked for the run, so four-eyes does not bar
+        /// them. Recorded rather than compared against the plane's chain: a
+        /// served caller may present an equal one, and the resuming plane may
+        /// hold another.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        plane_chain: bool,
     },
 
     /// A live execution pass began under this record body's fencing epoch.
     ///
-    /// Written before any effect the pass may dispatch. `period` is captured
+    /// Rides the pass's first append to the run — alone just before it when
+    /// that append is the conclusion — so it precedes any effect the pass
+    /// dispatches, and a pass that writes nothing leaves none. `period` is captured
     /// once so recovery never moves spend across a billing boundary; `release_slot`
     /// distinguishes fresh admission from a resume, which is deliberately not
     /// gated by the concurrency ceiling.
@@ -320,6 +330,23 @@ pub enum RecordKind {
         /// hashes identically.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outbound_bytes: Option<u64>,
+        /// The declared content rules this value was judged by at the sink,
+        /// matched or not, so a reader can tell "passed the rules" from "no
+        /// rule applied". Ids only: nothing matched is recorded anywhere.
+        ///
+        /// Absent where no rule applied.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_rules: Option<Vec<String>>,
+        /// Whom the credential this call presented to another party named:
+        /// the person the run acts for, nobody, or the plane itself.
+        ///
+        /// Recorded because whether the far side *could* check who asked is
+        /// the audit question, and wiring is not evidence of it. Never the
+        /// credential, its digest or its expiry.
+        ///
+        /// Absent for a call that presents no credential of this plane's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        credential: Option<crate::core::CredentialBinding>,
     },
 
     EffectDone {
@@ -377,6 +404,18 @@ pub enum RecordKind {
         /// [`DeclaredOutput`](crate::core::DeclaredOutput) for why re-reading
         /// the effect is not equivalent.
         declared: crate::core::DeclaredOutput,
+        /// What the declared content rules decided about the output, when one
+        /// matched. The value's sensitivity is `declared` joined with it, and
+        /// a recorded refusal is the step's answer; a replay reads both from
+        /// here and evaluates no rule.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<crate::core::ContentVerdict>,
+        /// How long the call took, in milliseconds, as this process measured
+        /// it — the wall time a reader asks about, never a run input: replay
+        /// reads it back and measures nothing. Absent where nothing was
+        /// performed live.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
     },
     EffectFailed {
         error: String,
@@ -404,6 +443,10 @@ pub enum RecordKind {
         /// ordinary failure costs no bytes and no hash input.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         permanent: bool,
+        /// How long the attempt took before it failed, as `EffectDone`'s
+        /// figure is measured.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        elapsed_ms: Option<u64>,
     },
 
     /// A limit refused an operation before it started.
@@ -447,10 +490,12 @@ pub enum RecordKind {
 
     /// The authority this run acts under was withdrawn while it was running.
     ///
-    /// Run-level — no step, no effect key — and written at a step boundary only:
-    /// between boundaries an effect may be announced and not yet recorded, and
-    /// stopping there manufactures the in-doubt case the protocol exists to
-    /// avoid.
+    /// Written at a step boundary, run-level with no effect key; or at a hop
+    /// about to present a credential naming the withdrawn subject, keyed to
+    /// that hop, which was not announced. Never between an announcement and
+    /// its outcome: stopping there manufactures the in-doubt case the protocol
+    /// exists to avoid. A hop's withholding is superseded by that hop's own
+    /// later announcement.
     ///
     /// **A pause, so it has a counterpart.** A lift is journaled as
     /// [`AuthorityRestored`](Self::AuthorityRestored) *beside* this record
@@ -459,7 +504,7 @@ pub enum RecordKind {
     /// construction as [`BudgetRefused`](Self::BudgetRefused) and
     /// [`BudgetReadmitted`](Self::BudgetReadmitted).
     AuthorityWithheld {
-        /// The delegation subject that was withdrawn — what an operator matches
+        /// The principal that was withdrawn — what an operator matches
         /// against the halt they threw.
         subject: String,
         /// Why, in the operator's own words, carried from the halt.
@@ -499,6 +544,19 @@ pub enum RecordKind {
     /// not be spelled the same way as an unrestricted one.
     IdentityBound {
         chain: Vec<Principal>,
+    },
+
+    /// Whose data this run took in: the run's data-subject bindings, resolved
+    /// once after its other header records.
+    ///
+    /// Recorded rather than re-resolved, so a resume and a strict replay
+    /// attribute exactly as the live run did, and so the subject trace reads
+    /// the journal rather than a declaration that may since have changed.
+    /// Every label read from the run's input, its inbound events and its
+    /// case state carries a [`SubjectRef`](crate::core::SubjectRef) to an
+    /// entry here; the subject itself is sealed.
+    DataSubjectBound {
+        bindings: Vec<BoundSubject>,
     },
 
     /// Policy refused an effect before it was attempted.
@@ -743,6 +801,51 @@ pub enum RecordKind {
         reason: String,
     },
 
+    /// An operator lifted an emergency stop.
+    ///
+    /// The runtime cannot check the instruction, so its weight is the name
+    /// beside it, as the throw's is. The quota register keeps only what is
+    /// stopped now; this record, the sole one of a sealed run of its own, keeps
+    /// who let the work start again and the whole stop it ended. It attests the
+    /// instruction and the row as read, not that the removal succeeded — the
+    /// register is the answer to what is in force.
+    HaltLifted {
+        /// The lifted scope, as [`HaltScope::key`](crate::quota::HaltScope::key)
+        /// spells it.
+        scope: String,
+        /// Who lifted it, and what established the name.
+        by: crate::core::Operator,
+        /// When it was lifted.
+        #[serde(with = "time::serde::rfc3339")]
+        at: Timestamp,
+        /// The ended halt's reason.
+        reason: String,
+        /// Who threw the ended halt.
+        thrown_by: crate::core::Operator,
+        /// When the ended halt was thrown.
+        #[serde(with = "time::serde::rfc3339")]
+        thrown_at: Timestamp,
+    },
+
+    /// An operator released a legal hold.
+    ///
+    /// The sole record of a sealed run of its own, stamped with the released
+    /// case. It carries names and instants and **not the hold's reason**: that
+    /// is free text about a matter the release lets an erasure destroy, and
+    /// this record is the erasure's authorization, which outlives the matter.
+    HoldReleased {
+        /// Who released it, and what established the name.
+        by: crate::core::Operator,
+        /// When it was released.
+        #[serde(with = "time::serde::rfc3339")]
+        at: Timestamp,
+        /// Who placed the ended hold.
+        placed_by: crate::core::Operator,
+        /// When the ended hold was placed.
+        #[serde(with = "time::serde::rfc3339")]
+        placed_at: Timestamp,
+    },
+
     /// Something the sweeper did to work nobody was watching.
     ///
     /// The sweeper acts on a clock rather than on a request, so there is no run
@@ -810,6 +913,47 @@ pub enum RecordKind {
     },
 }
 
+/// One resolved data-subject binding of a [`RecordKind::DataSubjectBound`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundSubject {
+    /// This entry's position, which every [`SubjectRef`](crate::core::SubjectRef)
+    /// to it names.
+    pub index: u16,
+    /// Where the subject was read from.
+    pub binding: SubjectBinding,
+    /// Whether the value it was read from was trusted. An untrusted binding
+    /// still attributes — it decides nothing — and a report says it was
+    /// asserted by untrusted input.
+    pub trusted: bool,
+    /// The subject, as the deployment names it. Sealed: it identifies a
+    /// person, and an erasure of the run's data must take it with it.
+    pub subject: String,
+}
+
+/// Where a data subject was read from: the manifest's binding forms, and the
+/// embedder naming one directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubjectBinding {
+    /// A field of the run's input, by RFC 6901 pointer.
+    Input { pointer: String },
+    /// The case the run belongs to.
+    Case,
+    /// Named by the embedder that admitted the run.
+    Named,
+}
+
+impl std::fmt::Display for SubjectBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input { pointer } => write!(f, "$input{pointer}"),
+            Self::Case => f.write_str("$case"),
+            Self::Named => f.write_str("named by the embedder"),
+        }
+    }
+}
+
 impl RecordKind {
     /// Stable discriminator, stored in an indexed column.
     #[must_use]
@@ -838,11 +982,14 @@ impl RecordKind {
             Self::AuthorityWithheld { .. } => "AuthorityWithheld",
             Self::AuthorityRestored { .. } => "AuthorityRestored",
             Self::IdentityBound { .. } => "IdentityBound",
+            Self::DataSubjectBound { .. } => "DataSubjectBound",
             Self::PolicyDenied { .. } => "PolicyDenied",
             Self::Released { .. } => "Released",
             Self::RunCancelled { .. } => "RunCancelled",
             Self::RunConcluded { .. } => "RunConcluded",
             Self::BreakGlass { .. } => "BreakGlass",
+            Self::HaltLifted { .. } => "HaltLifted",
+            Self::HoldReleased { .. } => "HoldReleased",
             Self::Swept { .. } => "Swept",
             Self::Observed { .. } => "Observed",
         }
@@ -916,7 +1063,7 @@ fn version_claimed(raw: &[u8]) -> Option<(String, u16)> {
 /// Bytes that do not name a kind at a version are left as an encoding fault.
 /// There is nobody to blame: a payload that hashes correctly and is not a
 /// record is not evidence that somebody is running a different build.
-pub(crate) fn unreadable(raw: &[u8], parse: serde_json::Error) -> StoreError {
+fn unreadable(raw: &[u8], parse: serde_json::Error) -> StoreError {
     match version_claimed(raw) {
         Some((kind, version)) => StoreError::UnreadableRecordShape {
             kind,
@@ -954,6 +1101,40 @@ pub struct RecordBody {
     pub effect_key: Option<EffectKey>,
     #[serde(flatten)]
     pub kind: RecordKind,
+}
+
+impl RecordBody {
+    /// The body a record's wire bytes hold, in the shape this build reads.
+    ///
+    /// The version is compared before the shape is believed: bytes at this
+    /// build's version for their kind are parsed, and bytes at any other are
+    /// handed to `upcaster` as written. The errors are
+    /// [`Record::from_stored_with`]'s, and naming a parse failure a skew is
+    /// sound only for bytes whose hash the caller has verified.
+    pub(crate) fn read_through(
+        upcaster: &dyn super::Upcaster,
+        raw: &[u8],
+    ) -> Result<Self, StoreError> {
+        match serde_json::from_slice::<Self>(raw) {
+            // The overwhelming case: one parse, one integer comparison, no
+            // allocation. Everything below is the cold path.
+            Ok(body) if body.v == upcaster.current_version(body.kind.kind_str()) => Ok(body),
+            // Parsed, and from another shape. The *raw* value is what the
+            // upcaster is handed — the parsed body has already lost whatever
+            // this build does not know, and lifting from it would lift a
+            // record with the interesting part missing.
+            Ok(body) => lift(upcaster, raw, body.kind.kind_str(), body.v),
+            // Did not parse. Either it is not a record, or it is one whose
+            // shape moved — and those are different answers, so the version is
+            // read from the bytes before the parse failure is believed.
+            Err(parse) => match version_claimed(raw) {
+                Some((kind, v)) if v != upcaster.current_version(&kind) => {
+                    lift(upcaster, raw, &kind, v)
+                }
+                _ => Err(unreadable(raw, parse)),
+            },
+        }
+    }
 }
 
 /// A sealed journal entry: body, chain links, and the bytes that were hashed.
@@ -1009,8 +1190,8 @@ impl Record {
     /// 256 KiB — and is deliberately a hard refusal rather than a truncation,
     /// because a silently shortened record is a journal that lies.
     ///
-    /// Enforced in [`Record::seal_signed`], which is the one function every
-    /// backend seals through, so no store can be added that quietly skips it.
+    /// Enforced in the step [`Record::seal_signed`] and [`Record::seal_at`]
+    /// both end in, so no store can be added that quietly skips it.
     pub const MAX_RECORD_BYTES: usize = 1 << 20;
 
     /// Seal, and attest it as the given signer.
@@ -1025,6 +1206,17 @@ impl Record {
         signer: Option<&dyn Signer>,
     ) -> Result<Self, StoreError> {
         let raw = canon::to_bytes(&body)?;
+        Self::linked(body, raw, prev_hash, signer)
+    }
+
+    /// Link bytes into the chain under `prev_hash`, refusing them above the
+    /// limit — the one step every seal ends in.
+    fn linked(
+        body: RecordBody,
+        raw: Vec<u8>,
+        prev_hash: Digest,
+        signer: Option<&dyn Signer>,
+    ) -> Result<Self, StoreError> {
         if raw.len() > Self::MAX_RECORD_BYTES {
             return Err(StoreError::RecordTooLarge {
                 bytes: raw.len(),
@@ -1039,6 +1231,50 @@ impl Record {
             signature: signer.map(|s| s.signature_over(&record_signing_input(hash))),
             raw,
         })
+    }
+
+    /// Seal at the position a store assigned, keeping the written bytes when
+    /// the append carries them.
+    ///
+    /// With no written bytes this is [`Record::seal_signed`]. With them — a
+    /// restore — the bytes are hashed against `prev_hash` as they stand and the
+    /// body is the store's index view of them, so they must name the position
+    /// the store assigned: bytes claiming another `seq`, `epoch` or `run` would
+    /// land a record under a chain position its own body contradicts.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] for written bytes that name another position,
+    /// [`StoreError::RecordTooLarge`] above the limit, and whatever
+    /// [`Record::seal_signed`] refuses.
+    pub fn seal_at(
+        body: RecordBody,
+        written: Option<Vec<u8>>,
+        prev_hash: Digest,
+        signer: Option<&dyn Signer>,
+    ) -> Result<Self, StoreError> {
+        #[derive(Deserialize)]
+        struct Position {
+            seq: Seq,
+            epoch: Epoch,
+            run: RunId,
+        }
+        let Some(raw) = written else {
+            return Self::seal_signed(body, prev_hash, signer);
+        };
+        let named = serde_json::from_slice::<Position>(&raw).ok();
+        if named.is_none_or(|p| p.seq != body.seq || p.epoch != body.epoch || p.run != body.run) {
+            return Err(StoreError::Corrupt {
+                seq: body.seq,
+                detail: format!(
+                    "the written bytes handed to the store do not name the position it \
+                     assigned (run {}, seq {}, epoch {}), so storing them would file a record \
+                     under a chain position its own body contradicts",
+                    body.run, body.seq, body.epoch
+                ),
+            });
+        }
+        Self::linked(body, raw, prev_hash, signer)
     }
 
     /// Reconstruct from storage, verifying the link before trusting the
@@ -1112,25 +1348,7 @@ impl Record {
                 ),
             });
         }
-        let body = match serde_json::from_slice::<RecordBody>(&raw) {
-            // The overwhelming case: one parse, one integer comparison, no
-            // allocation. Everything below is the cold path.
-            Ok(body) if body.v == upcaster.current_version(body.kind.kind_str()) => body,
-            // Parsed, and from another shape. The *raw* value is what the
-            // upcaster is handed — the parsed body has already lost whatever
-            // this build does not know, and lifting from it would lift a
-            // record with the interesting part missing.
-            Ok(body) => lift(upcaster, &raw, body.kind.kind_str(), body.v)?,
-            // Did not parse. Either it is not a record, or it is one whose
-            // shape moved — and those are different answers, so the version is
-            // read from the bytes before the parse failure is believed.
-            Err(parse) => match version_claimed(&raw) {
-                Some((kind, v)) if v != upcaster.current_version(&kind) => {
-                    lift(upcaster, &raw, &kind, v)?
-                }
-                _ => return Err(unreadable(&raw, parse)),
-            },
-        };
+        let body = RecordBody::read_through(upcaster, &raw)?;
         Ok(Self {
             body,
             prev_hash,
@@ -1295,6 +1513,9 @@ pub struct Append {
     pub phase: Phase,
     pub effect_key: Option<EffectKey>,
     pub kind: RecordKind,
+    /// The bytes a restore carries from the export, which the store keeps in
+    /// place of a re-seal. Set only by [`Append::restored`].
+    written: Option<Vec<u8>>,
 }
 
 impl Append {
@@ -1306,6 +1527,7 @@ impl Append {
             phase: Phase::Forward,
             effect_key: None,
             kind,
+            written: None,
         }
     }
 
@@ -1353,18 +1575,70 @@ impl Append {
             phase: body.phase,
             effect_key: body.effect_key,
             kind: body.kind,
+            written: None,
         }
     }
 
-    /// Materialize into a body at a given position.
+    /// The append that puts a verified record back exactly as it was written.
+    ///
+    /// The store stores and hashes the bytes the record carries and indexes
+    /// the body it reads from those bytes through its own upcaster — never the
+    /// append's fields, which a caller can change after this — so a record
+    /// restored across a shape change hashes as it did in the export. A body re-sealed instead would be this build's
+    /// serialization of the lifted shape: new bytes, a new hash, and a chain
+    /// that is no longer the one exported.
+    #[must_use]
+    pub fn restored(record: Record) -> Self {
+        Self {
+            written: Some(record.raw),
+            ..Self::from_body(record.body)
+        }
+    }
+
+    /// The written bytes a restore carries, which a store keeps rather than
+    /// re-sealing; `None` on every runtime write.
+    #[must_use]
+    pub fn written(&self) -> Option<&[u8]> {
+        self.written.as_deref()
+    }
+
+    /// The body at a given position, for a test that seals one directly.
+    #[cfg(test)]
+    pub(crate) fn into_body(self, seq: Seq, epoch: Epoch) -> RecordBody {
+        self.into_parts(seq, epoch, &super::Identity)
+            .expect("a test append materializes")
+            .0
+    }
+
+    /// Materialize into a body at a given position, with the written bytes a
+    /// restore carries; [`Record::seal_at`] takes both.
+    ///
+    /// With written bytes the body is read from them through `upcaster`, and
+    /// the caller's fields are ignored: every index a store builds — the
+    /// exactly-once key, the by-case stamp, the admission claim, the outcome,
+    /// a backend's kind column — is derived from this body, and reads parse the
+    /// bytes, so a body taken from the append's public fields could index a
+    /// record its own bytes contradict. The bytes must name the position the
+    /// store assigned.
     ///
     /// Sealing a record is a store's job, so this has no callers in a build with
     /// no store compiled in. Both backends are stores: the gate read `redb`
     /// alone while `PostgresStore` calls this on every append, which nothing
     /// noticed because no configuration ever compiled Postgres without redb.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] for written bytes that are not a record or that
+    /// name another position, and [`StoreError::UnknownRecordVersion`] for a
+    /// version `upcaster` does not reach.
     #[cfg(any(feature = "redb", feature = "postgres", test))]
-    pub(crate) fn into_body(self, seq: Seq, epoch: Epoch) -> RecordBody {
-        RecordBody {
+    pub(crate) fn into_parts(
+        self,
+        seq: Seq,
+        epoch: Epoch,
+        upcaster: &dyn super::Upcaster,
+    ) -> Result<(RecordBody, Option<Vec<u8>>), StoreError> {
+        let fields = RecordBody {
             seq,
             run: self.run,
             case: self.case,
@@ -1374,7 +1648,31 @@ impl Append {
             v: self.kind.version(),
             effect_key: self.effect_key,
             kind: self.kind,
+        };
+        let Some(raw) = self.written else {
+            return Ok((fields, None));
+        };
+        // The bytes are not hash-verified here, so a parse failure is a
+        // statement about them, never a skew.
+        let body = RecordBody::read_through(upcaster, &raw).map_err(|e| match e {
+            StoreError::UnknownRecordVersion { .. } => e,
+            other => StoreError::Corrupt {
+                seq,
+                detail: format!("the written bytes handed to the store are not a record: {other}"),
+            },
+        })?;
+        if body.seq != seq || body.epoch != epoch || body.run != fields.run {
+            return Err(StoreError::Corrupt {
+                seq,
+                detail: format!(
+                    "the written bytes handed to the store name run {}, seq {}, epoch {}, not \
+                     the position it assigned (run {}, seq {seq}, epoch {epoch}), so storing \
+                     them would file a record under a chain position its own body contradicts",
+                    body.run, body.seq, body.epoch, fields.run
+                ),
+            });
         }
+        Ok((body, Some(raw)))
     }
 }
 
@@ -1420,6 +1718,7 @@ mod tests {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             ),
             Digest::ZERO,
@@ -1457,6 +1756,7 @@ mod tests {
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             ),
             Digest::ZERO,
@@ -1564,6 +1864,8 @@ mod tests {
                 source: None,
                 by: None,
                 spend: Spend::default(),
+                content: None,
+                elapsed_ms: None,
             },
         )
         .effect(key);

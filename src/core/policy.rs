@@ -176,6 +176,11 @@ impl PolicyBundleIdentity {
 pub struct PolicyRequest<'a> {
     /// Who is acting — the agent, or an operator on whose behalf it runs.
     pub principal: &'a str,
+    /// What kind of name [`principal`](Self::principal) is.
+    ///
+    /// A subject named `alice` and a capability named `alice` are different
+    /// principals; an engine must not match one with a rule written for the other.
+    pub principal_kind: PrincipalKind,
     /// What they are doing, e.g. `"effect:perform"`, `"run:admit"`.
     pub action: &'a str,
     /// What they are doing it to, e.g. an effect kind or a capability.
@@ -185,6 +190,27 @@ pub struct PolicyRequest<'a> {
     /// Opaque to the engine's caller. Whether a rule keys on `amount_eur > 5000`
     /// is the deployment's business, not this crate's.
     pub context: &'a Value,
+}
+
+/// What a [`PolicyRequest::principal`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrincipalKind {
+    /// An authenticated identity: a delegation chain's subject, or an API caller.
+    Subject,
+    /// The capability a run acting under no chain was admitted for. It claims
+    /// nothing about who asked.
+    Capability,
+}
+
+impl PrincipalKind {
+    /// The entity type an engine with typed entities names this kind with.
+    #[must_use]
+    pub const fn entity_type(self) -> &'static str {
+        match self {
+            Self::Subject => "Subject",
+            Self::Capability => "Capability",
+        }
+    }
 }
 
 impl PolicyRequest<'_> {
@@ -329,7 +355,7 @@ impl PolicyDecision {
 /// Deny` arm refuses admission and every release along with the effects it was
 /// written for.
 ///
-/// [`ACTION_DECLARED`] and [`ACTION_EGRESS`] are **never asked**. They label
+/// [`ACTION_DECLARED`], [`ACTION_EGRESS`] and [`ACTION_CONTENT`] are **never asked**. They label
 /// refusals the manifest and the flow gates already decided, so an engine that
 /// matched on them would be writing rules for a question nobody puts to it.
 ///
@@ -468,3 +494,10 @@ pub const ACTION_DECLARED: &str = "effect:declared";
 /// replay consumes the recorded verdict instead of reporting that this build
 /// performs more effects than the record.
 pub const ACTION_EGRESS: &str = "effect:egress";
+/// The action string for a value a declared content rule refused.
+///
+/// Distinct from [`ACTION_EGRESS`] because the verdict is about the value's
+/// *content*, not its label: the remedy is the rule's scope in the manifest,
+/// or a value that does not match. Replayed as a sink refusal is, so a strict
+/// pass over a refused run concludes as the run did.
+pub const ACTION_CONTENT: &str = "effect:content";

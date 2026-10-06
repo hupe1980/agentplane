@@ -207,3 +207,88 @@ fn schema_descriptions_are_single_paragraph_hover_text() {
     }
     check(&Manifest::json_schema(), "");
 }
+
+/// The published `OpenAPI` document is the generated one.
+///
+/// The document is assembled from the route table the operator router serves
+/// and from the types its handlers answer with; this pins the file the site
+/// serves, which integrators generate clients from, to that. Regenerate with:
+/// `cargo run --features cli,http -- openapi > site/static/openapi.json`
+#[cfg(feature = "http")]
+#[test]
+fn the_published_openapi_is_the_generated_document() {
+    let published = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/site/static/openapi.json"
+    ))
+    .expect("site/static/openapi.json exists");
+    let published: serde_json::Value =
+        serde_json::from_str(&published).expect("the published document is JSON");
+    assert_eq!(
+        published,
+        agentplane::api::openapi::document(),
+        "site/static/openapi.json is stale — regenerate it with \
+         `cargo run --features cli,http -- openapi > site/static/openapi.json`"
+    );
+}
+
+/// **Every member of the document whose type is open says what it holds.**
+///
+/// The document drops the Rust documentation, written for a reader of the
+/// source. A member typed as any JSON value then carries nothing at all, and a
+/// client author reading `"amendment": {}` cannot tell a free-form field from
+/// one the plane reads closely. Each says what it holds instead.
+#[cfg(feature = "http")]
+#[test]
+fn every_open_member_of_the_document_says_what_it_holds() {
+    const SHAPED: &[&str] = &[
+        "type",
+        "$ref",
+        "enum",
+        "const",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "items",
+        "properties",
+    ];
+    fn walk(value: &serde_json::Value, path: &str, silent: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(serde_json::Value::Object(members)) = map.get("properties") {
+                    for (name, member) in members {
+                        let open = match member {
+                            serde_json::Value::Bool(true) => true,
+                            serde_json::Value::Object(m) => {
+                                !SHAPED.iter().any(|k| m.contains_key(*k))
+                            }
+                            _ => false,
+                        };
+                        let said = member
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|d| !d.trim().is_empty());
+                        if open && !said {
+                            silent.push(format!("{path}/properties/{name}"));
+                        }
+                    }
+                }
+                for (key, child) in map {
+                    walk(child, &format!("{path}/{key}"), silent);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, &format!("{path}/{index}"), silent);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut silent = Vec::new();
+    walk(&agentplane::api::openapi::document(), "", &mut silent);
+    assert!(
+        silent.is_empty(),
+        "open members the document says nothing about: {silent:?}"
+    );
+}

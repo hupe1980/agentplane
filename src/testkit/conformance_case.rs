@@ -68,6 +68,7 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     a_cases_blob_list_holds_only_its_own(store, r).await;
     a_hold_is_placed_once_listed_and_lifted(store, r).await;
     a_hold_on_a_missing_matter_is_not_found(store, r).await;
+    a_conditional_release_spares_a_hold_placed_since(store, r).await;
     the_last_drill_is_absent_then_replaced(store, r).await;
 }
 
@@ -250,6 +251,95 @@ async fn a_hold_is_placed_once_listed_and_lifted(store: &Arc<dyn CaseStore>, r: 
         Ok(false) => {}
         Ok(true) => r.record("hold", "releasing twice reported a second lift"),
         Err(e) => r.record("hold", format!("a repeated release failed: {e}")),
+    }
+}
+
+/// **A conditional release removes only the hold it names.**
+///
+/// A release followed by a re-place puts a new hold where the read one was;
+/// a releaser still holding the old read must not delete the new one under a
+/// record that names the old.
+async fn a_conditional_release_spares_a_hold_placed_since(
+    store: &Arc<dyn CaseStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("HOLD-IF-1"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    let first = crate::core::LegalHold {
+        placed_at: ts(2_000),
+        reason: "preservation order 2026-201".to_owned(),
+        by: crate::core::Operator::authenticated("compliance-dana").expect("a name"),
+    };
+    let second = crate::core::LegalHold {
+        placed_at: ts(3_000),
+        reason: "preservation order 2026-202".to_owned(),
+        by: crate::core::Operator::authenticated("compliance-eli").expect("a name"),
+    };
+    if store.place_hold(case, &first).await.is_err()
+        || store.release_hold(case).await.is_err()
+        || store.place_hold(case, &second).await.is_err()
+    {
+        return r.record("hold-if", "placing, releasing and placing again failed");
+    }
+    match store.release_hold_if(case, &first).await {
+        Ok(false) => {}
+        Ok(true) => r.record(
+            "hold-if",
+            "a release naming the old hold reported removing the new one",
+        ),
+        Err(e) => r.record("hold-if", format!("a conditional release failed: {e}")),
+    }
+    match store.hold(case).await {
+        Ok(Some(back)) if back == second => {}
+        Ok(other) => r.record(
+            "hold-if",
+            format!("a release naming the old hold removed the new one: {other:?}"),
+        ),
+        Err(e) => r.record("hold-if", format!("reading a hold failed: {e}")),
+    }
+    match store.release_hold_if(case, &second).await {
+        Ok(true) => {}
+        Ok(false) => r.record(
+            "hold-if",
+            "a release naming the standing hold removed nothing",
+        ),
+        Err(e) => r.record("hold-if", format!("a conditional release failed: {e}")),
+    }
+    match store.hold(case).await {
+        Ok(None) => {}
+        Ok(Some(_)) => r.record("hold-if", "a conditionally released hold is still in force"),
+        Err(e) => r.record("hold-if", format!("reading a hold failed: {e}")),
+    }
+    match store.holds(None, 50).await {
+        Ok(listed) if listed.iter().any(|(c, _)| *c == case) => {
+            r.record("hold-if", "a conditionally released hold is still listed");
+        }
+        Ok(_) => {}
+        Err(e) => r.record("hold-if", format!("listing holds failed: {e}")),
+    }
+    match store.release_hold_if(case, &second).await {
+        Ok(false) => {}
+        Ok(true) => r.record(
+            "hold-if",
+            "a repeated conditional release reported a second lift",
+        ),
+        Err(e) => r.record(
+            "hold-if",
+            format!("a repeated conditional release failed: {e}"),
+        ),
+    }
+    match store.release_hold_if(CaseId::generate(), &second).await {
+        Err(StoreError::NotFound(_)) => {}
+        other => r.record(
+            "hold-if",
+            format!("a conditional release on a missing matter must be NotFound, got {other:?}"),
+        ),
     }
 }
 
@@ -1751,6 +1841,7 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_waiter_is_matched_by_one_event_only(store, r).await;
     a_waiter_is_consumed_by_one_of_two_distinct_events(store, r).await;
     a_targeted_event_resumes_only_its_named_run(store, r).await;
+    a_wait_naming_its_sender_takes_no_other_producers_event(store, r).await;
     a_claimed_event_is_never_retired(store, r).await;
     a_claimed_event_is_recoverable_by_its_own_run(store, r).await;
     a_satisfied_waiter_does_not_claim_a_second_event(store, r).await;
@@ -1761,6 +1852,357 @@ pub async fn check_events(store: &Arc<dyn EventStore>, r: &mut Report) {
     a_minted_event_keeps_the_operator_who_minted_it(store, r).await;
     a_parked_wait_is_listed_ahead_of_idle_ones(store, r).await;
     a_closed_runs_waits_are_retired_together(store, r).await;
+    a_consumed_event_is_not_claimed_again_by_its_own_run(store, r).await;
+    unsubscribing_one_wait_sheds_only_its_own_claim(store, r).await;
+    a_retried_targeted_message_is_not_a_second_turn(store, r).await;
+    a_wait_claimed_in_step_takes_no_second_event(store, r).await;
+    a_closed_runs_unconsumed_message_goes_to_the_next_waiter(store, r).await;
+    a_parked_wait_recovers_only_its_own_claim(store, r).await;
+    a_message_addressed_to_a_closed_run_reaches_no_other(store, r).await;
+}
+
+/// **A wait already holding a claim takes no second message.**
+///
+/// A targeted delivery reached the wait between its registration and the
+/// step's own claim. The step must recover that message — not claim an older
+/// buffered one beside it, which retiring the wait would then shed unread.
+async fn a_parked_wait_recovers_only_its_own_claim(store: &Arc<dyn EventStore>, r: &mut Report) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let wait = turn(run, 54, "E-RACE-STEP");
+    let _ = store.subscribe(&wait, ts(1_000)).await;
+    let _ = store
+        .buffer(&message("race-old", "E-RACE-STEP", 1), ts(1_001))
+        .await;
+    if !matches!(
+        store
+            .deliver_to(run, &message("race-new", "E-RACE-STEP", 2), ts(1_002))
+            .await,
+        Ok(TargetedDelivery::Matched(_))
+    ) {
+        r.record("parked claim", "the targeted message was not matched");
+        return;
+    }
+    match store.claim_for(&wait, ts(1_003)).await {
+        Ok(Some(own)) if own.event.payload == serde_json::json!({ "n": 2 }) => {}
+        other => {
+            r.record(
+                "parked claim",
+                format!("a wait holding a targeted message claimed another beside it: {other:?}"),
+            );
+            return;
+        }
+    }
+    let other = turn(RunId::generate(), 55, "E-RACE-STEP");
+    let _ = store.subscribe(&other, ts(1_004)).await;
+    match store.claim_for(&other, ts(1_005)).await {
+        Ok(Some(left)) if left.event.payload == serde_json::json!({ "n": 1 }) => {}
+        other => r.record(
+            "parked claim",
+            format!("the buffered message was not left for the next waiter: {other:?}"),
+        ),
+    }
+}
+
+/// **A message sent to one run by name is that run's alone.**
+///
+/// Its run concluded without consuming it. Retiring the run's waits must not
+/// offer it to another run waiting on the same key — it was a continuation of
+/// one task, not of another — but dead-letter it, saying why.
+async fn a_message_addressed_to_a_closed_run_reaches_no_other(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let closed = RunId::generate();
+    let wait = turn(closed, 56, "E-ADDRESSED");
+    let _ = store.subscribe(&wait, ts(1_000)).await;
+    let addressed = message("addressed-1", "E-ADDRESSED", 1);
+    if !matches!(
+        store.deliver_to(closed, &addressed, ts(1_001)).await,
+        Ok(TargetedDelivery::Matched(_))
+    ) {
+        r.record("addressed", "the targeted message was not matched");
+        return;
+    }
+    let other = turn(RunId::generate(), 57, "E-ADDRESSED");
+    let _ = store.subscribe(&other, ts(1_002)).await;
+    match store.unsubscribe_run(closed, &[wait.effect]).await {
+        Ok(retired) if retired.released.is_empty() => {}
+        other => {
+            r.record(
+                "addressed",
+                format!("retiring the run released its addressed message: {other:?}"),
+            );
+            return;
+        }
+    }
+    if let Ok(Some(taken)) = store.claim_for(&other, ts(1_003)).await {
+        r.record(
+            "addressed",
+            format!(
+                "another run took a message addressed to a closed run: {:?}",
+                taken.event
+            ),
+        );
+    }
+    match store.dead_letters(100).await {
+        Ok(dead)
+            if dead.iter().any(|d| {
+                d.event.id == addressed.id && d.reason == crate::case::ADDRESSEE_CONCLUDED_REASON
+            }) => {}
+        other => r.record(
+            "addressed",
+            format!("the unconsumed addressed message was not dead-lettered: {other:?}"),
+        ),
+    }
+}
+
+/// **A message a run claimed and never consumed outlives the run.**
+///
+/// The run concluded between the claim and its delivery. Retiring its waits
+/// hands that message back, whole, for the next waiter — and keeps what the
+/// run did consume, which a second run must never be handed.
+async fn a_closed_runs_unconsumed_message_goes_to_the_next_waiter(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let closed = RunId::generate();
+    let answered = turn(closed, 50, "E-HANDOVER-A");
+    let pending = turn(closed, 51, "E-HANDOVER");
+    let _ = store.subscribe(&answered, ts(1_000)).await;
+    let _ = store.subscribe(&pending, ts(1_000)).await;
+    let _ = store
+        .buffer(&message("handover-a", "E-HANDOVER-A", 1), ts(1_001))
+        .await;
+    let _ = store
+        .buffer(&message("handover-1", "E-HANDOVER", 2), ts(1_001))
+        .await;
+    let a = store.claim_for(&answered, ts(1_002)).await;
+    let p = store.claim_for(&pending, ts(1_002)).await;
+    if !matches!((a, p), (Ok(Some(_)), Ok(Some(_)))) {
+        r.record("handover", "the closed run's two messages were not claimed");
+        return;
+    }
+    let next = turn(RunId::generate(), 52, "E-HANDOVER");
+    let _ = store.subscribe(&next, ts(1_003)).await;
+
+    match store.unsubscribe_run(closed, &[pending.effect]).await {
+        Ok(retired) => match retired.released.as_slice() {
+            [released] if released.payload == serde_json::json!({ "n": 2 }) => {}
+            other => {
+                r.record(
+                    "handover",
+                    format!(
+                        "retiring the run handed back {other:?} rather than the one \
+                         message its unanswered wait held"
+                    ),
+                );
+                return;
+            }
+        },
+        Err(e) => {
+            r.record("handover", format!("unsubscribe_run failed: {e}"));
+            return;
+        }
+    }
+    match store.claim_for(&next, ts(1_004)).await {
+        Ok(Some(taken)) if taken.event.payload == serde_json::json!({ "n": 2 }) => {}
+        other => r.record(
+            "handover",
+            format!("the next waiter was not offered the released message: {other:?}"),
+        ),
+    }
+    let late = turn(RunId::generate(), 53, "E-HANDOVER-A");
+    let _ = store.subscribe(&late, ts(1_005)).await;
+    if let Ok(Some(again)) = store.claim_for(&late, ts(1_006)).await {
+        r.record(
+            "handover",
+            format!(
+                "a message the closed run consumed was handed to another run: {:?}",
+                again.event
+            ),
+        );
+    }
+}
+
+fn turn(run: RunId, n: u8, key: &str) -> Subscription {
+    Subscription {
+        run,
+        case: None,
+        effect: effect(n),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "turn".into(),
+        correlation: keys(key),
+        from: None,
+    }
+}
+
+fn message(id: &str, key: &str, n: i64) -> InboundEvent {
+    InboundEvent {
+        source: "urn:conformance".to_owned(),
+        id: id.into(),
+        kind: "turn".into(),
+        correlation: keys(key),
+        payload: serde_json::json!({ "n": n }),
+        by: None,
+    }
+}
+
+/// **A message a run consumed is not consumed again by its next wait.**
+///
+/// A conversation waits on one kind and key turn after turn. The first turn's
+/// message was journaled and its wait retired; the second wait must find
+/// nothing until a second message arrives — not the first one again, and not
+/// its stripped husk.
+async fn a_consumed_event_is_not_claimed_again_by_its_own_run(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let first = turn(run, 40, "E-TURNS");
+    let _ = store.subscribe(&first, ts(1_000)).await;
+    let _ = store
+        .buffer(&message("turn-1", "E-TURNS", 1), ts(1_001))
+        .await;
+    if !matches!(store.claim_for(&first, ts(1_002)).await, Ok(Some(_))) {
+        r.record("turns", "the first turn's message was not claimed");
+        return;
+    }
+    let _ = store.unsubscribe(run, first.effect).await;
+
+    let second = turn(run, 41, "E-TURNS");
+    let _ = store.subscribe(&second, ts(1_003)).await;
+    match store.claim_for(&second, ts(1_004)).await {
+        Ok(None) => {}
+        Ok(Some(again)) => {
+            r.record(
+                "turns",
+                format!(
+                    "the second turn was handed the first turn's message again \
+                     (payload {}) — a consumed message counted twice",
+                    again.event.payload
+                ),
+            );
+            return;
+        }
+        Err(e) => {
+            r.record("turns", format!("claim_for failed: {e}"));
+            return;
+        }
+    }
+    let _ = store
+        .buffer(&message("turn-2", "E-TURNS", 2), ts(1_005))
+        .await;
+    match store.claim_for(&second, ts(1_006)).await {
+        Ok(Some(next)) if next.event.payload == serde_json::json!({ "n": 2 }) => {}
+        other => r.record(
+            "turns",
+            format!("the second turn did not receive the second message: {other:?}"),
+        ),
+    }
+}
+
+/// **Retiring one wait sheds only what that wait consumed.**
+///
+/// Two waits of one run each hold a claimed message not yet journaled; the
+/// first is journaled and retired. The second's message must still be there
+/// whole for its own delivery.
+async fn unsubscribing_one_wait_sheds_only_its_own_claim(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let a = turn(run, 42, "E-SHED-A");
+    let b = turn(run, 43, "E-SHED-B");
+    let _ = store.subscribe(&a, ts(1_000)).await;
+    let _ = store.subscribe(&b, ts(1_000)).await;
+    let _ = store
+        .buffer(&message("shed-a", "E-SHED-A", 1), ts(1_001))
+        .await;
+    let _ = store
+        .buffer(&message("shed-b", "E-SHED-B", 2), ts(1_001))
+        .await;
+    let claimed_a = store.claim_for(&a, ts(1_002)).await;
+    let claimed_b = store.claim_for(&b, ts(1_002)).await;
+    if !matches!((claimed_a, claimed_b), (Ok(Some(_)), Ok(Some(_)))) {
+        r.record("shedding", "both waits' messages were not claimed");
+        return;
+    }
+    let _ = store.unsubscribe(run, a.effect).await;
+    match store.claim_for(&b, ts(1_003)).await {
+        Ok(Some(kept)) if kept.event.payload == serde_json::json!({ "n": 2 }) => {}
+        other => r.record(
+            "shedding",
+            format!("retiring one wait stripped another wait's undelivered message: {other:?}"),
+        ),
+    }
+}
+
+/// **A peer's retry of a message already consumed is not the next turn.**
+///
+/// Targeted delivery recovers its own claim after a crash; it must not hand a
+/// message the run already journaled to the run's next wait on the same key.
+async fn a_retried_targeted_message_is_not_a_second_turn(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let first = turn(run, 44, "E-RETRY");
+    let _ = store.subscribe(&first, ts(1_000)).await;
+    let reply = message("retry-1", "E-RETRY", 1);
+    if !matches!(
+        store.deliver_to(run, &reply, ts(1_001)).await,
+        Ok(TargetedDelivery::Matched(_))
+    ) {
+        r.record("targeted retry", "the first delivery was not matched");
+        return;
+    }
+    let _ = store.unsubscribe(run, first.effect).await;
+    let _ = store.subscribe(&turn(run, 45, "E-RETRY"), ts(1_002)).await;
+    match store.deliver_to(run, &reply, ts(1_003)).await {
+        Ok(TargetedDelivery::Duplicate) => {}
+        other => r.record(
+            "targeted retry",
+            format!("a retried, already consumed message was delivered again: {other:?}"),
+        ),
+    }
+}
+
+/// **A wait that claimed its message in step takes no second one.**
+///
+/// The waiting step claims a buffered message and journals it; until the wait
+/// is retired, a delivery arriving for the same key must find no waiter there
+/// and stay buffered for the next.
+async fn a_wait_claimed_in_step_takes_no_second_event(store: &Arc<dyn EventStore>, r: &mut Report) {
+    r.checked += 1;
+    let run = RunId::generate();
+    let wait = turn(run, 46, "E-INSTEP");
+    let _ = store.subscribe(&wait, ts(1_000)).await;
+    let _ = store
+        .buffer(&message("instep-1", "E-INSTEP", 1), ts(1_001))
+        .await;
+    if !matches!(store.claim_for(&wait, ts(1_002)).await, Ok(Some(_))) {
+        r.record("in-step claim", "the buffered message was not claimed");
+        return;
+    }
+    let second = message("instep-2", "E-INSTEP", 2);
+    let _ = store.buffer(&second, ts(1_003)).await;
+    match store.match_waiter(&second, ts(1_004)).await {
+        Ok(None) => {}
+        other => r.record(
+            "in-step claim",
+            format!(
+                "a wait that already claimed its message was matched a second one, \
+                 which its delivery then discards: {other:?}"
+            ),
+        ),
+    }
 }
 
 /// **A parked wait is listed for redelivery ahead of every idle one.**
@@ -1779,6 +2221,7 @@ async fn a_parked_wait_is_listed_ahead_of_idle_ones(store: &Arc<dyn EventStore>,
         phase: Phase::Forward,
         kind: "parked.probe".into(),
         correlation: keys(&format!("PARKED-{n}")),
+        from: None,
     };
     for n in 0..4u8 {
         if store.subscribe(&wait(n), at).await.is_err() {
@@ -1841,6 +2284,7 @@ async fn a_closed_runs_waits_are_retired_together(store: &Arc<dyn EventStore>, r
             phase: Phase::Forward,
             kind: "retire.probe".into(),
             correlation: keys("RETIRE-1"),
+            from: None,
         };
         if store.subscribe(&sub, ts(1_000)).await.is_err() {
             r.record("retirement", "subscribe failed");
@@ -1855,13 +2299,14 @@ async fn a_closed_runs_waits_are_retired_together(store: &Arc<dyn EventStore>, r
         phase: Phase::Forward,
         kind: "retire.probe".into(),
         correlation: keys("RETIRE-1"),
+        from: None,
     };
     if store.subscribe(&live, ts(1_001)).await.is_err() {
         r.record("retirement", "subscribe failed");
         return;
     }
-    match store.unsubscribe_run(closed).await {
-        Ok(2) => {}
+    match store.unsubscribe_run(closed, &[]).await {
+        Ok(retired) if retired.waits == 2 && retired.released.is_empty() => {}
         other => r.record(
             "retirement",
             format!("retiring a run with two waits answered {other:?}"),
@@ -1926,6 +2371,7 @@ async fn a_minted_event_keeps_the_operator_who_minted_it(
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-MINTED"),
+        from: None,
     };
     let _ = store.subscribe(&sub, ts(1_000)).await;
     let _ = store.buffer(&event, ts(1_000)).await;
@@ -1985,6 +2431,7 @@ async fn a_waiter_is_consumed_by_one_of_two_distinct_events(
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-TWO-EVENTS"),
+        from: None,
     };
     let _ = store.subscribe(&sub, ts(1_000)).await;
 
@@ -2180,6 +2627,7 @@ async fn a_satisfied_waiter_does_not_claim_a_second_event(
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-ONESHOT"),
+        from: None,
     };
     let _ = store.subscribe(&sub, ts(1_000)).await;
 
@@ -2238,6 +2686,7 @@ async fn a_parked_wait_is_not_matched_again(store: &Arc<dyn EventStore>, r: &mut
         phase: Phase::Forward,
         kind: "parked.ack".into(),
         correlation: keys("E-PARKED"),
+        from: None,
     };
     let event = |id: &str| InboundEvent {
         source: "urn:conformance".to_owned(),
@@ -2321,6 +2770,7 @@ async fn an_erased_claim_is_dead_lettered_and_its_wait_reopened(
         phase: Phase::Forward,
         kind: "erased.ack".into(),
         correlation: keys("E-ERASED-CLAIM"),
+        from: None,
     };
     let event = |id: &str| InboundEvent {
         source: "urn:conformance".to_owned(),
@@ -2408,6 +2858,7 @@ async fn a_claimed_event_is_recoverable_by_its_own_run(
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-RECLAIM"),
+        from: None,
     };
     let _ = store.subscribe(&sub, ts(1_000)).await;
 
@@ -2462,6 +2913,7 @@ async fn a_claimed_event_is_recoverable_by_its_own_run(
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-RECLAIM"),
+        from: None,
     };
     let _ = store.subscribe(&stranger, ts(1_004)).await;
     if let Ok(Some(_)) = store.claim_for(&stranger, ts(1_005)).await {
@@ -2486,6 +2938,7 @@ async fn a_targeted_event_resumes_only_its_named_run(store: &Arc<dyn EventStore>
         phase: Phase::Forward,
         kind: "continue".into(),
         correlation: keys("E-TARGET"),
+        from: None,
     };
     let a = waiting(first, 13);
     let b = waiting(target, 14);
@@ -2549,6 +3002,113 @@ async fn a_targeted_event_resumes_only_its_named_run(store: &Arc<dyn EventStore>
     }
 }
 
+/// **A wait naming its sender is satisfied by that sender only** — on every
+/// delivery path. Correlation keys are business values any authenticated
+/// producer may know; `from` is what stops one of them consuming another
+/// producer's wait.
+#[allow(clippy::too_many_lines)]
+async fn a_wait_naming_its_sender_takes_no_other_producers_event(
+    store: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    const RULE: &str = "a wait naming its sender";
+    r.checked += 1;
+    let wait = |key: &str, n: u8| Subscription {
+        run: RunId::generate(),
+        case: None,
+        effect: effect(n),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "reply".into(),
+        correlation: keys(key),
+        from: Some("urn:peer:expected".to_owned()),
+    };
+    let event = |source: &str, id: &str, key: &str| InboundEvent {
+        source: source.to_owned(),
+        id: id.to_owned(),
+        kind: "reply".into(),
+        correlation: keys(key),
+        payload: serde_json::json!({}),
+        by: None,
+    };
+
+    // Broadcast: an arriving event looks for its waiter.
+    let broadcast = wait("E-FROM-BROADCAST", 40);
+    let _ = store.subscribe(&broadcast, ts(1_000)).await;
+    let stranger = event("urn:peer:other", "from-1", "E-FROM-BROADCAST");
+    let _ = store.buffer(&stranger, ts(1_001)).await;
+    if let Ok(Some(sub)) = store.match_waiter(&stranger, ts(1_001)).await {
+        r.record(
+            RULE,
+            format!(
+                "an event from urn:peer:other was matched to run {}, whose wait accepts \
+                 only urn:peer:expected",
+                sub.run
+            ),
+        );
+    }
+    let expected = event("urn:peer:expected", "from-2", "E-FROM-BROADCAST");
+    let _ = store.buffer(&expected, ts(1_002)).await;
+    match store.match_waiter(&expected, ts(1_002)).await {
+        Ok(Some(sub))
+            if sub.run == broadcast.run && sub.from.as_deref() == Some("urn:peer:expected") => {}
+        other => r.record(
+            RULE,
+            format!("the named sender's event did not match its wait intact: {other:?}"),
+        ),
+    }
+
+    // Buffered: a wait registering finds an event already waiting for it.
+    let early = event("urn:peer:other", "from-3", "E-FROM-BUFFERED");
+    let _ = store.buffer(&early, ts(1_003)).await;
+    let buffered = wait("E-FROM-BUFFERED", 41);
+    let _ = store.subscribe(&buffered, ts(1_004)).await;
+    if let Ok(Some(found)) = store.claim_for(&buffered, ts(1_004)).await {
+        r.record(
+            RULE,
+            format!(
+                "a wait accepting only urn:peer:expected claimed a buffered event from {}",
+                found.event.source
+            ),
+        );
+    }
+    let _ = store
+        .buffer(
+            &event("urn:peer:expected", "from-5", "E-FROM-BUFFERED"),
+            ts(1_004),
+        )
+        .await;
+    match store.claim_for(&buffered, ts(1_004)).await {
+        Ok(Some(found)) if found.event.source == "urn:peer:expected" => {}
+        other => r.record(
+            RULE,
+            format!("the named sender's buffered event was not claimed for its wait: {other:?}"),
+        ),
+    }
+
+    // Targeted: delivery names the run.
+    let targeted = wait("E-FROM-TARGETED", 42);
+    let _ = store.subscribe(&targeted, ts(1_005)).await;
+    let aimed = event("urn:peer:other", "from-4", "E-FROM-TARGETED");
+    if let Ok(TargetedDelivery::Matched(_)) =
+        store.deliver_to(targeted.run, &aimed, ts(1_006)).await
+    {
+        r.record(
+            RULE,
+            "a targeted event from urn:peer:other resumed a wait accepting only \
+             urn:peer:expected",
+        );
+    }
+    let answer = event("urn:peer:expected", "from-6", "E-FROM-TARGETED");
+    match store.deliver_to(targeted.run, &answer, ts(1_007)).await {
+        Ok(TargetedDelivery::Matched(sub)) if sub.run == targeted.run => {}
+        other => r.record(
+            RULE,
+            format!("the named sender's targeted event did not resume its wait: {other:?}"),
+        ),
+    }
+}
+
 /// A delivered message is not garbage.
 ///
 /// The sweep exists to retire messages nobody ever wanted. A backend that finds
@@ -2580,6 +3140,7 @@ async fn a_claimed_event_is_never_retired(store: &Arc<dyn EventStore>, r: &mut R
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-9"),
+        from: None,
     };
     let _ = store.subscribe(&sub, ts(1_000)).await;
     if !matches!(store.claim_for(&sub, ts(1_001)).await, Ok(Some(_))) {
@@ -2654,6 +3215,7 @@ async fn an_event_is_claimed_by_one_waiter_only(store: &Arc<dyn EventStore>, r: 
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-2"),
+        from: None,
     };
     let (a, b) = (sub(10), sub(11));
     let _ = store.subscribe(&a, ts(1_000)).await;
@@ -2687,6 +3249,7 @@ async fn a_waiter_is_matched_by_one_event_only(store: &Arc<dyn EventStore>, r: &
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-3"),
+        from: None,
     };
     let _ = store.subscribe(&sub, ts(1_000)).await;
 
@@ -2751,6 +3314,7 @@ pub async fn check_waiting_tenancy(
         phase: Phase::Forward,
         kind: "ack".into(),
         correlation: keys("E-TENANCY-WAIT"),
+        from: None,
     };
     let _ = mine.subscribe(&sub, ts(1_000)).await;
     // The attacker registers an identical wait — same run id, same effect,
@@ -2968,6 +3532,7 @@ async fn a_sealed_runs_parked_wait_is_retired(
         phase: Phase::Forward,
         kind: "sealed.parked".into(),
         correlation: keys("SEALED-PARKED"),
+        from: None,
     };
     if events.park_wait(&parked, ts(1_000)).await.is_err() {
         r.record("sealed waits", "park failed");
@@ -2989,26 +3554,18 @@ async fn a_sealed_runs_parked_wait_is_retired(
     true
 }
 
-/// Check that the wait tables pass over a sealed run.
-///
-/// The three handles are one backend: the liveness check is the wait tables
-/// consulting the journal's seal in the same database. The runtime retires a
-/// closed run's timers and waits as it seals it; this covers what outlives
-/// that — a crash between the seal and the retirement.
-pub async fn check_sealed_runs_waits(
+/// A run admitted, concluded and sealed, or `None` with the reason recorded.
+async fn a_sealed_run(
     journal: &Arc<dyn crate::journal::JournalStore>,
-    timers: &Arc<dyn TimerStore>,
-    events: &Arc<dyn EventStore>,
     r: &mut Report,
-) {
-    r.checked += 1;
+) -> Option<RunId> {
     let sealed = RunId::generate();
     let Ok(lease) = journal
         .acquire(sealed, "conformance", std::time::Duration::from_secs(60))
         .await
     else {
         r.record("sealed waits", "acquire failed");
-        return;
+        return None;
     };
     let admitted = crate::journal::Append::new(
         sealed,
@@ -3022,17 +3579,50 @@ pub async fn check_sealed_runs_waits(
             idempotency_key: None,
             admitted_by: None,
             served_unchained: false,
+            plane_chain: false,
         },
     );
-    if journal.append(lease.epoch, vec![admitted]).await.is_err()
+    let concluded = crate::journal::Append::new(
+        sealed,
+        crate::journal::RecordKind::RunConcluded {
+            outcome: "cancelled".into(),
+            reason: None,
+            exhaustion: None,
+            live_spend: crate::core::Spend::default(),
+            chain_head: crate::core::Digest::ZERO,
+        },
+    );
+    if journal
+        .append(lease.epoch, vec![admitted, concluded])
+        .await
+        .is_err()
         || journal
             .seal(sealed, lease.epoch, "cancelled")
             .await
             .is_err()
     {
         r.record("sealed waits", "the fixture could not seal its run");
-        return;
+        return None;
     }
+    Some(sealed)
+}
+
+/// Check that the wait tables pass over a sealed run.
+///
+/// The three handles are one backend: the liveness check is the wait tables
+/// consulting the journal's seal in the same database. The runtime retires a
+/// closed run's timers and waits as it seals it; this covers what outlives
+/// that — a crash between the seal and the retirement.
+pub async fn check_sealed_runs_waits(
+    journal: &Arc<dyn crate::journal::JournalStore>,
+    timers: &Arc<dyn TimerStore>,
+    events: &Arc<dyn EventStore>,
+    r: &mut Report,
+) {
+    r.checked += 1;
+    let Some(sealed) = a_sealed_run(journal, r).await else {
+        return;
+    };
 
     let timer = crate::core::Timer {
         run: sealed,
@@ -3068,6 +3658,7 @@ pub async fn check_sealed_runs_waits(
         phase: Phase::Forward,
         kind: "sealed.probe".into(),
         correlation: keys("SEALED-1"),
+        from: None,
     };
     let live = RunId::generate();
     if events.subscribe(&wait(sealed), ts(1_000)).await.is_err()

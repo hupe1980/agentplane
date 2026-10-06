@@ -439,6 +439,63 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     Ok(())
 }
 
+impl RedbStore {
+    /// Remove the hold on `case` in one write — any hold when `expected` is
+    /// `None`, and only that hold when it is `Some`.
+    async fn remove_hold(
+        &self,
+        case: CaseId,
+        expected: Option<LegalHold>,
+    ) -> Result<bool, StoreError> {
+        let tenant = self.tenant_name();
+        let key = case.to_string();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            let released = {
+                let c = w.open_table(CASES).map_err(|e| be(&e))?;
+                if c.get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_none()
+                {
+                    return Err(StoreError::NotFound(key));
+                }
+                let mut h = w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
+                let current = h
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (at, row) = v.value();
+                        (at, row.to_owned())
+                    });
+                let at = match (current, &expected) {
+                    (Some((at, row)), Some(expected)) => {
+                        let row = decode_hold(&row)?;
+                        let same = at == ts(expected.placed_at)
+                            && row.reason == expected.reason
+                            && row.by == expected.by;
+                        same.then_some(at)
+                    }
+                    (current, _) => current.map(|(at, _)| at),
+                };
+                match at {
+                    Some(at) => {
+                        h.remove((tenant.as_str(), key.as_str()))
+                            .map_err(|e| be(&e))?;
+                        let mut idx = w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
+                        idx.remove((tenant.as_str(), at, key.as_str()))
+                            .map_err(|e| be(&e))?;
+                        true
+                    }
+                    None => false,
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(released)
+        })
+        .await
+    }
+}
+
 #[async_trait]
 impl CaseStore for RedbStore {
     fn tenant(&self) -> &str {
@@ -888,37 +945,6 @@ impl CaseStore for RedbStore {
             }
             w.commit().map_err(|e| be(&e))?;
             Ok(())
-        })
-        .await
-    }
-
-    async fn detach_run(&self, case: CaseId, run: RunId) -> Result<bool, StoreError> {
-        let tenant = self.tenant_name();
-        let (c, r) = (case.to_string(), run.to_string());
-        self.with_db(move |db| {
-            let w = begin_write(db)?;
-            let removed = {
-                let mut seen = w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
-                // Both tables or neither: `CASE_RUN_SEEN` is what makes
-                // `attach_run` idempotent, so leaving it behind would mean a
-                // later attach of the same run silently did nothing.
-                match seen
-                    .remove((tenant.as_str(), c.as_str(), r.as_str()))
-                    .map_err(|e| be(&e))?
-                    .map(|v| v.value())
-                {
-                    Some(seq) => {
-                        w.open_table(CASE_RUNS)
-                            .map_err(|e| be(&e))?
-                            .remove((tenant.as_str(), c.as_str(), seq))
-                            .map_err(|e| be(&e))?;
-                        true
-                    }
-                    None => false,
-                }
-            };
-            w.commit().map_err(|e| be(&e))?;
-            Ok(removed)
         })
         .await
     }
@@ -1682,39 +1708,15 @@ impl CaseStore for RedbStore {
     }
 
     async fn release_hold(&self, case: CaseId) -> Result<bool, StoreError> {
-        let tenant = self.tenant_name();
-        let key = case.to_string();
-        self.with_db(move |db| {
-            let w = begin_write(db)?;
-            let released = {
-                let c = w.open_table(CASES).map_err(|e| be(&e))?;
-                if c.get((tenant.as_str(), key.as_str()))
-                    .map_err(|e| be(&e))?
-                    .is_none()
-                {
-                    return Err(StoreError::NotFound(key));
-                }
-                let mut h = w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
-                let at = h
-                    .get((tenant.as_str(), key.as_str()))
-                    .map_err(|e| be(&e))?
-                    .map(|v| v.value().0);
-                match at {
-                    Some(at) => {
-                        h.remove((tenant.as_str(), key.as_str()))
-                            .map_err(|e| be(&e))?;
-                        let mut idx = w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
-                        idx.remove((tenant.as_str(), at, key.as_str()))
-                            .map_err(|e| be(&e))?;
-                        true
-                    }
-                    None => false,
-                }
-            };
-            w.commit().map_err(|e| be(&e))?;
-            Ok(released)
-        })
-        .await
+        self.remove_hold(case, None).await
+    }
+
+    async fn release_hold_if(
+        &self,
+        case: CaseId,
+        standing: &LegalHold,
+    ) -> Result<bool, StoreError> {
+        self.remove_hold(case, Some(standing.clone())).await
     }
 
     async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError> {

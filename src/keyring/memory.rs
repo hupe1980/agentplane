@@ -47,6 +47,18 @@ pub struct EncryptedMemoryStore {
     keys: Arc<dyn KeyRing>,
     tenant: TenantId,
     lifecycle: Arc<dyn super::ErasureCoordinator>,
+    /// Key destructions an erasure owes: rows already gone whose keys the ring
+    /// refused to destroy.
+    owed: Arc<tokio::sync::Mutex<Vec<OwedKey>>>,
+}
+
+/// One version's key an erasure still has to destroy.
+#[derive(Debug)]
+struct OwedKey {
+    id: String,
+    version: u64,
+    at: Timestamp,
+    reason: String,
 }
 
 impl std::fmt::Debug for EncryptedMemoryStore {
@@ -80,6 +92,7 @@ impl EncryptedMemoryStore {
             keys,
             tenant,
             lifecycle: Arc::new(super::LocalCoordinator::new()),
+            owed: Arc::default(),
         }
     }
 
@@ -242,32 +255,44 @@ impl EncryptedMemoryStore {
         })
     }
 
-    /// Destroy the keys of versions the inner store already erased: each
-    /// entry is an id and the versions of it that went.
+    /// Destroy the keys of versions the inner store already erased — each
+    /// entry an id and the versions of it that went — after whatever earlier
+    /// erasures still owe.
     ///
-    /// The rows are gone from the live store, so a failure here cannot be
-    /// retried through the verb that erased them; it names the version whose
-    /// backups still open, for an operator to destroy by scope.
+    /// The rows are gone from the live store, so repeating the verb that
+    /// erased them would find nothing: a key the ring refuses stays owed, and
+    /// every later erasure verb destroys it first, failing while it cannot.
+    /// The debt lives in this process; a restart before it is paid loses it,
+    /// and the error names the scope to destroy by hand.
     async fn destroy_erased(
         &self,
         erased: &[(String, Vec<u64>)],
         at: Timestamp,
         reason: &str,
     ) -> Result<(), StoreError> {
+        let mut owed = self.owed.lock().await;
         for (id, versions) in erased {
-            for version in versions {
-                let scope = self.scope(id, *version);
-                self.keys
-                    .destroy(&scope, at, reason)
-                    .await
-                    .map_err(|error| {
-                        StoreError::Backend(format!(
-                            "memory '{id}' version {version} was erased from the store, and \
-                             destroying its key failed ({error}) — its backups still open until \
-                             scope '{scope}' is destroyed"
-                        ))
-                    })?;
-            }
+            owed.extend(versions.iter().map(|version| OwedKey {
+                id: id.clone(),
+                version: *version,
+                at,
+                reason: reason.to_owned(),
+            }));
+        }
+        while let Some(key) = owed.first() {
+            let scope = self.scope(&key.id, key.version);
+            self.keys
+                .destroy(&scope, key.at, &key.reason)
+                .await
+                .map_err(|error| {
+                    StoreError::Backend(format!(
+                        "memory '{}' version {} was erased from the store, and destroying its \
+                         key failed ({error}) — its backups still open until scope '{scope}' is \
+                         destroyed, which the next erasure retries",
+                        key.id, key.version
+                    ))
+                })?;
+            owed.remove(0);
         }
         Ok(())
     }
@@ -332,6 +357,7 @@ impl EncryptedMemoryStore {
             // silently checked holds for a truncated page of the subject.
             let ids = self.inner.subject_ids(subject).await?;
             self.refuse_held(&ids).await?;
+            self.destroy_erased(&[], at, reason).await?;
             for (id, versions) in Self::every_version(self.highest_versions(&ids).await?) {
                 for version in versions {
                     self.keys
@@ -385,6 +411,14 @@ impl MemoryStore for EncryptedMemoryStore {
     /// and whether it spans instances is the coordinator's to say.
     fn erasure_is_distributed(&self) -> Option<bool> {
         Some(self.lifecycle.is_distributed())
+    }
+
+    fn seals(&self) -> bool {
+        true
+    }
+
+    fn erasure_index(&self) -> Option<Arc<dyn crate::memory::SemanticRetriever>> {
+        self.inner.erasure_index()
     }
 
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
@@ -479,6 +513,7 @@ impl MemoryStore for EncryptedMemoryStore {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
             self.refuse_held(&[id.to_owned()]).await?;
             let (at, reason) = verb_erasure("forget");
+            self.destroy_erased(&[], at, &reason).await?;
             for (id, versions) in
                 Self::every_version(self.highest_versions(&[id.to_owned()]).await?)
             {

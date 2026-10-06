@@ -30,6 +30,40 @@ mod embedded {
         Timestamp::from_unix_timestamp(secs).expect("an instant")
     }
 
+    /// **A store an older build wrote refuses to open.** A wait's row gained
+    /// its sender, and a file holding the old row shape is refused at open —
+    /// not opened and then misread at the first delivery.
+    #[test]
+    fn a_store_with_the_old_subscription_row_refuses_to_open() {
+        #[allow(clippy::disallowed_methods)]
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-old-subs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("old.redb");
+        {
+            let db = redb::Database::create(&path).expect("db");
+            let w = db.begin_write().expect("write");
+            w.open_table(redb::TableDefinition::<
+                (&str, &str, &str, &str, &str),
+                (&str, u8, u32, &str, &str, i64),
+            >::new("subscriptions"))
+                .expect("the old row shape");
+            w.commit().expect("commit");
+        }
+        let refused = RedbStore::open(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            refused.is_err(),
+            "a store holding the old subscription row opened"
+        );
+    }
+
     fn task(n: u32, priority: Priority, created: i64) -> Task {
         let run = RunId::generate();
         let effect = EffectKey::for_effect(
@@ -243,6 +277,7 @@ mod embedded {
             phase: Phase::Forward,
             kind: "ack.received".to_owned(),
             correlation: vec![CorrelationKey::new("shipment", "SHP-1")],
+            from: None,
         };
         // The higher key is registered *first* and *earlier*, so an
         // implementation electing by registration time picks it — the drift
@@ -675,6 +710,7 @@ mod shared {
             phase: Phase::Forward,
             kind: "ack.received".to_owned(),
             correlation: vec![CorrelationKey::new("shipment", "SHP-1")],
+            from: None,
         };
         store
             .subscribe(&sub(high), at(1_000))

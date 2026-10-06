@@ -138,6 +138,9 @@ impl JournalStore for StagedAtomic {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
+    fn seals(&self) -> bool {
+        self.inner.seals()
+    }
 
     fn tenant(&self) -> &str {
         self.inner.tenant()
@@ -221,6 +224,13 @@ impl JournalStore for StagedAtomic {
         self.inner.count_by_outcome(outcome).await
     }
 
+    async fn runs_by_id(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunId>, StoreError> {
+        self.inner.runs_by_id(after, limit).await
+    }
     async fn recent_runs(
         &self,
         after: Option<(u64, RunId)>,
@@ -274,6 +284,21 @@ impl JournalStore for StagedAtomic {
         run: RunId,
     ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
         self.inner.inclusion_proof(run).await
+    }
+
+    async fn inclusion_proof_at(
+        &self,
+        run: RunId,
+        size: u64,
+    ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
+        self.inner.inclusion_proof_at(run, size).await
+    }
+
+    async fn log_positions(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<Option<(u64, crate::core::Digest)>>, StoreError> {
+        self.inner.log_positions(runs).await
     }
 
     async fn request_cancel(

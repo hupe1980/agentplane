@@ -188,6 +188,10 @@ impl MemoryStore for RedbStore {
         self.tenant_str()
     }
 
+    fn seals(&self) -> bool {
+        false
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn remember(&self, item: &MemoryItem) -> Result<u64, StoreError> {
         let tenant = self.tenant_name();

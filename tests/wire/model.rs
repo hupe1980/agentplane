@@ -1315,3 +1315,88 @@ fn usage_a_provider_invented_cannot_wrap_a_ceiling() {
         "cache counts reported beside the prompt wrapped the input total"
     );
 }
+
+/// Collects what the plane forwards, with the run each event belongs to.
+#[cfg(feature = "manifest")]
+#[derive(Debug, Default)]
+struct Collects(
+    std::sync::Mutex<Vec<(agentplane::core::RunId, agentplane::model::ModelStreamEvent)>>,
+);
+
+#[cfg(feature = "manifest")]
+impl agentplane::runtime::RunStreamObserver for Collects {
+    fn event(
+        &self,
+        run: agentplane::core::RunId,
+        event: Tainted<agentplane::model::ModelStreamEvent>,
+    ) {
+        self.0.lock().unwrap().push((run, event.peek().clone()));
+    }
+}
+
+/// **The plane forwards a declarative agent's live output, tagged with its
+/// run, and a replay forwards nothing.** The agent builds its own model call,
+/// so the observer reaches it only through the plane.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn the_plane_forwards_a_declarative_agents_live_output() {
+    let manifest = agentplane::manifest::Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summariser, version: "1.0.0" }
+spec:
+  execution: { kind: completion }
+  capabilities: { provides: [support.summarise] }
+  models:
+    privileged: { provider: fake, model: sum-1 }
+  budgets: {}
+"#,
+    )
+    .expect("manifest");
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.streaming();
+    provider.will_say("printers burn when the fuser jams");
+    let seen = Arc::new(Collects::default());
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let rt = agentplane::runtime::Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .provider(
+            "fake",
+            Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(agentplane::runtime::Agent::new(&manifest))
+        .observe_model_streams(Arc::clone(&seen) as Arc<dyn agentplane::runtime::RunStreamObserver>)
+        .build();
+    let out = rt
+        .run(
+            "support.summarise",
+            Tainted::trusted(serde_json::json!({ "q": "x" })),
+        )
+        .await
+        .unwrap();
+    let text: String = seen
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(run, _)| *run == out.run_id)
+        .filter_map(|(_, event)| match event {
+            agentplane::model::ModelStreamEvent::TextDelta(delta) => Some(delta.clone()),
+            agentplane::model::ModelStreamEvent::Usage(_) => None,
+        })
+        .collect();
+    assert_eq!(
+        text, "printers burn when the fuser jams",
+        "the live output did not reach the plane's observer"
+    );
+
+    let before = seen.0.lock().unwrap().len();
+    rt.replay(out.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .unwrap();
+    assert_eq!(
+        seen.0.lock().unwrap().len(),
+        before,
+        "a replay streamed output"
+    );
+}

@@ -159,6 +159,21 @@ pub struct Cosignature {
     pub signature: Vec<u8>,
 }
 
+impl Cosignature {
+    /// The witness's own timestamp, in seconds since the Unix epoch, read from
+    /// the payload [`Cosignature::signature`] carries — the instant the
+    /// signature covers.
+    ///
+    /// `None` for bytes that are not a bounded, non-zero `cosignature/v1`
+    /// payload; every cosignature a reader accepted yields `Some`.
+    #[must_use]
+    pub fn timestamp(&self) -> Option<u64> {
+        cosignature_payload(&self.signature)
+            .map(|(time, _)| time)
+            .filter(|time| *time != 0)
+    }
+}
+
 /// The message a cosignature signs, as C2SP `tlog-cosignature` states it: a
 /// domain-separation header, the witness's own timestamp line, then the whole
 /// note body — including its final newline, and **not** including any
@@ -184,9 +199,6 @@ pub(crate) fn cosignature_message(timestamp: u64, note_text: &str) -> String {
 /// A timestamp above 2^63 − 1 is `None` too: `tlog-cosignature` bounds it
 /// there, so eight bytes that read higher are not a cosignature this format
 /// can carry, whatever they sign.
-// Gated on the feature that consumes it — the HTTP client is the only reader
-// of foreign payloads; producers in this file only build them.
-#[cfg(feature = "witness-http")]
 #[must_use]
 pub(crate) fn cosignature_payload(blob: &[u8]) -> Option<(u64, &[u8])> {
     if blob.len() != 8 + 64 {
@@ -395,14 +407,47 @@ pub struct Anchor {
     pub checkpoint: Checkpoint,
     /// How it was obtained — `witness sigsum.org`, `file prior.json`.
     pub obtained_from: String,
+    /// The signed timestamp of each cosignature over `checkpoint`, taken
+    /// from the same witness answer. Empty for an anchor from a file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub witnessed: Vec<WitnessTime>,
+}
+
+/// When one witness key last saw the log: its cosignature's signed timestamp.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct WitnessTime {
+    /// The cosigning key.
+    pub key_id: KeyId,
+    /// Seconds since the Unix epoch, as the witness signed it.
+    pub timestamp: u64,
 }
 
 impl Anchor {
-    /// An anchor with its provenance.
+    /// An anchor with its provenance and no witness times.
     pub fn new(checkpoint: Checkpoint, obtained_from: impl Into<String>) -> Self {
         Self {
             checkpoint,
             obtained_from: obtained_from.into(),
+            witnessed: Vec::new(),
+        }
+    }
+
+    /// An anchor from a witness answer: its checkpoint and each cosignature's
+    /// signed timestamp.
+    pub fn from_cosigned(cosigned: &CosignedCheckpoint, obtained_from: impl Into<String>) -> Self {
+        let witnessed = cosigned
+            .cosignatures
+            .iter()
+            .filter_map(|c| {
+                c.timestamp().map(|timestamp| WitnessTime {
+                    key_id: c.key_id.clone(),
+                    timestamp,
+                })
+            })
+            .collect();
+        Self {
+            witnessed,
+            ..Self::new(cosigned.checkpoint.clone(), obtained_from)
         }
     }
 }

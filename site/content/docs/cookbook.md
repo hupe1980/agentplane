@@ -384,8 +384,8 @@ it found is a skill — written in a language built for decisions.
 defaulted to whatever driver happens to be present — falling back would run the
 agent on a model its own declaration does not name.
 
-`cargo run --example blog_room` has two of these, and one orchestrator that is
-still Rust because it delegates.
+`cargo run --example blog_room --features redb,fake-model,manifest` has two of
+these, and one orchestrator that is still Rust because it delegates.
 
 ---
 
@@ -694,7 +694,7 @@ spec:
       pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
     quarantined:
       provider: anthropic
-      model: claude-haiku-4-5-20251001
+      model: claude-haiku-4-5
       pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125 }
   tools:
     - ref: "tool://validator/apply_correction"
@@ -846,7 +846,8 @@ let args = cx.release(
 Policy evaluates `data:release`; the journal records releaser, prior label,
 scope, field, destination, basis and evidence. Provenance is retained, unrelated
 fields are unchanged, and the result remains `Tainted<Value>`. Run the complete
-success/refusal/release trail with `cargo run --example governed_transfer`.
+success/refusal/release trail with
+`cargo run --example governed_transfer --features manifest`.
 
 ## 🎛️ Let an untrusted choice pick from a menu — no code, no release {#let-an-untrusted-choice-pick-from-a-menu-no-code-no-release}
 
@@ -1248,7 +1249,8 @@ switched off on the Gemini 3 models. Schemas go to `responseJsonSchema` and are
 enforced during generation, never rewritten into Gemini's trimmed dialect.
 
 `safety(..)` passes the deployment's own thresholds through, exactly as
-`Bedrock::guardrail(..)` does: this crate ships no classifier, and what the
+`Bedrock::guardrail(..)` does: this crate ships no classifier — a deployment's
+own plugs in as a [content checker](@/docs/security.md#content-rules) — and what the
 runtime owns is that the thresholds are **effect identity** — loosening one
 between a run and its replay is divergence — and that an intervention is a
 *metered refusal* rather than an answer. A blocked prompt names its reason; a
@@ -1399,6 +1401,16 @@ rather than rolling your own.
 
 Every wait must name a deadline. An unbounded wait is a plan-contract violation,
 which is how "the process just stalled" stops being a category of incident.
+
+**The other trap:** a correlation key is a business value, and any producer
+allowed to deliver the kind who knows it can answer your wait. When one party
+is expected to reply, name it — `.from("peer:billing-svc")` — and an event from
+any other source, by broadcast, from the buffer or delivered to the run, leaves
+the wait open. The name is the sender as this plane authenticated it: an event
+that arrives over the API or A2A carries `peer:<actor>`, where `<actor>` is what
+your authenticator returned for the caller (a CloudEvent's own `source`
+attribute is not it), and one passed to `Runtime::deliver` in process carries
+the source its caller built it with.
 
 ## 👤 Require a human, with four eyes {#require-a-human-with-four-eyes}
 
@@ -1702,7 +1714,8 @@ spec:
 Dispatch is `commission`, not a transport: the consultation is a journaled
 delegation effect, so a strict replay reassembles the whole room without
 waking anyone, the researcher's answer arrives labelled untrusted, its spend
-bills the editor's run, and the depth ceiling sees the hop. The `agent` server
+bills the editor's run, the depth ceiling sees the hop, and the journaled
+answer names the researcher's sub-run (`run`). The `agent` server
 name is reserved — wiring a transport under it is refused at build, and a
 grant naming a capability no agent on the plane provides refuses the build
 too, rather than offering the model a consultation that fails when chosen.
@@ -1723,7 +1736,9 @@ sink gate those act at — declare ceilings on the consulted agent instead. Two
 ceilings interact by design: a commissioned input is `Internal` at least, so
 both agents need `max_sensitivity_egress: internal` or the room refuses its
 own point. `requires_approval: true` works exactly as on any grant — a person
-sees the capability and the arguments before any specialist runs.
+sees the capability and the arguments before any specialist runs, and beside
+them what the specialist's own declaration lets it do; the approval covers that
+revision ([security](@/docs/security.md)).
 
 ## 🌐 Call another *plane's* agent, from a file or a skill {#call-another-plane-s-agent-from-a-file-or-a-skill}
 
@@ -1810,8 +1825,9 @@ nothing to extend and is refused at the call — admit it with
 pass `--acting-as` to `agentplane run`.
 
 The `peer_call` example runs both planes in one process: a served reviewer on
-a loopback port and a desk that consults it, then a strict replay of the desk's
-run that the reviewer never hears about.
+a loopback port and a desk that consults it with a credential naming the run's
+owner, so the reviewer acts for Alice through the desk — then a strict replay
+of the desk's run that the reviewer never hears about.
 
 ## 🗺️ Plan once, then execute without the model {#plan-once-then-execute-without-the-model}
 
@@ -1825,7 +1841,7 @@ spec:
   execution: { kind: planned, max_turns: 4 }
   models:
     privileged:   { provider: anthropic, model: claude-sonnet-5 }
-    quarantined:  { provider: anthropic, model: claude-haiku-4-5-20251001 }
+    quarantined:  { provider: anthropic, model: claude-haiku-4-5 }
 ```
 
 The planner answers with steps like
@@ -2112,7 +2128,7 @@ Three things bite:
 
 ```sh
 agentplane serve examples/served.yaml \
-  --url https://agent.example.com --addr 0.0.0.0:8080 \
+  --url https://agent.example.com/a2a --addr 0.0.0.0:8080 \
   --policy policy.cedar --tokens tokens.yaml --store ./served.redb \
   --operator-addr 127.0.0.1:9090 --push-host hooks.example.com
 ```
@@ -2529,6 +2545,12 @@ let report = agentplane::testkit::conformance::check(&|| { /* build a fresh stor
 report.assert_conforms("MyStore");
 ```
 
+A store a restore can write into must also keep each restored record's bytes as
+they stand (`Append::written()`) and read them back through its upcaster. That
+is a second entry point, `conformance::check_upcasting`, which takes a factory
+building the store with a given upcaster and an export one record shape older
+(`testkit::older_shape`); `check` does not run it.
+
 **The trap:** writing your own tests for it. A new backend gets whatever tests
 its author thought of — and those are the ones they were already thinking about
 while writing it, so the invariant they misread is by construction the one with
@@ -2763,8 +2785,13 @@ cross-space query does not throw — it ranks unrelated memories confidently, an
 the only signal is "retrieval quality" months later.
 
 `cx.embed` stays available for building an index or embedding text for another
-purpose. It returns an `Embedding`: the floats **and** the revision that
-produced them, read from the driver.
+purpose. It returns an `Embedding`: the floats, the revision that produced
+them, read from the driver, and the usage the service reported — which counts
+against the run's token ceiling like a model call. Money counts only when the
+driver states its price (`.pricing(..)`); a plane whose budget, or any agent's,
+caps money refuses an unpriced embedder at build, and a priced one refuses a
+call whose reply reports no input tokens. Cohere on Bedrock reports none, so it
+cannot be priced.
 
 The effect records the exact vector, embedding revision, immutable index
 snapshot, filters, scores, lifecycle cutoff and `(id, version, digest)`
@@ -2793,7 +2820,7 @@ let embedder = Arc::new(
 );
 ```
 
-Three drivers ship, chosen by which wire the provider speaks:
+These drivers ship, chosen by which wire the provider speaks:
 
 | Driver | Reaches | Feature |
 |---|---|---|
@@ -2882,6 +2909,11 @@ impl SemanticRetriever for LanceHybrid {
         // The index is derived; authoritative memory is what the runtime reads
         // back, and it verifies scope and digest before anything is exposed.
     }
+
+    // Erasure reaches the index: drop the vectors, do not only hide them.
+    async fn forget(&self, gone: &Forgotten) -> Result<(), StoreError> {
+        /* delete rows by id, (id, version) or subject */
+    }
 }
 ```
 
@@ -2894,6 +2926,10 @@ handing the model something nothing verified.
 **And honour the limit.** More hits than were asked for is refused, not
 truncated — truncating would leave the selection's membership decided by the
 seam's iteration order.
+
+**And forget what memory forgets.** `IndexedMemoryStore` calls `forget` after
+every erasure verb, and an error there fails the erasure; the next erasure verb
+delivers what was missed — see [erasure](@/docs/erasure.md).
 
 `InMemorySemanticRetriever` is the exact-cosine reference and ranks on the
 vector alone — a reference implementation, not a statement about what the seam
@@ -3064,7 +3100,10 @@ Attach an `Arc<dyn ModelStreamObserver>` with
 one canonical journaled completion. Events are labelled untrusted at the call's
 output sensitivity; opaque reasoning is never emitted and strict replay emits
 nothing live. Observers should enqueue quickly and enforce network backpressure
-outside the provider callback.
+outside the provider callback. To follow every model call a plane makes —
+declarative agents build their own — register a `RunStreamObserver` with
+`RuntimeBuilder::observe_model_streams`: it receives the same events with the
+run each belongs to, and a call carrying its own observer keeps it.
 
 The split is worth stating, because getting it backwards produces either a
 useless log or an unreplayable run. **The completion is the truth** — one
@@ -3077,8 +3116,8 @@ attaching or removing one cannot change a run's history.
 Strict replay therefore calls the observer **zero times**, and that is the
 honest interface rather than a gap. Replay is not a rerun; a framework that
 re-streamed from a cache would be reconstructing a live experience, which is a
-different claim from reproducing a run. `cargo run --example streaming_run`
-prints all three facts, including the deltas reassembling into the completion
+different claim from reproducing a run. `cargo run --example streaming_run --features
+fake-model` prints all three facts, including the deltas reassembling into the completion
 byte for byte.
 
 Testing your own observer needs a provider that streams, so `FakeProvider`
@@ -3206,11 +3245,10 @@ the builder seals the journal, the case store, the worklist, the event buffer
 and blob payloads.
 
 ```rust
-// `builder_on` wires all six stores — journal, cases, tasks, events, timers,
-// memory — to one backend in one call, which is what a deployment on a single
-// `RedbStore` or `PostgresStore` means anyway.
+// `builder_on` wires every store but blobs to one backend in one call, which
+// is what a deployment on a single `RedbStore` or `PostgresStore` means anyway.
 let rt = Runtime::builder_on(store)
-    .keyring(keys)          // seals all of them
+    .keyring(keys)          // seals the payloads they hold
     .build();
 ```
 

@@ -94,7 +94,10 @@ anchors:
 #   --canon-check  re-derives every record vector from its parsed values, so
 #                  the bytes are *produced* by a second implementation and not
 #                  merely accepted by one
-#   (no flag)      verifies the sealed export, chain, log, cases and frame
+#   (no flag)      verifies the sealed export, chain, log, cases and frame;
+#                  over the signed export, with every published key, it also
+#                  checks the record signatures, the cosigned note anchor and
+#                  the signed grader verdict
 #   --self-test    damages that export and asserts every damage is reported —
 #                  a reader that answers "0 findings" for everything agrees
 #                  with this crate perfectly and is worth nothing
@@ -103,6 +106,8 @@ anchors:
 verify-golden:
     python3 tools/verify_export.py tests/golden/records.jsonl --canon-check
     python3 tools/verify_export.py tests/golden/export.jsonl
+    python3 tools/verify_export.py tests/golden/package.jsonl
+    python3 tools/verify_export.py tests/golden/export.signed.jsonl tests/golden/checkpoint.cosigned.note --grader-verdict tests/golden/export.grader-verdict.json $(cat tests/golden/keys.txt)
     python3 tools/verify_export.py tests/golden/export.jsonl --self-test
 
 # ── Feature configurations ──────────────────────────────────────────────────
@@ -247,11 +252,10 @@ EXAMPLE_FEATURES := "redb,testkit,manifest,keyring,media,mcp,mcp-server,a2a,a2a-
 
 # run every example end to end
 #
-# Two builds, not thirteen. This recipe used to spell each example's minimal
-# feature set on its own `cargo run` line, which reads well and meant cargo
-# rebuilt agentplane — and the whole dev-dependency graph behind it, testcontainers
-# and bollard included — every time the set changed. Twelve rebuilds to run
-# twenty-seven programs that each take milliseconds.
+# Two builds, not one per feature set: spelling each example's minimal set on
+# its own `cargo run` line makes cargo rebuild agentplane — and the whole
+# dev-dependency graph behind it, testcontainers and bollard included — every
+# time the set changes, for programs that each take milliseconds.
 #
 # The first build is the one that carries an assurance the union cannot: it
 # compiles every example that claims to need nothing but the default features,
@@ -278,7 +282,7 @@ examples:
         ./target/debug/examples/"$ex"
     done
 
-FULL_FEATURES := "cli,mcp,mcp-stdio,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push"
+FULL_FEATURES := "cli,mcp,mcp-stdio,mcp-server-http,a2a-server,http,cedar,keyring,media,opendal,signing,witness-http,postgres,push"
 
 # what an effect costs, so a performance claim can carry a number
 #
@@ -295,6 +299,18 @@ perf:
 cli-smoke:
     tools/cli-smoke.sh
 
+# The generator's self-test proves its output follows the document, so the
+# comparison cannot pass vacuously.
+#
+# the committed Python operator client is what the published document generates
+client-check:
+    python3 tools/gen_operator_client.py --self-test
+    python3 tools/gen_operator_client.py --check
+
+# the generated client against `agentplane serve` on a real socket
+client-smoke:
+    tools/client-smoke.sh
+
 # the container image: builds it, then proves it does what it exists for
 #
 # Not covered by `cli-smoke`, and the two fail differently. A binary that works
@@ -309,6 +325,19 @@ cli-smoke:
 # the container image: builds it, then proves it does what it exists for
 docker-smoke features="cli":
     FEATURES={{features}} tools/docker-smoke.sh
+
+# every framework quickstart against the plane `init --serve` writes, and the Helm chart
+#
+# Builds `:full` (or tests `IMAGE`), runs the published commands, checks each
+# quickstart's lock against its requirements and installs it with every hash
+# checked, drives each through its framework's own client, and reads the
+# governed run back from the operator listener; renders the chart's accept and
+# refuse cases. Needs Docker, `uv`, the network and `helm` (or Docker to run it); not
+# in `ci` for that reason, like `docker-smoke` and `test-a2a-tck`.
+#
+# every framework quickstart against the plane `init --serve` writes, and the chart
+frameworks:
+    FEATURES={{FULL_FEATURES}} tools/frameworks.sh
 
 # build both published variants locally, exactly as the registry gets them
 #
@@ -364,18 +393,11 @@ og:
 doc-examples:
     tools/check-doc-examples.sh
 
-# refuse a broken internal link or anchor in the docs site
-#
-# In `ci`, and deliberately `--skip-external-links`: an internal anchor is a
-# property of this repository — deterministic, and broken by the commit that
-# breaks it — while an external link is a property of somebody else's server,
-# so checking one in the gate makes a green build depend on the internet. The
-# deploy job checks both.
-# The same check the Pages workflow runs, external links included.
-#
-# Skipping them locally is what let a link to an unreleased item reach a push:
-# `docs.rs/…/latest` serves the last *published* crate, so a link to anything
-# added since resolves to a 404 that only the network can see. ~5 s.
+# In `ci`, and the same check the Pages workflow runs, external links
+# included: `docs.rs/…/latest` serves the last *published* crate, so a link to
+# anything added since resolves to a 404 that only the network can see. That
+# makes a green gate depend on the network, which is the price of catching it
+# before a push. ~5 s.
 #
 # the site's links, internal and external, as the deploy job checks them
 site-check:
@@ -398,7 +420,24 @@ site-serve:
 
 # TLA+ model check, plus the spec mutants
 specs:
+    ./tla/verify.sh --self-test
     ./tla/verify.sh
+
+# The dev page in a real browser, over records written to be executed: each
+# must appear as text, with no element made from it and no policy violation.
+# The source guard over the page script checks which sinks it names; this
+# checks the claim. Needs a Chromium or Chrome (`CHROMIUM=<path>` to choose).
+#
+# the dev page renders hostile records as text in headless Chromium
+dev-page-smoke:
+    tools/dev-page-smoke.sh
+
+# Re-shoot the dev page pictures in the getting-started guide, light and dark.
+# Nothing keeps them current, so run it after changing the page.
+#
+# re-shoot the guide's dev page screenshots
+dev-page-screenshots:
+    tools/dev-page-screenshot.sh
 
 # ── Release ─────────────────────────────────────────────────────────────────
 
@@ -467,7 +506,7 @@ audit:
 seams: test-mcp test-http test-attestation test-drivers
 
 # everything CI runs, minus the two slow layers
-ci: lint features anchors verify-golden audit test test-default test-minimal seams examples cli-smoke doc-examples docs site-check package
+ci: lint features anchors verify-golden audit test test-default test-minimal seams examples cli-smoke client-check client-smoke doc-examples docs site-check package
 
 # everything, including the slow layers — what a release must pass
-ci-full: ci specs mutants
+ci-full: ci specs dev-page-smoke mutants

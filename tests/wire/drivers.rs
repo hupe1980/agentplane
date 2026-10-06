@@ -4054,6 +4054,53 @@ async fn gemini_returns_the_models_turn_verbatim_including_its_thought_signature
         contents[2]["parts"][0]["functionResponse"]["response"]["output"]["found"],
         true
     );
+    assert!(
+        contents[2]["parts"][0]["functionResponse"]
+            .get("id")
+            .is_none(),
+        "an id this driver synthesized was sent as though the provider issued it: {body}"
+    );
+}
+
+/// A call the provider identified is answered under that id.
+#[tokio::test]
+async fn gemini_answers_a_provider_identified_call_under_its_id() {
+    let (canned, seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "done" }] },
+                "finishReason": "STOP",
+            }],
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("look it up");
+    let exchanges = [ToolExchange {
+        call: agentplane::model::ToolCall {
+            id: "call-7f3a".to_owned(),
+            name: "lookup".to_owned(),
+            arguments: json!({}),
+        },
+        output: json!({ "found": true }),
+        failed: false,
+    }];
+    let _ = driver
+        .complete(gemini_request(&model, &prompt, &[], &exchanges, None))
+        .await;
+
+    let body = seen.lock().unwrap().clone().unwrap();
+    let response = body["contents"]
+        .as_array()
+        .and_then(|turns| turns.last())
+        .map(|turn| turn["parts"][0]["functionResponse"].clone())
+        .expect("a results turn");
+    assert_eq!(
+        response["id"], "call-7f3a",
+        "the result did not name the call the provider issued: {body}"
+    );
 }
 
 /// Reasoning effort renders as a thinking level, or is refused — never bent.
@@ -4637,6 +4684,63 @@ async fn serve_gemini_sse(body: &'static str) -> (String, SeenQuery) {
 
 type SeenQuery = Arc<std::sync::Mutex<Option<String>>>;
 
+/// A Gemini stream refused at the intake ceiling carries the usage its chunks
+/// already reported: the wire states it cumulatively on every chunk, so the
+/// refusal knows what the call burned and a token ceiling counts it.
+#[tokio::test]
+async fn gemini_a_stream_past_the_ceiling_reports_what_it_burned() {
+    let event = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\
+                 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}}],\"usageMetadata\":\
+                 {\"promptTokenCount\":11,\"candidatesTokenCount\":500}}\n\n";
+    let chunk = bytes::Bytes::from(event.repeat(512));
+    let total = 24 * 1024 * 1024;
+    let handler = move || {
+        let chunk = chunk.clone();
+        async move {
+            use axum::response::IntoResponse;
+            let body = futures_util::stream::unfold(0usize, move |sent| {
+                let chunk = chunk.clone();
+                async move {
+                    (sent < total).then(|| {
+                        let next = sent + chunk.len();
+                        (Ok::<bytes::Bytes, std::io::Error>(chunk), next)
+                    })
+                }
+            });
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                axum::body::Body::from_stream(body),
+            )
+                .into_response()
+        }
+    };
+    let app = Router::new().route("/v1beta/models/{model}", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let driver = Gemini::new("k").unwrap().base(format!("http://{addr}"));
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let prompt = json!("hi");
+    let err = driver
+        .complete(gemini_request(&model, &prompt, &[], &[], None))
+        .await
+        .expect_err("a stream past the ceiling is not accumulated");
+    match &err {
+        ModelError::Unusable { usage, detail, .. } => {
+            assert!(detail.contains("grew past"), "{detail}");
+            assert_eq!(
+                (usage.input_tokens, usage.output_tokens),
+                (11, 500),
+                "the refusal dropped the usage the stream had already reported"
+            );
+        }
+        other => panic!("an oversized stream must be Unusable, not {other}"),
+    }
+}
+
 /// **The default path, end to end.** Streaming is what a Gemini deployment
 /// actually runs, and until this existed only `.buffered()` had been exercised
 /// through the driver — the accumulator had unit tests, the *path* had none.
@@ -4956,7 +5060,10 @@ async fn an_embedder_sends_the_wire_and_names_its_revision() {
 
     let (c, seen) = canned(
         200,
-        json!({ "data": [{ "embedding": [0.25, -0.5, 0.75] }] }),
+        json!({
+            "data": [{ "embedding": [0.25, -0.5, 0.75] }],
+            "usage": { "prompt_tokens": 4, "total_tokens": 4 }
+        }),
     );
     let url = serve(c).await;
     let embedder = OpenAiEmbedder::new("embed-3-small")
@@ -4971,8 +5078,12 @@ async fn an_embedder_sends_the_wire_and_names_its_revision() {
         "the revision must name the width; two widths are not one index"
     );
 
-    let vector = embedder.embed("refund policy").await.expect("embed");
-    assert_eq!(vector, vec![0.25, -0.5, 0.75]);
+    let answer = embedder.embed("refund policy").await.expect("embed");
+    assert_eq!(answer.vector, vec![0.25, -0.5, 0.75]);
+    assert_eq!(
+        answer.usage.input_tokens, 4,
+        "the reply's usage is what a token ceiling counts"
+    );
 
     let body = seen.lock().unwrap().clone().expect("a request was sent");
     assert_eq!(body["model"], "embed-3-small");
@@ -5069,7 +5180,8 @@ async fn an_embedder_refuses_a_host_nobody_granted() {
         .egress(agentplane::core::Egress::new().allow(host))
         .embed("x")
         .await
-        .expect("a granted host was refused");
+        .expect("a granted host was refused")
+        .vector;
     assert_eq!(vector, vec![1.0]);
 }
 
@@ -5094,7 +5206,7 @@ async fn gemini_embeds_a_query_and_renormalises_a_truncated_vector() {
         .base(url)
         .dimensions(3);
 
-    let vector = embedder.embed("refund policy").await.expect("embed");
+    let vector = embedder.embed("refund policy").await.expect("embed").vector;
     let norm = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 1e-5,
@@ -5184,12 +5296,70 @@ async fn gemini_refuses_a_reply_that_is_not_a_vector() {
         .base(url)
         .embed("x")
         .await
-        .expect("an ordinary reply was refused");
+        .expect("an ordinary reply was refused")
+        .vector;
     assert_eq!(
         vector,
         vec![3.0, 4.0],
         "a native-width vector arrives normalised and must be left alone"
     );
+}
+
+/// A priced embedder whose reply reports no usage is refused, not metered as
+/// free; the same reply unpriced is served. Both wires carry the count, so its
+/// absence is a server that does not speak them.
+#[tokio::test]
+async fn a_priced_embedder_refuses_a_reply_without_usage() {
+    use agentplane::memory::Embedder as _;
+    use agentplane::model::embeddings::{GeminiEmbedder, OpenAiEmbedder};
+
+    let price = agentplane::model::Pricing {
+        input: 1,
+        output: 0,
+        cache_read: 0,
+        cache_write: 0,
+    };
+    let openai = json!({ "data": [{ "embedding": [1.0] }] });
+    let gemini = json!({ "embedding": { "values": [1.0] } });
+
+    let (c, _) = canned(200, openai.clone());
+    let refused = OpenAiEmbedder::new("m")
+        .unwrap()
+        .base(serve(c).await)
+        .pricing(price)
+        .embed("x")
+        .await
+        .expect_err("a priced OpenAI-wire call with no usage was metered as free");
+    assert!(refused.to_string().contains("no input tokens"), "{refused}");
+    let (c, _) = canned(200, openai);
+    OpenAiEmbedder::new("m")
+        .unwrap()
+        .base(serve(c).await)
+        .embed("x")
+        .await
+        .expect("unpriced, a missing count is only information");
+
+    let (c, _) = canned(200, gemini.clone());
+    let refused = GeminiEmbedder::new("k", "gemini-embedding-001")
+        .unwrap()
+        .base(serve(c).await)
+        .pricing(price)
+        .embed("x")
+        .await
+        .expect_err("a priced Gemini call with no usageMetadata was metered as free");
+    assert!(refused.to_string().contains("no input tokens"), "{refused}");
+    let (c, _) = canned(
+        200,
+        json!({ "embedding": { "values": [1.0] }, "usageMetadata": { "promptTokenCount": 2 } }),
+    );
+    let metered = GeminiEmbedder::new("k", "gemini-embedding-001")
+        .unwrap()
+        .base(serve(c).await)
+        .pricing(price)
+        .embed("x")
+        .await
+        .expect("a reply with usageMetadata is metered");
+    assert_eq!(metered.usage.input_tokens, 2);
 }
 
 /// An asymmetric model is told the text is a query, and that is in the identity.

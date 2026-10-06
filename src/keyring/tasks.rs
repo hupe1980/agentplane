@@ -20,6 +20,11 @@
 //! is a `Tainted<String>`, so a summary built from a completion says so, and
 //! a deployment that writes personal data into one has put it somewhere this
 //! does not reach — visibly, rather than silently.
+//!
+//! `reach` is not sealed either: it is what a consulted agent's registered
+//! declaration permits, the plane's own configuration rather than the
+//! caller's data, and a reviewer of a withheld proposal still needs to see
+//! whom the consultation would hand work to.
 
 use std::sync::Arc;
 

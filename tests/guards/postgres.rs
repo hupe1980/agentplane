@@ -97,6 +97,33 @@ async fn postgres_satisfies_the_journal_store_contract() {
     .await;
 
     report.assert_conforms("PostgresStore");
+
+    let older = conformance::check_upcasting(
+        &|upcaster| {
+            let url = url.clone();
+            let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Arc::new(
+                    PostgresStore::connect(&url)
+                        .await
+                        .expect("connect to the test container")
+                        .for_tenant(
+                            agentplane::core::TenantId::new(format!("conformance-{n}"))
+                                .expect("a legal tenant id"),
+                        )
+                        .upcasting_with(upcaster),
+                ) as Arc<dyn JournalStore>
+            })
+        },
+        &agentplane::testkit::older_shape::older_shape(
+            &std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/export.jsonl"),
+            )
+            .expect("tests/golden/export.jsonl"),
+        ),
+    )
+    .await;
+    older.assert_conforms("PostgresStore under an upcaster");
 }
 
 /// Standing authority has the same semantics on the active-active backend.
@@ -759,6 +786,83 @@ async fn postgres_satisfies_the_case_layer_contracts() {
     report.assert_conforms("PostgresStore (case layer)");
 }
 
+/// **A subscriptions table an older build created gains the wait's sender at
+/// open**, as every late column in this schema does, rather than failing at
+/// the first wait that names one.
+#[tokio::test]
+async fn postgres_an_older_subscriptions_table_gains_the_sender_at_open() {
+    use agentplane::case::EventStore;
+    use agentplane::core::{
+        CorrelationKey, EffectKey, InboundEvent, Phase, RunId, StepId, Subscription, Timestamp,
+    };
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let mut raw = None;
+    for attempt in 0..10u64 {
+        if let Ok((client, connection)) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await
+        {
+            tokio::spawn(connection);
+            raw = Some(client);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250 * (attempt + 1))).await;
+    }
+    raw.expect("raw connection")
+        .batch_execute(
+            "CREATE TABLE subscriptions (
+                tenant TEXT NOT NULL, run_id TEXT NOT NULL, effect_key TEXT NOT NULL,
+                case_id TEXT, step BIGINT NOT NULL, phase TEXT NOT NULL,
+                event_kind TEXT NOT NULL, namespace TEXT NOT NULL, value TEXT NOT NULL,
+                created_at BIGINT NOT NULL, parked_at BIGINT,
+                PRIMARY KEY (tenant, run_id, effect_key, namespace, value))",
+        )
+        .await
+        .expect("the older table");
+
+    let store = connect_retrying(&url).await;
+    let at = Timestamp::from_unix_timestamp(1_760_000_000).expect("instant");
+    let wait = Subscription {
+        run: RunId::generate(),
+        case: None,
+        effect: EffectKey::for_effect(
+            StepId(0),
+            Phase::Forward,
+            0,
+            1,
+            &agentplane::core::EffectDescriptor::new("probe", serde_json::json!({})),
+        ),
+        step: StepId(0),
+        phase: Phase::Forward,
+        kind: "reply".into(),
+        correlation: vec![CorrelationKey::new("doc", "D-1")],
+        from: Some("peer:billing".to_owned()),
+    };
+    store
+        .subscribe(&wait, at)
+        .await
+        .expect("a wait naming its sender");
+    let event = InboundEvent {
+        source: "peer:billing".to_owned(),
+        id: "e-1".to_owned(),
+        kind: "reply".into(),
+        correlation: vec![CorrelationKey::new("doc", "D-1")],
+        payload: serde_json::json!({}),
+        by: None,
+    };
+    store.buffer(&event, at).await.expect("buffer");
+    let matched = store.match_waiter(&event, at).await.expect("match");
+    assert_eq!(
+        matched.and_then(|sub| sub.from),
+        Some("peer:billing".to_owned()),
+        "the older table did not carry the wait's sender"
+    );
+}
+
 /// The tenant is a key component here, checked against a real server.
 ///
 /// Postgres is the backend that exists for several plane instances sharing one
@@ -866,6 +970,7 @@ async fn journal_is_apart(acme: &PostgresStore, globex: &PostgresStore) {
                 idempotency_key: None,
                 admitted_by: None,
                 served_unchained: false,
+                plane_chain: false,
             },
         )],
     )
@@ -973,6 +1078,7 @@ async fn events_are_apart(
         phase: Phase::Forward,
         kind: "ack.received".to_owned(),
         correlation: vec![CorrelationKey::new("shipment", "SHP-9")],
+        from: None,
     };
     globex.subscribe(&sub, at).await.expect("globex subscribes");
 
@@ -1094,6 +1200,8 @@ mod atomic_fixtures {
                     source: None,
                     by: None,
                     spend: agentplane::core::Spend::default(),
+                    content: None,
+                    elapsed_ms: None,
                 },
             )])
         }
@@ -1180,6 +1288,64 @@ async fn a_co_located_resource_commits_with_the_journal() {
         1,
         "the record did not commit beside the write"
     );
+}
+
+/// A sealed journal lends the transaction too, and seals what commits in it.
+///
+/// A decorator that answered no transaction refused every atomic group on a
+/// sealed plane; one that forwarded the work's records would commit them in
+/// the clear.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn a_sealed_journal_commits_a_co_located_resource_sealed() {
+    use agentplane::core::{RunId, TenantId};
+    use agentplane::journal::{JournalStore, RecordKind, payload};
+    use agentplane::keyring::SealedJournal;
+    use agentplane::testkit::MemoryKeyRing;
+    use atomic_fixtures::{Ledger, Post, balance, ready};
+    use std::sync::Arc as StdArc;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let store = ready(&url).await;
+    let sealed = SealedJournal::wrap(
+        StdArc::clone(&store) as StdArc<dyn JournalStore>,
+        StdArc::new(MemoryKeyRing::new()),
+        TenantId::default(),
+    );
+
+    let run = RunId::generate();
+    let written = sealed
+        .atomic()
+        .expect("a sealed journal over postgres lends its transaction")
+        .append_atomic(run, 1, &Post(StdArc::new(Ledger { refuses: false }), run))
+        .await
+        .expect("commit");
+    assert_eq!(
+        balance(&store).await,
+        129,
+        "the resource write did not commit"
+    );
+    let output = |kind: &RecordKind| match kind {
+        RecordKind::EffectDone { output, .. } => output.clone(),
+        other => panic!("unexpected record: {other:?}"),
+    };
+    assert_eq!(
+        output(written[0].kind())["posted"],
+        129,
+        "handed back sealed"
+    );
+    let raw = store.read(run, 1).await.expect("read");
+    assert!(
+        payload::is_sealed(&output(raw[0].kind())),
+        "the atomic group's output reached the store in the clear"
+    );
+    let opened = sealed.read(run, 1).await.expect("read");
+    assert_eq!(output(opened[0].kind())["posted"], 129, "did not open");
 }
 
 /// A refused unit of work leaves **neither**.
@@ -1736,7 +1902,7 @@ async fn postgres_merkle_log_only_grows_at_its_end_under_concurrent_seals() {
     // Each run carries a record, so every leaf is distinct: runs with empty
     // chains share one leaf, and any order of them is consistent.
     let admit = |store: Arc<PostgresStore>, run: RunId, owner: &'static str| async move {
-        admitted_run(&store, run, owner).await
+        concluded_run(&store, run, owner).await
     };
 
     let (raw, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
@@ -1821,6 +1987,30 @@ async fn postgres_merkle_log_only_grows_at_its_end_under_concurrent_seals() {
     );
 }
 
+/// A run admitted and concluded, ready to seal.
+async fn concluded_run(
+    store: &PostgresStore,
+    run: agentplane::core::RunId,
+    owner: &str,
+) -> agentplane::journal::Lease {
+    let lease = admitted_run(store, run, owner).await;
+    let concluded = agentplane::journal::RecordKind::RunConcluded {
+        outcome: "succeeded".into(),
+        reason: None,
+        exhaustion: None,
+        live_spend: agentplane::core::Spend::default(),
+        chain_head: agentplane::core::Digest::ZERO,
+    };
+    store
+        .append(
+            lease.epoch,
+            vec![agentplane::journal::Append::new(run, concluded)],
+        )
+        .await
+        .expect("conclude");
+    lease
+}
+
 /// Lease `run` and append its admission, handing back the lease.
 async fn admitted_run(
     store: &PostgresStore,
@@ -1847,6 +2037,7 @@ async fn admitted_run(
                     idempotency_key: None,
                     admitted_by: None,
                     served_unchained: false,
+                    plane_chain: false,
                 },
             )],
         )
@@ -2287,7 +2478,7 @@ mod recovery_fixtures {
         let checkpoint = journal.checkpoint().await.expect("checkpoint");
         let mut bytes = Vec::new();
         let trailer =
-            agentplane::export::to_jsonl(&journal, Some(&cases), &[sealed, waiting], &mut bytes)
+            agentplane::export::to_jsonl(&journal, &cases, &[sealed, waiting], &mut bytes)
                 .await
                 .expect("export");
         assert_eq!(trailer.cases, 1, "the matter did not travel");
@@ -2745,7 +2936,7 @@ async fn the_log_grew_from_the_one_restored(
     let mut again = Vec::new();
     agentplane::export::to_jsonl(
         fresh,
-        Some(fresh_cases),
+        fresh_cases,
         &[taken.sealed, taken.waiting, after],
         &mut again,
     )
