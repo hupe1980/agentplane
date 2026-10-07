@@ -1251,12 +1251,21 @@ pub struct Label {""",
     "CredentialReachesTheJournal": (
         "src/peers/mod.rs",
         "a_credential_is_presented_to_the_peer_and_never_written_to_the_journal",
-        "a bearer token is written into the effect descriptor, and so into history",
-        """                "payload": self.payload,
-            }),""",
-        """                "payload": self.payload,
-                "auth": self.credential.as_ref().map(|c| c.expose()),
-            }),""",
+        "the token a hop presented is returned in its result, and so written into history",
+        """                credential.as_ref(),
+                self.provenance.as_ref(),
+            )
+            .await
+            .map_err(""",
+        """                credential.as_ref(),
+                self.provenance.as_ref(),
+            )
+            .await
+            .map(|reply| serde_json::json!({
+                "reply": reply,
+                "auth": credential.as_ref().map(|c| c.expose()),
+            }))
+            .map_err(""",
     ),
     # An issuer that ignores the RFC 8707 `resource` parameter hands back a token
     # the peer can spend elsewhere. Taking the issuer at its word about the
@@ -12068,7 +12077,7 @@ pub struct WrappedKey {""",
     "ARestoreAppendsToARunItAlreadyHolds": (
         "src/export.rs",
         "a_restore_refuses_a_store_already_holding_one_of_its_runs",
-        "a restore into a store that already holds one of its runs appends that run's history a second time behind the first, so a retried partial restore doubles every open run",
+        "a restore checks a held run only when it reaches it, so a file whose later run the store already holds is refused after its earlier runs were written — a partial restore behind the refusal",
         "        if store.head(run.run).await?.seq != 0 {",
         "        if store.head(run.run).await?.seq != 0 && false {",
     ),

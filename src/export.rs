@@ -2909,8 +2909,8 @@ async fn refuse_before_writing(
     }
 
     refuse_foreign_seals(parsed, store.tenant())?;
-    // `append` re-derives `seq`, so a run this store already holds would be
-    // appended to rather than rebuilt — a retried partial restore doubling it.
+    // Every run before the first write: the store refuses a held run's records
+    // on its own, but only once the runs ahead of it in the file are written.
     for run in &parsed.runs {
         if store.head(run.run).await?.seq != 0 {
             return Err(StoreError::Backend(format!(

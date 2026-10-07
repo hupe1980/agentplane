@@ -1755,51 +1755,79 @@ async fn a_run_writing_during_the_in_flight_walk_is_still_listed() {
 
 /// An export of one open run carrying a note, and the run's id.
 async fn one_open_run() -> (Vec<u8>, RunId) {
-    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
-    let run = RunId::generate();
-    let lease = store
-        .acquire(run, "test", Duration::from_mins(5))
-        .await
-        .expect("lease");
-    let note = RecordKind::Note {
-        text: "still working".into(),
-    };
-    store
-        .append(lease.epoch, vec![Append::new(run, note)])
-        .await
-        .expect("append");
-    let mut out = Vec::new();
-    agentplane::export::to_jsonl(&store, &crate::no_cases(), &[run], &mut out)
-        .await
-        .expect("export");
-    (out, run)
+    let (store, runs) = open_runs(1).await;
+    (export_of(&store, &runs).await, runs[0])
 }
 
-/// **A restore refuses a store that already holds one of its runs.**
+/// A store holding `count` open runs, each with one note.
+async fn open_runs(count: usize) -> (Arc<dyn JournalStore>, Vec<RunId>) {
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let mut runs = Vec::new();
+    for _ in 0..count {
+        let run = RunId::generate();
+        let lease = store
+            .acquire(run, "test", Duration::from_mins(5))
+            .await
+            .expect("lease");
+        let note = RecordKind::Note {
+            text: "still working".into(),
+        };
+        store
+            .append(lease.epoch, vec![Append::new(run, note)])
+            .await
+            .expect("append");
+        runs.push(run);
+    }
+    (store, runs)
+}
+
+async fn export_of(store: &Arc<dyn JournalStore>, runs: &[RunId]) -> Vec<u8> {
+    let mut out = Vec::new();
+    agentplane::export::to_jsonl(store, &crate::no_cases(), runs, &mut out)
+        .await
+        .expect("export");
+    out
+}
+
+/// **A restore refuses a store that already holds one of its runs, before
+/// writing any.**
 ///
 /// `append` re-derives `seq`, so a retried restore of an open run would append
-/// its history a second time behind the first — seq n+1..2n — rather than
-/// fail.
+/// its history a second time behind the first. The store refuses that record on
+/// its own; what the restore adds is checking every run before the first write,
+/// so a file whose *second* run is held does not leave its first one restored.
 #[tokio::test]
 async fn a_restore_refuses_a_store_already_holding_one_of_its_runs() {
-    let (out, run) = one_open_run().await;
+    let (source, runs) = open_runs(2).await;
+    let (fresh, held) = (runs[0], runs[1]);
+    let both = export_of(&source, &[fresh, held]).await;
     let target: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
-    agentplane::export::from_jsonl(&target, None, std::io::Cursor::new(&out))
-        .await
-        .expect("the first restore");
-    let before = target.head(run).await.expect("head").seq;
+    agentplane::export::from_jsonl(
+        &target,
+        None,
+        std::io::Cursor::new(&export_of(&source, &[held]).await),
+    )
+    .await
+    .expect("the first restore");
+    let before = target.head(held).await.expect("head").seq;
 
-    let refused = agentplane::export::from_jsonl(&target, None, std::io::Cursor::new(&out))
+    let refused = agentplane::export::from_jsonl(&target, None, std::io::Cursor::new(&both))
         .await
-        .expect_err("a second restore of the same run into the same store was accepted");
+        .expect_err("a restore over a run the store already holds was accepted");
     assert!(
-        refused.to_string().contains(&run.to_string()),
+        refused.to_string().contains(&held.to_string()),
         "the refusal does not name the run: {refused}"
     );
     assert_eq!(
-        target.head(run).await.expect("head").seq,
+        target.head(held).await.expect("head").seq,
         before,
         "the refused restore appended the run's history a second time"
+    );
+    assert_eq!(
+        target.head(fresh).await.expect("head").seq,
+        0,
+        "the refused restore wrote the run before the held one: a refusal left a \
+         partial restore behind"
     );
 }
 
