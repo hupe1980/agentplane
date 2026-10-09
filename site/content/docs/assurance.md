@@ -211,8 +211,7 @@ exhaustively — no seed, no injector, nothing to get lucky with. It sweeps a ru
 that succeeds and a run that unwinds.
 
 What it does *not* do is reorder writes, skew clocks, partition a network, or
-stall a disk. That needs the runtime on a simulated executor, and is the layer
-above this one.
+stall a disk; that needs a simulated executor, which this suite does not use.
 
 #### The assertion that bites is about failures, not outcomes
 

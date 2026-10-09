@@ -15,9 +15,14 @@
 //! is what `opened_at` is. A closure date would also be the wrong anchor for
 //! the case that reopens.
 //!
-//! Only **closed** cases are erased. A case still open is a matter still
-//! running, and erasing the data underneath a live run turns a retention pass
-//! into an outage.
+//! Only **closed** cases are erased, and only once every run of the case has
+//! concluded under an outcome nothing resumes from. A case still open is a
+//! matter still running, and a closed case can still hold a suspended run;
+//! erasing the data underneath either turns a retention pass into an outage.
+//!
+//! A case whose erasure completed is not selected again: its record says it
+//! went, when and why, and a pass that re-erased it every time would report
+//! the same matter erased on every date it ran.
 //!
 //! # What it destroys, and what it provably does not
 //!
@@ -30,13 +35,13 @@
 //!
 //! # What stops it
 //!
-//! A [`LegalHold`](crate::core::LegalHold) on a case, and nothing else. It is
-//! the only thing in this crate that makes an erasure fail rather than succeed,
-//! and it exists because a retention pass is *automatic*: it runs on a window
-//! nobody re-reads, and the matter somebody has been ordered to preserve looks
-//! exactly like every other closed case old enough to sweep. A held case is
-//! reported in [`RetentionReport::held`] — never in `failures`, because the
-//! sweep did what it was told.
+//! A [`LegalHold`](crate::core::LegalHold) on a case. It exists because a
+//! retention pass is *automatic*: it runs on a window nobody re-reads, and the
+//! matter somebody has been ordered to preserve looks exactly like every other
+//! closed case old enough to sweep. A held case is reported in
+//! [`RetentionReport::held`] — never in `failures`, because the sweep did what
+//! it was told. A case with a run that may still resume is left whole too, and
+//! reported in `failures` until that run concludes.
 //!
 //! **Without a key ring, journal payloads are permanent.** Blob tombstones
 //! still land, and they cover the live store only. This is the residual the
@@ -132,11 +137,12 @@ pub struct RetentionPlan {
     pub held: Vec<crate::core::CaseId>,
 }
 
-/// Select every closed case opened before `older_than`, erasing nothing.
+/// Select every closed case opened before `older_than` whose erasure has not
+/// completed, erasing nothing.
 ///
 /// # Errors
 ///
-/// If the case layer cannot be enumerated.
+/// If the case layer cannot be read.
 pub async fn plan(
     cases: &dyn CaseStore,
     older_than: Timestamp,
@@ -159,6 +165,16 @@ pub async fn plan(
             // A case still open is a matter still running. Erasing underneath a
             // live run turns a retention pass into an outage.
             if case.status == CaseStatus::Closed && case.opened_at < older_than {
+                // Done is done. One begun and not completed is selected again,
+                // because a crash between its record and its key destruction
+                // is exactly what the next pass exists to finish.
+                if cases
+                    .erasure(case.id)
+                    .await?
+                    .is_some_and(|erasure| erasure.complete)
+                {
+                    continue;
+                }
                 // The hold is read here so a dry run and a pass agree about what
                 // would happen. It is read *again* inside `erase_case`, and that
                 // is not redundancy: a hold placed between the two reads has to
@@ -202,7 +218,8 @@ pub struct Stores<'a> {
     pub disclosures: Option<&'a Arc<dyn crate::disclosure::DisclosureRegister>>,
 }
 
-/// Erase every closed case opened before `older_than`.
+/// Erase every closed case opened before `older_than` whose runs have all
+/// concluded, reading the conclusions from `journal`.
 ///
 /// `reason` lands on each tombstone and on the key destruction, so a later read
 /// says *expired, on this date, for this reason* rather than *missing*. It is
@@ -215,11 +232,23 @@ pub struct Stores<'a> {
 ///
 /// # Errors
 ///
-/// Only if the case layer cannot be enumerated. A store that fails on one case
+/// Only if the case layer cannot be walked — its pages, and each candidate's
+/// erasure record and hold as the plan reads them. A store that fails on one case
 /// is a *report entry*, not an error — the pass's job is to keep going and say
 /// what it could not do.
 pub async fn retain(
     stores: &Stores<'_>,
+    journal: &dyn crate::journal::JournalStore,
+    older_than: Timestamp,
+    at: Timestamp,
+    reason: &str,
+) -> Result<RetentionReport, StoreError> {
+    sweep(stores, Some(journal), older_than, at, reason).await
+}
+
+async fn sweep(
+    stores: &Stores<'_>,
+    journal: Option<&dyn crate::journal::JournalStore>,
     older_than: Timestamp,
     at: Timestamp,
     reason: &str,
@@ -273,18 +302,29 @@ pub async fn retain(
     // `UnderLegalHold` arm below still fires — for a hold placed after the plan
     // was taken, which is the only way one reaches `erase_case`.
     for case in &selected.held {
-        let reason = stores.cases.hold(*case).await.ok().flatten().map_or_else(
-            || "hold released while this pass ran".to_owned(),
-            |h| format!("placed at {} — {}", h.placed_at, h.reason),
-        );
-        report.held.push(format!(
-            "case {case}: preserved under a legal hold, {reason}"
-        ));
+        // A hold that cannot be read is a failure of this pass, not a hold
+        // released while it ran: reading it as released would tell an operator
+        // a preservation order is gone when nobody knows.
+        match stores.cases.hold(*case).await {
+            Ok(hold) => {
+                let reason = hold.map_or_else(
+                    || "hold released while this pass ran".to_owned(),
+                    |h| format!("placed at {} — {}", h.placed_at, h.reason),
+                );
+                report.held.push(format!(
+                    "case {case}: preserved under a legal hold, {reason}"
+                ));
+            }
+            Err(e) => report.failures.push(format!(
+                "case {case}: selected as held, and its hold could not be read: {e}"
+            )),
+        }
     }
     for case in selected.due {
         let erased = crate::blob::erase_case(
             stores.blobs.map(std::convert::AsRef::as_ref),
             stores.cases.as_ref(),
+            journal,
             #[cfg(feature = "keyring")]
             stores.keys.map(std::convert::AsRef::as_ref),
             stores.disclosures.map(std::convert::AsRef::as_ref),

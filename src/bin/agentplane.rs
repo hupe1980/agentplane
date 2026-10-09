@@ -160,10 +160,15 @@ const EXIT_STATUS_HELP: &str = "Exit status:
 /// Why a verb could not answer, which decides its exit status.
 ///
 /// A plain `String` is an operational fault — most refusals arrive as one from
-/// a store or a file — so `?` on the library's errors lands there, and a
-/// refusal of the command line itself is said with [`usage`].
+/// a store or a file — so `?` on a string lands there. The runtime's own
+/// refusals go through [`runtime_fault`] and a plane that will not assemble
+/// through [`build_fault`], so a refusal the plane made on purpose is never
+/// reported as an outage; a refusal of the command line itself is said with
+/// [`usage`].
 #[derive(Debug)]
 enum Fault {
+    /// The plane answered, and the answer is no: nothing was recorded.
+    Finding(String),
     Usage(String),
     Operational(String),
 }
@@ -171,6 +176,7 @@ enum Fault {
 impl Fault {
     const fn status(&self) -> u8 {
         match self {
+            Self::Finding(_) => exit::FINDING,
             Self::Usage(_) => exit::USAGE,
             Self::Operational(_) => exit::OPERATIONAL,
         }
@@ -180,7 +186,7 @@ impl Fault {
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Usage(m) | Self::Operational(m) => f.write_str(m),
+            Self::Finding(m) | Self::Usage(m) | Self::Operational(m) => f.write_str(m),
         }
     }
 }
@@ -196,14 +202,70 @@ fn usage(message: impl Into<String>) -> Fault {
     Fault::Usage(message.into())
 }
 
-/// A refused admission, as the exit status reports it: an input the agent
-/// cannot read its data subject from is the command as typed, and every other
-/// refusal is the plane's.
-fn admission_fault(e: agentplane::core::RuntimeError) -> Fault {
+/// A runtime error, placed in the exit table.
+///
+/// Three answers, by who has to act. **Usage (2)**: the command named
+/// something this plane does not hold — an unknown run, task or tenant, an
+/// input the agent cannot read its subject from, a request the runtime refuses
+/// as asked — and the same command fails the same way. **Finding (1)**: the
+/// plane understood and said no — four-eyes, a task already answered or held,
+/// a run that cannot be unwound, a policy denial — and nothing was recorded.
+/// **Operational (4)**: a store, a lease or the process could not be used,
+/// and the same command may succeed later. A variant this table does not name
+/// is operational, the answer that tells a scheduler to look rather than to
+/// stop asking.
+// By value, so it is the function `map_err` takes.
+#[allow(clippy::needless_pass_by_value)]
+fn runtime_fault(e: agentplane::core::RuntimeError) -> Fault {
+    use agentplane::core::{ClaimError, RuntimeError as E, StoreError};
+    let message = e.to_string();
     match e {
-        e @ agentplane::core::RuntimeError::SubjectUnbound { .. } => usage(e.to_string()),
-        e => e.to_string().into(),
+        E::SubjectUnbound { .. }
+        | E::PlanContract(_)
+        | E::UnknownTenant(_)
+        | E::ReservedEventKind { .. }
+        | E::NoProvider { .. }
+        | E::NoCaseStore { .. }
+        | E::Store(StoreError::NotFound(_))
+        | E::TaskClaim(ClaimError::NotFound(_) | ClaimError::Store(StoreError::NotFound(_))) => {
+            usage(message)
+        }
+        E::PolicyDenied(_)
+        | E::Delegation(_)
+        | E::TaskClaim(
+            ClaimError::NotPending { .. }
+            | ClaimError::AlreadyClaimed { .. }
+            | ClaimError::Excluded { .. }
+            | ClaimError::WrongRole { .. }
+            | ClaimError::NotHeld { .. }
+            | ClaimError::AlreadyAnswered { .. },
+        )
+        | E::ProposalWithheld { .. }
+        | E::TaskChanged { .. }
+        | E::PolicyBundleChanged { .. }
+        | E::DeclarationChanged { .. }
+        | E::DeclarationPinMismatch { .. }
+        | E::CanonicalizationChanged { .. }
+        | E::PayloadsErased { .. }
+        | E::PayloadsSealed { .. }
+        | E::QuotaExceeded(_)
+        | E::ChainBroken { .. }
+        | E::NotQuarantined { .. }
+        | E::NotUndecided { .. }
+        | E::CannotUnwind { .. }
+        | E::AlreadyConcluded { .. }
+        | E::ControlStands { .. } => Fault::Finding(message),
+        _ => Fault::Operational(message),
     }
+}
+
+/// A plane that will not assemble from what this command was handed.
+///
+/// Every [`BuildError`](agentplane::runtime::BuildError) is a wiring refusal —
+/// a manifest, a flag or an environment variable that does not fit — so it is
+/// the command as typed, said in the binary's own terms.
+fn build_fault(error: &agentplane::runtime::BuildError, manifests: &[Manifest]) -> Fault {
+    usage(in_cli_terms(error, manifests))
 }
 
 /// What `--version` prints: the version and the features compiled in.
@@ -391,12 +453,12 @@ struct ReconcileArgs {
     #[arg(long)]
     effect: String,
 
-    /// What was established: `landed` or `did-not-happen`.
+    /// What was established.
     ///
     /// No default. A person is asserting a fact the runtime could not
     /// establish, and a default would pick the answer for them.
-    #[arg(long)]
-    outcome: String,
+    #[arg(long, value_enum)]
+    outcome: Outcome,
 
     /// The result the run reads back, as JSON. Only with `--outcome landed`,
     /// and recorded untrusted: nothing here produced it.
@@ -405,10 +467,28 @@ struct ReconcileArgs {
 
     /// What was checked, and how. Required and recorded.
     #[arg(long)]
-    note: String,
+    reason: String,
 
     #[command(flatten)]
     who: ActingAs,
+}
+
+/// What a person established about an undecided effect.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// It happened; `--output` carries what it returned.
+    Landed,
+    /// It did not happen, and produced nothing.
+    DidNotHappen,
+}
+
+impl Outcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Landed => "landed",
+            Self::DidNotHappen => "did-not-happen",
+        }
+    }
 }
 
 /// Answer a quarantine.
@@ -420,10 +500,9 @@ struct QuarantineArgs {
     #[command(flatten)]
     at: StoreRef,
 
-    /// `reopen` to hand the run back to the executor, `abandon` to close it
-    /// where it stands, unwinding nothing.
-    #[arg(long)]
-    decision: String,
+    /// What to do with the run.
+    #[arg(long, value_enum)]
+    decision: QuarantineAnswer,
 
     /// What was looked at, and what was found. Required and recorded.
     #[arg(long)]
@@ -431,6 +510,24 @@ struct QuarantineArgs {
 
     #[command(flatten)]
     who: ActingAs,
+}
+
+/// The answer to a quarantine.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum QuarantineAnswer {
+    /// Hand the run back to the executor.
+    Reopen,
+    /// Close it where it stands, unwinding nothing.
+    Abandon,
+}
+
+impl QuarantineAnswer {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reopen => "reopen",
+            Self::Abandon => "abandon",
+        }
+    }
 }
 
 /// A verdict, said in so many words.
@@ -578,7 +675,7 @@ struct AcknowledgeArgs {
 
     /// What happened, and what was done about it. Required and recorded.
     #[arg(long)]
-    note: String,
+    reason: String,
 
     #[command(flatten)]
     who: ActingAs,
@@ -947,7 +1044,7 @@ struct VerifyArgs {
     /// Defaults to what the store reports, which is right for an auditor
     /// holding the database. Naming it explicitly is for the case where the
     /// store's own answer is the thing under suspicion.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_origin)]
     origin: Option<String>,
 
     /// A grader-verdict sidecar to check against this export. Repeatable.
@@ -1046,7 +1143,7 @@ struct AuditArgs {
     /// Defaults to what the store reports, which is right for an auditor
     /// holding the database. Naming it explicitly is for the case where the
     /// store's own answer is the thing under suspicion.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_origin)]
     origin: Option<String>,
 
     /// The oldest, in seconds, each witness key's latest signed timestamp may
@@ -1574,8 +1671,11 @@ struct ServeArgs {
     #[arg(long, env = "AGENTPLANE_POLICY")]
     policy: Option<String>,
 
-    /// Bearer tokens naming the callers this plane accepts.
-    #[arg(long, env = "AGENTPLANE_TOKENS")]
+    /// A file of the bearer tokens naming the callers this plane accepts.
+    ///
+    /// A path, never the tokens themselves — and never echoed back: a
+    /// misplaced token pasted here would otherwise be printed in the refusal.
+    #[arg(long, value_name = "FILE", env = "AGENTPLANE_TOKENS_FILE")]
     tokens: Option<String>,
 
     /// Journal on disk, and which tenant this plane serves. Required: a served
@@ -1883,6 +1983,18 @@ fn with_submission_witnesses(
     let log = agentplane::journal::LogKey::ed25519(name, public, Arc::new(signer))
         .map_err(|e| format!("--log-key {name}: {e}"))?;
     let mut witnesses: Vec<Arc<dyn agentplane::journal::Witness>> = Vec::new();
+    // A witness named twice is one party counted twice, which is the
+    // collusion a quorum exists to rule out.
+    let mut named = std::collections::BTreeSet::new();
+    if let Some(twice) = opts
+        .witness_submit
+        .iter()
+        .find(|p| !named.insert(p.trim_end_matches('/')))
+    {
+        return Err(format!(
+            "--witness-submit {twice} is given twice; a quorum counts distinct witnesses"
+        ));
+    }
     for prefix in &opts.witness_submit {
         let witness = agentplane::journal::HttpWitness::new(prefix, log.clone(), trusted.clone())
             .map_err(|e| format!("--witness-submit {prefix}: {e}"))?;
@@ -3123,15 +3235,15 @@ fn blocking<T, E: From<String>>(
 /// that has to come first: reopening a run whose doubt is unanswered
 /// quarantines it again, correctly, on the same effect.
 fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, Fault> {
-    let assertion = match opts.outcome.as_str() {
-        "landed" => {
+    let assertion = match opts.outcome {
+        Outcome::Landed => {
             let raw = opts.output.as_deref().unwrap_or("null");
             agentplane::core::Assertion::Landed(
                 serde_json::from_str(raw)
                     .map_err(|e| usage(format!("--output is not JSON: {e}")))?,
             )
         }
-        "did-not-happen" => {
+        Outcome::DidNotHappen => {
             if opts.output.is_some() {
                 return Err(usage(
                     "--output belongs to `--outcome landed`: an effect that did not happen \
@@ -3140,11 +3252,6 @@ fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, Fault> {
                 ));
             }
             agentplane::core::Assertion::DidNotHappen
-        }
-        other => {
-            return Err(usage(format!(
-                "'{other}' is not an outcome: use `landed` or `did-not-happen`"
-            )));
         }
     };
     let by = opts.who.operator()?;
@@ -3156,15 +3263,15 @@ fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, Fault> {
         let backend = opts.at.open().await?;
         let plane = backend.plane().build();
         plane
-            .reconcile_effect(run, effect, assertion, &by, &opts.note)
+            .reconcile_effect(run, effect, assertion, &by, &opts.reason)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(runtime_fault)?;
         println!(
             "{}",
             serde_json::json!({
                 "run": run.to_string(),
                 "effect": opts.effect,
-                "outcome": opts.outcome,
+                "outcome": opts.outcome.as_str(),
                 "by": by.actor(),
                 "basis": by.basis().as_str(),
             })
@@ -3183,14 +3290,9 @@ fn reconcile_verb(opts: &ReconcileArgs) -> Result<ExitCode, Fault> {
 fn quarantine_verb(opts: &QuarantineArgs) -> Result<ExitCode, Fault> {
     use agentplane::core::QuarantineDecision;
 
-    let decision = match opts.decision.as_str() {
-        "reopen" => QuarantineDecision::Reopen,
-        "abandon" => QuarantineDecision::Abandon,
-        other => {
-            return Err(usage(format!(
-                "'{other}' is not a decision: use `reopen` or `abandon`"
-            )));
-        }
+    let decision = match opts.decision {
+        QuarantineAnswer::Reopen => QuarantineDecision::Reopen,
+        QuarantineAnswer::Abandon => QuarantineDecision::Abandon,
     };
     let by = opts.who.operator()?;
     let run = agentplane::core::RunId::parse(&opts.run_id).map_err(|e| usage(e.to_string()))?;
@@ -3201,12 +3303,12 @@ fn quarantine_verb(opts: &QuarantineArgs) -> Result<ExitCode, Fault> {
         plane
             .record_quarantine_decision(run, &by, &opts.reason, decision)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(runtime_fault)?;
         println!(
             "{}",
             serde_json::json!({
                 "run": run.to_string(),
-                "decision": opts.decision,
+                "decision": opts.decision.as_str(),
                 "by": by.actor(),
                 "basis": by.basis().as_str(),
                 // The half an operator has to be told, rather than left to
@@ -3280,7 +3382,7 @@ fn tasks_verb(opts: &TasksArgs) -> Result<ExitCode, Fault> {
                 .task(id)
                 .await
                 .map_err(|e| e.to_string())?
-                .ok_or_else(|| format!("no task {id} on this plane"))?;
+                .ok_or_else(|| usage(format!("no task {id} on this plane")))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&task_json(&task, true)).map_err(|e| e.to_string())?
@@ -3364,7 +3466,7 @@ fn decide_verb(opts: &DecideArgs) -> Result<ExitCode, Fault> {
                 eprintln!("{}", withheld_refusal(id, reason));
                 return Ok(ExitCode::from(exit::FINDING));
             }
-            Err(e) => return Err(e.to_string().into()),
+            Err(e) => return Err(runtime_fault(e)),
         };
         println!(
             "{}",
@@ -3429,7 +3531,7 @@ fn acknowledge_verb(opts: &AcknowledgeArgs) -> Result<ExitCode, Fault> {
         let at = agentplane::core::Timestamp::now_utc();
         let note = agentplane::core::BreachNote {
             by: by.clone(),
-            note: opts.note.clone(),
+            note: opts.reason.clone(),
             at,
         };
         let recorded = backend
@@ -3472,7 +3574,7 @@ fn cancel_verb(opts: &CancelArgs) -> Result<ExitCode, Fault> {
         let first = plane
             .request_cancel(run, &by, &opts.reason)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(runtime_fault)?;
         println!(
             "{}",
             serde_json::json!({
@@ -5317,6 +5419,16 @@ fn card(opts: &CardArgs) -> Result<ExitCode, Fault> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// A log origin, refused at the command line when no witness could hold it.
+fn parse_origin(origin: &str) -> Result<String, String> {
+    agentplane::journal::Checkpoint::validate_origin(origin)
+        .map(|()| origin.to_owned())
+        .map_err(|e| match e {
+            agentplane::core::StoreError::Backend(why) => why,
+            other => other.to_string(),
+        })
+}
+
 fn main() -> ExitCode {
     // `clap` prints its own diagnostics and exits; everything past the parse is
     // this binary's own vocabulary. Parsed before the subscriber is installed
@@ -5425,14 +5537,17 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
     })?;
 
     let policy = load_policy_bundle(policy_path)?;
+    // The argument is not repeated in either refusal: somebody who pasted a
+    // token where the path goes would see it printed, and so would every log
+    // collecting this process's standard error.
     let tokens_src = std::fs::read_to_string(tokens_path)
-        .map_err(|e| format!("reading the token file {tokens_path}: {e}"))?;
+        .map_err(|e| format!("reading the token file named by --tokens: {}", e.kind()))?;
     // One `Arc`, two surfaces: the same accepted credentials govern both, so a
     // token added for a peer is not silently also an operator credential —
     // that separation is policy's job, on `a2a:*` versus `api:*` actions.
     let auth: Arc<dyn agentplane::api::Authenticator> = Arc::new(
         TokenAuthenticator::from_yaml(&tokens_src)
-            .map_err(|e| format!("the token file {tokens_path} was refused: {e}"))?,
+            .map_err(|e| usage(format!("the token file named by --tokens was refused: {e}")))?,
     );
     let operator_auth = Arc::clone(&auth);
 
@@ -5480,7 +5595,9 @@ fn serve(manifests: &[Manifest], opts: &ServeArgs) -> Result<ExitCode, Fault> {
             builder = builder.push(backend.push());
         }
         let builder = with_submission_witnesses(builder, opts).map_err(usage)?;
-        let runtime = builder.try_build().map_err(|e| e.to_string())?;
+        let runtime = builder
+            .try_build()
+            .map_err(|e| build_fault(&e, manifests))?;
 
         let mcp = mcp_surface(&runtime, Arc::clone(&auth), manifests, opts)?;
         let security = agentplane::peers::CardSecurity::bearer("bearer", Vec::<String>::new());
@@ -6115,7 +6232,6 @@ type WiredPeers = (
 /// line is visible to every process on the host.
 #[cfg(feature = "a2a")]
 fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<WiredPeers>, String> {
-    use agentplane::core::Scope;
     use agentplane::peers::a2a::{A2aClient, Endpoint};
     use agentplane::peers::{PeerCredential, PeerGrant, PeerId, PeerRegistry, PeerRouter};
 
@@ -6136,16 +6252,14 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
         if name.trim().is_empty() || url.trim().is_empty() {
             return Err(format!("--peer `{spec}` names no peer or no URL"));
         }
-        let grants: Vec<(String, bool)> = manifests
+        let naming: Vec<(String, &agentplane::manifest::ToolGrant)> = manifests
             .iter()
             .flat_map(|m| &m.spec.tools)
-            .filter_map(|g| {
-                agentplane::tools::ToolId::parse(&g.reference).map(|id| (id, g.mutates))
-            })
+            .filter_map(|g| agentplane::tools::ToolId::parse(&g.reference).map(|id| (id, g)))
             .filter(|(id, _)| id.server == name)
-            .map(|(id, mutates)| (id.tool, mutates))
+            .map(|(id, g)| (id.tool, g))
             .collect();
-        let granted: Vec<String> = grants.iter().map(|(tool, _)| tool.clone()).collect();
+        let granted: Vec<String> = naming.iter().map(|(tool, _)| tool.clone()).collect();
         if granted.is_empty() {
             return Err(format!(
                 "--peer `{name}` is wired but no manifest grants a `tool://{name}/…` \
@@ -6153,14 +6267,8 @@ fn connect_peers(specs: &[String], manifests: &[Manifest]) -> Result<Option<Wire
             ));
         }
         let peer = PeerId::new(name);
-        let mut grant = PeerGrant::new(Scope::of(granted.iter().cloned()));
-        // Read-only when every grant naming this peer says `mutates: false`,
-        // for the reason the scope is the grants': the reviewed documents say
-        // what a call to this peer does. One mutating grant keeps the whole
-        // registration mutating, which is the cautious reading.
-        if grants.iter().all(|(_, mutates)| !mutates) {
-            grant = grant.read_only();
-        }
+        // The reviewed documents say what a call to this peer does.
+        let mut grant = PeerGrant::from_grants(naming);
         let token_var = peer_token_var(name);
         if let Ok(token) = std::env::var(&token_var)
             && !token.is_empty()
@@ -6451,24 +6559,43 @@ fn declared_bound(m: &Manifest) -> DeclaredBound {
         );
     }
 
-    // A tool-calling agent's model calls are also bounded by its turns: a
-    // second figure, independent of the ceiling, and only as bounded as one
-    // call is.
+    // A tool-calling agent's model calls are also bounded by its turns, and a
+    // completion makes one: a second figure, independent of the ceiling, and
+    // only as bounded as one call is. A declared memory formation is one more
+    // call after the answer, on a role the per-call figure already covers.
+    let kind = m.spec.execution.as_ref().map(|e| e.kind);
     let turns = m
         .spec
         .execution
         .as_ref()
         .filter(|e| e.kind == agentplane::manifest::ExecutionKind::ToolCalling)
-        .map(|e| e.max_turns);
-    if let Some(turns) = turns {
+        .map(agentplane::manifest::Execution::turn_ceiling);
+    let answering = match kind {
+        Some(agentplane::manifest::ExecutionKind::Completion) => Some((1, "one answer".to_owned())),
+        _ => turns.map(|t| (t, format!("{t} turns"))),
+    };
+    let forms_memory = m
+        .spec
+        .memory
+        .as_ref()
+        .is_some_and(|memory| memory.formation.is_some());
+    let model_calls = answering
+        .as_ref()
+        .map(|(n, _)| n.saturating_add(u32::from(forms_memory)));
+    if let (Some((_, what)), Some(calls)) = (&answering, model_calls) {
+        let what = if forms_memory {
+            format!("{what} + one memory formation")
+        } else {
+            what.clone()
+        };
         lines.push(match call {
             Some(c) => format!(
-                "model calls: at most {turns} turns × one call = {} tokens, {} minor units",
-                u64::from(turns).saturating_mul(c.tokens),
-                u64::from(turns).saturating_mul(c.minor_units)
+                "model calls: at most {calls} ({what}) × one call = {} tokens, {} minor units",
+                u64::from(calls).saturating_mul(c.tokens),
+                u64::from(calls).saturating_mul(c.minor_units)
             ),
             None => format!(
-                "model calls: at most {turns} turns, no total — unbounded: {}",
+                "model calls: at most {calls} ({what}), no total — unbounded: {}",
                 call_gaps.join(", ")
             ),
         });
@@ -6480,6 +6607,7 @@ fn declared_bound(m: &Manifest) -> DeclaredBound {
             "roles": role_json,
             "units": units,
             "turns": turns,
+            "model_calls": model_calls,
         }),
     }
 }
@@ -7083,9 +7211,7 @@ async fn build_plane(
     // `try_build`, because everything on this plane arrived as input: a
     // wiring mistake in a file somebody handed us is a refusal with a
     // sentence, not a programmer error worth a crash.
-    builder
-        .try_build()
-        .map_err(|e| Fault::from(in_cli_terms(&e, manifests)))
+    builder.try_build().map_err(|e| build_fault(&e, manifests))
 }
 
 fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
@@ -7109,6 +7235,11 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
                 .map_err(|e| usage(format!("--expect-digest `{hex}` is not a digest: {e}")))
         })
         .transpose()?;
+    // The command as typed is judged before anything is built: a plane
+    // spawns MCP servers and dials peers, and a mistyped capability or an
+    // input that is not JSON must not cost either.
+    let capability = entry_capability(manifests, opts.capability.as_deref()).map_err(usage)?;
+    let input = opts.read_input().map_err(usage)?;
 
     // Current-thread on purpose. A CLI runs one agent and exits, so a work
     // stealing pool buys nothing and would mean pulling `rt-multi-thread` into
@@ -7135,7 +7266,6 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
         )
         .await?;
 
-        let capability = entry_capability(manifests, opts.capability.as_deref()).map_err(usage)?;
         // The case kind is the capability: a case is a matter, and the matter
         // a terminal run belongs to is the thing it was asked to do.
         let mut terms = agentplane::runtime::RunTerms::default().correlated(&capability, &keys);
@@ -7144,13 +7274,9 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
         }
         // No admission key, so the admission is always fresh.
         let agentplane::runtime::Admission::Fresh(outcome) = agent
-            .run_under(
-                &capability,
-                Tainted::trusted(opts.read_input().map_err(usage)?),
-                terms,
-            )
+            .run_under(&capability, Tainted::trusted(input), terms)
             .await
-            .map_err(admission_fault)?
+            .map_err(runtime_fault)?
         else {
             return Err("an unkeyed run was answered as a keyed one"
                 .to_owned()
@@ -7209,7 +7335,7 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, Fault> 
         }
         let agent = builder
             .try_build()
-            .map_err(|e| in_cli_terms(&e, manifests))?;
+            .map_err(|e| build_fault(&e, manifests))?;
 
         let outcome = match agent.replay(run, mode).await {
             // A terminal that recorded a decision and could not run the agent
@@ -7224,7 +7350,7 @@ fn replay(manifests: &[Manifest], opts: &ReplayArgs) -> Result<ExitCode, Fault> 
             }
             other => other,
         }
-        .map_err(|e| e.to_string())?;
+        .map_err(runtime_fault)?;
         Ok(conclude(
             &outcome,
             &Resume {
@@ -7398,10 +7524,14 @@ async fn strict_verdict(
 /// Registering every driver whose key happens to be set would make the agent
 /// runnable on a model its declaration does not name, the moment somebody
 /// exports the wrong variable.
+///
+/// A provider this binary has no driver for, or one whose credential is not
+/// in the environment, is the command as typed — the same command fails the
+/// same way until somebody changes it — so it exits as usage.
 async fn with_providers(
     builder: RuntimeBuilder,
     manifests: &[Manifest],
-) -> Result<RuntimeBuilder, String> {
+) -> Result<RuntimeBuilder, Fault> {
     let mut builder = builder;
     let mut seen: Vec<String> = Vec::new();
 
@@ -7417,7 +7547,10 @@ async fn with_providers(
                 continue;
             }
             seen.push(m.provider.clone());
-            builder = builder.provider(m.provider.clone(), driver(&m.provider).await?);
+            builder = builder.provider(
+                m.provider.clone(),
+                driver(&m.provider).await.map_err(usage)?,
+            );
         }
     }
     Ok(builder)
@@ -7583,9 +7716,53 @@ mod tests {
             binding: "$input/customer/id".to_owned(),
             reason: "it selects nothing in the run's input".to_owned(),
         };
-        assert_eq!(super::admission_fault(unbound).status(), super::exit::USAGE);
+        assert_eq!(super::runtime_fault(unbound).status(), super::exit::USAGE);
         assert_eq!(
-            super::admission_fault(agentplane::core::RuntimeError::Draining).status(),
+            super::runtime_fault(agentplane::core::RuntimeError::Draining).status(),
+            super::exit::OPERATIONAL
+        );
+    }
+
+    /// **A refusal the plane made on purpose is not an outage.** Four-eyes,
+    /// an answered task and a run that cannot be unwound are findings (1):
+    /// the plane understood and said no. An id that names nothing here is the
+    /// command as typed (2). Only a store or a lease that could not be used is
+    /// operational (4) — the status that tells a scheduler to try again.
+    #[test]
+    fn library_refusals_exit_by_the_published_table() {
+        use agentplane::core::{ClaimError, RuntimeError as E, StoreError, TaskId};
+        let task = TaskId::parse(&format!("task_{}", "0".repeat(64))).expect("a task id");
+        let status = |e: E| super::runtime_fault(e).status();
+
+        assert_eq!(
+            status(E::TaskClaim(ClaimError::Excluded {
+                actor: "ada".into()
+            })),
+            super::exit::FINDING,
+            "deciding your own proposal is a finding"
+        );
+        assert_eq!(
+            status(E::TaskClaim(ClaimError::AlreadyAnswered { task })),
+            super::exit::FINDING
+        );
+        assert_eq!(
+            status(E::CannotUnwind { run: "r".into() }),
+            super::exit::FINDING
+        );
+        assert_eq!(
+            status(E::TaskClaim(ClaimError::NotFound(task))),
+            super::exit::USAGE
+        );
+        assert_eq!(
+            status(E::Store(StoreError::NotFound("r".into()))),
+            super::exit::USAGE
+        );
+        assert_eq!(
+            status(E::PlanContract("needs a reason".into())),
+            super::exit::USAGE
+        );
+        assert_eq!(
+            status(E::Store(StoreError::Backend("disk".into()))),
             super::exit::OPERATIONAL
         );
     }
@@ -7792,6 +7969,50 @@ spec:
             "{:?}",
             bound.lines
         );
+    }
+
+    /// **A declared memory formation is one more model call**, after the
+    /// answer: a printed bound that counted only the answering calls would
+    /// understate what the declaration lets one run spend.
+    #[test]
+    fn validate_counts_the_memory_formation_call() {
+        let m = agentplane::manifest::Manifest::parse(&format!(
+            "apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: remembering, version: \"1.0.0\" }}
+spec:
+  capabilities: {{ provides: [remember.answer] }}
+  models:
+    privileged: {{ provider: fake, model: m, max_tokens: 100, max_input_tokens: 900, {PRICE} }}
+  execution: {{ kind: completion }}
+  memory:
+    formation:
+      subject: team/support
+      purpose: learned-facts
+      instruction: Extract stable facts only.
+      max_items: 2
+  budgets: {{ max_tokens: 10000 }}
+"
+        ))
+        .expect("the fixture parses");
+        let bound = declared_bound(&m);
+        assert_eq!(bound.json["model_calls"], 2, "{}", bound.json);
+        assert!(
+            bound.lines.iter().any(|l| l.contains(
+                "at most 2 (one answer + one memory formation) × one call = 2000 tokens"
+            )),
+            "{:?}",
+            bound.lines
+        );
+
+        // And a tool-calling agent's turns gain the same one call.
+        let looping = agent(
+            &format!(
+                "    privileged: {{ provider: fake, model: m, max_tokens: 100, max_input_tokens: 900, {PRICE} }}"
+            ),
+            "{ max_tokens: 10000 }",
+        );
+        assert_eq!(declared_bound(&looping).json["model_calls"], 4);
     }
 
     /// An unbounded term is named, and no total stands beside it.

@@ -1277,6 +1277,70 @@ async fn an_expired_unreleased_lease_marks_a_run_abandoned() {
     );
 }
 
+/// **A store that misses one renewal does not cost the run its lease.**
+///
+/// The heartbeat renews at a third of the TTL so that a renewal or two can be
+/// lost to a slow store. Giving up on the first failure would let a run that is
+/// still executing lapse into the recovery sweep, which takes it over and
+/// re-performs or quarantines work the original is still doing.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_failed_renewal_does_not_abandon_a_running_run() {
+    use agentplane::testkit::faults::{Faulty, Schedule};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct Slow;
+
+    #[async_trait::async_trait]
+    impl Skill for Slow {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("slow").provides("slow.work")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, agentplane::core::SkillError> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(Outcome::done(Tainted::trusted(json!("done"))))
+        }
+    }
+
+    let inner: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().unwrap());
+    let faulty = Arc::new(Faulty::new(
+        Arc::clone(&inner),
+        Schedule::healthy().renewals_fail(1),
+    ));
+    let rt = Arc::new(
+        Runtime::builder(Arc::clone(&faulty) as Arc<dyn JournalStore>)
+            .lease_ttl(Duration::from_secs(3))
+            .skill(Slow)
+            .build(),
+    );
+    let running = {
+        let rt = Arc::clone(&rt);
+        tokio::spawn(async move { rt.run("slow.work", Tainted::trusted(json!({}))).await })
+    };
+    // Past the TTL, with the step still running: the lease must still be held.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(
+        !faulty.injected().is_empty(),
+        "no renewal failed, so this test proves nothing"
+    );
+    assert!(
+        inner.abandoned_runs(10).await.unwrap().is_empty(),
+        "one failed renewal stopped the heartbeat, and a run still executing \
+         lapsed into recovery"
+    );
+    let out = running.await.unwrap().unwrap();
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "{:?}",
+        out.status
+    );
+}
+
 /// Copy a run's journal into `into` without its trailing conclusion, under a
 /// lease `dead-instance` holds and never hands back.
 ///

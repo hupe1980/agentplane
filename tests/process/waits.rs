@@ -1552,3 +1552,91 @@ async fn a_message_erased_after_its_claim_is_not_delivered_as_null() {
         "the erased message is not on the dead-letter list"
     );
 }
+
+/// Asks for the matter's `reply` obligation over a longer span than
+/// [`JustWaits`], then waits.
+#[derive(Debug)]
+struct WaitsLonger(&'static str);
+
+#[async_trait::async_trait]
+impl Skill for WaitsLonger {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("waits-longer").provides("demo.wait.longer")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        cx.deadline("reply", &DeadlineSpec::days(9), None).await?;
+        let reply = cx
+            .await_event(&AwaitSpec::new("reply.received", "reply").correlate(key(self.0)))
+            .await?;
+        Ok(Outcome::done(reply))
+    }
+}
+
+/// **A second run on a matter shares the obligation the matter already owes.**
+///
+/// The name is the matter's, so a run joining it waits under the terms the
+/// first registration fixed rather than failing on its own arithmetic — and
+/// journals those terms, so its history shows the obligation in force.
+#[tokio::test]
+async fn a_second_run_shares_the_obligation_its_matter_already_owes() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .cases(store.clone() as Arc<dyn CaseStore>)
+        .events(store.clone() as Arc<dyn EventStore>)
+        .skill(JustWaits("D-S"))
+        .skill(WaitsLonger("D-S"))
+        .build();
+
+    let first = rt
+        .run_correlated(
+            "demo.wait",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-S")],
+        )
+        .await
+        .unwrap();
+    assert!(first.status.is_suspended(), "{:?}", first.status);
+    let second = rt
+        .run_correlated(
+            "demo.wait.longer",
+            Tainted::trusted(json!({})),
+            "matter",
+            &[key("D-S")],
+        )
+        .await
+        .unwrap();
+    assert!(
+        second.status.is_suspended(),
+        "a second run on the matter failed on the obligation the first registered: {:?}",
+        second.status
+    );
+
+    let registered = |run| {
+        let store = store.clone();
+        async move {
+            (store as Arc<dyn JournalStore>)
+                .read(run, 1)
+                .await
+                .unwrap()
+                .into_iter()
+                .find_map(|r| match r.kind() {
+                    agentplane::journal::RecordKind::DeadlineRegistered { resolved_at, .. } => {
+                        Some(*resolved_at)
+                    }
+                    _ => None,
+                })
+                .expect("a registration record")
+        }
+    };
+    assert_eq!(
+        registered(second.run_id).await,
+        registered(first.run_id).await,
+        "the second run journaled terms the matter's obligation does not carry"
+    );
+}

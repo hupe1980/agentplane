@@ -73,12 +73,8 @@ it. Compliance-only logging always rots, and nobody notices for a year.
 
 A **run** is one goal, one plan, one lifetime — minutes. A **case** is a business
 process — a clearing dispute, a supplier switch — spanning weeks and many runs,
-correlated by business key.
-
-The obvious alternative is one long-lived workflow per process, and it is a
-versioning trap: a six-week workflow pins your code version for six weeks, and
-every deploy needs a migration story for in-flight instances. Inverting it —
-short runs, long cases — makes deploys free.
+correlated by business key. Short runs on a long case make deploys free: no
+in-flight workflow pins a code version for weeks.
 
 <figure class="diagram">
 <svg viewBox="0 0 640 210" role="img" aria-labelledby="rc-t rc-d" xmlns="http://www.w3.org/2000/svg">
@@ -193,11 +189,9 @@ What the *effect* says should happen when its outcome is unknown:
 | `Reconcile` | **ask the provider what happened** |
 | `RequiresOperator` | undecidable — escalate, never guess |
 
-`Reconcile` is the interesting one, and it is the answer the industry usually
-skips. The two standard responses to an unknown outcome are *retry and demand
-idempotency* or *stop and page someone*. There is a third that every serious
-provider supports: retrieve the payment intent by id; query the transfer by
-reference. A probe turns an undecidable outcome into a decided one.
+`Reconcile` asks instead of guessing: retrieve the payment intent by id, query
+the transfer by reference. A probe turns an undecidable outcome into a decided
+one.
 
 `RequiresOperator` is the **default for anything mutating**. An effect that
 forgets to describe itself gets the conservative treatment, not the convenient
@@ -419,10 +413,10 @@ discovering one call at a time.
 | `case_state()`, `put_case_state(v, s)`, `set_case_status(s)` | shared state across runs, version-checked |
 | `remember`, `recall`, `compact`, `form_memories`, `sweep_expired_memories` | governed memory |
 | `embed`, `semantic_recall` | vectors and ranking, both journaled |
-| `store_blob(bytes)`, `blobs()` | content-addressed payloads |
+| `store_blob(bytes)`, `blobs()` | content-addressed payloads; on a case-bound run `blobs()` is read-only and `store_blob` writes, linking the bytes to the case |
 | `fetch_media(..)` | a governed remote fetch, SSRF controls and all |
 | `draw(..)` | spend against a standing authorization |
-| `commission(capability, input)` | hand work to another agent on this plane |
+| `commission(capability, input)` | hand work to another agent on this plane — asked once, never retried |
 | `group()` | a transactional effect group |
 | `manifest()`, `budget()`, `run_id()` | what this agent was declared to be, and what it has spent |
 
@@ -445,6 +439,7 @@ covers the agent *entirely* rather than only its boundary.
 | `completion` | one model call, answered in the declared shape | the task is a prompt and a result shape |
 | `tool-calling` | call tools until the model stops asking | the shape of the work *is* the discovery |
 | `planned` | plan once over trusted input, then execute with data routed by reference | the shape is known up front and the data is hostile |
+| `call` | dispatch the one granted tool with the input as its arguments; no model | a framework with its own model routes a tool call through the plane |
 
 The set is closed on purpose: a config format whose behaviours are open-ended
 is one nobody can review. Everything else in this page applies unchanged —

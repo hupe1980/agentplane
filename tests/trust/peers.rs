@@ -1554,6 +1554,48 @@ spec:
         assert_eq!(provider.asked().len(), 2, "strict replay called the model");
     }
 
+    /// **A manifest grant cannot widen the wiring's ceiling.** The registry
+    /// entry is the operator's statement of what may reach that peer; the
+    /// reviewed grant may only tighten it, as it may for a tool.
+    #[tokio::test]
+    async fn a_manifest_grant_cannot_widen_the_wirings_peer_ceiling() {
+        let manifest = Manifest::parse(ASKS_REVIEWER).expect("parses");
+        let spy = Arc::new(Spy::default());
+        let provider = agentplane::testkit::FakeProvider::new();
+        // The wiring left at its default ceiling, below the manifest grant's.
+        let grant = PeerGrant::new(Scope::of(["audit.*"])).read_only();
+        let registry = PeerRegistry::new().allow(PeerId::new("reviewer"), grant);
+        let rt = Runtime::builder(store())
+            .owner("peers")
+            .acting_as(desk())
+            .provider(
+                "fake",
+                Arc::clone(&provider) as Arc<dyn agentplane::model::ModelProvider>,
+            )
+            .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+            .agent(Agent::new(&manifest))
+            .build();
+        provider.will_call_tool(
+            "call_1",
+            "reviewer__audit-check",
+            json!({ "invoice": "INV-9" }),
+        );
+        provider.will_say("Could not consult the reviewer.");
+
+        let _ = rt
+            .run(
+                "desk.answer",
+                Tainted::trusted(json!({ "invoice": "INV-9" })),
+            )
+            .await
+            .expect("run");
+        assert!(
+            spy.sent.lock().unwrap().is_empty(),
+            "the manifest grant's ceiling replaced the wiring's, and data above \
+             what the operator allowed reached the peer"
+        );
+    }
+
     /// The grant's own fields govern the hop: a protected field the model's
     /// untrusted completion cannot satisfy refuses the call at the sink, and
     /// nothing reaches the peer.
@@ -1845,5 +1887,110 @@ async fn the_peer_task_wrappers_dispatch_through_the_registry() {
         reason.contains("does not support task cancellation"),
         "cx.cancel_peer_task did not reach the transport — this refusal is only \
          reachable past the wiring lookup: {reason}"
+    );
+}
+
+/// **A task at a peer the declaration never granted is refused.** A task
+/// handle names a peer and a skill may build one for any peer the plane can
+/// reach, so reading or cancelling one is held to the declaration like a call.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_task_at_an_ungranted_peer_is_refused_by_the_declaration() {
+    use agentplane::manifest::Manifest;
+    use agentplane::runtime::Agent;
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: wrappers, version: "1.0.0" }
+spec:
+  capabilities: { provides: [peer.wrappers] }
+  tools:
+    - ref: tool://settlement/pay.check
+      mutates: false
+      description: Another peer altogether.
+  budgets: {}
+"#,
+    )
+    .expect("parses");
+    for cancel in [false, true] {
+        let spy = Arc::new(Spy::default());
+        let registry = PeerRegistry::new()
+            .allow(
+                reviewer(),
+                PeerGrant::new(Scope::of(["audit.check"])).read_only(),
+            )
+            .allow(
+                PeerId::new("settlement"),
+                PeerGrant::new(Scope::of(["pay.*"])).read_only(),
+            );
+        let rt = Runtime::builder(store())
+            .owner("peers")
+            .peers(registry, Arc::clone(&spy) as Arc<dyn PeerClient>)
+            .agent(Agent::new(&manifest).skill(UsesTheWrappers { cancel }))
+            .build();
+        let out = rt
+            .run("peer.wrappers", Tainted::trusted(json!({})))
+            .await
+            .expect("admitted");
+        assert!(
+            !matches!(out.status, RunStatus::Succeeded),
+            "a task at an ungranted peer was reached (cancel = {cancel})"
+        );
+        assert!(
+            spy.task_reads.lock().unwrap().is_empty(),
+            "the declaration did not stop the task read before the transport (cancel = {cancel})"
+        );
+        let denied = rt
+            .journal()
+            .read(out.run_id, 1)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r.kind(), RecordKind::PolicyDenied { action, .. } if action == "effect:declared"));
+        assert!(
+            denied,
+            "the refusal is not the declaration's (cancel = {cancel})"
+        );
+    }
+}
+
+/// **A peer wired from its manifest grants carries their ceiling.**
+///
+/// A call is held to the lower of the wiring's ceiling and its own grant's, so
+/// a wiring left at the default would refuse every call its reviewed grant
+/// allows — the peer is never asked, and the model is told only that the call
+/// was refused.
+#[cfg(feature = "manifest")]
+#[test]
+fn a_peer_wired_from_its_grants_carries_their_ceiling() {
+    let grant = |reference: &str, mutates: bool, ceiling: &str| {
+        serde_json::from_value::<agentplane::manifest::ToolGrant>(json!({
+            "ref": reference, "mutates": mutates, "max_sensitivity": ceiling,
+        }))
+        .unwrap()
+    };
+    let check = grant("tool://reviewer/audit.check", false, "internal");
+    let file = grant("tool://reviewer/audit.file", false, "confidential");
+    let wired = PeerGrant::from_grants([
+        ("audit.check".to_owned(), &check),
+        ("audit.file".to_owned(), &file),
+    ]);
+    assert_eq!(
+        wired.max_sensitivity,
+        agentplane::core::Sensitivity::Confidential
+    );
+    assert!(!wired.mutates, "every grant said mutates: false");
+
+    let writes = grant("tool://reviewer/audit.fix", true, "internal");
+    let wired = PeerGrant::from_grants([
+        ("audit.check".to_owned(), &check),
+        ("audit.fix".to_owned(), &writes),
+    ]);
+    assert!(wired.mutates, "one mutating grant keeps the peer mutating");
+    assert_eq!(
+        wired.max_sensitivity,
+        agentplane::core::Sensitivity::Internal
     );
 }

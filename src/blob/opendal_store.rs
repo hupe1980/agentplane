@@ -178,7 +178,28 @@ impl BlobStore for OpenDalBlobs {
             .write(&self.path(digest), bytes.to_vec())
             .await
             .map_err(|e| backend(&e))?;
-        Ok(())
+        // And one read after it, because the read before is a check an
+        // `expire` can pass between: its tombstone lands after that read and
+        // its delete before this write, and the bytes come back under it. An
+        // object store offers no write conditional on another object's
+        // absence, so the write is checked again once it has landed. A
+        // tombstone found now means this write raced an erasure and lost: the
+        // bytes are deleted again and the write is refused. An `expire` that
+        // starts after this read deletes the bytes itself.
+        // Only a tombstone deletes: a read that failed says nothing about one,
+        // and the bytes at a content address may be another writer's.
+        match self.absent(digest).await {
+            BlobError::NotFound(_) => Ok(()),
+            refusal @ (BlobError::Expired { .. } | BlobError::UnreadableTombstone { .. }) => {
+                match self.op.delete(&self.path(digest)).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
+                    Err(e) => return Err(backend(&e)),
+                }
+                Err(refusal)
+            }
+            other => Err(other),
+        }
     }
 
     async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {

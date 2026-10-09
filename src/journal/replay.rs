@@ -351,7 +351,6 @@ impl StepCursor {
     /// hop is the one that stands: an earlier one there was lifted, or the
     /// hop would not have been reached to be withheld again.
     fn withheld(&mut self, key: EffectKey, seq: Seq, subject: &str, reason: &str) {
-        self.supersede_withheld(key);
         self.unannounced(
             key,
             seq,
@@ -363,8 +362,10 @@ impl StepCursor {
     }
 
     /// A position the run stopped at before announcing anything: a refusal,
-    /// a denial or a withholding.
+    /// a denial or a withholding. Any of them supersedes a withholding at the
+    /// same hop — the hop was reached again, so the halt was lifted.
     fn unannounced(&mut self, key: EffectKey, seq: Seq, replay: EffectReplay) {
+        self.supersede_withheld(key);
         self.effects.push(Journaled {
             key,
             seq,
@@ -435,6 +436,7 @@ impl StepCursor {
             // fold; the records both stay in the chain, superseded rather than
             // erased.
             RecordKind::BudgetReadmitted { .. } => {
+                self.supersede_withheld(key);
                 if let Some(pos) = self
                     .effects
                     .iter()
@@ -1021,6 +1023,45 @@ mod tests {
                 Some(EffectReplay::Orphan { .. })
             ),
             "the announcement did not supersede every withholding before it"
+        );
+    }
+
+    /// A refusal at a hop after its withholding was lifted is what stands
+    /// there: a resume must reach the refusal, not re-raise a pause the
+    /// operator already ended.
+    #[test]
+    fn a_refusal_after_a_lifted_withholding_supersedes_it() {
+        let recs = records(vec![
+            (
+                S0,
+                key(1),
+                RecordKind::AuthorityWithheld {
+                    subject: "alice".into(),
+                    reason: "laptop lost".into(),
+                    by: crate::core::Operator::asserted("ops").unwrap(),
+                },
+            ),
+            (
+                S0,
+                key(1),
+                RecordKind::PolicyDenied {
+                    reason: "rate".into(),
+                    action: "effect:perform".into(),
+                    resource: "tool://crm/lookup".into(),
+                },
+            ),
+        ]);
+        let mut slice = ReplayCursor::from_records(&recs).take(S0, Phase::Forward);
+        assert!(
+            matches!(
+                slice.next(key(1), &desc(), 1).unwrap(),
+                Some(EffectReplay::Denied { .. })
+            ),
+            "the lifted withholding was served instead of the refusal after it"
+        );
+        assert!(
+            slice.exhausted(),
+            "the lifted withholding was left standing"
         );
     }
 

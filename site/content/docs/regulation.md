@@ -24,10 +24,8 @@ is a sales document.
 **This is the only place the mapping lives, and it is downstream of the
 mechanisms.** Each row names something defined elsewhere — the journal, the
 worklist, the export, the witness — and those definitions are authoritative
-about what they do; a row is authoritative about which obligation they are being
-read against. So when a mechanism changes, the row moves. Nothing in the other
-direction: a statute does not become satisfied because a page says so, which is
-the sentence at the top of this one.
+about what they do; a row is authoritative only about which obligation they are
+read against.
 
 ---
 
@@ -39,17 +37,16 @@ high-risk dates and left the transparency ones alone:
 
 | | Applies from |
 |---|---|
-| **Art. 50** transparency — disclosing that users are dealing with an AI, marking synthetic content | **2 August 2026** (in force now; watermarking of already-marketed systems graced to 2 December 2026) |
+| **Art. 50** transparency — disclosing that users are dealing with an AI, marking synthetic content | **2 August 2026** (applies; watermarking of already-marketed systems graced to 2 December 2026) |
 | **Annex III** high-risk obligations (Art. 9–15, 26) — standalone systems | **2 December 2027** (deferred 16 months from 2 August 2026) |
 | **Annex I** high-risk — AI embedded in regulated products | **2 August 2028** |
 
-The articles were **deferred, not amended**. The mapping below is unchanged by
-the Omnibus; only the calendar moved.
+The articles were **deferred, not amended**, so the mapping below holds for
+both calendars.
 
 > **Art. 50 is not a runtime obligation.** Telling a user they are talking to an
 > AI, and marking generated content, happen in your interface — not in a
-> journal. Nothing here discharges it, and the date being live now is exactly
-> when a tool claiming "AI Act ready" is worth least.
+> journal. Nothing here discharges it.
 
 ---
 
@@ -90,7 +87,8 @@ that was submitted, by a key the deployment registered under both its name and
 its note key id.
 
 Both directions are wired. `RuntimeBuilder::witnesses(witnesses, quorum)`
-submits on the periodic sweep, and `agentplane audit --witness <prefix>
+submits on the periodic sweep (the quorum counts distinct witness keys, so one
+witness listed twice counts once), and `agentplane audit --witness <prefix>
 --witness-key <name>=<base64>` reads back what a witness holds — which is the
 direction that matters for an audit, because it puts the anchor in a reader's
 hands rather than the operator's. Naming two witnesses is a check the plane
@@ -151,7 +149,7 @@ a retention policy nothing enforces is a document.
 |---|---|
 | Rehearse recovery | `Runtime::drill` holds every case's blob digests and sealed-state keys against the live stores, sorting them into *intact*, *erased by design*, *lost*, and *erased with no readable record of it*. `agentplane serve --drill-every 86400` runs it on a timer; `agentplane drill` runs one pass |
 | Prove a copy without this crate | `agentplane verify history.jsonl --checkpoint cp.note` recomputes an export from its own bytes; `restore` rebuilds a store and proves it by its own checkpoint |
-| Enforce a retention window | `Runtime::retain(older_than, at, reason)` erases every **closed** case opened before the window: blob tombstones, and the case's key scope destroyed, which reaches every replica and backup at once. `agentplane retention plan --older-than-days N` lists what that pass would erase, through the same selection rule, from a binary that wires no store able to erase |
+| Enforce a retention window | `Runtime::retain(older_than, at, reason)` erases every **closed** case opened before the window whose runs have all concluded: blob tombstones, and the case's key scope destroyed, which reaches every replica and backup at once. `agentplane retention plan --older-than-days N` lists what that pass would erase, through the same selection rule, from a binary that wires no store able to erase |
 | Know what retention did *not* reach | Every pass returns `not_erasable`, and it is the half that matters: without a key ring, journal payloads stay verbatim. A count with no coverage statement beside it is how a deployment comes to believe an obligation is discharged |
 
 ### Art. 26 — deployers keep logs
@@ -171,7 +169,8 @@ rebuilt from the file proves only that the file agrees with itself, which is
 what an editor who dropped a run also achieves. Supply one an earlier `audit`
 printed, or fetch one with `--witness` and `--origin` — [how the checkpoint is
 obtained](@/docs/operations.md#taking-the-record-away) is what the verdict rests
-on.
+on. An `--origin` no witness could hold — empty, too long, or carrying
+whitespace, `+` or a control character — is refused as a usage error.
 
 Both verbs take a store and nothing else — no manifest, no source tree, no Rust
 toolchain — because that is what an auditor holds. The export is JSON Lines: a
@@ -261,13 +260,13 @@ alone. Bytes are linked to their case when written, through `cx.store_blob`,
 because a digest cannot be reversed afterwards to discover what matter it
 belonged to.
 
-**What is still missing:** a scheduled TTL — object-store lifecycle rules do
-age-based expiry better than a sweeper could, at the cost of deleting rather
-than tombstoning. And on an **unsealed** journal, personal data that reached a
-record cannot be removed: wire a key ring, or keep it out through
-`cx.store_blob` and `max_sensitivity_journaled`. Governed memory is the one
-store `.keyring(..)` deliberately does not wrap — its erasure unit outlives the
-case and its adapter is single-node by contract — so wrap it explicitly.
+**What it does not do:** expire blobs on a TTL — object-store lifecycle rules
+do age-based expiry, at the cost of deleting rather than tombstoning. On an
+**unsealed** journal, personal data that reached a record cannot be removed:
+wire a key ring, or keep it out through `cx.store_blob` and
+`max_sensitivity_journaled`. Governed memory is the one store `.keyring(..)`
+does not wrap — its erasure unit is the item version, not the case — so wrap it
+explicitly → [erasure](@/docs/erasure.md).
 
 ---
 
@@ -286,7 +285,7 @@ case and its adapter is single-node by contract — so wrap it explicitly.
 
 **ISO/IEC 42001** and the **NIST AI RMF** consume the same artifacts — the
 journal answers "what happened and can you prove it" regardless of which
-framework asks, so no framework-specific integration is needed or planned. The
+framework asks, so no framework-specific integration is needed. The
 export is the integration: JSON Lines goes into whatever collects evidence.
 
 **The AI-logging standards.** ISO/IEC 24970 (*AI system logging*; FDIS ballot,

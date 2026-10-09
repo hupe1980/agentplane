@@ -846,6 +846,9 @@ impl Gemini {
     /// `thoughtsTokenCount` is billed as **output** and is reported *beside*
     /// `candidatesTokenCount` rather than inside it, so it is added — a
     /// reasoning-heavy run would otherwise under-report its bill by most of it.
+    /// `toolUsePromptTokenCount` — what a built-in tool's results fed back to
+    /// the model — is billed as **input** and reported beside
+    /// `promptTokenCount` on the same terms, so it is added there.
     /// `cachedContentTokenCount` is a **subset** of `promptTokenCount`, as
     /// `OpenAI` reports cached input, so it is recorded rather than added.
     fn usage(parsed: &Value) -> Usage {
@@ -857,7 +860,8 @@ impl Gemini {
                 .unwrap_or_default()
         };
         Usage {
-            input_tokens: count("promptTokenCount"),
+            input_tokens: count("promptTokenCount")
+                .saturating_add(count("toolUsePromptTokenCount")),
             // Saturating: both counts are whatever the response said, and a
             // wrapped sum reads an astronomical bill as a free one.
             output_tokens: count("candidatesTokenCount")
@@ -1123,10 +1127,11 @@ fn with_retry_info(error: ModelError, body: &str) -> ModelError {
 
 /// The `RetryInfo` detail's delay, in whole seconds.
 ///
-/// Whole seconds only, floor of a fractional value, zero reads as no advice —
-/// the same conservatisms `core::retry_after_seconds` applies to the header
-/// form. The ceiling on believing it (`max_advice`) stays where it always
-/// was, in the retry policy.
+/// Whole seconds, rounded **up**: the provider named the earliest moment a
+/// retry may succeed, and rounding a fractional delay down would retry before
+/// it — `1.5s` waits 2. Zero reads as no advice, as `core::retry_after_seconds`
+/// reads the header form. The ceiling on believing it (`max_advice`) is the
+/// retry policy's.
 fn retry_info_seconds(body: &str) -> Option<u64> {
     let parsed: Value = serde_json::from_str(body).ok()?;
     let details = parsed.get("error")?.get("details")?.as_array()?;
@@ -1138,7 +1143,17 @@ fn retry_info_seconds(body: &str) -> Option<u64> {
         })?
         .get("retryDelay")?
         .as_str()?;
-    let seconds: u64 = delay.strip_suffix('s')?.split('.').next()?.parse().ok()?;
+    let (whole, fraction) = match delay.strip_suffix('s')?.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (delay.strip_suffix('s')?, ""),
+    };
+    if !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let seconds = whole
+        .parse::<u64>()
+        .ok()?
+        .saturating_add(u64::from(fraction.bytes().any(|b| b != b'0')));
     (seconds > 0).then_some(seconds)
 }
 

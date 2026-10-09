@@ -22,6 +22,9 @@
 //! * **verification recomputes the digest** from the manifest that came back,
 //!   so a registry serving altered bytes fails rather than passing on its own
 //!   bookkeeping;
+//! * **only a manifest this crate accepts is stored** — a `Manifest` is a
+//!   public struct, and one stored unchecked burns its name and version on
+//!   content no resolve can serve;
 //! * **the inventory is enumerable** — *which agents does this organisation
 //!   run* is the first question a governance function asks, and a registry that
 //!   cannot answer it is one that gets maintained a second time somewhere else.
@@ -52,8 +55,8 @@ spec:
 
 /// Run the battery against one registry.
 ///
-/// The registry must be empty of the names this uses — `conformance-a` and
-/// `conformance-b` — since this publishes under them.
+/// The registry must be empty of the names this uses — `conformance-a`,
+/// `conformance-b` and `conformance-c` — since this publishes under them.
 pub async fn check(
     registry: &dyn Registry,
     signer: &dyn Signer,
@@ -64,7 +67,48 @@ pub async fn check(
     immutability(registry, report).await;
     pinning(registry, report).await;
     publisher(registry, signer, other_signer, verifier, report).await;
+    unvalidated(registry, report).await;
     inventory(registry, report).await;
+}
+
+/// A refused manifest is refused before it is stored, and burns nothing.
+///
+/// Built by editing a parsed manifest, which is how a caller holding the
+/// public struct produces one `parse` would never have returned: a zero token
+/// ceiling binds before any run starts.
+async fn unvalidated(registry: &dyn Registry, report: &mut Report) {
+    let mut invalid = manifest("conformance-c", "1.0.0", 1000);
+    if let Some(budgets) = invalid.spec.budgets.as_mut() {
+        budgets.max_tokens = Some(0);
+    }
+
+    report.checked += 1;
+    match registry.publish(&invalid).await {
+        Err(RegistryError::Invalid { .. }) => {}
+        Err(e) => report.record(
+            "publishing an unvalidated manifest is refused",
+            format!("the refusal came as `{e}` rather than as Invalid"),
+        ),
+        Ok(_) => report.record(
+            "publishing an unvalidated manifest is refused",
+            "a manifest `validate` refuses was stored, so its name and version now \
+             hold content no resolve can serve",
+        ),
+    }
+
+    report.checked += 1;
+    if let Err(e) = registry
+        .publish(&manifest("conformance-c", "1.0.0", 1000))
+        .await
+    {
+        report.record(
+            "a refused publish burns no version",
+            format!(
+                "the valid manifest for the version a refused publish named failed with \
+                 `{e}`, so the refusal consumed the version anyway"
+            ),
+        );
+    }
 }
 
 /// The refusal that makes a version number mean something.

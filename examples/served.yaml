@@ -7,7 +7,8 @@
 #     --tokens tokens.yaml \
 #     --store /tmp/served.redb
 #
-# One line differs from `summariser.yaml`, and it is the interesting one.
+# Two things differ from `summariser.yaml`: `spec.input`, and the security
+# line at the end, which is the interesting one.
 apiVersion: agentplane.hupe1980.github.io/v1alpha1
 kind: Agent
 metadata: { name: summariser, version: "1.0.0" }
@@ -40,8 +41,5 @@ spec:
     # default egress ceiling is `Public`, so without this line the peer's text
     # cannot reach the model and every served run fails with
     # `sensitivity Internal exceeds sink 'model.complete' ceiling Public`.
-    #
-    # That refusal is the design working: an agent that may talk to strangers
-    # says so in the reviewed file, rather than acquiring the permission by
-    # being put behind a socket.
+    # An agent that may talk to strangers says so in the reviewed file.
     max_sensitivity_egress: internal

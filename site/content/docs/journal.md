@@ -89,7 +89,9 @@ it is a failing test, and re-blessing the corpus is a command somebody types
 rather than something a formatter does.
 
 A conclusion is not always a closure. Only conclusions nothing may resume —
-`succeeded`, `cancelled`, `abandoned` — **seal**: the journal freezes (the
+`succeeded`, `cancelled`, `abandoned`, and the plane's own record runs
+(`swept`, `broke-glass`, `halt-lifted`, `hold-released`, `observed`) —
+**seal**: the journal freezes (the
 store refuses further appends as a constraint, not a convention) and the run
 enters the Merkle log below. `failed`, `exhausted`, `withheld` and `quarantined`
 leave the run open, because each has a party who can honestly answer it — a
@@ -234,7 +236,8 @@ Rust struct.
 #### The quorum, enforced
 
 * **Witness policy.** `WitnessQuorum::of(n)` declares how many cosignatures
-  suffice, and `cosign_quorum` holds each submission round to it. Three
+  suffice — counted by distinct witness key, so one witness listed twice counts
+  once — and `cosign_quorum` holds each submission round to it. Three
   answers stay distinguishable: **met**; a **shortfall**, a finding to clear
   rather than a log line; and an **integrity refusal** — a witness that saw
   this log shrink or fork — reported *even when the quorum was met*. A run
@@ -317,11 +320,9 @@ valid.
 Records are hashed over their exact wire bytes, and those bytes are what the
 store keeps. Verification never re-serializes.
 
-This matters when schemas evolve. If the chain were computed over the *upcast*
-form, then the first time a record shape changed, every historical hash would
-change with it — silently destroying tamper evidence for all past records, which
-is the one property the chain exists to provide. Upcasting is a read-time view;
-the chain is over history as written.
+A chain computed over the *upcast* form would move every historical hash the
+first time a record shape changed. Upcasting is a read-time view; the chain is
+over history as written.
 
 ### Schema evolution
 

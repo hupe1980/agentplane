@@ -948,6 +948,7 @@ async fn a_wall_clock_ceiling_stops_the_run() {
 /// probing a boundary looks like from the outside. With the ceiling at two, the
 /// third refusal must end the run rather than answer it.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_sink_refusal_counts_against_the_denial_ceiling() {
     use agentplane::core::{ProtectedField, RetryPolicy, SourceId};
 
@@ -1025,14 +1026,12 @@ async fn a_sink_refusal_counts_against_the_denial_ceiling() {
 
     let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().unwrap());
     let refused = Arc::new(AtomicUsize::new(0));
-    let out = Runtime::builder(Arc::clone(&store))
+    let rt = Runtime::builder(Arc::clone(&store))
         .owner("probe")
         .budget(Budget::unlimited().denials(2))
         .skill(Probes(Arc::clone(&refused)))
-        .build()
-        .run("probe", Tainted::trusted(json!({})))
-        .await
-        .unwrap();
+        .build();
+    let out = rt.run("probe", Tainted::trusted(json!({}))).await.unwrap();
 
     assert!(
         matches!(out.status, RunStatus::Exhausted(_)),
@@ -1062,6 +1061,29 @@ async fn a_sink_refusal_counts_against_the_denial_ceiling() {
         denials, 3,
         "every refusal is journaled, including the one the ceiling stopped the \
          run over"
+    );
+
+    // A replay counts the recorded refusals as the run did: a strict pass
+    // reaches the same ceiling at the same refusal, and a resume does not
+    // start the count again and probe past it.
+    let strict = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .unwrap();
+    assert!(
+        matches!(strict.status, RunStatus::Exhausted(_)),
+        "a strict replay of a run stopped at its denial ceiling reached another \
+         verdict: {:?}",
+        strict.status
+    );
+    let resumed = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .unwrap();
+    assert!(
+        matches!(resumed.status, RunStatus::Exhausted(_)),
+        "a resume reset the denial count and the run probed past its ceiling: {:?}",
+        resumed.status
     );
 }
 

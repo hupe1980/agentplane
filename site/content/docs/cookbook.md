@@ -149,7 +149,11 @@ A **commission** is an effect. Use it when one agent needs an answer from
 another and the shape is decided *while running* — an editor that reads a brief
 and then decides it needs research. It is journaled like any other effect, the
 answer comes back untrusted, and the sub-run has its own journal and its own
-ceiling.
+ceiling. It is never retried, since a retry would commission a second
+specialist, and one interrupted in flight waits on an operator
+(`RequiresOperator`). A sub-run that concludes without an answer fails the
+commission; the failure is recorded, so a replay reads the same verdict, and
+the sub-run's spend is billed to the commissioning run all the same.
 
 The rule of thumb: **if you can draw the graph before you start, draw it.** A
 plan is checkable in advance and a commission is not; the commission's advantage
@@ -641,12 +645,6 @@ and asks policy under `data:release`. A `trusted: true` field on a tool
 declaration would be the same claim with no record, no authorization and no
 reviewer.
 
-This is the shape Python's `@tool`, Pydantic AI, the OpenAI Agents SDK and Rig
-all arrived at, and the reasons are the same: a schema written twice is a schema
-that disagrees with itself. Those SDKs also derive the description from code,
-which is right when code is the declaration. Here the manifest is the reviewed,
-content-addressed declaration, so model-steering prose belongs there instead.
-
 `.toolbox(..)` is one call rather than three, two of them optional. It derives
 the catalogue from each agent's own declaration — the
 grants, their ceilings and their protected fields, stated once — and it
@@ -982,17 +980,28 @@ association has to be made now or never:
 let digest = cx.store_blob(&image_bytes).await?;   // linked to this case
 ```
 
+On a run bound to a case, `cx.blobs()` reads and refuses writes.
+
 **Erasing later.** A request names a person, which resolves to a case — never to
 a digest. So erase by case:
 
 ```rust
 use agentplane::blob::erase_case;
 
-let n = erase_case(Some(blobs.as_ref()), cases.as_ref(), &tenant, case, now, "art-17 request").await?;
+let erased = erase_case(
+    Some(blobs.as_ref()), cases.as_ref(), Some(journal.as_ref()),
+    Some(keys.as_ref()),   // the key ring argument exists with feature `keyring`
+    None,                  // a disclosure register, if you keep one
+    &tenant, case, now, "art-17 request",
+).await?;
 ```
 
 Every blob that case produced is tombstoned; other cases are untouched, even
-ones holding identical bytes. For a single artifact, `blobs.expire(digest, …)`
+ones holding identical bytes. A held or unclosed case, or one with a run that
+has not concluded or may still resume, is refused before anything is destroyed
+(`UnderLegalHold`, `CaseStillOpen`, `RunNotConcluded`); without a journal, a
+case with runs is refused. The erasure leaves a record on the case, which then
+refuses reopening, writes and holds (`StoreError::CaseErased`). For a single artifact, `blobs.expire(digest, …)`
 does the same for one address.
 
 The chain still verifies — it committed to the digest, not the content — so you
@@ -1513,7 +1522,6 @@ Declaratively, that is `spec.oversight.triage` — a predicate over the declared
 ```yaml
 oversight:
   approval: none
-  deadline: { name: unused, kind: hours, params: { n: 4 } }
   triage:
     - name: breach
       summary: "a regulatory deadline was missed"
@@ -1635,6 +1643,11 @@ metered like any other call and a replay does not perform them twice. Doubt
 reverses nothing: a member whose outcome cannot be established quarantines the
 run rather than unwinding around it.
 
+**A pause is not a failure.** An exhausted ceiling, a withdrawn authority or a
+suspension inside an open group leaves the group open: a raised ceiling or a
+lifted halt continues the step where it stopped. A cancel of such a run takes
+the group back and unwinds, and starts no new work on the way.
+
 ## 🧱 Commit a member *with* the journal {#commit-a-member-with-the-journal}
 
 If the table lives in the same Postgres as the journal, do not compensate — be
@@ -1657,7 +1670,7 @@ impl AtomicResource for PostEntry {
 }
 
 let mut g = cx.group("checkout", ["inventory", "ledger"]).await?;
-g.reversible("inventory", Reserve::new(&sku), |o| Release::new(o))?.await?;
+g.reversible("inventory", Reserve::new(&sku), |o| Release::new(o)).await?;
 g.atomic("ledger", Arc::new(PostEntry { account, amount }))?;
 g.commit(&[]).await?;
 ```
@@ -1775,7 +1788,8 @@ agentplane run desk.yaml --input '{"invoice": "INV-9"}' \
 `--peer` wires the A2A client for that name (needs `--features cli,a2a`, or
 the `:full` image); the registry scope is exactly the capabilities the
 manifests grant under `tool://reviewer/…`, the registration is read-only when
-every such grant says `mutates: false`, and the bearer token comes from the
+every such grant says `mutates: false`, its ceiling is the highest
+`max_sensitivity` among them (`PeerGrant::from_grants`), and the bearer token comes from the
 environment, never the command line. **`--acting-as` is required beside it**:
 a peer call is made on somebody's behalf, so the run's chain is rooted at that
 subject and scoped to what the file declares — the capabilities it provides and
@@ -1808,7 +1822,9 @@ one link** naming the peer — the caller's chain on a served plane,
 `cx.acting_as()` — so a chain with no room for another hop refuses at the desk.
 The peer receives the credential, not the chain, and its own authenticator
 decides what it acts under. The grant governs the hop as it governs a tool: its
-`protected_fields` and `max_sensitivity` are checked at the sink,
+`protected_fields` and `max_sensitivity` are checked at the sink — under the
+registration's own ceiling, which a grant cannot widen and which starts at
+`public` for `PeerGrant::new` —
 `mutates: true` puts the whole-value taint gate in front of it,
 `requires_approval` puts a person in front of it. The answer comes back untrusted, labelled
 `tool://reviewer/audit.check`, so a source rule downstream can name this
@@ -2297,7 +2313,8 @@ for row in store.parked(100).await? {
 share one store and are told apart by the `operator:` prefix; the A2A server
 refuses a caller-supplied `pushNotificationConfig.id` that begins with it,
 because operator destinations are exempt from the URL controls precisely on the
-grounds that there is no caller involved.
+grounds that there is no caller involved, and the A2A push methods neither
+list, read nor delete an `operator:` registration.
 
 ## ✍️ Sign the body a destination receives {#sign-the-body-a-destination-receives}
 
@@ -3028,7 +3045,9 @@ sharing a naming convention nobody wrote down. Full rules:
 
 With feature `keyring`, wrap a single-node memory backend in
 `EncryptedMemoryStore::new`. Content is ciphertext in the backing
-store, and each item is sealed under its own scope, so `forget`,
+store, its labels (trust, sensitivity, provenance, writer, creation and expiry)
+are bound into the envelope, so a relabelled row does not open, and each item
+is sealed under its own scope, so `forget`,
 `forget_cascading` and the expiry sweep destroy the keys of what they erase.
 `erase_subject(subject, at, reason)` checks legal holds, destroys every item
 scope of the subject, then cleans rows, leaving pre-erasure backups
@@ -3113,10 +3132,8 @@ exactly the same questions at a thousand times the verification cost. **The
 observer is a view**: not provider-visible, so not part of effect identity, so
 attaching or removing one cannot change a run's history.
 
-Strict replay therefore calls the observer **zero times**, and that is the
-honest interface rather than a gap. Replay is not a rerun; a framework that
-re-streamed from a cache would be reconstructing a live experience, which is a
-different claim from reproducing a run. `cargo run --example streaming_run --features
+Strict replay calls the observer **zero times**: replay is not a rerun.
+`cargo run --example streaming_run --features
 fake-model` prints all three facts, including the deltas reassembling into the completion
 byte for byte.
 
@@ -3256,7 +3273,10 @@ Erasing a case destroys its wrapping key, so every copy becomes unreadable at
 once — including the ones nobody can reach:
 
 ```rust
-blob::erase_case(Some(&blobs), cases.as_ref(), Some(keys.as_ref()), &tenant, case, at, reason).await?;
+blob::erase_case(
+    Some(&blobs), cases.as_ref(), Some(journal.as_ref()), Some(keys.as_ref()), None,
+    &tenant, case, at, reason,
+).await?;
 ```
 
 The chain still verifies afterwards, because it commits to the sealed bytes
@@ -3285,6 +3305,7 @@ let report = agentplane::audit::audit(&store, &runs, &Evidence {
     anchors: &anchors,          // every observation you can obtain, not the best one
     verifier: Some(&verifier),
     require_signatures: true,
+    freshness: None,            // or the auditor's clock and a maximum witness age
 }).await?;
 report.assert_complete();
 ```

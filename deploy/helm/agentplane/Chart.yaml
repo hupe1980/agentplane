@@ -2,8 +2,8 @@ apiVersion: v2
 name: agentplane
 description: One agentplane plane — A2A, MCP and operator listeners over a Postgres journal.
 type: application
-version: 0.46.0
-appVersion: "0.46.0"
+version: 0.47.0
+appVersion: "0.47.0"
 home: https://hupe1980.github.io/agentplane/
 sources:
   - https://github.com/hupe1980/agentplane

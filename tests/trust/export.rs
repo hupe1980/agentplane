@@ -1464,13 +1464,18 @@ use agentplane::core::RunId;
 /// the first `head()` asked: activity landing in the middle of a walk.
 /// `rewrite` changes every note's text on its way in and re-seals it instead
 /// of keeping the written bytes, so what the store keeps is not what it was
-/// handed.
+/// handed. `unplaced` fails every `log_positions`, as a store that cannot read
+/// its log index does. `misplaced` answers every inclusion at an index one
+/// past the tree it names — the shape a proof takes when a store reads a run's
+/// position and the leaves in two snapshots.
 #[derive(Debug)]
 struct Doctored {
     inner: Arc<dyn JournalStore>,
     at: Option<Checkpoint>,
     touch: std::sync::Mutex<Option<(RunId, Epoch)>>,
     rewrite: bool,
+    unplaced: bool,
+    misplaced: bool,
 }
 
 impl Doctored {
@@ -1480,6 +1485,8 @@ impl Doctored {
             at: None,
             touch: std::sync::Mutex::new(None),
             rewrite: false,
+            unplaced: false,
+            misplaced: false,
         }
     }
 }
@@ -1608,7 +1615,14 @@ impl JournalStore for Doctored {
         self.inner.consistency_proof(old).await
     }
     async fn inclusion_proof(&self, run: RunId) -> Result<Option<Inclusion>, StoreError> {
-        self.inner.inclusion_proof(run).await
+        let found = self.inner.inclusion_proof(run).await?;
+        Ok(match found {
+            Some(inc) if self.misplaced => Some(Inclusion {
+                index: inc.size,
+                ..inc
+            }),
+            other => other,
+        })
     }
     async fn inclusion_proof_at(
         &self,
@@ -1616,6 +1630,15 @@ impl JournalStore for Doctored {
         size: u64,
     ) -> Result<Option<Inclusion>, StoreError> {
         self.inner.inclusion_proof_at(run, size).await
+    }
+    async fn log_positions(
+        &self,
+        runs: &[RunId],
+    ) -> Result<Vec<Option<(u64, Digest)>>, StoreError> {
+        if self.unplaced {
+            return Err(StoreError::Backend("the log index did not answer".into()));
+        }
+        self.inner.log_positions(runs).await
     }
     async fn request_cancel(
         &self,
@@ -3790,4 +3813,468 @@ mod grader_verdict {
         );
         refused_for(&one(&export, &record_domain, keys), Component::Signature);
     }
+}
+
+/// `tools/verify_export.py` over `bytes`: whether it found the file sound, and
+/// what it said.
+fn second_reader_on(name: &str, bytes: &[u8]) -> (bool, String) {
+    let path = std::env::temp_dir().join(format!(
+        "agentplane-second-{name}-{}.jsonl",
+        std::process::id()
+    ));
+    std::fs::write(&path, bytes).expect("write");
+    let out = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("tools/verify_export.py")
+        .arg(&path)
+        .output()
+        .expect("python3 runs the second reader");
+    let _ = std::fs::remove_file(&path);
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// An admitted run in `store`, under a lease: its id and the lease's epoch.
+async fn admitted(store: &Arc<dyn JournalStore>, input: Value) -> (RunId, Epoch) {
+    let run = RunId::generate();
+    let lease = store
+        .acquire(run, "test", Duration::from_mins(5))
+        .await
+        .expect("lease");
+    store
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunAdmitted {
+                    capability: "demo.shaped".into(),
+                    governed_by: None,
+                    input_label: agentplane::core::Label::trusted(),
+                    input,
+                    policy_bundle: None,
+                    canon: agentplane::core::canon::VERSION,
+                    idempotency_key: None,
+                    admitted_by: None,
+                    served_unchained: false,
+                    plane_chain: false,
+                },
+            )],
+        )
+        .await
+        .expect("admit");
+    (run, lease.epoch)
+}
+
+/// A conclusion under `outcome`, drawn over `chain_head`.
+fn concluded(outcome: &str, chain_head: Digest) -> RecordKind {
+    RecordKind::RunConcluded {
+        outcome: outcome.into(),
+        reason: None,
+        exhaustion: None,
+        live_spend: agentplane::core::Spend::default(),
+        chain_head,
+    }
+}
+
+/// **A clear payload shaped like a seal restores.** The marker is a shape a
+/// caller's own value can have — an input of `{"$sealed": "x"}`, a note that
+/// opens `$sealed:` — and on a store that seals nothing its bytes are not an
+/// envelope at all. Refusing it as "sealed for another tenant" made a plain
+/// history unrestorable over a value somebody typed.
+#[tokio::test]
+async fn a_clear_payload_shaped_like_a_seal_restores() {
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let (run, epoch) = admitted(&store, json!({ "$sealed": "x" })).await;
+    store
+        .append(
+            epoch,
+            vec![Append::new(
+                run,
+                RecordKind::Note {
+                    text: "$sealed:AAAA".into(),
+                },
+            )],
+        )
+        .await
+        .expect("note");
+    let out = export_of(&store, &[run]).await;
+
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let restored = agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(&out))
+        .await
+        .expect("a clear payload shaped like a seal was refused as a foreign one");
+    assert!(restored.is_faithful(), "{restored:?}");
+    assert_eq!(fresh.read(run, 1).await.expect("read").len(), 2);
+}
+
+/// **A run quarantined and then resumed is read once.** The outcome index keeps
+/// a run's last conclusion, so the resumed run is listed under `quarantined`
+/// and again as in flight; read twice, it is exported as two blocks claiming
+/// one run, which the verifier reports as a file stitched from two histories.
+#[tokio::test]
+async fn a_run_quarantined_and_resumed_is_read_once() {
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let (run, epoch) = admitted(&store, Value::Null).await;
+    let head = store.head(run).await.expect("head");
+    store
+        .append(
+            epoch,
+            vec![Append::new(run, concluded("quarantined", head.hash))],
+        )
+        .await
+        .expect("quarantine");
+    store
+        .append(
+            epoch,
+            vec![Append::new(
+                run,
+                RecordKind::Note {
+                    text: "resumed".into(),
+                },
+            )],
+        )
+        .await
+        .expect("resume");
+
+    let found = agentplane::export::runs_to_read(&store, &["quarantined".to_owned()], true, 10)
+        .await
+        .expect("listed");
+    assert_eq!(found.runs, vec![run], "{found:?}");
+    assert_eq!(found.in_flight, 0, "counted in flight a run already listed");
+
+    let out = export_of(&store, &found.runs).await;
+    let report = agentplane::export::verify(std::io::Cursor::new(&out), None, &[]).expect("verify");
+    assert!(report.findings.is_empty(), "{:#?}", report.findings);
+}
+
+/// **A restore refuses a line it would have to skip, and a file whose counts
+/// its trailer disowns.** Each damage below leaves every other line valid, so
+/// a restore that skipped it rebuilt a history with that line missing — and
+/// reported it faithful whenever the line was not a sealed run's.
+#[tokio::test]
+async fn a_restore_refuses_a_line_it_would_have_to_skip() {
+    let (store, _) = one_run().await;
+    let (open, epoch) = admitted(&store, Value::Null).await;
+    store
+        .append(
+            epoch,
+            vec![Append::new(
+                open,
+                RecordKind::Note {
+                    text: "still working".into(),
+                },
+            )],
+        )
+        .await
+        .expect("note");
+    let runs = store.runs_by_id(None, 10).await.expect("runs");
+    let text = String::from_utf8(export_of(&store, &runs).await).expect("utf8");
+    let lines: Vec<&str> = text.lines().collect();
+    let with = |at: usize, extra: &str| {
+        let mut out: Vec<&str> = lines.clone();
+        out.insert(at, extra);
+        out.join("\n")
+    };
+    // The last record line, the open run's note.
+    let last_record = lines
+        .iter()
+        .rposition(|l| !l.contains("\"kind\":\"agentplane."))
+        .expect("a record line");
+    let mut dropped = lines.clone();
+    dropped.remove(last_record);
+    let mut recounted: Vec<Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("json"))
+        .collect();
+    let trailer = recounted.len() - 1;
+    recounted[trailer]["records"] = json!(recounted[trailer]["records"].as_u64().expect("n") + 1);
+    let recounted = recounted
+        .iter()
+        .map(|v| serde_json::to_string(v).expect("line"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for (what, file, named) in [
+        ("a line that is not JSON", with(1, "{not json"), "not JSON"),
+        (
+            "a line of a kind this build does not know",
+            with(1, r#"{"kind":"agentplane.export.later","note":"x"}"#),
+            "kind this build does not know",
+        ),
+        (
+            "a record before any run block",
+            with(1, lines[last_record]),
+            "before any run block",
+        ),
+        (
+            "a record line removed",
+            dropped.join("\n"),
+            "record(s) were written",
+        ),
+        (
+            "a trailer that counts one more",
+            recounted,
+            "record(s) were written",
+        ),
+    ] {
+        let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+        let refused =
+            agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(file.as_bytes()))
+                .await;
+        let Err(e) = refused else {
+            panic!("{what}: restored");
+        };
+        assert!(e.to_string().contains(named), "{what}: {e}");
+        assert!(
+            fresh.runs_by_id(None, 10).await.expect("runs").is_empty(),
+            "{what}: the refusal wrote something first"
+        );
+    }
+
+    let fresh: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    agentplane::export::from_jsonl(&fresh, None, std::io::Cursor::new(text.as_bytes()))
+        .await
+        .expect("the untouched file restores");
+}
+
+/// **An export whose store cannot place its runs fails rather than writing
+/// them as open.** Every sealed run without its position is a file that
+/// rebuilds an empty tree against a header committing to a full one — a
+/// verdict of tampering over an outage.
+#[tokio::test]
+async fn an_export_whose_store_cannot_place_its_runs_fails() {
+    let (store, run) = one_run().await;
+    let blind: Arc<dyn JournalStore> = Arc::new(Doctored {
+        unplaced: true,
+        ..Doctored::over(store)
+    });
+    let mut out = Vec::new();
+    let written = agentplane::export::to_jsonl(&blind, &crate::no_cases(), &[run], &mut out).await;
+    assert!(
+        written.is_err(),
+        "an export without log positions was written: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// **A line whose `seq` or `prev_hash` disagrees with its hashed half is a
+/// finding in both readers.** The two are copies, as the readable body is; a
+/// reader that ignored them and one that checked them disagreed about one file.
+#[tokio::test]
+async fn a_line_copy_that_disagrees_with_its_bytes_is_a_finding_in_both_readers() {
+    let (store, run) = one_run().await;
+    let text = String::from_utf8(export_of(&store, &[run]).await).expect("utf8");
+    let (sound, said) = second_reader_on("clean-copies", text.as_bytes());
+    assert!(sound, "{said}");
+
+    for (what, edit) in [
+        (
+            "seq",
+            (|v: &mut Value| v["seq"] = json!(v["seq"].as_u64().expect("seq") + 5))
+                as fn(&mut Value),
+        ),
+        ("prev_hash", |v: &mut Value| {
+            v["prev_hash"] = json!(Digest::of(b"another head"));
+        }),
+    ] {
+        let mut edited = false;
+        let file = text
+            .lines()
+            .map(|line| {
+                let mut v: Value = serde_json::from_str(line).expect("json");
+                if !edited && v.get("kind").is_none() {
+                    edit(&mut v);
+                    edited = true;
+                }
+                serde_json::to_string(&v).expect("line")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let report = agentplane::export::verify(std::io::Cursor::new(file.as_bytes()), None, &[])
+            .expect("verify");
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.contains("line's copy was edited")),
+            "{what}: {:#?}",
+            report.findings
+        );
+        let (sound, said) = second_reader_on(what, file.as_bytes());
+        assert!(!sound, "{what}: the second reader passed it:\n{said}");
+    }
+}
+
+/// **An inclusion at an index past its own tree is unpinned, not a rewrite.**
+/// It is the shape a proof takes when a store reads a run's position and the
+/// leaves in two snapshots with a seal between them; no path from that index
+/// can verify, and `BadInclusion` would report a rewrite over a race.
+#[tokio::test]
+async fn an_inclusion_past_its_tree_is_unpinned_rather_than_a_rewrite() {
+    let (store, run) = one_run().await;
+    let misplaced: Arc<dyn JournalStore> = Arc::new(Doctored {
+        misplaced: true,
+        ..Doctored::over(store)
+    });
+    let report =
+        agentplane::audit::audit(&misplaced, &[run], &agentplane::audit::Evidence::default())
+            .await
+            .expect("audit");
+    assert!(
+        !report
+            .findings
+            .iter()
+            .any(|f| matches!(f, agentplane::audit::Finding::BadInclusion { .. })),
+        "{:#?}",
+        report.findings
+    );
+    assert!(
+        report
+            .not_checked
+            .iter()
+            .any(|n| n.contains("could not be pinned")),
+        "{:#?}",
+        report.not_checked
+    );
+}
+
+/// **The live audit holds every conclusion's chain head, as the export's
+/// verifier does.** A run concluded, resumed and concluded again carries one
+/// claim per conclusion; holding only the last passed a history the offline
+/// reader refuses.
+#[tokio::test]
+async fn every_conclusion_s_chain_head_is_held_by_the_live_audit() {
+    let store: Arc<dyn JournalStore> = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let (run, epoch) = admitted(&store, Value::Null).await;
+    store
+        .append(
+            epoch,
+            vec![Append::new(
+                run,
+                concluded("failed", Digest::of(b"elsewhere")),
+            )],
+        )
+        .await
+        .expect("a conclusion over another head");
+    store
+        .append(
+            epoch,
+            vec![Append::new(
+                run,
+                RecordKind::Note {
+                    text: "resumed".into(),
+                },
+            )],
+        )
+        .await
+        .expect("resume");
+    let head = store.head(run).await.expect("head");
+    store
+        .append(
+            epoch,
+            vec![Append::new(run, concluded("succeeded", head.hash))],
+        )
+        .await
+        .expect("conclude");
+    store.seal(run, epoch, "succeeded").await.expect("seal");
+
+    let report = agentplane::audit::audit(&store, &[run], &agentplane::audit::Evidence::default())
+        .await
+        .expect("audit");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|f| matches!(f, agentplane::audit::Finding::SealClaim { .. })),
+        "the first conclusion's foreign head passed the live audit: {:#?}",
+        report.findings
+    );
+    let offline = agentplane::export::verify(
+        std::io::Cursor::new(export_of(&store, &[run]).await),
+        None,
+        &[],
+    )
+    .expect("verify");
+    assert!(
+        offline.findings.iter().any(|f| f.contains("chain head")),
+        "{:#?}",
+        offline.findings
+    );
+}
+
+/// **An erasure survives a disaster recovery.**
+///
+/// The erasure record is what tells a destroyed key from a lost one. A
+/// restore that dropped it would bring the matter back as an ordinary closed
+/// case — reopenable and writable, its key reported missing by the drill.
+#[tokio::test]
+async fn an_erasure_record_survives_export_and_restore() {
+    use agentplane::case::{CaseStore, Erasure, ErasureStart};
+    use agentplane::core::{Case, CaseStatus, CaseVersion, RunId, Timestamp};
+
+    let origin = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let cases: Arc<dyn CaseStore> = Arc::clone(&origin) as Arc<dyn CaseStore>;
+    let store: Arc<dyn JournalStore> = origin;
+    let case = agentplane::core::CaseId::generate();
+    cases
+        .import_case(
+            &Case {
+                id: case,
+                kind: "matter".into(),
+                status: CaseStatus::Closed,
+                correlation: Vec::new(),
+                state: json!({}),
+                version: CaseVersion::INITIAL,
+                opened_at: Timestamp::from_unix_timestamp(1_600_000_000).expect("instant"),
+                runs: Vec::<RunId>::new(),
+            },
+            &[],
+            &[],
+        )
+        .await
+        .expect("import");
+    let at = Timestamp::from_unix_timestamp(1_700_000_000).expect("instant");
+    assert!(matches!(
+        cases
+            .begin_erasure(case, at, "art-17 request")
+            .await
+            .expect("begin"),
+        ErasureStart::Marked(_)
+    ));
+    cases.complete_erasure(case).await.expect("complete");
+
+    let mut bytes = Vec::new();
+    agentplane::export::to_jsonl(&store, &cases, &[], &mut bytes)
+        .await
+        .expect("export");
+    let verified =
+        agentplane::export::verify(std::io::Cursor::new(&bytes), None, &[]).expect("verify");
+    assert!(verified.is_sound(), "{:#?}", verified.findings);
+
+    let fresh = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let fresh_journal: Arc<dyn JournalStore> = Arc::clone(&fresh) as Arc<dyn JournalStore>;
+    let fresh_cases: Arc<dyn CaseStore> = fresh as Arc<dyn CaseStore>;
+    agentplane::export::from_jsonl(
+        &fresh_journal,
+        Some(&fresh_cases),
+        std::io::Cursor::new(&bytes),
+    )
+    .await
+    .expect("restore");
+
+    assert_eq!(
+        fresh_cases.erasure(case).await.expect("erasure"),
+        Some(Erasure {
+            at,
+            reason: "art-17 request".into(),
+            complete: true,
+        }),
+        "the restored plane forgot that it erased this matter"
+    );
 }

@@ -347,10 +347,16 @@ impl RedbStore {
     /// Goes into every checkpoint, so two planes' checkpoints cannot be
     /// confused for one another — which matters the moment they are published
     /// to a shared witness.
-    #[must_use]
-    pub fn origin(mut self, origin: impl Into<String>) -> Self {
-        self.origin = origin.into();
-        self
+    ///
+    /// # Errors
+    ///
+    /// If the name breaks [`Checkpoint::validate_origin`](crate::journal::Checkpoint::validate_origin),
+    /// refused here rather than at the first checkpoint a witness turns away.
+    pub fn origin(mut self, origin: impl Into<String>) -> Result<Self, StoreError> {
+        let origin = origin.into();
+        crate::journal::Checkpoint::validate_origin(&origin)?;
+        self.origin = origin;
+        Ok(self)
     }
 
     /// Write records signed as this identity.
@@ -393,36 +399,33 @@ impl RedbStore {
     /// The log's leaves, in seal order — already leaf-hashed, as the type
     /// says.
     async fn log_leaves(&self) -> Result<Vec<crate::core::merkle::LeafHash>, StoreError> {
-        let tenant = self.tenant.clone();
-        self.with_db(move |db| {
-            let r = db.begin_read().map_err(|e| be(&e))?;
-            let log = r.open_table(SEAL_LOG).map_err(|e| be(&e))?;
-            let seals = r.open_table(RUN_SEAL).map_err(|e| be(&e))?;
-            let mut out = Vec::new();
-            // This tenant's range only. Iterating the whole table would build a
-            // Merkle log covering other tenants' runs, so a checkpoint would
-            // commit to history its holder may not see.
-            for entry in log
-                .range((tenant.as_str(), 0)..=(tenant.as_str(), u64::MAX))
-                .map_err(|e| be(&e))?
-            {
-                let (_, run) = entry.map_err(|e| be(&e))?;
-                let Some(seal) = seals.get(run.value()).map_err(|e| be(&e))? else {
-                    continue;
-                };
-                let (_, head, _) = seal.value();
-                out.push(crate::core::merkle::leaf_hash(&digest(head)?));
-            }
-            Ok(out)
-        })
-        .await
+        Ok(self.log_walk(&[]).await?.0)
     }
 
     /// Where each run sits in the log, and its leaf value, from one walk.
-    ///
-    /// The position is the run's index in seal order, counted while iterating —
-    /// dense by construction, because the tree is built from the same walk.
     async fn positions(&self, runs: &[RunId]) -> Result<Vec<Option<(u64, Digest)>>, StoreError> {
+        Ok(self.log_walk(runs).await?.1)
+    }
+
+    /// The log's leaves and where each of `runs` sits in them, read in one
+    /// transaction.
+    ///
+    /// One snapshot, because a proof pairs a position with the tree it is a
+    /// position in: read apart, a run sealed between the two reads has an index
+    /// past the leaves its proof is built over, and the proof fails as if the
+    /// log had been rewritten. The position is the run's index in seal order,
+    /// counted while iterating — dense by construction, because the tree is
+    /// built from the same walk.
+    async fn log_walk(
+        &self,
+        runs: &[RunId],
+    ) -> Result<
+        (
+            Vec<crate::core::merkle::LeafHash>,
+            Vec<Option<(u64, Digest)>>,
+        ),
+        StoreError,
+    > {
         let keys: Vec<String> = runs.iter().map(|&run| self.run_key(run)).collect();
         let tenant = self.tenant.clone();
         self.with_db(move |db| {
@@ -431,7 +434,10 @@ impl RedbStore {
             let seals = r.open_table(RUN_SEAL).map_err(|e| be(&e))?;
             let mut wanted: std::collections::HashMap<&str, Option<(u64, Digest)>> =
                 keys.iter().map(|k| (k.as_str(), None)).collect();
-            let mut rank = 0u64;
+            let mut leaves = Vec::new();
+            // This tenant's range only. Iterating the whole table would build a
+            // Merkle log covering other tenants' runs, so a checkpoint would
+            // commit to history its holder may not see.
             for entry in log
                 .range((tenant.as_str(), 0)..=(tenant.as_str(), u64::MAX))
                 .map_err(|e| be(&e))?
@@ -440,13 +446,15 @@ impl RedbStore {
                 let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {
                     continue;
                 };
+                let (_, head, _) = seal.value();
+                let head = digest(head)?;
                 if let Some(slot) = wanted.get_mut(run_id.value()) {
-                    let (_, head, _) = seal.value();
-                    *slot = Some((rank, digest(head)?));
+                    *slot = Some((leaves.len() as u64, head));
                 }
-                rank += 1;
+                leaves.push(crate::core::merkle::leaf_hash(&head));
             }
-            Ok(keys.iter().map(|k| wanted[k.as_str()]).collect())
+            let positions = keys.iter().map(|k| wanted[k.as_str()]).collect();
+            Ok((leaves, positions))
         })
         .await
     }
@@ -1813,9 +1821,13 @@ impl JournalStore for RedbStore {
     }
 
     async fn checkpoint(&self) -> Result<crate::journal::Checkpoint, StoreError> {
+        // The composed name, not only the base: a tenant lengthens it, and a
+        // base that passed alone can fail once a tenant is appended.
+        let origin = self.log_origin();
+        crate::journal::Checkpoint::validate_origin(&origin)?;
         let leaves = self.log_leaves().await?;
         Ok(crate::journal::Checkpoint {
-            origin: self.log_origin(),
+            origin,
             size: leaves.len() as u64,
             root: crate::core::merkle::root(&leaves),
         })
@@ -1838,12 +1850,31 @@ impl JournalStore for RedbStore {
         Ok(crate::core::merkle::consistency_proof(&leaves, old))
     }
 
+    async fn consistency_proof_at(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<Vec<Digest>, StoreError> {
+        let leaves = self.log_leaves().await?;
+        let (old, new) = (
+            usize::try_from(old_size).unwrap_or(usize::MAX),
+            usize::try_from(new_size).unwrap_or(usize::MAX),
+        );
+        if old > new || new > leaves.len() {
+            return Err(StoreError::Backend(format!(
+                "asked to prove {old_size} → {new_size} and the log holds {} leaves",
+                leaves.len()
+            )));
+        }
+        Ok(crate::core::merkle::consistency_proof(&leaves[..new], old))
+    }
+
     async fn inclusion_proof(
         &self,
         run: RunId,
     ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
-        let leaves = self.log_leaves().await?;
-        let Some((index, seal)) = self.positions(&[run]).await?.pop().flatten() else {
+        let (leaves, mut placed) = self.log_walk(&[run]).await?;
+        let Some((index, seal)) = placed.pop().flatten() else {
             return Ok(None);
         };
         Ok(Some(crate::journal::Inclusion {
@@ -1862,7 +1893,7 @@ impl JournalStore for RedbStore {
         run: RunId,
         size: u64,
     ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
-        let leaves = self.log_leaves().await?;
+        let (leaves, mut placed) = self.log_walk(&[run]).await?;
         let prefix = usize::try_from(size)
             .ok()
             .and_then(|size| leaves.get(..size))
@@ -1872,7 +1903,7 @@ impl JournalStore for RedbStore {
                     leaves.len()
                 ))
             })?;
-        let Some((index, seal)) = self.positions(&[run]).await?.pop().flatten() else {
+        let Some((index, seal)) = placed.pop().flatten() else {
             return Ok(None);
         };
         let Some(at) = usize::try_from(index).ok().filter(|&at| at < prefix.len()) else {
@@ -2008,14 +2039,17 @@ mod tests {
         let tenant_then_origin = RedbStore::open_in_memory()
             .expect("store")
             .for_tenant(tenant.clone())
-            .origin("plane-1");
+            .origin("plane-1")
+            .expect("origin");
         let origin_then_tenant = RedbStore::open_in_memory()
             .expect("store")
             .origin("plane-1")
+            .expect("origin")
             .for_tenant(tenant.clone());
         let twice = RedbStore::open_in_memory()
             .expect("store")
             .origin("plane-1")
+            .expect("origin")
             .for_tenant(tenant.clone())
             .for_tenant(tenant);
 

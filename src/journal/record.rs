@@ -1175,6 +1175,37 @@ fn record_signing_input(hash: Digest) -> Digest {
     crate::core::signing_hash(crate::core::DOMAIN_RECORD, &hash)
 }
 
+/// The deepest nesting of arrays and objects in JSON `bytes`, counting only
+/// brackets outside strings.
+///
+/// A byte scan rather than a parse, because a parser is exactly what stops at
+/// the limit this measures against.
+pub(crate) fn nesting_depth(bytes: &[u8]) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for &b in bytes {
+        if in_string {
+            match (escaped, b) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
 impl Record {
     /// Serialize canonically and link into the chain.
     pub fn seal(body: RecordBody, prev_hash: Digest) -> Result<Self, StoreError> {
@@ -1194,6 +1225,19 @@ impl Record {
     /// both end in, so no store can be added that quietly skips it.
     pub const MAX_RECORD_BYTES: usize = 1 << 20;
 
+    /// The deepest a record's bytes may nest arrays and objects.
+    ///
+    /// Every reader of a record has a nesting limit, and a record past it is
+    /// one the chain committed to and no reader can parse: this crate's
+    /// (`serde_json`, 127 levels) on every read and every restore, and the
+    /// second reader's (Python's recursion limit, around 1000). The bound sits
+    /// under the lowest of them with room for the levels an export line wraps
+    /// a record in, so a record that seals is a record every reader opens.
+    ///
+    /// Enforced where [`Record::MAX_RECORD_BYTES`] is, and for the same
+    /// reason: refusing at seal is the only moment it is still cheap.
+    pub const MAX_RECORD_DEPTH: usize = 100;
+
     /// Seal, and attest it as the given signer.
     ///
     /// The signature is taken over the chain hash, which already covers
@@ -1210,7 +1254,7 @@ impl Record {
     }
 
     /// Link bytes into the chain under `prev_hash`, refusing them above the
-    /// limit — the one step every seal ends in.
+    /// size or nesting limit — the one step every seal ends in.
     fn linked(
         body: RecordBody,
         raw: Vec<u8>,
@@ -1221,6 +1265,13 @@ impl Record {
             return Err(StoreError::RecordTooLarge {
                 bytes: raw.len(),
                 limit: Self::MAX_RECORD_BYTES,
+            });
+        }
+        let depth = nesting_depth(&raw);
+        if depth > Self::MAX_RECORD_DEPTH {
+            return Err(StoreError::RecordTooDeep {
+                depth,
+                limit: Self::MAX_RECORD_DEPTH,
             });
         }
         let hash = Digest::chain(prev_hash, &raw);
@@ -1449,10 +1500,11 @@ impl Record {
     /// Two separate questions, deliberately answered by two separate calls. The
     /// chain says the records are consistent with each other; the signatures say
     /// who wrote them. A caller that only runs [`Self::verify_chain`] is asking
-    /// the weaker question, and this crate's own store does exactly that on
-    /// every read — because a plane without a configured verifier has no basis
-    /// to reject anything, and failing closed there would make signing
-    /// impossible to adopt incrementally.
+    /// the weaker question, and the runtime does exactly that when it replays a
+    /// run (a store's read checks less still: each record's hash against its
+    /// own bytes, not the links between records) — because a plane without a
+    /// configured verifier has no basis to reject anything, and failing closed
+    /// there would make signing impossible to adopt incrementally.
     ///
     /// `require_signature` is what stops that leniency becoming a hole. With it
     /// set, an unsigned record is a failure rather than a shrug — which is the
@@ -1769,6 +1821,85 @@ mod tests {
             r.raw().len(),
             Record::MAX_RECORD_BYTES
         );
+    }
+
+    /// A record whose input nests `levels` arrays deep.
+    fn nested(levels: usize) -> RecordBody {
+        let mut input = json!(null);
+        for _ in 0..levels {
+            input = json!([input]);
+        }
+        body(
+            1,
+            RecordKind::RunAdmitted {
+                capability: "deep@1".into(),
+                governed_by: None,
+                input,
+                input_label: crate::core::Label::trusted(),
+                policy_bundle: None,
+                canon: crate::core::canon::VERSION,
+                idempotency_key: None,
+                admitted_by: None,
+                served_unchained: false,
+                plane_chain: false,
+            },
+        )
+    }
+
+    /// **A record nested past what every reader parses is refused at seal.**
+    ///
+    /// Without the bound the chain commits to bytes `serde_json` stops reading
+    /// at 127 levels: the seal succeeds, and every later read of the run —
+    /// resume, export, restore — fails on a record nobody can remove. The
+    /// round-trip half is the other sign: the deepest record the bound admits
+    /// reads back through the store's own path, and through an export line,
+    /// which wraps it once more.
+    #[test]
+    fn a_record_nested_past_the_reader_limit_is_refused_at_seal() {
+        // The deepest input whose record sits exactly at the bound.
+        let at = (0..Record::MAX_RECORD_DEPTH)
+            .rev()
+            .find(|&levels| {
+                let raw = canon::to_bytes(&nested(levels)).expect("canonical");
+                nesting_depth(&raw) == Record::MAX_RECORD_DEPTH
+            })
+            .expect("a nesting that lands on the bound");
+
+        let deepest = Record::seal(nested(at), Digest::ZERO).expect("the bound itself seals");
+        let back =
+            Record::from_stored_signed(deepest.raw().to_vec(), Digest::ZERO, deepest.hash, None)
+                .expect("the deepest sealable record reads back");
+        assert_eq!(back.body, deepest.body);
+        let line = format!(
+            "{{\"body\":{},\"raw\":{}}}",
+            String::from_utf8(deepest.raw().to_vec()).expect("utf-8"),
+            serde_json::to_string(&String::from_utf8(deepest.raw().to_vec()).expect("utf-8"))
+                .expect("a string")
+        );
+        serde_json::from_str::<Value>(&line).expect("an export line wrapping it parses");
+
+        match Record::seal(nested(at + 1), Digest::ZERO) {
+            Err(StoreError::RecordTooDeep { depth, limit }) => {
+                assert_eq!(
+                    (depth, limit),
+                    (Record::MAX_RECORD_DEPTH + 1, Record::MAX_RECORD_DEPTH)
+                );
+            }
+            Err(other) => panic!("refused for the wrong reason: {other}"),
+            Ok(r) => panic!(
+                "a record {} levels deep was sealed, and no reader can parse it",
+                nesting_depth(r.raw())
+            ),
+        }
+        // Far past the bound, the case the limit exists for.
+        assert!(Record::seal(nested(200), Digest::ZERO).is_err());
+    }
+
+    /// Brackets inside strings are text, not nesting.
+    #[test]
+    fn nesting_depth_skips_strings_and_escapes() {
+        assert_eq!(nesting_depth(br#"{"a":"[[[{{\"]]]","b":[1,{"c":2}]}"#), 3);
+        assert_eq!(nesting_depth(b"7"), 0);
     }
 
     fn chain_of(n: u64) -> Vec<Record> {

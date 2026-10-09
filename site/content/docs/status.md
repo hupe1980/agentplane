@@ -18,12 +18,9 @@ Evaluating against a control catalogue →
 
 ## 📌 What to pin, and what will move {#what-to-pin-and-what-will-move}
 
-Pre-alpha means every one of these can change. It does not mean they are all
-equally likely to, and an adopter deciding what to build against deserves the
-difference rather than one blanket warning.
-
-Nothing here is a compatibility promise. It is a statement about where the
-remaining design pressure is, grouped by
+Pre-alpha means every one of these can change, not that they are equally likely
+to. Nothing here is a compatibility promise; it says where the remaining design
+pressure is, grouped by
 [what the freeze will be a promise about](#what-the-freeze-promises).
 
 | Surface | Expect | Why |
@@ -49,15 +46,10 @@ remaining design pressure is, grouped by
 
 ## 🧊 Format freeze: the conditions, and where they stand {#format-freeze}
 
-The single question that decides whether this can be recommended for anything
-regulated, asked directly enough to deserve a direct answer: **the strongest
-control here — a tamper-evident, offline-verifiable audit trail — cannot be
-signed off as a long-term record while its format may break with no migration
-path.** Every other gap an adopter finds is closable with integration work.
-This one is not.
-
-There is no date. What there is instead is a condition list, each row naming
-what it demands and where the evidence is.
+**A tamper-evident, offline-verifiable audit trail cannot be signed off as a
+long-term record while its format may break with no migration path.** There is
+no date; there is a condition list, each row naming what it demands and where
+the evidence is.
 
 **Every condition is met.** The freeze itself is a deliberate act — the point
 at which hard cuts stop and a shape change becomes an upcaster plus a version
@@ -95,29 +87,21 @@ doorway. It attaches to what the guarantees are *made of*:
 | **The Rust API** — `Skill`, `StepCtx`, `Runtime`, the store traits | **no** | pre-alpha and additive in intent, pinned by an exact version in practice |
 | **Store schemas** | **no**, deliberately | the journal is the record and a store is an index derived from it; a store is rebuilt from an export rather than migrated |
 
-**What an adopter depends on is the evidence, and both doorways produce the
-same evidence.** Linking the crate gets the same promise about everything it
-stores and exports, and takes the ordinary pre-alpha risk on the signatures it
-compiles against — the half a `cargo update` reports and a rebuild settles,
-rather than the half that strands a history.
+Linking the crate gets the same promise about everything it stores and
+exports, and takes the ordinary pre-alpha risk on the signatures it compiles
+against.
 
-**Until the freeze, the honest position for an adopter is:** treat the export as the
-long-term artifact and the store as disposable. `agentplane export` produces
-framed JSON Lines with a checkpoint, `agentplane verify` recomputes it from its
-own bytes, and `agentplane restore` rebuilds a store from it — three verbs that
-already work, and the reason a store change is a rebuild rather than a loss —
-the procedure is on [upgrading](@/docs/upgrading.md#procedure).
-That is a real answer, not a promise: an export taken today is verifiable today
-by a party who has never run this crate.
+**Until the freeze**, treat the export as the long-term artifact and the store
+as disposable. `agentplane export` produces framed JSON Lines with a
+checkpoint, `agentplane verify` recomputes it from its own bytes, and
+`agentplane restore` rebuilds a store from it — the procedure is on
+[upgrading](@/docs/upgrading.md#procedure). An export is verifiable by a party
+who has never run this crate.
 
 ## 🚫 Deliberately not built {#deliberately-not-built}
 
-Two kinds, and conflating them is what makes a gap list useless. **Refused** will
-not arrive: something in the design forecloses it, and the entry says what.
-**Deferred** names what it is waiting on, so a reader can tell whether their own
-need would move it.
-
-
+**Refused** will not arrive: something in the design forecloses it, and the
+entry says what. **Deferred** names what it is waiting on.
 ### Refused
 
 | Refused | What forecloses it |
@@ -177,9 +161,6 @@ python3 tools/mutants.py <name> --verify   # one guarantee, end to end
 MUTANTS_SHARD=2/10 just mutants          # one slice, for a machine that is not alone
 ```
 
-The mutation sweep is the one that matters most: it breaks each guarantee on
-purpose and requires the test *written for it* to fail. That is why this page
-asserts no inventory of guarantees — an inventory is a claim a reader has to
-trust, and a sweep is one they can run. What the sweep reports, and why
-`just anchors` is not a substitute for running it, is on
-[assurance](@/docs/assurance.md).
+The mutation sweep breaks each guarantee on purpose and requires the test
+*written for it* to fail. What it reports, and why `just anchors` is not a
+substitute for running it, is on [assurance](@/docs/assurance.md).

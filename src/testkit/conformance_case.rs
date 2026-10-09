@@ -70,6 +70,249 @@ pub async fn check_cases(store: &Arc<dyn CaseStore>, r: &mut Report) {
     a_hold_on_a_missing_matter_is_not_found(store, r).await;
     a_conditional_release_spares_a_hold_placed_since(store, r).await;
     the_last_drill_is_absent_then_replaced(store, r).await;
+    an_erasure_record_is_decided_against_the_hold(store, r).await;
+    an_erased_case_takes_no_write_and_no_hold(store, r).await;
+    a_named_obligation_is_registered_once(store, r).await;
+}
+
+/// **The erasure record is decided against the hold, and the first stands.**
+///
+/// `begin_erasure` is the decision every destruction rests on, so it has to
+/// refuse a held or unclosed matter *without writing* — a record left behind
+/// by a refusal would lock a case nobody erased — and a retry has to get the
+/// first attempt's instant and reason back, or its tombstones say something
+/// the first attempt's did not.
+async fn an_erasure_record_is_decided_against_the_hold(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    use crate::case::ErasureStart;
+
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("ERASE-1"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    match store.begin_erasure(case, ts(5_000), "too early").await {
+        Ok(ErasureStart::NotClosed(_)) => {}
+        other => {
+            return r.record(
+                "erasure",
+                format!("an open case must refuse its erasure as NotClosed, got {other:?}"),
+            );
+        }
+    }
+    let hold = crate::core::LegalHold {
+        placed_at: ts(2_000),
+        reason: "preservation order".to_owned(),
+        by: crate::core::Operator::asserted("compliance").expect("a name"),
+    };
+    if store.place_hold(case, &hold).await.is_err() || store.close(case).await.is_err() {
+        return r.record("erasure", "a case could not be held and closed");
+    }
+    match store.begin_erasure(case, ts(5_000), "held").await {
+        Ok(ErasureStart::Held(back)) if back == hold => {}
+        other => {
+            return r.record(
+                "erasure",
+                format!("a held case must refuse its erasure with the hold, got {other:?}"),
+            );
+        }
+    }
+    match store.erasure(case).await {
+        Ok(None) => {}
+        other => {
+            return r.record(
+                "erasure",
+                format!("a refused erasure left a record behind: {other:?}"),
+            );
+        }
+    }
+    if store.release_hold(case).await.is_err() {
+        return r.record("erasure", "a hold could not be released");
+    }
+    let first = crate::case::Erasure {
+        at: ts(6_000),
+        reason: "art-17 request".to_owned(),
+        complete: false,
+    };
+    match store.begin_erasure(case, first.at, &first.reason).await {
+        Ok(ErasureStart::Marked(got)) if got == first => {}
+        other => {
+            return r.record(
+                "erasure",
+                format!("a closed, unheld case must be marked, got {other:?}"),
+            );
+        }
+    }
+    match store.begin_erasure(case, ts(7_000), "a retry").await {
+        Ok(ErasureStart::Marked(got)) if got == first => {}
+        other => r.record(
+            "erasure",
+            format!(
+                "a retried erasure must get the first record back, so its tombstones say \
+                 what the first attempt's did — got {other:?}"
+            ),
+        ),
+    }
+    if let Err(e) = store.complete_erasure(case).await {
+        return r.record("erasure", format!("completing an erasure failed: {e}"));
+    }
+    match store.erasure(case).await {
+        Ok(Some(got)) if got.complete && got.at == first.at && got.reason == first.reason => {}
+        other => r.record(
+            "erasure",
+            format!("a completed erasure must read back complete and unchanged, got {other:?}"),
+        ),
+    }
+    let missing = CaseId::generate();
+    if !matches!(
+        store.begin_erasure(missing, ts(1), "nothing").await,
+        Err(StoreError::NotFound(_))
+    ) {
+        r.record("erasure", "an erasure of a missing case must be NotFound");
+    }
+}
+
+/// **An erased case takes no write and no hold.**
+///
+/// Reopening one re-claims its correlation keys and routes the next message
+/// about the matter into a case whose key is gone; a state write lands under
+/// that scope; and a hold accepted after the erasure began preserves nothing
+/// while reading as effective. Each is refused, and the case stays closed.
+async fn an_erased_case_takes_no_write_and_no_hold(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("ERASE-2"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let case = opened.case_id();
+    if store.close(case).await.is_err()
+        || store
+            .begin_erasure(case, ts(5_000), "art-17 request")
+            .await
+            .is_err()
+    {
+        return r.record("erasure", "a closed case could not be marked erased");
+    }
+    if !matches!(
+        store.set_status(case, crate::core::CaseStatus::Open).await,
+        Err(StoreError::CaseErased { .. })
+    ) {
+        r.record(
+            "erasure",
+            "an erased case was reopened, or refused as something else",
+        );
+    }
+    let version = match store.case(case).await {
+        Ok(Some(c)) => c.version,
+        other => return r.record("erasure", format!("reading the case failed: {other:?}")),
+    };
+    if !matches!(
+        store
+            .put_state(case, version, serde_json::json!({"again": true}))
+            .await,
+        Err(StoreError::CaseErased { .. })
+    ) {
+        r.record(
+            "erasure",
+            "state was written into an erased case, or refused as something else",
+        );
+    }
+    let hold = crate::core::LegalHold {
+        placed_at: ts(6_000),
+        reason: "too late".to_owned(),
+        by: crate::core::Operator::asserted("compliance").expect("a name"),
+    };
+    if !matches!(
+        store.place_hold(case, &hold).await,
+        Err(StoreError::CaseErased { .. })
+    ) {
+        r.record(
+            "erasure",
+            "a hold on a case whose erasure had begun was accepted, or refused as \
+             something other than an erased case",
+        );
+    }
+    match store.case(case).await {
+        Ok(Some(c)) if c.status == crate::core::CaseStatus::Closed => {}
+        other => r.record(
+            "erasure",
+            format!("an erased case must stay closed, got {other:?}"),
+        ),
+    }
+    if !matches!(store.correlate(&keys("ERASE-2")).await, Ok(None)) {
+        r.record("erasure", "an erased case's keys were claimed again");
+    }
+}
+
+/// **A named obligation is registered once.**
+///
+/// The same terms again are the same registration. Different terms are
+/// refused rather than dropped: the journal records the second registration,
+/// and a store that kept the first silently would enforce a deadline the
+/// journal does not show as current.
+async fn a_named_obligation_is_registered_once(store: &Arc<dyn CaseStore>, r: &mut Report) {
+    r.checked += 1;
+    let Ok(opened) = store
+        .correlate_or_open("matter", &keys("OBLIGATION-ONCE"), ts(1_000))
+        .await
+    else {
+        return;
+    };
+    let first = crate::core::Deadline {
+        case: opened.case_id(),
+        name: "respond".into(),
+        resolved_at: ts(9_000),
+        calendar_digest: Digest::of(b"cal"),
+        warn_at: Some(ts(8_000)),
+        state: crate::core::DeadlineState::Pending,
+        acknowledged: None,
+    };
+    if let Err(e) = store.register_deadline(&first).await {
+        return r.record("obligation", format!("registering failed: {e}"));
+    }
+    if let Err(e) = store.register_deadline(&first).await {
+        r.record(
+            "obligation",
+            format!("re-registering the same terms must be the same registration, got {e}"),
+        );
+    }
+    let moved = [
+        crate::core::Deadline {
+            resolved_at: ts(9_500),
+            ..first.clone()
+        },
+        crate::core::Deadline {
+            calendar_digest: Digest::of(b"another calendar"),
+            ..first.clone()
+        },
+        crate::core::Deadline {
+            warn_at: None,
+            ..first.clone()
+        },
+    ];
+    for later in moved {
+        if !matches!(
+            store.register_deadline(&later).await,
+            Err(StoreError::DeadlineExists { .. })
+        ) {
+            r.record(
+                "obligation",
+                "a second registration with different terms was accepted, so the store \
+                 enforces terms the journal does not show as current",
+            );
+        }
+    }
+    match store.deadlines(first.case).await {
+        Ok(held) if held == [first.clone()] => {}
+        other => r.record(
+            "obligation",
+            format!("the first registration must stand unchanged, got {other:?}"),
+        ),
+    }
 }
 
 /// **A rehearsal's verdict: absent before the first, replaced by the latest.**
@@ -209,7 +452,8 @@ async fn a_hold_is_placed_once_listed_and_lifted(store: &Arc<dyn CaseStore>, r: 
         },
         Ok(true) => r.record(
             "hold",
-            "a second placement reported itself as the first — a retry must not              move when a hold began or why",
+            "a second placement reported itself as the first — a retry must not \
+             move when a hold began or why",
         ),
         Err(e) => r.record("hold", format!("a repeated placement failed: {e}")),
     }
@@ -220,7 +464,8 @@ async fn a_hold_is_placed_once_listed_and_lifted(store: &Arc<dyn CaseStore>, r: 
             if !listed.iter().any(|(c, h)| *c == case && *h == hold) {
                 r.record(
                     "hold",
-                    "a held matter is not in the hold listing, so it can only be                      found by somebody who already knows the answer",
+                    "a held matter is not in the hold listing, so it can only be \
+                     found by somebody who already knows the answer",
                 );
             }
         }
@@ -241,7 +486,8 @@ async fn a_hold_is_placed_once_listed_and_lifted(store: &Arc<dyn CaseStore>, r: 
     match store.holds(None, 50).await {
         Ok(listed) if listed.iter().any(|(c, _)| *c == case) => r.record(
             "hold",
-            "a released hold is still listed — the listing has no verb that              empties it, so it is a level that only rises",
+            "a released hold is still listed — the listing has no verb that \
+             empties it, so it is a level that only rises",
         ),
         Ok(_) => {}
         Err(e) => r.record("hold", format!("listing holds failed: {e}")),

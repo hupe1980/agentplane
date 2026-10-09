@@ -296,6 +296,10 @@ pub struct RunBlock {
 /// `hold` is always written, `null` for a matter nobody ordered preserved. A
 /// restore that brought a held matter back without its hold would hand the
 /// next retention pass a closed, old, unheld case to erase.
+///
+/// `erasure` is always written too, `null` for a matter nobody erased. A
+/// restore that dropped it would bring back a case whose key is destroyed as
+/// an ordinary closed one — reopenable, writable, and a drill finding.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct CaseBlock {
     /// Always `"agentplane.export.case"`.
@@ -305,6 +309,9 @@ pub struct CaseBlock {
     pub blobs: Vec<crate::core::Digest>,
     /// The legal hold on this matter: instant, reason and operator.
     pub hold: Option<crate::core::LegalHold>,
+    /// The erasure record on this matter: instant, reason, and whether it
+    /// completed.
+    pub erasure: Option<crate::case::Erasure>,
 }
 
 /// The last line of an export: what it contains, and what it does not.
@@ -559,13 +566,11 @@ async fn write_file<W: std::io::Write>(
 
     // Asked before the records so each block heads them, and asked at all
     // because the log position is the half of the evidence the records do not
-    // carry. A store that cannot answer leaves the runs unsealed rather than
-    // failing the export: the position is missing, and the verifier says so,
-    // which is better than no export.
-    let positions = store
-        .log_positions(runs)
-        .await
-        .unwrap_or_else(|_| vec![None; runs.len()]);
+    // carry. A store that cannot answer fails the export: writing every run
+    // without its position would describe sealed runs as open, and the file
+    // would rebuild an empty tree against a header that commits to a full one
+    // — a verdict of tampering where there was only an outage.
+    let positions = store.log_positions(runs).await.map_err(|e| as_io(&e))?;
     for (&run, placed) in runs.iter().zip(positions) {
         // A run sealed *after* the header's checkpoint was taken is not in that
         // checkpoint. Stamping its position anyway would make the export
@@ -712,7 +717,8 @@ fn carries_sealed(raw: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(raw).is_ok_and(|value| walk(&value))
 }
 
-/// One case block: the case, its deadlines, its blob digests and its hold.
+/// One case block: the case, its deadlines, its blob digests, its hold and
+/// its erasure record.
 async fn write_case<W: std::io::Write>(
     cases: &Arc<dyn crate::case::CaseStore>,
     case: crate::core::Case,
@@ -721,6 +727,7 @@ async fn write_case<W: std::io::Write>(
     let deadlines = cases.deadlines(case.id).await.map_err(|e| as_io(&e))?;
     let blobs = cases.blobs_of(case.id).await.map_err(|e| as_io(&e))?;
     let hold = cases.hold(case.id).await.map_err(|e| as_io(&e))?;
+    let erasure = cases.erasure(case.id).await.map_err(|e| as_io(&e))?;
     writeln!(
         out,
         "{}",
@@ -730,6 +737,7 @@ async fn write_case<W: std::io::Write>(
             deadlines,
             blobs,
             hold,
+            erasure,
         })?
     )
 }
@@ -965,10 +973,10 @@ pub(crate) fn verify_observed<R: std::io::BufRead>(
         if let Some(kind) = value.get("kind").and_then(Value::as_str) {
             note_unknown_members(kind, report.selection.is_some(), &value, &mut report);
         }
-        match value.get("kind").and_then(Value::as_str) {
+        match Line::of(&value) {
             // A package is read by the same pass, with its own settlement: each
             // leaf is proved by its path, and nothing counts the log.
-            Some(kind @ ("agentplane.export" | DISCLOSURE_KIND)) => {
+            Line::Header(kind) => {
                 if !is_first {
                     report.findings.push(format!(
                         "a '{kind}' header appears past the first line and was ignored — the \
@@ -987,10 +995,10 @@ pub(crate) fn verify_observed<R: std::io::BufRead>(
                     read_selection(&value, &mut report);
                 }
             }
-            Some("agentplane.export.case") => {
+            Line::Case => {
                 read_case_block(&value, &mut report, &mut carried, &mut blob_digests);
             }
-            Some("agentplane.export.run") => {
+            Line::Run => {
                 run_blocks += 1;
                 finish_run(
                     &mut report,
@@ -1005,8 +1013,10 @@ pub(crate) fn verify_observed<R: std::io::BufRead>(
                     claim_once(opened, &mut blocks_of, &mut positions, &mut report);
                 }
             }
-            Some("agentplane.export.end") => read_trailer(&value, &mut report, &mut claims),
-            _ => {
+            Line::End => read_trailer(&value, &mut report, &mut claims),
+            // A line of a kind this build does not know is read as what the
+            // format says an unframed line is — a record — and fails as one.
+            Line::Record | Line::Unknown => {
                 report.records += 1;
                 let Some(pass) = pass.as_mut() else {
                     report.findings.push(
@@ -1044,6 +1054,38 @@ pub(crate) fn verify_observed<R: std::io::BufRead>(
     );
     settle_cases(&mut report, &stamped, &carried, blob_digests);
     Ok(report)
+}
+
+/// What one export line is, by its `kind` — the one classification both
+/// readers of a file use, so the verifier and the restore cannot disagree about
+/// which lines are records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Line {
+    /// The first line: `agentplane.export` or a package header, by name.
+    Header(&'static str),
+    Run,
+    Case,
+    End,
+    /// No `kind` member: the format's one unframed line.
+    Record,
+    /// A `kind` this build does not know, or one that is not a string.
+    Unknown,
+}
+
+impl Line {
+    fn of(value: &serde_json::Value) -> Self {
+        let Some(kind) = value.get("kind") else {
+            return Self::Record;
+        };
+        match kind.as_str() {
+            Some("agentplane.export") => Self::Header("agentplane.export"),
+            Some(DISCLOSURE_KIND) => Self::Header(DISCLOSURE_KIND),
+            Some("agentplane.export.run") => Self::Run,
+            Some("agentplane.export.case") => Self::Case,
+            Some("agentplane.export.end") => Self::End,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// What the trailer claims about the file, held for the settlement.
@@ -1243,6 +1285,9 @@ fn read_case_block(
             .push("a case block's deadlines are malformed".to_owned());
     }
     if let Err(e) = case_hold(value) {
+        report.findings.push(e);
+    }
+    if let Err(e) = case_erasure(value) {
         report.findings.push(e);
     }
     *blob_digests += value
@@ -1809,11 +1854,17 @@ fn read_header(value: &serde_json::Value, report: &mut VerifyReport) {
     if let Some(why) = canon_unverifiable(value.get("canon").and_then(serde_json::Value::as_u64)) {
         report.unverifiable = Some(why);
     }
+    // The reason travels with the refusal: an origin no witness would accept
+    // is refused by the deserializer naming the class, and "unreadable" alone
+    // would leave the reader to guess which member it was.
     match value
         .get("checkpoint")
-        .and_then(|c| serde_json::from_value::<Checkpoint>(c.clone()).ok())
+        .map(|c| serde_json::from_value::<Checkpoint>(c.clone()))
     {
-        Some(c) => report.checkpoint = c,
+        Some(Ok(c)) => report.checkpoint = c,
+        Some(Err(e)) => report
+            .findings
+            .push(format!("the header's checkpoint is unreadable: {e}")),
         None => report
             .findings
             .push("the header carries no readable checkpoint".to_owned()),
@@ -1900,6 +1951,25 @@ fn read_record(
             "run {current}: record {}'s readable body does not match its wire bytes — the \
              display copy was edited, and every hash still verifies over the real one",
             body.seq
+        ));
+        pass.clean = false;
+    }
+    // The line's `seq` and `prev_hash` are copies too — of the body's position
+    // and of the head before it — and held to them the same way, so the two
+    // readers of this format agree that a line saying something its hashed
+    // half does not is a finding rather than a field one of them ignores.
+    let line_prev = value
+        .get("prev_hash")
+        .and_then(|h| serde_json::from_value::<crate::core::Digest>(h.clone()).ok());
+    let line_seq = value.get("seq").and_then(serde_json::Value::as_u64);
+    if line_prev != Some(pass.prev) || line_seq != Some(body.seq) {
+        report.findings.push(format!(
+            "run {current}: record {}'s line says seq {line_seq:?} after {}, and its wire \
+             bytes and the chain say seq {} after {} — the line's copy was edited",
+            body.seq,
+            line_prev.map_or_else(|| "nothing".to_owned(), crate::core::Digest::to_hex),
+            body.seq,
+            pass.prev.to_hex()
         ));
         pass.clean = false;
     }
@@ -2412,20 +2482,34 @@ pub async fn runs_to_read(
     limit: usize,
 ) -> Result<RunsToRead, StoreError> {
     let mut found = RunsToRead::default();
+    // Each run once. The outcome index keeps a run's last conclusion, so a run
+    // quarantined and then resumed is listed under its outcome *and* in flight;
+    // read twice, it is exported as two blocks claiming one run, which the
+    // verifier reports as a file stitched from two histories.
+    let mut listed = std::collections::HashSet::new();
     for outcome in outcomes {
         let runs = store.runs_by_outcome(outcome, limit + 1).await?;
         if runs.len() > limit {
             found.reached.push(outcome.clone());
         }
-        found.runs.extend(runs.into_iter().take(limit));
+        found.runs.extend(
+            runs.into_iter()
+                .take(limit)
+                .filter(|run| listed.insert(*run)),
+        );
     }
     if include_in_flight {
         let flight = runs_in_flight(store, limit).await?;
         if flight.truncated {
             found.reached.push("in-flight runs".to_owned());
         }
-        found.in_flight = flight.runs.len();
-        found.runs.extend(flight.runs);
+        let fresh: Vec<RunId> = flight
+            .runs
+            .into_iter()
+            .filter(|run| listed.insert(*run))
+            .collect();
+        found.in_flight = fresh.len();
+        found.runs.extend(fresh);
         found.unreadable = flight.unreadable;
     }
     Ok(found)
@@ -2811,6 +2895,9 @@ async fn restore_parsed(
                 if let Some(hold) = &block.hold {
                     case_store.place_hold(block.case.id, hold).await?;
                 }
+                if let Some(erasure) = &block.erasure {
+                    restore_erasure(case_store.as_ref(), block.case.id, erasure).await?;
+                }
                 imported += 1;
             }
             not_carried.push(
@@ -2932,17 +3019,22 @@ async fn refuse_before_writing(
 fn refuse_foreign_seals(parsed: &Parsed, tenant: &str) -> Result<(), StoreError> {
     use crate::journal::payload::{self, SealedField};
 
+    // Only an envelope that reads and names another tenant is refused. The
+    // marker is a shape a clear payload can also have — an agent's input of
+    // `{"$sealed": "x"}` is one — and its bytes are not an envelope at all:
+    // refusing it would make an unsealed history unrestorable over a value a
+    // caller typed. A genuine envelope always reads, because the key ring
+    // wrote it.
     let foreign = |envelope: Option<Vec<u8>>, whose: &dyn std::fmt::Display| match envelope
         .as_deref()
         .and_then(payload::sealed_tenant)
     {
-        Some(sealer) if sealer == tenant => Ok(()),
-        sealer => Err(StoreError::Backend(format!(
-            "{whose} carries a payload sealed for tenant '{}', and this store serves \
+        Some(sealer) if sealer != tenant => Err(StoreError::Backend(format!(
+            "{whose} carries a payload sealed for tenant '{sealer}', and this store serves \
                  '{tenant}' — under another tenant it opens for nobody and an erasure \
-                 there would not reach it, so the file is refused before anything is written",
-            sealer.as_deref().unwrap_or("(unreadable envelope)")
+                 there would not reach it, so the file is refused before anything is written"
         ))),
+        _ => Ok(()),
     };
     for run in &parsed.runs {
         for record in &run.records {
@@ -3056,6 +3148,52 @@ struct RestoredCase {
     deadlines: Vec<crate::core::Deadline>,
     blobs: Vec<crate::core::Digest>,
     hold: Option<crate::core::LegalHold>,
+    erasure: Option<crate::case::Erasure>,
+}
+
+/// Mark a restored case erased as its export says, with the original instant
+/// and reason.
+///
+/// Through the store's own erasure verbs, so a restored marker obeys the rules
+/// a live one does: a case under hold or not closed is refused, which a sound
+/// export never carries.
+async fn restore_erasure(
+    cases: &dyn crate::case::CaseStore,
+    case: crate::core::CaseId,
+    erasure: &crate::case::Erasure,
+) -> Result<(), StoreError> {
+    match cases
+        .begin_erasure(case, erasure.at, &erasure.reason)
+        .await?
+    {
+        crate::case::ErasureStart::Marked(_) => {}
+        other => {
+            return Err(StoreError::Backend(format!(
+                "case {case}: the export says it was erased, and the restored case \
+                 refuses the marker ({other:?}) — a case cannot be erased and held, \
+                 or erased and open"
+            )));
+        }
+    }
+    if erasure.complete {
+        cases.complete_erasure(case).await?;
+    }
+    Ok(())
+}
+
+/// A case block's erasure record: `null` for none, an
+/// [`Erasure`](crate::case::Erasure) otherwise, and an error when the member is
+/// missing or unreadable. Shared by the verifier and the restore.
+fn case_erasure(value: &serde_json::Value) -> Result<Option<crate::case::Erasure>, String> {
+    let Some(erasure) = value.get("erasure") else {
+        return Err(
+            "a case block carries no `erasure` member, so whether the matter was erased \
+             is unknown"
+                .to_owned(),
+        );
+    };
+    serde_json::from_value::<Option<crate::case::Erasure>>(erasure.clone())
+        .map_err(|e| format!("a case block's erasure record is malformed: {e}"))
 }
 
 /// A case block's hold: `null` for none, a [`LegalHold`](crate::core::LegalHold)
@@ -3104,11 +3242,19 @@ fn restored_case(value: &serde_json::Value) -> Result<Option<RestoredCase>, std:
             case.id
         ))
     })?;
+    let erasure = case_erasure(value).map_err(|e| {
+        std::io::Error::other(format!(
+            "case {}: {e} — restoring the matter without it would bring an erased case \
+             back as an ordinary one, so the file is refused",
+            case.id
+        ))
+    })?;
     Ok(Some(RestoredCase {
         case,
         deadlines,
         blobs,
         hold,
+        erasure,
     }))
 }
 
@@ -3120,13 +3266,17 @@ fn restored_case(value: &serde_json::Value) -> Result<Option<RestoredCase>, std:
 /// moment they most need it — and the right order is restore, then verify the
 /// result against its own checkpoint, which [`from_jsonl`] reports.
 ///
-/// One class of line is a hard error rather than a skip: a record line that
-/// cannot be *replayed as written*. Its wire bytes must be present and parse —
-/// the one available guess otherwise, the editable display copy, is exactly
-/// the value the wire-bytes rule exists to keep out of the rebuilt history —
-/// and they must be the bytes its hash covers, at the version this build
-/// writes; see [`replayable`]. All of it is decided here, before
-/// [`from_jsonl`] writes anything.
+/// What replay needs is every line: a line that is not JSON, of a kind this
+/// build does not know, a run block naming no run, or a record outside any
+/// block is refused rather than skipped, because skipping it restores a
+/// history with that line missing. The run and record counts are held to the
+/// trailer's, as [`verify`] holds them. And a record line must be *replayable
+/// as written*: its wire bytes must be present and parse — the one available
+/// guess otherwise, the editable display copy, is exactly the value the
+/// wire-bytes rule exists to keep out of the rebuilt history — and they must be
+/// the bytes its hash covers, at the version this build writes; see
+/// [`replayable`]. All of it is decided here, before [`from_jsonl`] writes
+/// anything.
 fn parse<R: std::io::BufRead>(
     input: R,
     upcaster: &dyn crate::journal::Upcaster,
@@ -3146,93 +3296,179 @@ fn parse<R: std::io::BufRead>(
         cases: Vec::new(),
         signed: 0,
     };
-    for line in input.lines() {
+    // The trailer's counts, held against what was read once the file ends.
+    let mut declared: Option<(Option<u64>, Option<u64>)> = None;
+    let mut records = 0u64;
+    let mut run_blocks = 0u64;
+    for (number, line) in input.lines().enumerate() {
         let line = line?;
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        if line.trim().is_empty() {
             continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            return Err(refused(format!(
+                "line {} is not JSON, so whatever it carried would be lost",
+                number + 1
+            )));
         };
-        match value.get("kind").and_then(Value::as_str) {
-            Some("agentplane.export") => {
+        match Line::of(&value) {
+            Line::Header(DISCLOSURE_KIND) => return Err(std::io::Error::other(PACKAGE_REFUSED)),
+            Line::Header(_) => {
                 parsed.version = value.get("version").and_then(Value::as_u64);
                 parsed.canon = value.get("canon").and_then(Value::as_u64);
-                if let Some(c) = value
-                    .get("checkpoint")
-                    .and_then(|c| serde_json::from_value::<Checkpoint>(c.clone()).ok())
-                {
-                    parsed.checkpoint = c;
+                if let Some(c) = value.get("checkpoint") {
+                    parsed.checkpoint =
+                        serde_json::from_value::<Checkpoint>(c.clone()).map_err(|e| {
+                            refused(format!("the header's checkpoint is unreadable: {e}"))
+                        })?;
                 }
             }
-            Some("agentplane.export.run") => {
-                if let Some(run) = value
+            Line::Run => {
+                run_blocks += 1;
+                let Some(run) = value
                     .get("run")
                     .and_then(Value::as_str)
                     .and_then(|s| RunId::parse(s).ok())
-                {
-                    parsed.runs.push(RestoredRun {
-                        run,
-                        index: value.get("index").and_then(Value::as_u64),
-                        outcome: None,
-                        records: Vec::new(),
-                        hashes: Vec::new(),
-                        prev: crate::core::Digest::ZERO,
-                    });
-                }
+                else {
+                    return Err(refused(format!(
+                        "line {} is a run block naming no readable run, so the records under \
+                         it belong to nothing",
+                        number + 1
+                    )));
+                };
+                parsed.runs.push(RestoredRun {
+                    run,
+                    index: value.get("index").and_then(Value::as_u64),
+                    outcome: None,
+                    records: Vec::new(),
+                    hashes: Vec::new(),
+                    prev: crate::core::Digest::ZERO,
+                });
             }
-            Some("agentplane.export.case") => {
+            Line::Case => {
                 if let Some(case) = restored_case(&value)? {
                     parsed.cases.push(case);
                 }
             }
-            Some("agentplane.export.end") => parsed.complete = true,
-            Some(DISCLOSURE_KIND) => return Err(std::io::Error::other(PACKAGE_REFUSED)),
-            // A line carrying a `kind` this build does not recognise is not a
-            // record — record lines are the only unkinded lines in the format
-            // — so it is skipped per the no-checking rule rather than held to
-            // a record's obligations.
-            Some(_) => {}
-            _ => {
-                if value.get("signature").is_some_and(|a| !a.is_null()) {
-                    parsed.signed += 1;
-                }
-                // The wire bytes are the source of truth, exactly as they are
-                // for the verifier: the readable `body` is a courtesy copy,
-                // and a restore replaying the copy would rebuild whatever the
-                // display half said rather than what the chain covered. There
-                // is deliberately **no fallback to that copy**: a record line
-                // with no `raw`, or whose `raw` does not parse, is a hard
-                // error rather than a skip or a guess — silently substituting
-                // the one editable value two mechanisms must agree about would
-                // rebuild a history the chain never hashed and let the
-                // subsequent verify pass bless it.
-                let Some(raw) = value.get("raw").and_then(Value::as_str) else {
-                    return Err(std::io::Error::other(
-                        "a record line carries no wire bytes (`raw`) — restoring its display \
-                         copy instead would rebuild what the readable half says rather than \
-                         what the chain hashed, so the file is refused instead of guessed at",
-                    ));
-                };
-                let Some(claimed) = value
-                    .get("hash")
-                    .and_then(|h| serde_json::from_value::<crate::core::Digest>(h.clone()).ok())
-                else {
-                    return Err(std::io::Error::other(
-                        "a record line carries no hash — nothing ties its bytes to the chain, \
-                         so the file is refused instead of replayed",
-                    ));
-                };
-                let Some(current) = parsed.runs.last_mut() else {
-                    continue;
-                };
-                let record = replayable(raw.as_bytes(), current.prev, claimed, upcaster)?;
-                current.prev = claimed;
-                if let crate::journal::RecordKind::RunConcluded { outcome, .. } = &record.body.kind
-                {
-                    current.outcome = Some(outcome.clone());
-                }
-                current.records.push(record);
-                current.hashes.push(claimed);
+            Line::End => {
+                parsed.complete = true;
+                declared = Some((
+                    value.get("runs_requested").and_then(Value::as_u64),
+                    value.get("records").and_then(Value::as_u64),
+                ));
+            }
+            // Record lines are the only unkinded lines in the format, so a
+            // `kind` this build does not know is neither a frame it can read
+            // nor a record it can replay — and skipping it would restore a
+            // history with whatever it carried missing.
+            Line::Unknown => {
+                return Err(refused(format!(
+                    "line {} is of a kind this build does not know ({})",
+                    number + 1,
+                    value.get("kind").map(Value::to_string).unwrap_or_default()
+                )));
+            }
+            Line::Record => {
+                records += 1;
+                restore_record(&value, number, &mut parsed, upcaster)?;
             }
         }
     }
+    if let Some(counts) = declared {
+        held_to_trailer(counts, run_blocks, records)?;
+    }
     Ok(parsed)
+}
+
+/// A refusal of the whole file, before anything is written.
+fn refused(mut what: String) -> std::io::Error {
+    what.push_str(
+        " — a restore writes back every line or none, so the file is refused \
+         before anything is written",
+    );
+    std::io::Error::other(what)
+}
+
+/// One record line, replayed into the run block it follows.
+fn restore_record(
+    value: &serde_json::Value,
+    number: usize,
+    parsed: &mut Parsed,
+    upcaster: &dyn crate::journal::Upcaster,
+) -> Result<(), std::io::Error> {
+    use serde_json::Value;
+
+    if value.get("signature").is_some_and(|a| !a.is_null()) {
+        parsed.signed += 1;
+    }
+    // The wire bytes are the source of truth, exactly as they are for the
+    // verifier: the readable `body` is a courtesy copy, and a restore
+    // replaying the copy would rebuild whatever the display half said rather
+    // than what the chain covered. There is deliberately **no fallback to
+    // that copy**: a record line with no `raw`, or whose `raw` does not parse,
+    // is a hard error rather than a skip or a guess — silently substituting
+    // the one editable value two mechanisms must agree about would rebuild a
+    // history the chain never hashed and let the subsequent verify pass bless
+    // it.
+    let Some(raw) = value.get("raw").and_then(Value::as_str) else {
+        return Err(std::io::Error::other(
+            "a record line carries no wire bytes (`raw`) — restoring its display \
+             copy instead would rebuild what the readable half says rather than \
+             what the chain hashed, so the file is refused instead of guessed at",
+        ));
+    };
+    let Some(claimed) = value
+        .get("hash")
+        .and_then(|h| serde_json::from_value::<crate::core::Digest>(h.clone()).ok())
+    else {
+        return Err(std::io::Error::other(
+            "a record line carries no hash — nothing ties its bytes to the chain, \
+             so the file is refused instead of replayed",
+        ));
+    };
+    let Some(current) = parsed.runs.last_mut() else {
+        return Err(refused(format!(
+            "line {} is a record before any run block, so nothing says which run it \
+             belongs to",
+            number + 1
+        )));
+    };
+    let record = replayable(raw.as_bytes(), current.prev, claimed, upcaster)?;
+    current.prev = claimed;
+    if let crate::journal::RecordKind::RunConcluded { outcome, .. } = &record.body.kind {
+        current.outcome = Some(outcome.clone());
+    }
+    current.records.push(record);
+    current.hashes.push(claimed);
+    Ok(())
+}
+
+/// The trailer's accounting, held as `verify` holds it: a file whose lines
+/// were removed or added after it was taken restores a history the export
+/// never described, and every line in it is valid on its own. A file with no
+/// trailer is refused by the caller, which names the truncation.
+fn held_to_trailer(
+    declared: (Option<u64>, Option<u64>),
+    run_blocks: u64,
+    records: u64,
+) -> Result<(), std::io::Error> {
+    let (Some(requested), Some(written)) = declared else {
+        return Err(refused(
+            "the trailer is missing the run and record counts this format always writes, \
+             so the file cannot be held to its own accounting"
+                .to_owned(),
+        ));
+    };
+    if requested != run_blocks {
+        return Err(refused(format!(
+            "the trailer says {requested} run(s) were requested and the file carries \
+             {run_blocks} run block(s)"
+        )));
+    }
+    if written != records {
+        return Err(refused(format!(
+            "the trailer says {written} record(s) were written and the file carries {records}"
+        )));
+    }
+    Ok(())
 }

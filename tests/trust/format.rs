@@ -2262,3 +2262,124 @@ async fn a_step_this_build_writes(
         .find(|r| matches!(r.kind(), RecordKind::StepStarted { .. }))
         .expect("the step record")
 }
+
+/// **Both readers refuse every origin the crate refuses, in the export
+/// header.** The origin is matched against a witness's memory and an auditor's
+/// anchor, so a header naming a log no conforming witness would accept is
+/// refused by this crate's verifier naming the class — and a second reader
+/// that took it would be the one reader an auditor could be handed a file
+/// that passes.
+#[test]
+fn the_second_reader_refuses_every_origin_the_crate_refuses() {
+    let golden = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/export.jsonl"),
+    )
+    .expect("tests/golden/export.jsonl");
+    let dir = std::env::temp_dir().join(format!("agentplane-origins-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    for (class, origin) in [
+        ("empty", String::new()),
+        ("256 bytes", "a".repeat(256)),
+        ("a space", "agentplane/acme corp".to_owned()),
+        ("U+00A0", "agentplane/acme\u{a0}corp".to_owned()),
+        ("U+3000", "agentplane/acme\u{3000}corp".to_owned()),
+        ("a plus", "agentplane/a+b".to_owned()),
+        ("a newline", "agentplane\nforged".to_owned()),
+        ("a tab", "agentplane\tlog".to_owned()),
+        ("a control character", "agentplane\u{1}".to_owned()),
+    ] {
+        let file = golden
+            .lines()
+            .enumerate()
+            .map(|(at, line)| {
+                let mut v: Value = serde_json::from_str(line).expect("json");
+                if at == 0 {
+                    v["checkpoint"]["origin"] = json!(origin);
+                }
+                serde_json::to_string(&v).expect("line")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let ours = agentplane::export::verify(std::io::Cursor::new(file.as_bytes()), None, &[])
+            .expect("the file reads");
+        assert!(
+            ours.findings
+                .iter()
+                .any(|f| f.contains("checkpoint origin")),
+            "{class}: this crate's verifier took the origin: {:#?}",
+            ours.findings
+        );
+
+        let path = dir.join("origin.jsonl");
+        std::fs::write(&path, &file).expect("write");
+        let out = std::process::Command::new("python3")
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .arg("tools/verify_export.py")
+            .arg(&path)
+            .output()
+            .expect("python3 runs the second reader");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.code() == Some(1) && said.contains("checkpoint origin"),
+            "{class}: the second reader took the origin:\n{said}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// **The second reader's record vocabulary is the format's.** It refuses a
+/// record of a kind outside its list, so a kind this build writes and the list
+/// lacks is a sound export the second reader calls damaged, and a kind the
+/// list keeps after the build dropped it is one it passes that this crate
+/// refuses. Held to the corpus, which holds one vector per kind this build
+/// writes.
+#[test]
+fn the_second_readers_record_vocabulary_is_the_corpus_s() {
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tools/verify_export.py"),
+    )
+    .expect("tools/verify_export.py");
+    let list = source
+        .split_once("RECORD_KINDS = frozenset(")
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(list, _)| list)
+        .expect("the second reader declares RECORD_KINDS");
+    let theirs: BTreeSet<String> = list
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect();
+    let ours: BTreeSet<String> = corpus()
+        .iter()
+        .map(|kind| kind.kind_str().to_owned())
+        .collect();
+    assert_eq!(
+        theirs, ours,
+        "tools/verify_export.py's RECORD_KINDS is not the vocabulary this build writes"
+    );
+}
+
+/// **The second reader re-derives every record vector and every number
+/// vector.** `--canon-check` is the half of the second reader that produces
+/// bytes rather than checking them, and the number vectors are the only
+/// coverage its double formatting has: no record vector carries a double.
+#[test]
+fn the_second_readers_canon_check_re_derives_every_vector() {
+    let out = std::process::Command::new("python3")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "tools/verify_export.py",
+            "tests/golden/records.jsonl",
+            "--canon-check",
+        ])
+        .output()
+        .expect("python3 runs the second reader");
+    assert!(
+        out.status.success(),
+        "the second reader's canonicalizer disagrees:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

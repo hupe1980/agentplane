@@ -36,12 +36,19 @@ async fn an_acp_session_is_recorded_audited_and_never_reads_as_an_effect() {
     // What the user asked.
     let prompted = update(
         r#"{"sessionId":"sess-1","update":{"sessionUpdate":"user_message_chunk",
-            "title":"rename the config loader"}}"#,
+            "content":{"type":"text","text":"rename the config loader"}}}"#,
     );
     let Mapped::Step { step, detail } = acp::step_of(&prompted) else {
         panic!("a user turn is evidence and must be recorded");
     };
     assert_eq!(step, ObservedStep::Prompted);
+    // ACP v1 carries a message chunk's words in `content`, a `ContentBlock`;
+    // a `user_message_chunk` has no `title`.
+    assert_eq!(
+        detail.as_deref(),
+        Some("rename the config loader"),
+        "the user's instruction was not read from the chunk's content"
+    );
     session.step(step, detail).await.expect("record");
 
     // What the agent reported doing.

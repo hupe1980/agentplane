@@ -71,7 +71,10 @@ pub struct Lease {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Checkpoint {
     /// Which log. A deployment-chosen name, so two planes' checkpoints cannot
-    /// be confused for one another.
+    /// be confused for one another. Held to [`Checkpoint::validate_origin`]
+    /// when read, so a header or file naming a log no witness would accept is
+    /// refused here as it would be there.
+    #[serde(deserialize_with = "deserialize_origin")]
     pub origin: String,
     /// How many runs are committed to.
     pub size: u64,
@@ -81,7 +84,51 @@ pub struct Checkpoint {
 
 use super::note::{b64, unb64};
 
+fn deserialize_origin<'de, D: serde::Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+    let origin = <String as serde::Deserialize>::deserialize(de)?;
+    Checkpoint::validate_origin(&origin).map_err(serde::de::Error::custom)?;
+    Ok(origin)
+}
+
 impl Checkpoint {
+    /// The longest origin C2SP `tlog-cosignature` admits, in UTF-8 bytes.
+    pub const MAX_ORIGIN_BYTES: usize = 255;
+
+    /// Whether `origin` may name a log, by C2SP `tlog-cosignature`'s rule: a
+    /// non-empty UTF-8 string of at most 255 bytes with no Unicode space, no
+    /// `+` and no control character below U+0020.
+    ///
+    /// One rule for every door an origin arrives at — a store's name, a note,
+    /// an export header, a witness lookup — because a log named one way here
+    /// and refused by a conforming witness is a log whose checkpoints nobody
+    /// can cosign, and a newline in it is a note that reads back as another.
+    ///
+    /// # Errors
+    ///
+    /// Naming the class and, for a character, which one.
+    pub fn validate_origin(origin: &str) -> Result<(), StoreError> {
+        let bad = |what: String| StoreError::Backend(format!("checkpoint origin: {what}"));
+        if origin.is_empty() {
+            return Err(bad("is empty, so it names no log".to_owned()));
+        }
+        if origin.len() > Self::MAX_ORIGIN_BYTES {
+            return Err(bad(format!(
+                "is {} bytes, and a witness accepts at most {}",
+                origin.len(),
+                Self::MAX_ORIGIN_BYTES
+            )));
+        }
+        if let Some(c) = origin
+            .chars()
+            .find(|c| c.is_whitespace() || *c == '+' || u32::from(*c) < 0x20)
+        {
+            return Err(bad(format!(
+                "contains {c:?}, which tlog-cosignature forbids in an origin"
+            )));
+        }
+        Ok(())
+    }
+
     /// The C2SP `tlog-checkpoint` note body: origin, size, base64 root.
     ///
     /// A text form matters more than it looks. A checkpoint is the one artifact
@@ -149,9 +196,7 @@ impl Checkpoint {
                  ignores them lets two different signed texts name one checkpoint",
             ));
         }
-        if origin.is_empty() {
-            return Err(bad("the origin is empty, so the note names no log"));
-        }
+        Self::validate_origin(origin)?;
         // A leading zero, a `+`, or surrounding space would all be accepted by
         // `parse` after trimming, and each is a second spelling of one number.
         if size.is_empty()
@@ -764,6 +809,51 @@ pub trait JournalStore: Send + Sync + Debug {
     ///
     /// If the store is unreachable, or `old_size` exceeds the current log.
     async fn consistency_proof(&self, old_size: u64) -> Result<Vec<Digest>, StoreError>;
+
+    /// Prove the log as it stood at `new_size` leaves extends the one at
+    /// `old_size` — the proof for a checkpoint an earlier
+    /// [`checkpoint`](Self::checkpoint) returned, not for the live log.
+    ///
+    /// A witness verifies a proof against the checkpoint it is handed, so a
+    /// proof built against a log one seal larger fails there and reads as a
+    /// fork. The default answers only while the log is still at `new_size`,
+    /// read on both sides of the proof so a seal landing between them is
+    /// refused rather than proved against another tree; a backend that holds
+    /// the leaves answers at any past size.
+    ///
+    /// # Errors
+    ///
+    /// If the store is unreachable, `old_size > new_size`, `new_size` exceeds
+    /// the log, or the log moved while the default was proving.
+    async fn consistency_proof_at(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<Vec<Digest>, StoreError> {
+        let moved = |live: u64| {
+            StoreError::Backend(format!(
+                "this store proves consistency only against its live log ({live} leaves), \
+                 and {new_size} was asked for"
+            ))
+        };
+        if old_size > new_size {
+            return Err(StoreError::Backend(format!(
+                "a consistency proof runs from a smaller tree to a larger one, and \
+                 {old_size} → {new_size} does not"
+            )));
+        }
+        let before = self.checkpoint().await?.size;
+        if before != new_size {
+            return Err(moved(before));
+        }
+        let proof = self.consistency_proof(old_size).await?;
+        // The log only grows, so the same size on both sides is the same tree.
+        let after = self.checkpoint().await?.size;
+        if after != new_size {
+            return Err(moved(after));
+        }
+        Ok(proof)
+    }
 
     /// Prove a sealed run is in the log this checkpoint commits to.
     ///

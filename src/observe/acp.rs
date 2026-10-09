@@ -73,9 +73,28 @@ pub struct Update {
     /// A human-readable title for the call.
     #[serde(default)]
     pub title: Option<String>,
+    /// The chunk a message update carries.
+    #[serde(default)]
+    pub content: Option<ContentBlock>,
     /// Why the turn stopped, where the update says so.
     #[serde(rename = "stopReason", default)]
     pub stop_reason: Option<String>,
+}
+
+/// One `ContentBlock`, in the subset this plane records: its kind, and its
+/// text when it is a text block.
+///
+/// The other kinds — an image, an audio clip, a resource — are kept as their
+/// kind alone. A record of a prompt holds what the user said, not a copy of
+/// every attachment, and the kind still says something arrived.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentBlock {
+    /// The discriminator, in the wire's own spelling.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// The text, for a `text` block.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// A `session/request_permission` request, in the subset this plane records.
@@ -161,9 +180,15 @@ pub fn step_of(update: &Update) -> Mapped {
     };
     match update.session_update.as_str() {
         // The user's turn: the instruction is the evidence, and it is theirs.
+        // A message chunk carries its words in `content`, a `ContentBlock`;
+        // one that is not text is recorded as a prompt with no words.
         "user_message_chunk" => Mapped::Step {
             step: ObservedStep::Prompted,
-            detail: update.title.clone(),
+            detail: update
+                .content
+                .as_ref()
+                .filter(|block| block.kind == "text")
+                .and_then(|block| block.text.clone()),
         },
         "tool_call" | "tool_call_update" => {
             let Some(call) = update.tool_call_id.clone() else {

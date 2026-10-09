@@ -94,9 +94,10 @@ confused-deputy bug.
 The peer is a server name in a grant. `tool://reviewer/audit.check` is offered
 to a tool-calling model like any tool and dispatches to the registered peer
 `reviewer`; the grant's protected fields and ceiling govern the hop at the sink,
-its `mutates` can only make the hop more cautious than the registry's wiring,
-and the answer is labelled with the same reference so a source rule can name
-it. Which of the four things a server name can be — a tool transport, typed
+its ceiling can only tighten the wiring's `PeerGrant` `max_sensitivity`,
+never widen it, its `mutates` can only make the hop more cautious than the
+registry's wiring, and the answer is labelled with the same reference so a
+source rule can name it. Which of the four things a server name can be — a tool transport, typed
 tools, an agent on this plane, a peer — is settled once, at build, and a name
 that could be two of them refuses the build.
 
@@ -108,12 +109,13 @@ one of two ways, and the difference is what the peer can see:
 - **A held credential** (`PeerGrant::with_credential`, or the CLI's
   `AGENTPLANE_PEER_TOKEN_<NAME>`). It names nobody: every run on the plane
   presents the same token, so the peer sees the plane as its caller and cannot
-  tell one run's principal from another's.
+  tell one run's principal from another's. A credential naming a subject is
+  refused there at startup; it comes from a source.
 - **A credential source** (`PeerGrant::with_source`). Each hop presents a
   credential for the run's owner — the person at the root of its chain — with
   the plane as actor, valid only at that peer. A run acting for nobody is
-  refused; a run admitted as the plane presents the plane's own held
-  credential, or is refused if there is none.
+  refused; a run admitted as the plane, or commissioned by one, presents the
+  plane's own held credential, or is refused if there is none.
 
 `peers::TokenEndpoint` (`a2a` feature) obtains such credentials by OAuth token
 exchange (RFC 8693) at the deployment's issuer: the owner's principal id as the
@@ -122,7 +124,10 @@ credential as the actor token; the peer as `audience`, and as the RFC 8707
 `resource` where one is mapped. Put `Cached` in front of it. The issuer takes
 the plane's word for the subject because it authenticated the plane — a
 resumed run holds no inbound token to present. A refusal reports the OAuth
-error code only.
+error code only. An answer that is not a bearer access token — an
+`issued_token_type` other than an access token, a `token_type` other than
+`Bearer`, or an empty token — is refused as the issuer's final answer. A token
+with no `expires_in` is held five minutes.
 
 The call, the remote task read and the cancel all present the same run's
 credential. Which kind a hop presented is on its `EffectStarted` record
@@ -134,7 +139,8 @@ only at the next step boundary: each live subject-bound hop reads the halts
 first, and on a match no credential is presented, every source drops what it
 holds for that subject, and the run is withheld exactly as a withdrawal at a
 step boundary withholds it. An undo is exempt, as it is from a budget's
-verdict.
+verdict. Throwing or lifting a subject halt also drops the credentials held for
+that subject, and `CredentialSource::forget`, which does that, has no default.
 
 Four decisions there are worth stating.
 
@@ -208,14 +214,9 @@ the part that decides.** A governed suspension has no expression on MCP without
 the Tasks extension, so that is what this plane depends on; `2026-07-28` is the
 revision carrying it.
 
-Stated the other way round the promise would have to be
-re-made every time the specification moved, because a Current revision keeps
-receiving backwards-compatible changes under the same date, and the
-specification's own lifecycle states — Active, Deprecated, Removed, with a
+The specification's lifecycle states — Active, Deprecated, Removed, with a
 twelve-month floor before removal — are defined per **feature**, not per
-revision. The specification says the rest of it directly: removal from the
-specification does not oblige an implementation to drop a feature, and that
-timeline is the implementation's own.
+revision.
 
 **Served, this plane speaks two revisions, and the promise is per extension.**
 They are `2026-07-28` and `2025-11-25`, one constant with the calling half. A
@@ -223,7 +224,9 @@ host holding the Tasks extension — `2026-07-28` with
 `io.modelcontextprotocol/tasks` declared — is offered every tool. A host
 without it, which is any `2025-11-25` session and any `2026-07-28` host that
 does not declare the extension, is offered only the tools whose runs can never
-suspend, and calling another by name is refused before anything is admitted.
+suspend, and calling another by name is refused before anything is admitted,
+with the extension's own `-32021` (missing required client capability) naming
+`io.modelcontextprotocol/tasks`.
 `2025-11-25`'s experimental tasks are not implemented: a tool there with no
 `taskSupport` is `forbidden`, which is what a never-suspending tool is. A
 revision older than `2025-11-25` is refused at the handshake, naming the two.
@@ -327,6 +330,9 @@ peer to stop it, so a run that commissioned remote work and is itself cancelled
 propagates the stop rather than leaving the peer spending on an answer nobody
 will read. The cancel is cooperative and safely retryable: a repeat of one that
 landed meets the protocol's `TaskNotCancelable` refusal, never a second act.
+Under a manifest, reading or cancelling a task at a peer (`cx.peer_task`,
+`cx.cancel_peer_task`) requires the manifest to grant some capability at that
+peer.
 Strict replay reads the recorded snapshot and never polls again. Subscription
 remains a server-side journal view rather than a second client event channel;
 outbound callers use explicit polling or an application webhook mapped into the
@@ -441,26 +447,26 @@ derive it, because the two sets of nouns overlap without matching:
 | `contextId` | a **case** — the long-lived matter many runs share | which is why every task carries one, and why a server needs a case layer to serve A2A at all |
 | *(no equivalent)* | a **human task** — a worklist item awaiting a person | "task" is already three protocols' word; this one never crosses the A2A wire |
 
-The mapping is deliberately at the adapter and not in the core's names:
-protocols are wire contracts, and renaming the engine after one of several
-adapters would make `task` mean three things in one codebase.
-
-It is a **separate router**, not routes on the operator API. That surface's
-invariant is that every route authenticates, and an Agent Card is public by
-definition — it is what a caller reads *before* it has credentials. Adding one
-unauthenticated path to a surface built on "every route authenticates" deletes
-the invariant for the one route nobody would think to check.
+It is a **separate router**, not routes on the operator API: every operator
+route authenticates, and an Agent Card is public by definition.
 
 | Method | Behaviour |
 |---|---|
 | `SendMessage` | blocking returns a completed `Task` with the answer artifact; `returnImmediately` returns a working `Task` |
 | `GetTask` | state, bounded input history, and replay-reconstructed terminal artifacts |
-| `CancelTask` | a durable stop request; the task stays `WORKING` |
+| `CancelTask` | a durable stop request; the task stays `WORKING`. It reaches failed, exhausted and withheld runs too; a closed or quarantined run answers `-32002` |
 | `GetExtendedAgentCard` | the authenticated card |
 | `SendStreamingMessage`, `SubscribeToTask` | SSE status and artifact updates, read from the journal; terminal subscription is refused; at most `streams_per_caller` (default 8) open per peer |
 | `ListTasks` | newest-first, cursor-paginated and per-task-authorized, with context/status/time filters, bounded history and optional artifacts — both bounded, see below |
 | the push-notification configs | durable create/get/list/delete when wired; the protocol-specific refusal otherwise |
 | anything else | `-32601`, method not found |
+
+Every method authenticates before its parameters are read: an unauthenticated
+call answers 401 whatever it names. A continuation does not take
+`taskPushNotificationConfig`; register with `CreateTaskPushNotificationConfig`.
+A withheld run reads `TASK_STATE_AUTH_REQUIRED`, an interrupted state: a
+continuation is refused because the run resumes when the deployment restores its
+authority, not on a message.
 
 **A task belongs to the peer that admitted it.** Every method that names a task
 — `GetTask`, `CancelTask`, `SubscribeToTask`, a continuation, every push-config
@@ -475,7 +481,7 @@ one fixed sentence; the detail goes to the operator's log.
 **`ListTasks` bounds both of its expensive answers, and says when a bound
 bit.** Every listing is bounded by `filter_scan_budget` (default 1024 of the
 caller's own tasks) because the spec's `totalSize` is the exact
-pre-pagination count and an unbounded listing would buy a scan of every task
+pre-pagination count — the listing's total on every page — and an unbounded listing would buy a scan of every task
 the caller ever opened. The candidates are read from an index of the runs each
 peer admitted, maintained by the journal in the write that records each
 admission, so another peer's runs and the embedder's cost a listing nothing —
@@ -490,14 +496,10 @@ budget returns the remaining tasks without artifacts and marks each with
 id recovers them. A bounded result must not be shaped like a complete one.
 
 **One task has one state, whichever surface reports it.** `GetTask`, the row a
-task occupies in `ListTasks`, and the snapshot a subscription opens with are
-three views of one run's history, and they answer from one function that reads
-it. Three copies of that reading would agree until a record kind was added or a
-suspension reworded — after which a client that polled, one that listed and one
-that subscribed would each be told something different, each would be behaving
-correctly, and the protocol gives them no way to discover the disagreement. The
-surfaces differ only in what an *empty* history means: no such task for a fetch,
-a working row for a listing that must not fail its page over one unreadable run.
+task occupies in `ListTasks`, and the snapshot a subscription opens with answer
+from one function that reads the run's history. They differ only in what an
+*empty* history means: no such task for a fetch, a working row for a listing
+that must not fail its page over one unreadable run.
 
 **Blocking is the default, and unset means blocking** — the spec's rule. A
 successful blocking call returns the skill output as a text or data artifact; a
@@ -714,20 +716,11 @@ forward.
 
 #### One client, judged at connect
 
-Pinning a connection to pre-approved addresses is the obvious way to stop a name
-resolving somewhere else between the check and the connect. It costs an HTTP
-client per destination — a pin is a property of the client — so a caller that
-pins builds a fresh connection pool, TLS session and handshake for every
-message. A delivery sweep or an agent delegating to a peer in a loop pays that
-per event.
+The address rule lives in the client's DNS resolver rather than in a
+per-destination pin, so one pooled client serves every destination and every
+connection it opens later is judged too.
 
-The rule lives in the client's DNS resolver instead. That keeps the guarantee
-and drops the cost, and strengthens it: a **pooled** client opens connections
-long after any pre-flight returned, and those are exactly the ones a one-shot
-check never saw.
-
-The pre-flight stays, and is not redundant — the two cover different things.
-The pre-flight judges **every** destination once, including an IP literal, and
+A pre-flight check runs as well, and covers something different. It judges **every** destination once, including an IP literal, and
 is the only one that can say *which* refusal happened: a DNS hook can only fail,
 and a forbidden address must not read as a receiver that is merely down, because
 one is never retried and the other always is. The resolver judges **every name
@@ -775,28 +768,18 @@ memory its reply costs. See
 
 #### The stream is a view of the journal, not an event bus
 
-The obvious way to stream progress is an in-process broadcast channel: a step
-finishes, it publishes, subscribers receive. It is wrong here in three ways that
-only appear in production.
-
-A channel's events live in memory, so a subscriber that reconnects has **missed**
-whatever happened while it was away and nothing can tell it what. A channel is
-per process, so a subscriber attached to the instance that is *not* running the
-work receives nothing — and which instance that is changes after every failover.
-And a channel is a second record of what happened, which can disagree with the
-first.
-
-Reading updates from the journal instead makes the stream exactly as durable as
-the run: a client that drops and re-subscribes picks up the current state and
+Updates are read from the journal, not from an in-process channel, so the
+stream is exactly as durable as the run: a client that drops and re-subscribes picks up the current state and
 continues, any instance can serve it, and the events cannot disagree with history
 because they *are* history. The cost is a poll rather than a push — one indexed
 read per subscriber per interval — and it is stated rather than hidden.
 
-Two endings, not one. The spec requires closing on a terminal state; this also
-closes on `INPUT_REQUIRED`, because a suspended run may be waiting on a person
-for a week and holding a connection open for that is a leak with a spec
-reference. Reconnecting costs the client nothing, since the stream is rebuilt
-from history rather than resumed from memory.
+The stream stays open across `INPUT_REQUIRED`: a person's decision continues
+the same task. It ends when the run concludes — including a withheld conclusion,
+reported as `AUTH_REQUIRED`, which a client re-subscribes to follow — or when
+this instance stops. A client that would rather not hold a connection for a waiting run can
+drop it and re-subscribe at any time; reconnecting costs nothing, since the
+stream is rebuilt from history rather than resumed from memory.
 
 There is deliberately **no SSE keep-alive**: with one, the response body does
 not end when the stream does, so the connection outlives the task — the exact
@@ -823,7 +806,8 @@ handle still means something after a restart or from another instance.
 `tasks/cancel` is the runtime's own cancellation, recorded and honoured at the
 next step boundary. Both act only on runs the asker admitted — any other run id
 answers as no such task — and a completed task hands back the call's own result,
-a cancelled one reads `cancelled`.
+a cancelled one reads `cancelled`, a suspended or withheld one reads `working`,
+and any other concluded run reads `failed`.
 
 **A host that cannot hold a task is offered only what never needs one.** A run
 may suspend when its agent declares oversight, a grant asks for approval, a
@@ -947,15 +931,10 @@ wire every self-hosted server speaks. The separate `bedrock` feature ships
 Amazon Bedrock Runtime Converse through the AWS SDK; separate gating avoids
 imposing its dependency graph on the HTTP drivers.
 
-They exist partly to prove the seam is right — that a driver can report *what a
-failure consumed* — and partly because the thing a driver must not get wrong is
-not the transport. Three of the four carry provider-owned continuation
-state (OpenAI's encrypted reasoning items, Anthropic's signed thinking blocks,
-Gemini's thought signatures), and all three do it the same way: **the provider's
-own turn, verbatim and opaque**. That is a shape rather than three
-accommodations. A driver that normalises the assistant turn into a neutral
-representation has nowhere to keep what it does not understand, and what it does
-not understand is exactly what the next request has to return.
+Three of the four carry provider-owned continuation state (OpenAI's encrypted
+reasoning items, Anthropic's signed thinking blocks, Gemini's thought
+signatures), and all three keep it the same way: **the provider's own turn,
+verbatim and opaque**, because that is what the next request has to return.
 
 Status classification is shared between them, in `model::wire`, because it is
 doctrine rather than vendor detail:

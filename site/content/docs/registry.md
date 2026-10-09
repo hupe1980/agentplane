@@ -91,20 +91,10 @@ let rt = Runtime::builder(store)
     .build();
 ```
 
-The claim this unlocks is worth stating precisely, and as a **conjunction**
-rather than as a boast about what nobody else has — a negative about every
-product in a field moving this fast is not a claim anyone can check. A
-declarative agent here is content-addressed **in its entirety**, *and* every step
-it takes is journaled, *and* the run replays deterministically.
-
-Each half exists elsewhere; the pairing is the point. Declarative agent formats
-(`agent.yaml`, CrewAI, ADK) give you the first — a reviewable, versioned file.
-Durable-execution platforms give you the second and third, and as of Dapr 1.18
-they sign and attest that history too. What is hard to assemble from either side
-is a file that is *both* the whole definition of the agent and the thing whose
-execution replays: a signed history of a program you cannot fully see is
-evidence about a black box, and a reviewable file with no execution record is a
-description of intentions.
+A declarative agent here is content-addressed **in its entirety**, *and* every
+step it takes is journaled, *and* the run replays deterministically: the file
+is both the whole definition of the agent and the thing whose execution
+replays.
 
 Two refusals keep it honest. A manifest declaring `execution` with no capability
 is refused — an agent nothing can call is a file that does nothing. And a
@@ -116,11 +106,12 @@ exact substitution this layer exists to prevent.
 `kind` is an enum, deliberately short, and every variant is a behaviour that is
 implemented and tested. A config format whose behaviours are open-ended is one
 nobody can review, because the reviewer would have to know what the string does.
-Three exist: `completion` (one model call, answered in the declared shape),
-`tool-calling` (call tools until the model stops asking) and `planned` (plan
+Four exist: `completion` (one model call, answered in the declared shape),
+`tool-calling` (call tools until the model stops asking), `planned` (plan
 once over trusted input, then execute with step outputs routed by reference
-rather than back through a model's context). A fourth would have to meet the
-same standard rather than being a string that happens to parse.
+rather than back through a model's context) and `call` (dispatch the one
+granted tool with the input as its arguments, calling no model) →
+[`spec.execution`](@/docs/manifest.md#spec-execution).
 
 ### Oversight, declared without a predicate
 
@@ -134,7 +125,7 @@ spec:
   oversight:
     approval: required
     approvers: [role:compliance-officer]
-    deadline: klaerung          # resolved by your Calendar
+    deadline: { name: klaerung, kind: working-days, params: { n: 1 } }   # resolved by your Calendar
     on_expiry: deny             # the default
 ```
 
@@ -173,9 +164,9 @@ skill, written in a language built for decisions.
 A field read by convention is two independent copies of one decision. The
 reviewer approves `model: haiku`, the code calls opus, and nothing anywhere
 disagrees — worse than useless, because it manufactures confidence. So the rule
-is: **a field either has an enforcement point, or it is marked as intent.**
+is: **a field either has an enforcement point, or it is refused.**
 
-What enforces today, before dispatch:
+What enforces before dispatch:
 
 | Field | Refused when | Reported as |
 |---|---|---|
@@ -256,12 +247,10 @@ must govern behavior, not describe behavior implemented somewhere else.
 Three combinations are refused, because the fields are individually fine and it
 is the combination that describes nothing:
 
-* **`specialist` with `max_delegation_depth` above zero.** The consistently
-  reported top failure mode of handoff architectures is the infinite loop — A
-  hands to B, B to C, C back to A. The structural answer is that most agents in
-  an arrangement have no authority to hand off at all, and a specialist that may
-  delegate is an orchestrator nobody reviewed as one. The role itself imposes
-  zero at dispatch when the numeric field is omitted.
+* **`specialist` with `max_delegation_depth` above zero.** A specialist that
+  may delegate is an orchestrator nobody reviewed as one, and handoff loops
+  start there. The role itself imposes zero at dispatch when the numeric field
+  is omitted.
 * **`single` with a coordinating role.** There is nobody to orchestrate or route
   to.
 * **`collaborative` with no `reason`, or a `reason` without `collaborative`.**
@@ -275,11 +264,9 @@ is the combination that describes nothing:
   and an unchecked justification is not a weak control but an escape hatch,
   since a plan refused as false parallelism was approved by editing one word.
 
-`distinct-authority` deserves emphasis because neither side of the public
-multi-agent debate raises it: **the best reason to split agents is often
-security, not capability.** If a sub-task needs credentials the parent should not
-hold, delegating to a narrower agent is least privilege, and the coordination
-cost buys a real security property rather than hypothetical speed.
+`distinct-authority` deserves emphasis: **the best reason to split agents is
+often security, not capability.** If a sub-task needs credentials the parent
+should not hold, delegating to a narrower agent is least privilege.
 
 ### A model id is a behaviour change, so it is versioned like one
 
@@ -401,9 +388,7 @@ redundant:
 | **Publisher immutability** | identical bytes attributed to a different signer | write time | the registry |
 
 Immutability is what makes "we reviewed 2.0.0" a statement about an artifact
-rather than about a Tuesday — the property Go's module proxy and crates.io both
-arrived at, and the one whose absence produced the npm and PyPI incidents.
-Re-publishing *identical* content still succeeds, because a retried deploy is
+rather than about a Tuesday. Re-publishing *identical* content still succeeds, because a retried deploy is
 not an attack and treating it as one teaches people to force.
 
 A pin is the caller declining to need that promise. It is the only one of the
@@ -415,8 +400,8 @@ call should be the one you can see at the call site.
 The signature covers a domain-separated manifest hash, so it cannot be replayed
 as a journal-record signature. An identical unsigned artifact may adopt its
 first signature later without changing its digest; once publisher evidence
-exists, another signer is refused rather than silently replacing it. Supporting
-several publishers requires an explicit signature set and is not built.
+exists, another signer is refused rather than silently replacing it. An
+artifact has one publisher.
 
 `RedbStore` and `PostgresStore` implement the registry durably, and `names` and
 `versions` enumerate what is published; `MemoryRegistry` is process-local, for

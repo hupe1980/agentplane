@@ -754,7 +754,9 @@ async fn a_run_acts_under_the_terms_chain_not_the_planes() {
             RunTerms::default().acting_as(alice),
         )
         .await
-        .expect("inside the caller's scope");
+        .expect("inside the caller's scope")
+        .into_outcome()
+        .expect("the run rested");
     let records = store.read(out.run_id, 1).await.unwrap();
     let bound = records
         .iter()
@@ -832,7 +834,9 @@ async fn a_steps_policy_context_names_the_runs_chain_live_and_on_replay() {
             RunTerms::default().acting_as(alice),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_outcome()
+        .expect("the run rested");
     assert_eq!(
         subjects_of(&live),
         vec!["user:alice"],
@@ -913,7 +917,9 @@ async fn a_commissioned_run_acts_under_the_orderers_chain_plus_one_link() {
             RunTerms::default().acting_as(alice),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_outcome()
+        .expect("the run rested");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
 
     let chains: Vec<Vec<String>> = {
@@ -939,6 +945,57 @@ async fn a_commissioned_run_acts_under_the_orderers_chain_plus_one_link() {
         "the sub-run must act under the orderer's chain extended by the \
          commissioned agent, not under the plane's: {chains:?}"
     );
+}
+
+/// **A commission from the plane's own run is the plane's work one link
+/// down.** Its sub-run records that it acts as the plane, so a peer it calls is
+/// shown the plane's credential — never one naming the plane's owner as if a
+/// person had asked. A caller's run stays a caller's.
+#[tokio::test]
+async fn a_commission_keeps_whether_the_run_acts_as_the_plane() {
+    for (as_plane, terms) in [
+        (true, RunTerms::default()),
+        (
+            false,
+            RunTerms::default().acting_as(Delegation::root(Principal::new(
+                "user:alice",
+                Scope::of(["audit.*"]),
+            ))),
+        ),
+    ] {
+        let store = db();
+        let world: World = Arc::default();
+        let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .owner("identity")
+            .acting_as(owner())
+            .skill(Orderer {
+                world: Arc::clone(&world),
+            })
+            .skill(Checker {
+                name: "audit.check",
+                world: Arc::clone(&world),
+            })
+            .build();
+        let out = rt
+            .run_plan_under(plan("audit.order"), Tainted::trusted(json!({})), terms)
+            .await
+            .unwrap()
+            .into_outcome()
+            .expect("the run rested");
+        assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
+        for (run, _) in store.recent_runs(None, 10).await.unwrap() {
+            let records = store.read(run, 1).await.unwrap();
+            let plane_chain = records.iter().find_map(|r| match r.kind() {
+                RecordKind::RunAdmitted { plane_chain, .. } => Some(*plane_chain),
+                _ => None,
+            });
+            assert_eq!(
+                plane_chain,
+                Some(as_plane),
+                "run {run} disagrees with its parent about acting as the plane"
+            );
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -983,7 +1040,9 @@ async fn a_replayed_step_reads_the_recorded_chain_not_the_configured_one() {
             RunTerms::default().acting_as(alice),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_outcome()
+        .expect("the run rested");
     assert_eq!(
         out.output.as_ref().map(|o| o.peek()["subject"].clone()),
         Some(json!("user:alice")),
@@ -1007,4 +1066,43 @@ async fn a_replayed_step_reads_the_recorded_chain_not_the_configured_one() {
         "a replayed step acted under the plane's current chain instead of the \
          recorded one: {replayed:?}"
     );
+}
+
+/// **A keyed plan admission admits once.** The key is held to the rule every
+/// keyed entry point holds it to, and a redelivery is answered by the run it
+/// already admitted — never by a store error.
+#[tokio::test]
+async fn a_keyed_plan_admission_is_validated_and_answered_by_its_holder() {
+    let store = db();
+    let world: World = Arc::default();
+    let rt = runtime(&store, &world, Some(owner()));
+
+    let refused = rt
+        .run_plan_under(
+            plan("audit.check"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().once(""),
+        )
+        .await;
+    assert!(refused.is_err(), "an empty key was claimed");
+
+    let first = rt
+        .run_plan_under(
+            plan("audit.check"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().once("delivery-7"),
+        )
+        .await
+        .expect("admitted");
+    assert!(first.is_fresh());
+    let again = rt
+        .run_plan_under(
+            plan("audit.check"),
+            Tainted::trusted(json!({})),
+            RunTerms::default().once("delivery-7"),
+        )
+        .await
+        .expect("a redelivery is answered, not refused");
+    assert!(!again.is_fresh(), "the redelivery admitted a second run");
+    assert_eq!(again.run_id(), first.run_id());
 }

@@ -546,7 +546,12 @@ async fn placement(
     if inc.size != current.size {
         *current = store.checkpoint().await?;
     }
-    if inc.size != current.size {
+    // A position at or past the size it is claimed in is not a position in that
+    // tree — the shape a proof takes when the store read the run's index and
+    // the leaves at two different moments. Unpinned, like the size race above:
+    // no path from that index can verify, and calling it `BadInclusion` would
+    // report a rewrite where there was only a seal landing mid-read.
+    if inc.size != current.size || inc.index >= inc.size {
         return Ok(Placement::Unpinned);
     }
     let leaf = merkle::leaf_hash(&inc.seal);
@@ -818,23 +823,21 @@ fn missing_evidence(evidence: &Evidence<'_>) -> Vec<String> {
     out
 }
 
-/// The sealing record's own claim, held to the chain it sits in.
+/// Every sealing record's own claim, held to the chain it sits in.
 ///
 /// `RunSealed.chain_head` is the head the conclusion was drawn over, which is
 /// by construction its own record's `prev_hash` — checkable only after the
-/// chain has verified, so `prev_hash` is evidence rather than input. A run
-/// with no conclusion has made no claim, and holds vacuously.
+/// chain has verified, so `prev_hash` is evidence rather than input. Every
+/// conclusion, not the last: a run concluded, resumed and concluded again
+/// carries one claim per conclusion, and the export's verifier holds each of
+/// them, so the live audit holding only the last would pass a history the
+/// offline reader refuses. A run with no conclusion has made no claim, and
+/// holds vacuously.
 fn seal_claim_holds(records: &[Record]) -> bool {
-    records
-        .iter()
-        .rev()
-        .find_map(|r| match r.kind() {
-            crate::journal::RecordKind::RunConcluded { chain_head, .. } => {
-                Some(*chain_head == r.prev_hash)
-            }
-            _ => None,
-        })
-        .unwrap_or(true)
+    records.iter().all(|r| match r.kind() {
+        crate::journal::RecordKind::RunConcluded { chain_head, .. } => *chain_head == r.prev_hash,
+        _ => true,
+    })
 }
 
 /// The deletion check, against the checkpoint the auditor brought.

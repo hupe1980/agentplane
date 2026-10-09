@@ -36,6 +36,8 @@ struct Fixture {
     /// already sealed.
     ring: Arc<MemoryKeyRing>,
     tenant: TenantId,
+    /// The journal beside the cases, which a retention pass reads.
+    journal: Arc<RedbStore>,
 }
 
 impl Fixture {
@@ -56,7 +58,7 @@ fn fixture() -> Fixture {
     let ring = Arc::new(MemoryKeyRing::new());
     let tenant = TenantId::new(TenantId::DEFAULT).expect("valid");
     let sealed = SealedCases::wrap(
-        redb as Arc<dyn CaseStore>,
+        Arc::clone(&redb) as Arc<dyn CaseStore>,
         Arc::clone(&ring) as Arc<dyn KeyRing>,
         tenant.clone(),
     );
@@ -68,6 +70,7 @@ fn fixture() -> Fixture {
         keys: Arc::clone(&ring) as Arc<dyn KeyRing>,
         ring,
         tenant,
+        journal: redb,
     }
 }
 
@@ -112,6 +115,7 @@ async fn the_drill_tells_erasure_from_loss() {
     agentplane::blob::erase_case(
         Some(f.blobs.as_ref()),
         f.cases.as_ref(),
+        None,
         Some(f.keys.as_ref()),
         None,
         &f.tenant,
@@ -482,6 +486,7 @@ async fn retention_erases_closed_cases_past_the_window_and_nothing_else() {
             tenant: &f.tenant,
             disclosures: None,
         },
+        f.journal.as_ref(),
         ts(1_001),
         ts(5_000),
         "retention: 1 day",
@@ -554,6 +559,7 @@ async fn retention_without_a_key_ring_reports_what_it_cannot_reach() {
             tenant: &f.tenant,
             disclosures: None,
         },
+        f.journal.as_ref(),
         ts(1_001),
         ts(5_000),
         "retention: 1 day",
@@ -598,6 +604,7 @@ async fn retention_without_a_blob_store_still_destroys_the_case_key() {
             tenant: &f.tenant,
             disclosures: None,
         },
+        f.journal.as_ref(),
         ts(1_001),
         ts(5_000),
         "retention: 1 day",
@@ -652,7 +659,8 @@ async fn a_rehearsal_leaves_a_record_the_plane_can_be_asked_for() {
     let store = Arc::new(
         RedbStore::open_in_memory()
             .expect("store")
-            .origin("drill-plane"),
+            .origin("drill-plane")
+            .unwrap(),
     );
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(store.clone() as Arc<dyn CaseStore>)
@@ -717,6 +725,7 @@ async fn a_retention_pass_names_what_a_case_walk_does_not_reach() {
             tenant: &f.tenant,
             disclosures: None,
         },
+        f.journal.as_ref(),
         ts(1_001),
         ts(5_000),
         "retention",

@@ -547,11 +547,23 @@ pub struct Oversight {
     pub approval: Approval,
     /// Who may decide. Empty means anyone — a choice worth making on purpose
     /// rather than by omission.
-    #[serde(default)]
+    ///
+    /// Refused when nothing gates (`approval: none` and no grant with
+    /// `requires_approval`): a triage row's audience is its rule's own, so an
+    /// approver list there names reviewers of a decision nobody is asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvers: Vec<String>,
     /// The obligation that bounds the wait.
-    pub deadline: OversightDeadline,
+    ///
+    /// Required when something gates and refused when nothing does: triage
+    /// rows are bounded by each rule's own deadline, so this one would bound
+    /// a wait that never happens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<OversightDeadline>,
     /// What happens when the window closes.
+    ///
+    /// `proceed` is refused when nothing gates: a triage row has no run
+    /// waiting behind it, so there is nothing to proceed past.
     #[serde(default)]
     pub on_expiry: Expiry,
     /// Who is added to the audience when an unanswered task escalates.
@@ -762,19 +774,29 @@ pub enum Expiry {
 pub struct Execution {
     /// Which built-in behaviour runs this agent.
     pub kind: ExecutionKind,
-    /// How many model turns a tool-calling agent may take.
+    /// How many model turns a `tool-calling` agent may take, or how many
+    /// steps a `planned` agent's plan may hold.
     ///
     /// A ceiling rather than a suggestion: a model that keeps asking for tools
     /// would otherwise run until the budget stopped it, and a budget stops it
     /// *after* paying for every turn. Bounded here so the failure is "this agent
-    /// did not converge" rather than an invoice.
-    #[serde(default = "default_max_turns")]
-    pub max_turns: u32,
+    /// did not converge" rather than an invoice. Omitted means
+    /// [`DEFAULT_MAX_TURNS`](Self::DEFAULT_MAX_TURNS). Zero is refused — it
+    /// admits no turn, so the agent could never answer — and so is any value on
+    /// `completion` or `call`, which take no turns for it to bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
 }
 
-/// Enough turns for a real chain of tool calls, few enough to notice a loop.
-const fn default_max_turns() -> u32 {
-    8
+impl Execution {
+    /// Enough turns for a real chain of tool calls, few enough to notice a loop.
+    pub const DEFAULT_MAX_TURNS: u32 = 8;
+
+    /// The turn ceiling that applies: the declared one, or the default.
+    #[must_use]
+    pub fn turn_ceiling(&self) -> u32 {
+        self.max_turns.unwrap_or(Self::DEFAULT_MAX_TURNS)
+    }
 }
 
 /// The built-in behaviours a manifest may ask for.
@@ -1797,6 +1819,7 @@ impl Manifest {
         self.validate_rate_limits()?;
         self.validate_mutating_grants_can_fire()?;
         self.validate_call()?;
+        self.validate_turn_ceiling()?;
         self.validate_agent_grants()?;
         self.validate_context_grants()?;
         self.validate_topology()?;
@@ -2219,6 +2242,29 @@ impl Manifest {
         Ok(())
     }
 
+    /// A turn ceiling bounds something, or it is not declared.
+    fn validate_turn_ceiling(&self) -> Result<(), ManifestError> {
+        let Some(execution) = &self.spec.execution else {
+            return Ok(());
+        };
+        match (execution.kind, execution.max_turns) {
+            (ExecutionKind::Completion | ExecutionKind::Call, Some(_)) => {
+                Err(ManifestError::Unenforceable {
+                    field: "spec.execution.max_turns",
+                    detail: "this kind makes exactly one call and takes no turns, so a turn \
+                             ceiling is read by nothing — remove it, or use `tool-calling` \
+                             or `planned`",
+                })
+            }
+            (_, Some(0)) => Err(ManifestError::Unenforceable {
+                field: "spec.execution.max_turns",
+                detail: "zero admits no turn, so the agent could never answer — omit it for \
+                         the default, or declare at least 1",
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// A `call` agent is one grant and the input that fills it; a field a
     /// `call` run would never read is refused rather than carried.
     fn validate_call(&self) -> Result<(), ManifestError> {
@@ -2246,15 +2292,10 @@ impl Manifest {
         if let Err(ManifestError::Syntax(detail)) =
             Self::refuse_open_objects(&input.schema, "spec.input.schema")
         {
-            let at = detail
-                .split(" declares")
-                .next()
-                .unwrap_or("spec.input.schema");
             return Err(ManifestError::Syntax(format!(
-                "{at} declares an object without `additionalProperties: false`, and a \
-                 `call` agent's input is its tool's arguments — so a caller could send \
-                 arguments nobody reviewed. Close it, declaring every argument the call \
-                 may carry"
+                "{detail}. A `call` agent's input is its tool's arguments, so a schema \
+                 that admits an undeclared field lets a caller send arguments nobody \
+                 reviewed — declare every argument the call may carry"
             )));
         }
         if self.spec.models.is_some() {
@@ -2492,15 +2533,8 @@ impl Manifest {
                          control nothing performs",
             });
         }
-        if o.deadline.name.trim().is_empty() {
-            return Err(ManifestError::Empty("spec.oversight.deadline.name"));
-        }
-        if o.deadline.kind.trim().is_empty() {
-            return Err(ManifestError::Empty("spec.oversight.deadline.kind"));
-        }
-        o.deadline
-            .validate_count("spec.oversight.deadline.params.n")?;
         let gates_a_call = self.spec.tools.iter().any(|grant| grant.requires_approval);
+        Self::validate_wait_fields(o, gates_a_call)?;
         // `tools-only` with nothing asking for it gates nothing at all, and
         // reads in review as oversight that is present.
         if o.approval == Approval::ToolsOnly && !gates_a_call {
@@ -2595,6 +2629,62 @@ impl Manifest {
                 detail: "`escalate_to` names an escalation audience, but `on_expiry` never \
                          escalates — set `on_expiry: escalate` or drop the list, so the \
                          declaration and the policy say the same thing",
+            });
+        }
+        Ok(())
+    }
+
+    /// The fields that describe a wait, held to whether anything waits.
+    ///
+    /// When no run of this agent waits on a person — `approval: none` and no
+    /// grant requesting approval — the block is triage only, and each field
+    /// that describes a wait describes nothing: it is refused rather than
+    /// carried as a control that reads as present. When something does wait,
+    /// the deadline that bounds it is required.
+    fn validate_wait_fields(o: &Oversight, gates_a_call: bool) -> Result<(), ManifestError> {
+        let gates = o.approval != Approval::None || gates_a_call;
+        match (&o.deadline, gates) {
+            (Some(deadline), true) => {
+                if deadline.name.trim().is_empty() {
+                    return Err(ManifestError::Empty("spec.oversight.deadline.name"));
+                }
+                if deadline.kind.trim().is_empty() {
+                    return Err(ManifestError::Empty("spec.oversight.deadline.kind"));
+                }
+                deadline.validate_count("spec.oversight.deadline.params.n")?;
+            }
+            (None, true) => {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.oversight.deadline",
+                    detail: "a run of this agent waits on a person, and nothing bounds the \
+                             wait — declare the obligation that does, e.g. \
+                             `deadline: { name: review, kind: hours, params: { n: 8 } }`",
+                });
+            }
+            (Some(_), false) => {
+                return Err(ManifestError::Unenforceable {
+                    field: "spec.oversight.deadline",
+                    detail: "nothing here waits on a person — 'none' gates no answer and no \
+                             grant requests approval — so this deadline bounds no wait; each \
+                             triage rule carries its own. Remove it",
+                });
+            }
+            (None, false) => {}
+        }
+        if !gates && !o.approvers.is_empty() {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.oversight.approvers",
+                detail: "nothing here waits on a person, so these approvers would review a \
+                         decision nobody is asked — a triage row's audience is its rule's own \
+                         `audience`. Remove the list, or gate the answer or a call",
+            });
+        }
+        if !gates && o.on_expiry == Expiry::Proceed {
+            return Err(ManifestError::Unenforceable {
+                field: "spec.oversight.on_expiry",
+                detail: "'proceed' acts when a wait expires, and nothing here waits — a \
+                         triage row has no run behind it to proceed. Use 'deny' or \
+                         'escalate'",
             });
         }
         Ok(())
@@ -3086,34 +3176,70 @@ impl Manifest {
     /// digest-covered, and rewriting it would mean the file a reviewer signed
     /// and the shape that runs are two different documents.
     ///
-    /// Deliberately narrow: this is *not* the whole strict-decoding subset.
-    /// Optionality and unions are spelled differently by different providers,
-    /// and refusing a manifest that runs perfectly well on Gemini would be this
-    /// crate inventing a restriction one vendor has.
+    /// Every subschema is judged, through the one walker
+    /// [`strict_schema_problem`](crate::model::strict_schema_problem) also
+    /// uses: an object under `anyOf`, in `$defs`, or as the schema of
+    /// `additionalProperties` is as much an object somebody fills in as one
+    /// under `properties`. A node is an object when its `type` says so or when
+    /// it declares `properties`, `patternProperties` or `additionalProperties`
+    /// without a `type`, since a validator applies those keywords either way.
+    /// `patternProperties` is refused outright — it admits every name matching
+    /// a pattern, which is fields nobody declared by another spelling — and so
+    /// is a `$ref` outside the document, whose target nothing here can judge.
+    ///
+    /// Deliberately narrow otherwise: this is *not* the whole strict-decoding
+    /// subset. Optionality and unions are spelled differently by different
+    /// providers, and refusing a manifest that runs perfectly well on Gemini
+    /// would be this crate inventing a restriction one vendor has.
     fn refuse_open_objects(schema: &serde_json::Value, at: &str) -> Result<(), ManifestError> {
-        let is_object = match schema.get("type") {
-            Some(serde_json::Value::String(name)) => name == "object",
-            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "object"),
-            _ => false,
-        };
-        if is_object && schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
-        {
-            return Err(ManifestError::Syntax(format!(
-                "{at} declares an object without `additionalProperties: false`, so the \
-                 model may answer with fields nobody declared — and constrained decoding \
-                 cannot bind a schema that permits them, which leaves the declaration \
-                 advisory at exactly the moment it is supposed to hold. Close it"
-            )));
-        }
-        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-            for (name, nested) in properties {
-                Self::refuse_open_objects(nested, &format!("{at}.{name}"))?;
+        let mut problem: Option<String> = None;
+        crate::model::for_each_subschema(schema, at, &mut |node, path| {
+            if problem.is_some() {
+                return;
             }
+            let Some(obj) = node.as_object() else {
+                return;
+            };
+            if obj.contains_key("patternProperties") {
+                problem = Some(format!(
+                    "{path} declares `patternProperties`, which admits every field whose \
+                     name matches a pattern — fields nobody declared, by another spelling. \
+                     Name each property instead"
+                ));
+                return;
+            }
+            if let Some(target) = obj.get("$ref").and_then(|r| r.as_str())
+                && !target.starts_with('#')
+            {
+                problem = Some(format!(
+                    "{path} points `$ref` at `{target}`, a schema this document does not \
+                     carry, so nothing here can say it is closed. Inline it, or move it \
+                     under `$defs`"
+                ));
+                return;
+            }
+            let is_object = match obj.get("type") {
+                Some(serde_json::Value::String(name)) => name == "object",
+                Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "object"),
+                Some(_) => false,
+                None => ["properties", "additionalProperties"]
+                    .iter()
+                    .any(|key| obj.contains_key(*key)),
+            };
+            if is_object && obj.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
+            {
+                problem = Some(format!(
+                    "{path} declares an object without `additionalProperties: false`, so the \
+                     model may answer with fields nobody declared — and constrained decoding \
+                     cannot bind a schema that permits them, which leaves the declaration \
+                     advisory at exactly the moment it is supposed to hold. Close it"
+                ));
+            }
+        });
+        match problem {
+            Some(detail) => Err(ManifestError::Syntax(detail)),
+            None => Ok(()),
         }
-        if let Some(items) = schema.get("items") {
-            Self::refuse_open_objects(items, &format!("{at}[]"))?;
-        }
-        Ok(())
     }
 
     /// Every schema a **model** is held to is one that can still hold.
@@ -3331,15 +3457,20 @@ impl Manifest {
     /// Whether a run of this agent may suspend, judged from the declaration.
     ///
     /// `is_peer` answers whether a grant's server is wired as an A2A peer,
-    /// which only the plane knows. True for oversight, a grant asking for
-    /// approval, an agent grant, a peer grant, and a coded skill (no
+    /// which only the plane knows. True for an answer gated by
+    /// `oversight.approval: required`, a grant asking for approval, an agent
+    /// grant, a peer grant, and a coded skill (no
     /// `spec.execution`), whose body this cannot see into. Conservative: a
     /// false *true* withholds a tool from a host that cannot hold a task; a
     /// false *false* is caught when the run suspends.
     #[must_use]
     pub fn may_suspend(&self, is_peer: impl Fn(&str) -> bool) -> bool {
         self.spec.execution.is_none()
-            || self.spec.oversight.is_some()
+            || self
+                .spec
+                .oversight
+                .as_ref()
+                .is_some_and(|o| o.approval == Approval::Required)
             || self.spec.tools.iter().any(|grant| {
                 grant.requires_approval
                     || crate::tools::ToolId::parse(&grant.reference).is_none_or(|id| {

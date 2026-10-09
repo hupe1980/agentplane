@@ -143,22 +143,11 @@ or is refused. Three properties make the whole map *intent by construction*:
   is reserved as `kubernetes.io/` is there, so an annotation can never shadow
   a field the format grows.
 
-**Who may read them is the same line Kubernetes draws.** In a cluster,
-annotations are configuration for *controllers* all the time — an ingress
-controller reads its rewrite rules from them, cert-manager its issuer, a cloud
-provider its load-balancer type — while the API server itself never acts on
-one. Here the runtime is the API server: it enforces `spec` and never reads an
-annotation, because a field that changes behaviour belongs where it is
-validated, versioned and refused when wrong. Your wiring is the controller:
-the map is public on `Manifest`, a registry resolve returns it, and a deploy
-pipeline, a dashboard or a controller that turns a manifest into a cluster
-object may read `example.com/replicas` and act on it — that is what the
-namespace is for. What the runtime refuses is only to *be* that controller,
-and Kubernetes' own history says why: `kubernetes.io/ingress.class` was read
-by controllers as configuration with no schema and no version until it had to
-be promoted to a real field (`ingressClassName`) to get them. Anything an
-agent's behaviour should depend on goes in `spec`, and the format grows a
-field for it.
+**Who may read them is the same line Kubernetes draws.** The runtime is the
+API server: it enforces `spec` and never reads an annotation. Your wiring is
+the controller: the map is public on `Manifest`, a registry resolve returns
+it, and a deploy pipeline or dashboard may read `example.com/replicas` and act
+on it. Anything an agent's behaviour should depend on goes in `spec`.
 
 A blank value is refused: a key that answers nothing reads, to a reviewer, like
 a question that was answered. Everything else in `metadata` is still closed —
@@ -178,7 +167,7 @@ reaches.
 | Field | Default | Notes |
 |---|---|---|
 | `kind` | **required** | `completion`, `tool-calling`, `planned` or `call`. |
-| `max_turns` | `8` | The loop's turn ceiling, and a `planned` agent's step ceiling. A ceiling, not a suggestion: a budget also stops a runaway loop, but only *after* paying for every turn. |
+| `max_turns` | `8` | The loop's turn ceiling, and a `planned` agent's step ceiling. A ceiling, not a suggestion: a budget also stops a runaway loop, but only *after* paying for every turn. `0` is refused, and so is the field on `completion` and `call`. |
 
 `kind` is a closed enum on purpose. A configuration format whose behaviours are
 open-ended is one nobody can review, because the reviewer would have to know what
@@ -267,11 +256,8 @@ prompt is exactly `role`, a blank line, then `constraints`, so a third field
 would concatenate the same way while giving a reviewer one more place to look.
 
 `role` is one line because it answers *what is this agent*; `constraints` is
-unbounded and is where a hundred-line numbered procedure belongs. That it lives
-in the digest is the point rather than a cost: in a regulated domain, editing
-step 7 of a procedure **should** change the identity consumers pin, and should
-show up as a diff with a reviewer on it. A procedure held in code has no version
-at all.
+unbounded and is where a hundred-line numbered procedure belongs, so editing
+step 7 of it changes the digest consumers pin.
 
 The block is optional because an embedder may compose its prompt in code — in
 which case the digest does not cover it.
@@ -337,10 +323,10 @@ Three combinations are refused, and each refusal is the point:
   `reason` on a non-collaborative mode is refused too: a justification for
   something the agent does not do reads in review as one that was required.
 
-`distinct-authority` is the reason worth emphasising, because neither side of the
-public multi-agent debate raises it: **the best reason to split agents is often
-security, not capability.** If a sub-task needs credentials the parent should not
-hold, delegating to a narrower agent is least privilege.
+`distinct-authority` is the reason worth emphasising: **the best reason to
+split agents is often security, not capability.** If a sub-task needs
+credentials the parent should not hold, delegating to a narrower agent is least
+privilege.
 
 There is no `routed`/`router`. Choosing one agent before a run starts is
 deployment dispatch, and accepting YAML the runtime never executes manufactures
@@ -465,7 +451,9 @@ a run can end one call past `max_tokens` or `max_minor_units` per step in
 flight — so under a spend quota an agent whose per-call bound is unbounded is
 refused at admission ([per-tenant ceilings](@/docs/operations.md#per-tenant-ceilings)).
 `agentplane validate` prints the worst case per agent — the ceiling plus the
-width times one call, and for a `tool-calling` agent `max_turns` times one call —
+width times one call, and the model calls a run makes (`max_turns` for
+`tool-calling`, one for `completion`, plus one for a declared memory formation)
+times one call —
 derived from the file alone, naming every term the file leaves unbounded
 instead of printing a total for it.
 
@@ -816,9 +804,9 @@ human is in the loop when none is.
 | Field | Default | Notes |
 |---|---|---|
 | `approval` | **required** | `required` gates every answer; `tools-only` gates only the grants that set `requires_approval`; `none` gates nothing and leaves the deciding to `triage`. See below |
-| `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. |
-| `deadline` | **required** | The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name. `kind` and `params` reach the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says; a count `n` that is not a positive integer is refused at parse. |
-| `on_expiry` | deny | What happens when the window closes. `deny` refuses the answer. `escalate` widens the audience and keeps waiting: the `escalate_to` roles join the reviewers, the stale claim is cleared, and the task leaves the expiry scan — it is answered by a person or answered never. `proceed` acts unattended. |
+| `approvers` | anyone | Roles that may decide. Empty means anyone — worth choosing on purpose rather than by omission. Refused when nothing gates. |
+| `deadline` | **required** when something gates | Required when `approval` is `required` or `tools-only`, or a grant sets `requires_approval`; refused on a triage-only block, where each triage rule carries its own. The obligation that bounds the wait: `{ name, kind, params }`. The agent **registers** it, which is why the declaration carries more than a name. `kind` and `params` reach the deployment's `Calendar` unchanged, so "one working day" means whatever that domain says; a count `n` that is not a positive integer is refused at parse. |
+| `on_expiry` | deny | What happens when the window closes. `deny` refuses the answer. `escalate` widens the audience and keeps waiting: the `escalate_to` roles join the reviewers, the stale claim is cleared, and the task leaves the expiry scan — it is answered by a person or answered never. `proceed` acts unattended, and is refused on a triage-only block. |
 | `escalate_to` | — | Roles added to the audience when a task escalates. **Required by `on_expiry: escalate`**, because widening is escalation's one enforceable meaning; refused beside any other policy. `escalate` also needs bounded audiences: an empty `approvers` already means *anyone*, which no list can widen. |
 | `allow_unattended` | `false` | Explicit consent required for `on_expiry: proceed`, so acting with no human is a greppable decision somebody made rather than an enum variant they picked off a list. |
 | `triage` | none | Tasks opened **beside** a completed answer. See below. |
@@ -864,7 +852,6 @@ person must see.**
 ```yaml
 oversight:
   approval: none
-  deadline: { name: unused, kind: hours, params: { n: 4 } }
   triage:
     - name: breach
       summary: "a regulatory deadline was missed"

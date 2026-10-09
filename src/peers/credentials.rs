@@ -145,13 +145,16 @@ pub trait CredentialSource: Send + Sync + Debug {
         now: Timestamp,
     ) -> Result<PeerCredential, CredentialError>;
 
-    /// Drop everything held for `subject`, at every audience.
+    /// Drop everything held for `subject`, at every audience, including what
+    /// an exchange already in flight for them would bring back.
     ///
-    /// Called when an operator withdraws the subject's authority: a held
-    /// credential outlives the halt until it expires, and must not be served
-    /// to the next run that asks once the halt is lifted and thrown again. A
-    /// source that holds nothing has nothing to drop.
-    fn forget(&self, _subject: &str) {}
+    /// Called when an operator withdraws or restores the subject's authority:
+    /// a held credential outlives the halt until it expires, and must not be
+    /// served to the next run that asks once the halt is lifted. Required
+    /// rather than defaulted, so a source that holds credentials cannot
+    /// compile without saying how it lets go of them; one that holds nothing
+    /// implements it as nothing.
+    fn forget(&self, subject: &str);
 }
 
 /// The wall clock, for a credential's freshness.
@@ -202,7 +205,15 @@ pub struct Cached {
     exchange: std::sync::Arc<dyn TokenExchange>,
     /// How far before expiry a credential stops being used.
     skew: Duration,
-    held: Mutex<BTreeMap<(PeerId, String), PeerCredential>>,
+    held: Mutex<Held>,
+}
+
+/// The cache and, per subject, how many times it was forgotten — so an
+/// exchange that began before a `forget` cannot put its answer back after it.
+#[derive(Debug, Default)]
+struct Held {
+    credentials: BTreeMap<(PeerId, String), PeerCredential>,
+    forgotten: BTreeMap<String, u64>,
 }
 
 impl Cached {
@@ -217,7 +228,7 @@ impl Cached {
         Self {
             exchange,
             skew: Self::DEFAULT_SKEW,
-            held: Mutex::new(BTreeMap::new()),
+            held: Mutex::new(Held::default()),
         }
     }
 
@@ -240,14 +251,15 @@ impl CredentialSource for Cached {
         // Scoped so the guard is gone before the await below: a lock held across
         // a suspension is held on the *thread*, and this one would be held for
         // the length of a network round trip.
-        {
+        let generation = {
             let held = self.held.lock().expect("credential cache");
-            if let Some(c) = held.get(&key)
+            if let Some(c) = held.credentials.get(&key)
                 && c.is_usable_at(now, self.skew)
             {
                 return Ok(c.clone());
             }
-        }
+            held.forgotten.get(subject).copied().unwrap_or(0)
+        };
 
         // The issuer is not taken at its word about who the token is for. An
         // issuer that ignores `resource` hands back something the peer can spend
@@ -263,17 +275,22 @@ impl CredentialSource for Cached {
             });
         }
 
-        self.held
-            .lock()
-            .expect("credential cache")
-            .insert(key, fresh.clone());
+        let mut held = self.held.lock().expect("credential cache");
+        // Kept only if nobody forgot this subject while the exchange was out:
+        // the answer is still presented to this caller, who asked before the
+        // halt, but never lent to the next one.
+        if held.forgotten.get(subject).copied().unwrap_or(0) == generation {
+            let skew = self.skew;
+            held.credentials.retain(|_, c| c.is_usable_at(now, skew));
+            held.credentials.insert(key, fresh.clone());
+        }
         Ok(fresh)
     }
 
     fn forget(&self, subject: &str) {
-        self.held
-            .lock()
-            .expect("credential cache")
+        let mut held = self.held.lock().expect("credential cache");
+        held.credentials
             .retain(|(_, held_for), _| held_for != subject);
+        *held.forgotten.entry(subject.to_owned()).or_default() += 1;
     }
 }

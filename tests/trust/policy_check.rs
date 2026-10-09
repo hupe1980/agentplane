@@ -914,11 +914,11 @@ async fn a_sealed_and_an_erased_run_are_not_evaluable_for_their_own_reasons() {
             .unwrap();
         runs.push(run);
     }
-    agentplane::blob::erase_run(
-        ring.as_ref(),
-        None,
-        &tenant,
-        runs[1],
+    // The run's own scope, destroyed directly: these runs are unconcluded
+    // fixtures, which `erase_run` refuses, and what is under test is how an
+    // erased run reads.
+    ring.destroy(
+        &agentplane::keyring::scope(&tenant, &runs[1].to_string()),
         Timestamp::from_unix_timestamp(1_760_000_000).unwrap(),
         "subject exercised the right to erasure",
     )

@@ -353,6 +353,10 @@ impl MemoryStore for PostgresStore {
         // a life below it, never extend one past it — so the effective expiry
         // is the *earlier* of the two (`LEAST`, with absent sides coalesced to
         // +infinity so they never win).
+        // The id breaks ties `COLLATE "C"` — by byte, as redb orders its keys —
+        // because a truncated page is decided by the tie-break, and a database
+        // collation would keep a different memory than the other backend at
+        // the same rank and second.
         let rows = client
             .query(
                                 "SELECT item.item FROM memory_items item
@@ -366,7 +370,7 @@ impl MemoryStore for PostgresStore {
                                                         COALESCE(item.expires_at, 9223372036854775807),
                                                         COALESCE(access.expires_at, 9223372036854775807)
                                                 ) > $4)
-                                 ORDER BY item.trust_rank ASC, item.created_at DESC, item.id ASC LIMIT $5",
+                                 ORDER BY item.trust_rank ASC, item.created_at DESC, item.id COLLATE \"C\" ASC LIMIT $5",
                                 &[
                                         &tenant,
                                         &query.subject,
@@ -870,8 +874,8 @@ impl MemoryStore for PostgresStore {
         let rows = client
             .query(
                 "SELECT id FROM memory_legal_holds
-                  WHERE tenant = $1 AND id > $2
-                  ORDER BY id
+                  WHERE tenant = $1 AND id COLLATE \"C\" > $2
+                  ORDER BY id COLLATE \"C\"
                   LIMIT $3",
                 &[&tenant, &after, &limit],
             )
@@ -1043,7 +1047,7 @@ impl MemoryStore for PostgresStore {
                          AND edge.source_id = $2
                          AND edge.derived_id = item.id
                          AND edge.derived_version = item.version)
-                 ORDER BY item.created_at DESC, item.id ASC",
+                 ORDER BY item.created_at DESC, item.id COLLATE \"C\" ASC",
                 &[&tenant, &id],
             )
             .await

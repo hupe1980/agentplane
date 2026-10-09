@@ -78,7 +78,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::core::{AnyEffect, Effect, GroupOutcome, StepError, Tainted};
+use crate::core::{AnyEffect, Effect, EffectKey, GroupOutcome, StepError, Tainted};
 use crate::journal::RecordKind;
 use crate::runtime::StepCtx;
 
@@ -470,6 +470,9 @@ impl<'g, 'c> EffectGroup<'g, 'c> {
             let resource = member.resource.clone();
             match self.cx.effect_as_member(member.effect).await {
                 Ok(v) => outputs.push(v),
+                // A pause leaves the group open: the resumed step reads the
+                // landed members back and reaches this one again.
+                Err(e) if is_pause(&e) => return Err(e),
                 // Nothing has externalised — no prior deferred member landed, no
                 // atomic member committed, and *this* member provably did not
                 // reach the world (`DidNotHappen`) — so the group can still be
@@ -583,6 +586,18 @@ fn no_group() -> StepError {
         group: String::new(),
         detail: "the group was already settled".to_owned(),
     }
+}
+
+/// A stop that is a pause rather than a failure: a wait, a withdrawn
+/// authority, an exhausted ceiling. Each ends the step with its work standing
+/// and is answered by a resume — so an open group is left open across it, and
+/// the resumed step commits or abandons it, rather than being taken back for a
+/// reason that says nothing about the work.
+pub(crate) const fn is_pause(e: &StepError) -> bool {
+    matches!(
+        e,
+        StepError::Suspended(_) | StepError::Withheld { .. } | StepError::Budget(_)
+    )
 }
 
 /// Whether a member's failure leaves open the possibility that the call reached
@@ -702,18 +717,17 @@ impl<'a> StepCtx<'a> {
         let reversals = std::mem::take(&mut open.reversals);
         open.deferred.clear();
 
-        // Undo is exempt from the gate, exactly as a compensating phase is: a
-        // ceiling exists to bound work, not to strand it half-done. The spend
-        // is still billed and journaled, so an overshoot is visible rather than
-        // silent.
+        // Undo is exempt from the budget's verdict, exactly as a compensating
+        // phase is: a ceiling exists to bound work, not to strand it half-done.
+        // The declaration and the policy still judge it, and the spend is
+        // billed and journaled, so an overshoot is visible rather than silent.
         //
         // The exemption is set and cleared **around a single call**, with
         // nothing between the two but one `await`, so no path through the
         // reversal can leave it standing. That matters more than it looks: the
-        // flag suppresses the manifest check, policy and the budget, so a
-        // reversal that returned early with it still set would leave every
-        // later effect in the step ungated — a security hole reached by adding
-        // an ordinary `?` to a loop.
+        // flag suppresses the budget's verdict, so a reversal that returned
+        // early with it still set would leave every later effect in the step
+        // unbounded — reached by adding an ordinary `?` to a loop.
         self.set_reversing(true);
         let reversed = self.reverse_each(reversals).await;
         self.set_reversing(false);
@@ -908,9 +922,31 @@ impl StepCtx<'_> {
         members: Vec<AtomicMember>,
     ) -> Result<(), StepError> {
         let mut keyed = Vec::with_capacity(members.len());
-        for member in members {
-            let descriptor = member.inner.descriptor();
-            let key = self.next_effect_key(&descriptor);
+        // Every key first, in member order, as the live pass derives them:
+        // replay has to recognise a refusal recorded at a *later* member's key.
+        let prepared: Vec<_> = members
+            .into_iter()
+            .map(|member| {
+                let descriptor = member.inner.descriptor();
+                let key = self.next_effect_key(&descriptor);
+                (key, descriptor, member)
+            })
+            .collect();
+        let keys: Vec<EffectKey> = prepared.iter().map(|(key, ..)| *key).collect();
+        // Members the live pass gated and never committed, because a later
+        // member was refused: nothing is recorded at their keys. They wait
+        // here for that refusal's answer on this pass.
+        let mut pending: Vec<(EffectKey, crate::core::EffectDescriptor, AtomicMember)> = Vec::new();
+        for (i, (key, descriptor, member)) in prepared.into_iter().enumerate() {
+            if self.replaying()
+                && !self.cursor_peek_is(key)
+                && keys[i + 1..]
+                    .iter()
+                    .any(|&later| self.cursor_peek_is(later))
+            {
+                pending.push((key, descriptor, member));
+                continue;
+            }
             if self.replaying() {
                 // Consume the recorded pair. The output is discarded rather
                 // than returned: an atomic member's result is not handed back
@@ -945,7 +981,15 @@ impl StepCtx<'_> {
                         refusal @ (crate::journal::EffectReplay::Refused { .. }
                         | crate::journal::EffectReplay::Denied { .. }),
                     ) => {
-                        self.replayed_refusal(key, &descriptor, refusal, 0).await?;
+                        if let Err(stands) =
+                            self.replayed_refusal(key, &descriptor, refusal, 0).await
+                        {
+                            // Billed as the live pass's gate billed them.
+                            for _ in &pending {
+                                self.bill_replayed(crate::core::Spend::ZERO, 0);
+                            }
+                            return Err(stands);
+                        }
                     }
                     // An atomic member's records commit with its transaction,
                     // so the only things history can hold under its key are
@@ -993,6 +1037,13 @@ impl StepCtx<'_> {
             // than an omission: a member is a write to a co-located database in
             // the transaction that commits this run's own records. That ceiling
             // bounds what left the deployment, and nothing here did.
+            // A refusal re-admitted on this pass: the members before it are
+            // gated now and commit with it, as one transaction.
+            for (earlier, earlier_descriptor, earlier_member) in pending.drain(..) {
+                self.gate(earlier, earlier, &earlier_descriptor, true, None, None, 0)
+                    .await?;
+                keyed.push((earlier, earlier_member));
+            }
             self.gate(key, key, &descriptor, true, None, None, 0)
                 .await?;
             keyed.push((key, member));

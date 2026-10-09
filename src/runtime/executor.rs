@@ -97,6 +97,11 @@ enum Acting {
     Caller(crate::core::Delegation),
     /// A served caller that presented no chain: this run acts under none.
     Nobody,
+    /// A chain delegated from the plane's own, for a run the plane's run
+    /// commissioned: it acts under that chain, and as the plane, so a peer
+    /// it calls is presented the plane's credential rather than one naming
+    /// the plane's owner as if a person had asked.
+    PlaneDelegate(crate::core::Delegation),
 }
 
 impl Acting {
@@ -107,7 +112,7 @@ impl Acting {
     ) -> Option<&'a crate::core::Delegation> {
         match self {
             Self::Plane => plane,
-            Self::Caller(chain) => Some(chain),
+            Self::Caller(chain) | Self::PlaneDelegate(chain) => Some(chain),
             Self::Nobody => None,
         }
     }
@@ -121,7 +126,7 @@ impl Acting {
     ) -> Option<&'a crate::core::Delegation> {
         match self {
             Self::Plane | Self::Nobody => plane,
-            Self::Caller(chain) => Some(chain),
+            Self::Caller(chain) | Self::PlaneDelegate(chain) => Some(chain),
         }
     }
 }
@@ -173,6 +178,13 @@ impl RunTerms {
     #[must_use]
     pub fn acting_as(mut self, chain: crate::core::Delegation) -> Self {
         self.acting_as = Acting::Caller(chain);
+        self
+    }
+
+    /// Act under `chain` as the plane: a commission from a run the plane
+    /// itself admitted, whose sub-run is the plane's work one link down.
+    pub(crate) fn acting_as_plane(mut self, chain: crate::core::Delegation) -> Self {
+        self.acting_as = Acting::PlaneDelegate(chain);
         self
     }
 
@@ -385,6 +397,15 @@ impl Admission {
     /// What the run produced, if it has produced anything yet.
     #[must_use]
     pub const fn outcome(&self) -> Option<&RunOutcome> {
+        match self {
+            Self::Fresh(outcome) | Self::Replayed(outcome) => Some(outcome),
+            Self::InFlight(_) => None,
+        }
+    }
+
+    /// What the run produced, owned, if it has produced anything yet.
+    #[must_use]
+    pub fn into_outcome(self) -> Option<RunOutcome> {
         match self {
             Self::Fresh(outcome) | Self::Replayed(outcome) => Some(outcome),
             Self::InFlight(_) => None,
@@ -1616,7 +1637,7 @@ impl Runtime {
             tenant: &self.tenant,
             disclosures: self.disclosures.as_ref(),
         };
-        crate::retention::retain(&stores, older_than, at, reason)
+        crate::retention::retain(&stores, self.store.as_ref(), older_than, at, reason)
             .await
             .map_err(RuntimeError::from_store)
     }
@@ -2214,7 +2235,20 @@ impl Runtime {
         quotas
             .set_halt(scope, by, at, reason)
             .await
-            .map_err(RuntimeError::Store)
+            .map_err(RuntimeError::Store)?;
+        self.forget_credentials(scope);
+        Ok(())
+    }
+
+    /// Drop the peer credentials held for a subject a halt names, when it is
+    /// thrown and when it is lifted — not only when a hop next meets it, which
+    /// may never happen while the halt stands.
+    fn forget_credentials(&self, scope: &crate::quota::HaltScope) {
+        if let (crate::quota::HaltScope::Subject { id }, Some(wiring)) =
+            (scope, self.peers.as_ref())
+        {
+            wiring.registry.forget(id);
+        }
     }
 
     /// Lift one, and let work at that scope start again — recording who did.
@@ -2279,6 +2313,7 @@ impl Runtime {
             .lift_halt_if(&halt)
             .await
             .map_err(|e| removal_failed(run, &e))?;
+        self.forget_credentials(scope);
         if !removed {
             let now = quotas.halts().await.map_err(|e| removal_failed(run, &e))?;
             if now.iter().any(|h| &h.scope == scope) {
@@ -2940,7 +2975,7 @@ impl Runtime {
         if raised == input.label().sensitivity {
             return Ok(input);
         }
-        Ok(input.with_joined_label(&crate::core::Label::trusted().with_sensitivity(raised)))
+        Ok(input.raised_to(raised))
     }
 
     #[cfg(not(feature = "manifest"))]
@@ -3018,45 +3053,34 @@ impl Runtime {
                 // a live, never-released lease over a concluded run, which
                 // the recovery sweep then "recovers" forever.
                 //
-                // A failed renewal means the lease was lost — released by the
-                // conclusion, lapsed and reclaimed, or taken over. Stop
-                // either way: the run's next append will be fenced, which is
-                // the correct outcome, and claiming now would only resurrect
-                // ownership this instance no longer has.
-                if store.renew(run, &owner, epoch, ttl).await.is_err() {
-                    return;
+                // Stop only when the store says the lease is gone — released
+                // by the conclusion, lapsed and reclaimed, or taken over: the
+                // run's next append will be fenced, which is the correct
+                // outcome, and claiming now would only resurrect ownership
+                // this instance no longer has. Any other failure is the store
+                // not answering, and giving up then would let a run that is
+                // still executing lapse into somebody else's recovery.
+                match store.renew(run, &owner, epoch, ttl).await {
+                    Ok(_) => {}
+                    Err(crate::core::StoreError::LeaseNotHeld { .. }) => return,
+                    Err(error) => tracing::warn!(
+                        target: "agentplane::lease",
+                        run = %run,
+                        error = %error,
+                        "a lease renewal failed; the next one retries"
+                    ),
                 }
             }
         }))
     }
 
-    /// The withdrawal standing against this run's authority, if one is.
-    ///
-    /// Read at a step boundary on a live pass only: a halt thrown *today* must
-    /// not decide what a run did last year, which is the rule the cancellation
-    /// check beside it follows. Only a subject-scoped halt naming a principal
-    /// on the run's chain reaches here — see
-    /// [`HaltScope::withdraws_from`](crate::quota::HaltScope::withdraws_from).
-    ///
-    /// An unreachable store propagates. Carrying on would leave a withdrawal
-    /// unenforced exactly while the accounting is down.
-    ///
-    /// # Errors
-    ///
-    /// If the quota store is unreachable.
-    async fn withdrawn_authority(
-        &self,
-        identity: Option<&crate::core::Delegation>,
-    ) -> Result<Option<Withdrawal>, RuntimeError> {
-        self.withdrawal_against(identity)
-            .await
-            .map_err(RuntimeError::Store)
-    }
-
     /// The standing withdrawal that reaches `identity`, if one does.
     ///
     /// The one predicate the step boundary and a subject-bound hop both ask,
-    /// so the two cannot disagree about whose authority is withdrawn.
+    /// so the two cannot disagree about whose authority is withdrawn. Read on
+    /// a live pass only — a halt thrown today must not decide what a run did
+    /// last year — and an unreachable store propagates, because carrying on
+    /// would leave a withdrawal unenforced exactly while accounting is down.
     pub(crate) async fn withdrawal_against(
         &self,
         identity: Option<&crate::core::Delegation>,
@@ -4048,6 +4072,9 @@ impl Runtime {
 
     /// Execute an explicit plan under [`RunTerms`].
     ///
+    /// Keyed terms admit once, as every `_once` entry point does: the key is
+    /// validated, and a redelivery is answered by the run it already admitted.
+    ///
     /// # Errors
     ///
     /// As [`run_plan`](Self::run_plan) and [`run_under`](Self::run_under).
@@ -4056,8 +4083,21 @@ impl Runtime {
         plan: PlanIR,
         input: Tainted<Value>,
         terms: RunTerms,
-    ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, terms).await
+    ) -> Result<Admission, RuntimeError> {
+        let Some(key) = terms.idempotency_key.clone() else {
+            return Ok(Admission::Fresh(self.admit_plan(plan, input, terms).await?));
+        };
+        validate_admission_key(&key)?;
+        if let Some(held) = self.holder_of(&key).await? {
+            return self.answer_with(held).await;
+        }
+        match self.admit_plan(plan, input, terms).await {
+            Ok(outcome) => Ok(Admission::Fresh(outcome)),
+            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
+                run, ..
+            })) => self.answer_with(parse_holder(&run)?).await,
+            Err(e) => Err(e),
+        }
     }
 
     /// Admission under a key, for the blocking `_once` entry points.
@@ -4437,7 +4477,11 @@ impl Runtime {
             idempotency_key,
             admitted_by,
             served_unchained: matches!(acting_as, Acting::Nobody),
-            plane_chain: matches!(acting_as, Acting::Plane) && self.identity.is_some(),
+            plane_chain: match acting_as {
+                Acting::Plane => self.identity.is_some(),
+                Acting::PlaneDelegate(_) => true,
+                Acting::Caller(_) | Acting::Nobody => false,
+            },
         }
     }
 
@@ -5717,6 +5761,49 @@ impl Runtime {
                     )
                     .await
                     .map_err(RuntimeError::from_store)?;
+                // A step that paused with its group open holds work only that
+                // step can take back: its reversals are built from the members'
+                // outputs as the step runs. Re-run it once to abandon the group
+                // — members read back, the pause aborts instead of waiting —
+                // and only then unwind the steps before it.
+                let abandon: Vec<StepId> = ready
+                    .iter()
+                    .copied()
+                    .filter(|&s| {
+                        recorded_groups.iter().any(|((step, phase, _), g)| {
+                            *step == s && *phase == Phase::Forward && g.opened > g.settled
+                        })
+                    })
+                    .collect();
+                if !abandon.is_empty() {
+                    let dispatched = self
+                        .dispatch(
+                            &abandon,
+                            cursor,
+                            Batch {
+                                agent: &agent,
+                                identity: identity.as_ref(),
+                                subjects: &subjects,
+                                run,
+                                epoch,
+                                ir: &current,
+                                mode,
+                                case: &case,
+                                ledger: &ledger,
+                                writing,
+                                stamp: &stamp,
+                                input: &input,
+                                outputs: &outputs,
+                                started: &started,
+                                finished: &finished,
+                                recorded_groups: &recorded_groups,
+                                parallelism: 1,
+                                abandoning: true,
+                            },
+                        )
+                        .await;
+                    collect(dispatched, &abandon, cursor)?;
+                }
                 return self
                     .stop(
                         Unwind {
@@ -5748,7 +5835,10 @@ impl Runtime {
             // this is a **pause**: `stop` is reached with a status
             // `maybe_unwind` passes straight through, as exhaustion is.
             if writing && at_frontier {
-                let standing = self.withdrawn_authority(identity.as_ref()).await?;
+                let standing = self
+                    .withdrawal_against(identity.as_ref())
+                    .await
+                    .map_err(RuntimeError::Store)?;
                 match (standing, withheld.take()) {
                     // Lifted since the run was withheld: that decision is a
                     // fact about the run and goes on the record, beside the
@@ -5874,6 +5964,7 @@ impl Runtime {
                         finished: &finished,
                         recorded_groups: &recorded_groups,
                         parallelism: quota.parallelism(&budget),
+                        abandoning: false,
                     },
                 )
                 .await;
@@ -6145,6 +6236,7 @@ impl Runtime {
                             .filter(|((s, p, _), _)| *s == step && *p == Phase::Forward)
                             .map(|((_, _, name), n)| (name.clone(), *n))
                             .collect(),
+                        abandoning: batch.abandoning,
                     },
                     batch.input,
                     batch.outputs,
@@ -7223,6 +7315,7 @@ impl Runtime {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_step_inner(
         &self,
         ctx: StepRun<'_>,
@@ -7253,6 +7346,7 @@ impl Runtime {
             already_started,
             already_finished,
             recorded_groups,
+            abandoning,
         } = ctx;
         let step = node.id;
         let skill = self.resolve(&node.capability.0)?;
@@ -7305,6 +7399,7 @@ impl Runtime {
                 recorded_groups,
             }),
         );
+        cx.abandoning = abandoning;
         // The one place elapsed time is measured, and it is measured with a
         // journaled clock read like every other observation — a wall-clock
         // ceiling decided from an ambient clock would give a replayed run a
@@ -7844,6 +7939,8 @@ struct Batch<'a> {
     recorded_groups: &'a BTreeMap<(StepId, Phase, String), super::ctx::RecordedGroup>,
     /// How many of this ready set may be in flight at once.
     parallelism: usize,
+    /// Re-running steps only to abandon groups a pause left open.
+    abandoning: bool,
 }
 
 /// A standing withdrawal, as the step boundary meets it.
@@ -7925,6 +8022,9 @@ struct Unwind<'a> {
 }
 
 /// What one step's execution needs.
+// Each flag is an independent fact about this dispatch; no combination is
+// invalid, so an enum over them would satisfy the lint at the reader's expense.
+#[allow(clippy::struct_excessive_bools)]
 struct StepRun<'a> {
     identity: Option<&'a crate::core::Delegation>,
     subjects: &'a BTreeSet<crate::core::SubjectRef>,
@@ -7945,6 +8045,9 @@ struct StepRun<'a> {
     already_finished: bool,
     /// Group records this step and phase already wrote. Always empty live.
     recorded_groups: BTreeMap<String, super::ctx::RecordedGroup>,
+    /// Whether this step is re-run only to abandon a group a pause left
+    /// open, because the run was cancelled while paused.
+    abandoning: bool,
 }
 
 /// The half of a `StepCtx`'s frame that belongs to the **step**.
@@ -8659,7 +8762,11 @@ async fn settle_abandoned_group(
     let Some(name) = cx.open_group().map(|g| g.name.clone()) else {
         return result;
     };
-    if matches!(&result, Err(SkillError::Step(StepError::Suspended(_)))) {
+    // A pause leaves the group open for the resumed step to settle — unless
+    // the run was cancelled while paused and this pass exists to abandon it.
+    if !cx.abandoning
+        && matches!(&result, Err(SkillError::Step(e)) if crate::runtime::group::is_pause(e))
+    {
         return result;
     }
 
@@ -10227,9 +10334,9 @@ impl RuntimeBuilder {
     /// deployment and nowhere else; wrapping it here would hand that adapter to
     /// an active-active `PostgreSQL` plane, where the mutex coordinates nothing
     /// and the hold race it exists to prevent is the result. Its erasure unit
-    /// is `tenant/memory/<subject>` and outlives every case, so `erase_case`
-    /// was never the act that reaches it either. Wrap it yourself, where the
-    /// deployment's topology is visible:
+    /// is one item version (`memory-item/<id>@<version>`) and outlives every
+    /// case, so `erase_case` is not the act that reaches it either. Wrap it
+    /// yourself, where the deployment's topology is visible:
     ///
     /// ```ignore
     /// let memories = EncryptedMemoryStore::new(inner, keys.clone(), tenant.clone());

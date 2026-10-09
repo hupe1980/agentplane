@@ -789,6 +789,12 @@ impl ChatCompletions {
                     ));
                 }
             }
+            // An error object inside a 200, handled as soon as it lands: the
+            // server may still send `[DONE]` after it, and settling the empty
+            // answer that would reassemble is a failure reported as success.
+            if let Some(error) = acc.error() {
+                return Err(stream_error(model, &acc, error));
+            }
             if acc.done() {
                 break;
             }
@@ -840,6 +846,66 @@ fn severed(
     ModelError::Unavailable {
         model: model.clone(),
         detail: format!("the stream ended before it generated: {detail}"),
+    }
+}
+
+/// An error the server sent inside the stream.
+///
+/// After generation it is a severed answer whose cost is unknown —
+/// [`Unaccounted`](ModelError::Unaccounted), as [`severed`] says. Before it,
+/// the object is classified as the status it names would be: a numeric
+/// `code` in the HTTP range goes through the one status table, and otherwise
+/// the error's `type` or `code` decides between a rate limit, a refusal and an
+/// outage. There is no `Retry-After` on this path, so no window is invented.
+fn stream_error(
+    model: &ModelId,
+    acc: &chat_completions_stream::Accumulator,
+    error: &Value,
+) -> ModelError {
+    let detail = format!("the provider reported an error inside the stream: {error}");
+    if acc.generated() {
+        return severed(model, acc, &detail);
+    }
+    if let Some(status) = error
+        .get("code")
+        .and_then(Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (300..=599).contains(code))
+    {
+        return classify_status(
+            model,
+            status,
+            &reqwest::header::HeaderMap::new(),
+            &error.to_string(),
+        );
+    }
+    let named = |key: &str| error.get(key).and_then(Value::as_str).unwrap_or_default();
+    let kind = format!("{} {}", named("type"), named("code"));
+    if kind.contains("rate_limit") || kind.contains("insufficient_quota") {
+        ModelError::RateLimited {
+            model: model.clone(),
+            detail,
+            retry_after: None,
+        }
+    } else if [
+        "invalid_request",
+        "authentication",
+        "permission",
+        "not_found",
+        "context_length",
+    ]
+    .iter()
+    .any(|name| kind.contains(name))
+    {
+        ModelError::Refused {
+            model: model.clone(),
+            detail,
+        }
+    } else {
+        ModelError::Unavailable {
+            model: model.clone(),
+            detail,
+        }
     }
 }
 

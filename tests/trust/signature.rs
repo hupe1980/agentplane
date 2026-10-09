@@ -339,7 +339,12 @@ async fn sealed_runs(store: &Arc<RedbStore>, n: usize) -> Vec<agentplane::core::
 /// Every sealed run enters the log, and can prove it.
 #[tokio::test]
 async fn a_sealed_run_is_committed_to() {
-    let store = Arc::new(RedbStore::open_in_memory().unwrap().origin("test-plane"));
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .unwrap()
+            .origin("test-plane")
+            .unwrap(),
+    );
     let runs = sealed_runs(&store, 5).await;
 
     let cp = (store.clone() as Arc<dyn JournalStore>)
@@ -1032,7 +1037,12 @@ async fn only_an_outside_checkpoint_detects_a_deletion() {
 /// A checkpoint from a different plane is refused, not compared.
 #[tokio::test]
 async fn a_checkpoint_from_another_plane_is_refused() {
-    let store = Arc::new(RedbStore::open_in_memory().unwrap().origin("plane-a"));
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .unwrap()
+            .origin("plane-a")
+            .unwrap(),
+    );
     let runs = sealed_runs(&store, 2).await;
     let s = store.clone() as Arc<dyn JournalStore>;
 

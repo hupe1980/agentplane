@@ -185,27 +185,19 @@ pub fn wire(
     }
 
     let peers = peers_called(history);
-    let mut grants: BTreeMap<String, Vec<(String, bool)>> = BTreeMap::new();
+    let mut grants: BTreeMap<String, Vec<(String, &crate::manifest::ToolGrant)>> = BTreeMap::new();
     for grant in manifests.iter().flat_map(|m| &m.spec.tools) {
         if let Some(id) = crate::tools::ToolId::parse(&grant.reference)
             && id.server != crate::tools::AGENT_SERVER
         {
-            grants
-                .entry(id.server)
-                .or_default()
-                .push((id.tool, grant.mutates));
+            grants.entry(id.server).or_default().push((id.tool, grant));
         }
     }
     let mut registry = crate::peers::PeerRegistry::new();
     let mut any_peer = false;
     for (server, tools) in grants {
         if peers.contains(&server) {
-            let mut grant = crate::peers::PeerGrant::new(crate::core::Scope::of(
-                tools.iter().map(|(tool, _)| tool.clone()),
-            ));
-            if tools.iter().all(|(_, mutates)| !mutates) {
-                grant = grant.read_only();
-            }
+            let grant = crate::peers::PeerGrant::from_grants(tools);
             registry = registry.allow(crate::peers::PeerId::new(server), grant);
             any_peer = true;
         } else {

@@ -303,6 +303,9 @@ pub struct PeerGrant {
     /// Whether a call to this peer changes the world.
     pub mutates: bool,
     pub recovery: Recovery,
+    /// The most sensitive data a call may send. A call is held to the lower
+    /// of this and its own tool grant's ceiling, so the wiring bounds every
+    /// declaration that names the peer.
     pub max_sensitivity: Sensitivity,
     pub output_sensitivity: Sensitivity,
     pub retry: RetryPolicy,
@@ -316,6 +319,30 @@ pub struct PeerGrant {
 }
 
 impl PeerGrant {
+    /// The grant a set of reviewed tool grants naming one peer implies: their
+    /// tools as the scope, read-only only when every grant says `mutates:
+    /// false`, and the highest ceiling any of them declares.
+    ///
+    /// For a plane whose manifests are its wiring, so the operator's ceiling
+    /// and the declaration's cannot disagree.
+    #[cfg(feature = "manifest")]
+    #[must_use]
+    pub fn from_grants<'g>(
+        grants: impl IntoIterator<Item = (String, &'g crate::manifest::ToolGrant)>,
+    ) -> Self {
+        let grants: Vec<_> = grants.into_iter().collect();
+        let mut grant = Self::new(Scope::of(grants.iter().map(|(tool, _)| tool.clone())));
+        if grants.iter().all(|(_, g)| !g.mutates) {
+            grant = grant.read_only();
+        }
+        grant.max_sensitivity = grants
+            .iter()
+            .map(|(_, g)| crate::tools::ToolSafety::from_grant(g).max_sensitivity)
+            .max()
+            .unwrap_or(grant.max_sensitivity);
+        grant
+    }
+
     /// A grant with the conservative posture: mutating, operator-resolved.
     #[must_use]
     pub fn new(scope: Scope) -> Self {
@@ -335,12 +362,21 @@ impl PeerGrant {
     ///
     /// # Panics
     ///
-    /// If the credential's audience is not this peer. That is a configuration
-    /// error the operator must see at startup rather than a refusal at 3am, and
-    /// there is no sensible way to continue: the alternative is holding a
-    /// credential that can only ever be sent to the wrong place.
+    /// If the credential's audience is not this peer, or it names a subject.
+    /// Both are configuration errors the operator must see at startup rather
+    /// than a refusal at 3am: the first is a credential that can only ever be
+    /// sent to the wrong place, and the second one person's token presented
+    /// for every run while the record calls it unbound — a credential that
+    /// names its subject comes from [`with_source`](Self::with_source).
     #[must_use]
     pub fn with_credential(mut self, peer: &PeerId, credential: PeerCredential) -> Self {
+        assert!(
+            credential.subject().is_none(),
+            "a credential naming '{}' was attached to peer '{peer}' as the one every \
+             run presents; a credential bound to a person is obtained per run, from \
+             a credential source",
+            credential.subject().unwrap_or_default()
+        );
         assert_eq!(
             credential.audience(),
             peer,
@@ -1292,7 +1328,7 @@ impl PeerCall {
     #[must_use]
     pub fn governed_by(mut self, safety: &crate::tools::ToolSafety) -> Self {
         self.grant.mutates |= safety.mutates;
-        self.grant.max_sensitivity = safety.max_sensitivity;
+        self.grant.max_sensitivity = self.grant.max_sensitivity.min(safety.max_sensitivity);
         self.grant.output_sensitivity =
             self.grant.output_sensitivity.max(safety.output_sensitivity);
         self.protected.clone_from(&safety.protected_fields);

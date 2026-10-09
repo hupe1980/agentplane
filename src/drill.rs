@@ -182,7 +182,8 @@ pub async fn drill(stores: &Stores<'_>) -> Result<DrillReport, StoreError> {
             }
             #[cfg(feature = "keyring")]
             if let Some(keys) = stores.keys {
-                check_sealed(&mut report, keys.as_ref(), case.id, &case.state).await;
+                let erased = stores.cases.erasure(case.id).await?.is_some();
+                check_sealed(&mut report, keys.as_ref(), case.id, &case.state, erased).await;
             }
         }
         if !full {
@@ -280,13 +281,23 @@ async fn check_sealed(
     keys: &dyn crate::keyring::KeyRing,
     case: crate::core::CaseId,
     state: &serde_json::Value,
+    erased: bool,
 ) {
     use crate::keyring::KeyError;
 
     match crate::keyring::probe_sealed_case_state(keys, case, state).await {
         None => {}
         Some(Ok(())) => report.sealed_open += 1,
-        Some(Err(KeyError::Destroyed { .. })) => report.sealed_erased += 1,
+        // Erased only when the case's own erasure record says so. A key ring
+        // that cannot tell a destroyed key from one that never existed — a
+        // restore into another key service, a wrong namespace, a key removed
+        // by hand — would otherwise make every lost key read as a lawful
+        // erasure, and a drill that reports none is the one nobody reads.
+        Some(Err(KeyError::Destroyed { .. })) if erased => report.sealed_erased += 1,
+        Some(Err(KeyError::Destroyed { .. })) => report.findings.push(format!(
+            "case {case}: its key is gone and no erasure record accounts for it — a key \
+             removed outside the plane, or a key service that never held it, not an erasure"
+        )),
         Some(Err(KeyError::Unavailable(e))) => report.not_checked.push(format!(
             "case {case}: the key ring could not be reached ({e}) — whether the sealed \
              state opens was not established either way"
@@ -363,6 +374,67 @@ mod sealed_classification_tests {
         ])
     }
 
+    /// **A key gone with no erasure record is a finding, not an erasure.** A
+    /// key service that cannot tell a destroyed key from one it never held
+    /// answers both the same way; only the case's own erasure record says
+    /// which, so without one the drill names the loss.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn a_destroyed_key_with_no_erasure_record_is_a_finding() {
+        use crate::case::CaseStore as _;
+        use std::sync::Arc;
+
+        let ring = Arc::new(MemoryKeyRing::new());
+        let store = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"));
+        let tenant = crate::core::TenantId::default();
+        let sealed = crate::keyring::SealedCases::wrap(
+            Arc::clone(&store) as Arc<dyn crate::case::CaseStore>,
+            Arc::clone(&ring) as Arc<dyn crate::keyring::KeyRing>,
+            tenant.clone(),
+        );
+        let case = sealed
+            .correlate_or_open(
+                "matter",
+                &[crate::core::CorrelationKey::new("ns", "LOST-1")],
+                crate::core::Timestamp::UNIX_EPOCH,
+            )
+            .await
+            .expect("open")
+            .case_id();
+        let version = sealed
+            .case(case)
+            .await
+            .expect("read")
+            .expect("case")
+            .version;
+        sealed
+            .put_state(case, version, serde_json::json!({ "about": "a matter" }))
+            .await
+            .expect("state");
+        let raw = store.case(case).await.expect("read").expect("case").state;
+        crate::keyring::KeyRing::destroy(
+            ring.as_ref(),
+            &crate::core::erasure_scope(&tenant, &case.to_string()),
+            crate::core::Timestamp::UNIX_EPOCH,
+            "removed by hand",
+        )
+        .await
+        .expect("destroy");
+
+        let mut unrecorded = blank();
+        check_sealed(&mut unrecorded, ring.as_ref(), case, &raw, false).await;
+        assert_eq!(
+            unrecorded.sealed_erased, 0,
+            "a lost key was counted as an erasure"
+        );
+        assert_eq!(unrecorded.findings.len(), 1, "{:?}", unrecorded.findings);
+
+        let mut recorded = blank();
+        check_sealed(&mut recorded, ring.as_ref(), case, &raw, true).await;
+        assert_eq!(recorded.sealed_erased, 1);
+        assert_eq!(recorded.findings, Vec::<String>::new());
+    }
+
     /// **A build skew and a suspected loss are different findings.**
     ///
     /// Both are findings — this plane is holding a case it cannot read either
@@ -378,7 +450,14 @@ mod sealed_classification_tests {
     async fn a_version_this_build_cannot_read_is_not_reported_as_loss_or_tampering() {
         let ring = MemoryKeyRing::new();
         let mut report = blank();
-        check_sealed(&mut report, &ring, CaseId::generate(), &from_the_future()).await;
+        check_sealed(
+            &mut report,
+            &ring,
+            CaseId::generate(),
+            &from_the_future(),
+            true,
+        )
+        .await;
 
         assert_eq!(
             report.sealed_open, 0,
@@ -409,7 +488,7 @@ mod sealed_classification_tests {
             crate::journal::payload::wrap(&[crate::keyring::ENVELOPE_FORMAT_VERSION, 0]);
 
         let mut report = blank();
-        check_sealed(&mut report, &ring, CaseId::generate(), &truncated).await;
+        check_sealed(&mut report, &ring, CaseId::generate(), &truncated, true).await;
 
         assert_eq!(report.findings.len(), 1, "{:#?}", report.findings);
         assert!(
@@ -447,6 +526,7 @@ mod sealed_classification_tests {
             &ring,
             CaseId::generate(),
             &crate::journal::payload::wrap(&bytes),
+            true,
         )
         .await;
 
@@ -481,6 +561,7 @@ mod sealed_classification_tests {
             &ring,
             CaseId::generate(),
             &serde_json::json!({ "about": "a readable matter" }),
+            true,
         )
         .await;
         assert_eq!(

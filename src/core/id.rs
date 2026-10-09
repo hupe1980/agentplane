@@ -185,12 +185,24 @@ macro_rules! ulid_newtype {
             /// database columns without the caller having to know which form it
             /// is holding.
             ///
+            /// Only the canonical spelling: uppercase Crockford base32 whose
+            /// first character is at most `7`. The decoder also reads
+            /// lowercase, and a first character past `7` overflows 128 bits
+            /// and wraps, so without this one id would have many spellings —
+            /// and every index keyed on the string would hold a different run
+            /// for each.
+            ///
             /// # Errors
             ///
-            /// If what remains after the prefix is not a ULID.
+            /// If what remains after the prefix is not a ULID in its canonical
+            /// spelling.
             pub fn parse(s: &str) -> Result<Self, ulid::DecodeError> {
                 let bare = s.strip_prefix(concat!($prefix, "_")).unwrap_or(s);
-                ulid::Ulid::from_string(bare).map(Self)
+                let id = ulid::Ulid::from_string(bare)?;
+                if id.to_string() != bare {
+                    return Err(ulid::DecodeError::InvalidChar);
+                }
+                Ok(Self(id))
             }
         }
 
@@ -681,6 +693,36 @@ mod tests {
     fn bare_ulids_still_parse() {
         let r = RunId::generate();
         assert_eq!(RunId::parse(&r.0.to_string()).unwrap(), r);
+    }
+
+    /// **One id, one spelling.** Lowercase and a first character past `7`
+    /// both decode — the second by wrapping past 128 bits — so each was a
+    /// second string for an id some index already holds under the first.
+    #[test]
+    fn a_non_canonical_spelling_of_an_id_is_refused() {
+        const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let r = RunId::generate();
+        let canonical = r.0.to_string();
+        assert_eq!(RunId::parse(&canonical).expect("canonical"), r);
+
+        let lower = canonical.to_ascii_lowercase();
+        assert!(
+            RunId::parse(&lower).is_err(),
+            "{lower} parsed as an alias of {canonical}"
+        );
+        assert!(RunId::parse(&format!("run_{lower}")).is_err());
+
+        // Eight places on, the first character sets bit 128, which falls off
+        // the value: this spelling decodes to the id `canonical` names.
+        let first = ALPHABET
+            .iter()
+            .position(|&c| c == canonical.as_bytes()[0])
+            .expect("crockford");
+        let wrapped = format!("{}{}", char::from(ALPHABET[first + 8]), &canonical[1..]);
+        assert!(
+            RunId::parse(&wrapped).is_err(),
+            "{wrapped} wrapped to an alias of {canonical}"
+        );
     }
 
     /// Prefixes are not interchangeable in *meaning*, but parsing is lenient by

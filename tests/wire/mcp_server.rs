@@ -351,10 +351,18 @@ async fn a_host_without_tasks_is_offered_only_tools_that_cannot_suspend() {
             )
             .await;
         let said = format!("{refused:?}");
+        let Err(rmcp::service::ServiceError::McpError(error)) = refused else {
+            panic!("{label}: calling a may-suspend tool by name was not refused: {said}");
+        };
+        assert_eq!(
+            error.code,
+            rmcp::model::ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY,
+            "{label}: the Tasks extension answers a call it cannot serve without a task \
+             with -32021, not as a bad argument: {said}"
+        );
         assert!(
-            refused.is_err() && said.contains("io.modelcontextprotocol/tasks"),
-            "{label}: calling a may-suspend tool by name was not refused naming the \
-             extension: {said}"
+            said.contains("io.modelcontextprotocol/tasks"),
+            "{label}: the refusal does not name the extension it requires: {said}"
         );
         assert_eq!(
             plane

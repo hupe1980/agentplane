@@ -25,7 +25,7 @@ use async_trait::async_trait;
 
 use crate::core::{Digest, KeyId, KeySignature, Signer, StoreError, Verifier};
 use crate::manifest::registry::{
-    PublishVerdict, check_signature, decide_publish, reparse, sign_manifest, to_yaml,
+    PublishVerdict, check_signature, decide_publish, prepare_publish, reparse, sign_manifest,
 };
 use crate::manifest::{Manifest, Registry, RegistryError};
 
@@ -64,12 +64,7 @@ impl PostgresStore {
     ) -> Result<Digest, RegistryError> {
         let name = manifest.metadata.name.clone();
         let version = manifest.metadata.version.clone();
-        let digest = manifest.digest().map_err(|source| RegistryError::Corrupt {
-            name: name.clone(),
-            version: version.clone(),
-            source,
-        })?;
-        let yaml = to_yaml(manifest)?;
+        let (digest, yaml) = prepare_publish(manifest)?;
         let (key_id, signature_hex) = signature
             .as_ref()
             .map_or((String::new(), String::new()), |a| {

@@ -763,23 +763,21 @@ async fn a_failed_reversal_quarantines_rather_than_reporting_success() {
 
 // ── How a group behaves beside every other mechanism ────────────────────────
 
-/// A ceiling bounds work; it must not strand it half-done.
-///
-/// A reversal runs in the step's **forward** phase, so the phase — which is what
-/// exempts a compensating effect from the gate — says nothing about it. Without
-/// a separate exemption a run that reached its ceiling mid-group could not
-/// release the hold it had already placed, which is the outcome the
-/// compensation exemption exists to prevent, reached by a different road.
+/// **Exhaustion inside a group is a pause, and the unwind it does not do is
+/// the operator's.** The ceiling stops the step with the hold and the
+/// authorisation standing — work a raised ceiling continues, so nothing is
+/// taken back. A cancel then unwinds both, and the reversals run although the
+/// budget is spent: a ceiling bounds work, it does not strand it half-done.
 #[tokio::test]
-async fn a_group_is_taken_back_even_when_the_budget_is_exhausted() {
+async fn exhaustion_inside_a_group_pauses_and_a_cancel_still_unwinds_it() {
     use agentplane::core::Budget;
+    use agentplane::runtime::Mode;
 
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let world = World::new();
     let rt = Runtime::builder(store as Arc<dyn JournalStore>)
         // Exactly the three forward members: the hold, the authorisation, the
-        // read. The gated send is refused for want of allowance, and the two
-        // reversals that follow have none left.
+        // read. The gated send is refused for want of allowance.
         .budget(Budget::unlimited().effects(3))
         .skill(Checkout {
             world: Arc::clone(&world),
@@ -791,19 +789,42 @@ async fn a_group_is_taken_back_even_when_the_budget_is_exhausted() {
         .await
         .expect("run");
     assert!(
-        !matches!(out.status, RunStatus::Quarantined(_)),
-        "the unwind was refused for want of budget: {:?}",
+        matches!(out.status, RunStatus::Exhausted(_)),
+        "exhaustion inside a group is a pause: {:?}",
         out.status
     );
     assert!(
-        world.did("released sku-1") && world.did("voided"),
-        "a run that hit its ceiling could not undo the work it had already \
-         done — a charged card and no order: {:?}",
+        !world.did("released sku-1") && !world.did("voided"),
+        "a pause took back work a raised ceiling would have continued: {:?}",
         world.entries()
     );
     assert!(
         !world.did("order confirmed"),
         "the gated member ran despite the group not committing"
+    );
+
+    rt.request_cancel(
+        out.run_id,
+        &agentplane::core::Operator::asserted("ops").unwrap(),
+        "not worth a raise",
+    )
+    .await
+    .expect("cancel");
+    let cancelled = rt.replay(out.run_id, Mode::Resume).await.expect("resume");
+    assert!(
+        !matches!(cancelled.status, RunStatus::Quarantined(_)),
+        "the unwind was refused for want of budget: {:?}",
+        cancelled.status
+    );
+    assert!(
+        world.did("released sku-1") && world.did("voided"),
+        "a cancelled run could not undo the work it had already done — a \
+         charged card and no order: {:?}",
+        world.entries()
+    );
+    assert!(
+        !world.did("order confirmed"),
+        "the cancel sent the gated member"
     );
 }
 
@@ -2649,18 +2670,12 @@ impl Skill for HoldThenSend {
     }
 }
 
-/// A budget refusal *inside* the replayed prefix stays a refusal, whatever the
-/// ceiling now says.
-///
-/// A raised ceiling un-pauses a run whose refusal is the history frontier —
-/// the last thing the run did. A refusal a group abort already answered is
-/// different: the record continues past it, through the reversals and the
-/// `Aborted` settlement, so re-admitting it mid-prefix would dispatch the
-/// member where history holds the abort's reversals — divergence and a
-/// quarantine manufactured out of an operator's raise. The resume must
-/// re-reach the recorded abort instead, byte for byte.
+/// **A budget refusal inside a group is a pause a raised ceiling continues.**
+/// The deferred send is refused at the ceiling, the group stays open with the
+/// hold standing, and a resume under a raised ceiling sends it and commits —
+/// the hold is never released and re-taken.
 #[tokio::test]
-async fn a_refusal_a_group_abort_already_answered_is_not_readmitted() {
+async fn a_refusal_inside_a_group_is_continued_by_a_raised_ceiling() {
     let world = World::new();
     let store = Arc::new(RedbStore::open_in_memory().expect("store"));
     let build = |budget: agentplane::core::Budget| {
@@ -2672,53 +2687,190 @@ async fn a_refusal_a_group_abort_already_answered_is_not_readmitted() {
             .build()
     };
 
-    // One effect of budget: the hold lands, the deferred send is refused, the
-    // group aborts and the hold is released (reversals are gate-exempt).
     let capped = build(agentplane::core::Budget::default().effects(1));
     let out = capped
         .run("hold.then.send", Tainted::trusted(json!({})))
         .await
         .expect("run");
     assert!(
-        matches!(out.status, RunStatus::Failed(_)),
-        "the premise is a refused deferred member and a clean abort: {:?}",
+        matches!(out.status, RunStatus::Exhausted(_)),
+        "a refused member inside a group is a pause: {:?}",
         out.status
     );
-    assert_eq!(world.entries(), vec!["held", "released"]);
+    assert_eq!(
+        world.entries(),
+        vec!["held"],
+        "the pause took the hold back"
+    );
 
-    // Raised and resumed: the refusal is inside the prefix — the abort's
-    // reversals and settlement follow it — so the resume re-reaches the same
-    // conclusion rather than dispatching the send into recorded history.
     let raised = build(agentplane::core::Budget::default().effects(10));
     let again = raised
         .replay(out.run_id, agentplane::runtime::Mode::Resume)
         .await
         .expect("resume");
     assert!(
-        matches!(again.status, RunStatus::Failed(_)),
-        "a raised ceiling re-admitted a refusal the group abort had already \
-         answered — the resume diverged from its own history: {:?}",
+        matches!(again.status, RunStatus::Succeeded),
+        "a raised ceiling did not continue the paused group: {:?}",
         again.status
-    );
-    assert!(
-        !world.did("sent"),
-        "the resume dispatched the send an aborted group never ran: {:?}",
-        world.entries()
     );
     assert_eq!(
         world.entries(),
-        vec!["held", "released"],
-        "the resume re-performed a member or a reversal"
+        vec!["held", "sent"],
+        "the resume re-performed or reversed a member"
     );
     assert_eq!(
         group_kind_count(&store, out.run_id, "GroupSettled").await,
         1,
-        "the resume must consume the recorded settlement, appending none"
+        "the group settles once, when it commits"
+    );
+}
+
+/// **A cancel does no new work, whatever was raised before it.** The paused
+/// member is re-walked only so the group can abort; a ceiling raised in the
+/// meantime must not re-admit the refused send on that pass and let the
+/// cancel perform — and commit — what it was asked to stop.
+#[tokio::test]
+async fn a_cancel_under_a_raised_ceiling_sends_nothing() {
+    let world = World::new();
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let build = |budget: agentplane::core::Budget| {
+        Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+            .budget(budget)
+            .skill(HoldThenSend {
+                world: Arc::clone(&world),
+            })
+            .build()
+    };
+
+    let capped = build(agentplane::core::Budget::default().effects(1));
+    let out = capped
+        .run("hold.then.send", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Exhausted(_)),
+        "a refused member inside a group is a pause: {:?}",
+        out.status
+    );
+
+    let raised = build(agentplane::core::Budget::default().effects(10));
+    raised
+        .request_cancel(
+            out.run_id,
+            &agentplane::core::Operator::asserted("ops").unwrap(),
+            "not this one",
+        )
+        .await
+        .expect("cancel");
+    let cancelled = raised
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("cancel pass");
+    assert!(
+        matches!(cancelled.status, RunStatus::Cancelled { .. }),
+        "the cancel did not conclude cancelled: {:?}",
+        cancelled.status
+    );
+    assert_eq!(
+        world.entries(),
+        vec!["held", "released"],
+        "the cancel performed new work instead of only taking the hold back"
     );
     assert_eq!(
         group_kind_count(&store, out.run_id, "BudgetReadmitted").await,
         0,
-        "a mid-prefix refusal must not be re-admitted"
+        "the cancel journaled a re-admission it never acted on"
+    );
+}
+
+/// Holds inside a group, waits a moment, then sends and commits.
+#[derive(Debug)]
+struct HoldWaitSend {
+    world: Arc<World>,
+}
+
+#[async_trait::async_trait]
+impl Skill for HoldWaitSend {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("hold-wait-send").provides("hold.wait.send")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let w = &self.world;
+        let mut g = cx
+            .group("hold.wait.send", ["inventory", "notify"])
+            .await
+            .map_err(SkillError::Step)?;
+        g.reversible("inventory", Call::new("stock.hold", "held", w), |_| {
+            Call::new("stock.release", "released", w)
+        })
+        .await
+        .map_err(SkillError::Step)?;
+        let _ = g;
+        cx.sleep(std::time::Duration::from_millis(1))
+            .await
+            .map_err(SkillError::Step)?;
+        let mut g = cx
+            .group("hold.wait.send", ["inventory", "notify"])
+            .await
+            .map_err(SkillError::Step)?;
+        g.deferred("notify", Call::new("mail.send", "sent", w))
+            .map_err(SkillError::Step)?;
+        g.commit(&[]).await.map_err(SkillError::Step)?;
+        Ok(Outcome::done(Tainted::trusted(json!("sent"))))
+    }
+}
+
+/// **A cancel does not finish a wait that ended meanwhile.** The run is
+/// cancelled while suspended inside a group, after its timer is due: the pass
+/// that abandons the group replays past the wait, and must take the hold back
+/// rather than go on to send and commit.
+#[tokio::test]
+async fn a_cancel_after_a_wait_ended_sends_nothing() {
+    let world = World::new();
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
+        .timers(store.clone() as Arc<dyn agentplane::case::TimerStore>)
+        .skill(HoldWaitSend {
+            world: Arc::clone(&world),
+        })
+        .build();
+
+    let out = rt
+        .run("hold.wait.send", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        out.status.is_suspended(),
+        "expected a suspension, got {:?}",
+        out.status
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    rt.request_cancel(
+        out.run_id,
+        &agentplane::core::Operator::asserted("ops").unwrap(),
+        "not this one",
+    )
+    .await
+    .expect("cancel");
+    let cancelled = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Resume)
+        .await
+        .expect("cancel pass");
+    assert!(
+        matches!(cancelled.status, RunStatus::Cancelled { .. }),
+        "the cancel did not conclude cancelled: {:?}",
+        cancelled.status
+    );
+    assert_eq!(
+        world.entries(),
+        vec!["held", "released"],
+        "the cancel finished the wait and sent instead of taking the hold back"
     );
 }
 
@@ -2905,5 +3057,170 @@ async fn a_cleanly_aborted_group_leaves_its_step_nothing_to_unwind() {
             "seat released"
         ],
         "the group was not taken back exactly once, or step 0 was not compensated"
+    );
+}
+
+/// **A plane missing its wiring fails before dispatch, and a group beside it is
+/// taken back cleanly.** Asking for a timer on a plane with no timer store
+/// asks nothing of the world, so it is no reason to doubt the members that
+/// landed: the group is aborted and each is reversed, not quarantined.
+#[tokio::test]
+async fn a_wiring_fault_beside_an_open_group_aborts_it() {
+    #[derive(Debug)]
+    struct HoldsThenSleeps {
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for HoldsThenSleeps {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("sleeps").provides("sleeps")
+        }
+
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let mut g = cx
+                .group("sleeps", ["inventory"])
+                .await
+                .map_err(SkillError::Step)?;
+            g.reversible(
+                "inventory",
+                Call::new("stock.hold", "held", &self.world),
+                |_| Call::new("stock.release", "released", &self.world),
+            )
+            .await
+            .map_err(SkillError::Step)?;
+            cx.sleep(std::time::Duration::from_secs(60))
+                .await
+                .map_err(SkillError::Step)?;
+            Ok(Outcome::done(Tainted::trusted(json!("slept"))))
+        }
+    }
+
+    let world = World::new();
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(HoldsThenSleeps {
+            world: Arc::clone(&world),
+        })
+        .build();
+    let out = rt
+        .run("sleeps", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "a plane with no timer store failed the run: {:?}",
+        out.status
+    );
+    let settled = store
+        .read(out.run_id, 1)
+        .await
+        .expect("read")
+        .iter()
+        .find_map(|r| match r.kind() {
+            agentplane::journal::RecordKind::GroupSettled { outcome, .. } => Some(*outcome),
+            _ => None,
+        });
+    assert_eq!(
+        settled,
+        Some(agentplane::core::GroupOutcome::Aborted),
+        "a fault that asked nothing of the world quarantined the group as in doubt"
+    );
+    assert!(world.did("released"), "the landed member was not reversed");
+}
+
+/// **A group whose second atomic member is refused replays as it ran.** The
+/// first member was gated and never committed, so nothing is recorded at its
+/// key; a replay must recognise the refusal recorded at the later key rather
+/// than call the faithful history divergent.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn a_refused_second_atomic_member_replays_as_it_ran() {
+    use agentplane::core::{PolicyBundleIdentity, PolicyDecision, PolicyEngine, PolicyRequest};
+    use agentplane::runtime::Mode;
+
+    #[derive(Debug)]
+    struct RefusesTheSecondAccount;
+
+    impl PolicyEngine for RefusesTheSecondAccount {
+        fn authorize(&self, r: &PolicyRequest<'_>) -> PolicyDecision {
+            if r.context.to_string().contains("AC-2") {
+                PolicyDecision::deny("AC-2 is closed to this agent".to_owned())
+            } else {
+                PolicyDecision::Permit
+            }
+        }
+        fn bundle(&self) -> PolicyBundleIdentity {
+            PolicyBundleIdentity::new(
+                agentplane::core::Digest::of(b"refuses-ac-2"),
+                "agentplane-test/policy-v1",
+            )
+        }
+    }
+
+    #[derive(Debug)]
+    struct Transfers {
+        world: Arc<World>,
+    }
+
+    #[async_trait::async_trait]
+    impl Skill for Transfers {
+        fn descriptor(&self) -> SkillDescriptor {
+            SkillDescriptor::new("transfers").provides("transfers")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut StepCtx<'_>,
+            _input: Tainted<Value>,
+        ) -> Result<Outcome, SkillError> {
+            let mut g = cx
+                .group("transfers", ["ledger"])
+                .await
+                .map_err(SkillError::Step)?;
+            for (account, amount) in [("AC-1", -50), ("AC-2", 50)] {
+                g.atomic(
+                    "ledger",
+                    Arc::new(Posts {
+                        account: account.to_owned(),
+                        amount,
+                        refuses: false,
+                        world: Arc::clone(&self.world),
+                    }),
+                )
+                .map_err(SkillError::Step)?;
+            }
+            g.commit(&[]).await.map_err(SkillError::Step)?;
+            Ok(Outcome::done(Tainted::trusted(json!("transferred"))))
+        }
+    }
+
+    let (store, _redb) = staged();
+    let world = World::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .policy(Arc::new(RefusesTheSecondAccount))
+        .skill(Transfers {
+            world: Arc::clone(&world),
+        })
+        .build();
+    let out = rt
+        .run("transfers", Tainted::trusted(json!({})))
+        .await
+        .expect("run");
+    assert!(
+        matches!(out.status, RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert!(store.applied().is_empty(), "half a transfer committed");
+
+    let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replay");
+    assert_eq!(
+        format!("{:?}", replayed.status),
+        format!("{:?}", out.status),
+        "a faithful history whose second atomic member was refused read as divergent"
     );
 }

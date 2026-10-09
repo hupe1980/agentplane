@@ -1086,3 +1086,98 @@ async fn the_window_a_peer_named_is_on_the_record() {
         "a peer that named no window is reported as having named one: {silent}"
     );
 }
+
+/// **A commission is asked once.** A specialist that ran and gave no answer
+/// may have acted, and each dispatch admits a sub-run of its own — so a retry
+/// would be a second specialist doing the work again beside the first. The
+/// failure is the commission's recorded outcome, and replay reads it back.
+#[cfg(feature = "manifest")]
+#[tokio::test]
+async fn a_failed_commission_is_not_commissioned_again() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct Orders;
+
+    #[async_trait::async_trait]
+    impl agentplane::core::Skill for Orders {
+        fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+            agentplane::core::SkillDescriptor::new("orders").provides("demo.orders")
+        }
+        async fn invoke(
+            &self,
+            cx: &mut agentplane::runtime::StepCtx<'_>,
+            _input: agentplane::core::Tainted<serde_json::Value>,
+        ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+            let answer = cx
+                .commission(
+                    "demo.flaky",
+                    agentplane::core::Tainted::trusted(serde_json::json!({})),
+                )
+                .await?;
+            Ok(agentplane::core::Outcome::done(answer))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Flaky(std::sync::Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl agentplane::core::Skill for Flaky {
+        fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+            agentplane::core::SkillDescriptor::new("flaky").provides("demo.flaky")
+        }
+        async fn invoke(
+            &self,
+            _cx: &mut agentplane::runtime::StepCtx<'_>,
+            _input: agentplane::core::Tainted<serde_json::Value>,
+        ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(agentplane::core::Outcome::fail("the specialist gave up"))
+        }
+    }
+
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
+    let rt = agentplane::runtime::Runtime::builder(std::sync::Arc::clone(&store))
+        .skill(Orders)
+        .skill(Flaky(std::sync::Arc::clone(&calls)))
+        .build();
+    let out = rt
+        .run(
+            "demo.orders",
+            agentplane::core::Tainted::trusted(serde_json::json!({})),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(out.status, agentplane::runtime::RunStatus::Failed(_)),
+        "{:?}",
+        out.status
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the commission was retried, and the specialist ran again beside its first run"
+    );
+    assert_eq!(
+        store.recent_runs(None, 10).await.unwrap().len(),
+        2,
+        "one parent and exactly one sub-run"
+    );
+    let replayed = rt
+        .replay(out.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .unwrap();
+    assert_eq!(
+        format!("{:?}", replayed.status),
+        format!("{:?}", out.status),
+        "a strict replay reached another verdict for the failed commission"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "strict replay asked the specialist"
+    );
+}

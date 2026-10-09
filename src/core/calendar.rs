@@ -53,7 +53,8 @@ pub trait Calendar: Send + Sync + std::fmt::Debug {
 
 /// The built-in calendar: plain wall-clock offsets.
 ///
-/// Understands `hours` and `days` so the runtime is usable without an adapter.
+/// Understands `minutes`, `hours` and `days`, each a positive count `n` of
+/// that unit, so the runtime is usable without an adapter.
 /// It deliberately does **not** guess at working days or holidays — a wrong
 /// answer there is worse than no answer, because it looks right.
 #[derive(Debug, Clone, Copy, Default)]
@@ -149,9 +150,7 @@ mod tests {
     ///
     /// `time::Duration::hours` multiplies before it constructs and panics on
     /// overflow, so the unchecked form aborted the process from inside a
-    /// calendar — on a number read out of a manifest. What this does NOT
-    /// cover: a negative count, which resolves to an instant in the past and is
-    /// legitimate (an obligation imported already overdue).
+    /// calendar — on a number read out of a manifest.
     #[test]
     fn a_count_that_cannot_be_a_duration_is_refused_not_a_panic() {
         let base = datetime!(2026-07-30 09:00:00 UTC);
@@ -174,6 +173,36 @@ mod tests {
         let spec = DeadlineSpec::days(4_000_000);
         let err = WallClock.resolve(base, &spec).unwrap_err();
         assert!(matches!(err, CalendarError::OutOfRange { .. }), "{err:?}");
+    }
+
+    /// A count of zero or less is refused rather than resolved: it would land
+    /// on `from` or before it, an obligation breached as it is registered.
+    #[test]
+    fn a_count_that_is_not_positive_is_refused() {
+        let base = datetime!(2026-07-30 09:00:00 UTC);
+        for n in [0, -1, i64::MIN] {
+            let spec = DeadlineSpec::new("minutes", serde_json::json!({ "n": n }));
+            let err = WallClock.resolve(base, &spec).unwrap_err();
+            assert!(
+                matches!(err, CalendarError::BadParams { .. }),
+                "n = {n}: expected a refusal, got {err:?}"
+            );
+        }
+    }
+
+    /// `minutes` is a unit like the other two, sixty seconds each.
+    #[test]
+    fn resolves_minutes() {
+        let base = datetime!(2026-07-30 09:00:00 UTC);
+        assert_eq!(
+            WallClock
+                .resolve(
+                    base,
+                    &DeadlineSpec::new("minutes", serde_json::json!({ "n": 90 }))
+                )
+                .unwrap(),
+            datetime!(2026-07-30 10:30:00 UTC)
+        );
     }
 
     #[test]

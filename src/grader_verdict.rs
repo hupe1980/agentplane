@@ -378,11 +378,7 @@ fn check_one(
         _ => None,
     });
     out.records_past_prefix = last.saturating_sub(sidecar.last_seq);
-    out.sealed_payloads = prefix().any(|r| {
-        serde_json::to_value(r.kind())
-            .as_ref()
-            .is_ok_and(holds_sealed)
-    });
+    out.sealed_payloads = prefix().any(|r| holds_sealed(r.kind()));
     let Some(graders) = graders else {
         out.status = Status::NotChecked;
         "the binding holds; no grader key was supplied, so who signed the verdict was \
@@ -420,11 +416,42 @@ fn check_one(
     out
 }
 
-fn holds_sealed(value: &serde_json::Value) -> bool {
-    crate::journal::payload::is_sealed(value)
-        || match value {
-            serde_json::Value::Object(map) => map.values().any(holds_sealed),
-            serde_json::Value::Array(items) => items.iter().any(holds_sealed),
-            _ => false,
-        }
+/// Whether any payload field of `kind` is sealed — value or text.
+///
+/// Read through the one list of sealable fields rather than by walking the
+/// record's JSON for the value marker: a note's text or a failure's message is
+/// sealed as a string, which no value walk recognises, and a sidecar over such
+/// a prefix would be reported as graded over plaintext.
+fn holds_sealed(kind: &RecordKind) -> bool {
+    use crate::journal::payload::{self, SealedField};
+    let mut kind = kind.clone();
+    payload::payloads(&mut kind)
+        .into_iter()
+        .any(|field| match field {
+            SealedField::Value(v) => payload::is_sealed(v),
+            SealedField::Text(t) => payload::is_sealed_text(t),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A sealed text field is a sealed payload.** A note's text is sealed as
+    /// a string, not as a `{"$sealed": …}` value, so a check that looked only
+    /// for the value marker reported a prefix of sealed notes as plaintext.
+    #[test]
+    fn a_sealed_text_field_counts_as_a_sealed_payload() {
+        let envelope = crate::core::b64::encode(b"an envelope");
+        let sealed_note = RecordKind::Note {
+            text: format!("$sealed:{envelope}"),
+        };
+        assert!(
+            holds_sealed(&sealed_note),
+            "a sealed note was read as plaintext"
+        );
+        assert!(!holds_sealed(&RecordKind::Note {
+            text: "plain words".into(),
+        }));
+    }
 }

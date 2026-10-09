@@ -234,6 +234,64 @@ fn provider_side_media_refusal(kind: &str) -> String {
     )
 }
 
+/// Visit every subschema of `schema`, the root first, with its path.
+///
+/// One walker for every rule that judges a schema node by node, because a rule
+/// is only as wide as the walk under it: two walkers drift, and a subschema the
+/// narrower one never visits is one the rule silently does not apply to. It
+/// descends every keyword whose value is a schema or a collection of schemas —
+/// the applicators (`properties`, `patternProperties`, `additionalProperties`,
+/// `items`, `prefixItems`, `contains`, `propertyNames`, `not`, `if`/`then`/
+/// `else`, `anyOf`/`oneOf`/`allOf`) and the definition tables a `$ref` points
+/// into (`$defs`, `definitions`). A boolean schema is visited too; a caller
+/// that only judges objects ignores it.
+#[cfg(any(
+    feature = "providers",
+    feature = "bedrock",
+    feature = "fake-model",
+    feature = "manifest"
+))]
+pub(crate) fn for_each_subschema(
+    schema: &serde_json::Value,
+    path: &str,
+    visit: &mut dyn FnMut(&serde_json::Value, &str),
+) {
+    visit(schema, path);
+    let Some(obj) = schema.as_object() else {
+        return;
+    };
+    for (key, child) in obj {
+        match key.as_str() {
+            "properties" | "patternProperties" | "$defs" | "definitions" => {
+                if let Some(map) = child.as_object() {
+                    for (name, sub) in map {
+                        for_each_subschema(sub, &format!("{path}.{name}"), visit);
+                    }
+                }
+            }
+            "items" | "prefixItems" | "anyOf" | "oneOf" | "allOf" => match child {
+                serde_json::Value::Array(list) => {
+                    for (i, sub) in list.iter().enumerate() {
+                        for_each_subschema(sub, &format!("{path}.{key}[{i}]"), visit);
+                    }
+                }
+                single => for_each_subschema(single, &format!("{path}.{key}"), visit),
+            },
+            "additionalProperties"
+            | "additionalItems"
+            | "contains"
+            | "propertyNames"
+            | "not"
+            | "if"
+            | "then"
+            | "else" => {
+                for_each_subschema(child, &format!("{path}.{key}"), visit);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Why a schema cannot be used with strict constrained decoding, if it cannot.
 ///
 /// `OpenAI`'s strict mode accepts a **subset** of JSON Schema, and a schema that
@@ -252,7 +310,7 @@ fn provider_side_media_refusal(kind: &str) -> String {
     feature = "manifest"
 ))]
 pub fn strict_schema_problem(schema: &serde_json::Value) -> Option<String> {
-    fn walk(node: &serde_json::Value, path: &str, out: &mut Vec<String>) {
+    fn check(node: &serde_json::Value, path: &str, out: &mut Vec<String>) {
         let Some(obj) = node.as_object() else { return };
 
         if obj.contains_key("default") {
@@ -327,31 +385,12 @@ pub fn strict_schema_problem(schema: &serde_json::Value) -> Option<String> {
                 }
             }
         }
-
-        for (key, child) in obj {
-            match key.as_str() {
-                "properties" | "$defs" | "definitions" => {
-                    if let Some(map) = child.as_object() {
-                        for (name, sub) in map {
-                            walk(sub, &format!("{path}.{name}"), out);
-                        }
-                    }
-                }
-                "items" | "not" => walk(child, &format!("{path}.{key}"), out),
-                "anyOf" | "oneOf" | "allOf" => {
-                    if let Some(list) = child.as_array() {
-                        for (i, sub) in list.iter().enumerate() {
-                            walk(sub, &format!("{path}.{key}[{i}]"), out);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     let mut problems = Vec::new();
-    walk(schema, "schema", &mut problems);
+    for_each_subschema(schema, "schema", &mut |node, path| {
+        check(node, path, &mut problems);
+    });
     if problems.is_empty() {
         return None;
     }

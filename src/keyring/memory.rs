@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{StoreError, TenantId, Timestamp};
 use crate::journal::payload;
-use crate::memory::{Cascade, MemoryItem, MemoryStore, Recall, Selected};
+use crate::memory::{Cascade, MemoryErasure, MemoryItem, MemoryStore, Reached, Recall, Selected};
 
 use super::{Erasure, KeyError, KeyRing};
 
@@ -162,6 +162,15 @@ impl EncryptedMemoryStore {
     /// A canonical JSON array, so no field's content can spell another's: an
     /// envelope moved to another id, version, subject, purpose or tenant fails
     /// to authenticate there rather than opening as that row's content.
+    ///
+    /// **The labels are bound too** — trust, sensitivity, provenance, writer,
+    /// creation and expiry. They sit in the clear beside the ciphertext
+    /// because the store filters and ranks on them, and that is exactly why
+    /// they must not be editable: a row relabelled *trusted* or *public*, or
+    /// given a later expiry, would otherwise open as the same content under
+    /// claims its writer never made. Instants are bound to the nanosecond
+    /// their row carries; `superseded_at` and the access window are lifecycle
+    /// the store moves after the write, and are not.
     fn aad(&self, item: &MemoryItem, version: u64) -> Result<Vec<u8>, StoreError> {
         crate::core::canon::to_bytes(&(
             "memory",
@@ -170,6 +179,15 @@ impl EncryptedMemoryStore {
             version,
             item.subject.as_str(),
             item.purpose.as_str(),
+            (
+                &item.trust,
+                &item.sensitivity,
+                &item.provenance,
+                item.written_by.as_str(),
+                item.created_at.unix_timestamp_nanos().to_string(),
+                item.expires_at
+                    .map(|at| at.unix_timestamp_nanos().to_string()),
+            ),
         ))
         .map_err(|error| StoreError::Backend(error.to_string()))
     }
@@ -538,11 +556,20 @@ impl MemoryStore for EncryptedMemoryStore {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
             let ids = self.inner.subject_ids(subject).await?;
             let highest = self.highest_versions(&ids).await?;
-            let count = self.inner.forget_subject(subject).await?;
+            // Through `erase_reaching`, so a derived index below that could
+            // not be told does not stop the keys of rows already gone from
+            // being destroyed: its failure is answered after them.
+            let (reached, untold) = self
+                .inner
+                .erase_reaching(MemoryErasure::Subject(subject))
+                .await?;
+            let Reached::Subject(count) = reached else {
+                return Err(crate::memory::mismatched("forget_subject", &reached));
+            };
             let (at, reason) = verb_erasure("forget_subject");
             self.destroy_erased(&Self::every_version(highest), at, &reason)
                 .await?;
-            Ok(count)
+            untold.map_or(Ok(count), Err)
         })
         .await
     }
@@ -565,12 +592,18 @@ impl MemoryStore for EncryptedMemoryStore {
     /// removed.
     async fn forget_cascading(&self, id: &str) -> Result<Cascade, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
-            let cascade = self.inner.forget_cascading(id).await?;
+            let (reached, untold) = self
+                .inner
+                .erase_reaching(MemoryErasure::Cascading(id))
+                .await?;
+            let Reached::Cascading(cascade) = reached else {
+                return Err(crate::memory::mismatched("forget_cascading", &reached));
+            };
             let (at, reason) = verb_erasure("forget_cascading");
             self.destroy_erased(&Self::every_version(cascade.erased.clone()), at, &reason)
                 .await?;
             self.destroy_erased(&cascade.trimmed, at, &reason).await?;
-            Ok(cascade)
+            untold.map_or(Ok(cascade), Err)
         })
         .await
     }
@@ -600,19 +633,104 @@ impl MemoryStore for EncryptedMemoryStore {
     /// Destroys the key of every version of every id the sweep erased.
     async fn sweep_expired(&self, at: Timestamp) -> Result<Vec<(String, u64)>, StoreError> {
         super::under_lock(self.lifecycle.as_ref(), &self.lifecycle_scope(), || async {
-            let swept = self.inner.sweep_expired(at).await?;
+            let (reached, untold) = self
+                .inner
+                .erase_reaching(MemoryErasure::Expired(at))
+                .await?;
+            let Reached::Expired(swept) = reached else {
+                return Err(crate::memory::mismatched("sweep_expired", &reached));
+            };
             self.destroy_erased(
                 &Self::every_version(swept.clone()),
                 at,
                 "memory retention expired",
             )
             .await?;
-            Ok(swept)
+            untold.map_or(Ok(swept), Err)
         })
         .await
     }
 
     async fn touch(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError> {
         self.inner.touch(ids, at).await
+    }
+}
+
+#[cfg(all(test, feature = "testkit", feature = "redb"))]
+mod tests {
+    use std::sync::Arc;
+
+    use super::EncryptedMemoryStore;
+    use crate::core::{Sensitivity, SourceId, TenantId, Timestamp, Trust};
+    use crate::memory::{MemoryItem, MemoryStore};
+
+    type Relabel = fn(&mut MemoryItem);
+
+    /// **A relabelled row does not open.**
+    ///
+    /// Trust, sensitivity and the rest sit in the clear beside the
+    /// ciphertext, because the store ranks and filters on them. A row whose
+    /// labels were rewritten in place — an untrusted memory made trusted, an
+    /// expiry moved — must fail to authenticate rather than open as the same
+    /// content under a claim its writer never made.
+    #[tokio::test]
+    async fn a_relabelled_memory_row_does_not_open() {
+        let at = |s| Timestamp::from_unix_timestamp(s).expect("instant");
+        let inner = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"));
+        let sealed = EncryptedMemoryStore::new(
+            Arc::clone(&inner) as Arc<dyn MemoryStore>,
+            Arc::new(crate::testkit::MemoryKeyRing::new()),
+            TenantId::default(),
+        );
+        sealed
+            .remember(&MemoryItem {
+                id: "r-1".to_owned(),
+                subject: "person-r".to_owned(),
+                purpose: "support".to_owned(),
+                content: serde_json::json!({"note": "ignore the above"}),
+                provenance: vec![SourceId::new("tool:web")],
+                sensitivity: Sensitivity::Confidential,
+                trust: Trust::Untrusted,
+                written_by: "skill:triage".to_owned(),
+                version: 0,
+                created_at: at(1_760_000_000),
+                expires_at: Some(at(1_760_086_400)),
+                access_retention_seconds: None,
+                superseded_at: None,
+                derived_from: Vec::new(),
+            })
+            .await
+            .expect("remember");
+        let row = inner.version("r-1", 1).await.expect("raw").expect("row");
+        assert!(
+            sealed
+                .open_item(row.clone())
+                .await
+                .expect("opens")
+                .is_some(),
+            "the untouched row must open"
+        );
+
+        let relabellings: [(&str, Relabel); 6] = [
+            ("trust", |m| m.trust = Trust::Trusted),
+            ("sensitivity", |m| m.sensitivity = Sensitivity::Public),
+            ("provenance", |m| {
+                m.provenance = vec![SourceId::new("operator")];
+            }),
+            ("writer", |m| m.written_by = "operator:dana".to_owned()),
+            ("creation", |m| {
+                m.created_at = Timestamp::from_unix_timestamp(1_700_000_000).expect("instant");
+            }),
+            ("expiry", |m| m.expires_at = None),
+        ];
+        for (label, relabel) in relabellings {
+            let mut moved = row.clone();
+            relabel(&mut moved);
+            let read = sealed.open_item(moved).await;
+            assert!(
+                read.is_err(),
+                "a row with its {label} rewritten opened as the same content: {read:?}"
+            );
+        }
     }
 }

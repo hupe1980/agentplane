@@ -16,7 +16,124 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.46.0] — unreleased
+## [0.47.0] — 2026-10-09
+
+### Changed
+
+- **BREAKING: a pause inside an effect group leaves the group open.** An
+  exhausted ceiling or a withdrawn authority inside an open group no longer
+  aborts it; a raised ceiling or a lifted halt continues the step. A cancel of
+  such a run re-runs the paused step to abandon the group, then unwinds.
+- **BREAKING: a commission is asked once.** `StepCtx::commission` never retries,
+  a crash between its announcement and its record needs an operator, and a
+  sub-run that concludes without an answer fails the commission — recorded,
+  with its spend billed to the parent.
+- **BREAKING: `StepError::NotWired`** names a step asking for something the
+  plane was not built with (a task, timer or event store, a case, peers). It is
+  never handed to a model and aborts an open group cleanly.
+- **BREAKING: `StepCtx::blobs()` is read-only for a run bound to a case**; bytes
+  a case produces are written with `StepCtx::store_blob`, which links them so
+  erasing the case reaches them.
+- **BREAKING: `Runtime::run_plan_under` returns `Admission`**, validating a
+  keyed admission and answering a redelivery with the run it admitted.
+- **BREAKING: a tenant id holding whitespace or `+` is refused**, and
+  `RedbStore::origin`/`PostgresStore::origin` return `Result`: a checkpoint
+  origin follows C2SP `tlog-cosignature` (non-empty, at most 255 bytes, no
+  space, `+` or control character) at every door, in both readers.
+- **BREAKING: manifest fields that nothing reads are refused.** Triage-only
+  oversight refuses `approvers`, `on_expiry: proceed` and a block-level
+  `deadline`; `execution.max_turns` is optional, refused at `0` and on
+  `completion` and `call`.
+- **BREAKING: CLI exit statuses follow the published table** for the runtime's
+  refusals: a four-eyes or policy refusal exits 1; an unknown run, task,
+  tenant or provider and every plane-assembly refusal exit 2.
+- **BREAKING: CLI spelling.** `reconcile` and `acknowledge` take `--reason`;
+  `serve --tokens` names a file and reads `AGENTPLANE_TOKENS_FILE`.
+- **BREAKING: A2A wire answers.** A withheld run reports
+  `TASK_STATE_AUTH_REQUIRED` (MCP: `working`); the endpoint authenticates
+  before it reads a request; a continuation carrying a push configuration, a
+  batch, a method-less body and a non-scalar `id` are refused with their own
+  codes.
+- **BREAKING: id parsing accepts only the canonical ULID spelling**, and
+  restore refuses a line it would have to skip and counts the trailer disowns.
+- **BREAKING: an erasure leaves a record on the case, and the case stays
+  erased.** `CaseStore` gains `begin_erasure`, `complete_erasure` and
+  `erasure` (Postgres DDL edited in place); an erased case refuses reopening,
+  writes and holds (`StoreError::CaseErased`, 409 on the API). The export's
+  case block carries it as a required `erasure` member, and a restore marks
+  the case again.
+- **BREAKING: erasing refuses work that may still resume.** `blob::erase_case`
+  and `blob::erase_run` take the journal; a case with a run that may resume,
+  a case-bound run and an unconcluded run are refused before anything is
+  destroyed. `retention::retain` takes the journal too.
+- **BREAKING: a named obligation's terms are fixed** — registering it again
+  in the case store with other terms is `StoreError::DeadlineExists`, the same
+  terms a no-op. A run asking for a name its matter already owes shares the
+  standing obligation and journals its terms.
+- **BREAKING: sealed memory binds its labels** (trust, sensitivity,
+  provenance, writer, creation and expiry) into the envelope; rows sealed by
+  earlier builds do not open.
+
+### Fixed
+
+- **A cancel starts no new work.** Cancelling a run paused inside a group
+  takes the group back even when a ceiling was raised, a withholding lifted or
+  a wait ended in the meantime; that pass could perform and commit the paused
+  member.
+- **An A2A peer cannot reach the deployment's webhooks.** The push methods no
+  longer list, read or delete an `operator:` destination on the peer's task.
+- **Replay agrees with the run it reads.** A recorded refusal counts toward
+  `max_denials` again on replay and resume; the plane's journal ceiling is
+  judged on live dispatch only; a refusal after a lifted withholding
+  supersedes it; an atomic group whose second member was refused replays as
+  it ran.
+- **A manifest grant cannot widen a peer's egress ceiling**, and reading or
+  cancelling a task at a peer requires a grant at that peer. `PeerGrant::from_grants`
+  derives a peer's wiring — scope, `mutates`, ceiling — from the grants naming
+  it, as `agentplane run --peer` and replay do.
+- **A content rule's classification reaches every field label**, so a
+  protected field's own ceiling sees it.
+- **A sub-run commissioned by the plane's own run acts as the plane**, so a peer
+  it calls is shown the plane's credential.
+- **Subject-bound credentials:** a token endpoint's answer that is not a bearer
+  access token is refused; a token with no stated lifetime is held five
+  minutes; throwing or lifting a subject halt drops that subject's cached
+  credentials, including what an exchange in flight brings back.
+- **The lease heartbeat survives a store blip**; it stops only when the lease
+  is gone.
+- **A host without the MCP Tasks extension is told what it lacks**: `-32021`
+  naming `io.modelcontextprotocol/tasks`, not `-32602`.
+- **Integrity:** a record nested past 100 levels is refused at seal; a clear
+  payload shaped like a seal no longer blocks a restore; a witness submission
+  proves consistency at its checkpoint's size; a quorum counts distinct
+  witness keys; an inclusion proof reads one snapshot; the live audit holds
+  every conclusion's chain head.
+- **Export and restore:** a resumed quarantined run is exported once; an
+  export whose store cannot place its runs fails; `verify` reports a record
+  line whose copies disagree with its hashed bytes.
+- **The second reader** writes doubles as ECMAScript does, holds `v` and
+  `kind` to the format, and reports hostile numbers and shapes as findings.
+- **A2A:** `CancelTask` reaches failed, exhausted and withheld runs; every
+  agent's card carries the tenant, push flag and signature; an oversized
+  `messageId` is `-32602`; `ListTasks` `totalSize` holds on every page.
+- **Declarations:** a `call` input's open-object rule walks every subschema;
+  a truncated `completion` answer fails the run; a registry refuses a manifest
+  that does not survive its stored form; a triage-only agent is not offered
+  as one that may suspend.
+- **Models:** an in-stream error from a Chat Completions server surfaces as
+  the provider's; tool-call fragments without an index stay separate calls;
+  Gemini's retry delay rounds up and its tool-use prompt tokens are billed.
+- **The ACP adapter** reads a user message's text from its `content`.
+- **Erasure:** a hold placed while an erasure runs and the erasure resolve to
+  exactly one; a sealed memory erasure whose index could not be told still
+  destroys the keys; a redelivered erased event is a duplicate, not a
+  retried fault; a retention pass does not re-erase an erased case; a write
+  racing `expire` cannot put erased bytes back.
+- **A key gone with no erasure record is a drill finding**, not an erasure —
+  Vault cannot tell a destroyed key from one it never held.
+- **PostgreSQL recall breaks ties by byte**, as redb does.
+
+## [0.46.0] — 2026-10-07
 
 ### Added
 

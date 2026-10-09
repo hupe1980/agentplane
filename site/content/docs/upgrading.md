@@ -147,10 +147,11 @@ plane that ran on the old build does not start:
 
 | What | The rule | What to do |
 |---|---|---|
-| **Token files** (`serve --tokens`) | Every token is at least 32 bytes and is none of the values printed in this project's examples | Generate each with `openssl rand -hex 32` |
+| **Token files** (`serve --tokens FILE`, `AGENTPLANE_TOKENS_FILE`) | Every token is at least 32 bytes and is none of the values printed in this project's examples | Generate each with `openssl rand -hex 32` |
 | **Vault transit keys** (`keyring-vault`) | The key for a scope is named `ap-` and the hex SHA-256 of the scope — `VaultTransit::key_name` — and no other name is read | Provision the keys under those names. Vault's transit `backup` and `restore/<name>` carry existing key material to a new name, which keeps sealed payloads readable |
 | **The policy bundle** (`serve --policy`) | A file or a directory, loaded as `agentplane policy check` loads it. A served surface refuses a set that cannot evaluate every request shape it will ask, including a caller that presents no chain; a plane with no engine refuses every `release`. A principal is `Subject::"…"` or `Capability::"…"` — there is no `Agent::` — and a schema's `appliesTo` lists both ([the authorization context](@/docs/security.md#the-authorization-context)) | Run `agentplane policy check --bundle <bundle> --from plane.jsonl` — a `cedar` build — against the old export, and `--candidate` for the bundle you are moving to |
-| **Manifests** | Parsed by this build's schema — for example a money ceiling needs `pricing` on every model role | `agentplane validate`, below |
+| **Tenant ids** (`--tenant`, `TenantId::new`) | At most 64 characters, with no `/`, `:`, control character, whitespace or `+` — a tenant id is part of the checkpoint origin | Choose a conforming id |
+| **Manifests** | Parsed by this build's schema — for example a money ceiling needs `pricing` on every model role; a field nothing reads is refused, such as `approvers` on triage-only oversight or `max_turns` on a `completion` agent | `agentplane validate`, below |
 | **Scripts that drive the CLI** | A verb or flag this build does not have is a usage error, exit `2`; statuses follow [one table](@/docs/operations.md#exit-statuses) | Check each against `agentplane <verb> --help`, and alert on `1`, `4`, `5` and `6` as the different pages they are |
 
 ## Checking your own upgrade {#checking}

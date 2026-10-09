@@ -343,26 +343,23 @@ async fn a_tombstone_that_does_not_read_is_a_finding_not_an_erasure() {
 
 /// **Ordinary work does not undo an erasure, and the refusal says so.**
 ///
-/// Content addressing makes the address the content, so a run producing the
-/// same bytes a second time lands on the erased object. This is the ordinary
-/// shape rather than an exotic one: a resumed run re-storing what it stored
-/// before, or a second run of the same matter doing the same work.
+/// Content addressing makes the address the content, so a write of the same
+/// bytes at the erased matter's address lands on the erased object. Two doors
+/// lead there and both are shut: the erased case refuses to be reopened, so a
+/// second run of the same matter opens a new case under a new scope, and the
+/// address itself refuses the write.
 ///
-/// The plane here is deliberately **unsealed**, because that is the half that
-/// was open. On a sealed deployment the destroyed wrapping key refuses the
-/// write first, so the hazard was invisible in exactly the configuration a
-/// reviewer would reach for to check it.
-///
-/// The refusal's *type* is the second half. `StoreError::BlobErased` rather
-/// than a backend string: retrying cannot help, the store is healthy, and a
-/// business rule wearing a storage fault's type is read as an outage by
-/// everything that classifies one.
+/// The plane here is deliberately **unsealed**: on a sealed deployment the
+/// destroyed wrapping key refuses the write first, so the hazard would be
+/// invisible in exactly the configuration a reviewer would reach for.
+/// How the refusal is classified for a step is `blob::refusal`'s unit test.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_run_cannot_put_back_what_an_erasure_removed() {
     use agentplane::blob::erase_case;
     use agentplane::case::CaseStore;
     use agentplane::core::{
-        CorrelationKey, Outcome, Skill, SkillDescriptor, SkillError, StoreError, Tainted, TenantId,
+        CorrelationKey, Outcome, Skill, SkillDescriptor, SkillError, Tainted, TenantId,
     };
     use agentplane::runtime::{RunStatus, Runtime, StepCtx};
     use agentplane::store::RedbStore;
@@ -420,6 +417,7 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
     let erased = erase_case(
         Some(blobs.as_ref()),
         store.as_ref(),
+        Some(store.as_ref() as &dyn agentplane::journal::JournalStore),
         #[cfg(feature = "keyring")]
         None,
         None,
@@ -435,23 +433,32 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
         "the run's blob was not linked, so nothing was erased"
     );
 
-    // **The same matter, reopened.** Erasing needs the case closed, so the
-    // scenario this guards is the one where somebody puts the matter back: the
-    // erasure scope is the case's, so reopening it points ordinary work at the
-    // scope whose bytes are gone. A new correlation would open a *new* case
-    // with a new scope, which is different work rather than a resurrection.
-    cases
-        .set_status(case, agentplane::core::CaseStatus::Open)
-        .await
-        .expect("reopen");
+    // **The same matter cannot be put back.** The erasure scope is the case's,
+    // so reopening it would point ordinary work at the scope whose bytes are
+    // gone; an erased case refuses the reopening, and a new correlation opens
+    // a *new* case with a new scope, which is different work rather than a
+    // resurrection.
+    assert!(
+        cases
+            .set_status(case, agentplane::core::CaseStatus::Open)
+            .await
+            .is_err(),
+        "an erased case was reopened, so its next run writes into the erased scope"
+    );
     let again = rt
         .run_correlated("records.file", Tainted::trusted(json!({})), "claim", &keys)
         .await
         .expect("the second run is admitted");
+    let reopened = cases
+        .correlate(&keys)
+        .await
+        .expect("correlate")
+        .expect("a case");
+    assert_ne!(reopened, case, "the second run joined the erased case");
     assert!(
-        !matches!(again.status, RunStatus::Succeeded),
-        "the second run stored the erased bytes again, so an erasure reported as \
-         discharged was undone by ordinary work"
+        matches!(again.status, RunStatus::Succeeded),
+        "{:?}",
+        again.status
     );
 
     // And what reached the store is still a tombstone rather than the filing.
@@ -464,18 +471,15 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
         other => panic!("the bytes are back: {other:?}"),
     }
 
-    // The refusal is typed, so a caller classifying it does not read an
-    // enforced rule as a store having a bad day.
+    // A write at the erased address is refused rather than putting the bytes
+    // back under the tombstone.
     let refused = agentplane::blob::ScopedBlobs::new(Arc::clone(&blobs), scope)
         .put(FILING)
         .await
         .expect_err("the write is refused");
     assert!(
-        matches!(
-            agentplane::blob::refusal_for_test(refused),
-            StoreError::BlobErased { .. }
-        ),
-        "an erased write must not be classified as a backend fault"
+        matches!(refused, BlobError::Expired { .. }),
+        "an erased address took a write: {refused:?}"
     );
 }
 
@@ -557,6 +561,7 @@ async fn erasing_a_case_leaves_other_cases_alone() {
     let n = erase_case(
         Some(blobs.as_ref()),
         cases.as_ref(),
+        None,
         #[cfg(feature = "keyring")]
         None,
         None,
@@ -1491,9 +1496,15 @@ async fn a_legal_hold_stops_the_retention_sweep_and_lifting_it_lets_the_sweep_th
         tenant: &tenant,
         disclosures: None,
     };
-    let report = agentplane::retention::retain(&stores, ts(1_000), ts(20), "retention")
-        .await
-        .expect("retain");
+    let report = agentplane::retention::retain(
+        &stores,
+        &agentplane::store::RedbStore::open_in_memory().expect("journal"),
+        ts(1_000),
+        ts(20),
+        "retention",
+    )
+    .await
+    .expect("retain");
 
     assert_eq!(
         report.erased, 1,
@@ -1533,19 +1544,24 @@ async fn a_legal_hold_stops_the_retention_sweep_and_lifting_it_lets_the_sweep_th
         cases.release_hold(held).await.expect("release"),
         "the hold was not there to lift"
     );
-    let after = agentplane::retention::retain(&stores, ts(1_000), ts(30), "retention")
-        .await
-        .expect("retain");
+    let after = agentplane::retention::retain(
+        &stores,
+        &agentplane::store::RedbStore::open_in_memory().expect("journal"),
+        ts(1_000),
+        ts(30),
+        "retention",
+    )
+    .await
+    .expect("retain");
     assert!(
         after.held.is_empty(),
         "a released matter is still reported as preserved: {:?}",
         after.held
     );
-    // Both, because erasure is idempotent: the matter erased by the first pass
-    // is still closed and still past the window, and re-erasing it writes the
-    // tombstones again over bytes that already carry them. That is the
-    // behaviour a resumable erasure needs — the count is passes, not victims.
-    assert_eq!(after.erased, 2, "a released matter was not erased");
+    // Only the released one: the matter the first pass erased carries a
+    // completed erasure record, and a pass that erased it again would report
+    // the same matter erased on every date it ran.
+    assert_eq!(after.erased, 1, "a released matter was not erased");
     assert!(
         matches!(
             held_blobs.get(kept).await,
@@ -1584,10 +1600,17 @@ async fn erasing_a_held_case_directly_is_refused_before_anything_is_destroyed() 
         )
         .await
         .expect("place hold");
+    // A run nobody has shown concluded, too: the hold is the answer, because
+    // it is the one that says on whose instruction the matter stays.
+    cases
+        .attach_run(held, agentplane::core::RunId::generate())
+        .await
+        .expect("attach");
 
     match erase_case(
         Some(blobs.as_ref()),
         cases.as_ref(),
+        None,
         #[cfg(feature = "keyring")]
         None,
         None,
@@ -1645,10 +1668,16 @@ async fn erasing_a_case_that_is_still_open_is_refused() {
         .await
         .expect("open")
         .case_id();
+    // Its run has not concluded either; that the matter is open is the answer,
+    // because closing it is the operator's next step.
+    let run = agentplane::core::RunId::generate();
+    cases.attach_run(case, run).await.expect("attach");
+    journaled(store.as_ref(), run, Some(case), vec![admitted()]).await;
 
     match erase_case(
         Some(blobs.as_ref()),
         cases.as_ref(),
+        Some(store.as_ref() as &dyn agentplane::journal::JournalStore),
         #[cfg(feature = "keyring")]
         None,
         None,
@@ -1665,12 +1694,15 @@ async fn erasing_a_case_that_is_still_open_is_refused() {
         other => panic!("an open matter was erased under its own live work: {other:?}"),
     }
 
-    // Closed, and the same call goes through — the refusal is about the state
-    // of the matter, not a verb that stopped working.
+    // Concluded and closed, and the same call goes through — the refusal is
+    // about the state of the matter, not a verb that stopped working.
+    let done = concluded(store.as_ref(), run, "succeeded").await;
+    journaled(store.as_ref(), run, Some(case), vec![done]).await;
     cases.close(case).await.expect("close");
     erase_case(
         Some(blobs.as_ref()),
         cases.as_ref(),
+        Some(store.as_ref() as &dyn agentplane::journal::JournalStore),
         #[cfg(feature = "keyring")]
         None,
         None,
@@ -1705,6 +1737,7 @@ async fn erasing_an_unknown_case_is_not_found() {
     let outcome = erase_case(
         Some(blobs.as_ref()),
         store.as_ref(),
+        Some(store.as_ref() as &dyn agentplane::journal::JournalStore),
         #[cfg(feature = "keyring")]
         None,
         None,
@@ -1774,6 +1807,7 @@ async fn a_release_record_survives_the_erasure_it_authorized() {
     agentplane::blob::erase_case(
         Some(blobs.as_ref()),
         store.as_ref(),
+        Some(store.as_ref() as &dyn agentplane::journal::JournalStore),
         Some(ring.as_ref() as &dyn KeyRing),
         None,
         &TenantId::default(),
@@ -1802,4 +1836,429 @@ async fn a_release_record_survives_the_erasure_it_authorized() {
             .contains("preservation order"),
         "the hold's reason travelled into a record that outlives the matter"
     );
+}
+
+// ── Erasure decides once, against the hold, the status and the runs ─────────
+
+/// One closed matter holding one linked blob, on a store that is both the case
+/// layer and the journal.
+async fn closed_matter(
+    key: &str,
+) -> (
+    Arc<agentplane::store::RedbStore>,
+    Arc<dyn BlobStore>,
+    agentplane::core::CaseId,
+    Digest,
+) {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, TenantId};
+
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let blobs: Arc<dyn BlobStore> = Arc::new(MemoryBlobs::new());
+    let case = store
+        .correlate_or_open("claim", &[CorrelationKey::new("claim", key)], ts(1))
+        .await
+        .expect("open")
+        .case_id();
+    let scope = agentplane::core::erasure_scope(&TenantId::default(), &case.to_string());
+    let digest = agentplane::blob::ScopedBlobs::new(Arc::clone(&blobs), scope)
+        .put(b"personal data")
+        .await
+        .expect("put");
+    store.link_blob(case, digest, ts(2)).await.expect("link");
+    store.close(case).await.expect("close");
+    (store, blobs, case, digest)
+}
+
+/// Erase `case` on `store`, with the store's own journal.
+async fn erase(
+    store: &agentplane::store::RedbStore,
+    blobs: &dyn BlobStore,
+    disclosures: Option<&dyn agentplane::disclosure::DisclosureRegister>,
+    case: agentplane::core::CaseId,
+) -> Result<agentplane::blob::Erased, agentplane::blob::EraseError> {
+    agentplane::blob::erase_case(
+        Some(blobs),
+        store,
+        Some(store as &dyn agentplane::journal::JournalStore),
+        #[cfg(feature = "keyring")]
+        None,
+        disclosures,
+        &agentplane::core::TenantId::default(),
+        case,
+        ts(9_000),
+        "art-17 request",
+    )
+    .await
+}
+
+fn bytes_of(blobs: &Arc<dyn BlobStore>, case: agentplane::core::CaseId) -> Arc<dyn BlobStore> {
+    let scope =
+        agentplane::core::erasure_scope(&agentplane::core::TenantId::default(), &case.to_string());
+    Arc::new(agentplane::blob::ScopedBlobs::new(Arc::clone(blobs), scope))
+}
+
+fn preservation_order() -> agentplane::core::LegalHold {
+    agentplane::core::LegalHold {
+        placed_at: ts(5),
+        reason: "preservation order 2026-201".to_owned(),
+        by: operator("compliance"),
+    }
+}
+
+/// Places a hold on its case while the erasure reads the disclosure register —
+/// after the erasure's own hold read, before anything is destroyed.
+#[derive(Debug)]
+struct HoldsWhileRead {
+    cases: Arc<agentplane::store::RedbStore>,
+    case: agentplane::core::CaseId,
+}
+
+#[async_trait::async_trait]
+impl agentplane::disclosure::DisclosureRegister for HoldsWhileRead {
+    async fn record(
+        &self,
+        _act: &agentplane::disclosure::Disclosure,
+    ) -> Result<(), agentplane::core::StoreError> {
+        Ok(())
+    }
+    async fn disclosures(
+        &self,
+        _cases: &[agentplane::core::CaseId],
+        _runs: &[agentplane::core::RunId],
+    ) -> Result<Vec<agentplane::disclosure::Disclosure>, agentplane::core::StoreError> {
+        use agentplane::case::CaseStore;
+        self.cases
+            .place_hold(self.case, &preservation_order())
+            .await
+            .expect("the hold lands before the erasure decides");
+        Ok(Vec::new())
+    }
+}
+
+/// Places a hold on its case while the erasure is tombstoning it, and keeps
+/// the store's answer.
+#[derive(Debug)]
+struct HoldsWhileExpiring {
+    inner: Arc<dyn BlobStore>,
+    cases: Arc<agentplane::store::RedbStore>,
+    case: agentplane::core::CaseId,
+    answer: std::sync::Mutex<Option<Result<bool, String>>>,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for HoldsWhileExpiring {
+    async fn put(&self, bytes: &[u8]) -> Result<Digest, BlobError> {
+        self.inner.put(bytes).await
+    }
+    async fn put_at(&self, digest: Digest, bytes: &[u8]) -> Result<(), BlobError> {
+        self.inner.put_at(digest, bytes).await
+    }
+    async fn get_raw(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
+        self.inner.get_raw(digest).await
+    }
+    async fn get(&self, digest: Digest) -> Result<Vec<u8>, BlobError> {
+        self.inner.get(digest).await
+    }
+    async fn expire(&self, digest: Digest, at: Timestamp, reason: &str) -> Result<(), BlobError> {
+        use agentplane::case::CaseStore;
+        let answer = self
+            .cases
+            .place_hold(self.case, &preservation_order())
+            .await
+            .map_err(|e| e.to_string());
+        *self.answer.lock().expect("lock") = Some(answer);
+        self.inner.expire(digest, at, reason).await
+    }
+    async fn has(&self, digest: Digest) -> Result<bool, BlobError> {
+        self.inner.has(digest).await
+    }
+}
+
+/// **A hold placed mid-erasure either stops it or is refused — never both
+/// accepted and walked past.**
+///
+/// The erasure's hold read is a read; a hold placed after it was accepted and
+/// the key destroyed anyway, so the register said *preserved* about a matter
+/// that was gone. The erasure record is written in the transaction that checks
+/// the hold, and a hold is refused on a case carrying it, so whichever lands
+/// first decides and the other is told.
+#[tokio::test]
+async fn a_hold_placed_mid_erasure_either_stops_it_or_is_refused() {
+    use agentplane::blob::EraseError;
+    use agentplane::case::CaseStore;
+
+    // The hold lands between the erasure's read and its decision: it stops it.
+    let (store, blobs, case, digest) = closed_matter("CLM-H1").await;
+    let register = HoldsWhileRead {
+        cases: Arc::clone(&store),
+        case,
+    };
+    let outcome = erase(&store, blobs.as_ref(), Some(&register), case).await;
+    assert!(
+        matches!(outcome, Err(EraseError::UnderLegalHold { .. })),
+        "a hold placed after the erasure's read was walked past: {outcome:?}"
+    );
+    assert!(
+        bytes_of(&blobs, case).get(digest).await.is_ok(),
+        "a held matter's bytes were expired"
+    );
+    assert_eq!(store.erasure(case).await.expect("erasure"), None);
+
+    // The erasure has decided: the hold is refused, and the register does not
+    // claim a preservation the erasure already overtook.
+    let (store, blobs, case, digest) = closed_matter("CLM-H2").await;
+    let racing = HoldsWhileExpiring {
+        inner: Arc::clone(&blobs),
+        cases: Arc::clone(&store),
+        case,
+        answer: std::sync::Mutex::default(),
+    };
+    erase(&store, &racing, None, case)
+        .await
+        .expect("the erasure decided first");
+    let answer = racing.answer.lock().expect("lock").clone();
+    assert!(
+        matches!(answer, Some(Err(_))),
+        "a hold was accepted on a matter whose erasure had begun: {answer:?}"
+    );
+    assert_eq!(store.hold(case).await.expect("hold"), None);
+    assert!(matches!(
+        bytes_of(&blobs, case).get(digest).await,
+        Err(BlobError::Expired { .. })
+    ));
+    assert!(
+        store
+            .erasure(case)
+            .await
+            .expect("erasure")
+            .is_some_and(|e| e.complete && e.reason == "art-17 request"),
+        "the erasure left no complete record of itself"
+    );
+}
+
+/// Append `kinds` to `run` on `journal`, bound to `case` when one is given.
+async fn journaled(
+    journal: &dyn agentplane::journal::JournalStore,
+    run: agentplane::core::RunId,
+    case: Option<agentplane::core::CaseId>,
+    kinds: Vec<agentplane::journal::RecordKind>,
+) {
+    use agentplane::journal::Append;
+    let lease = journal
+        .acquire(run, "erasure-test", std::time::Duration::from_mins(1))
+        .await
+        .expect("lease");
+    let batch = kinds
+        .into_iter()
+        .map(|kind| {
+            let append = Append::new(run, kind);
+            match case {
+                Some(case) => append.case(case),
+                None => append,
+            }
+        })
+        .collect();
+    journal.append(lease.epoch, batch).await.expect("append");
+    journal
+        .release_lease(run, lease.epoch)
+        .await
+        .expect("release");
+}
+
+fn admitted() -> agentplane::journal::RecordKind {
+    agentplane::journal::RecordKind::RunAdmitted {
+        capability: "claims.assess".into(),
+        governed_by: None,
+        input_label: agentplane::core::Label::trusted(),
+        input: serde_json::json!({ "claimant": "Ada Lovelace" }),
+        policy_bundle: None,
+        canon: agentplane::core::canon::VERSION,
+        idempotency_key: None,
+        admitted_by: None,
+        served_unchained: false,
+        plane_chain: false,
+    }
+}
+
+async fn concluded(
+    journal: &dyn agentplane::journal::JournalStore,
+    run: agentplane::core::RunId,
+    outcome: &str,
+) -> agentplane::journal::RecordKind {
+    agentplane::journal::RecordKind::RunConcluded {
+        outcome: outcome.to_owned(),
+        chain_head: journal.head(run).await.expect("head").hash,
+        reason: None,
+        exhaustion: None,
+        live_spend: agentplane::core::Spend::default(),
+    }
+}
+
+/// **A closed case is not a case with no live work.**
+///
+/// A run suspended on a wait is still a run the plane may resume, and closing
+/// its case does not change that. Erasing under it destroys the key the run
+/// resumes against, so the erasure is refused — before anything is destroyed
+/// — until every run of the case has concluded under an outcome nothing
+/// resumes from.
+#[tokio::test]
+async fn erasing_a_closed_case_with_a_suspended_run_is_refused() {
+    use agentplane::blob::EraseError;
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CorrelationKey, RunId, SuspendReason};
+    use agentplane::journal::RecordKind;
+
+    let (store, blobs, case, digest) = closed_matter("CLM-S").await;
+    let run = RunId::generate();
+    store.attach_run(case, run).await.expect("attach");
+    journaled(
+        store.as_ref(),
+        run,
+        Some(case),
+        vec![
+            admitted(),
+            RecordKind::RunSuspended {
+                reason: SuspendReason::AwaitingEvent {
+                    kind: "reply".to_owned(),
+                    correlation: vec![CorrelationKey::new("claim", "CLM-S")],
+                    until: ts(100_000),
+                },
+            },
+        ],
+    )
+    .await;
+
+    let outcome = erase(&store, blobs.as_ref(), None, case).await;
+    assert!(
+        matches!(outcome, Err(EraseError::RunNotConcluded { run: ref r, .. }) if *r == run.to_string()),
+        "a closed case with a suspended run was erased: {outcome:?}"
+    );
+    assert!(
+        bytes_of(&blobs, case).get(digest).await.is_ok(),
+        "the refused erasure destroyed bytes"
+    );
+    assert_eq!(store.erasure(case).await.expect("erasure"), None);
+
+    // Concluded, the same matter erases.
+    let done = concluded(store.as_ref(), run, "succeeded").await;
+    journaled(store.as_ref(), run, Some(case), vec![done]).await;
+    erase(&store, blobs.as_ref(), None, case)
+        .await
+        .expect("a concluded case erases");
+}
+
+/// **An erased case cannot be reopened, written or held.**
+///
+/// Reopening re-claimed its correlation keys, so the next message about the
+/// matter attached to a case whose key is gone; a state write landed under
+/// that scope; a hold on it preserved nothing and read as effective.
+#[tokio::test]
+async fn an_erased_case_cannot_be_reopened() {
+    use agentplane::case::CaseStore;
+    use agentplane::core::{CaseStatus, CaseVersion, CorrelationKey};
+
+    let (store, blobs, case, _) = closed_matter("CLM-E").await;
+    erase(&store, blobs.as_ref(), None, case)
+        .await
+        .expect("erase");
+
+    for status in [CaseStatus::Open, CaseStatus::Escalated] {
+        assert!(
+            store.set_status(case, status).await.is_err(),
+            "an erased case was moved to {status:?}"
+        );
+    }
+    let version = store.case(case).await.expect("read").expect("case").version;
+    assert!(
+        store
+            .put_state(case, version, serde_json::json!({"claimant": "again"}))
+            .await
+            .is_err(),
+        "state was written into an erased case"
+    );
+    assert_ne!(version, CaseVersion(u64::MAX));
+    assert!(
+        store.place_hold(case, &preservation_order()).await.is_err(),
+        "a hold was accepted on an erased case"
+    );
+    assert_eq!(
+        store.case(case).await.expect("read").expect("case").status,
+        CaseStatus::Closed
+    );
+    assert_eq!(
+        store
+            .correlate(&[CorrelationKey::new("claim", "CLM-E")])
+            .await
+            .expect("correlate"),
+        None,
+        "the erased case's keys were claimed again"
+    );
+}
+
+/// **`erase_run` reaches only the run that belongs to no case, and only once
+/// it has concluded.**
+///
+/// A case-bound run's payloads are sealed under the case, so destroying the
+/// run's own scope erased nothing and answered as if it had; and a run that
+/// may resume would be left unable to.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn erase_run_refuses_a_case_bound_run() {
+    use agentplane::blob::{EraseError, erase_run};
+    use agentplane::core::{RunId, TenantId};
+    use agentplane::keyring::{KeyRing, SealedJournal};
+
+    let tenant = TenantId::default();
+    let ring = Arc::new(agentplane::testkit::MemoryKeyRing::new());
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let journal = SealedJournal::wrap(
+        Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>,
+        Arc::clone(&ring) as Arc<dyn KeyRing>,
+        tenant.clone(),
+    );
+    let alive = |run: RunId| {
+        let ring = Arc::clone(&ring);
+        let scope = agentplane::keyring::scope(&tenant, &run.to_string());
+        async move { ring.data_key(&scope).await.is_ok() }
+    };
+
+    let (_, _, case, _) = closed_matter("CLM-R").await;
+    let bound = RunId::generate();
+    journaled(journal.as_ref(), bound, Some(case), vec![admitted()]).await;
+    let done = concluded(journal.as_ref(), bound, "succeeded").await;
+    journaled(journal.as_ref(), bound, Some(case), vec![done]).await;
+    let outcome = erase_run(
+        ring.as_ref(),
+        journal.as_ref(),
+        None,
+        &tenant,
+        bound,
+        ts(9_000),
+        "art-17 request",
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(EraseError::RunBelongsToCase { case: ref c, .. }) if *c == case.to_string()),
+        "a case-bound run was 'erased' by its own scope: {outcome:?}"
+    );
+    assert!(alive(bound).await, "the refused erasure destroyed a key");
+
+    let live = RunId::generate();
+    journaled(journal.as_ref(), live, None, vec![admitted()]).await;
+    let outcome = erase_run(
+        ring.as_ref(),
+        journal.as_ref(),
+        None,
+        &tenant,
+        live,
+        ts(9_000),
+        "art-17 request",
+    )
+    .await;
+    assert!(
+        matches!(outcome, Err(EraseError::RunNotConcluded { .. })),
+        "a run that may still resume was erased: {outcome:?}"
+    );
+    assert!(alive(live).await, "the refused erasure destroyed a key");
 }

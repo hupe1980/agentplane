@@ -66,12 +66,25 @@ impl std::fmt::Debug for TokenEndpoint {
     }
 }
 
+/// What RFC 8693 §2.2.1 requires a successful response to carry. Optional
+/// here so a missing member is the issuer's answer, reported as such, rather
+/// than a parse failure read as an outage.
 #[derive(Deserialize)]
-struct Issued {
-    access_token: String,
+struct TokenResponse {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    issued_token_type: Option<String>,
+    #[serde(default)]
+    token_type: Option<String>,
     #[serde(default)]
     expires_in: Option<u64>,
 }
+
+/// How long a token whose issuer named no lifetime is held before the
+/// issuer is asked again. `expires_in` is only RECOMMENDED, and a token held
+/// for ever is served past whatever expiry the issuer kept to itself.
+const UNSTATED_LIFETIME: time::Duration = time::Duration::minutes(5);
 
 #[derive(Deserialize)]
 struct Refused {
@@ -238,15 +251,34 @@ impl TokenExchange for TokenEndpoint {
                 unavailable(detail)
             });
         }
-        let issued: Issued = serde_json::from_slice(&body)
+        let issued: TokenResponse = serde_json::from_slice(&body)
             .map_err(|e| unavailable(format!("the token endpoint's answer is not a token: {e}")))?;
-        let mut credential =
-            PeerCredential::for_subject(audience.clone(), subject, issued.access_token);
-        if let Some(seconds) = issued.expires_in {
-            let lifetime = time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX));
-            if let Some(at) = super::credentials::now().checked_add(lifetime) {
-                credential = credential.expiring_at(at);
-            }
+        // A bearer access token is what the hop presents; anything else — a
+        // refresh token, a DPoP-bound one, an empty string — would be sent as
+        // a bearer and refused by the peer, reported as the peer's failure.
+        let refuse = |what: &str| CredentialError::Refused {
+            audience: audience.clone(),
+            detail: format!("the token endpoint answered {what}"),
+        };
+        if issued.issued_token_type.as_deref() != Some(ACCESS_TOKEN_TYPE) {
+            return Err(refuse("a token that is not an access token"));
+        }
+        if !issued
+            .token_type
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("bearer"))
+        {
+            return Err(refuse("a token that is not a bearer token"));
+        }
+        let Some(token) = issued.access_token.filter(|t| !t.is_empty()) else {
+            return Err(refuse("no token"));
+        };
+        let lifetime = issued.expires_in.map_or(UNSTATED_LIFETIME, |seconds| {
+            time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
+        });
+        let mut credential = PeerCredential::for_subject(audience.clone(), subject, token);
+        if let Some(at) = super::credentials::now().checked_add(lifetime) {
+            credential = credential.expiring_at(at);
         }
         Ok(credential)
     }

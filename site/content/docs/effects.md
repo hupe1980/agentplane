@@ -113,10 +113,7 @@ failure is permanent: a tool that ran and reported failure has given its answer,
 and is not asked again unless its `ToolSafety::retry_landed` says its failures
 are transient.
 
-The vocabulary is borrowed from distributed transactions, where a participant
-whose outcome is unknown after a failure has been called **in-doubt** since the
-XA specification. The situation is identical, and so is the resolution: an
-in-doubt mutation is escalated, never guessed at.
+An in-doubt mutation is escalated, never guessed at.
 
 Three gates decide, in order:
 
@@ -285,9 +282,8 @@ and the work it could not take back is still standing.
 A **group reversal** carries the same exemption, and needs it stated separately
 because it cannot be inferred: a reversal runs in the step's *forward* phase, so
 the phase — which is what exempts a compensating effect — says nothing about it.
-Without the exemption a run that reached its ceiling mid-group could not release
-the hold it had already placed, which is the outcome above reached by a different
-road.
+Without it, cancelling a run that reached its ceiling mid-group could not
+release the hold it had already placed.
 
 ### A compensation may wait for a human
 
@@ -504,7 +500,9 @@ Doubt is the one condition under which nothing may be reversed — undoing a cal
 that may or may not have landed is a coin flip with the outside world's money on
 it — so a group in doubt is reported unsettled and the run is quarantined. A
 reversal that fails stops the unwind for the same reason a failed compensation
-does: continuing would undo members *around* one now in an unknown state.
+does: continuing would undo members *around* one now in an unknown state. A
+step refused for wiring the plane lacks (`StepError::NotWired`) asked nothing
+of the world, so its open group is aborted, not quarantined.
 
 A group is bracketed in the journal by `GroupOpened` and `GroupSettled`, and an
 opened group with no settlement beside it is delivered through the run that
@@ -564,9 +562,7 @@ that buys is not a refinement:
   nobody took back;
 - **an abort is a `ROLLBACK`**, which is free and cannot itself fail halfway.
 
-Compensation that never has to run beats compensation that runs correctly. DBOS
-makes the same observation for same-database steps, and it is the one place this
-design can do better than a saga rather than merely do a saga carefully.
+Compensation that never has to run beats compensation that runs correctly.
 
 The seam is SQL, and only Postgres offers it. That is the premise, not a
 limitation to apologise for: the resource is *already there* — a ledger table
@@ -614,9 +610,13 @@ successfully* with a group still open has its group reversed and fails loudly,
 because a group that commits by being forgotten would make the most consequential
 thing a group does the thing that happens when an author writes nothing.
 
-A suspension is not an abandonment. The frame is persisted and the step re-runs
-from the top, rebuilding the group from the journal as it replays the members, so
-a group may legitimately span a durable wait.
+A pause is not an abandonment. A suspension, an exhausted ceiling or a withdrawn
+authority inside an open group leaves the group open and reverses nothing: the
+frame is persisted and the step re-runs from the top on resume, rebuilding the
+group from the journal as it replays the members, so a group may legitimately
+span a durable wait. A cancel of a run paused that way re-runs the paused step
+once to abandon the group — its reversals run — and then unwinds the steps
+before it.
 
 ## Case state and ownership
 
@@ -660,7 +660,8 @@ Renewal runs at a third of the TTL, so two renewals can be lost to a slow store
 before the lease lapses. Renewing *at* the TTL would make any hesitation fatal,
 and a lapsed lease is one anybody may take — including, per `acquire`'s own
 rule, the caller that let it lapse, which would fence a run with its own
-heartbeat.
+heartbeat. A transient store error does not stop the heartbeat; it stops only
+when the store says the lease is gone.
 
 `RuntimeBuilder::lease_ttl` sets it, and **refuses anything under two seconds**.
 Both stores keep expiry in whole seconds and lapse on `expires_at <= now`, so a
@@ -934,8 +935,10 @@ PostgreSQL excludes derivative creation for the complete traversal and deletion.
 Formation is explicit despite being automatic: a digest-covered manifest field
 or `StepCtx::form_memories` invokes a constrained extraction call and bounded
 governed writes. There is no generic hook that persists arbitrary conversations.
-`EncryptedMemoryStore` makes a tenant/subject wrapping scope the erasure unit,
-so destroying it makes backup ciphertext unreadable. Its concrete lifecycle
-coordinator is single-node; active-active deployments still need a distributed
-database/KMS ceremony. Provider conversations and compaction remain projections,
-never durable memory truth.
+`EncryptedMemoryStore` seals each item version under its own key scope
+(`memory-item/<id>@<version>`) and binds the item's labels into the envelope,
+so destroying the key makes backup ciphertext unreadable. Its default lifecycle
+lock is process-local; an active-active plane wires the Postgres coordinator
+([erasing on more than one instance](@/docs/erasure.md#erasing-on-more-than-one-instance)).
+Provider conversations and compaction remain projections, never durable memory
+truth.

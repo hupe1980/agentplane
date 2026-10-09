@@ -26,6 +26,11 @@ fn witness() -> MemoryWitness {
     MemoryWitness::new(Arc::new(StubSigner::default()), observed()).expect("a non-zero instant")
 }
 
+/// A witness signing under its own key, so a quorum can count it apart.
+fn witness_as(key: &str) -> MemoryWitness {
+    MemoryWitness::new(Arc::new(StubSigner::new(key)), observed()).expect("a non-zero instant")
+}
+
 /// Leaves for a log of `n` runs, and the checkpoint over them.
 fn log(n: usize) -> (Vec<merkle::LeafHash>, Checkpoint) {
     let leaves: Vec<merkle::LeafHash> = (0..n)
@@ -457,8 +462,14 @@ impl Witness for Down {
 
 /// Seal `n` runs so the store has a real log to prove consistency over.
 async fn sealed_store(n: usize) -> Arc<agentplane::store::RedbStore> {
-    use agentplane::journal::{Append, JournalStore, RecordKind};
     let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    seal_more(&store, n).await;
+    store
+}
+
+/// Seal `n` more runs into `store`.
+async fn seal_more(store: &agentplane::store::RedbStore, n: usize) {
+    use agentplane::journal::{Append, JournalStore, RecordKind};
     for _ in 0..n {
         let run = agentplane::RunId::generate();
         let lease = store
@@ -503,7 +514,6 @@ async fn sealed_store(n: usize) -> Arc<agentplane::store::RedbStore> {
             .await
             .expect("seal");
     }
-    store
 }
 
 /// Enough fresh witnesses cosign, and the report says nothing needs a person.
@@ -513,7 +523,8 @@ async fn a_met_quorum_with_no_refusals_needs_nobody() {
 
     let store = sealed_store(3).await;
     let cp = store.checkpoint().await.expect("checkpoint");
-    let witnesses: Vec<Arc<dyn Witness>> = vec![Arc::new(witness()), Arc::new(witness())];
+    let witnesses: Vec<Arc<dyn Witness>> =
+        vec![Arc::new(witness_as("w-1")), Arc::new(witness_as("w-2"))];
 
     let outcome = cosign_quorum(
         store.as_ref(),
@@ -581,8 +592,11 @@ async fn a_fork_report_survives_a_met_quorum() {
         .await
         .expect("the forged history is internally consistent");
 
-    let witnesses: Vec<Arc<dyn Witness>> =
-        vec![Arc::new(witness()), Arc::new(witness()), Arc::new(poisoned)];
+    let witnesses: Vec<Arc<dyn Witness>> = vec![
+        Arc::new(witness_as("w-1")),
+        Arc::new(witness_as("w-2")),
+        Arc::new(poisoned),
+    ];
     let outcome = cosign_quorum(
         store.as_ref(),
         &cp,
@@ -902,6 +916,8 @@ fn a_key_name_that_would_break_the_line_is_refused() {
         "with\ttab",
         "\u{2014}dash",
         "with\u{0}nul",
+        // `signed-note` forbids a `+` in a key name.
+        "with+plus",
     ] {
         let note = SignedNote::new("log\n1\nx\n")
             .expect("valid")
@@ -1438,4 +1454,230 @@ async fn freshness_without_a_max_age_is_not_checked() {
         "verify passed freshness silently: {:?}",
         verified.not_checked
     );
+}
+
+/// **A quorum counts witness keys, not answers.** One witness configured twice
+/// — two URLs for one service, one key behind two entries — answers twice and
+/// is one party; a quorum of two met by it is a quorum of one.
+#[tokio::test]
+async fn a_quorum_counts_each_witness_key_once() {
+    use agentplane::journal::{JournalStore, WitnessQuorum, cosign_quorum};
+
+    let store = sealed_store(2).await;
+    let cp = store.checkpoint().await.expect("checkpoint");
+
+    let twice: Vec<Arc<dyn Witness>> =
+        vec![Arc::new(witness_as("w-1")), Arc::new(witness_as("w-1"))];
+    let outcome = cosign_quorum(
+        store.as_ref(),
+        &cp,
+        &twice,
+        WitnessQuorum::of(2).expect("two"),
+    )
+    .await
+    .expect("submission");
+    assert_eq!(outcome.cosignatures.len(), 2, "both entries answered");
+    assert!(
+        !outcome.met(),
+        "one key answering twice met a quorum of two"
+    );
+    assert_eq!(outcome.shortfall(), 1);
+    assert!(outcome.needs_attention());
+
+    let distinct: Vec<Arc<dyn Witness>> =
+        vec![Arc::new(witness_as("w-1")), Arc::new(witness_as("w-2"))];
+    let outcome = cosign_quorum(
+        store.as_ref(),
+        &cp,
+        &distinct,
+        WitnessQuorum::of(2).expect("two"),
+    )
+    .await
+    .expect("submission");
+    assert!(outcome.met(), "two keys did not meet a quorum of two");
+}
+
+/// **A checkpoint taken before a seal is proved at its own size.** The sweep
+/// takes a checkpoint, then submits it; a run sealing in between grows the log.
+/// A consistency proof against the live log is a proof to a tree one leaf
+/// larger than the checkpoint the witness is handed, which the witness reads
+/// as a history that does not extend — a fork report over nothing but time.
+#[tokio::test]
+async fn a_checkpoint_taken_before_a_seal_is_proved_at_its_own_size() {
+    use agentplane::journal::{JournalStore, WitnessQuorum, cosign_quorum};
+
+    let store = sealed_store(1).await;
+    let early = store.checkpoint().await.expect("first checkpoint");
+    let w = Arc::new(witness_as("w-1"));
+    w.cosign(&early, 0, &[]).await.expect("first sight");
+
+    seal_more(&store, 2).await;
+    let taken = store
+        .checkpoint()
+        .await
+        .expect("the checkpoint the sweep takes");
+    // The race: a run seals after the checkpoint and before the submission.
+    seal_more(&store, 1).await;
+    assert!(store.checkpoint().await.expect("live").size > taken.size);
+
+    let witnesses: Vec<Arc<dyn Witness>> = vec![w];
+    let outcome = cosign_quorum(
+        store.as_ref(),
+        &taken,
+        &witnesses,
+        WitnessQuorum::of(1).expect("one"),
+    )
+    .await
+    .expect("submission");
+    assert!(
+        outcome.met() && outcome.integrity.is_empty(),
+        "a seal landing mid-submission was reported as a fork: routine {:?}, integrity {:?}",
+        outcome.routine,
+        outcome.integrity
+    );
+}
+
+/// One origin of each class C2SP `tlog-cosignature` forbids, and the word the
+/// refusal must carry.
+fn bad_origins() -> Vec<(&'static str, String, &'static str)> {
+    vec![
+        ("empty", String::new(), "is empty"),
+        ("256 bytes", "a".repeat(256), "256 bytes"),
+        ("an ASCII space", "agentplane/acme corp".into(), "' '"),
+        ("U+00A0", "agentplane/acme\u{a0}corp".into(), "'\\u{a0}'"),
+        (
+            "U+3000",
+            "agentplane/acme\u{3000}corp".into(),
+            "'\\u{3000}'",
+        ),
+        ("a plus", "agentplane/a+b".into(), "'+'"),
+        ("a newline", "agentplane\nforged".into(), "'\\n'"),
+        ("a tab", "agentplane\tlog".into(), "'\\t'"),
+        ("a control character", "agentplane\u{1}".into(), "'\\u{1}'"),
+    ]
+}
+
+/// **Every bad origin is refused where it is made and where it is read.**
+///
+/// The origin is what a witness indexes its memory by and what a monitor
+/// hashes into a URL, so one a conforming witness refuses is a log nobody can
+/// cosign — reported, until now, as an outage. Each class is run through the
+/// builder, the rule itself, the note parser, the JSON form an export header
+/// and a checkpoint file share, and the witness reader; the tenant classes
+/// through `TenantId`, which the origin is composed from; and a base that
+/// passes alone through the composition that pushes it past the bound.
+#[tokio::test]
+async fn each_bad_origin_is_refused_at_the_builder_and_on_parse() {
+    use agentplane::journal::JournalStore;
+
+    let root = merkle::root(&[]);
+    for (class, origin, named) in bad_origins() {
+        let builder = agentplane::store::RedbStore::open_in_memory()
+            .expect("store")
+            .origin(origin.clone());
+        let Err(refused) = builder else {
+            panic!("the builder took an origin with {class}");
+        };
+        assert!(
+            refused.to_string().contains(named),
+            "{class}: the refusal does not name it: {refused}"
+        );
+        assert!(Checkpoint::validate_origin(&origin).is_err(), "{class}");
+
+        let note = Checkpoint {
+            origin: origin.clone(),
+            size: 0,
+            root,
+        }
+        .to_note();
+        assert!(
+            Checkpoint::from_note(&note).is_err(),
+            "{class}: the note parser read the origin"
+        );
+
+        let json = serde_json::json!({ "origin": origin, "size": 0, "root": root });
+        let parsed = serde_json::from_value::<Checkpoint>(json);
+        let Err(e) = parsed else {
+            panic!("{class}: a checkpoint deserialised with it");
+        };
+        assert!(e.to_string().contains(named), "{class}: {e}");
+
+        #[cfg(feature = "witness-http")]
+        {
+            let reader = agentplane::journal::WitnessReader::new(
+                "http://127.0.0.1:9",
+                vec![agentplane::journal::TrustedWitness::ed25519("w", [7; 32])],
+            )
+            .expect("a reader");
+            assert!(
+                matches!(
+                    reader.latest(&origin).await,
+                    Err(WitnessError::BadOrigin(_))
+                ),
+                "{class}: the witness reader asked about it"
+            );
+        }
+    }
+
+    // A tenant becomes part of the origin, so the tenant classes are refused
+    // there, once, before any checkpoint carries them.
+    for tenant in ["acme corp", "acme\u{a0}corp", "acme\u{3000}corp", "a+b"] {
+        assert!(
+            matches!(
+                agentplane::core::TenantId::new(tenant),
+                Err(agentplane::core::TenantError::Unloggable(_))
+            ),
+            "the tenant {tenant:?} was accepted and would name an uncosignable log"
+        );
+    }
+
+    // A base that conforms alone, and a tenant that pushes the composition
+    // past the bound: refused when a checkpoint would carry it.
+    let long = agentplane::store::RedbStore::open_in_memory()
+        .expect("store")
+        .origin("a".repeat(250))
+        .expect("250 bytes conform")
+        .for_tenant(agentplane::core::TenantId::new("acme-corp").expect("tenant"));
+    let refused = long
+        .checkpoint()
+        .await
+        .expect_err("a 260-byte composed origin");
+    assert!(refused.to_string().contains("260 bytes"), "{refused}");
+}
+
+/// **A conforming origin round-trips.** At the bound and with multi-byte
+/// characters — the bound is in bytes, not characters — through the note, the
+/// JSON form, and a store's own checkpoint under a tenant.
+#[tokio::test]
+async fn a_conforming_origin_round_trips() {
+    use agentplane::journal::JournalStore;
+
+    let at_bound = format!("{}a", "é".repeat(127));
+    assert_eq!(at_bound.len(), 255);
+    for origin in [at_bound.as_str(), "example.com/log42", "agentplane/acme"] {
+        let (_, mut cp) = log(3);
+        cp.origin = origin.to_owned();
+        assert_eq!(
+            Checkpoint::from_note(&cp.to_note()).expect("its own note"),
+            cp,
+            "{origin}"
+        );
+        let json = serde_json::to_value(&cp).expect("serialises");
+        assert_eq!(
+            serde_json::from_value::<Checkpoint>(json).expect("its own JSON"),
+            cp
+        );
+    }
+
+    let store = agentplane::store::RedbStore::open_in_memory()
+        .expect("store")
+        .origin("a".repeat(250))
+        .expect("conforms")
+        .for_tenant(agentplane::core::TenantId::new("acme").expect("tenant"));
+    let cp = store
+        .checkpoint()
+        .await
+        .expect("a 255-byte composed origin");
+    assert_eq!(cp.origin.len(), 255);
+    assert_eq!(Checkpoint::from_note(&cp.to_note()).expect("note"), cp);
 }

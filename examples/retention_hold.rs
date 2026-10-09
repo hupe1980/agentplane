@@ -110,7 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tenant: &tenant,
         disclosures: None,
     };
-    let report = agentplane::retention::retain(&stores, at(CUTOFF), at(SWEPT), "7 years").await?;
+    let report =
+        agentplane::retention::retain(&stores, store.as_ref(), at(CUTOFF), at(SWEPT), "7 years")
+            .await?;
     println!("\n3. the pass");
     println!("   erased         → {}", report.erased);
     println!("   failures       → {:?}", report.failures);
@@ -147,7 +149,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("the matter was held")
         .record;
     println!("\n   released, recorded in run {released}");
-    let after = agentplane::retention::retain(&stores, at(CUTOFF), at(SWEPT), "7 years").await?;
+    let after =
+        agentplane::retention::retain(&stores, store.as_ref(), at(CUTOFF), at(SWEPT), "7 years")
+            .await?;
     println!("\n5. the hold is lifted and the same pass runs again");
     println!("   still held     → {}", after.held.len());
     println!(

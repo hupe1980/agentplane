@@ -205,13 +205,16 @@ impl VaultTransit {
             // narrow for that reason — a false positive would report live data
             // as erased.
             //
-            // Vault cannot say *when* or *why* it went; it keeps no tombstone.
-            // The caller's own erasure record is the authority on that, so this
-            // reports the fact rather than inventing a date.
+            // Vault cannot say *when* or *why* it went, or even *whether it
+            // was erased*: it keeps no tombstone, and a key deleted by hand
+            // reads exactly like one an erasure destroyed. The plane's erasure
+            // record (`CaseStore::erasure`) is what tells the two apart, so
+            // the reason says so rather than claiming an erasure, and the
+            // epoch instant is a placeholder no reader should take as a date.
             400 | 404 if is_missing_key(&reason()) => Err(KeyError::Destroyed {
                 scope: scope.to_owned(),
                 at: Timestamp::UNIX_EPOCH,
-                reason: "the wrapping key no longer exists in Vault".to_owned(),
+                reason: MISSING_KEY.to_owned(),
             }),
             // A refusal that retrying cannot fix: no permission, or a key whose
             // configuration forbids what was asked.
@@ -228,6 +231,11 @@ impl VaultTransit {
         }
     }
 }
+
+/// What a missing transit key is reported as: a fact about the key, not a
+/// claim that anybody erased it.
+const MISSING_KEY: &str = "no key exists in Vault for this scope; whether it was erased is \
+     for the plane's erasure record to say — a key deleted outside the plane reads the same";
 
 /// Whether a Vault refusal means the key is gone rather than forbidden.
 ///
@@ -350,6 +358,11 @@ impl KeyRing for VaultTransit {
         to_key(&reply.data.plaintext, "the data key transit returned")
     }
 
+    /// Deletes the transit key. `at` and `reason` are not sent: transit keeps
+    /// no record of why a key went, so they live in the erasure record the
+    /// caller wrote before calling this
+    /// ([`CaseStore::begin_erasure`](crate::case::CaseStore::begin_erasure)
+    /// for a case).
     async fn destroy(&self, scope: &str, _at: Timestamp, _reason: &str) -> Result<(), KeyError> {
         // Deleting the *key*, which is what makes every data key ever wrapped
         // under it unopenable. Vault refuses unless the key was configured with

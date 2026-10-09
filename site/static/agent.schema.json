@@ -460,11 +460,13 @@
           "description": "Which built-in behaviour runs this agent."
         },
         "max_turns": {
-          "default": 8,
-          "description": "How many model turns a tool-calling agent may take.",
+          "description": "How many model turns a `tool-calling` agent may take, or how many steps a `planned` agent's plan may hold.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
@@ -874,7 +876,6 @@
           "description": "What a human decides **before** the run continues."
         },
         "approvers": {
-          "default": [],
           "description": "Who may decide. Empty means anyone — a choice worth making on purpose rather than by omission.",
           "items": {
             "type": "string"
@@ -882,9 +883,12 @@
           "type": "array"
         },
         "deadline": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/OversightDeadline"
+            },
+            {
+              "type": "null"
             }
           ],
           "description": "The obligation that bounds the wait."
@@ -914,8 +918,7 @@
         }
       },
       "required": [
-        "approval",
-        "deadline"
+        "approval"
       ],
       "type": "object"
     },

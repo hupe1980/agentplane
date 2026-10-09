@@ -116,3 +116,59 @@ async fn an_issuer_refusal_is_final_and_names_only_its_code() {
         "the issuer's own description reached the error: {text}"
     );
 }
+
+async fn answering(body: &'static str) -> String {
+    let app = Router::new().route(
+        "/token",
+        post(move || async move { (axum::http::StatusCode::OK, body.to_owned()) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}/token")
+}
+
+/// **Only a bearer access token is presented.** A response that issues some
+/// other kind of token — a refresh token, a DPoP-bound one, an empty string —
+/// is the issuer's answer about this request, refused at the boundary rather
+/// than sent as a bearer and reported as the peer's failure.
+#[tokio::test]
+async fn an_issued_token_that_is_not_a_bearer_access_token_is_refused() {
+    for body in [
+        r#"{"access_token":"t","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"DPoP"}"#,
+        r#"{"access_token":"t","issued_token_type":"urn:ietf:params:oauth:token-type:refresh_token","token_type":"Bearer"}"#,
+        r#"{"access_token":"","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer"}"#,
+        r#"{"access_token":"t","token_type":"Bearer"}"#,
+    ] {
+        let endpoint =
+            TokenEndpoint::new(answering(body).await, "urn:example:principal-id", "actor")
+                .expect("a loopback issuer in a testkit build");
+        let refused = endpoint
+            .exchange(&PeerId::new("reviewer"), "user:alice")
+            .await
+            .expect_err("an unusable token was presented");
+        assert!(
+            matches!(refused, CredentialError::Refused { .. }),
+            "{body}: {refused:?}"
+        );
+    }
+}
+
+/// **A token whose issuer named no lifetime is not held for ever.**
+#[tokio::test]
+async fn a_token_with_no_stated_lifetime_still_expires() {
+    let endpoint = TokenEndpoint::new(
+        answering(r#"{"access_token":"t","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"bearer"}"#).await,
+        "urn:example:principal-id",
+        "actor",
+    )
+    .expect("a loopback issuer in a testkit build");
+    let credential = endpoint
+        .exchange(&PeerId::new("reviewer"), "user:alice")
+        .await
+        .expect("issued");
+    assert!(
+        credential.expires_at().is_some(),
+        "a token with no stated lifetime would be served past an expiry the issuer kept to itself"
+    );
+}

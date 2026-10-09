@@ -60,10 +60,8 @@ pod that can reach it, so never point one at `trust` authentication.
 It reconciles nothing. A plane holds its declarations from start, an open run
 stays pinned to the revision it began under, and a resume under another
 revision is quarantined — so the only safe response to a changed manifest or
-policy is a new pod, which is what an upgrade is: the ConfigMap's checksum is a
-pod annotation, and changing either rolls the Deployment. A controller watching
-manifests would have no other act available, which is why the project ships
-none.
+policy is a new pod: the ConfigMap's checksum is a pod annotation, and changing
+either rolls the Deployment.
 
 `serve` reads the token file and the store once, at start, and never reloads
 them. The chart hashes both Secrets as the cluster holds them into a pod

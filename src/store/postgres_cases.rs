@@ -65,6 +65,16 @@ CREATE TABLE IF NOT EXISTS cases (
     -- it is the normal operating condition.
     version   BIGINT NOT NULL DEFAULT 0 CHECK (version >= 0),
     opened_at BIGINT NOT NULL,
+    -- The erasure record: set by `begin_erasure` under this row's lock, in
+    -- the transaction that checks the hold, and never cleared. On the row
+    -- rather than in a table of its own so a state write's single UPDATE can
+    -- refuse on it: a write waiting on the erasure's lock re-reads the row
+    -- the erasure wrote, and a predicate on another table would be read from
+    -- the snapshot the write started with.
+    erased_at        BIGINT,
+    erasure_reason   TEXT,
+    erasure_complete BOOLEAN NOT NULL DEFAULT FALSE,
+    CHECK ((erased_at IS NULL) = (erasure_reason IS NULL)),
     PRIMARY KEY (tenant, case_id)
 );
 
@@ -519,6 +529,24 @@ fn corrupt(what: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Corrupt {
         seq: 0,
         detail: format!("{what}: {e}"),
+    }
+}
+
+/// The erasure record held in a row's three erasure columns, from `first`.
+fn erasure_from(
+    row: &tokio_postgres::Row,
+    first: usize,
+) -> Result<Option<crate::case::Erasure>, StoreError> {
+    let at: Option<i64> = row.get(first);
+    let reason: Option<String> = row.get(first + 1);
+    match (at, reason) {
+        (Some(at), Some(reason)) => Ok(Some(crate::case::Erasure {
+            at: Timestamp::from_unix_timestamp(at)
+                .map_err(|e| corrupt("unrepresentable erased_at", e))?,
+            reason,
+            complete: row.get(first + 2),
+        })),
+        _ => Ok(None),
     }
 }
 
@@ -1012,7 +1040,11 @@ impl CaseStore for PostgresStore {
         state: serde_json::Value,
     ) -> Result<CaseVersion, StoreError> {
         let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
-        let next = expected.next();
+        let next = expected
+            .next()
+            .and_then(|next| i64::try_from(next.0).ok().map(|n| (next, n)))
+            .ok_or_else(|| crate::case::version_exhausted(&case.to_string()))?;
+        let (next, stored) = next;
         // The row count is read, and that is the point. The previous version of
         // this method discarded it and returned `Ok(())` for a case that does
         // not exist — the same defect already found once in `release` on this
@@ -1020,11 +1052,12 @@ impl CaseStore for PostgresStore {
         let n = client
             .execute(
                 "UPDATE cases SET state = $2, version = $3
-                  WHERE case_id = $1 AND version = $4 AND tenant = $5",
+                  WHERE case_id = $1 AND version = $4 AND tenant = $5
+                    AND erased_at IS NULL",
                 &[
                     &case.to_string(),
                     &state.to_string(),
-                    &i64::try_from(next.0).unwrap_or(i64::MAX),
+                    &stored,
                     &i64::try_from(expected.0).unwrap_or(i64::MAX),
                     &self.tenant_name(),
                 ],
@@ -1038,11 +1071,20 @@ impl CaseStore for PostgresStore {
         // conflict sends the caller into a re-read loop against nothing.
         let current = client
             .query_opt(
-                "SELECT version FROM cases WHERE case_id = $1 AND tenant = $2",
+                "SELECT version, erased_at, erasure_reason, erasure_complete FROM cases
+                  WHERE case_id = $1 AND tenant = $2",
                 &[&case.to_string(), &self.tenant_name()],
             )
             .await
             .map_err(|e| be(&e))?;
+        if let Some(erasure) = current
+            .as_ref()
+            .map(|row| erasure_from(row, 1))
+            .transpose()?
+            .flatten()
+        {
+            return Err(crate::case::case_erased(&case.to_string(), &erasure));
+        }
         match current {
             Some(row) => Err(StoreError::CaseConflict {
                 case: case.to_string(),
@@ -1066,17 +1108,21 @@ impl CaseStore for PostgresStore {
         let tx = client.transaction().await.map_err(|e| be(&e))?;
         // Read the prior status under the row lock, so *which transition this is*
         // is decided against the row this transaction is about to write.
-        let was: Option<String> = tx
+        let row = tx
             .query_opt(
-                "SELECT status FROM cases WHERE case_id = $1 AND tenant = $2 FOR UPDATE",
+                "SELECT status, erased_at, erasure_reason, erasure_complete FROM cases
+                  WHERE case_id = $1 AND tenant = $2 FOR UPDATE",
                 &[&case.to_string(), &self.tenant_name()],
             )
             .await
-            .map_err(|e| be(&e))?
-            .map(|r| r.get(0));
-        let Some(was) = was else {
+            .map_err(|e| be(&e))?;
+        let Some(row) = row else {
             return Err(StoreError::NotFound(case.to_string()));
         };
+        if let Some(erasure) = erasure_from(&row, 1)? {
+            return Err(crate::case::case_erased(&case.to_string(), &erasure));
+        }
+        let was: String = row.get(0);
         tx.execute(
             "UPDATE cases SET status = $2 WHERE case_id = $1 AND tenant = $3",
             &[&case.to_string(), &status.as_str(), &self.tenant_name()],
@@ -1205,12 +1251,34 @@ impl CaseStore for PostgresStore {
             });
         }
 
+        // A name is registered once: the same terms again are the same
+        // registration, and different terms are refused rather than dropped —
+        // the journal records the second registration, and a store that kept
+        // the first would enforce terms nobody reads as current. The case
+        // row's lock above serializes two registrations of one name.
+        let existing = tx
+            .query_opt(
+                "SELECT resolved_at, calendar_digest, warn_at FROM case_deadlines
+                  WHERE case_id = $1 AND name = $2 AND tenant = $3",
+                &[&d.case.to_string(), &d.name, &self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if let Some(row) = existing {
+            let same = row.get::<_, i64>(0) == d.resolved_at.unix_timestamp()
+                && row.get::<_, Vec<u8>>(1) == d.calendar_digest.as_bytes().to_vec()
+                && row.get::<_, Option<i64>>(2) == d.warn_at.map(Timestamp::unix_timestamp);
+            return if same {
+                Ok(())
+            } else {
+                Err(crate::case::deadline_exists(&d.case.to_string(), &d.name))
+            };
+        }
         tx.execute(
             "INSERT INTO case_deadlines
                    (case_id, name, resolved_at, calendar_digest, warn_at, state, tenant,
                     acknowledged_at, acknowledged_by, acknowledged_note, acknowledged_basis)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-                 ON CONFLICT (tenant, case_id, name) DO NOTHING",
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &d.case.to_string(),
                 &d.name,
@@ -1508,15 +1576,22 @@ impl CaseStore for PostgresStore {
         // The case row's lock, for the reason `register_deadline` takes it: two
         // snapshots each reading the other's pre-state is how a hold lands on a
         // case that an erasure in the other transaction is already destroying.
-        let exists = tx
+        // `begin_erasure` takes the same lock and writes its marker on this
+        // row, so the row read here — after any erasure holding the lock has
+        // committed — carries the marker, and the hold is refused.
+        let row = tx
             .query_opt(
-                "SELECT 1 FROM cases WHERE tenant = $1 AND case_id = $2 FOR UPDATE",
+                "SELECT erased_at, erasure_reason, erasure_complete FROM cases
+                  WHERE tenant = $1 AND case_id = $2 FOR UPDATE",
                 &[&self.tenant_name(), &case.to_string()],
             )
             .await
             .map_err(|e| be(&e))?;
-        if exists.is_none() {
+        let Some(row) = row else {
             return Err(StoreError::NotFound(case.to_string()));
+        };
+        if let Some(erasure) = erasure_from(&row, 0)? {
+            return Err(crate::case::case_erased(&case.to_string(), &erasure));
         }
         // First placement wins: `DO NOTHING` rather than `DO UPDATE`, so a retry
         // cannot move the instant or rewrite the reason.
@@ -1618,6 +1693,107 @@ impl CaseStore for PostgresStore {
             ))
         })
         .transpose()
+    }
+
+    async fn begin_erasure(
+        &self,
+        case: CaseId,
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<crate::case::ErasureStart, StoreError> {
+        use crate::case::ErasureStart;
+        let mut client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let tx = client.transaction().await.map_err(|e| be(&e))?;
+        // The lock `place_hold` takes. Whichever commits first decides: a hold
+        // committed first is read below by a statement that starts after this
+        // lock was granted, and a marker committed first is on the row
+        // `place_hold` reads under the same lock.
+        let row = tx
+            .query_opt(
+                "SELECT status, erased_at, erasure_reason, erasure_complete FROM cases
+                  WHERE tenant = $1 AND case_id = $2 FOR UPDATE",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let Some(row) = row else {
+            return Err(StoreError::NotFound(case.to_string()));
+        };
+        if let Some(standing) = erasure_from(&row, 1)? {
+            return Ok(ErasureStart::Marked(standing));
+        }
+        let held = tx
+            .query_opt(
+                "SELECT placed_at, reason, by_actor, by_basis FROM case_legal_holds
+                  WHERE tenant = $1 AND case_id = $2",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        if let Some(h) = held {
+            return Ok(ErasureStart::Held(super::hold_from_row(
+                Timestamp::from_unix_timestamp(h.get::<_, i64>(0))
+                    .map_err(|e| corrupt("unrepresentable placed_at", e))?,
+                hold_row(h.get(1), &h.get::<_, String>(2), &h.get::<_, String>(3))?,
+            )));
+        }
+        let status = status_from(&row.get::<_, String>(0))?;
+        if status != CaseStatus::Closed {
+            return Ok(ErasureStart::NotClosed(status));
+        }
+        tx.execute(
+            "UPDATE cases SET erased_at = $3, erasure_reason = $4
+              WHERE tenant = $1 AND case_id = $2",
+            &[
+                &self.tenant_name(),
+                &case.to_string(),
+                &at.unix_timestamp(),
+                &reason,
+            ],
+        )
+        .await
+        .map_err(|e| be(&e))?;
+        tx.commit().await.map_err(|e| be(&e))?;
+        Ok(ErasureStart::Marked(crate::case::Erasure {
+            at,
+            reason: reason.to_owned(),
+            complete: false,
+        }))
+    }
+
+    async fn complete_erasure(&self, case: CaseId) -> Result<(), StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                "UPDATE cases SET erasure_complete = erased_at IS NOT NULL
+                  WHERE tenant = $1 AND case_id = $2
+              RETURNING erased_at IS NOT NULL",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        match row.map(|r| r.get::<_, bool>(0)) {
+            Some(true) => Ok(()),
+            Some(false) => Err(StoreError::Backend(format!(
+                "no erasure was begun on case {case}, so none can be completed"
+            ))),
+            None => Err(StoreError::NotFound(case.to_string())),
+        }
+    }
+
+    async fn erasure(&self, case: CaseId) -> Result<Option<crate::case::Erasure>, StoreError> {
+        let client = self.pool().get().await.map_err(|e| pool_err(&e))?;
+        let row = client
+            .query_opt(
+                "SELECT erased_at, erasure_reason, erasure_complete FROM cases
+                  WHERE tenant = $1 AND case_id = $2",
+                &[&self.tenant_name(), &case.to_string()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        row.map(|row| erasure_from(&row, 0))
+            .transpose()
+            .map(Option::flatten)
     }
 
     async fn holds(

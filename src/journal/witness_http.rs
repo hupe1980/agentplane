@@ -765,6 +765,9 @@ impl WitnessReader {
     pub async fn latest(&self, origin: &str) -> Result<Option<CosignedCheckpoint>, WitnessError> {
         use sha2::{Digest as _, Sha256};
 
+        crate::journal::Checkpoint::validate_origin(origin)
+            .map_err(|e| WitnessError::BadOrigin(e.to_string()))?;
+
         // `GET <monitoring prefix>/<origin hash>/checkpoint`, where the origin
         // hash is lowercase hex SHA-256 of the origin line. Hex of the *origin*
         // and not of the note: a reader who knows only which log they are

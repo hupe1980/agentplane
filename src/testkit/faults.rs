@@ -109,6 +109,7 @@ pub struct Schedule {
     leafless: Vec<RunId>,
     contested: Vec<RunId>,
     detail: Option<&'static str>,
+    failing_renewals: u64,
 }
 
 impl Schedule {
@@ -124,6 +125,7 @@ impl Schedule {
             leafless: Vec::new(),
             contested: Vec::new(),
             detail: None,
+            failing_renewals: 0,
         }
     }
 
@@ -142,6 +144,7 @@ impl Schedule {
             leafless: Vec::new(),
             contested: Vec::new(),
             detail: None,
+            failing_renewals: 0,
         }
     }
 
@@ -195,6 +198,18 @@ impl Schedule {
     #[must_use]
     pub const fn detail(mut self, detail: &'static str) -> Self {
         self.detail = Some(detail);
+        self
+    }
+
+    /// Fail the first `n` lease renewals as a store blip would — a dropped
+    /// connection, a busy pool — leaving the lease itself held.
+    ///
+    /// The other faults model writes; this one models the heartbeat's own
+    /// call, whose failure means *nothing* about who holds the run unless
+    /// the store says the lease is gone.
+    #[must_use]
+    pub const fn renewals_fail(mut self, n: u64) -> Self {
+        self.failing_renewals = n;
         self
     }
 
@@ -257,6 +272,7 @@ pub struct Faulty {
     inner: Arc<dyn JournalStore>,
     schedule: Schedule,
     calls: AtomicU64,
+    renewals: AtomicU64,
     injected: Arc<std::sync::Mutex<Vec<(u64, Fault)>>>,
     runs: Arc<std::sync::Mutex<Vec<RunId>>>,
 }
@@ -269,6 +285,7 @@ impl Faulty {
             inner,
             schedule,
             calls: AtomicU64::new(0),
+            renewals: AtomicU64::new(0),
             injected: Arc::new(std::sync::Mutex::new(Vec::new())),
             runs: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
@@ -481,6 +498,18 @@ impl JournalStore for Faulty {
         epoch: Epoch,
         ttl: Duration,
     ) -> Result<Lease, StoreError> {
+        let n = self.renewals.fetch_add(1, Ordering::SeqCst);
+        if n < self.schedule.failing_renewals {
+            if let Ok(mut injected) = self.injected.lock() {
+                injected.push((n + 1, Fault::FailedClean));
+            }
+            return Err(StoreError::Backend(
+                self.schedule
+                    .detail
+                    .unwrap_or("injected: the store did not answer the renewal")
+                    .to_owned(),
+            ));
+        }
         self.inner.renew(run, owner, epoch, ttl).await
     }
 
@@ -515,6 +544,14 @@ impl JournalStore for Faulty {
 
     async fn consistency_proof(&self, old_size: u64) -> Result<Vec<Digest>, StoreError> {
         self.inner.consistency_proof(old_size).await
+    }
+
+    async fn consistency_proof_at(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<Vec<Digest>, StoreError> {
+        self.inner.consistency_proof_at(old_size, new_size).await
     }
 
     async fn inclusion_proof(

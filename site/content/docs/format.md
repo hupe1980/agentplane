@@ -59,8 +59,10 @@ The order a deployment takes a new `v` in is
   `run_01ARZ3NDEKTSV4RRFFQ69G5FAV`, `case_…`, `batch_…`. The same spelling
   everywhere — record bodies, export blocks, store keys, log lines — so an
   identifier says which kind it is wherever it is read, and `_` is outside
-  Crockford base32 so the prefix can never be part of the ULID. A reader may
-  accept a bare ULID; a writer emits the prefix.
+  Crockford base32 so the prefix can never be part of the ULID. The ULID is
+  in its canonical spelling — uppercase, first character at most `7` — and a
+  reader refuses any other, since one id with two spellings is two index keys.
+  A reader may accept a bare ULID; a writer emits the prefix.
 - **Seq**, **Epoch** — unsigned 64-bit integers.
 - **Timestamp** — RFC 3339 with an offset, as a JSON string.
 - **Bytes in JSON** — base64, RFC 4648 standard alphabet, **padded**, and
@@ -134,6 +136,12 @@ reading a missing `v` as "the current shape".
 **A record body is at most 1 MiB** of canonical bytes. A writer refuses a
 larger one rather than truncating it; bytes that do not fit belong in a blob
 store addressed by digest.
+
+**A record body nests at most 100 levels** of arrays and objects, counting the
+body itself. Every JSON parser stops at a nesting limit — the reference
+reader's at 127 — and a record past it would be committed to the chain and
+unreadable by every reader. A writer refuses a deeper one; a reader may refuse
+one it cannot parse, and must accept every record within the bound.
 
 ## 5. The hash chain {#hash-chain}
 
@@ -224,6 +232,17 @@ truncated read produce.
 ```json
 {"origin": "...", "size": 1234, "root": "<hex>"}
 ```
+
+The `origin` names the log, and it follows the rule C2SP
+[`tlog-cosignature`](https://github.com/C2SP/C2SP/blob/main/tlog-cosignature.md)
+states for a log origin: a non-empty UTF-8 string of **at most 255 bytes**,
+containing **no Unicode space** (the White_Space property), **no `+`** and **no
+control character below U+0020**. A reader refuses a checkpoint whose origin
+breaks it — in an export header, a checkpoint file, a note or an
+`ORIGIN:SIZE:ROOT` argument — because a witness indexes its memory by the
+origin and a conforming witness refuses such a log on first submission. The
+bound counts bytes, not characters. A tenant is part of the origin
+(`<origin>/<tenant>`), so a tenant name holds no space and no `+` either.
 
 A checkpoint claiming `size` 0 beside any root other than the empty root
 describes a log that cannot exist and must be refused. A witness has no prior
@@ -353,9 +372,11 @@ This one envelope is what every sealed store keeps, not only record payloads.
 Each seals to associated data naming what the bytes belong to, so an envelope
 copied elsewhere fails to authenticate rather than opening as another row's
 data. A sealed blob's is `blob:<scope>:<digest hex>`; a sealed memory's is the
-canonical JSON array `["memory", tenant, id, version, subject, purpose]`, and a
-memory row's content is the sealed JSON payload above, with no plaintext digest
-beside it.
+canonical JSON array `["memory", tenant, id, version, subject, purpose,
+[trust, sensitivity, provenance, written_by, created_at, expires_at]]` — the
+two instants as decimal strings of Unix nanoseconds, `expires_at` `null` when
+absent — so a row whose labels were edited does not open. A memory row's
+content is the sealed JSON payload above, with no plaintext digest beside it.
 
 ## 9. The export file {#export-file}
 
@@ -442,6 +463,10 @@ export carries it sealed.
 attestation of where. It is written as an explicit `null` rather than omitted,
 so a reader tells *unsigned* from *a field this export forgot*.
 
+`seq` and `prev_hash` are copies — of the body's `seq` and of the hash of the
+record before it — and a reader holds them to what they copy: a line whose
+copies disagree with its hashed half is a finding, as an edited `body` is.
+
 `raw` is **the exact bytes the hash covers**, carried as a JSON string —
 canonical record bytes are UTF-8 JSON, so they escape and recover byte for
 byte. It is the member that makes the file checkable: a verifier that
@@ -458,7 +483,8 @@ than trusting either alone.
          "state":{…},"version":0,"opened_at":"<rfc3339>","runs":["run_<ulid>"]},
  "deadlines":[…],"blobs":["<hex>"],
  "hold":{"placed_at":"<rfc3339>","reason":"…",
-         "by":{"actor":"…","basis":"authenticated"}}}
+         "by":{"actor":"…","basis":"authenticated"}},
+ "erasure":null}
 ```
 
 | Member | Type |
@@ -468,11 +494,18 @@ than trusting either alone.
 | `deadlines` | the case's obligations, each with `case`, `name`, `resolved_at`, `calendar_digest`, `state` and optionally `warn_at` and `acknowledged` |
 | `blobs` | digest hex strings |
 | `hold` | `null`, or the legal hold on the matter, with exactly these members: `placed_at` (an RFC 3339 instant), `reason`, and `by` — the operator who placed it, as `actor` and `basis` (`authenticated`, `asserted` or `connected`) |
+| `erasure` | `null`, or the erasure record on the matter, with exactly these members: `at` (an RFC 3339 instant), `reason`, and `complete` (a boolean: every tombstone and the key destruction landed) |
 
 `hold` is required. A restore places it again with its original instant, reason
 and operator; a reader that finds it missing or malformed reports a finding and a
 restore refuses the file, because a matter restored without its hold is one the
 next retention pass erases.
+
+`erasure` is required on the same terms. A restore marks the case erased again
+with its original instant and reason, so the recovered plane refuses to reopen,
+write or hold it and its drill reads the destroyed key as erased by design. A
+case block carrying both a hold and an erasure is a finding: no plane writes
+one.
 
 `case.id` is `case_<ulid>` — the same spelling a record body's `case` member
 carries, which is what makes the cross-layer check a string comparison.
@@ -509,6 +542,13 @@ unchecked.
 
 `unreadable` **names** the runs the export could not read rather than counting
 them, because the run that fails to read is not a random one.
+
+A restore holds the file to these counts before it writes anything: run
+blocks to `runs_requested` and record lines to `records`. It also refuses a
+line that is not JSON, a line of a `kind` it does not know, a run block naming
+no run and a record line before any run block — each is a line it would
+otherwise have to skip, and every other line of such a file is valid on its
+own.
 
 **The trailer's absence is the signal that matters.** An export cut short by a
 crash, a full disk or a killed pipe ends without one, so a reader tells a
@@ -560,7 +600,8 @@ An implementation that does the following has verified the file.
 1. **Header.** Refuse an unknown `version`. If `canon` is not a rule this
    reader implements, stop here: every digest below is *unverifiable* rather
    than *wrong*, so the report is neither sound nor a finding, and says
-   `unverifiable (unknown canon)`. `agentplane verify` and
+   `unverifiable (unknown canon)`. A checkpoint whose `origin` breaks
+   [the origin rule](#checkpoint) is a finding naming the rule. `agentplane verify` and
    `tools/verify_export.py` both exit `6` for it, and `agentplane restore`
    refuses such a file with the same status before opening the store. A `size` of 0 beside any root other
    than the empty root is a checkpoint describing a log that cannot exist.
@@ -578,7 +619,12 @@ An implementation that does the following has verified the file.
    `raw` and compare the result with `body` — the two must agree, type for
    type (`1`, `1.0` and `true` differ), or the file's readable half is saying
    something its hashed half does not. A line escaping a lone surrogate is not
-   JSON this format admits.
+   JSON this format admits, and neither is `NaN`, `Infinity` or a number
+   beyond the largest double. A record whose `v` is not the version the reader
+   implements, or whose `kind` is not in the [vocabulary](#vocabulary), is a
+   build skew the reader reports, never a record it reads as the current
+   shape. An integer member — `version`, `size`, `index`, `seq` — is a JSON
+   integer: `true` is not `1`.
 3. **Per run.** `prev_hash` of the first record is 32 zero bytes and its
    `seq` is 1; every later record's `prev_hash` is its predecessor's `hash`;
    `seq` is contiguous and ascending; and every record's own `body.run` is the run its block claims.
@@ -958,18 +1004,14 @@ contradiction, and treating the earlier record as final reports a run as stopped
 whose own later records show it finishing.
 
 Each kind's member set is pinned by `tests/golden/records.jsonl`, one line per
-kind. That file is the normative statement of the payloads: prose listing them
-here would be the same facts in two places, and the copy that drifts is always
-the second one.
+kind. That file is the normative statement of the payloads.
 
 ## What this format does not promise {#not-promised}
 
 **Store encodings are not specified here.** The journal is the record and the
 stores are indexes derived from it; a store is rebuilt by
 [`restore`](@/docs/operations.md), which reads this format and proves the
-result by equal Merkle roots at equal size. That is a weaker promise on
-purpose, and it is written down here rather than left to be inferred from
-silence. What a store writes beside the data it indexes is its own business:
+result by equal Merkle roots at equal size. What a store writes beside the data it indexes is its own business:
 the object store's erasure tombstone, for one, does carry a version, because it
 outlives the bytes it describes and a reader that cannot interpret one must say
 so rather than report an erasure it invented.

@@ -312,6 +312,9 @@ pub(crate) struct Rates {
 }
 
 /// Per-step execution context.
+// Each flag is an independent fact about this step; no combination is invalid,
+// so an enum over them would satisfy the lint at the reader's expense.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub struct StepCtx<'a> {
     store: &'a Arc<dyn JournalStore>,
@@ -410,6 +413,10 @@ pub struct StepCtx<'a> {
     /// Group records this step and phase already wrote — see
     /// [`Frame::recorded_groups`].
     pub(crate) recorded_groups: std::collections::BTreeMap<String, RecordedGroup>,
+    /// Whether this step runs only to abandon a group a pause left open: the
+    /// run was cancelled while paused, so the pause that ends this pass
+    /// aborts the group instead of leaving it open again.
+    pub(crate) abandoning: bool,
 }
 
 impl<'a> StepCtx<'a> {
@@ -497,6 +504,7 @@ impl<'a> StepCtx<'a> {
             declaration,
             signer,
             recorded_groups,
+            abandoning: false,
             reversing: false,
             open_group: None,
             member_dispatch: false,
@@ -566,6 +574,11 @@ impl<'a> StepCtx<'a> {
         asked: &EffectDescriptor,
     ) -> Result<Option<crate::journal::EffectReplay>, StepError> {
         self.cursor.next(key, asked, 1)
+    }
+
+    /// Whether the next recorded entry is at `key`, without consuming it.
+    pub(crate) fn cursor_peek_is(&self, key: EffectKey) -> bool {
+        self.cursor.peek_is(key)
     }
 
     pub(crate) const fn epoch(&self) -> Epoch {
@@ -707,14 +720,16 @@ impl<'a> StepCtx<'a> {
             })
             .transpose()
             .map_err(|e| {
-                StepError::Effect(crate::core::EffectError::Other(format!(
+                StepError::Effect(crate::core::EffectError::Refused(format!(
                     "commissioning '{capability}' refused: {e}"
                 )))
             })?;
         let initiator = self.initiator().await?;
         let served_unchained = self.served_unchained().await?;
+        let plane_chain = self.plane_chain().await?;
         let commissioned = self
             .effect(Commission {
+                plane_chain,
                 capability: capability.to_owned(),
                 input: input.peek().clone(),
                 label: input.label().clone(),
@@ -737,6 +752,12 @@ impl<'a> StepCtx<'a> {
             tokens: commissioned.peek().tokens,
             minor_units: commissioned.peek().minor_units,
         });
+        // Billed first: a sub-run that gave no answer still spent.
+        if let Some(failed) = commissioned.peek().failed.clone() {
+            return Err(StepError::Effect(crate::core::EffectError::Performed(
+                failed,
+            )));
+        }
         // Raised, never lowered — the same rule the effect layer applies to a
         // declared sensitivity, applied here because only now is the figure
         // known. A specialist that handled `Confidential` data must not have
@@ -866,7 +887,7 @@ impl<'a> StepCtx<'a> {
         F: FnOnce(crate::model::ModelCall) -> crate::model::ModelCall,
     {
         let stream = self.model_stream();
-        let refuse = |detail: String| StepError::Effect(crate::core::EffectError::Other(detail));
+        let refuse = |detail: String| StepError::NotWired(detail);
         let manifest = self.manifest.clone().ok_or_else(|| {
             refuse(
                 "this skill runs under no manifest, so `cx.complete` has no declared \
@@ -966,12 +987,12 @@ impl<'a> StepCtx<'a> {
         arguments: Tainted<Value>,
     ) -> Result<Tainted<Value>, StepError> {
         let (catalog, client) = self.tools.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "this plane has no tool catalogue — `RuntimeBuilder::toolbox(..)` derives \
                  one from the agents' declarations, and `.tools(catalog, client)` states \
                  it explicitly"
                     .into(),
-            ))
+            )
         })?;
         let egress = self.tool_egress();
         self.sink_with(&arguments, |value| {
@@ -1039,19 +1060,19 @@ impl<'a> StepCtx<'a> {
         payload: &Tainted<Value>,
     ) -> Result<Tainted<Value>, StepError> {
         let wiring = self.peers.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "this plane reaches no peers — `RuntimeBuilder::peers(registry, client)` \
                  is what wires them"
                     .into(),
-            ))
+            )
         })?;
         let chain = self.identity.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "a peer call is made on somebody's behalf, and this run acts under no \
                  chain — admit it with `RunTerms::acting_as`, or build the plane with \
                  `RuntimeBuilder::acting_as`"
                     .into(),
-            ))
+            )
         })?;
         // The grant that governs this call: the governing manifest's own,
         // read directly — it is the reviewed document, and a plane whose
@@ -1210,11 +1231,11 @@ impl<'a> StepCtx<'a> {
 
     fn peer_wiring(&self) -> Result<Arc<super::executor::PeerWiring>, StepError> {
         self.peers.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "this plane reaches no peers — `RuntimeBuilder::peers(registry, client)` \
                  is what wires them"
                     .into(),
-            ))
+            )
         })
     }
 
@@ -1607,6 +1628,8 @@ impl<'a> StepCtx<'a> {
                 }
             }
 
+            self.starts_no_work_when_abandoning(&descriptor)?;
+
             // ── Live ───────────────────────────────────────────────────────
             //
             // Admission is checked per attempt, not once per effect. A retry is
@@ -1857,17 +1880,15 @@ impl<'a> StepCtx<'a> {
         outbound_bytes: u64,
     ) -> Result<(), StepError> {
         let EffectReplay::Refused { limit, used } = refusal else {
-            return Err(recorded_refusal(refusal));
+            return Err(self.replayed_denial(refusal));
         };
         // Re-askable only at the history frontier, and the condition is
         // deliberately `writes_enabled`: a re-admission is a write, and
-        // bookkeeping writes begin where history ends. A refusal *inside* the
-        // replayed prefix was already answered by the run itself — the group
-        // abort that follows one is history — so re-admitting it mid-prefix
-        // would dispatch where the record holds the abort's reversals,
-        // manufacturing divergence out of a raise. Strict is covered by the
-        // same condition: verification writes nothing and consults no ledger.
-        if !self.writes_enabled() {
+        // bookkeeping writes begin where history ends. Strict is covered by
+        // the same condition: verification writes nothing and consults no
+        // ledger. A cancelling pass re-admits nothing either — it exists to
+        // take work back, not to continue it.
+        if !self.writes_enabled() || self.abandoning {
             return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
         }
         // Asked without taking the slot: this is the question "does the
@@ -2216,9 +2237,7 @@ impl<'a> StepCtx<'a> {
             .into_iter()
             .fold(sent.label().sensitivity, crate::core::content_joined);
         let judged = if classified > sent.label().sensitivity {
-            Some(
-                sent.with_joined_label(&crate::core::Label::trusted().with_sensitivity(classified)),
-            )
+            Some(sent.raised_to(classified))
         } else {
             redacted
         };
@@ -2430,6 +2449,28 @@ impl<'a> StepCtx<'a> {
         let _ = dispatch;
         self.admit(key, &descriptor.kind, outbound_bytes, true)
             .await
+    }
+
+    /// Refuse a forward dispatch on the pass that abandons a cancelled run.
+    ///
+    /// That pass re-walks the paused step only so its open group can abort, so
+    /// past the frontier it takes work back and starts none: whatever was
+    /// raised, lifted or decided since the pause, a forward dispatch here would
+    /// perform — and could commit — what the operator asked to stop.
+    fn starts_no_work_when_abandoning(
+        &self,
+        descriptor: &EffectDescriptor,
+    ) -> Result<(), StepError> {
+        if self.abandoning && !self.undoing() {
+            return Err(StepError::Effect(crate::core::EffectError::Rejected(
+                format!(
+                    "{} was not dispatched: the run is being cancelled, and cancelling \
+                 starts no new work",
+                    descriptor.kind
+                ),
+            )));
+        }
+        Ok(())
     }
 
     /// Whether this dispatch takes work back: a compensating phase, or a group
@@ -2656,6 +2697,24 @@ impl<'a> StepCtx<'a> {
                 manifest.tool_grant(&reference).is_none().then(|| {
                     format!(
                         "manifest '{}' does not grant '{reference}' — a peer the agent's declaration never listed is authority nobody granted",
+                        manifest.metadata.name
+                    )
+                })
+            }
+            // Reading or cancelling a task at a peer is authority at that
+            // peer, granted only by a capability there: a task handle names a
+            // peer, and a skill may build one for any peer the plane can reach.
+            "a2a.task/get" | "a2a.task/cancel" => {
+                let peer = descriptor.args["peer"].as_str().unwrap_or_default();
+                let prefix = format!("tool://{peer}/");
+                (!manifest
+                    .spec
+                    .tools
+                    .iter()
+                    .any(|grant| grant.reference.starts_with(&prefix)))
+                .then(|| {
+                    format!(
+                        "manifest '{}' grants nothing at peer '{peer}' — a task at a peer the agent's declaration never listed is authority nobody granted",
                         manifest.metadata.name
                     )
                 })
@@ -3391,17 +3450,17 @@ impl<'a> StepCtx<'a> {
     /// says Tuesday when it is audited next year.
     pub async fn sleep_until(&mut self, until: Timestamp) -> Result<(), StepError> {
         let timers = self.timers.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "durable timers need a timer store — build the runtime with `.timers(store)`"
                     .into(),
-            ))
+            )
         })?;
 
         // Whole seconds, matching the store's precision. Two records of one
         // wake-up that disagree by a fraction of a second give "when does this
         // fire?" two answers.
         let until = until.replace_nanosecond(0).map_err(|e| {
-            StepError::Effect(crate::core::EffectError::Other(format!(
+            StepError::Effect(crate::core::EffectError::Refused(format!(
                 "unrepresentable wake instant: {e}"
             )))
         })?;
@@ -3525,12 +3584,12 @@ impl<'a> StepCtx<'a> {
         let now = self.now().await?;
         let until = now
             .checked_add(time::Duration::try_from(how_long).map_err(|e| {
-                StepError::Effect(crate::core::EffectError::Other(format!(
+                StepError::Effect(crate::core::EffectError::Refused(format!(
                     "unrepresentable sleep duration: {e}"
                 )))
             })?)
             .ok_or_else(|| {
-                StepError::Effect(crate::core::EffectError::Other(
+                StepError::Effect(crate::core::EffectError::Refused(
                     "sleep duration overflows the representable range".into(),
                 ))
             })?;
@@ -3613,6 +3672,24 @@ impl<'a> StepCtx<'a> {
             })),
             None => Ok(()),
         }
+    }
+
+    /// A recorded refusal read back, counted toward `max_denials` exactly as
+    /// the pass that recorded it counted it — so a replay reaches the ceiling
+    /// at the same refusal the original did, and a resume does not start the
+    /// count again. A sink or content refusal always counts; an engine denial
+    /// stops an undo no more than it did live.
+    fn replayed_denial(&self, refusal: EffectReplay) -> StepError {
+        if let EffectReplay::Denied { action, .. } = &refusal {
+            let sink =
+                action == crate::core::ACTION_EGRESS || action == crate::core::ACTION_CONTENT;
+            if let Err(exceeded) = self.ledger.lock().expect("budget mutex").record_denial()
+                && (sink || !self.undoing())
+            {
+                return StepError::Budget(exceeded);
+            }
+        }
+        recorded_refusal(refusal)
     }
 
     /// A refusal a step is handed, counted toward `max_denials` first: past
@@ -3827,7 +3904,12 @@ impl<'a> StepCtx<'a> {
             (Some(plane), Some(manifest)) => Some(plane.min(manifest)),
             (only, None) | (None, only) => only,
         };
-        if let Some(journal_ceiling) = journal_ceiling
+        // Live dispatch only, like every other sink gate: on replay the record
+        // already says what this ceiling decided, and judging it again would
+        // write a second refusal in strict mode and re-judge history under
+        // today's ceiling.
+        if live_dispatch
+            && let Some(journal_ceiling) = journal_ceiling
             && stored > journal_ceiling
         {
             let denial = PolicyError::JournalCeiling {
@@ -4057,16 +4139,8 @@ impl<'a> StepCtx<'a> {
         if self.mode.is_replaying() {
             match self.cursor.next(key, &descriptor, 1)? {
                 Some(EffectReplay::Done { .. }) => return Ok(released),
-                Some(EffectReplay::Denied {
-                    reason,
-                    action,
-                    resource,
-                }) => {
-                    return Err(StepError::Denied {
-                        action,
-                        resource,
-                        reason,
-                    });
+                Some(denied @ EffectReplay::Denied { .. }) => {
+                    return Err(self.replayed_denial(denied));
                 }
                 Some(_) => {
                     return Err(StepError::ReplayOverrun {
@@ -4494,11 +4568,7 @@ impl<'a> StepCtx<'a> {
 ///   *anyone*, and `Task::escalate` deliberately will not narrow it, so the
 ///   declared widening would do nothing.
 fn escalation_names_its_audience(spec: &TaskSpec) -> Result<(), StepError> {
-    let refuse = |detail: &str| {
-        Err(StepError::Effect(crate::core::EffectError::Other(
-            detail.into(),
-        )))
-    };
+    let refuse = |detail: &str| Err(StepError::NotWired(detail.into()));
     if let Expiry::Escalate { to } = &spec.on_expiry {
         if to.is_empty() {
             return refuse(
@@ -4615,6 +4685,57 @@ pub(crate) struct Outbound<'a> {
     pub(crate) content_rules: &'a [String],
 }
 
+/// A case's blob store, readable and closed to writes: see [`StepCtx::blobs`].
+#[derive(Debug)]
+struct CaseBlobsReadOnly(Arc<dyn crate::blob::BlobStore>);
+
+impl CaseBlobsReadOnly {
+    fn refused() -> crate::blob::BlobError {
+        crate::blob::BlobError::Backend(
+            "this handle reads a case's blobs; write them with `StepCtx::store_blob`, which \
+             records that the case produced them so erasing the case reaches them"
+                .to_owned(),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::blob::BlobStore for CaseBlobsReadOnly {
+    fn tenant(&self) -> &str {
+        self.0.tenant()
+    }
+    async fn put(&self, _bytes: &[u8]) -> Result<crate::core::Digest, crate::blob::BlobError> {
+        Err(Self::refused())
+    }
+    async fn put_at(
+        &self,
+        _digest: crate::core::Digest,
+        _bytes: &[u8],
+    ) -> Result<(), crate::blob::BlobError> {
+        Err(Self::refused())
+    }
+    async fn get_raw(
+        &self,
+        digest: crate::core::Digest,
+    ) -> Result<Vec<u8>, crate::blob::BlobError> {
+        self.0.get_raw(digest).await
+    }
+    async fn get(&self, digest: crate::core::Digest) -> Result<Vec<u8>, crate::blob::BlobError> {
+        self.0.get(digest).await
+    }
+    async fn expire(
+        &self,
+        _digest: crate::core::Digest,
+        _at: Timestamp,
+        _reason: &str,
+    ) -> Result<(), crate::blob::BlobError> {
+        Err(Self::refused())
+    }
+    async fn has(&self, digest: crate::core::Digest) -> Result<bool, crate::blob::BlobError> {
+        self.0.has(digest).await
+    }
+}
+
 fn recorded_refusal(replay: EffectReplay) -> StepError {
     match replay {
         EffectReplay::Refused { limit, used } => {
@@ -4721,11 +4842,11 @@ impl StepCtx<'_> {
 
     fn case_ctx(&self) -> Result<&CaseContext, StepError> {
         self.case.as_ref().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "this run has no case: build the runtime with a case store and admit the run \
                  with correlation keys"
                     .into(),
-            ))
+            )
         })
     }
 
@@ -5514,12 +5635,17 @@ impl StepCtx<'_> {
     /// The blob store for this run, sealed to its case.
     ///
     /// **Use this rather than a store held from the builder.** With a key ring
-    /// configured, bytes written here are encrypted under the case's data key,
-    /// and a store obtained any other way writes them in the clear — the two
-    /// would disagree about what erasing the case actually erased. It is also
-    /// what a skill passes to
-    /// [`ModelCall::with_media`](crate::model::ModelCall::with_media), so
-    /// materialization reads through the same envelope that sealed the bytes.
+    /// configured, it reads through the case's data key — the envelope
+    /// [`store_blob`](Self::store_blob) sealed the bytes in — where a store
+    /// obtained any other way sees only ciphertext. It is also what a skill
+    /// passes to [`ModelCall::with_media`](crate::model::ModelCall::with_media),
+    /// so materialization reads through the same envelope.
+    ///
+    /// **Read-only for a run bound to a case**: bytes a case produces are
+    /// written with [`store_blob`](Self::store_blob), which records that the
+    /// case produced them, so erasing the case reaches them. A write through
+    /// this handle would land in the case's address space with no record, and
+    /// an erasure would report success over bytes it never touched.
     ///
     /// # Errors
     ///
@@ -5527,7 +5653,12 @@ impl StepCtx<'_> {
     /// key ring is — there would be no erasure unit to scope the key to, and
     /// falling back to storing in the clear would silently drop the guarantee.
     pub fn blobs(&self) -> Result<Arc<dyn crate::blob::BlobStore>, StepError> {
-        self.blobs_scoped(None)
+        let blobs = self.blobs_scoped(None)?;
+        Ok(if self.case.is_some() {
+            Arc::new(CaseBlobsReadOnly(blobs))
+        } else {
+            blobs
+        })
     }
 
     /// The blob store, sealed to whichever unit owns erasure for these bytes.
@@ -5629,7 +5760,7 @@ impl StepCtx<'_> {
         let blobs = if self.mode == Mode::Strict {
             None
         } else {
-            Some(self.blobs()?)
+            Some(self.blobs_scoped(None)?)
         };
         let at = self.now().await?;
         let Some(blobs) = blobs else {
@@ -5800,7 +5931,7 @@ impl StepCtx<'_> {
             .await?
             .into_unlabelled();
 
-        let deadline = Deadline {
+        let mut deadline = Deadline {
             case: cx.case_id,
             name: name.clone(),
             resolved_at: resolved.at,
@@ -5822,13 +5953,30 @@ impl StepCtx<'_> {
         // regression check — including re-arming a deadline an operator had
         // since cancelled.
         if self.mode != Mode::Strict {
-            cx.cases.register_deadline(&deadline).await?;
+            match cx.cases.register_deadline(&deadline).await {
+                Ok(()) => {}
+                // Another run on this matter registered the name first. The
+                // obligation is the matter's, so this run shares it on the
+                // terms it was registered with, and journals those.
+                Err(crate::core::StoreError::DeadlineExists { .. }) => {
+                    if let Some(standing) = cx
+                        .cases
+                        .deadlines(cx.case_id)
+                        .await?
+                        .into_iter()
+                        .find(|d| d.name == deadline.name)
+                    {
+                        deadline = standing;
+                    }
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
 
         self.append(RecordKind::DeadlineRegistered {
             name,
-            resolved_at: resolved.at,
-            calendar_digest: resolved.calendar_digest,
+            resolved_at: deadline.resolved_at,
+            calendar_digest: deadline.calendar_digest,
         })
         .await?;
 
@@ -5989,9 +6137,9 @@ impl StepCtx<'_> {
     pub async fn task(&mut self, spec: &TaskSpec) -> Result<Decision, StepError> {
         let cx = self.case_ctx()?.clone();
         let tasks = cx.tasks.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "human tasks need a task store — build the runtime with `.tasks(store)`".into(),
-            ))
+            )
         })?;
 
         escalation_names_its_audience(spec)?;
@@ -6106,20 +6254,20 @@ impl StepCtx<'_> {
     pub async fn open_task(&mut self, spec: &TaskSpec) -> Result<TaskId, StepError> {
         let cx = self.case_ctx()?.clone();
         let tasks = cx.tasks.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "human tasks need a task store — build the runtime with `.tasks(store)`".into(),
-            ))
+            )
         })?;
         // A notification is not a decision, so `Expiry::ProceedUnattended` has nothing
         // to proceed *past* and the unattended consent it demands would be
         // consent to nothing. Refused rather than accepted-and-ignored.
         if spec.on_expiry == Expiry::ProceedUnattended {
-            return Err(StepError::Effect(crate::core::EffectError::Other(
+            return Err(StepError::NotWired(
                 "a task opened beside an answer has no decision to wait for, so \
                  `Expiry::ProceedUnattended` describes nothing — the run has already proceeded. \
                  Use `Deny` to let the window close, or `Escalate` to widen the audience"
                     .into(),
-            )));
+            ));
         }
         escalation_names_its_audience(spec)?;
         let due_at = self.deadline_instant(&cx, &spec.deadline).await?;
@@ -6240,7 +6388,7 @@ impl StepCtx<'_> {
         // human task's correlation key *is* its id, and that id is derived from
         // the key. Taking a closure resolves the circularity without a second
         // identifier that could drift from the first.
-        let key_preview = self.preview_key(kind, &[]);
+        let key_preview = self.preview_key(kind);
         let spec = &AwaitSpec {
             kind: kind.to_owned(),
             correlation: correlate(key_preview),
@@ -6249,10 +6397,10 @@ impl StepCtx<'_> {
         };
         let cx = self.case_ctx()?.clone();
         let events = cx.events.clone().ok_or_else(|| {
-            StepError::Effect(crate::core::EffectError::Other(
+            StepError::NotWired(
                 "durable waits need an event store — build the runtime with `.events(store)`"
                     .into(),
-            ))
+            )
         })?;
 
         // The wait is an effect: its output is the event. That means replay
@@ -6260,7 +6408,7 @@ impl StepCtx<'_> {
         // suspension machinery has to exist twice.
         let descriptor =
             EffectDescriptor::new(AWAIT_KIND, serde_json::json!({ "kind": spec.kind }));
-        let key = self.preview_key(kind, &[]);
+        let key = self.preview_key(kind);
         debug_assert_eq!(
             key,
             EffectKey::derive(
@@ -6387,7 +6535,7 @@ impl StepCtx<'_> {
     ///
     /// Needed because a human task's correlation key is derived from its own
     /// effect key, so the key must be known before the subscription is built.
-    fn preview_key(&self, kind: &str, _unused: &[CorrelationKey]) -> EffectKey {
+    fn preview_key(&self, kind: &str) -> EffectKey {
         // Attempt 1, always: a wait that times out suspends or dead-letters,
         // it never repeats, so there is no second attempt to distinguish.
         EffectKey::derive(
@@ -6442,10 +6590,10 @@ impl StepCtx<'_> {
             .find(|d| d.name == name)
             .map(|d| d.resolved_at)
             .ok_or_else(|| {
-                StepError::Effect(crate::core::EffectError::Other(format!(
+                StepError::NotWired(format!(
                     "wait references deadline '{name}', which is not registered on this case \
                      — register it before waiting, or the run has no horizon"
-                )))
+                ))
             })
     }
 
@@ -6599,6 +6747,9 @@ struct Commission {
     /// tasks bar the same person. Not in the descriptor, for the reason the
     /// chain is not: both runs' `RunAdmitted` records it.
     initiator: Option<String>,
+    /// Whether the commissioning run acts as the plane. Its sub-run does too,
+    /// one link down, so the credential a peer is shown is still the plane's.
+    plane_chain: bool,
     /// Whether the commissioning run acts for a served caller that presented
     /// no chain. Read from its `RunAdmitted`, and the one fact that tells a
     /// chainless served run from the plane's own chainless run.
@@ -6699,6 +6850,14 @@ struct Commissioned {
     /// follow the delegation into the run that did the work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     run: Option<String>,
+    /// Why the sub-run gave no answer, when it concluded without one.
+    ///
+    /// Recorded as the commission's outcome rather than raised as an effect
+    /// failure: the sub-run ran, may have acted, and spent — so its spend is
+    /// billed to this run like an answer's, and a replay reads the same
+    /// verdict back instead of asking the specialist again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failed: Option<String>,
 }
 
 const fn internal_floor() -> crate::core::Sensitivity {
@@ -6763,6 +6922,19 @@ impl Effect for Commission {
         crate::core::Spend::ZERO
     }
 
+    /// Never asked twice. Each dispatch admits a sub-run of its own, so a
+    /// retry is a second specialist doing the work again beside the first.
+    fn retry(&self) -> crate::core::RetryPolicy {
+        crate::core::RetryPolicy::never()
+    }
+
+    /// A commission announced and never recorded may have admitted a sub-run
+    /// that is still working — the recovery sweep resumes that run — so
+    /// re-performing it would commission a second. Only a person can say.
+    fn recovery(&self) -> crate::core::Recovery {
+        crate::core::Recovery::RequiresOperator
+    }
+
     async fn perform(&self) -> Result<Self::Output, crate::core::EffectError> {
         let plane = self
             .plane
@@ -6775,6 +6947,9 @@ impl Effect for Commission {
         // as the plane when it is the plane's own run, which on a plane with
         // no chain of its own is what holds the tenant's mandates.
         let mut terms = match (&self.chain, self.served_unchained) {
+            (Some(chain), _) if self.plane_chain => {
+                super::RunTerms::default().acting_as_plane(chain.clone())
+            }
             (Some(chain), _) => super::RunTerms::default().acting_as(chain.clone()),
             (None, true) => super::RunTerms::default().served(None),
             (None, false) => super::RunTerms::default(),
@@ -6800,31 +6975,41 @@ impl Effect for Commission {
             )
             .await
             .map_err(|e| match e {
-                // Decided before the sub-run was admitted: nothing ran, and
-                // no retry changes which revision answers.
-                crate::core::RuntimeError::DeclarationPinMismatch { .. } => {
-                    crate::core::EffectError::Refused(e.to_string())
-                }
-                e => crate::core::EffectError::Interrupted {
+                // The store could not say whether the sub-run was admitted.
+                crate::core::RuntimeError::Store(_) => crate::core::EffectError::Interrupted {
                     driver: self.capability.clone(),
                     detail: e.to_string(),
                 },
+                // Refused at admission — unknown capability, scope, policy,
+                // quota, a halt, a pinned revision that moved: no sub-run
+                // exists and nothing ran.
+                e => crate::core::EffectError::Refused(e.to_string()),
             })?;
 
         let spend = out.spend();
-        let answer = out
-            .output
-            .ok_or_else(|| crate::core::EffectError::Interrupted {
-                driver: self.capability.clone(),
-                detail: format!("'{}' finished without producing output", self.capability),
-            })?;
+        let run = Some(out.run_id.to_string());
+        let Some(answer) = out.output else {
+            return Ok(Commissioned {
+                answer: Value::Null,
+                tokens: spend.tokens,
+                minor_units: spend.minor_units,
+                sensitivity: internal_floor(),
+                data_subjects: BTreeSet::new(),
+                run,
+                failed: Some(format!(
+                    "'{}' concluded {:?} without an answer; its run is {}",
+                    self.capability, out.status, out.run_id
+                )),
+            });
+        };
         Ok(Commissioned {
-            run: Some(out.run_id.to_string()),
+            run,
             sensitivity: answer.label().sensitivity,
             data_subjects: answer.label().data_subjects.clone(),
             answer: answer.into_unlabelled(),
             tokens: spend.tokens,
             minor_units: spend.minor_units,
+            failed: None,
         })
     }
 }

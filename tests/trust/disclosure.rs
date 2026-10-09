@@ -671,6 +671,7 @@ async fn an_unsealed_disclosure_is_reported_not_reached() {
     let erased = agentplane::blob::erase_case(
         None,
         plane.cases.as_ref(),
+        Some(plane.journal.as_ref()),
         #[cfg(feature = "keyring")]
         None,
         Some(plane.register.as_ref()),
@@ -738,6 +739,7 @@ async fn an_erasure_names_the_disclosure_of_what_it_erased() {
     let erased = agentplane::blob::erase_case(
         None,
         cases.as_ref(),
+        Some(journal.as_ref()),
         Some(ring.as_ref() as &dyn KeyRing),
         Some(store.as_ref() as &dyn agentplane::disclosure::DisclosureRegister),
         &agentplane::core::TenantId::default(),
@@ -775,6 +777,7 @@ async fn an_erasure_names_the_disclosure_of_what_it_erased() {
     .expect("disclosed");
     let copies = agentplane::blob::erase_run(
         ring.as_ref(),
+        plane.journal.as_ref(),
         Some(plane.register.as_ref()),
         &agentplane::core::TenantId::default(),
         plane.loose,
@@ -814,6 +817,7 @@ async fn a_retention_pass_names_the_disclosures_of_what_it_erased() {
             tenant: &tenant,
             disclosures: Some(&plane.register),
         },
+        plane.journal.as_ref(),
         agentplane::core::Timestamp::from_unix_timestamp(4_000_000_000).expect("instant"),
         instant(),
         "retention",

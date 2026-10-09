@@ -359,10 +359,16 @@ impl PostgresStore {
     }
 
     /// Name this plane's Merkle log.
-    #[must_use]
-    pub fn origin(mut self, origin: impl Into<String>) -> Self {
-        self.origin = origin.into();
-        self
+    ///
+    /// # Errors
+    ///
+    /// If the name breaks [`Checkpoint::validate_origin`](crate::journal::Checkpoint::validate_origin),
+    /// refused here rather than at the first checkpoint a witness turns away.
+    pub fn origin(mut self, origin: impl Into<String>) -> Result<Self, StoreError> {
+        let origin = origin.into();
+        crate::journal::Checkpoint::validate_origin(&origin)?;
+        self.origin = origin;
+        Ok(self)
     }
 
     /// Serve one tenant.
@@ -410,6 +416,48 @@ impl PostgresStore {
                 digest_from(&r.get::<_, Vec<u8>>(0)).map(|d| crate::core::merkle::leaf_hash(&d))
             })
             .collect::<Result<Vec<_>, _>>()
+    }
+
+    /// The log's leaves and where each of `runs` sits in them, from one
+    /// statement.
+    ///
+    /// One statement is one snapshot, and a proof needs one: a position read
+    /// apart from the leaves can name a run sealed after them, whose index is
+    /// past the tree its proof is built over — a proof that fails as if the
+    /// log had been rewritten. The position is the dense rank in seal order, a
+    /// tree without holes needing it whatever the stored indices are.
+    async fn log_walk(
+        &self,
+        runs: &[RunId],
+    ) -> Result<
+        (
+            Vec<crate::core::merkle::LeafHash>,
+            Vec<Option<(u64, Digest)>>,
+        ),
+        StoreError,
+    > {
+        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
+        let rows = client
+            .query(
+                "SELECT run_id, chain_head FROM run_seal WHERE tenant = $1 ORDER BY log_index ASC",
+                &[&self.tenant_name()],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let ids: Vec<String> = runs.iter().map(ToString::to_string).collect();
+        let mut placed = vec![None; runs.len()];
+        let mut leaves = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let head = digest_from(&row.get::<_, Vec<u8>>(1))?;
+            let id: String = row.get(0);
+            for (slot, wanted) in placed.iter_mut().zip(&ids) {
+                if *wanted == id {
+                    *slot = Some((leaves.len() as u64, head));
+                }
+            }
+            leaves.push(crate::core::merkle::leaf_hash(&head));
+        }
+        Ok((leaves, placed))
     }
 }
 
@@ -1802,9 +1850,13 @@ impl JournalStore for PostgresStore {
     }
 
     async fn checkpoint(&self) -> Result<crate::journal::Checkpoint, StoreError> {
+        // The composed name, not only the base: a tenant lengthens it, and a
+        // base that passed alone can fail once a tenant is appended.
+        let origin = self.log_origin();
+        crate::journal::Checkpoint::validate_origin(&origin)?;
         let leaves = self.log_leaves().await?;
         Ok(crate::journal::Checkpoint {
-            origin: self.log_origin(),
+            origin,
             size: leaves.len() as u64,
             root: crate::core::merkle::root(&leaves),
         })
@@ -1827,36 +1879,41 @@ impl JournalStore for PostgresStore {
         Ok(crate::core::merkle::consistency_proof(&leaves, old))
     }
 
+    async fn consistency_proof_at(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<Vec<Digest>, StoreError> {
+        let leaves = self.log_leaves().await?;
+        let (old, new) = (
+            usize::try_from(old_size).unwrap_or(usize::MAX),
+            usize::try_from(new_size).unwrap_or(usize::MAX),
+        );
+        if old > new || new > leaves.len() {
+            return Err(StoreError::Backend(format!(
+                "asked to prove {old_size} → {new_size} and the log holds {} leaves",
+                leaves.len()
+            )));
+        }
+        Ok(crate::core::merkle::consistency_proof(&leaves[..new], old))
+    }
+
     async fn inclusion_proof(
         &self,
         run: RunId,
     ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
-        let leaves = self.log_leaves().await?;
-        let client = self.pool.get().await.map_err(|e| pool_err(&e))?;
-        let Some(row) = client
-            .query_opt(
-                "SELECT rank, chain_head FROM (
-                     SELECT run_id, chain_head,
-                            ROW_NUMBER() OVER (ORDER BY log_index) - 1 AS rank
-                       FROM run_seal WHERE tenant = $1
-                 ) ranked WHERE run_id = $2",
-                &[&self.tenant_name(), &run.to_string()],
-            )
-            .await
-            .map_err(|e| be(&e))?
-        else {
+        let (leaves, mut placed) = self.log_walk(&[run]).await?;
+        let Some((index, seal)) = placed.pop().flatten() else {
             return Ok(None);
         };
-        // Position in the *tree* is the dense rank, which a tree without
-        // holes needs whatever the stored positions are.
-        let index: i64 = row.get(0);
-        let seal = digest_from(&row.get::<_, Vec<u8>>(1))?;
-        let index = usize::try_from(index).unwrap_or(0);
         Ok(Some(crate::journal::Inclusion {
-            index: index as u64,
+            index,
             size: leaves.len() as u64,
             seal,
-            proof: crate::core::merkle::inclusion_proof(&leaves, index),
+            proof: crate::core::merkle::inclusion_proof(
+                &leaves,
+                usize::try_from(index).unwrap_or(usize::MAX),
+            ),
         }))
     }
 
@@ -1865,7 +1922,7 @@ impl JournalStore for PostgresStore {
         run: RunId,
         size: u64,
     ) -> Result<Option<crate::journal::Inclusion>, StoreError> {
-        let leaves = self.log_leaves().await?;
+        let (leaves, mut placed) = self.log_walk(&[run]).await?;
         let prefix = usize::try_from(size)
             .ok()
             .and_then(|size| leaves.get(..size))
@@ -1875,7 +1932,7 @@ impl JournalStore for PostgresStore {
                     leaves.len()
                 ))
             })?;
-        let Some((index, seal)) = self.log_positions(&[run]).await?.pop().flatten() else {
+        let Some((index, seal)) = placed.pop().flatten() else {
             return Ok(None);
         };
         let Some(at) = usize::try_from(index).ok().filter(|&at| at < prefix.len()) else {
@@ -2143,7 +2200,7 @@ fn column_json(
         Type::BYTEA => row
             .try_get::<_, Option<Vec<u8>>>(i)
             .map_err(|e| StoreError::Backend(e.to_string()))?
-            .map_or(Value::Null, |b| Value::String(hex(&b))),
+            .map_or(Value::Null, |b| Value::String(hex::encode(b))),
         ref other => {
             return Err(StoreError::Backend(format!(
                 "column '{}' has type {other}, which this seam does not convert — \
@@ -2152,14 +2209,6 @@ fn column_json(
                 row.columns()[i].name()
             )));
         }
-    })
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
     })
 }
 

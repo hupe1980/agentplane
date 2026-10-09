@@ -213,9 +213,17 @@ impl CaseVersion {
     /// The version a case has before anybody has written to it.
     pub const INITIAL: Self = Self(0);
 
+    /// The version after this one, or `None` at the last one.
+    ///
+    /// Checked rather than wrapping: a version that wrapped to zero would let a
+    /// writer still holding version 0 win the compare-and-set it lost, which
+    /// is the lost update the version exists to prevent.
     #[must_use]
-    pub const fn next(self) -> Self {
-        Self(self.0 + 1)
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(n) => Some(Self(n)),
+            None => None,
+        }
     }
 }
 
@@ -505,7 +513,8 @@ pub enum SweptAction {
     /// than a finding — recorded anyway, because a takeover bumps the run's
     /// epoch and fences its previous owner, and *who fenced whom, and why*
     /// must be answerable from the journal rather than inferred from an epoch
-    /// gap. The detail names the outcome the resume reached.
+    /// gap. It is written before the resume, so it names the takeover; the
+    /// outcome is in the recovered run's own journal.
     RunRecovered,
     /// The decision noted just before this one for the same subject did not
     /// take effect.
@@ -516,4 +525,18 @@ pub enum SweptAction {
     /// note alone would claim a decision that never applied. A breach needs
     /// none: it is acted on first and noted only once it applied.
     NotApplied,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CaseVersion;
+
+    /// The last version has no successor rather than wrapping to the first,
+    /// where a writer still holding version 0 would win a compare-and-set it
+    /// lost.
+    #[test]
+    fn the_last_case_version_has_no_successor() {
+        assert_eq!(CaseVersion(4).next(), Some(CaseVersion(5)));
+        assert_eq!(CaseVersion(u64::MAX).next(), None);
+    }
 }

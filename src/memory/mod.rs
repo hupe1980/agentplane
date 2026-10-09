@@ -1143,6 +1143,66 @@ pub trait MemoryStore: Send + Sync + Debug {
     /// choice does not cover: the `expires_at` ceiling, which no touch moves,
     /// and a swept id, which is a tombstone no touch revives.
     async fn touch(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError>;
+
+    /// Run an erasure verb, answering what it removed from the rows even when
+    /// a copy derived from them could not be told.
+    ///
+    /// The second element is that untold copy: `Some` when the rows went and
+    /// a derived index still holds what they held. A sealing wrapper needs
+    /// the first element whatever the second says — it destroys exactly the
+    /// keys of what the rows lost — so an index failure must not hide it: an
+    /// error in its place leaves rows gone and their keys alive, and nothing
+    /// names them again. The plain verbs answer the untold copy as their
+    /// error, so no caller of those reads success while a copy survives.
+    ///
+    /// The default runs the plain verb and owes nothing, which is right for a
+    /// store with no derived copy of its own.
+    ///
+    /// # Errors
+    ///
+    /// As the verb, when the rows were not erased.
+    async fn erase_reaching(
+        &self,
+        verb: MemoryErasure<'_>,
+    ) -> Result<(Reached, Option<StoreError>), StoreError> {
+        let reached = match verb {
+            MemoryErasure::Subject(subject) => {
+                Reached::Subject(self.forget_subject(subject).await?)
+            }
+            MemoryErasure::Cascading(id) => Reached::Cascading(self.forget_cascading(id).await?),
+            MemoryErasure::Expired(at) => Reached::Expired(self.sweep_expired(at).await?),
+        };
+        Ok((reached, None))
+    }
+}
+
+/// A store that answered a different verb than it was asked.
+pub(crate) fn mismatched(verb: &str, reached: &Reached) -> StoreError {
+    StoreError::Backend(format!(
+        "{verb} was answered with {reached:?}, which is another verb's result"
+    ))
+}
+
+/// An erasure verb, named for [`MemoryStore::erase_reaching`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryErasure<'a> {
+    /// [`MemoryStore::forget_subject`].
+    Subject(&'a str),
+    /// [`MemoryStore::forget_cascading`].
+    Cascading(&'a str),
+    /// [`MemoryStore::sweep_expired`].
+    Expired(Timestamp),
+}
+
+/// What an erasure verb removed from the rows, in the verb's own terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reached {
+    /// How many items a subject erasure removed.
+    Subject(usize),
+    /// What a cascading erasure removed.
+    Cascading(Cascade),
+    /// The ids an expiry sweep erased, each with its highest version.
+    Expired(Vec<(String, u64)>),
 }
 
 #[cfg(test)]

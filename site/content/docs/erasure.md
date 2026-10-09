@@ -154,7 +154,9 @@ Runtime::builder(store)
 ```
 
 Where both are present the **stricter** binds, the same rule a reviewed tool
-grant follows: a declaration may only tighten what the deployment allows. It is
+grant follows: a declaration may only tighten what the deployment allows. Both
+are judged on live dispatch only: on replay the record already says what the
+ceiling decided, and history is not re-judged under today's ceiling. It is
 an enforcement point rather than a warning — a build-time lint that let the run
 proceed would be the advisory control this format refuses everywhere else.
 
@@ -183,9 +185,7 @@ seals it just the same. An operator `Outbox`'s store is swept up too: it keeps
 the destinations' webhook bearer tokens — credentials like any caller's — so
 `SealedPush` wraps it in the same pass. The decorators (`SealedJournal`,
 `SealedCases`, `SealedTasks`, `SealedEvents`, `SealedPush`) are public for
-embedders wiring stores by hand, but a plane should not need five correct
-decisions where one will do: a control that can be forgotten five times is one
-where forgetting looks exactly like remembering.
+embedders wiring stores by hand.
 
 **Governed memory is the one store this call leaves alone, and the exclusion
 is forced rather than an oversight.** `EncryptedMemoryStore` serialises subject
@@ -263,23 +263,13 @@ let memories = EncryptedMemoryStore::new(inner, keys.clone(), tenant.clone())
     .coordinated_by(Arc::new(store.erasure_coordinator()));
 ```
 
-**Why a session advisory lock and not a row.** A row taken with `SELECT … FOR
-UPDATE` needs its transaction held open for the whole erasure, and the erasure's
-own writes go through the store's other connections — so the row lock would be
-held by a transaction that cannot see the work it protects. A *session* lock is
-held by the connection, and `PostgreSQL` releases it when the session ends. That
-last property is the one that chose it: an instance that dies mid-erasure
-releases by dying, where a lease with a TTL must choose between stranding the
-subject and handing it over while the first instance's KMS call may still be in
-flight.
+A *session* lock is held by the connection, so an instance that dies
+mid-erasure releases it by dying.
 
-**Dropping the lease releases the scope.** The usual argument against an RAII
-guard — releasing a distributed lock is async and fallible, `Drop` is neither —
-holds for a lease *table* and not for either primitive here: a process-local
-mutex releases by dropping its guard, and a `PostgreSQL` session advisory lock
-ends with the session, so dropping the connection releases it. Both are
-synchronous and cannot fail. That is what makes a cancelled erasure safe: put a
-`timeout` around a memory write and you abandon the work, not the subject.
+**Dropping the lease releases the scope.** A process-local mutex releases by
+dropping its guard, and a session advisory lock ends with its connection, so a
+cancelled erasure is safe: put a `timeout` around a memory write and you
+abandon the work, not the subject.
 
 Use `under_lock` anyway. It releases on the success *and* the failure path, and
 what it adds is the tidy half — an explicit unlock, so the scope frees
@@ -298,13 +288,10 @@ the memory store says whether its lifecycle lock spans them
 (`MemoryStore::erasure_is_distributed`). A shared store beside a process-local
 lock is `BuildError::ErasureCoordinatorNotShared`, naming the fix.
 
-`is_shared` has **no default**, deliberately. A default of `false` would let an
-embedder's shared backend answer *single-writer* by saying nothing, and a control
-that fails open when an implementer forgets is a property the runtime relies on
-rather than checks. `erasure_is_distributed` *does* default — to `None`, meaning
-"no lifecycle lock because there is no cryptographic erasure here", which is the
-honest answer for an ordinary store and leaves the check inapplicable rather than
-satisfied.
+`is_shared` has **no default**, so a shared backend cannot answer
+*single-writer* by saying nothing. `erasure_is_distributed` defaults to `None`
+— no lifecycle lock because there is no cryptographic erasure here — which
+leaves the check inapplicable rather than satisfied.
 
 Two properties make it worth having rather than merely present. Only the
 *payload* is sealed: `seq`, `run`, `case`, `effect_key` and the record's own
@@ -444,9 +431,17 @@ clock: a window, applied to every closed case, by the plane.
 pass only selects closed ones: destroying the key freezes every run the case
 covers. Their plans and effect outputs stop opening, so none of them can be
 replayed, resumed or unwound again — the work is over whether or not anybody
-decided it should be. Conclude the runs, close the case, then erase. The
-refusal is typed (`EraseError::CaseStillOpen`) and nothing is destroyed before
-it.
+decided it should be. A closed case is refused too while any run it covers
+may still resume — suspended, quarantined or unconcluded — because closing a
+case does not stop its runs. Conclude the runs, close the case, then erase. The refusals are typed (`EraseError::CaseStillOpen`,
+`EraseError::RunNotConcluded`) and nothing is destroyed before them.
+
+**An erased case stays erased.** The erasure is recorded on the case itself —
+instant and reason — before the key is destroyed. An erased case cannot be
+reopened, written, held or erased again (`StoreError::CaseErased`, a 409 on the
+operator API), a retention pass skips it, and a key ring that reports the
+case's key missing is read against that record: a missing key with no erasure
+record is a fault the drill names, not a completed erasure.
 
 ```rust
 let report = plane.retain(cutoff, now, "retention: 7 years from opening").await?;
@@ -558,7 +553,8 @@ release fails naming the record's run. `GET /holds?state=released` and
 field beside `failures`, and a hold does not make `is_complete()` false — a
 control doing its job must not page anybody. `retention::plan` splits `due` from
 `held` too, so a dry run and a pass never disagree. The hold is read again inside
-`erase_case`, which is what honours one placed between the two.
+`erase_case`, which is what honours one placed between the two: the hold and the
+erasure race for the same case row, and exactly one of them wins.
 
 **What else could destroy it.** Two things here destroy on a schedule, and a hold
 stops both: `retention::retain` (closed cases past a window) and
@@ -569,7 +565,9 @@ payload, and journal records are append-only. A hold travels with its case
 through `agentplane export` and restore — instant, reason and operator — so the
 first retention pass on a recovered plane finds it. The deliberate verbs —
 `erase_case`, `forget`, `forget_subject` — all consult a hold; `erase_run` does
-not, because its unit is a run bound to no matter.
+not, because its unit is a run bound to no matter. It refuses a run that belongs
+to a case (`EraseError::RunBelongsToCase`) and one that may still resume
+(`EraseError::RunNotConcluded`).
 
 **It says what is preserved now, not what ever was.** Releasing leaves no history
 here. Kept rows would make their free-text reasons outlive the matter they
@@ -651,10 +649,7 @@ delivery it has not seen a 2xx for, or a redelivery arriving after retirement
 admits a second run — the failure the key exists to prevent, delivered on a
 timer.
 
-There is no default, deliberately. Other durable runtimes bound this for you —
-Restate expires an idempotency key a day after the invocation completes,
-Temporal's dedup window is its namespace retention — and both are choosing a
-retry horizon on your behalf. Pick yours from the emitter, not from the index's
+There is no default. Pick the window from the emitter, not from the index's
 size:
 
 ```sh
@@ -831,7 +826,8 @@ The erasure unit is the **case**, on both sides, because the case is already the
 retention unit — bytes are linked to their case when they are written, and a
 second differently-shaped unit for keys would let the two disagree about what an
 erasure covered. `cx.blobs()` is where a skill gets a store already sealed to its
-case; a store held from the builder writes in the clear, and the two would
+case — read-only on a run bound to a case, whose bytes are written with
+`cx.store_blob` so erasing the case reaches them; a store held from the builder writes in the clear, and the two would
 disagree about what erasing the case erased. A **blob** write on a run under a
 key ring that belongs to no case is refused rather than quietly unsealed. The
 run's *journal* payloads are a different matter: a record bound to no case seals
@@ -900,7 +896,9 @@ rather than a warning in a doc comment.
 `RuntimeBuilder::tenant` names the tenant a plane runs as, and the name is a
 validated type rather than a string: it refuses `/` and `:`, because a tenant
 called `acme/prod` would otherwise produce the same key scope as tenant `acme`
-with unit `prod`, and the two would be indistinguishable afterwards.
+with unit `prod`, and the two would be indistinguishable afterwards. It refuses
+whitespace, `+` and control characters too, because the tenant names the
+checkpoint origin, which C2SP `tlog-cosignature` forbids them in.
 
 The tenant is a **key component**, never a filter. That distinction is the whole
 of it: a filter is a predicate somebody has to remember to write, and the query

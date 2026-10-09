@@ -129,6 +129,11 @@ pub enum WitnessError {
     /// The witness could not be reached or refused for its own reasons.
     #[error("witness: {0}")]
     Unavailable(String),
+
+    /// The origin asked about is not one a log may have, so no witness holds
+    /// it — refused before any request, rather than reported as an outage.
+    #[error("{0}")]
+    BadOrigin(String),
 }
 
 /// A witness's signature that it saw a log at this size and root.
@@ -279,7 +284,8 @@ pub struct WitnessQuorum {
 }
 
 impl WitnessQuorum {
-    /// Require `required` cosignatures per checkpoint.
+    /// Require `required` cosignatures per checkpoint, each from a distinct
+    /// witness key.
     ///
     /// # Errors
     ///
@@ -336,13 +342,27 @@ impl QuorumOutcome {
     /// Whether enough witnesses cosigned.
     #[must_use]
     pub fn met(&self) -> bool {
-        self.cosignatures.len() >= self.required
+        self.distinct_keys() >= self.required
     }
 
     /// How many cosignatures are still missing.
     #[must_use]
     pub fn shortfall(&self) -> usize {
-        self.required.saturating_sub(self.cosignatures.len())
+        self.required.saturating_sub(self.distinct_keys())
+    }
+
+    /// How many distinct witness keys cosigned.
+    ///
+    /// Keys, not answers: a quorum is a number of independent parties, and one
+    /// witness configured twice — two URLs for one service, one key behind two
+    /// names in a list — answers twice while being one party. Counting its
+    /// answers would let a quorum of two be met by a single witness.
+    fn distinct_keys(&self) -> usize {
+        self.cosignatures
+            .iter()
+            .map(|c| &c.key_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
     }
 
     /// Whether a person must look.
@@ -500,9 +520,10 @@ pub fn split_views(held: &[(String, Checkpoint)]) -> Vec<SplitView> {
 ///
 /// # Errors
 ///
-/// Only if the **store** cannot produce a consistency proof — a caller-side
-/// failure. A witness failing is never an error here; it is what the
-/// [`QuorumOutcome`] exists to report.
+/// Only if the **store** cannot produce a consistency proof at the
+/// checkpoint's size — a caller-side failure, which the trait's default
+/// answers once the log has moved past it. A witness failing is never an
+/// error here; it is what the [`QuorumOutcome`] exists to report.
 pub async fn cosign_quorum(
     store: &dyn super::JournalStore,
     checkpoint: &Checkpoint,
@@ -522,8 +543,13 @@ pub async fn cosign_quorum(
                 // The witness said where it is. A cursor ahead of this
                 // checkpoint gets no proof — there is no growth to prove, and
                 // the witness's own shrink refusal is the honest answer.
+                // Proved at the checkpoint's own size, not the live log's: a
+                // run sealed since the checkpoint was taken would make a proof
+                // against the live log fail at the witness as a fork.
                 let proof = if witness_size <= checkpoint.size {
-                    store.consistency_proof(witness_size).await?
+                    store
+                        .consistency_proof_at(witness_size, checkpoint.size)
+                        .await?
                 } else {
                     Vec::new()
                 };

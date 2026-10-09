@@ -500,11 +500,11 @@ async fn a_sink_is_named_by_kind_and_why_when_its_arguments_are_not_opened() {
     assert!(matches!(keyed.effects[0].sink, Sink::Tool { .. }));
     assert_eq!(keyed.recalls.len(), 1);
 
-    agentplane::blob::erase_run(
-        ring.as_ref(),
-        None,
-        &tenant,
-        run,
+    // The run's own scope, destroyed directly: the run is an unconcluded
+    // fixture, which `erase_run` refuses, and what is under test is how an
+    // erased run reads.
+    ring.destroy(
+        &agentplane::keyring::scope(&tenant, &run.to_string()),
         Timestamp::from_unix_timestamp(1_760_000_000).unwrap(),
         "subject exercised the right to erasure",
     )

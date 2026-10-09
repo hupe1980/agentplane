@@ -946,6 +946,17 @@ pub enum StepError {
     #[error(transparent)]
     Budget(#[from] crate::core::BudgetExceeded),
 
+    /// What the step asked for needs something this plane was not built with
+    /// — a store, a catalogue, a case, a chain — so nothing was asked of the
+    /// world.
+    ///
+    /// A refusal before dispatch, and its own variant for two reasons: an
+    /// open group beside it is taken back cleanly rather than quarantined as
+    /// if a call might have landed, and a model is never handed it as a tool
+    /// error to route around — a plane missing its wiring fails the run.
+    #[error("{0}")]
+    NotWired(String),
+
     /// The authority this run acts under was withdrawn, found at a hop about
     /// to present a credential on its behalf.
     ///
@@ -1049,6 +1060,7 @@ impl StepError {
             Self::Unreproducible { .. } => "unreproducible",
             Self::NonDeterminism { .. } => "nondeterminism",
             Self::Budget(_) => "budget",
+            Self::NotWired(_) => "not_wired",
             Self::Withheld { .. } => "withheld",
             Self::Suspended(_) => "suspended",
             Self::Denied { .. } => "denied",
@@ -1339,6 +1351,40 @@ pub enum StoreError {
          journal a digest and keep the bytes outside the chain"
     )]
     RecordTooLarge { bytes: usize, limit: usize },
+
+    /// The record nests deeper than every reader of the journal accepts.
+    ///
+    /// Refused at the write for the reason the size limit is: a record the
+    /// chain committed and no reader can parse is recovery and audit lost at
+    /// once, discovered on the first read after the run needs it.
+    #[error(
+        "record nests {depth} levels deep and the journal limit is {limit} — every reader \
+         stops at a nesting limit, so a deeper record would be committed and unreadable"
+    )]
+    RecordTooDeep { depth: usize, limit: usize },
+
+    /// A write, a reopening or a hold reached a case that was erased.
+    ///
+    /// The caller's request, not the store's fault: the key the case's data
+    /// was sealed under is gone, so nothing written to it could be read, and
+    /// a hold on it would preserve nothing.
+    #[error(
+        "case {case} was erased at {at} ({reason}); an erased case cannot be reopened, \
+         written or held, because the key its data was sealed under is gone"
+    )]
+    CaseErased {
+        case: String,
+        at: String,
+        reason: String,
+    },
+
+    /// A named obligation was registered again with other terms.
+    #[error(
+        "obligation '{name}' on case {case} is already registered with a different \
+         instant, calendar or warning; an obligation's terms are fixed when it is \
+         registered, so register a new name rather than restating this one"
+    )]
+    DeadlineExists { case: String, name: String },
 
     /// The `(run_id, effect_key)` unique index rejected a second start for one
     /// effect. Exactly-once is a database invariant here, not a code path.

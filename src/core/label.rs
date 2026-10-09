@@ -899,6 +899,35 @@ impl<T> Tainted<T> {
         }
     }
 
+    /// This value, at least as sensitive as `sensitivity` at its root **and
+    /// at every labelled field** — so a per-field ceiling, which reads the
+    /// field's own label, sees a raise a content rule made over the whole.
+    ///
+    /// Release marks are dropped: each was granted against the value at the
+    /// sensitivity it had then, and a rule that finds it more sensitive
+    /// withdraws the premise the release was granted on.
+    #[must_use]
+    #[cfg(feature = "manifest")]
+    pub(crate) fn raised_to(&self, sensitivity: Sensitivity) -> Self
+    where
+        T: Clone,
+    {
+        let raise = |label: &Label| {
+            let at = label.sensitivity.max(sensitivity);
+            label.clone().with_sensitivity(at)
+        };
+        Self {
+            value: self.value.clone(),
+            label: raise(&self.label),
+            fields: self
+                .fields
+                .iter()
+                .map(|(path, label)| (path.clone(), raise(label)))
+                .collect(),
+            releases: BTreeSet::new(),
+        }
+    }
+
     /// This value, attributed to `subjects` at its root and at every labelled
     /// field, so a projection keeps the attribution.
     ///
@@ -1212,13 +1241,32 @@ fn apply_release_scope(label: &Label, scope: ReleaseScope) -> Label {
     released
 }
 
-fn escape_pointer_token(token: &str) -> String {
-    token.replace('~', "~0").replace('/', "~1")
-}
+use crate::core::canon::pointer_token as escape_pointer_token;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A classification raises every field label with the root, so a ceiling
+    /// on one field sees it.
+    #[cfg(feature = "manifest")]
+    #[test]
+    fn a_raise_reaches_every_labelled_field() {
+        let value = Tainted::object([("body", Tainted::trusted(serde_json::json!("x")))]);
+        let raised = value.raised_to(Sensitivity::Confidential);
+        assert_eq!(raised.label().sensitivity, Sensitivity::Confidential);
+        for (path, label) in raised.field_labels() {
+            assert_eq!(
+                label.sensitivity,
+                Sensitivity::Confidential,
+                "field {path} kept its old sensitivity, so a ceiling on it misses the raise"
+            );
+        }
+        assert!(
+            raised.field_labels().next().is_some(),
+            "no field was labelled; this proves nothing"
+        );
+    }
 
     fn src(s: &str) -> SourceId {
         SourceId::new(s)

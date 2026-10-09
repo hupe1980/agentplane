@@ -508,7 +508,7 @@ if "${BIN[@]}" quarantine some-run --store "$jdir/j.redb" --actor a --reason x \
         --decision sideways >/dev/null 2>&1; then
     echo "FAIL: \`quarantine\` accepted a decision it cannot make"; exit 1
 fi
-if "${BIN[@]}" reconcile some-run --store "$jdir/j.redb" --actor a --note n \
+if "${BIN[@]}" reconcile some-run --store "$jdir/j.redb" --actor a --reason n \
         --effect 00 --outcome did-not-happen --output '{}' >/dev/null 2>&1; then
     echo "FAIL: \`reconcile\` accepted a result for an effect that did not happen"; exit 1
 fi
@@ -546,6 +546,17 @@ print(t[0]["task"])')"
     echo "FAIL: deciding from a terminal failed:"; sed 's/^/    /' "$odir/decide.err"; exit 1; }
 [ "$("${BIN[@]}" tasks --store "$odir/o.redb" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tasks"]))')" = "0" ] || {
     echo "FAIL: a decided task is still on the worklist"; exit 1; }
+# A refusal the plane made on purpose is a finding (1), and an id that names
+# nothing here is the command as typed (2) — neither is an outage (4).
+ostatus() { set +e; "$@" >/dev/null 2>&1; echo $?; set -e; }
+[ "$(ostatus "${BIN[@]}" decide "$task" reject --reason late --actor bo --store "$odir/o.redb")" = "1" ] || {
+    echo "FAIL: deciding an answered task is not a finding (1)"; exit 1; }
+[ "$(ostatus "${BIN[@]}" decide "task_$(printf '0%.0s' $(seq 64))" approve --reason x --actor bo \
+    --store "$odir/o.redb")" = "2" ] || {
+    echo "FAIL: deciding a task that does not exist is not a usage error (2)"; exit 1; }
+[ "$(ostatus "${BIN[@]}" cancel run_01ARZ3NDEKTSV4RRFFQ69G5FAV --reason x --actor bo \
+    --store "$odir/o.redb")" = "2" ] || {
+    echo "FAIL: cancelling a run that does not exist is not a usage error (2)"; exit 1; }
 out="$("${BIN[@]}" replay "$run_id" --manifest "$APPROVAL" --store "$odir/o.redb" 2>&1)" || {
     echo "FAIL: the approved run did not finish: $out"; exit 1; }
 grep -q 'Succeeded' <<<"$out" || { echo "FAIL: the approved run did not succeed: $out"; exit 1; }

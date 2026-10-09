@@ -90,21 +90,46 @@ impl SealedEvents {
         format!("event:{tenant}:{}", event.dedup_key())
     }
 
-    async fn sealed(&self, event: &InboundEvent) -> Result<InboundEvent, StoreError> {
+    /// The event with its payload sealed, or `None` when this message was
+    /// erased and its row is still here — a redelivery of an erased message.
+    ///
+    /// Sealing runs before the store's dedup, so a counterparty retrying a
+    /// message that was erased meets the destroyed key first. That is a
+    /// duplicate, and answering it as one is what the row surviving the
+    /// erasure exists for: an error in its place is a retry loop, every
+    /// attempt refused as a fault. A destroyed key with **no** row is not a
+    /// duplicate — nothing was ever buffered under it — and stays an error.
+    async fn sealed(&self, event: &InboundEvent) -> Result<Option<InboundEvent>, StoreError> {
         let plain = crate::core::canon::to_bytes(&event.payload).map_err(|e| {
             StoreError::Backend(format!("an event payload would not serialise: {e}"))
         })?;
-        let envelope = super::envelope::seal(
+        let envelope = match super::envelope::seal(
             self.keys.as_ref(),
             &self.scope_for(&event.source, &event.id),
             Self::aad(&self.tenant, event).as_bytes(),
             &plain,
         )
         .await
-        .map_err(|e| StoreError::Backend(format!("sealing an event payload failed: {e}")))?;
+        {
+            Ok(envelope) => envelope,
+            Err(e @ super::KeyError::Destroyed { .. }) => {
+                if self.inner.minter(&event.source, &event.id).await?.is_some() {
+                    return Ok(None);
+                }
+                return Err(StoreError::Backend(format!(
+                    "sealing an event payload failed: {e}, and no message with this identity \
+                     was ever buffered"
+                )));
+            }
+            Err(e) => {
+                return Err(StoreError::Backend(format!(
+                    "sealing an event payload failed: {e}"
+                )));
+            }
+        };
         let mut sealed = event.clone();
         sealed.payload = payload::wrap(&envelope);
-        Ok(sealed)
+        Ok(Some(sealed))
     }
 
     /// One buffered message's payload, back in the clear.
@@ -206,7 +231,10 @@ impl EventStore for SealedEvents {
     }
 
     async fn buffer(&self, event: &InboundEvent, at: Timestamp) -> Result<bool, StoreError> {
-        self.inner.buffer(&self.sealed(event).await?, at).await
+        match self.sealed(event).await? {
+            Some(sealed) => self.inner.buffer(&sealed, at).await,
+            None => Ok(false),
+        }
     }
 
     async fn claim_for(
@@ -236,9 +264,10 @@ impl EventStore for SealedEvents {
         // stores the event when it finds no waiter, and a payload that reached
         // the buffer in the clear here would be readable exactly when nobody
         // was waiting for it — the dead-letter case.
-        self.inner
-            .match_waiter(&self.sealed(event).await?, at)
-            .await
+        match self.sealed(event).await? {
+            Some(sealed) => self.inner.match_waiter(&sealed, at).await,
+            None => Ok(None),
+        }
     }
 
     async fn deliver_to(
@@ -247,9 +276,10 @@ impl EventStore for SealedEvents {
         event: &InboundEvent,
         at: Timestamp,
     ) -> Result<TargetedDelivery, StoreError> {
-        self.inner
-            .deliver_to(run, &self.sealed(event).await?, at)
-            .await
+        match self.sealed(event).await? {
+            Some(sealed) => self.inner.deliver_to(run, &sealed, at).await,
+            None => Ok(TargetedDelivery::Duplicate),
+        }
     }
 
     async fn subscribe(&self, sub: &Subscription, at: Timestamp) -> Result<(), StoreError> {
@@ -494,6 +524,79 @@ mod aad_tests {
             "the buffer's ciphertext survived the erasure"
         );
         assert_eq!(letters[0].reason, "nobody came");
+    }
+
+    /// **A counterparty retrying an erased message gets a duplicate.**
+    ///
+    /// Sealing runs before the store's dedup, so the retry meets the destroyed
+    /// key first. Answered as a fault, every retry is refused as an outage and
+    /// the sender loops for ever; the surviving row is what says this message
+    /// was seen. A key destroyed for a message never buffered is not a
+    /// duplicate, and stays an error.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn a_redelivered_erased_event_is_a_duplicate() {
+        use crate::case::TargetedDelivery;
+        use crate::core::Timestamp;
+        use crate::keyring::KeyRing as _;
+        use std::sync::Arc;
+
+        let at = |seconds| Timestamp::from_unix_timestamp(seconds).expect("time");
+        let tenant = TenantId::new("event-redeliver").expect("tenant");
+        let inner = Arc::new(
+            crate::store::RedbStore::open_in_memory()
+                .expect("store")
+                .for_tenant(tenant.clone()),
+        ) as Arc<dyn EventStore>;
+        let ring = Arc::new(MemoryKeyRing::new());
+        let sealed = SealedEvents::wrap(
+            Arc::clone(&inner),
+            Arc::clone(&ring) as Arc<dyn KeyRing>,
+            tenant.clone(),
+        );
+        let message = InboundEvent {
+            source: "counterparty".to_owned(),
+            id: "7".to_owned(),
+            kind: "reply".to_owned(),
+            correlation: vec![crate::core::CorrelationKey::new("order", "O-7")],
+            payload: serde_json::json!({"pii": "erase me"}),
+            by: None,
+        };
+        assert!(sealed.buffer(&message, at(1_000)).await.expect("buffer"));
+        let erased = sealed
+            .erase_event("counterparty", "7", at(2_000), "erasure request")
+            .await
+            .expect("erase");
+        assert_eq!(erased.reached, 1);
+
+        assert!(
+            !sealed
+                .buffer(&message, at(3_000))
+                .await
+                .expect("a redelivery of an erased message is refused as a fault"),
+            "a redelivery of an erased message was buffered as new"
+        );
+        assert_eq!(
+            sealed
+                .deliver_to(RunId::generate(), &message, at(3_000))
+                .await
+                .expect("a targeted redelivery is refused as a fault"),
+            TargetedDelivery::Duplicate
+        );
+
+        // Never buffered, key destroyed: nothing says it was seen.
+        ring.destroy(
+            &crate::keyring::event_scope(&tenant, "counterparty", "8"),
+            at(2_000),
+            "pre-emptive erasure",
+        )
+        .await
+        .expect("destroy");
+        let unseen = InboundEvent {
+            id: "8".to_owned(),
+            ..message
+        };
+        assert!(sealed.buffer(&unseen, at(3_000)).await.is_err());
     }
 
     /// Delegates everything, and fails the ciphertext cleanup.

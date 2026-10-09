@@ -14,13 +14,12 @@ Every snippet here is either lifted from a working example in `examples/` — wh
 CI runs on every push — or from the crate's own compile-checked rustdoc. If one
 does not build, that is a bug worth reporting.
 
-**The order is deliberate.** Sections 2 and 3 are two doorways onto the same
-guarantees, and the first one needs no Rust at all. It comes first because it
-needs nothing but a file; the
+Sections 2 and 3 are two doorways onto the same guarantees; the first needs no
+Rust at all. The
 [compatibility promise](@/docs/status.md#what-the-freeze-promises) attaches to
-the evidence both doorways produce — the record, the export and the operator
-vocabulary — not to either doorway. Writing skills in Rust buys expressiveness
-and takes the ordinary pre-alpha risk on function signatures.
+the evidence both produce — the record, the export and the operator
+vocabulary — not to either doorway; Rust function signatures carry the ordinary
+pre-alpha risk.
 
 ---
 
@@ -115,8 +114,7 @@ than resume, under the same manifest or an [edited one](@/docs/operations.md#str
 Card a served manifest would advertise, so what a peer will see is reviewable
 before anything listens on a socket.
 
-Or with no Rust toolchain at all, which is rather the point of a tier whose
-premise is *a file and a key are the whole agent*:
+Or with no Rust toolchain at all:
 
 ```sh
 docker run --rm --read-only --network none -v "$PWD:/work:ro" \
@@ -124,18 +122,16 @@ docker run --rm --read-only --network none -v "$PWD:/work:ro" \
   run /work/summariser.yaml --input '{"ticket": "printer on fire"}'
 ```
 
-`--read-only --network none` are not decoration — they are the check that the
-claim below is true. The default journal is in memory and the fake driver needs
-no network, so the first run needs neither a disk nor the internet, and the
-image's own smoke test runs exactly this way rather than taking that on trust.
+`--read-only --network none` check the claim: the default journal is in memory
+and the fake driver needs no network, so the first run needs neither a disk nor
+the internet. The image's own smoke test runs exactly this way.
 
 The image is distroless, nonroot, has no shell, and is published multi-arch,
 cosign-signed and with SLSA provenance and an SBOM bound to the digest.
 `:slim` — the default and `:latest` — carries every model provider; `:full`
 adds MCP, the A2A peer server, the operator HTTP surface, Cedar, key rings,
-governed media and Postgres. The split is about **surface**, not size: they are
-within a megabyte of each other, and the reason to run `:slim` is that it does
-not contain an HTTP server or a database client at all.
+governed media and Postgres. The split is about **surface**, not size: `:slim`
+contains no HTTP server and no database client.
 
 ### Tools, still without Rust
 
@@ -149,32 +145,27 @@ agentplane run examples/tool-calling.yaml \
   --mcp "tickets=python3 examples/mcp-server.py"
 ```
 
-That split is deliberate. An agent's declaration — and therefore its digest —
-must not change when it moves between a laptop and a cluster, so grants are
-reviewed and wiring is deployed. A grant naming a server nobody wired is
-**refused at build**, in the same breath as a grant nothing implements:
+An agent's declaration — and therefore its digest — must not change when it
+moves between a laptop and a cluster, so grants are reviewed and wiring is
+deployed. A grant naming a server nobody wired is **refused at build**:
 
 ```text
-'tickets/read' is granted but nothing implements it and no transport is wired
-for server 'tickets' — the model will be offered a tool that fails when chosen
+agentplane: agent 'ticket-desk' declares `execution.kind: tool-calling` and grants
+tools on tickets, but nothing reaches them. Name the process that serves each
+one: `--mcp tickets=<command>` for an MCP server, or `--peer <name>=<url>` for
+an A2A peer
 ```
 
-`--mcp` **runs a command**, and that is worth being explicit about: it is not an
-escalation over what the caller already had — the operator typed it on the same
-line as the manifest path — and nothing in a run's data path can reach it.
-A manifest, a model and an A2A peer all cannot choose a server; only argv can.
-The command is split on whitespace and no shell is involved: no globbing, no
-pipelines, no `$(...)`. Needs `--features cli,mcp-stdio`, or the `:full` image.
+`--mcp` **runs a command**. Only argv can choose a server — a manifest, a model
+and an A2A peer cannot. The command is split on whitespace and no shell is
+involved: no globbing, no pipelines, no `$(...)`. Needs
+`--features cli,mcp-stdio`, or the `:full` image.
 
-**One constraint worth knowing before you reach for the image.** `:full` has
-`mcp-stdio` compiled in, and a distroless image has **no interpreter and no
-shell** — so the `npx`- and Python-based servers most of the MCP ecosystem
-publishes cannot run inside it. Only a statically linked server binary mounted
-into the container can. That is the price of a base image with no package
-manager, and it is a real trade rather than an oversight: run the CLI on a host
-that has the runtime your server needs, or ship your MCP server as a static
-binary. The container smoke test asserts the image has no interpreter, so if a
-base image ever gains one, that assumption fails loudly instead of drifting.
+**`:full` has no interpreter and no shell**, so the `npx`- and Python-based
+servers most of the MCP ecosystem publishes cannot run inside it — only a
+statically linked server binary mounted into the container can. Run the CLI on
+a host that has the runtime your server needs, or ship your MCP server as a
+static binary.
 
 ### Hosting it, still without Rust
 
@@ -197,7 +188,7 @@ cd agentplane/examples/frameworks/pydantic-ai
 uv run --no-project --python 3.12 --with-requirements requirements.lock quickstart.py
 ```
 
-The last two run any of the five quickstarts below; change the directory.
+The last two run any of the quickstarts below; change the directory.
 `init --serve` writes seven files into `plane/`: the starter agent on the `fake`
 provider, the shipped policy, a token file with three freshly generated callers
 (`peer-1`, `framework-1`, `ops-1`), the framework caller's token alone, a
@@ -256,16 +247,11 @@ placeholders by name: a credential copied out of a public repository is one
 every reader holds. The bearer for the operator surface is the `ops-alice` line
 of `tokens.yaml`.
 
-That second URL is the point of `--operator-addr`. Every conclusion this runtime
-reaches is meant to be *queryable by whoever must clear it* rather than merely
-emitted. It is **off unless asked for and on its own listener**: the
-public address is the one a peer holds, and putting the worklist and task
-decisions behind it is one policy mistake away from a peer reading every run.
-
-The separation is enforced by **policy**, not by the port. In
-`serve-policy.cedar` the `peer` role reaches the A2A actions and the `operator`
-role the API ones, so a peer token that reaches the operator socket is still
-refused — the separate port is defence in depth rather than the control itself.
+That second URL is the operator surface: **off unless asked for and on its own
+listener**, away from the address a peer holds. The separation is enforced by
+**policy**, not by the port: in `serve-policy.cedar` the `peer` role reaches the
+A2A actions and the `operator` role the API ones, so a peer token that reaches
+the operator socket is still refused.
 
 `--mcp-addr` serves every agent in the file as MCP tools over Streamable HTTP,
 at `http://127.0.0.1:8081/mcp` — the URL and bearer header an agent framework
@@ -288,12 +274,10 @@ it was declined.
 
 `--push-host <host>` (repeatable) turns on **A2A push notifications** to that
 exact host. Without one, push is not wired and the Agent Card advertises it as
-*absent* rather than claiming a capability nothing serves. That flag is the
-whole of the configuration: `PushSender` owns HTTPS-only, the all-answer
-public-IP check, DNS pinning, manual redirects, the timeout and secret
-redaction; what an operator decides is *where*, which is the one thing the crate
-cannot. The grant is checked at **registration** as well as at delivery, so a
-peer learns straight away:
+*absent*. That flag is the whole of the configuration: `PushSender` owns
+HTTPS-only, the all-answer public-IP check, DNS pinning, manual redirects, the
+timeout and secret redaction. The grant is checked at **registration** as well
+as at delivery, so a peer learns straight away:
 
 ```text
 this deployment does not permit webhooks to 'evil.example.net'
@@ -301,18 +285,14 @@ a webhook URL must be https — the payload describes a task, and sending it in
 clear to an address the recipient chose is a disclosure
 ```
 
-Note the ordering: a peer also needs `a2a:task.push` in the policy set, and that
-gate runs **first**. A policy that omits it declines with the uniform *this
-request was not permitted*, saying nothing about the URL — which is correct, and
-worth knowing when a webhook registration is refused for a reason that looks
-nothing like a webhook problem.
+A peer also needs `a2a:task.push` in the policy set, and that gate runs
+**first**: a policy that omits it declines with the uniform *this request was
+not permitted*, saying nothing about the URL.
 
 A served plane also **sweeps**: deadlines warn and breach, tasks expire, dead
 letters are retired, and due timers fire, every `--sweep-every` seconds (30 by
-default, `0` to drive it from your own scheduler). Without it an agent that calls
-`cx.sleep`, waits on an event, or opens a human task would be accepted and then
-never make progress — a suspended run is a row, and something has to come back
-for it.
+default, `0` to drive it from your own scheduler). Without it a run that sleeps,
+waits on an event, or opens a human task never makes progress.
 
 And it **drains**. `SIGTERM` or `SIGINT` stops it accepting, answers what it has
 in hand, and gives the runs already executing `--drain-secs` (25 by default) to
@@ -320,13 +300,13 @@ finish. Without that a deploy cuts runs mid-tool-call, which the journal can onl
 report as *this call may or may not have happened* — see [stopping an
 instance](@/docs/operations.md#stopping-an-instance).
 
-Four things are refused rather than defaulted, and each refusal is the design:
+Refused rather than defaulted:
 
 - **`--policy`** — a Cedar policy file, or a bundle directory. A permissive engine and no engine are the
   same behaviour, and only one of them looks governed.
-- **`--tokens`** — bearer tokens naming callers. A server that authenticates
-  nobody has no actor to record a decision against; an unknown credential is
-  refused rather than becoming an anonymous caller. An entry may carry a
+- **`--tokens`** — a file of bearer tokens naming callers
+  (`AGENTPLANE_TOKENS_FILE`). An unknown credential is refused rather than
+  becoming an anonymous caller. An entry may carry a
   `scope` (and a `not_after`), which becomes that caller's own delegation
   chain: every run it starts is admitted under it and recorded as acting for
   the caller, not for the plane.
@@ -345,8 +325,7 @@ peer arrives labelled `Internal` — it came from outside — while `--input` on
 your own command line arrives `Public`. Without that line the peer's text cannot
 reach the model, and the run fails with *sensitivity Internal exceeds sink
 'model.complete' ceiling Public*. An agent that may talk to strangers says so in
-the reviewed file rather than acquiring the permission by being put behind a
-socket.
+the reviewed file.
 
 Needs `--features cli,a2a-server,cedar`; a build without them says so and names
 the flag. The `:full` image is built with them.
@@ -366,21 +345,21 @@ declared orchestrator; say `--capability` when the file leaves any doubt.
 Every verb takes only its own flags — `agentplane run --push-host …` does not
 parse, because the flag lives on `serve`'s struct. Deployment wiring also reads
 `AGENTPLANE_STORE`, `AGENTPLANE_TENANT`, `AGENTPLANE_URL`, `AGENTPLANE_POLICY`,
-`AGENTPLANE_TOKENS`, `AGENTPLANE_ADDR`, `AGENTPLANE_OPERATOR_ADDR`,
-`AGENTPLANE_SWEEP_EVERY`, `AGENTPLANE_DRILL_EVERY`, `AGENTPLANE_DRAIN_SECS` and
-`AGENTPLANE_LOG_FORMAT`, with the flag winning when
-both are given — one rule, rather than a config file and a precedence table.
+`AGENTPLANE_TOKENS_FILE`, `AGENTPLANE_ADDR`, `AGENTPLANE_OPERATOR_ADDR`,
+`AGENTPLANE_MCP_ADDR`, `AGENTPLANE_SWEEP_EVERY`, `AGENTPLANE_DRILL_EVERY`, `AGENTPLANE_DRAIN_SECS` and
+`AGENTPLANE_LOG_FORMAT`, with the flag winning when both are given.
 `agentplane <verb> --help` is generated from the same structs that enforce the
-flags, so it cannot describe an option nobody implemented.
+flags.
 
 The answer goes to stdout and everything else to stderr, so it pipes. A run that
-is refused, exhausted or failed exits `1`, because whoever scripts this needs
-the shell's own answer to "did it work". A run that stopped to **wait** — for a
-person, a timer or an event — exits `3`, neither an answer nor a failure, and
-prints what it waits for and the commands that move it on, naming the store and
-the tenant it ran on (a `postgres://` password is left out; a store taken from
-`AGENTPLANE_STORE` is printed as that variable). A command this binary refuses
-exits `2`, a store it cannot reach `4`, and an answer `--limit` cut short `5` —
+did not succeed — refused by policy, exhausted or failed — exits `1`. A run that
+stopped to **wait** — for a person, a timer or an event — exits `3`, and prints
+what it waits for and the commands that move it on, naming the store and the
+tenant it ran on (a `postgres://` password is left out; a store taken from
+`AGENTPLANE_STORE` is printed as that variable). A command this binary refuses —
+a bad flag, an unknown capability or tenant, a manifest the plane will not
+assemble from — exits `2`, a store it cannot reach `4`, and an answer `--limit`
+cut short `5` —
 the whole table is at the foot of `agentplane --help` and in
 [operations](@/docs/operations.md#exit-statuses).
 
@@ -412,9 +391,8 @@ and a local or Hugging Face model is `provider: chat-completions` with
 `CHAT_COMPLETIONS_BASE_URL` pointing at any OpenAI-compatible server — Ollama,
 TGI, vLLM, llama.cpp, or `https://router.huggingface.co/v1` with
 `CHAT_COMPLETIONS_API_KEY=$HF_TOKEN`.
-An agent's declaration must not change when its credential does. And only
-the providers the manifest *names* are registered — otherwise exporting the wrong
-variable would make the agent runnable on a model its declaration never named.
+Only the providers the manifest *names* are registered, so exporting the wrong
+variable cannot make the agent runnable on a model its declaration never named.
 
 ### Trying it on a page {#trying-it-on-a-page}
 
@@ -538,12 +516,8 @@ warning: ignoring agentplane@0.6.0 (which requires rustc 1.94.1)
 
 The first sign is that the API does not match this page. `cargo tree -p
 agentplane` says which version you have; declare `1.94.1` in your own manifest.
-
-Deliberately not a version number to copy. The version a reader should depend on
-is the latest **published** one, which is a fact this repository does not hold —
-`Cargo.toml` carries the version being *developed*, and the two differ for as
-long as a release takes. `cargo add` asks the registry, so the answer cannot go
-stale between a bump and a publish.
+Depend on the latest **published** version, which `cargo add` asks the registry
+for.
 
 ## 4. Write a skill 🛠️ {#write-a-skill}
 
@@ -552,10 +526,8 @@ anything non-deterministic.
 
 `agentplane::prelude::*` is the one import: the skill you write, the context it
 is handed, the labels its data carries, and the plane that runs it. Everything
-in it is also reachable by its full path — the prelude adds no API, it just
-stops the first program opening with five `use` lines. Names that are common
-here but likely to collide in your crate (`Record`, `Digest`, `Label`,
-`Capability`) are deliberately left out.
+in it is also reachable by its full path. Names likely to collide in your crate
+(`Record`, `Digest`, `Label`, `Capability`) are left out.
 
 ```rust
 use agentplane::prelude::*;
@@ -621,26 +593,17 @@ let replayed = runtime.replay(outcome.run_id, Mode::Strict).await?;
 assert_eq!(outcome.output, replayed.output);
 ```
 
-`build()` **panics** on a wiring fault, which is right for a binary whose author
-is looking at the code it aborts in. A long-running service wants the diagnosis
-as a value: `try_build()` returns the same `BuildError` instead, and every
-refusal in it is a deployment fault that should exit with a message rather than
-abort — a plane assembled from a manifest that arrived at run time is handling
-an *input*, and a panic there reports one tenant's typo by killing every other
-tenant's in-flight run. Same checks underneath, so the two cannot drift about
-what is refused.
+`build()` **panics** on a wiring fault. A long-running service, or a plane
+assembled from a manifest that arrived at run time, uses `try_build()`, which
+returns the same checks as a `BuildError`.
 
 Note `run("greet", …)` takes a **capability**. Here the capability *is* the
-skill's name, because a skill that declares nothing answers its own name — a
-hello-world program should not have to invent two names for one thing.
-`.provides(..)` exists for the case where the two genuinely differ: in a plan,
-one skill answers an abstract capability another step names, so what a step
-needs is decoupled from who provides it. Declaring a capability **replaces**
-the name default rather than adding to it — one declared surface, not two.
+skill's name, because a skill that declares nothing answers its own name.
+`.provides(..)` declares an abstract capability another step names, and
+**replaces** the name default rather than adding to it.
 
-Get it wrong and the plane tells you what it *does* have, because it is the only
-party that knows. Here, from a plane whose skill declared
-`.provides("demo.greet")`:
+Get it wrong and the plane tells you what it *does* have. Here, from a plane
+whose skill declared `.provides("demo.greet")`:
 
 ```text
 Error: no skill provides capability 'demo.greeet' — this plane provides:
@@ -648,11 +611,8 @@ demo.greet. `run` takes a capability, not a skill name; a skill declares its own
 with `SkillDescriptor::new(..).provides(..)`
 ```
 
-That is `Debug`, not `Display`, and the distinction is why it reads that way:
-`fn main() -> Result<_, E>` reports through `Debug`, so on the errors you
-actually hold this crate makes the two the same. Otherwise the message above
-would have been written, and never shown to anyone — you would have got
-`NoProvider("demo.greeet")`.
+`fn main() -> Result<_, E>` reports through `Debug`, and this crate's errors
+make `Debug` and `Display` the same, so that is what `main` prints.
 
 This exact skill and run is on disk as a runnable file — `cargo run --example
 hello_skill` — so the shape above is something you execute, not only read.
@@ -723,9 +683,7 @@ let result = cx
 agent's declaration does not grant, the protected account must be trusted while
 an ordinary memo can keep its model provenance, the egress ceiling applies, and
 the call is journaled — so a replay reads the result back instead of posting
-twice. `mutates` defaults to **true**, and that default is the whole posture: a
-tool nobody has thought about gets the treatment that makes the runtime
-cautious, not the one that makes it fast. A mutating call whose outcome is
+twice. `mutates` defaults to **true**, the cautious treatment. A mutating call whose outcome is
 unknown escalates to an operator rather than being retried. The result comes
 back `Tainted` and untrusted, whatever the tool says about itself.
 
@@ -787,10 +745,8 @@ provider.will_say("approved");
 assert_eq!(provider.calls(), 1, "replay must not ask the model again");
 ```
 
-It is deterministic on purpose, and it never reports a call as free — a fake that
-answered differently each time would make every replay test a coin-toss, and one
-that reported zero usage would let every budget test pass over a runtime that had
-stopped counting.
+It is deterministic, and it never reports a call as free, so budget tests
+count.
 
 It can stream, too, which is what makes a live view testable:
 
@@ -800,9 +756,7 @@ provider.streaming().will_say("approved");
 // before the completion returns
 ```
 
-Chunking keeps the separator on the preceding chunk, so concatenating every delta
-reproduces the completion byte for byte — the property an observer appending into
-a buffer depends on, and the one an assertion on chunk *count* would miss.
+Concatenating every delta reproduces the completion byte for byte.
 
 ## Where next 🧭 {#where-next}
 
@@ -877,9 +831,15 @@ disappearing with the status. The whole protocol is
 [Answering a quarantine](@/docs/operations.md#answering-a-quarantine).
 
 **`StepError::Denied`** — the policy engine refused. The journal has the reason;
-what the *model* is told is one uniform sentence on purpose, because a precise
-refusal is an oracle an injected prompt can probe. See
+the *model* is told one uniform sentence, so a refusal is no oracle for an
+injected prompt. See
 [security](@/docs/security.md).
+
+**`StepError::NotWired`** — the step asked for something this plane was not
+built with: a task store, a timer store, a case, a peer registry. Nothing was
+asked of the world. The run fails rather than relaying the error to a model,
+and an open effect group beside it is taken back cleanly. Wire the missing
+piece and resume.
 
 **`protected field ...`** — an authority-bearing path is absent, untrusted,
 derived from a source outside the allowlist, or above its own sensitivity
@@ -887,11 +847,10 @@ ceiling. Fix the dataflow or use a narrowly scoped, policy-authorized `Release`;
 do not mark the whole object trusted.
 
 **`Exhausted(...)`** — a declared budget, or a tool's `rate_limit`, bound the
-run. This is a journaled **pause**, not a transient provider failure
-and not a fault: the run did what it was told, and what it was told included a
-ceiling, so its completed work stands. Raise the reviewed ceiling and resume —
-the recorded refusal is re-evaluated against the current ledger — or cancel,
-which unwinds. `cargo run --example budget_pause` runs the whole protocol:
+run. This is a journaled **pause**, not a fault: its completed work stands, and
+inside an open effect group the group stays open. Raise the reviewed ceiling
+and resume — the recorded refusal is re-evaluated against the current ledger —
+or cancel, which unwinds and starts no new work. `cargo run --example budget_pause` runs the whole protocol:
 pause, re-refusal under the same ceiling, re-admission under a raise, strict
 verification.
 

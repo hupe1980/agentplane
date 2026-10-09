@@ -516,6 +516,7 @@ async fn erasing_a_case_destroys_its_key_and_the_backup_with_it() {
     let n = agentplane::blob::erase_case(
         Some(disk.as_ref()),
         store.as_ref(),
+        Some(store.as_ref() as &dyn agentplane::journal::JournalStore),
         Some(ring.as_ref() as &dyn KeyRing),
         None,
         &agentplane::core::TenantId::default(),
@@ -1342,6 +1343,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
     agentplane::blob::erase_case(
         Some(&blobs),
         cases_plain.as_ref(),
+        Some(journal.as_ref() as &dyn JournalStore),
         Some(ring.as_ref()),
         None,
         &tenant,
@@ -1485,8 +1487,28 @@ async fn a_case_less_runs_payloads_are_erasable_by_run() {
         other => panic!("unexpected record: {other:?}"),
     }
 
+    // Concluded first: `erase_run` refuses a run that may still resume.
+    let head = journal.head(run).await.expect("head");
+    journal
+        .append(
+            lease.epoch,
+            vec![Append::new(
+                run,
+                RecordKind::RunConcluded {
+                    outcome: "succeeded".to_owned(),
+                    chain_head: head.hash,
+                    reason: None,
+                    exhaustion: None,
+                    live_spend: agentplane::core::Spend::default(),
+                },
+            )],
+        )
+        .await
+        .expect("conclude");
+
     agentplane::blob::erase_run(
         ring.as_ref(),
+        journal.as_ref(),
         None,
         &tenant,
         run,
@@ -1505,9 +1527,17 @@ async fn a_case_less_runs_payloads_are_erasable_by_run() {
         other => panic!("unexpected record: {other:?}"),
     }
     // Idempotent: a retry cannot rewrite when or why the data went.
-    agentplane::blob::erase_run(ring.as_ref(), None, &tenant, run, at, "retry")
-        .await
-        .expect("second erasure");
+    agentplane::blob::erase_run(
+        ring.as_ref(),
+        journal.as_ref(),
+        None,
+        &tenant,
+        run,
+        at,
+        "retry",
+    )
+    .await
+    .expect("second erasure");
     // And the history still proves itself with no key at all.
     let stored = raw.read(run, 1).await.expect("raw");
     Record::verify_chain(&stored, Digest::ZERO)
@@ -1579,6 +1609,7 @@ impl agentplane::core::Skill for SendsConsent {
 /// erasure guide states.
 #[cfg(all(feature = "redb", feature = "keyring"))]
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn an_erased_low_entropy_value_is_recoverable_from_the_export() {
     use agentplane::core::{Digest, EffectDescriptor, EffectKey, StepId, Tainted, TenantId, canon};
     use agentplane::journal::{JournalStore, RecordBody, RecordKind, payload};
@@ -1600,9 +1631,17 @@ async fn an_erased_low_entropy_value_is_recoverable_from_the_export() {
         .expect("run");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
     let erased = now();
-    agentplane::blob::erase_run(ring.as_ref(), None, &tenant, out.run_id, erased, "erasure")
-        .await
-        .expect("erase");
+    agentplane::blob::erase_run(
+        ring.as_ref(),
+        store.as_ref(),
+        None,
+        &tenant,
+        out.run_id,
+        erased,
+        "erasure",
+    )
+    .await
+    .expect("erase");
 
     let mut export = Vec::new();
     agentplane::export::to_jsonl(

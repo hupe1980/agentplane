@@ -69,6 +69,14 @@ pub enum TenantError {
     )]
     Separator(char),
 
+    /// A character a checkpoint origin may not hold, which the tenant becomes
+    /// part of.
+    #[error(
+        "a tenant id may not contain {0:?}: it becomes part of the checkpoint origin, \
+         where tlog-cosignature forbids spaces and '+'"
+    )]
+    Unloggable(char),
+
     /// Long enough to be a mistake rather than a name.
     #[error("a tenant id is limited to {max} characters, and this one is {len}")]
     TooLong { len: usize, max: usize },
@@ -115,6 +123,13 @@ impl TenantId {
             .find(|c| matches!(c, '/' | ':' | '\0' | '\n') || c.is_control())
         {
             return Err(TenantError::Separator(bad));
+        }
+        // A tenant names a log too — `<origin>/<tenant>` — and a checkpoint
+        // origin may hold no space and no `+` (C2SP `tlog-cosignature`), so a
+        // tenant that could not name a cosignable log is refused here, once,
+        // rather than at the first checkpoint a witness turns away.
+        if let Some(bad) = trimmed.chars().find(|c| c.is_whitespace() || *c == '+') {
+            return Err(TenantError::Unloggable(bad));
         }
         Ok(Self(trimmed.to_owned()))
     }

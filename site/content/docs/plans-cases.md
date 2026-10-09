@@ -103,13 +103,10 @@ machine.
 admission and result-application follow, so a plan's stopping point does not
 depend on its schedule.
 
-This is the useful part of Pregel — a bulk-synchronous ready set with parallel
-work and deterministic state application — without importing cyclic mutable
-channels. A cycle would execute one step id more than once, collide with its
-effect-key/journal slice, and make authorization depend on data observed after
-the plan was frozen. Dynamic control flow therefore remains an explicit,
-versioned replan with lineage. A graph algorithm that is itself deterministic
-can still live inside one skill; it does not redefine the runtime protocol.
+There are no cycles: a cycle would execute one step id more than once,
+collide with its effect-key/journal slice, and make authorization depend on
+data observed after the plan was frozen. Dynamic control flow is an explicit,
+versioned replan with lineage.
 
 **Completion is structural**: every terminal node must have run. A workload
 asserting it finished is not evidence.
@@ -254,22 +251,21 @@ miss off the obligation listing in one call. Re-applying the state already held
 still succeeds, because a sweep repeating its own last write is a retry rather
 than an edit. A late answer is recorded as an account of the breach.
 
+**A named obligation's terms are fixed when it is registered.** Registering the
+same name in the case store again with another instant, calendar or warning is
+`StoreError::DeadlineExists`; the same terms are a no-op. A run whose
+`cx.deadline` names an obligation its matter already owes shares it: the step
+gets the standing deadline and the journal records its terms.
+
 Every half holds on the agent path too: `set_status(Closed)` routes through the
 same closure, and the conformance battery pins each refusal's type on every
 backend.
 
 ### Why a case rather than one long-lived run
 
-Durable-execution engines usually model this as a workflow that lives for weeks.
-That is a versioning trap: a six-week workflow pins your code version for six
-weeks, and every deploy needs a migration story for in-flight instances.
-
-Inverting it — short runs, long cases — makes deploys free. The cost is that
-continuity must be explicit (case state, not local variables), which is the
-right trade when the alternative is an auditor asking about a process whose code
-no longer exists.
-
-That explicit state has rules of its own.
+A workflow that lives for weeks pins its code version for weeks. Short runs on a
+long case make deploys free, at the cost that continuity is explicit — case
+state, not local variables — and that state has rules of its own.
 
 **It is read through the effect protocol, not directly.** Case state is mutable
 storage shared by every run on the case, so reading it is exactly as
@@ -288,12 +284,8 @@ a model completion could put it into case state and read it back clean in a
 later step, or a later *run*, having passed none of `cx.release`'s policy check and
 leaving no record that a declassification happened.
 
-Storing the writing step's label instead would be no better, because it describes
-one write out of many while reading as authoritative. The join of every writer is
-the only honest label; it decays to untrusted the moment anything untrusted lands
-and never recovers on its own — so untrusted *is* that answer, without the
-machinery needed to arrive at it. A caller who genuinely needs it trusted asks
-for a release, which is journaled, policy-checked, and names who decided.
+A caller who genuinely needs it trusted asks for a release, which is
+journaled, policy-checked, and names who decided.
 
 **A write names the version it read.** A run is owned — one writer per journal,
 arbitrated by the lease. A case is the opposite: it is what several runs share,
@@ -545,9 +537,10 @@ tiers: a run refused at the step ceiling and one refused at an effect ceiling
 are each re-asked against the ledger now in force, journaled as
 `BudgetReadmitted` beside the refusal it supersedes (see
 [Exhaustion is not failure](#exhaustion-is-not-failure)). Only a refusal at
-the **history frontier** is re-asked — one the run itself already answered,
-such as a group member's refusal followed by the abort's reversals, replays
-verbatim, because re-admitting it would dispatch into recorded history.
+the **history frontier** is re-asked — one the run itself already answered
+replays verbatim, because re-admitting it would dispatch into recorded
+history — and a cancelling pass re-admits nothing, since it exists to take work
+back.
 
 ### What can be limited
 
@@ -592,10 +585,8 @@ once, and dispatch stays ordered so narrowing the wave never reorders it. Absent
 the plan's own width is the bound — right for a graph you wrote, wrong for one
 anything else may widen.
 
-This is stated rather than hidden, because the alternative — implying a hard cap
-— is how somebody sizes a limit at exactly their ceiling and is surprised. Where
-a true ceiling matters, set `max_effects` as well: a count is known in advance,
-so that one is exact however wide the plan runs.
+Where a true ceiling matters, set `max_effects` as well: a count is known in
+advance, so that one is exact however wide the plan runs.
 
 Money is tracked in **integer minor units**. Money that rounds differently on
 two machines is money that produces two different budget verdicts.

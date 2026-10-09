@@ -130,9 +130,9 @@ pub enum BlobError {
 pub enum EraseError {
     /// The matter is under a legal hold, so **nothing was destroyed**.
     ///
-    /// The only refusal in the erasure path, and the one state here that is not
-    /// a fault: no tombstone was written and no key destroyed, because somebody
-    /// outside the plane said this matter must be preserved. The reason travels
+    /// A refusal that is the control working rather than a fault: no tombstone
+    /// was written and no key destroyed, because somebody outside the plane
+    /// said this matter must be preserved. The reason travels
     /// with it so whoever reads the report can say on whose instruction the data
     /// is still there.
     #[error(
@@ -165,6 +165,33 @@ pub enum EraseError {
          Conclude the case's runs and close it, then erase"
     )]
     CaseStillOpen { case: String, status: String },
+
+    /// A run of the matter has not concluded, so **nothing was destroyed**.
+    ///
+    /// A closed case is not a case with no live work: a run suspended on a
+    /// wait, quarantined for a person, or never concluded is still a run the
+    /// plane may resume, and destroying the key under it leaves work that
+    /// can no longer be replayed or unwound — the outage
+    /// [`CaseStillOpen`](Self::CaseStillOpen) refuses, reached through a
+    /// status that does not describe it. Only a conclusion nothing resumes
+    /// from ([`SEALED_OUTCOMES`](crate::runtime::SEALED_OUTCOMES)) counts.
+    #[error(
+        "run {run} {state}, so nothing was erased: erasing the data under a run that may \
+         still resume leaves work that can no longer be replayed or unwound. Conclude the \
+         run, then erase"
+    )]
+    RunNotConcluded { run: String, state: String },
+
+    /// The run belongs to a case, so **nothing was destroyed**.
+    ///
+    /// A case-bound run's payloads are sealed under its case's scope, so
+    /// destroying the run's own scope reaches none of them while answering as
+    /// if it had. The erasure unit for that run is its case.
+    #[error(
+        "run {run} belongs to case {case}, so nothing was erased: its payloads are sealed \
+         under the case, and erasing the run's own scope reaches none of them. Erase the case"
+    )]
+    RunBelongsToCase { run: String, case: String },
 
     /// A tombstone could not be written.
     #[error(transparent)]
@@ -337,33 +364,50 @@ pub trait BlobStore: Send + Sync + Debug {
 /// reaches exactly this case's copies — [`ScopedBlobs`] carries the argument
 /// for why the erasure unit leads the address.
 ///
-/// Returns how many blobs were expired, and every disclosure of the case or
-/// its runs that `disclosures` holds. Zero blobs is an ordinary answer: a case
-/// that stored nothing has nothing to forget, and reporting that as an error
-/// would make the caller special-case the common path.
+/// Returns how many blobs were expired — zero is an ordinary answer — and
+/// every disclosure of the case or its runs that `disclosures` holds.
 ///
-/// What this does **not** touch is the journal. Records are append-only by
-/// design, so personal data written into one cannot be removed — keep it out of
-/// records rather than expecting erasure to reach it.
+/// What this does **not** touch is the journal's records: they are
+/// append-only, so personal data written into one cannot be removed — keep it
+/// out of records rather than expecting erasure to reach it.
 ///
-/// `blobs` is optional because the erasure unit is the **key scope**, and a
-/// plane that seals its journal with a key ring and stores no blobs at all is
-/// an ordinary shape. Refusing to erase such a case for want of a store to
-/// tombstone would leave the one act that reaches every copy undone because a
-/// second, lesser act had nowhere to land. With no store the linked digests
-/// are counted and left; on a sealed plane their bytes become unreadable by
-/// the key destruction below, and a later drill reads them as *erased by
-/// design* through the key rather than through a tombstone.
+/// `blobs` is optional because the erasure unit is the **key scope**: a plane
+/// that seals with a key ring and stores no blobs still erases by the key
+/// destruction, and a later drill reads any linked bytes as *erased by design*
+/// through the key rather than through a tombstone.
+///
+/// # What is decided before anything is destroyed
+///
+/// * A held or unclosed case is refused as such before its runs are read:
+///   the hold names on whose instruction the matter stays, and closing it is
+///   the operator's next step, so either is the more useful answer.
+/// * Every run of the case has concluded under an outcome nothing resumes
+///   from, read from `journal`. Without a journal a case with runs is refused
+///   rather than assumed quiet: *no evidence of live work* is not evidence of
+///   none.
+/// * [`CaseStore::begin_erasure`](crate::case::CaseStore::begin_erasure)
+///   writes the erasure record in the transaction that checks the hold and the
+///   status, so a hold placed concurrently either lands first and stops this,
+///   or is refused. From the record on, the case cannot be reopened, written
+///   or held.
+///
+/// A retry of an erasure that was begun and not completed runs again under
+/// the instant and reason the record holds, and records it complete at the
+/// end.
 ///
 /// # Errors
 ///
 /// [`EraseError::Store`] carrying [`StoreError::NotFound`](crate::core::StoreError::NotFound)
-/// if the case does not exist, and an error if the case's blob list cannot be
-/// read or a blob cannot be expired.
+/// if the case does not exist; [`EraseError::UnderLegalHold`],
+/// [`EraseError::CaseStillOpen`] or [`EraseError::RunNotConcluded`] when
+/// nothing was destroyed; and an error if the journal, the register or the
+/// case's blob list cannot be read, a blob cannot be expired, or the key
+/// cannot be destroyed.
 #[allow(clippy::too_many_arguments)]
 pub async fn erase_case(
     blobs: Option<&dyn BlobStore>,
     cases: &dyn crate::case::CaseStore,
+    journal: Option<&dyn crate::journal::JournalStore>,
     #[cfg(feature = "keyring")] keyring: Option<&dyn crate::keyring::KeyRing>,
     disclosures: Option<&dyn crate::disclosure::DisclosureRegister>,
     tenant: &crate::core::TenantId,
@@ -371,42 +415,48 @@ pub async fn erase_case(
     at: crate::core::Timestamp,
     reason: &str,
 ) -> Result<Erased, EraseError> {
-    // **Before anything is destroyed, and before any tombstone is written.**
-    // The order is the whole guarantee: a hold checked after the first
-    // `expire` would leave a half-erased matter that the hold says must be
-    // whole, and no verb here puts bytes back.
-    if let Some(hold) = cases.hold(case).await? {
-        return Err(EraseError::UnderLegalHold {
-            case: case.to_string(),
-            placed_at: hold.placed_at.to_string(),
-            reason: hold.reason,
-        });
-    }
+    use crate::case::ErasureStart;
 
-    // **Checked here rather than by whoever calls this.** A retention pass
-    // already selects closed cases and documents why; stated only there, it
-    // held for exactly as long as nothing else called this function — and the
-    // Article 17 path does, naming a matter rather than a window.
-    //
     // A case this plane does not hold is refused: answering `Ok(0)` would read
     // as a matter that stored nothing and was erased, closing a request whose
     // real matter is untouched.
-    let found = cases.case(case).await?;
-    if found.is_none() {
+    let Some(found) = cases.case(case).await? else {
         return Err(EraseError::Store(crate::core::StoreError::NotFound(
             case.to_string(),
         )));
+    };
+
+    // An erasure already begun had its runs checked before its record landed,
+    // and from then on nothing reopens the case; a retry only finishes it.
+    if cases.erasure(case).await?.is_none() {
+        if let Some(hold) = cases.hold(case).await? {
+            return Err(held(case, hold));
+        }
+        if found.status != crate::core::CaseStatus::Closed {
+            return Err(still_open(case, found.status));
+        }
+        if let Some((run, state)) = unconcluded(journal, &found.runs).await? {
+            return Err(EraseError::RunNotConcluded {
+                run: run.to_string(),
+                state,
+            });
+        }
     }
-    let runs = found.as_ref().map(|c| c.runs.clone()).unwrap_or_default();
-    if let Some(open) = found.filter(|c| c.status != crate::core::CaseStatus::Closed) {
-        return Err(EraseError::CaseStillOpen {
-            case: case.to_string(),
-            status: format!("{:?}", open.status).to_lowercase(),
-        });
-    }
+
     // Read before anything is destroyed, so a register that cannot answer
     // leaves the matter whole rather than erased with its copies unnamed.
-    let copies = copies_of(disclosures, &[case], &runs).await?;
+    let copies = copies_of(disclosures, &[case], &found.runs).await?;
+
+    // **The decision the destruction rests on.** The hold and status above
+    // are a courtesy for a clear answer; this write decides them again with
+    // the record, in one transaction a concurrent `place_hold` serializes
+    // against.
+    let marked = match cases.begin_erasure(case, at, reason).await? {
+        ErasureStart::Marked(marked) => marked,
+        ErasureStart::Held(hold) => return Err(held(case, hold)),
+        ErasureStart::NotClosed(status) => return Err(still_open(case, status)),
+    };
+    let (at, reason) = (marked.at, marked.reason.as_str());
 
     let digests = cases.blobs_of(case).await?;
     let scope = crate::core::erasure_scope(tenant, &case.to_string());
@@ -437,7 +487,57 @@ pub async fn erase_case(
             .await
             .map_err(|e| EraseError::Blob(BlobError::Backend(e.to_string())))?;
     }
+    cases.complete_erasure(case).await?;
     Ok(Erased { blobs: n, copies })
+}
+
+fn held(case: crate::core::CaseId, hold: crate::core::LegalHold) -> EraseError {
+    EraseError::UnderLegalHold {
+        case: case.to_string(),
+        placed_at: hold.placed_at.to_string(),
+        reason: hold.reason,
+    }
+}
+
+fn still_open(case: crate::core::CaseId, status: crate::core::CaseStatus) -> EraseError {
+    EraseError::CaseStillOpen {
+        case: case.to_string(),
+        status: format!("{status:?}").to_lowercase(),
+    }
+}
+
+/// The first of `runs` that may still resume, and what its journal says.
+///
+/// Read whole rather than from the head: records can follow a conclusion, and
+/// the question is the *last conclusion*, which
+/// [`audit::has_sealing_conclusion`](crate::audit) already answers for the
+/// offline checker — one rule for *which conclusions close*.
+async fn unconcluded(
+    journal: Option<&dyn crate::journal::JournalStore>,
+    runs: &[crate::core::RunId],
+) -> Result<Option<(crate::core::RunId, String)>, EraseError> {
+    let Some(&first) = runs.first() else {
+        return Ok(None);
+    };
+    let Some(journal) = journal else {
+        return Ok(Some((
+            first,
+            "was not checked: no journal was given to read its conclusion from".to_owned(),
+        )));
+    };
+    for &run in runs {
+        let records = journal.read(run, 0).await?;
+        if records.is_empty() {
+            return Ok(Some((run, "has no record in this journal".to_owned())));
+        }
+        if !crate::audit::has_sealing_conclusion(&records) {
+            return Ok(Some((
+                run,
+                "has no conclusion it cannot resume from".to_owned(),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// What an erasure did, and the copies outside the plane it did not reach.
@@ -478,12 +578,9 @@ async fn copies_of(
 ///
 /// The counterpart of [`erase_case`], for the unit that call can never reach:
 /// a record bound to no case seals its payloads under `tenant/<run>` (see
-/// `SealedJournal`), and `erase_case` — which walks a case's blobs and
-/// destroys the *case* scope — was the only erasure verb, so a case-less run's
-/// sealed payloads had no erasure path at all. This is the missing verb: it
-/// destroys exactly the `tenant/<run>` scope, and with it every payload sealed
-/// under that run — in the live store, every replica, and every backup ever
-/// taken, because what is destroyed was never in them.
+/// `SealedJournal`). This destroys exactly that scope, and with it every
+/// payload sealed under that run — in the live store, every replica, and every
+/// backup ever taken, because what is destroyed was never in them.
 ///
 /// **The erasure unit is the run.** There is no blob traversal here because
 /// blob writes are scoped to a run's case; a run with no case links no blobs
@@ -496,25 +593,44 @@ async fn copies_of(
 /// the first destruction stands, so a retry cannot rewrite when or why the
 /// data went.
 ///
-/// # Errors
-///
-/// If the key ring cannot be reached.
+/// **Refused for a run that belongs to a case**, or one that may still
+/// resume — both decided from `journal` before anything is destroyed. A
+/// case-bound run's payloads are sealed under the case, so this verb would
+/// destroy a scope holding none of them and answer as if it had erased the
+/// run; and a run that may resume would be left unable to.
 ///
 /// **A case-less run cannot be held.** A legal hold is placed on a *matter*,
-/// and this verb exists precisely for the run that belongs to none — so there
-/// is no row to hold and nothing here consults one. A deployment that needs a
-/// run preserved binds it to a case, which is also what gives it an obligation
-/// trail; that is the documented limit rather than a second hold mechanism
-/// keyed by run.
+/// so nothing here consults one. A deployment that needs a run preserved binds
+/// it to a case, which also gives it an obligation trail.
+///
+/// # Errors
+///
+/// [`EraseError::RunBelongsToCase`] or [`EraseError::RunNotConcluded`] when
+/// nothing was destroyed, or an error if the journal or the key ring cannot be
+/// reached.
 #[cfg(feature = "keyring")]
 pub async fn erase_run(
     keyring: &dyn crate::keyring::KeyRing,
+    journal: &dyn crate::journal::JournalStore,
     disclosures: Option<&dyn crate::disclosure::DisclosureRegister>,
     tenant: &crate::core::TenantId,
     run: crate::core::RunId,
     at: crate::core::Timestamp,
     reason: &str,
 ) -> Result<Vec<String>, EraseError> {
+    let records = journal.read(run, 0).await?;
+    if let Some(case) = records.iter().find_map(|r| r.body.case) {
+        return Err(EraseError::RunBelongsToCase {
+            run: run.to_string(),
+            case: case.to_string(),
+        });
+    }
+    if let Some((run, state)) = unconcluded(Some(journal), &[run]).await? {
+        return Err(EraseError::RunNotConcluded {
+            run: run.to_string(),
+            state,
+        });
+    }
     let copies = copies_of(disclosures, &[], &[run]).await?;
     keyring
         .destroy(&crate::keyring::scope(tenant, &run.to_string()), at, reason)
@@ -539,17 +655,6 @@ pub(crate) fn refusal(e: BlobError) -> crate::core::StoreError {
     }
 }
 
-/// [`refusal`] under a name a test may call.
-///
-/// The classification is the half of the rule a caller sees, and it is not
-/// otherwise reachable: `StepCtx::store_blob` is the only in-crate caller and
-/// its own error is wrapped twice by the time a test could read it.
-#[doc(hidden)]
-#[must_use]
-pub fn refusal_for_test(e: BlobError) -> crate::core::StoreError {
-    refusal(e)
-}
-
 /// Check fetched bytes against the address they came from.
 ///
 /// Shared by every backend so the verification cannot be implemented slightly
@@ -563,5 +668,30 @@ pub(crate) fn verify(digest: Digest, bytes: Vec<u8>) -> Result<Vec<u8>, BlobErro
             expected: digest.to_hex(),
             actual: actual.to_hex(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BlobError, refusal};
+    use crate::core::StoreError;
+
+    /// An erased address refuses a write as a rule, not as an outage: the
+    /// classification is the half of the rule a caller holding a step sees.
+    #[test]
+    fn an_erased_write_is_refused_as_a_rule_rather_than_a_fault() {
+        let refused = refusal(BlobError::Expired {
+            digest: "ab".to_owned(),
+            at: 7,
+            reason: "art-17 request".to_owned(),
+        });
+        assert!(
+            matches!(refused, StoreError::BlobErased { ref reason, .. } if reason == "art-17 request"),
+            "an erased write must not be classified as a backend fault: {refused:?}"
+        );
+        assert!(matches!(
+            refusal(BlobError::NotFound("ab".to_owned())),
+            StoreError::Backend(_)
+        ));
     }
 }

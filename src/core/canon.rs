@@ -129,6 +129,12 @@ pub fn value_bytes(value: &Value) -> Vec<u8> {
     out
 }
 
+/// One RFC 6901 reference token: `~` is `~0` and `/` is `~1`, in that order.
+#[must_use]
+pub(crate) fn pointer_token(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
 /// Where two JSON values first differ, as an RFC 6901 pointer.
 ///
 /// `None` when they are equal. The empty string — RFC 6901's pointer to the
@@ -151,10 +157,7 @@ pub fn value_bytes(value: &Value) -> Vec<u8> {
 /// because "the object differs" is the answer the reader already had.
 #[must_use]
 pub fn first_difference(left: &Value, right: &Value) -> Option<String> {
-    fn escape(token: &str) -> String {
-        // RFC 6901: `~` is `~0` and `/` is `~1`, in that order.
-        token.replace('~', "~0").replace('/', "~1")
-    }
+    use pointer_token as escape;
 
     fn walk(left: &Value, right: &Value, at: &str) -> Option<String> {
         match (left, right) {
@@ -465,6 +468,12 @@ mod tests {
             (1.797_693_134_862_315_7e308, "1.7976931348623157e+308"), // largest double
             (-4.5, "-4.5"),
             (-1e30, "-1e+30"),
+            // Where a shortest-digits writer that is not ECMAScript's turns
+            // exponential early: below 1e-4 and from 1e16.
+            (1.234_567_890_123_456_8e-5, "0.000012345678901234568"),
+            (1.234_567_890_123_456_8e20, "123456789012345680000"),
+            (1e16, "10000000000000000"),
+            (-5e-5, "-0.00005"),
         ];
         for (input, expected) in vectors {
             let mut out = Vec::new();

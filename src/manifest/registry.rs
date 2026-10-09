@@ -134,6 +134,20 @@ pub enum RegistryError {
         offered: String,
     },
 
+    /// The offered manifest is not one this crate accepts.
+    ///
+    /// Refused before anything is stored. A `Manifest` is a public struct a
+    /// caller can build or edit without [`Manifest::parse`], and a backend that
+    /// stored one unchecked would burn its name and version on content no
+    /// resolve can ever serve — immutability then forbids the fix.
+    #[error("manifest '{name}' version '{version}' cannot be published: {source}")]
+    Invalid {
+        name: String,
+        version: String,
+        #[source]
+        source: ManifestError,
+    },
+
     /// The backing store failed.
     #[error("registry storage: {0}")]
     Backend(String),
@@ -421,6 +435,39 @@ pub fn reparse(name: &str, version: &str, yaml: &str) -> Result<Manifest, Regist
     })
 }
 
+/// Check an offered manifest and produce what a backend stores for it.
+///
+/// Every backend calls this before its read-modify-write, so a refusal costs
+/// nothing. The stored YAML is put through [`Manifest::parse`] — every rule a
+/// resolve will apply — and must come back with the **same digest**: otherwise
+/// the row would hold one document under another's address, and every later
+/// resolve would either be refused as corrupt or serve content nobody
+/// published. Shared for the reason [`decide_publish`] is: three copies of
+/// "what may be stored" drift.
+///
+/// # Errors
+///
+/// [`RegistryError::Invalid`] when the manifest is refused or does not
+/// survive its own round trip.
+pub fn prepare_publish(manifest: &Manifest) -> Result<(Digest, String), RegistryError> {
+    let invalid = |source| RegistryError::Invalid {
+        name: manifest.metadata.name.clone(),
+        version: manifest.metadata.version.clone(),
+        source,
+    };
+    let digest = manifest.digest().map_err(invalid)?;
+    let yaml = to_yaml(manifest)?;
+    let stored = Manifest::parse(&yaml).map_err(invalid)?;
+    if stored.digest().map_err(invalid)? != digest {
+        return Err(invalid(ManifestError::Syntax(
+            "the manifest does not survive its own stored form: the YAML a registry \
+             keeps parses to a different digest than the one offered"
+                .to_owned(),
+        )));
+    }
+    Ok((digest, yaml))
+}
+
 /// The canonical stored form of a manifest.
 ///
 /// # Errors
@@ -469,12 +516,7 @@ impl MemoryRegistry {
             manifest.metadata.name.clone(),
             manifest.metadata.version.clone(),
         );
-        let digest = manifest.digest().map_err(|e| RegistryError::Corrupt {
-            name: name.clone(),
-            version: version.clone(),
-            source: e,
-        })?;
-        let yaml = to_yaml(manifest)?;
+        let (digest, yaml) = prepare_publish(manifest)?;
 
         let mut entries = self
             .entries

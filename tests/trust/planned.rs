@@ -1197,10 +1197,38 @@ async fn a_plane_without_a_manifest_can_bound_what_it_writes_down() {
     );
 
     // With one, the same value is refused before it reaches the chain.
-    let out = plane(Some(Sensitivity::Internal))
+    let refusing = plane(Some(Sensitivity::Internal));
+    let out = refusing
         .run("intake.record", confidential(json!({ "iban": "GB-4471" })))
         .await
         .expect("run");
+    // And a strict replay reads that refusal back rather than judging it again:
+    // the same verdict, and not one record written.
+    let before = refusing
+        .journal()
+        .read(out.run_id, 1)
+        .await
+        .expect("read")
+        .len();
+    let replayed = refusing
+        .replay(out.run_id, agentplane::runtime::Mode::Strict)
+        .await
+        .expect("replay");
+    assert_eq!(
+        format!("{:?}", replayed.status),
+        format!("{:?}", out.status),
+        "a strict replay of a run the plane's journal ceiling refused reached another verdict"
+    );
+    assert_eq!(
+        refusing
+            .journal()
+            .read(out.run_id, 1)
+            .await
+            .expect("read")
+            .len(),
+        before,
+        "a strict replay wrote to the journal"
+    );
     match out.status {
         RunStatus::Failed(reason) => {
             assert!(

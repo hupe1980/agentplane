@@ -243,3 +243,53 @@ async fn erasing_a_key_that_forbids_deletion_is_refused_not_retried() {
         ),
     }
 }
+
+/// **A missing transit key is reported as missing, not as erased.**
+///
+/// Vault keeps no tombstone, so a key deleted by hand and a key an erasure
+/// destroyed read the same. The answer has to carry that rather than claim an
+/// erasure: the plane's erasure record is what tells the two apart, and a
+/// reason that already said *erased* would let a drill count a lost key as a
+/// completed erasure without asking it.
+#[tokio::test]
+async fn a_missing_transit_key_does_not_claim_an_erasure() {
+    use agentplane::keyring::{KeyError, WrappedKey};
+
+    let image = GenericImage::new("hashicorp/vault", VAULT)
+        .with_exposed_port(8200.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Development mode should NOT"))
+        .with_env_var("VAULT_DEV_ROOT_TOKEN_ID", ROOT_TOKEN)
+        .with_env_var("VAULT_DEV_LISTEN_ADDRESS", "0.0.0.0:8200");
+
+    let Ok(container) = image.start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = published_port(&container, 8200).await;
+    let address = format!("http://127.0.0.1:{port}");
+    reqwest::Client::new()
+        .post(format!("{address}/v1/sys/mounts/transit"))
+        .header("X-Vault-Token", ROOT_TOKEN)
+        .json(&serde_json::json!({ "type": "transit" }))
+        .send()
+        .await
+        .expect("mount transit");
+
+    // No key was ever created for this scope.
+    let ring = VaultTransit::new(&address, "transit", ROOT_TOKEN).expect("build");
+    let wrapped = WrappedKey {
+        scope: "never-provisioned".to_owned(),
+        wrapped_by: "vault:v1".into(),
+        sealed:
+            b"vault:v1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+                .to_vec(),
+    };
+    match ring.open(&wrapped).await {
+        Err(KeyError::Destroyed { reason, .. }) => assert!(
+            reason.contains("whether it was erased"),
+            "a missing key was reported as an erasure, which no erasure record \
+             backs: {reason}"
+        ),
+        other => panic!("a missing key must read as Destroyed, got {other:?}"),
+    }
+}

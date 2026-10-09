@@ -73,7 +73,7 @@ FRAMING_MEMBERS = {
     HEADER_KIND: {"kind", "version", "checkpoint", "canon"},
     PACKAGE_KIND: {"kind", "version", "checkpoint", "canon", "selection"},
     RUN_KIND: {"kind", "run", "index", "seal"},
-    CASE_KIND: {"kind", "case", "deadlines", "blobs", "hold"},
+    CASE_KIND: {"kind", "case", "deadlines", "blobs", "hold", "erasure"},
     TRAILER_KIND: {
         "kind",
         "runs_requested",
@@ -84,7 +84,67 @@ FRAMING_MEMBERS = {
     },
 }
 
+# The record vocabulary (the specification's Vocabulary section) and the one
+# record version this reader implements. A record of a kind or at a version
+# outside them is one this reader cannot interpret: it says so rather than
+# passing over it, which is what the Rust reader does through its upcaster.
+RECORD_VERSION = 1
+RECORD_KINDS = frozenset(
+    {
+        "RunAdmitted", "QuotaPassStarted", "PlanFrozen", "StepStarted", "StepFinished",
+        "Note", "EffectStarted", "EffectDone", "EffectFailed", "EffectReconciled",
+        "StepCompensated", "QuarantineDecided", "GroupOpened", "GroupSettled",
+        "BudgetRefused", "BudgetReadmitted", "AuthorityWithheld", "AuthorityRestored",
+        "IdentityBound", "DataSubjectBound", "PolicyDenied", "RunSuspended",
+        "CaseBound", "DeadlineRegistered", "DeadlineTransition", "Released",
+        "RunCancelled", "RunConcluded", "BreakGlass", "HaltLifted", "HoldReleased",
+        "Swept", "Observed",
+    }
+)
+
+# A checkpoint origin, by C2SP tlog-cosignature: non-empty UTF-8 of at most 255
+# bytes, with no Unicode space, no '+' and no control character below U+0020.
+MAX_ORIGIN_BYTES = 255
+
 ZERO = bytes(32)
+
+
+def origin_refusal(origin: object) -> str | None:
+    """Why `origin` cannot name a log, or None — the rule the Rust reader's
+    `Checkpoint::validate_origin` states, in its words."""
+    if not isinstance(origin, str):
+        return f"checkpoint origin: {origin!r} is not a string"
+    if not origin:
+        return "checkpoint origin: is empty, so it names no log"
+    size = len(origin.encode("utf-8"))
+    if size > MAX_ORIGIN_BYTES:
+        return f"checkpoint origin: is {size} bytes, and a witness accepts at most {MAX_ORIGIN_BYTES}"
+    for c in origin:
+        if c in UNICODE_WHITESPACE or c == "+" or ord(c) < 0x20:
+            return f"checkpoint origin: contains {c!r}, which tlog-cosignature forbids in an origin"
+    return None
+
+
+def is_integer(value: object) -> bool:
+    """A JSON integer: Python's bool is an int, and JSON's `true` is not one."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _no_constant(name: str) -> object:
+    raise ValueError(f"{name} is not JSON")
+
+
+def _finite(text: str) -> float:
+    value = float(text)
+    if value in (float("inf"), float("-inf")):
+        raise ValueError(f"{text} is out of range for a double")
+    return value
+
+
+def loads(text: str) -> object:
+    """JSON as RFC 8259 and the Rust reader define it: no NaN or Infinity, and
+    no number past the largest double — both of which Python's `json` accepts."""
+    return json.loads(text, parse_constant=_no_constant, parse_float=_finite)
 
 
 def sha256(data: bytes) -> bytes:
@@ -380,6 +440,29 @@ def same(a: object, b: object) -> bool:
     return a == b
 
 
+def erasure_problem(block: dict) -> str | None:
+    """Why a case block's `erasure` member is unreadable, or None when it is sound.
+
+    The member is required and may be `null`. A restore that dropped it would
+    bring an erased matter back as an ordinary closed one, so a missing or
+    malformed record is a finding rather than "not erased".
+    """
+    if "erasure" not in block:
+        return "the case block carries no erasure member"
+    erasure = block["erasure"]
+    if erasure is None:
+        return None
+    if not isinstance(erasure, dict) or set(erasure) != {"at", "reason", "complete"}:
+        return "the erasure record is malformed: it needs exactly at, reason and complete"
+    if not isinstance(erasure["at"], str) or not is_rfc3339(erasure["at"]):
+        return "the erasure record is malformed: at is not an RFC 3339 instant"
+    if not isinstance(erasure["reason"], str) or not isinstance(erasure["complete"], bool):
+        return "the erasure record is malformed: reason is a string and complete a boolean"
+    if block.get("hold") is not None:
+        return "the case is both erased and held, which no plane writes"
+    return None
+
+
 def hold_problem(block: dict) -> str | None:
     """Why a case block's `hold` member is unreadable, or None when it is sound.
 
@@ -404,6 +487,7 @@ def hold_problem(block: dict) -> str | None:
         or set(by) != {"actor", "basis"}
         or not isinstance(by["actor"], str)
         or not by["actor"].strip()
+        or not isinstance(by["basis"], str)
         or by["basis"] not in BASES
     ):
         return "the legal hold is malformed: by needs a non-empty actor and a known basis"
@@ -623,8 +707,8 @@ def verify(
         if not line.strip():
             continue
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
+            value = loads(line)
+        except ValueError as error:
             report.note(f"line {number} is not JSON: {error}")
             return report
         if not isinstance(value, dict):
@@ -634,6 +718,9 @@ def verify(
             json.dumps(value, ensure_ascii=False).encode("utf-8")
         except UnicodeEncodeError:
             report.note(f"line {number} is not JSON: it escapes a lone surrogate")
+            return report
+        if not isinstance(value.get("kind", ""), str):
+            report.note(f"line {number} carries a kind that is not a string")
             return report
         if not parsed and value.get("kind") == PACKAGE_KIND:
             package = True
@@ -659,7 +746,7 @@ def verify(
     if header.get("kind") not in (HEADER_KIND, PACKAGE_KIND):
         report.note(f"the first line is not a {HEADER_KIND} or {PACKAGE_KIND} header")
         return report
-    if header.get("version") != EXPORT_VERSION:
+    if not same(header.get("version"), EXPORT_VERSION):
         report.note(
             f"export version {header.get('version')!r} is not one this reader "
             f"implements ({EXPORT_VERSION})"
@@ -678,9 +765,13 @@ def verify(
     if not isinstance(checkpoint, dict):
         report.note("the header carries no checkpoint")
         return report
+    refusal = origin_refusal(checkpoint.get("origin"))
+    if refusal is not None:
+        report.note(f"the header's checkpoint is unreadable: {refusal}")
+        return report
     claimed_root = unhex(checkpoint.get("root"), "the checkpoint root", report)
     log_size = checkpoint.get("size")
-    if not isinstance(log_size, int):
+    if not is_integer(log_size) or log_size < 0:
         report.note("the checkpoint has no integer size")
         return report
     if log_size == 0 and claimed_root is not None and claimed_root != empty_root():
@@ -720,6 +811,9 @@ def verify(
 
         if kind == RUN_KIND:
             current_run = value.get("run")
+            if not isinstance(current_run, str):
+                report.note(f"a run block names no run: {current_run!r}")
+                current_run = repr(current_run)
             prev_hash = ZERO
             last_seq = None
             report.runs += 1
@@ -741,7 +835,7 @@ def verify(
                 # be told how much of the file that covers.
                 open_runs += 1
                 continue
-            if not isinstance(index, int) or seal is None:
+            if not is_integer(index) or seal is None:
                 report.note(f"run {current_run}: a placed run needs both index and seal")
                 report.blocks[str(current_run)]["sealed"] = False
                 continue
@@ -763,9 +857,9 @@ def verify(
                 report.note("a case block carries no identifier")
             else:
                 carried.add(str(identifier))
-            problem = hold_problem(value)
-            if problem is not None:
-                report.note(f"case {identifier}: {problem}")
+            for problem in (hold_problem(value), erasure_problem(value)):
+                if problem is not None:
+                    report.note(f"case {identifier}: {problem}")
             continue
 
         if kind == TRAILER_KIND:
@@ -816,9 +910,12 @@ def verify(
             check_record_signature(value, claimed, current_run, keys, report)
 
         try:
-            wire = json.loads(raw)
-        except json.JSONDecodeError as error:
+            wire = loads(raw)
+        except ValueError as error:
             report.note(f"run {current_run}: a record's wire bytes do not parse: {error}")
+            continue
+        if not isinstance(wire, dict):
+            report.note(f"run {current_run}: a record's wire bytes are not a JSON object")
             continue
         # The format's `raw` is canonical bytes: bytes that hash to their claim
         # and that no writer under this canon produces are a finding, and the
@@ -833,8 +930,31 @@ def verify(
                 "not match its wire bytes"
             )
 
+        # The record's own vocabulary, before anything is read from it as a
+        # record: a version or kind this reader does not implement is a skew
+        # it reports, never a shape it reads as the current one.
+        if not same(wire.get("v"), RECORD_VERSION):
+            report.note(
+                f"run {current_run}: record {wire.get('seq')} is at version "
+                f"{wire.get('v')!r} and this reader reads {RECORD_VERSION} — a build skew "
+                "rather than an edit"
+            )
+        elif not isinstance(wire.get("kind"), str) or wire["kind"] not in RECORD_KINDS:
+            report.note(
+                f"run {current_run}: record {wire.get('seq')} is of kind "
+                f"{wire.get('kind')!r}, which is not in the record vocabulary"
+            )
+
         seq = wire.get("seq")
-        if not isinstance(seq, int):
+        # The line's own `seq` is a copy of the body's, as its `prev_hash` is of
+        # the head before it: held to the hashed bytes, so the two readers
+        # agree that a line saying something its body does not is a finding.
+        if not same(value.get("seq"), seq):
+            report.note(
+                f"run {current_run}: a record line says seq {value.get('seq')!r} and its "
+                f"wire bytes say {seq!r}"
+            )
+        if not is_integer(seq):
             report.note(f"run {current_run}: a record has no integer seq")
         else:
             if last_seq is None and seq != 1:
@@ -1012,7 +1132,10 @@ def verify(
         report.note("no trailer: this file is a prefix, not a whole export")
     else:
         unreadable = trailer.get("unreadable") or []
-        declared = {str(entry.get("run")) for entry in unreadable if isinstance(entry, dict)}
+        if not isinstance(unreadable, list) or not all(isinstance(e, dict) for e in unreadable):
+            report.note("the trailer's unreadable list is not a list of runs and reasons")
+            unreadable = []
+        declared = {str(entry.get("run")) for entry in unreadable}
         # Complete as an artifact, incomplete as a history: unchecked, not
         # tampered with — the writer said so at export time.
         for entry in unreadable:
@@ -1098,21 +1221,35 @@ def canonical_number(value: int | float) -> str:
         raise ValueError(f"{value!r} has no JSON form")
     if value == 0:
         return "0"
-    # ECMAScript's number-to-string at radix 10: shortest round-tripping
-    # digits, positional inside [1e-6, 1e21), exponential with an explicit
-    # sign outside it.
-    if abs(value) >= 1e-6 and abs(value) < 1e21:
-        text = repr(value)
-        if text.endswith(".0"):
-            text = text[:-2]
-        if "e" in text:  # Python reaches for exponents earlier than ECMAScript
-            text = f"{value:.17f}".rstrip("0").rstrip(".")
-        return text
-    mantissa, exponent = repr(value).split("e")
-    if mantissa.endswith(".0"):
-        mantissa = mantissa[:-2]
-    sign = "+" if not exponent.startswith("-") else "-"
-    return f"{mantissa}e{sign}{exponent.lstrip('+-').lstrip('0') or '0'}"
+    # ECMAScript's Number::toString at radix 10, from the shortest digits that
+    # round-trip — which `repr` gives — placed by ECMAScript's rule rather than
+    # Python's: positional for a decimal exponent n in (-6, 21], exponential
+    # with an explicit sign outside it. Python switches to exponents at 1e16
+    # and 1e-4, so its spelling cannot be reused, only its digits.
+    digits, n = _shortest_digits(value)
+    k = len(digits)
+    sign = "-" if value < 0 else ""
+    if k <= n <= 21:
+        return sign + digits + "0" * (n - k)
+    if 0 < n <= 21:
+        return sign + digits[:n] + "." + digits[n:]
+    if -6 < n <= 0:
+        return sign + "0." + "0" * -n + digits
+    exponent = n - 1
+    mantissa = digits if k == 1 else digits[0] + "." + digits[1:]
+    return f"{sign}{mantissa}e{'+' if exponent >= 0 else '-'}{abs(exponent)}"
+
+
+def _shortest_digits(value: float) -> tuple[str, int]:
+    """The shortest round-tripping decimal digits of |value|, without leading
+    or trailing zeros, and n such that |value| = 0.digits × 10**n."""
+    mantissa, _, exponent = repr(abs(value)).partition("e")
+    whole, _, fraction = mantissa.partition(".")
+    digits = whole + fraction
+    n = len(whole) + (int(exponent) if exponent else 0)
+    significant = digits.lstrip("0")
+    n -= len(digits) - len(significant)
+    return significant.rstrip("0"), n
 
 
 def canonical(value: object) -> str:
@@ -1162,6 +1299,12 @@ _RFC_8785_NUMBERS: list[tuple[float, str]] = [
     (1.7976931348623157e308, "1.7976931348623157e+308"),
     (-4.5, "-4.5"),
     (-1e30, "-1e+30"),
+    # Where Python's own spelling turns exponential and ECMAScript's does not:
+    # below 1e-4 and from 1e16.
+    (1.2345678901234568e-05, "0.000012345678901234568"),
+    (1.2345678901234568e20, "123456789012345680000"),
+    (1e16, "10000000000000000"),
+    (-5e-05, "-0.00005"),
 ]
 
 
@@ -1277,6 +1420,18 @@ def _damaged(lines: list[dict]) -> list[tuple[str, list[dict], str]]:
             del line["hold"]
     cases.append(("a case block without its hold", unheld, "carries no hold member"))
 
+    unerased = copy.deepcopy(lines)
+    for line in unerased:
+        if line.get("kind") == CASE_KIND:
+            del line["erasure"]
+    cases.append(("a case block without its erasure record", unerased, "carries no erasure member"))
+
+    misdated = copy.deepcopy(lines)
+    for line in misdated:
+        if line.get("kind") == CASE_KIND:
+            line["erasure"] = {"at": "last tuesday", "reason": "art-17", "complete": True}
+    cases.append(("an erasure at no instant", misdated, "at is not an RFC 3339 instant"))
+
     cases.append(("a file cut short", copy.deepcopy(lines)[:-1], "this file is a prefix"))
 
     surrogate = copy.deepcopy(lines)
@@ -1384,6 +1539,120 @@ def _bounded(lines: list[dict]) -> list[tuple[str, list[dict], str]]:
         if line.get("kind") == HEADER_KIND:
             line["attestation_bundle"] = {"alg": "ml-dsa-65"}
     return [("a framing member from a later writer", ahead, "attestation_bundle")]
+
+
+# One bad origin of each class tlog-cosignature names, and the class a reader
+# must say it refused.
+BAD_ORIGINS = [
+    ("an empty origin", "", "is empty"),
+    ("an origin past 255 bytes", "a" * 256, "is 256 bytes"),
+    ("an origin with a space", "agentplane/acme corp", "contains ' '"),
+    ("an origin with U+00A0", "agentplane/acme\u00a0corp", "contains '\\xa0'"),
+    ("an origin with U+3000", "agentplane/acme\u3000corp", "contains '\\u3000'"),
+    ("an origin with a plus", "agentplane/a+b", "contains '+'"),
+    ("an origin with a newline", "agentplane\nforged", "contains '\\n'"),
+    ("an origin with a tab", "agentplane\tlog", "contains '\\t'"),
+    ("an origin with a control character", "agentplane\x01", "contains '\\x01'"),
+]
+
+
+def _origin_cases(lines: list[dict]) -> int:
+    """Each bad origin, refused in the header, in a note, in a JSON checkpoint
+    file and in an ORIGIN:SIZE:ROOT anchor; and the bound and a multi-byte
+    character accepted. The number of cases not answered as expected."""
+    import copy
+    import tempfile
+
+    failures = 0
+    header = lines[0]["checkpoint"]
+    root_b64 = base64.b64encode(bytes.fromhex(header["root"])).decode("ascii")
+    for name, origin, expected in BAD_ORIGINS:
+        damaged = copy.deepcopy(lines)
+        damaged[0]["checkpoint"]["origin"] = origin
+        report = verify([json.dumps(line) for line in damaged])
+        refusals = {
+            "the header": any("origin" in f and expected in f for f in report.findings),
+            # A newline or a control character breaks the note's own structure
+            # first, so a note is held to being refused, not to naming why.
+            "a note": isinstance(
+                parse_note("note", f"{origin}\n{header['size']}\n{root_b64}\n\n— w AAAAAAA=\n"), str
+            ),
+            "an anchor": expected in str(parse_anchor(f"{origin}:{header['size']}:{header['root']}")),
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+            json.dump({"origin": origin, "size": header["size"], "root": header["root"]}, f)
+        try:
+            refusals["a JSON checkpoint"] = expected in str(parse_anchor(f.name))
+        finally:
+            os.unlink(f.name)
+        missed = [where for where, refused in refusals.items() if not refused]
+        if missed:
+            print(f"MISS {name}: not refused naming {expected!r} in {', '.join(missed)}")
+            failures += 1
+        else:
+            print(f"ok   {name}, refused in the header, a note and both anchor forms")
+    for name, origin in [("an origin of exactly 255 bytes", "é" * 127 + "a"), ("a conforming origin", "example.com/log42")]:
+        if origin_refusal(origin) is not None or not isinstance(
+            parse_anchor(f"{origin}:{header['size']}:{header['root']}"), Anchor
+        ):
+            print(f"MISS {name}: refused")
+            failures += 1
+        else:
+            print(f"ok   {name} is accepted")
+    return failures
+
+
+def _strict_json_cases(lines: list[dict]) -> int:
+    """Bytes Python's json reads and the format does not: each is a finding,
+    never a traceback. The number of cases not answered as expected."""
+    import copy
+
+    failures = 0
+    first = next(i for i, l in enumerate(lines) if "kind" not in l)
+
+    def relinked(raw: str) -> list[dict]:
+        out = copy.deepcopy(lines)
+        out[first]["raw"] = raw
+        out[first]["hash"] = sha256(bytes.fromhex(out[first]["prev_hash"]) + raw.encode()).hex()
+        return out
+
+    wire = json.loads(lines[first]["raw"])
+    cases = [
+        ("a NaN in a record's wire bytes", relinked(lines[first]["raw"][:-1] + ',"x":NaN}'), "do not parse"),
+        ("an Infinity in a record's wire bytes", relinked(lines[first]["raw"][:-1] + ',"x":Infinity}'), "do not parse"),
+        ("a number past the largest double", relinked(lines[first]["raw"][:-1] + ',"x":1e400}'), "do not parse"),
+        ("a record whose wire bytes are an array", relinked("[1,2]"), "not a JSON object"),
+        ("a record of a kind outside the vocabulary", relinked(canonical(dict(wire, kind="Teleported"))), "not in the record vocabulary"),
+    ]
+    boolean_size = copy.deepcopy(lines)
+    boolean_size[0]["checkpoint"]["size"] = True
+    cases.append(("a checkpoint size of true", boolean_size, "no integer size"))
+    boolean_version = copy.deepcopy(lines)
+    boolean_version[0]["version"] = True
+    cases.append(("an export version of true", boolean_version, "export version"))
+    # `false` is the index Python's bool would read as 0, the one position a
+    # contiguity check cannot tell from the integer.
+    boolean_index = copy.deepcopy(lines)
+    for line in boolean_index:
+        if line.get("kind") == RUN_KIND and is_integer(line.get("index")) and line["index"] == 0:
+            line["index"] = False
+    cases.append(("a log index of false", boolean_index, "needs both index and seal"))
+    reseq = copy.deepcopy(lines)
+    reseq[first]["seq"] = reseq[first]["seq"] + 7
+    cases.append(("a line seq its body does not say", reseq, "wire bytes say"))
+    for name, damaged, expected in cases:
+        try:
+            report = verify([json.dumps(line) for line in damaged])
+        except Exception as error:  # noqa: BLE001 — a traceback is the defect
+            print(f"MISS {name}: raised {error!r}")
+            failures += 1
+            continue
+        if any(expected in f for f in report.findings):
+            print(f"ok   {name}")
+        else:
+            print(f"MISS {name}: nothing reported {expected!r}; got {report.findings}")
+            failures += 1
+    return failures
 
 
 def _older_shape(lines: list[dict]) -> list[dict]:
@@ -1840,12 +2109,16 @@ def self_test(lines: list[str], directory: str = ".") -> int:
         else:
             print(f"MISS {name}: nothing said it passed over {expected!r}")
             failures += 1
+    # This reader implements one record version, as the Rust reader does with no
+    # upcaster: a record at another is a skew it names, never an edit and never
+    # a shape it reads as the current one.
     older = verify([json.dumps(line) for line in _older_shape(parsed)])
-    if older.findings:
+    skews = [f for f in older.findings if "build skew rather than an edit" in f]
+    if not skews or any("altered" in f for f in older.findings):
         print(f"MISS a record at an older shape: reported {older.findings}")
         failures += 1
     else:
-        print("ok   a record at an older shape verifies by its hash")
+        print("ok   a record at an older shape is a skew, not an edit")
     foreign = copy.deepcopy(parsed)
     foreign[0]["canon"] = 999
     report = verify([json.dumps(line) for line in foreign])
@@ -1919,6 +2192,8 @@ def self_test(lines: list[str], directory: str = ".") -> int:
         print(f"MISS a sidecar over a run that does not verify: got {component!r}")
         failures += 1
 
+    failures += _origin_cases(parsed)
+    failures += _strict_json_cases(parsed)
     failures += _ed25519_cases()
     failures += _signed_cases(directory)
 
@@ -2036,10 +2311,12 @@ def parse_anchor(spec: str) -> Anchor | str:
         if not text.lstrip().startswith("{"):
             return parse_note(spec, text)
         try:
-            value = json.loads(text)
+            value = loads(text)
             origin, size, root = value.get("origin"), value["size"], value["root"]
         except (ValueError, KeyError, AttributeError) as error:
             return f"{spec}: not a checkpoint file ({error})"
+        if not is_integer(size) or not isinstance(root, str):
+            return f"{spec}: not a checkpoint file (the size is not an integer or the root not a string)"
     else:
         parts = spec.rsplit(":", 2)
         if len(parts) == 2:
@@ -2055,6 +2332,10 @@ def parse_anchor(spec: str) -> Anchor | str:
         return f"{spec!r}: the size is not an integer or the root is not hex"
     if size < 0 or len(digest) != 32:
         return f"{spec!r}: a size is non-negative and a root is 32 bytes"
+    if origin is not None:
+        refusal = origin_refusal(origin)
+        if refusal is not None:
+            return f"{spec!r}: {refusal}"
     anchor = Anchor(size, digest, origin)
     anchor.source = spec
     return anchor
@@ -2097,11 +2378,11 @@ def note_text_refusal(text: str) -> str | None:
 
 def note_name_refusal(name: str) -> str | None:
     """Why a key name is not one, or None: empty, or carrying whitespace, a
-    control character or an em dash."""
+    control character, an em dash or a '+' (which signed-note forbids)."""
     if not name:
         return "a key name is empty"
     for c in name:
-        if c in UNICODE_WHITESPACE or _is_control(c) or c == EM_DASH:
+        if c in UNICODE_WHITESPACE or _is_control(c) or c == EM_DASH or c == "+":
             return f"a key name contains {c!r}"
     return None
 
@@ -2119,6 +2400,9 @@ def parse_note(spec: str, text: str) -> Anchor | str:
     head = body.split("\n")
     if len(head) < 4 or not head[0] or not SIZE_LINE.fullmatch(head[1]):
         return f"{spec}: the note body is not origin, canonical decimal size, root"
+    refusal = origin_refusal(head[0])
+    if refusal is not None:
+        return f"{spec}: {refusal}"
     root = b64_canonical(head[2]) or b""
     if len(root) != 32:
         return f"{spec}: the note's root is not 32 bytes of canonical base64"

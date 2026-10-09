@@ -105,12 +105,14 @@ impl Accumulator {
                     // would otherwise produce a parts array as long as the
                     // answer, which is a different document from the one a
                     // buffered call returns.
+                    //
+                    // Appended to the buffer that is already there: rebuilding
+                    // the joined string per chunk copies the whole answer each
+                    // time, which is quadratic in a long, finely chunked one.
                     Some(last) => {
-                        let joined = format!(
-                            "{}{text}",
-                            last.get("text").and_then(Value::as_str).unwrap_or_default()
-                        );
-                        *last = json!({ "text": joined });
+                        if let Some(Value::String(joined)) = last.get_mut("text") {
+                            joined.push_str(text);
+                        }
                     }
                     None => self.parts.push(part.clone()),
                 }
@@ -216,6 +218,27 @@ fn is_plain_text(part: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long answer streamed one token per chunk is one text part, joined
+    /// in order — the document a buffered call returns.
+    #[test]
+    fn many_small_chunks_join_into_one_text_part_in_order() {
+        let mut acc = Accumulator::new();
+        let mut expected = String::new();
+        for i in 0..2000 {
+            let fragment = format!("{}", i % 10);
+            expected.push_str(&fragment);
+            acc.push(&format!(
+                r#"{{"candidates":[{{"content":{{"role":"model","parts":[{{"text":"{fragment}"}}]}}}}]}}"#
+            ));
+        }
+        let response = acc.into_response();
+        let parts = response["candidates"][0]["content"]["parts"]
+            .as_array()
+            .expect("parts");
+        assert_eq!(parts.len(), 1, "adjacent text parts were not merged");
+        assert_eq!(parts[0]["text"], expected.as_str());
+    }
 
     #[test]
     fn adjacent_text_is_joined_and_signed_parts_survive() {

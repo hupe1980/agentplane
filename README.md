@@ -92,8 +92,7 @@ agentplane run examples/summariser.yaml --input '{"ticket": "printer on fire"}'
 agentplane run examples/room.yaml       --input '{"topic": "durable execution"}'
 ```
 
-Or without a Rust toolchain at all — needing one to run a YAML file rather
-defeats the point of the file:
+Or without a Rust toolchain at all:
 
 ```sh
 docker run --rm --read-only --network none \
@@ -136,6 +135,7 @@ passes the protocol project's own conformance kit, started without writing Rust:
 # `serve` refuses the shipped placeholders and any token under 32 bytes.
 sed -e "s/replace-me:peer-a:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
     -e "s/replace-me:ops-alice:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
+    -e "s/replace-me:app-1:openssl-rand-hex-32/$(openssl rand -hex 32)/" \
     examples/serve-tokens.yaml > tokens.yaml
 
 agentplane serve examples/served.yaml \
@@ -198,9 +198,9 @@ outcome of, and a rolling deploy should not be the ordinary way a plane produces
 those ([stopping an
 instance](https://hupe1980.github.io/agentplane/docs/operations/#stopping-an-instance)).
 
-Both `--policy` and `--tokens` are required and have no defaults. That is the
-design rather than an inconvenience: a permissive engine and no engine are the
-same behaviour, and a server that authenticates nobody has no actor to record a
+Both `--policy` and `--tokens` (a file, or `AGENTPLANE_TOKENS_FILE`) are
+required and have no defaults: a permissive engine and no engine are the same
+behaviour, and a server that authenticates nobody has no actor to record a
 decision against. A token may carry its caller's own `scope` and `not_after`;
 every run that caller starts is then admitted under a chain rooted at the
 caller — checked against the plan, refused once expired — and the journal
@@ -301,9 +301,7 @@ of this crate's Rust — enforced by a guard, because a verifier that consulted
 `src/` would agree with the implementation by construction. `just verify-golden`
 runs it: it **re-derives** all 33 record vectors from their parsed values with
 its own canonicalizer and chain digest, verifies the sealed export end to end,
-and then damages that export and asserts every damage is reported. Vectors a
-project generates and then checks are that project agreeing with itself; this
-is the part that is not.
+and then damages that export and asserts every damage is reported.
 
 **🧯 A recovery drill, not a backup.** The restore path is exercised against a
 real `PostgreSQL` server — restoring one tenant's history into another tenant of
@@ -312,8 +310,7 @@ actually puts an operator in. It asserts equal roots at equal size, records
 hash-for-hash, the matter with its obligation and its artifact, isolation in
 both directions, and a first lease past the journal's highest epoch. Then it
 asks the restored plane to take **new work**, and checks that the seal extends
-the log it restored: a store that reads correctly and cannot be written to is a
-backup. The RPO/RTO tables, and the list of what an operator re-establishes by
+the log it restored. The RPO/RTO tables, and the list of what an operator re-establishes by
 hand, are on the
 [operations page](https://hupe1980.github.io/agentplane/docs/operations/#disaster-recovery).
 
@@ -330,40 +327,23 @@ tree size with two different roots is a split view no single anchor exhibits.
 
 **🧾 Conformance by the protocol's own kit.** `just test-a2a-tck` runs the
 official [a2a-tck](https://github.com/a2aproject/a2a-tck) against this crate's
-A2A server on a live socket. Every other A2A test drives this server with this
-crate's own client, which proves symmetry, not conformance — a client and
-server written from the same misreading agree everywhere; the kit is the
-reader that did not.
+A2A server on a live socket — a reader this crate's own client is not.
 
 **🌐 Tests against a real provider.** `just test-live` runs the OpenAI, Gemini
 and `OpenAI`-compatible drivers, plus the embedding wire, against the actual
-APIs. They are gated twice — an explicit `AGENTPLANE_LIVE=1`
-*and* a key — because a credential being available is not a decision to spend
-money with it, and they are never part of `ci`. They exist because a stubbed
-provider is structurally unable to have the defects a real one finds: it never
-rejects a malformed request and never returns a shape the driver mis-reads. The
-Gemini battery is the sharpest case — a **thought signature** is minted and
-validated by Google, so a canned server accepts whatever a fixture tells it to
-and says nothing about whether Gemini takes the signature back, which is the one
-check distinguishing a driver that carries the model's turn verbatim from one
-rebuilding it.
+APIs. They are gated twice — an explicit `AGENTPLANE_LIVE=1` *and* a key —
+and are never part of `ci`. A stubbed provider never rejects a malformed
+request and never returns a shape the driver mis-reads; a real one does, and
+only Gemini can say whether it takes a **thought signature** back.
 
 **🧬 Mutation testing over the code.** Every load-bearing guarantee is broken on
 purpose, and the test *named for each one* must fail. A mutation caught by some other test is
-reported **weak**, not passing — that usually means the guarantee has no test of
-its own and is being held up by one that could be rewritten without anyone
-noticing what it protected.
-
-A guarantee can be implemented, tested and green while deleting it fails no
-test — a fixture that launders a value before it reaches the check is enough.
-Only removing the guarantee shows that, so the sweep removes each one.
+reported **weak**, not passing: the guarantee has no test of its own.
 
 It runs on **every push**, sharded across a CI matrix. `MUTANTS_SHARD=k/n` takes a
 contiguous slice of a list grouped by the feature set each mutation builds
-under, cut on **measured seconds rather than count** — a mutation checked by a
-library unit test costs six times one checked in an integration binary, and a
-matrix finishes when its slowest job does. Each shard needs its own checkout:
-the sweep rewrites source in place.
+under, cut on measured seconds rather than count. Each shard needs its own
+checkout: the sweep rewrites source in place.
 
 `just anchors` is the cheap half, and it checks text rather than types: a
 mutation still *matching* the code it names does not prove its replacement still

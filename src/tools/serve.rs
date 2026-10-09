@@ -729,16 +729,14 @@ impl ServerHandler for McpServer {
             ));
         };
         let tasks = host_has_tasks(&context);
+        // The Tasks extension's own answer for a call that cannot be served
+        // without a task: `-32021`, naming the capability in `data`, so a host
+        // can tell "declare the extension" from "your arguments are wrong".
         if served.may_suspend && !tasks {
-            return Err(McpError::invalid_params(
-                format!(
-                    "'{}' may wait on a person or a timer, and this host did not negotiate \
-                     the {} extension (MCP {}) that carries a waiting call back as a task",
-                    request.name,
-                    rmcp::model::TASKS_EXTENSION_ID,
-                    crate::tools::MCP_REVISION
-                ),
-                None,
+            return Err(McpError::missing_required_client_capability(
+                rmcp::model::ClientCapabilities::builder()
+                    .enable_tasks()
+                    .build(),
             ));
         }
 
@@ -981,7 +979,13 @@ impl ServerHandler for McpServer {
             // an event or somebody's decision, and *working* is what that is to
             // a caller polling it — the alternative reports a run that will
             // finish as one that failed.
-            Some(RunStatus::Suspended(_)) | None => TaskPayload::Working,
+            //
+            // A withheld run is the same kind of pause — its authority was
+            // withdrawn and it continues when the halt is lifted — so it is
+            // working too, never a failure that later turns into a result.
+            Some(RunStatus::Suspended(_) | RunStatus::Withheld { .. }) | None => {
+                TaskPayload::Working
+            }
             // Everything else that has concluded is a failure *to the caller* —
             // exhausted, quarantined, abandoned and failed are four different
             // facts to an operator and one fact to a model: it did not happen.

@@ -2672,6 +2672,58 @@ async fn the_memory_registry_satisfies_the_registry_contract() {
     report.assert_conforms("MemoryRegistry");
 }
 
+/// **A registry stores only a manifest this crate accepts.** `Manifest` is a
+/// public struct, so a caller can hand `publish` one `parse` would never have
+/// returned; stored unchecked, it burns its name and version on content no
+/// resolve can serve, and immutability then forbids the fix. Both in-process
+/// backends are held to it here; Postgres runs the battery that names it.
+#[tokio::test]
+async fn publishing_an_unvalidated_manifest_is_refused_and_burns_no_version() {
+    use agentplane::manifest::{MemoryRegistry, Registry, RegistryError};
+    use agentplane::store::RedbStore;
+
+    let valid = Manifest::parse(
+        "
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: unchecked, version: '1.0.0' }
+spec:
+  capabilities: { provides: [work.do] }
+  budgets: { max_tokens: 1000 }
+",
+    )
+    .expect("parse");
+    let mut invalid = valid.clone();
+    invalid.spec.budgets.as_mut().expect("budgets").max_tokens = Some(0);
+
+    let memory = MemoryRegistry::new();
+    let redb = RedbStore::open_in_memory().expect("store");
+    for (backend, registry) in [
+        ("memory", &memory as &dyn Registry),
+        ("redb", &redb as &dyn Registry),
+    ] {
+        assert!(
+            matches!(
+                registry.publish(&invalid).await,
+                Err(RegistryError::Invalid { .. })
+            ),
+            "{backend}: a manifest `validate` refuses was published"
+        );
+        assert!(
+            registry
+                .versions("unchecked")
+                .await
+                .expect("versions")
+                .is_empty(),
+            "{backend}: the refused publish left a version behind"
+        );
+        registry
+            .publish(&valid)
+            .await
+            .unwrap_or_else(|e| panic!("{backend}: the version was burned: {e}"));
+    }
+}
+
 /// The same contract, against a registry that survives a restart.
 ///
 /// A process-local registry cannot answer *which agents does this organisation
@@ -3698,9 +3750,51 @@ spec:
             .spec
             .execution
             .expect("declared")
-            .max_turns
+            .turn_ceiling()
             > 0,
         "an omitted `max_turns` must not mean unbounded"
+    );
+}
+
+/// **A turn ceiling bounds turns, or it is not declared.** Zero admits no
+/// turn, so the agent could never answer; on `completion` or `call`, which make
+/// one call and take no turns, any value is read by nothing.
+#[test]
+fn max_turns_zero_is_refused() {
+    let with = |kind: &str, turns: &str| {
+        format!(
+            r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: {{ name: looper, version: "1.0.0" }}
+spec:
+  capabilities: {{ provides: [loop.answer] }}
+  identity: {{ role: "Answer" }}
+  models:
+    privileged: {{ provider: fake, model: m-1 }}
+  execution: {{ kind: {kind}{turns} }}
+  budgets: {{}}
+"#
+        )
+    };
+    let field = |yaml: String| match Manifest::parse(&yaml) {
+        Err(ManifestError::Unenforceable { field, .. }) => field,
+        other => panic!("expected a refusal naming the field, got {other:?}"),
+    };
+
+    Manifest::parse(&with("tool-calling", ", max_turns: 1")).expect("one turn parses");
+    assert_eq!(
+        field(with("tool-calling", ", max_turns: 0")),
+        "spec.execution.max_turns"
+    );
+    assert_eq!(
+        field(with("completion", ", max_turns: 4")),
+        "spec.execution.max_turns"
+    );
+    let omitted = Manifest::parse(&with("completion", "")).expect("an omitted ceiling parses");
+    assert_eq!(
+        omitted.spec.execution.expect("declared").turn_ceiling(),
+        agentplane::manifest::Execution::DEFAULT_MAX_TURNS
     );
 }
 
@@ -6728,7 +6822,6 @@ spec:
 {output}
   oversight:
     approval: none
-    deadline: {{ name: unused, kind: hours, params: {{ n: 4 }} }}
     triage:
 {rules}
   budgets: {{}}
@@ -6776,7 +6869,6 @@ spec:
   execution: { kind: completion }
   oversight:
     approval: none
-    deadline: { name: unused, kind: hours, params: { n: 4 } }
   budgets: {}
 ";
     let refused = Manifest::parse(IDLE)
@@ -6786,6 +6878,123 @@ spec:
             if *field == "spec.oversight.approval"),
         "wrong refusal: {refused}"
     );
+}
+
+/// **A triage-only block carries no field that describes a wait.** With
+/// `approval: none` and no grant requesting approval nothing waits on a
+/// person: approvers would review a decision nobody is asked, `proceed` would
+/// act past a wait that never happens, and the block-level deadline would bound
+/// it. Each is refused; a gated block still requires its deadline.
+#[test]
+fn triage_only_oversight_refuses_approvers_and_proceed() {
+    const TRIAGE: &str = r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: watcher, version: '1.0.0' }
+spec:
+  capabilities: { provides: [watch.deadline] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: completion }
+  output:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [deadline_status]
+      properties:
+        deadline_status: { type: string }
+  oversight:
+    approval: none
+    triage:
+      - name: breach
+        summary: 'a deadline was missed'
+        audience: [grid-operations]
+        when:
+          - path: /deadline_status
+            equals: BREACH
+        deadline: { name: triage, kind: hours, params: { n: 8 } }
+  budgets: {}
+";
+    Manifest::parse(TRIAGE).expect("a triage-only block with no wait fields parses");
+
+    let refused_on = |yaml: String| match Manifest::parse(&yaml) {
+        Err(ManifestError::Unenforceable { field, .. }) => field,
+        other => panic!("expected an Unenforceable refusal, got {other:?}"),
+    };
+    let with = |line: &str| {
+        TRIAGE.replace(
+            "    approval: none\n",
+            &format!("    approval: none\n{line}\n"),
+        )
+    };
+
+    assert_eq!(
+        refused_on(with("    approvers: [compliance]")),
+        "spec.oversight.approvers"
+    );
+    assert_eq!(
+        refused_on(with("    on_expiry: proceed\n    allow_unattended: true")),
+        "spec.oversight.on_expiry"
+    );
+    assert_eq!(
+        refused_on(with(
+            "    deadline: { name: unused, kind: hours, params: { n: 4 } }"
+        )),
+        "spec.oversight.deadline"
+    );
+    // Escalation still means something here: it widens a triage row's audience.
+    Manifest::parse(&with(
+        "    on_expiry: escalate\n    escalate_to: [duty-manager]",
+    ))
+    .expect("escalating a triage row is a wait-free control");
+
+    // And a block that gates the answer cannot leave its wait unbounded.
+    let gated = TRIAGE.replace("    approval: none\n", "    approval: required\n");
+    assert_eq!(refused_on(gated), "spec.oversight.deadline");
+}
+
+/// **A triage-only agent never suspends**: the run returns its answer and a
+/// matching rule only adds a worklist row, so a host that cannot hold a task
+/// may still be offered it. An answer gate can wait.
+#[test]
+fn may_suspend_is_false_for_triage_only_oversight() {
+    let triage = Manifest::parse(
+        r"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: watcher, version: '1.0.0' }
+spec:
+  capabilities: { provides: [watch.deadline] }
+  models: { privileged: { provider: fake, model: m-1 } }
+  execution: { kind: completion }
+  output:
+    schema:
+      type: object
+      additionalProperties: false
+      required: [deadline_status]
+      properties:
+        deadline_status: { type: string }
+  oversight:
+    approval: none
+    triage:
+      - name: breach
+        summary: 'a deadline was missed'
+        audience: [grid-operations]
+        when:
+          - { path: /deadline_status, equals: BREACH }
+        deadline: { name: triage, kind: hours, params: { n: 8 } }
+  budgets: {}
+",
+    )
+    .expect("parse");
+    assert!(
+        !triage.may_suspend(|_| true),
+        "a triage-only agent was judged able to suspend"
+    );
+
+    let mut gated = triage;
+    let oversight = gated.spec.oversight.as_mut().expect("oversight");
+    oversight.approval = agentplane::manifest::Approval::Required;
+    assert!(gated.may_suspend(|_| false), "an answer gate opens a task");
 }
 
 /// `tools-only` obliges every mutating grant, not just the one that asked.
@@ -7659,6 +7868,72 @@ fn a_call_agent_with_an_open_input_is_refused() {
     );
 }
 
+/// **An open object is refused wherever it sits in a `call` input**, not only
+/// under `properties`: a union branch, a definition a `$ref` points at, and the
+/// schema of `additionalProperties` are each an object a caller fills in.
+#[test]
+fn a_call_input_with_an_open_object_under_any_of_is_refused() {
+    let union = CALL.replace(
+        "        recipient: { type: string }\n",
+        "        recipient: { type: string }\n        memo:\n          anyOf:\n            - { type: object, properties: { text: { type: string } } }\n            - { type: \"null\" }\n",
+    );
+    let said = call_refusal(&union);
+    assert!(
+        said.contains("spec.input.schema.memo.anyOf[0]")
+            && said.contains("additionalProperties: false"),
+        "the refusal must name the open branch and the fix, got: {said}"
+    );
+
+    // An object spelled without `type` is still one a validator applies.
+    let untyped = CALL.replace(
+        "        recipient: { type: string }\n",
+        "        recipient: { type: string }\n        memo: { properties: { text: { type: string } } }\n",
+    );
+    assert!(call_refusal(&untyped).contains("spec.input.schema.memo"));
+
+    // A schema-valued `additionalProperties` admits every name it does not list.
+    let valued = CALL.replace(
+        "      additionalProperties: false\n      properties:\n        recipient",
+        "      additionalProperties: { type: string }\n      properties:\n        recipient",
+    );
+    assert!(call_refusal(&valued).contains("additionalProperties: false"));
+
+    // And `patternProperties` admits fields nobody declared by another spelling.
+    let patterned = CALL.replace(
+        "      additionalProperties: false\n      properties:\n        recipient",
+        "      additionalProperties: false\n      patternProperties: { \"^x-\": { type: string } }\n      properties:\n        recipient",
+    );
+    assert!(call_refusal(&patterned).contains("patternProperties"));
+}
+
+/// The `$defs` twin: a definition is walked whether or not anything points at
+/// it, and a `$ref` outside the document is refused because its target cannot
+/// be judged.
+#[test]
+fn a_call_input_with_an_open_object_under_defs_or_ref_is_refused() {
+    let defs = CALL.replace(
+        "        recipient: { type: string }\n",
+        "        recipient: { type: string }\n        memo: { $ref: \"#/$defs/memo\" }\n      $defs:\n        memo: { type: object, properties: { text: { type: string } } }\n",
+    );
+    let said = call_refusal(&defs);
+    assert!(
+        said.contains("spec.input.schema.memo") && said.contains("additionalProperties: false"),
+        "the refusal must name the open definition, got: {said}"
+    );
+
+    let closed = defs.replace(
+        "memo: { type: object, properties",
+        "memo: { type: object, additionalProperties: false, properties",
+    );
+    Manifest::parse(&closed).expect("a closed definition behind a local `$ref` parses");
+
+    let remote = CALL.replace(
+        "        recipient: { type: string }\n",
+        "        recipient: { type: string }\n        memo: { $ref: \"https://example.com/memo.json\" }\n",
+    );
+    assert!(call_refusal(&remote).contains("$ref"));
+}
+
 /// **A mutating grant with no field rules cannot fire for a served caller**,
 /// whose input is untrusted — refused at parse, as for `tool-calling`.
 #[test]
@@ -7844,4 +8119,56 @@ async fn a_subject_binding_that_cannot_resolve_fails_the_run() {
         .expect("the run recorded its binding");
     assert_eq!(bound[0].subject, "cust-17");
     assert!(bound[0].trusted);
+}
+
+/// **A `completion` agent's cut-off answer is not its answer**, as it is not
+/// a `tool-calling` agent's: a partial result must never be settled shaped like
+/// a whole one, and nothing marks a truncated text as partial once it is the
+/// run's output.
+#[cfg(feature = "redb")]
+#[tokio::test]
+async fn a_truncated_completion_fails_rather_than_answering() {
+    use agentplane::runtime::{Agent, RunStatus, Runtime};
+
+    let manifest = Manifest::parse(
+        r#"
+apiVersion: agentplane.hupe1980.github.io/v1alpha1
+kind: Agent
+metadata: { name: summarizer, version: "1.0.0" }
+spec:
+  capabilities: { provides: [text.summarize] }
+  identity: { role: "Summarize the text" }
+  models:
+    privileged: { provider: fake, model: m-1 }
+  execution: { kind: completion }
+  budgets: {}
+"#,
+    )
+    .expect("parse");
+    let store: std::sync::Arc<dyn agentplane::journal::JournalStore> =
+        std::sync::Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let provider = agentplane::testkit::FakeProvider::new();
+    provider.will_say("the gist is").truncated();
+    let rt = Runtime::builder(store)
+        .provider(
+            "fake",
+            std::sync::Arc::clone(&provider)
+                as std::sync::Arc<dyn agentplane::model::ModelProvider>,
+        )
+        .agent(Agent::new(&manifest))
+        .build();
+
+    let out = rt
+        .run(
+            "text.summarize",
+            Tainted::trusted(serde_json::json!({ "text": "a long text" })),
+        )
+        .await
+        .expect("the run completes");
+    assert!(
+        matches!(&out.status, RunStatus::Failed(m)
+            if m.contains("partial answer") && m.contains("spec.models.<role>.max_tokens")),
+        "a cut-off completion was settled as the run's output: {:?}",
+        out.status
+    );
 }

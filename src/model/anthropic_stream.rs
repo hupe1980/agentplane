@@ -376,11 +376,13 @@ impl Accumulator {
         let Some(block) = self.blocks.get_mut(&index).and_then(Value::as_object_mut) else {
             return;
         };
-        let value = block
+        // Appended in place: rebuilding the string per delta copies the whole
+        // block each time, which is quadratic in a long, finely chunked answer.
+        if let Value::String(text) = block
             .entry(field.to_owned())
-            .or_insert_with(|| Value::String(String::new()));
-        if let Some(text) = value.as_str() {
-            *value = Value::String(format!("{text}{fragment}"));
+            .or_insert_with(|| Value::String(String::new()))
+        {
+            text.push_str(fragment);
         }
     }
 
@@ -488,6 +490,26 @@ mod tests {
         assert_eq!(acc.stop_reason(), Some("end_turn"));
         assert_eq!(acc.billed().input_tokens, 25);
         assert_eq!(acc.billed().output_tokens, 15);
+    }
+
+    /// A long answer streamed a few characters at a time is reassembled in
+    /// order and whole, one fragment appended to the block per delta.
+    #[test]
+    fn many_small_deltas_reassemble_one_block_in_order() {
+        let mut acc = Accumulator::new();
+        feed(&mut acc, &[START]);
+        acc.event(
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        );
+        let mut expected = String::new();
+        for i in 0..2000 {
+            let fragment = format!("{}", i % 10);
+            expected.push_str(&fragment);
+            let (n, d) = text_delta(&fragment);
+            acc.event(&n, &d);
+        }
+        assert_eq!(acc.text(), expected);
     }
 
     #[test]

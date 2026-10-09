@@ -435,6 +435,48 @@ async fn a_task_says_whether_it_carries_prose_the_run_did_not_write() {
     );
 }
 
+/// A decision by a caller no record can name is this plane's fault, not the
+/// caller's request: answered as every other write answers it, and nothing is
+/// decided.
+///
+/// A 400 tells the caller to fix a request it has no way to fix — the name
+/// came from the deployment's authenticator, not from the body.
+#[tokio::test]
+async fn a_decision_by_an_unusable_caller_is_refused_as_the_planes_fault() {
+    let f = fixture();
+    let task = f.pending_task().await;
+    let router = f.router();
+    let path = format!("/tasks/{task}/decide");
+    let (status, body) = send(
+        &router,
+        post(
+            &path,
+            Some(" "),
+            &json!({ "approved": true, "reason": "ok" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        body.to_string().contains("cannot be recorded"),
+        "the documented sentence: {body}"
+    );
+    let (status, body) = send(
+        &router,
+        post(
+            &path,
+            Some("bob"),
+            &json!({ "approved": true, "reason": "ok" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refused decision decided the task: {body}"
+    );
+}
+
 /// The decision is recorded under the authenticated caller.
 #[tokio::test]
 async fn the_decision_is_recorded_under_the_authenticated_caller() {

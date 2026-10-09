@@ -118,11 +118,13 @@ if [[ "$FEATURES" == *a2a-server* && "$FEATURES" == *cedar* ]]; then
     echo "REFUSED: the served card never came up"; docker logs "$cid"; exit 1; }
   grep -q '"summariser"' <<<"$card" || { echo "REFUSED: wrong card: $card"; exit 1; }
 
-  # An unauthenticated call must be refused, or the image ships an open door.
+  # An unauthenticated call must be refused, or the image ships an open door:
+  # with 401 and a JSON-RPC error body, as A2A answers a missing credential.
   rpc='{"jsonrpc":"2.0","id":"1","method":"SendMessage","params":{"message":{"role":"ROLE_USER","parts":[{"text":"printer on fire"}],"messageId":"m1"}}}'
-  anon=$(curl -sf -X POST "http://127.0.0.1:18080/a2a" -H 'content-type: application/json' \
-           -H 'a2a-version: 1.0' -d "$rpc")
-  grep -q '"error"' <<<"$anon" || { echo "REFUSED: an unauthenticated call was accepted: $anon"; exit 1; }
+  anon=$(curl -s -w '\n%{http_code}' -X POST "http://127.0.0.1:18080/a2a" \
+           -H 'content-type: application/json' -H 'a2a-version: 1.0' -d "$rpc")
+  [[ "${anon##*$'\n'}" == 401 ]] && grep -q '"error"' <<<"$anon" || {
+    echo "REFUSED: an unauthenticated call was not refused with 401: $anon"; exit 1; }
 
   ok=$(curl -sf -X POST "http://127.0.0.1:18080/a2a" -H 'content-type: application/json' \
          -H 'a2a-version: 1.0' -H "authorization: Bearer $PEER_TOKEN" -d "$rpc")

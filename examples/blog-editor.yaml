@@ -30,9 +30,9 @@ spec:
     privileged: { provider: fake, model: editor-1 }
 
   budgets:
-    # `max_tokens` bounds the whole room, not just this run's own idling: a
-    # delegation is an effect, and `Delegate::spend` reports what the specialist
-    # consumed, so the commission is billed here.
+    # `max_tokens` bounds the whole room, not just this run's own: a
+    # commission is an effect, and what the specialist's sub-run spent is
+    # billed to this run.
     #
     # `max_effects` bounds the overshoot. Spend is billed after the fact, like
     # any metered effect, so the room can exceed the token ceiling by at most

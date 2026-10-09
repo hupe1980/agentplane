@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.46.0"
+version      = "0.47.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -52,8 +52,8 @@ redb = ["dep:redb"]
 # fencing and exactly-once are arbitrated by the database rather than by hoping
 # the writers agree.
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
-# The agent declaration: tool grants, budgets, egress ceiling, injection
-# pattern. Off by default — the runtime is usable wired by builder calls; the
+# The agent declaration: tool grants, budgets, egress ceiling, oversight.
+# Off by default — the runtime is usable wired by builder calls; the
 # manifest is what makes those declarations reviewable.
 manifest = ["dep:serde_yaml_ng", "dep:jsonschema", "dep:regex", "dep:unicode-normalization"]
 # Everything the `agentplane` binary needs. `signing` and `witness-http` are

@@ -178,6 +178,43 @@ async fn postgres_satisfies_the_memory_store_contract() {
     .await;
 }
 
+/// **Recall breaks ties by byte under a locale collation too.**
+///
+/// The certified image collates its default database bytewise, so the
+/// battery's tie row cannot see a store that left the tie-break to the
+/// database. Run it again on a database whose default collation is a real
+/// locale — ICU's English, where `B` sorts after `a` — which is what a
+/// deployment on a glibc or ICU-configured server gets.
+#[tokio::test]
+async fn postgres_recall_breaks_ties_by_byte_under_a_locale_collation() {
+    use agentplane::memory::MemoryStore;
+
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let admin = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    // The base store's open is the readiness wait; the database is created
+    // once the server answers.
+    drop(connect_retrying(&admin).await);
+    let (client, connection) = tokio_postgres::connect(&admin, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(connection);
+    client
+        .batch_execute(
+            "CREATE DATABASE locale_memory TEMPLATE template0 \
+             LOCALE_PROVIDER icu ICU_LOCALE 'en-US' LOCALE 'C'",
+        )
+        .await
+        .expect("an ICU database");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/locale_memory");
+    let tenant = agentplane::core::TenantId::new("memory-locale").expect("tenant");
+    let store = Arc::new(connect_retrying(&url).await.for_tenant(tenant)) as Arc<dyn MemoryStore>;
+    conformance::memory(store).await;
+}
+
 #[cfg(feature = "push")]
 #[tokio::test]
 async fn postgres_persists_push_delivery_cursors() {

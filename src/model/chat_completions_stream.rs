@@ -33,6 +33,13 @@ pub struct Accumulator {
     /// severed-stream mapping turns on.
     generated: bool,
     done: bool,
+    /// An error object the server sent **inside** the 200 stream, in place of
+    /// a chunk. Some OpenAI-compatible servers report a failure that way once
+    /// the headers are gone; read as a chunk it has no `choices`, and skipped
+    /// it would let a following `[DONE]` settle an empty answer.
+    error: Option<Value>,
+    /// The key the last index-less tool-call fragment was filed under.
+    unindexed: Option<u64>,
     /// Message-level keys this accumulator does not itself understand, kept
     /// for the reason [`PartialCall::extra`] keeps its own: the extension is
     /// what the next request has to return, and `reasoning_content` on
@@ -79,6 +86,10 @@ impl Accumulator {
             return None;
         }
         let chunk: Value = serde_json::from_str(data).ok()?;
+        if let Some(error) = chunk.get("error").filter(|e| !e.is_null()) {
+            self.error = Some(error.clone());
+            return None;
+        }
         // The usage-bearing chunk has an empty `choices` array on the real
         // wire, so usage is read independently of the choice — and so is the
         // model name, which this wire repeats on every chunk.
@@ -104,7 +115,10 @@ impl Accumulator {
             .into_iter()
             .flatten()
         {
-            let index = fragment.get("index").and_then(Value::as_u64).unwrap_or(0);
+            let index = match fragment.get("index").and_then(Value::as_u64) {
+                Some(index) => index,
+                None => self.unindexed_key(fragment),
+            };
             let call = self.calls.entry(index).or_default();
             // The id and name are whole values, set by the first fragment that
             // carries them. Some servers repeat both on every chunk; appended,
@@ -160,6 +174,34 @@ impl Accumulator {
         self.content.push_str(text);
         self.generated = true;
         Some(text.to_owned())
+    }
+
+    /// Where a tool-call fragment with no `index` belongs.
+    ///
+    /// The wire's framing is the index; a server that omits it sends each call
+    /// whole or continues the one before. A fragment naming an id other than
+    /// the current call's is a **new** call, filed after every key in use —
+    /// keyed to 0 regardless, two calls' arguments would be concatenated into
+    /// one call nobody made. A fragment with no id continues the current one.
+    fn unindexed_key(&mut self, fragment: &Value) -> u64 {
+        let id = fragment.get("id").and_then(Value::as_str);
+        let current = self.unindexed.filter(|key| {
+            let known = self.calls.get(key).map_or("", |c| c.id.as_str());
+            id.is_none_or(|id| known.is_empty() || known == id)
+        });
+        let key = current.unwrap_or_else(|| {
+            self.calls
+                .last_key_value()
+                .map_or(0, |(last, _)| last.saturating_add(1))
+        });
+        self.unindexed = Some(key);
+        key
+    }
+
+    /// The error object the server sent inside the stream, if it sent one.
+    #[must_use]
+    pub const fn error(&self) -> Option<&Value> {
+        self.error.as_ref()
     }
 
     /// Whether any output was seen — see the module docs.
@@ -292,6 +334,46 @@ mod tests {
         assert_eq!(call["id"], "call_1");
         assert_eq!(call["function"]["name"], "lookup");
         assert_eq!(call["function"]["arguments"], r#"{"id":"x"}"#);
+    }
+
+    /// A server that omits `index` and sends each call whole still names two
+    /// calls, each with its own arguments — keyed to 0, the second's would be
+    /// appended to the first's under the first's id.
+    #[test]
+    fn calls_without_an_index_stay_separate_calls() {
+        let mut acc = Accumulator::new();
+        for data in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"id\":\"a\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"id":"call_2","type":"function","function":{"name":"lookup","arguments":"{\"id\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"b\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ] {
+            acc.push(data);
+        }
+        let out = acc.into_response();
+        let calls = out["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("calls");
+        assert_eq!(calls.len(), 2, "two calls were merged into one: {calls:?}");
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["arguments"], r#"{"id":"a"}"#);
+        assert_eq!(calls[1]["id"], "call_2");
+        assert_eq!(calls[1]["function"]["arguments"], r#"{"id":"b"}"#);
+    }
+
+    /// An error object in place of a chunk is kept for the driver, not
+    /// skipped as a chunk with no choices.
+    #[test]
+    fn an_in_stream_error_is_kept_rather_than_skipped() {
+        let mut acc = Accumulator::new();
+        acc.push(r#"{"error":{"message":"overloaded","type":"server_error","code":503}}"#);
+        acc.push("[DONE]");
+        assert_eq!(
+            acc.error().and_then(|e| e.get("message")),
+            Some(&Value::String("overloaded".into()))
+        );
+        assert!(!acc.generated());
     }
 
     /// Nothing seen means nothing generated — the severed-stream mapping's

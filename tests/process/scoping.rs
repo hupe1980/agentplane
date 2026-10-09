@@ -484,7 +484,6 @@ async fn a_skill_can_scope_its_own_recall_to_the_runs_correlation() {
 const TRIAGE: &str = r#"
   oversight:
     approval: none
-    deadline: { name: unused, kind: hours, params: { n: 4 } }
     triage:
       - name: breach
         summary: "a regulatory deadline was missed"

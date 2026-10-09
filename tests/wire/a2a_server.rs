@@ -809,6 +809,77 @@ async fn a_caller_may_not_register_in_the_operator_namespace() {
     assert!(ok["result"]["task"]["id"].is_string(), "{ok:#}");
 }
 
+/// A peer can neither see nor delete an operator destination.
+///
+/// The outbox registers the deployment's own destination against every run, in
+/// the same store the A2A push methods read. Listing it would hand a peer the
+/// deployment's internal URL; deleting it would remove the operator's delivery
+/// and its cursor from under the operator. Every push method answers an
+/// operator id exactly as a configuration that does not exist.
+#[tokio::test]
+async fn a_peer_can_neither_see_nor_delete_an_operator_destination() {
+    let f = fixture();
+    let (_, sent) = send(
+        &f.router(),
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = sent["result"]["task"]["id"].as_str().unwrap();
+    let run = RunId::parse(task).unwrap();
+    let operator_id = format!("{}bus", agentplane::push::OPERATOR_PREFIX);
+    let destination = PushConfig {
+        id: operator_id.clone(),
+        task: run,
+        url: "http://bus.internal/events".to_owned(),
+        token: None,
+        authentication: None,
+    };
+    PushStore::put(&*f.store, &destination, 1).await.unwrap();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+
+    let (_, listed) = send(
+        &router,
+        rpc(
+            "ListTaskPushNotificationConfigs",
+            &json!({"taskId": task}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        listed["result"]["configs"],
+        json!([]),
+        "the listing disclosed the deployment's destination: {listed:#}"
+    );
+    assert!(!listed.to_string().contains("bus.internal"), "{listed:#}");
+
+    let key = json!({"taskId": task, "id": operator_id});
+    let (_, got) = send(
+        &router,
+        rpc("GetTaskPushNotificationConfig", &key, Some("peer-a")),
+    )
+    .await;
+    assert_eq!(err_code(&got), i64::from(code::TASK_NOT_FOUND), "{got:#}");
+
+    send(
+        &router,
+        rpc("DeleteTaskPushNotificationConfig", &key, Some("peer-a")),
+    )
+    .await;
+    assert!(
+        PushStore::get(&*f.store, run, &operator_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "a peer deleted the deployment's own destination"
+    );
+}
+
 #[tokio::test]
 async fn push_worker_retries_from_the_same_journal_cursor_and_cleans_terminal_tasks() {
     let f = fixture();
@@ -1161,6 +1232,177 @@ async fn every_method_is_authenticated() {
             "{method} produced a result for a caller with no identity: {body:#}"
         );
     }
+}
+
+/// An unauthenticated caller learns nothing about the request it sent.
+///
+/// Parameters, the tenant field and the method name each answer differently
+/// depending on what was sent, so answering any of them before the credential
+/// lets a caller with no identity map the surface: which methods exist, which
+/// parameters each takes, which tenant the card routes. Everything after the
+/// version check waits for authentication.
+#[tokio::test]
+async fn an_unauthenticated_caller_is_challenged_before_its_request_is_read() {
+    let f = fixture();
+    let router = f.router();
+    for (method, params) in [
+        ("NoSuchMethod", json!({})),
+        (
+            "GetTask",
+            json!({"id": "01JRJ00000000000000000000A", "bogus": 1}),
+        ),
+        (
+            "GetTask",
+            json!({"id": "01JRJ00000000000000000000A", "tenant": "elsewhere"}),
+        ),
+        ("SendMessage", json!({"message": "not a message"})),
+        (
+            "SendStreamingMessage",
+            json!({"message": {"role": "ROLE_AGENT"}}),
+        ),
+    ] {
+        let (status, body) = send(&router, rpc(method, &params, None)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method} {params} was read before the caller was authenticated: {body:#}"
+        );
+    }
+}
+
+/// A `messageId` too long for the admission key is the caller's error.
+///
+/// The id is half of the run's admission key, which the runtime bounds. Passed
+/// through, the oversized key came back as an internal fault — an answer a
+/// client retries unchanged, forever.
+#[tokio::test]
+async fn an_oversized_message_id_is_invalid_params() {
+    let f = fixture();
+    let router = f.router();
+    let message = |id: &str| {
+        json!({"message": {
+            "messageId": id,
+            "role": "ROLE_USER",
+            "parts": [{"text": "go"}]
+        }})
+    };
+    let (_, long) = send(
+        &router,
+        rpc("SendMessage", &message(&"m".repeat(600)), Some("peer-a")),
+    )
+    .await;
+    assert_eq!(err_code(&long), i64::from(code::INVALID_PARAMS), "{long:#}");
+    assert!(
+        f.seen.lock().unwrap().is_empty(),
+        "the skill ran for a message that was refused"
+    );
+
+    // An id that fits is admitted, so the bound is the key's and not lower.
+    let (_, fits) = send(
+        &router,
+        rpc("SendMessage", &message(&"m".repeat(400)), Some("peer-a")),
+    )
+    .await;
+    assert!(fits["result"]["task"]["id"].is_string(), "{fits:#}");
+}
+
+/// A continuation does not take a push configuration it would drop.
+///
+/// The message continues an existing task, and registering a webhook on that
+/// task is `CreateTaskPushNotificationConfig`'s job. Accepting the field and
+/// doing nothing with it tells the caller a webhook was registered that never
+/// will be.
+#[tokio::test]
+async fn a_continuation_refuses_a_push_configuration() {
+    let f = continuation_fixture();
+    let (server, _worker, _transport) = f.push_server();
+    let router = server.router();
+    let (_, first) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("begin")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let task = first["result"]["task"]["id"].as_str().unwrap().to_owned();
+    let continuation = json!({
+        "message": {
+            "messageId": "m-followup",
+            "taskId": task,
+            "role": "ROLE_USER",
+            "parts": [{"data": {"approved": true}, "mediaType": "application/json"}]
+        },
+        "configuration": {
+            "taskPushNotificationConfig": {"url": "https://client.example/hook"}
+        }
+    });
+    let (_, body) = send(&router, rpc("SendMessage", &continuation, Some("peer-a"))).await;
+    assert_eq!(err_code(&body), i64::from(code::INVALID_PARAMS), "{body:#}");
+    let (_, still) = send(
+        &router,
+        rpc("GetTask", &json!({"id": task}), Some("peer-a")),
+    )
+    .await;
+    assert_eq!(
+        still["result"]["status"]["state"], "TASK_STATE_INPUT_REQUIRED",
+        "the refused continuation was delivered anyway: {still:#}"
+    );
+}
+
+/// The JSON-RPC envelope's refusals each carry their own code.
+///
+/// Valid JSON of the wrong shape — a batch, a request with no `method` — is
+/// an invalid request, not a parse error; telling the caller its serializer is
+/// broken sends it looking in the wrong place. An `id` that is neither a
+/// string, a number nor null is invalid too. A body over the size limit is an
+/// HTTP refusal and stays 413.
+#[tokio::test]
+async fn the_json_rpc_envelope_refusals_carry_their_own_codes() {
+    let f = fixture();
+    let router = f.router();
+    let raw = |body: Vec<u8>| {
+        Request::builder()
+            .uri("/a2a")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("A2A-Version", "1.0")
+            .header("x-actor", "peer-a")
+            .body(Body::from(body))
+            .unwrap()
+    };
+    for (what, body, expected) in [
+        ("not JSON", b"{not json".to_vec(), -32700),
+        (
+            "a batch",
+            serde_json::to_vec(&json!([{"jsonrpc": "2.0", "id": 1, "method": "GetTask"}])).unwrap(),
+            -32600,
+        ),
+        (
+            "no method",
+            serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1})).unwrap(),
+            -32600,
+        ),
+        (
+            "an object id",
+            serde_json::to_vec(
+                &json!({"jsonrpc": "2.0", "id": {"a": 1}, "method": "ListTasks", "params": {}}),
+            )
+            .unwrap(),
+            -32600,
+        ),
+    ] {
+        let (_, answer) = send(&router, raw(body)).await;
+        assert_eq!(err_code(&answer), expected, "{what}: {answer:#}");
+    }
+    let huge = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0", "id": 1, "method": "SendMessage",
+        "params": {"message": text(&"x".repeat(3 * 1024 * 1024))}
+    }))
+    .unwrap();
+    let (status, _) = send(&router, raw(huge)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 /// And the gate is a real gate: a denying policy stops every method.
@@ -2195,6 +2437,10 @@ async fn list_tasks_filters_context_and_uses_opaque_cursor_pages() {
     let (_, page_two) = send(&f.router(), rpc("ListTasks", &next, Some("peer-a"))).await;
     assert_eq!(page_two["result"]["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(page_two["result"]["nextPageToken"], "");
+    assert_eq!(
+        page_two["result"]["totalSize"], 2,
+        "a continuation page counted only the tasks after its cursor: {page_two:#}"
+    );
 
     let (_, with_artifacts) = send(
         &f.router(),
@@ -2688,6 +2934,100 @@ async fn cancelling_a_finished_task_is_not_cancelable() {
     // comparison. -32002 is TaskNotCancelableError in the A2A 1.0 error-code
     // table, and a client written against the spec matches on the number.
     assert_eq!(err_code(&body), -32002, "{body:#}");
+}
+
+#[derive(Debug)]
+struct Fails;
+
+#[async_trait::async_trait]
+impl Skill for Fails {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("settlement.check").provides("settlement.check")
+    }
+
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        Err(SkillError::Other("the ledger did not answer".to_owned()))
+    }
+}
+
+/// `CancelTask` reaches every run the runtime's stop reaches — a failed one too.
+///
+/// A failed run has concluded and is still resumable: its completed work
+/// stands, and stopping it is how that work gets unwound. Which runs a stop
+/// reaches is the runtime's decision; a door that refused every concluded run
+/// on its own would keep a peer from the one remedy the operator API offers
+/// for the same run.
+#[tokio::test]
+async fn cancel_task_reaches_a_failed_run() {
+    let manifest = Manifest::parse(ONE_SKILL).expect("parse");
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .skill(Fails)
+        .build();
+    let router = A2aServer::new(
+        rt,
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &manifest,
+        "https://plane.internal/a2a",
+    )
+    .expect("wired")
+    .router();
+    let (_, sent) = send(
+        &router,
+        rpc(
+            "SendMessage",
+            &json!({"message": text("go")}),
+            Some("peer-a"),
+        ),
+    )
+    .await;
+    let id = sent["result"]["task"]["id"].as_str().unwrap().to_owned();
+    let run = RunId::parse(&id).unwrap();
+    let concluded = |records: &[agentplane::journal::Record]| {
+        records.iter().rev().find_map(|record| match record.kind() {
+            RecordKind::RunConcluded { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+    };
+    assert_eq!(
+        concluded(&store.read(run, 1).await.unwrap()).as_deref(),
+        Some("failed"),
+        "{sent:#}"
+    );
+
+    let (_, body) = send(
+        &router,
+        rpc("CancelTask", &json!({"id": id}), Some("peer-a")),
+    )
+    .await;
+    assert!(
+        body.get("error").is_none(),
+        "a failed, resumable run was refused a stop the runtime accepts: {body:#}"
+    );
+    assert_eq!(
+        concluded(&store.read(run, 1).await.unwrap()).as_deref(),
+        Some("cancelled"),
+        "the stop was answered but never reached the run"
+    );
+
+    // A second stop finds it stopped.
+    let (_, again) = send(
+        &router,
+        rpc("CancelTask", &json!({"id": id}), Some("peer-a")),
+    )
+    .await;
+    assert_eq!(
+        err_code(&again),
+        i64::from(code::TASK_NOT_CANCELABLE),
+        "{again:#}"
+    );
 }
 
 /// One counterparty, one provenance spelling: `peer:{actor}`, on every door.
@@ -5222,6 +5562,82 @@ async fn a_plane_serves_one_card_per_agent_and_a_directory() {
         sent["result"]["task"]["id"].is_string(),
         "the second agent's skill did not dispatch: {sent:#}"
     );
+}
+
+/// Each agent's own card carries the deployment facts the well-known card does.
+///
+/// An agent's card is fetched and pinned exactly as the well-known one is. One
+/// without the tenant routes a client nowhere, one without the push flag hides
+/// a capability the server honours, and one left unsigned is the copy an
+/// attacker substitutes, since a verifier cannot tell it from a forgery.
+#[tokio::test]
+async fn every_agents_card_carries_the_tenant_push_flag_and_signature() {
+    use agentplane::peers::{AgentCard, CardSigner, CardVerifier};
+    use agentplane::policy::{Ed25519Signer, Ed25519Verifier};
+
+    let signer = Ed25519Signer::new("did:example:acme", &[5u8; 32]);
+    let verifier = Ed25519Verifier::new()
+        .trust("did:example:acme", &signer.verifying_key())
+        .expect("a valid key");
+    let manifests = Manifest::parse_all(TWO_AGENTS).expect("two agents");
+    let refs: Vec<&Manifest> = manifests.iter().collect();
+    let tenant = TenantId::new("acme").expect("valid");
+    let store = Arc::new(
+        RedbStore::open_in_memory()
+            .unwrap()
+            .for_tenant(tenant.clone()),
+    );
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .cases(Arc::clone(&store) as Arc<dyn CaseStore>)
+        .policy(Arc::new(Recording::default()) as Arc<dyn PolicyEngine>)
+        .tenant(tenant);
+    for capability in ["support.answer", "research.dig"] {
+        builder = builder.skill(Echoes {
+            capability,
+            seen: seen.clone(),
+        });
+    }
+    let router = A2aServer::hosting(
+        builder.build(),
+        Arc::new(HeaderAuth),
+        &card_security(),
+        &refs,
+        "https://plane.internal/a2a",
+    )
+    .expect("a plane may host several agents")
+    .with_push(
+        Arc::clone(&store) as Arc<dyn PushStore>,
+        Arc::new(RecordingPush::default()) as Arc<dyn PushTransport>,
+    )
+    .expect("push before signing")
+    .signing_cards_with(&signer as &dyn CardSigner)
+    .expect("sign")
+    .router();
+
+    for path in [
+        "/.well-known/agent-card.json".to_owned(),
+        agentplane::peers::agent_card_path("desk"),
+        agentplane::peers::agent_card_path("researcher"),
+    ] {
+        let req = Request::builder()
+            .uri(path.as_str())
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = send(&router, req).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(
+            body["supportedInterfaces"][0]["tenant"], "acme",
+            "{path} omits the tenant a client must echo: {body:#}"
+        );
+        assert_eq!(
+            body["capabilities"]["pushNotifications"], true,
+            "{path} hides the push capability: {body:#}"
+        );
+        let card: AgentCard = serde_json::from_value(body).expect("a card");
+        card.verify(&verifier as &dyn CardVerifier)
+            .unwrap_or_else(|e| panic!("{path} does not verify: {e}"));
+    }
 }
 
 /// Two agents claiming one skill is refused at construction.

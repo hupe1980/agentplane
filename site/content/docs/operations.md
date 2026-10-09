@@ -33,16 +33,11 @@ Failover is not a special code path — it is the crash-recovery path. Lease
 expires, another instance claims at `epoch + 1`, resumes via replay. That is the
 payoff of building on replay: HA costs one lease table and an epoch column.
 
-The claim is **initiated by the sweep**, and the subject matters. Fencing makes
-takeover safe and replay makes it correct, but neither makes it *happen*: every
-other resume has an event-shaped driver — an inbound message, a fired timer, an
-operator — so a run crashed mid-step with none of those pending would have no
-driver at all, appear in no backlog (it concluded nothing, and its wake was
-already consumed), and wait forever while looking exactly like work in progress.
-The sweep's recovery pass is what closes that: an expired lease that still
-names an owner is precisely "an instance died
-holding this run", because every clean exit — sealed, failed, suspended —
-releases. See [the sweeper](#the-sweeper).
+The claim is **initiated by the sweep**. A run crashed mid-step with no message,
+timer or operator pending has no other driver and appears in no backlog. An
+expired lease that still names an owner means "an instance died holding this
+run", because every clean exit — sealed, failed, suspended — releases. See
+[the sweeper](#the-sweeper).
 
 ### A live run renews; only a dead owner's lease expires
 
@@ -53,7 +48,8 @@ run would be taken over and the original fenced mid-flight, having already done
 real work.
 
 So the runtime renews while a run executes, at a third of the TTL, and stops the
-moment execution returns. Set the TTL with `RuntimeBuilder::lease_ttl`: it bounds
+moment execution returns. A renewal the store fails to answer is logged and
+retried at the next period; renewal stops only when the lease is gone. Set the TTL with `RuntimeBuilder::lease_ttl`: it bounds
 how long a **crashed** owner strands its runs, not how long a run may take.
 
 Anything under two seconds is refused at build. Both stores keep expiry in whole
@@ -93,16 +89,13 @@ while the next `acquire` starts again at 1 — so a writer already fenced at 2
 outranks the new owner and the mechanism inverts. Releasing marks the row expired
 instead, and the next takeover advances the epoch as any takeover does.
 
-**Releasing is something a run does, never something a shutdown does.** The
-intuition runs the other way — hand the leases back on the way out and the next
-instance starts immediately — and it is wrong in a way the fence does not cover.
-A release says *takeover is safe now*. For a run still inside a tool call it is
-not: the next owner replays, finds the announced effect with no outcome, and
-performs the call a second time while the first is still in flight. The epoch
-bump stops the second **append**; nothing stops the second **send**. So an
-instance on its way out finishes what it can and leaves the rest to expire —
-which is the one signal the recovery sweep reads as *an instance died holding
-this run*, and is exactly what a run cut short by a shutdown is.
+**Releasing is something a run does, never something a shutdown does.** A
+release says *takeover is safe now*; for a run still inside a tool call it is
+not, because the next owner would perform the call a second time while the
+first is in flight — the epoch stops the second **append**, not the second
+**send**. An instance on its way out finishes what it can and leaves the rest
+to expire, which the recovery sweep reads as *an instance died holding this
+run*.
 
 ## Stopping an instance {#stopping-an-instance}
 
@@ -231,17 +224,9 @@ hashes both Secrets as the cluster holds them), and otherwise needs
 exactly-once, chaining. They are storage invariants deliberately — application
 logic can be bypassed by the next caller, a constraint cannot.
 
-A second backend is where that stops being true, and the mechanism is worth being
-precise about. The new store is written from the same prose as the first. It
-encodes two guarantees exactly and something *nearly* like the third. Nothing
-catches it, because the suite that proves the runtime correct runs against the
-embedded store, and the new one gets whatever tests its author wrote — which are the
-tests for the parts they were already thinking about. The invariant they misread
-is by construction the one with no test.
-
-So the contract is written once, in `testkit::conformance`, and every backend is
+The contract is written once, in `testkit::conformance`, and every backend is
 run against the same battery. It ships rather than living in `tests/` because an
-embedder bringing their own store needs it for the same reason.
+embedder bringing their own store needs it too.
 
 Two design choices in the battery:
 
@@ -298,42 +283,20 @@ no run served twice, none skipped.
 
 The tie-break on run id is contract rather than detail. Both backends keep
 whole-second timestamps, so runs written back to back share one; without a
-tie-break the store may order them differently between two calls, and a cursor
-landing inside the tie drops or duplicates whichever moved. From a single page
-both look like a healthy listing.
-
-The page boundary is also what makes the method checkable: a signature with no
-boundary has no boundary to get wrong, so a battery can pin nothing about it —
-and a listing that returns everything makes its one caller read every run's
-complete journal on every request.
+tie-break a cursor landing inside the tie drops or duplicates whichever moved.
 
 #### A sequential test cannot detect a race
 
-Sequential checks prove the *result* is right, not that it is right for the right
-reason — a `SELECT` then `INSERT` returns the correct answer every time it is
-called one at a time.
+So correlation also has a racing check — eight racers across four keys, because
+two concurrent callers serialise often enough that dropping the arbitrating
+constraint goes undetected — and mutation testing proves the check can fail. A
+race check corroborates; the constraint in the store is what makes absence
+real. redb admits one writer at a time and passes trivially.
 
-So correlation also has a racing check, and it races **hard**: two concurrent
-callers serialise often enough that dropping the constraint which arbitrates
-correlation goes undetected. Eight racers across four keys catches it on every
-run, and mutation-testing the battery is what proves the check can fail.
-
-* **A race test that does not reliably race reports green** — an untested
-  guarantee wearing a test's clothing.
-* **A race check corroborates, it does not prove.** Passing means no interleaving
-  found a violation; the constraint in the store is what makes absence real.
-
-A store that serialises internally — redb admits one writer at a time — passes
-trivially and correctly, having no race to lose. That is not a reason to skip it:
-the check exists for the backend where the race is real.
-
-A comment claiming a count-and-insert serialises "inside the row lock the write
-takes" reads as sound, and no such lock exists for inserts of different rows. So
-the guards suite **races every store-side concurrency claim against a real
+The guards suite **races every store-side concurrency claim against a real
 PostgreSQL**: quota admission, a tool's rate ceiling across two planes,
 authority draws, task claims, timer sweeps, case correlation and case-state
-writes. A claim about concurrency that has only been read is a claim; raced, it
-is evidence.
+writes.
 
 ### Postgres
 
@@ -433,10 +396,6 @@ laptop's container would be worse than quoting none.
 
 ## The sweeper
 
-Until something runs on a clock, a deadline is a number in a table and an
-unclaimed event is a row nobody reads. That is the failure this runtime is built
-against — not a crash, but a silence.
-
 One tick, several findings — not all of them alarms, and the first two routine
 healing that still means something died. Recovery runs first, because an
 abandoned run may be one step from meeting a deadline the passes below would
@@ -477,7 +436,8 @@ The witness pass is the one phase whose counterparty is somebody else's server,
 which is why it runs last: a slow witness must not delay a breach or a
 recovery. `cosignatures` is evidence accumulating — the system working, like
 `timers_fired`. `witness_shortfall` is a plane running with fewer independent
-parties vouching for its history than the deployment declared it required, and
+parties vouching for its history than the deployment declared it required —
+counted by distinct witness key, so one witness listed twice counts once — and
 nothing else will clear it. `witness_integrity` is a witness refusing on
 integrity grounds — the log shrank, forked, or claimed growth the witness
 could not verify — and it is reported even when the quorum was **met**,
@@ -563,11 +523,8 @@ asking why.
 ### A finding has to be findable
 
 Every conclusion this runtime reaches is queryable by whoever must clear it,
-without them already knowing which run, case or matter to open. A control that
-notices and does not deliver is closer to none than to half, because it also
-manufactures the belief that somebody was told.
-
-Each backlog is a question, not an id:
+without them already knowing which run, case or matter to open. Each backlog is
+a question, not an id:
 
 ```sh
 curl -H "$AUTH" 'https://plane/runs?outcome=quarantined'   # history you cannot trust
@@ -580,13 +537,9 @@ curl -H "$AUTH" 'https://plane/push'                       # receivers that stop
 
 All six page the same way: `truncated` says whether there is more, and the
 order puts the item you are most likely to want first — newest for runs and
-cases, longest-overdue for obligations. **Ascending order is only safe on a
-listing that drains.** A bounded query taken oldest-first is a page that stops
-changing: if nothing ever leaves it, a plane whose backlog exceeds one page
-returns the same rows forever and the thing that just happened is the one that
-never appears. Obligations are ordered that way because acknowledging a breach
-removes it — the head of that page is not permanent, and `POST
-/obligations/acknowledge` is what moves it.
+cases, longest-overdue for obligations. Oldest-first is safe for obligations
+only because the listing drains: `POST /obligations/acknowledge` removes a
+breach from it.
 
 `/runs` reads an index **derived** from the `RunConcluded` record inside `append`,
 in the same transaction, so it rebuilds from the chain and is never an
@@ -604,18 +557,13 @@ Exhaustion remains structured in the journal and in operator push events, so
 automation can inspect the exact ceiling without parsing `reason`.
 
 `/cases` defaults to `escalated`. An unrecognised status is a `400` rather than
-a quiet fallback — answering *what is escalated* with a list of healthy cases
-reads as an empty backlog, which is the most reassuring possible way to be
-wrong.
+a quiet fallback.
 
-`/obligations` takes no status. A breach is the only obligation state anybody
-has to be told about; the rest are either still watched by the sweep or already
-answered. It reads the obligation's own row rather than the case's status, so it
-still answers after the matter is closed — closure is when people stop looking,
-which is when the record has to stand on its own.
+`/obligations` takes no status: it lists breaches. It reads the obligation's own
+row rather than the case's status, so it still answers after the matter is
+closed.
 
-**It lists breaches nobody has accounted for, and that qualifier is what makes
-it a backlog rather than a ledger.** `POST /obligations/acknowledge` names the
+**It lists breaches nobody has accounted for.** `POST /obligations/acknowledge` names the
 case and the obligation and records who looked, taken from the authenticated
 caller rather than the body. The obligation stays `Breached` — what ends is the
 question, not the fact — and the account is readable afterwards on
@@ -721,12 +669,9 @@ before you use it:
 - **Your name is on it.** The record is the same `EffectReconciled` a probe
   writes, plus `asserted_by`. "The provider told us" and "somebody asserted it"
   are different evidence and the chain keeps them apart.
-- **The value you supply is untrusted.** Every other output in this runtime is
-  labelled by the effect that produced it; there is no effect here, and you are
-  not the provider that returned it. So it takes the conservative point of the
-  lattice, and a run that needed that output to be trusted will be refused at
-  its next gate and unwind. That is the honest ending — the alternative would
-  make this the one place in the design where a person declassifies by typing.
+- **The value you supply is untrusted.** No effect produced it, so it takes the
+  conservative point of the lattice, and a run that needed that output to be
+  trusted is refused at its next gate and unwinds.
 
 **3 — Hand it back, or write it off.**
 
@@ -775,10 +720,8 @@ Admission keys are kept until you retire them:
 agentplane forget-admissions --store ./journal.redb --older-than-days 30
 ```
 
-**The window has no default, and that is the decision.** Retiring a key reopens
-the door it closed, so a window shorter than your emitter's retry horizon admits
-a second run on a timer. Runtimes that bound this automatically have to guess at
-that horizon; nothing here can know it.
+**The window has no default.** Retiring a key reopens the door it closed, so a
+window shorter than your emitter's retry horizon admits a second run.
 
 The index is a row per admitted message and grows with inbound volume — a size
 your database monitoring already reports. The verb prints what it retired, so a
@@ -829,17 +772,13 @@ runs with: every case's blob digests read **through that case's own handle** —
 the unit-scoped address the plane wrote to, opened through the sealing
 envelope when a ring is wired — then re-hashed (`get`, never `has` — presence
 without integrity passes over altered bytes), and sealed state proven to open
-with the plaintext dropped on the spot. Reading any other way would hold the
-references against a store the deployment does not use: on a sealed plane,
-every intact envelope would report as corrupt, the one verdict that pages. The
-report's verdict has four answers, and the second is the one worth trusting the
-tooling for:
-**intact**; **erased by design** — a tombstone or a destroyed key is retention
-reporting itself, counted and never a finding; **lost**, which pages; and **the
+with the plaintext dropped on the spot. The report's verdict has four answers:
+**intact**; **erased by design** — a tombstone, or a destroyed key on a case
+whose erasure record accounts for it, counted and never a finding; **lost**,
+which pages — a key gone with no erasure record is lost, since a key service
+cannot tell a destroyed key from one it never held; and **the
 bytes are gone and their tombstone does not read**, which pages too — the
-erasure may well have run, and nothing left in the store can say so. A drill
-that alarmed on erasure would teach you its findings are noise, and that is how a real loss gets ignored
-six months later.
+erasure may well have run, and nothing left in the store can say so.
 
 The same rehearsal has a CLI verb for deployments that never write Rust:
 `agentplane drill` opens the store the flags name, prints the report as JSON,
@@ -856,13 +795,9 @@ a check shows both, because that is the run an investigator opened the report
 for.
 
 Read `warrants` with `unadmitted`, its complement: **every run that verified is
-in exactly one of the two**. A run with no admission record produces no warrant,
-and reported alone the warrant list is shorter than the run list with nothing
-saying why — so the runs that have no answer are listed with the outcome they
-concluded under. Some are unadmitted by design: the sweeper opens a run of its
-own for decisions it takes without a request. What the pair buys is that *what
-authorized this run* is a question the report answers for all of them, including
-with "nothing did".
+in exactly one of the two**. A run with no admission record is listed under
+`unadmitted` with the outcome it concluded under — the sweeper's own runs, for
+one.
 
 `audit` prints the report as JSON and exits non-zero on findings — but **not** on
 `not_checked`, which is a separate list and the one worth reading. An audit given
@@ -881,8 +816,8 @@ agentplane audit --store ./journal.redb \
 off by default, because history written before signing was configured is
 legitimately unsigned. `--prior` is the deletion check: the report's own
 `current` field, saved from an earlier pass, and a log that shrank or forked
-since then is a finding. The loop is deliberate — each audit prints the
-checkpoint the next one checks against.
+since then is a finding — each audit prints the checkpoint the next one checks
+against.
 
 Both verbs default to every sealed outcome. `--outcome` narrows and `--limit`
 bounds, and reaching the limit is never a pass. An **audit** records it in the
@@ -1032,8 +967,8 @@ scheduler reads the status and nothing else:
 | Status | Means |
 |---|---|
 | `0` | Done, and the answer is yes. |
-| `1` | A finding or a negative answer: a failed run, an audit, verify, `drill` or `policy check` finding, a grant `grants` found unused, a strict replay that diverged, `attention` finding something, a `content check` a rule would refuse, a `halt --lift` / `hold --lift` / `rearm` that found nothing standing, a `decide` approval of a proposal the terminal cannot show or naming a `--digest` the task no longer holds, an invalid manifest under `validate`, a `history` of a run the store does not hold. |
-| `2` | Usage: the command as typed cannot be carried out — a flag, argument or input this binary refuses. `clap`'s own parse errors use it too. |
+| `1` | A finding or a negative answer: a failed run, an audit, verify, `drill` or `policy check` finding, a grant `grants` found unused, a strict replay that diverged, `attention` finding something, a `content check` a rule would refuse, a `halt --lift` / `hold --lift` / `rearm` that found nothing standing, a `decide` approval of a proposal the terminal cannot show or naming a `--digest` the task no longer holds, an invalid manifest under `validate`, a `history` of a run the store does not hold; and a refusal the plane made on purpose — four-eyes, a policy denial, a task already answered or held, a run that cannot be unwound — with nothing recorded. |
+| `2` | Usage: the command as typed cannot be carried out — a flag, argument or input this binary refuses; an unknown run, task, tenant or provider; a plane that will not assemble from the manifest and flags. `clap`'s own parse errors use it too. |
 | `3` | A `run` or a resuming `replay` stopped to wait, for a person, a timer or an event. A strict replay of a waiting run that reproduces the wait is verified, `0`. |
 | `4` | Operational: a store, a witness, the network or a file could not be used. |
 | `5` | Partial: `--limit` truncated what was read — `audit`, `export`, `tasks`, `waiting`, `halt list --lifted` and `hold list --released`, each of which also prints `truncated` — `policy check` could evaluate nothing, `grants` met an incomplete export or calls it could not read, `subject` had its scan cut or met a run it could not read, or a strict replay met a run it could not replay (and none diverged). |
@@ -1076,16 +1011,11 @@ about it is in the journal or in the report, so *how often did policy stop a run
 from starting* is a question a clean report answers with silence rather than with
 zero.
 
-Manufacturing a run to record its own refusal would mean a chain, a seal and a
-Merkle leaf for something that never executed, and would let a caller grow the
-store by being denied. Every refusal **after** admission is journaled, which is
-why an effect-level denial has a `PolicyDenied` record and this one does not.
-
-The number lives in the `agentplane.policy.denials` metric and
-`agentplane.policy.denied` telemetry, both carrying the action, with the
-durability of whatever collects them. It is deliberately not in `not_checked`:
-that list is what *this* audit could not check, and an entry in every report ever
-produced would train you to skip it.
+Recording it would give a caller a way to grow the store by being denied. Every
+refusal **after** admission is journaled, which is why an effect-level denial
+has a `PolicyDenied` record and this one does not. The number lives in the
+`agentplane.policy.denials` metric and `agentplane.policy.denied` telemetry,
+both carrying the action, with the durability of whatever collects them.
 
 Auditing open runs (`--outcome failed`, say) is not an alarm: an open run has
 no Merkle leaf, so it is checked on chain and signatures and the report says in
@@ -1100,12 +1030,9 @@ resume, so whether the group's members were taken or taken back is permanently
 undecided — a state no honest writer produces.
 
 For a sealed run, the log's leaf is held to the **verified chain's own head**,
-before the tree math and independent of any checkpoint race. A truncated but
-internally consistent prefix of a sealed run verifies on its own, and the log's
-genuine leaf verifies against the genuine tree — so an audit that checked each
-half without holding them to each other was verifying two halves of two
-different claims. A mismatch is a finding: records were removed or replaced
-after sealing, and the served history is not the one the checkpoint commits to.
+before the tree math and independent of any checkpoint race, so a truncated but
+internally consistent prefix does not pass. A mismatch is a finding: records
+were removed or replaced after sealing.
 
 `verify` is the drill, and it takes the file alone. It re-seals every record
 through the same function the store sealed with — so agreement is evidence about
@@ -1117,11 +1044,9 @@ and compares the root against the checkpoint in the header. With `--key` it
 also verifies signatures, strictly: inside a signed history, an unsigned record
 is the one an attacker who cannot sign would add.
 
-That last check is the one worth understanding. Delete a whole run from an
-export and every remaining chain still verifies perfectly: a chain links records
-*within* a run and knows nothing about its neighbours. Only the rebuilt tree
-notices the missing leaf. It is also the reason each run block carries its log
-position at all — without it an export is a transcript rather than evidence.
+That last check is what catches a whole run deleted from an export: every
+remaining chain still verifies, and only the rebuilt tree notices the missing
+leaf.
 
 Exit codes: findings fail, `not_checked` does not. A pass with no public key has
 established less rather than failed, and the report says which.
@@ -1136,16 +1061,12 @@ from the grounds. Beside the report is an `anchor` object:
 | `unreached` | witnesses asked that gave no anchor, and why |
 | `split_view` | witnesses that disagree, which fails the command |
 
-A clean report against a cosigned anchor and a clean report against a
-checkpoint somebody typed are different statements; the anchor is what
-distinguishes them. `held_to` on the report names the checkpoint itself — the
-anchor says how it was obtained, and never repeats the value.
+`held_to` on the report names the checkpoint itself; the anchor says how it was
+obtained, and never repeats the value.
 
 **Name a second `--witness`.** Two witnesses holding one tree size with two
-different roots is the event witnessing exists to detect, and the one an
-operator auditing their own plane cannot find alone: every other check compares
-the store against something the store produced. Witnesses at *different* sizes
-are not a split view — they observed at different times.
+different roots is a split view, which no check against the store alone can
+find. Witnesses at *different* sizes are not a split view.
 
 **How fresh the anchor is.** A witness signs a timestamp with every
 cosignature. `audit --max-checkpoint-age SECS` judges each witness key's latest
@@ -1156,7 +1077,9 @@ been cut without a witness noticing, not *whether* they were. A plane keeps the
 times fresh by declaring `serve --witness-submit URL --witness-key NAME=KEY
 --log-key NAME=PATH --witness-interval SECS`: the sweeper re-submits an
 unchanged checkpoint once the interval passes, an interval shorter than
-`--sweep-every` is refused, and one with no witness is refused at build. The
+`--sweep-every` is refused, and one with no witness is refused at build. One
+`--witness-submit` URL given twice is refused, since a quorum counts distinct
+witnesses. The
 second reader checks the same cosignatures on a note anchor under its own
 `--witness-key NAME=BASE64`, and judges freshness under `--max-checkpoint-age
 SECS` (with `--now RFC3339` for a fixed clock) by the same rule; a time whose
@@ -1190,9 +1113,10 @@ a request for exactly those conclusions.
 
 It rebuilds the case layer beside the journal: every matter is queryable again
 — `case`, correlation, the status worklist, the deadline sweep, the blob links
-erasure walks, and the legal holds that stop a retention pass from erasing a
-matter — and the conformance battery holds the import to every one of
-those read paths on both backends. A store
+erasure walks, the legal holds that stop a retention pass from erasing a
+matter, and the erasure record that keeps an erased case erased — and the
+conformance battery holds the import to every one of those read paths on both
+backends. A store
 that already holds a case refuses it: a restore rebuilds a case layer, it does
 not merge one.
 
@@ -1209,59 +1133,30 @@ refusing a write, or a rebuilt hash missing the file's — leaves a partial stor
 that a retry refuses as already holding the run: discard it and restore into a
 fresh one.
 
-It replays the ordinary `append` path rather than writing rows, and that is the
-safety argument: `append` maintains six derived indexes — case, exactly-once,
-outcome and its ordering counter, and both halves of the discovery index — and a
-restore that rebuilt five of them would produce a store that reads perfectly
-until somebody queries the sixth.
+It replays the ordinary `append` path rather than writing rows, so every
+derived index `append` maintains is rebuilt. Runs are **sealed in log-index
+order**, because that order *is* the Merkle log, and `epoch` is **carried, not
+re-derived**, because it is inside the hashed body.
 
-Two details make that reproduce the original bytes rather than similar ones.
-Runs are **sealed in log-index order**, because that order *is* the Merkle log —
-seal them in file order and the same leaves give a different root. And `epoch` is
-**carried, not re-derived**: it is inside the hashed body, so a run that ever
-changed hands would rehash under a single fresh lease, and those are exactly the
-runs a failover produced. Both backends fence only when a lease row exists, so
-restoring into a store with no leases writes each record under its own epoch.
-
-**The fencing token picks up where the history left off.** The epoch is a
-fencing token, and the lease table that normally holds its high-water mark is
-store-local state an export does not carry — so a restored run has records
-reaching epoch 7 and no lease row at all. A first lease is therefore issued one
-past the highest epoch the run's **own journal** records, not at 1. Restarting
-at 1 would give a run that had already changed hands a second ownership period
-wearing the number of its first, and the two would be indistinguishable in the
-only durable record of either — which matters beyond tidiness, because quota
-settlement decides which pass a spend belongs to by matching that number. The
-rule is checked in the store conformance battery on both backends.
-
-What it cannot see is an epoch that was **issued and never written under**: a
-lease taken by an owner that died before appending leaves no record, so nothing
-durable knows the number was handed out. It bounds every epoch that ever wrote,
-which is every epoch that can conflict with the rebuilt history. The rest is the
-requirement every failover already has and the runbook owns — **the old
-deployment must not reach the restored store.**
+**The fencing token picks up where the history left off.** A first lease on a
+restored run is issued one past the highest epoch the run's **own journal**
+records, not at 1, so a fencing token cannot go backwards across a restore. An
+epoch issued and never written under leaves no record and is not seen, so
+**the old deployment must not reach the restored store.**
 
 What does not survive is named in the report rather than left to be discovered.
 
-**A restored wait is armed by nothing, and this is the entry that costs work.**
-`RestoreReport::awaiting` lists the runs whose history ends in a wait, as ids
-rather than a count, because each one needs an act. The wait itself is
-journaled — `RunSuspended` carries the instant, the kind and the correlation —
-but what makes a wait *happen* is a row in a store the export does not carry:
-a timer, a subscription, and any worklist row the wait opened. So a restored
-suspended run has no timer to fire and no subscription to match, and because it
-released its lease cleanly when it suspended, the recovery pass does not see it
-either. Nothing in the system names it.
+**A restored wait is armed by nothing.** `RestoreReport::awaiting` lists the
+runs whose history ends in a wait, as ids. The wait is journaled, but its timer,
+subscription and worklist row live in stores the export does not carry, and the
+run released its lease when it suspended, so the recovery pass does not see it
+either.
 
-**Resuming it repairs it**, and not by new machinery: the runtime already treats
-an announced-but-unarmed wait as repairable, because a crash between the
-announcement and the registration produces exactly this state. A resume replays
-to the wait, finds no terminal record, and re-arms the timer, re-subscribes and
-re-opens the task row from the journal — `until` derives from journaled reads,
-so the instant is the one the original recorded. `restore` cannot do it: a
-resume runs the agent's own code and a restore holds stores. So the runbook step
-is *resume every run in `awaiting`*, and a plane that skips it has restored a
-history and not the work.
+**Resuming it repairs it.** A resume replays to the wait, finds no terminal
+record, and re-arms the timer, re-subscribes and re-opens the task row from the
+journal, at the instant the original recorded. `restore` cannot do it — a
+resume runs the agent's own code — so the runbook step is *resume every run in
+`awaiting`*.
 
 **Four layers are not in the export at all**: the worklist and the decisions
 recorded against it, inbound events nobody claimed, webhook registrations with
@@ -1294,30 +1189,16 @@ let plane = planes.cross(&caller, &target, "INC-42: stuck settlement").await?;
 ```
 
 `Planes::cross` hands back the plane only once the crossing is on that tenant's
-record. That ordering is the control, and making it a door rather than a step is
-what makes it one: a break-glass that serves first and records best-effort works
-exactly as well when its own evidence is lost, which is the state an incident is
-most likely to produce.
-
-The whole `Caller` goes in rather than its actor, roles and tenant separately,
-because those are one fact — who authenticated. Passed apart, a handler can
-record one operator's name against another's crossing, and the record is written,
-signed, and wrong.
+record; if the record cannot be written, nothing is served. The whole `Caller`
+goes in, so the record names who authenticated.
 
 The ordinary lookup, `Planes::get`, takes the same `Caller` and serves **its**
-tenant. That is what leaves `cross` as the way to reach another one: a signature
-taking a bare tenant id cannot tell *mine* from *somebody else's*, so it serves
-both and the difference lives in whether the handler remembered which to pass.
-The narrow claim worth making is that no path reaches another tenant's plane by
-accident, because none can name one — not that a cross-tenant read is
-impossible, since an embedder writing its own `Authenticator` decides what a
-credential means and can mint a `Caller` for any tenant. That seam is where a
-deployment defines identity; it is a deliberate act rather than a forgotten step.
+tenant, so no path reaches another tenant's plane by accident. An embedder
+writing its own `Authenticator` decides what a credential means and can mint a
+`Caller` for any tenant; that seam is where a deployment defines identity.
 
-`cross` is what an admin surface should use: it records the crossing and hands
-back the plane in one call, so no ordering is left to the caller.
-`record_break_glass` is for an embedder recording a crossing they made some
-other way.
+`cross` is what an admin surface should use. `record_break_glass` is for an
+embedder recording a crossing they made some other way.
 
 Same-tenant crossings are refused, because recording routine access as
 break-glass buries the real ones. A tenant this process does not serve is
@@ -1331,52 +1212,31 @@ curl -H "$AUTH" 'https://plane/runs?outcome=broke-glass'
 ```
 
 `GET /runs/{run}` on one answers `status: "broke-glass"`, `decided_by` with the
-operator, and `reason` with the words they gave. Both halves, because an
-incident review asks two questions and a surface that answers only *why* sends
-the reader to the export for the name.
+operator, and `reason` with the words they gave.
 
 Who may pull it is your policy engine's decision, not this crate's.
 
 ### One matter, one scan
 
-*Show me everything about this matter* is the question a regulated deployment
-asks, and there are two ways to answer it. Listing the case's runs and reading
-each is a join whose cost grows with the case's life — and it **misses** every
-record written by a run the case does not own.
-
-A sweep is exactly that run. One tick may escalate several cases and belongs to
-none of them, so a per-run walk never reaches the record explaining why a case
-was escalated — which is the only reason for writing it down.
-
-So the journal carries the case on the record and indexes it:
+Listing a case's runs and reading each **misses** every record written by a run
+the case does not own — a sweep that escalated it, for one. So the journal
+carries the case on the record and indexes it:
 
 ```rust
 let history = store.case_history(case, 200).await?;
 ```
 
-One range scan, tenant-first like every other key here, so a query that forgets
-the predicate returns nothing rather than another customer's matter. Both
-backends are held to it by the same conformance battery, which checks the two
-halves separately — that the scan finds this matter's records, *and* that it
-returns no other's. Either alone passes for the wrong reason: a scan returning
-nothing satisfies the second, and one returning everything satisfies the first.
+One range scan, tenant-first like every other key here. The conformance battery
+holds both backends to finding this matter's records *and* returning no other's.
 
 `GET /cases/{id}` includes it, with `history_truncated` when the bound bit,
 because a shortened list is shaped exactly like a complete one.
 
 ### The sweep writes its own history
 
-The sweeper makes the plane's most consequential *automated* decisions: it
-breaches an obligation, escalates a case, expires a person's task. Nothing asked
-it to — that is the point of it — so there is no run whose history explains why
-the state changed.
-
-Without a record, *why is this case escalated* is answerable only from the
-resulting state, and state cannot distinguish **the sweep breached this at
-02:00** from **somebody set it**. No human was present to remember which.
-
-So a tick that decides anything writes its decisions into a **sealed run of its
-own**: `Swept { subject, action, detail }`, one per action, with a typed action
+The sweeper breaches obligations, escalates cases and expires tasks with no run
+asking it to. A tick that decides anything writes its decisions into a **sealed
+run of its own**: `Swept { subject, action, detail }`, one per action, with a typed action
 rather than a message. It inherits the chain, the per-record signature and the
 Merkle inclusion every other run has, so the external audit tool checks it
 without being taught what a sweep is.
@@ -1389,8 +1249,7 @@ if let Some(run) = report.record {
 }
 ```
 
-**A quiet tick writes nothing.** A healthy plane sweeps constantly, and a Merkle
-log filling with evidence of inactivity is where the somethings hide.
+**A quiet tick writes nothing.**
 
 **A breach is applied first and noted after; a warning or an expiry is noted
 first and corrected if it lost.** A breach is conditional: a run that met the
@@ -1406,29 +1265,17 @@ a subject's `deadline_warned` or `task_expired` as withdrawn when a
 `not_applied` follows it. An expiry that meets a person's answer also settles
 the task to that answer, so the next tick does not meet it again.
 
-Two things are deliberately *not* in it, and both are worth knowing. Dead-lettered
-events are counted rather than named, because the event store reports how many
-aged out and not which — they stay in the report and the emitted event, and
-there is deliberately no `SweptAction` for them, because a variant nobody
-constructs reads as a capability. And a sweep run is not a *plan*: it seals as
-`swept`, never as `succeeded`, because a tick that breached forty obligations is
-not a plan that completed. `GET /runs/{run}` answers `swept` with no reason —
-what it decided is on its records, not in a one-line summary.
+Dead-lettered events are not in it: the event store reports how many aged out
+and not which, so they are counted in the report and the emitted event. A sweep
+run seals as `swept`, never as `succeeded`; `GET /runs/{run}` answers `swept`
+with no reason — what it decided is on its records.
 
 ### A capped tick says it was capped
 
 Each sweep takes a bounded batch — 128 timers, 512 obligations, 512 expired
 tasks, 128 stalled deliveries, and 32 abandoned runs, the smallest because
-recovering one executes live from the frontier — so one tick is bounded. A
-sweeper still working through a backlog is a sweeper not noticing the *next*
-obligation, which is the failure the whole mechanism exists against.
-
-The hazard is that a bounded query returns a list shaped exactly like a complete
-one. A tick that handled its cap and a tick that handled everything produce the
-same counters, and they are the two states most worth telling apart: the first
-means the backlog is growing while the report looks ordinary.
-
-So `SweepReport::saturated` names which sweeps came back full, and
+recovering one executes live from the frontier — so one tick is bounded.
+`SweepReport::saturated` names which sweeps came back full, and
 `needs_attention()` is true when any did. A saturated tick means *at least* the
 cap was waiting — never that the cap was all there was.
 
@@ -1461,49 +1308,30 @@ only on a 2xx, because that is the only thing a cursor means.
 
 ### The runtime does not measure durations
 
-Ambient clocks are lint-denied with three named escapes, each for a value that
-gets journaled or is store metadata. A fourth escape *for instrumentation* would
-end the rule, because timing is the most plausible-sounding reason anyone reaches
-for a clock. And a replayed run would re-measure durations belonging to calls it
-never made, so "effect latency by driver" would average network time with journal
-reads — the failure `agentplane.effect.replayed` exists to prevent, arriving
-through the metrics door.
-
-Durations are therefore derived from spans, by the collector. The spans carry the
+Ambient clocks are lint-denied outside named escapes for values that get
+journaled or are store metadata, and a replayed run would re-measure durations
+belonging to calls it never made. Durations are derived from spans, by the
+collector. The spans carry the
 mode and the replay flag, so a collector can compute latency *and* exclude
 replays, which an in-crate histogram could not.
 
 ### Counters are emitted; gauges are observed
 
-"Open cases" cannot be an increment-on-open, decrement-on-close counter. A crash
-between the state change and the emission loses a decrement permanently, and the
-dashboard slowly invents open cases that do not exist — *plausibly*, which is
-worse than obviously.
+Gauges come from a census query against the store, never from
+increment/decrement counters a crash can unbalance, and the sweeper emits them
+on each tick. A gauge is never read from a `limit`-bounded query, which would
+flatten at the page size.
 
-So gauges come from a census query against the store, and the sweeper emits them:
-it already runs periodically and already takes its `now` as a parameter, so no
-clock is read. The census is also the only consumer of a case's `opened_at`, and
-the reason that column exists — a count cannot distinguish ten cases open for an
-hour from ten open for a month.
-
-A gauge must never be read from a `limit`-bounded query. That is why `census`
-exists rather than `by_status(..).len()`: a paged count rises, flattens at the
-page size, and looks like a plateau exactly when it has become a backlog.
-
-**A counter cannot report a backlog, and the difference bites hardest on the one
-that matters.** `agentplane.quarantines` counts the *moment* a run is set aside.
-It is monotonic and it lives in the process, so after a restart it reads zero
-over a backlog of forty, and a backlog that stopped growing reads exactly like
-one that was cleared. The number to alert on is
+**A counter cannot report a backlog.** `agentplane.quarantines` counts the
+*moment* a run is set aside, in the process, so after a restart it reads zero
+over a backlog of forty. The number to alert on is
 `agentplane.runs.quarantined` — the level, counted from the store's outcome index
 on every sweep, which is the same index `GET /runs?outcome=quarantined` pages.
 
 It falls when somebody answers one — see
-[Answering a quarantine](#answering-a-quarantine). What it must not be read as
-is *risk retired*: an abandoned run leaves this count while whatever it left in
-the world stays exactly where it was, which is why the doubt is delivered as an
-`agentplane audit` finding derived from the journal rather than as a status
-somebody can clear.
+[Answering a quarantine](#answering-a-quarantine). It is not *risk retired*: an
+abandoned run leaves this count while what it left in the world stays, and the
+doubt becomes an `agentplane audit` finding.
 
 ### Two rules, both guarded
 
@@ -1512,11 +1340,9 @@ error embeds the allowed and used figures; a label carrying those is one time
 series per distinct budget, which is how a metrics backend falls over. Every
 dimension comes from an `as_str()` accessor.
 
-**The catalogue is not a wish list.** A declared-but-unemitted event leaves an
-empty panel, which at least looks wrong. A declared-but-unemitted *counter* reads
-as a hard zero — indistinguishable from "this never happens" — so an operator
-concludes the system is healthy from a number nobody wired up.
-`tests/guards/layering.rs` fails the build if a catalogue entry has no emitter.
+**The catalogue is not a wish list.** A declared-but-unemitted counter reads as
+a hard zero; `tests/guards/layering.rs` fails the build if a catalogue entry has
+no emitter.
 
 ## Observability
 
@@ -1553,31 +1379,20 @@ An agent's name and a conversation's identity are `gen_ai.agent.name` and
 generic tooling reads. The conversation is this plane's **case**, which is also
 what the A2A surface answers `contextId` with.
 
-`gen_ai.response.model` is the one attribute a request cannot stand in for: it is
-the provider's own word about which weights served the call, and it differs from
-the request whenever an alias resolves, a deployment is moved under a pinned name,
-or a gateway routes elsewhere. It is absent where the wire does not say —
-Bedrock's `Converse` names no model on the way back — and it is never filled in
-from the request, which would report that a substitution had been ruled out when
-nothing looked.
+`gen_ai.response.model` is the provider's own word about which weights served
+the call. It is absent where the wire does not say — Bedrock's `Converse` names
+no model on the way back — and never filled in from the request.
 
 `error.type` carries the class of fault on any attempt that failed — `timeout`,
-`refused`, `rate_limited`, `metered`. `agentplane.outcome` says *whether* an
-attempt succeeded and makes a failure countable; this says what went wrong, so
-"which driver fails how" is a group-by rather than a search through rendered
-prose. Without it, a dashboard built on the convention reports a plane with no
-failures at all.
+`refused`, `rate_limited`, `metered` — beside `agentplane.outcome`, which says
+*whether* it succeeded.
 
-`agentplane.effect.key` is the join between a trace and the evidence. Everything
-else on the span names a category; this is the journal's own identity for that
-attempt, and `GET /runs/{run}/history` serves records under it. It **names** the
-attempt without carrying what it sent — which is the claim worth making, since a
-digest is still a commitment to the values it was taken over.
+`agentplane.effect.key` is the join between a trace and the evidence: the
+journal's own identity for that attempt, under which `GET /runs/{run}/history`
+serves records. It names the attempt without carrying what it sent.
 
 Effects that are not GenAI operations — reading the clock, arming a timer,
-writing case state — carry no such attribute at all. That is deliberate:
-labelling them would make the attribute useless to the tooling that keys on it,
-which is the whole reason to emit it.
+writing case state — carry no `gen_ai.operation.name`.
 
 ### What is deliberately never emitted {#no-content-in-traces}
 
@@ -1636,9 +1451,8 @@ Further decisions worth knowing:
   siblings that silently reparents their work. `Instrument` is the only form that
   survives a suspension, and `tests/guards/layering.rs` bans the guard in async
   code.
-- **The vocabulary lives in `runtime::telemetry`.** A span name typed inline at
-  twelve call sites is twelve chances to drift, and telemetry drift is invisible:
-  the dashboard stops matching and nobody is told.
+- **The vocabulary lives in `runtime::telemetry`**, never typed inline at a
+  call site.
 
 Every failure that must not pass silently has its own event target:
 
@@ -1664,39 +1478,27 @@ Every failure that must not pass silently has its own event target:
 
 That list is `telemetry::LOUD_EVENTS`, and this table is checked against it:
 `tests/guards/docs.rs` fails the build if the runtime promises an event this
-page does not name, because a table headed *every* is an alerting checklist and
-a short one is read as a complete one.
-
-`tests/guards/layering.rs` fails the build if any of those has no emitter, and
-`tests/process/telemetry.rs` asserts on what a subscriber actually received
-rather than on what the source contains — an instrumentation test that greps is checking the
-author's intent, not the runtime's behaviour.
+page does not name, `tests/guards/layering.rs` if any of them has no emitter,
+and `tests/process/telemetry.rs` asserts on what a subscriber actually
+received.
 
 ### The last mile: instrumented is not monitored
 
-Shipping no exporter is the right call for the same reason as shipping no policy
-engine, and it leaves a gap that a deployment has to close by hand. Three things
-sit in it, none of them obvious from the API docs, and
+No exporter ships, so a deployment closes three gaps by hand;
 `cargo run --example observability` is a runnable bridge that does all three and
 asserts on the result:
 
-1. **Latency must exclude replay** — and the runtime already makes this easy in
-   a way worth stating, because it is not what a reader assumes. A replayed
-   effect opens **no span at all**; it emits a `debug` *event* on the
-   `agentplane.effect` target with `replayed = true`, plus the
-   `agentplane.effects.replayed` counter. So a histogram built from *spans* is
-   clean by construction. What is not safe is keying on the **target** and
-   treating everything on it as a span: that view sees both, and it is the one
-   in which replays quietly improve your p99 in proportion to how much recovery
-   you are doing.
+1. **Latency must exclude replay.** A replayed effect opens **no span at all**;
+   it emits a `debug` *event* on the `agentplane.effect` target with
+   `replayed = true`, plus the `agentplane.effects.replayed` counter. A
+   histogram built from *spans* is clean; one keyed on the **target** sees
+   both.
 2. **Scheduling the sweep is scheduling your gauges.** Gauges come from a census
-   queried against the stores, never from increments — see below for why — so a
-   plane with no sweep loop has counters and no gauges, and nothing says so. A
-   dashboard with no data looks exactly like a plane holding nothing.
+   the sweep takes, so a plane with no sweep loop has counters and no gauges,
+   and nothing says so.
 3. **`SweepReport::needs_attention()` is the alert predicate.** It already folds
    in breaches, expiries, dead letters, saturation, failed recoveries, lost
-   evidence and an unreadable census. Re-deriving it from individual counters is
-   how the next failure mode ends up alerting on nothing.
+   evidence and an unreadable census; do not re-derive it from counters.
 
 The example's module docs carry the OTLP wiring verbatim — pinned crate
 versions, the `tracing-opentelemetry` layer, and where each of the three rules
@@ -1714,14 +1516,11 @@ agentplane serve agent.yaml \
 
 ## The operator surface
 
-Feature `http`, off by default. A library embedded in someone else's process
-should not open a port unless asked.
+Feature `http`, off by default.
 
-**There are two surfaces, and the second one matters most when the first is
-gone.** The HTTP API acts on a *running plane*; each CLI verb opens a *store*.
-On the embedded backend that division is load-bearing, because redb admits one
-writer process: a verb that opens the store is a verb that runs while the
-plane is down — which is exactly when somebody is reaching for it.
+**There are two surfaces.** The HTTP API acts on a *running plane*; each CLI
+verb opens a *store*. redb admits one writer process, so on the embedded backend
+a CLI verb runs while the plane is down, and the API while it is up.
 
 So every remedy `agentplane attention` names is a verb the CLI has, and every
 remedy `GET /attention` names is a route the API has — or, where the API has
@@ -1747,12 +1546,12 @@ not a condition.
 reopens or abandons the run afterwards; `tasks` lists the worklist and
 `decide <task> approve|reject` answers one; `acknowledge` accounts for a
 breached obligation; `cancel` stops a run the ceiling or the halt will not
-release; `rearm` revives a parked push registration. Each takes `--actor`,
-recorded as **asserted** — nothing at a terminal verified the name, and the record says so, where the same act through
-the API records `authenticated`.
+release; `rearm` revives a parked push registration. Each but `rearm` requires
+`--actor`, recorded as **asserted** (the same act through the API records
+`authenticated`), and `--reason`.
 
-Two of them cannot finish the job from a terminal, and say so rather than
-pretending. `quarantine` records the decision and reports `"applied": false`:
+Two of them cannot finish the job from a terminal, and say so.
+`quarantine` records the decision and reports `"applied": false`:
 a terminal holds the journal and not the agent, so the next resume applies it.
 `decide` records the decision durably, completes the task and reports what the
 delivery did — `Buffered`, from a terminal that holds no agent — and prints the
@@ -1760,16 +1559,13 @@ delivery did — `Buffered`, from a terminal that holds no agent — and prints 
 `cancel` from a terminal records the stop and leaves it to the plane that holds
 the agent, which observes it on its next resume.
 
-**Only a plane that can drive a run judges it.** A terminal holds no policy
-engine and no declaration, and a governed run was admitted under both; a
-terminal that compared its own empty policy with the run's would quarantine
-every governed run it answered a task for. So a resume first asks whether this
-plane provides every capability the run's plans name, and a plane that does not
-stops there — `NoProvider`, reported as `Buffered` by a delivery and as a
-recorded, undriven request by a cancel. A plane that does hold the agent under
-a different policy bundle or an edited declaration still quarantines the run:
-that is a real mismatch, and the one a rollout across a mixed fleet has to
-plan for.
+**Only a plane that can drive a run judges it.** A resume first asks whether
+this plane provides every capability the run's plans name, and a plane that
+does not — a terminal holds no agent — stops there: `NoProvider`, reported as
+`Buffered` by a delivery and as a recorded, undriven request by a cancel. A
+plane that does hold the agent under a different policy bundle or an edited
+declaration quarantines the run; a rollout across a mixed fleet has to plan for
+that.
 
 ### Serving it
 
@@ -1779,9 +1575,8 @@ process.
 
 **A listener per audience.** The peer surface binds to `--addr`; the operator
 surface this section documents is opt-in beside it on `--operator-addr`, and the
-MCP surface agent frameworks call on `--mcp-addr`. A network policy can then
-treat *another agent calling in*, *a framework calling a tool* and *a person
-deciding a task* differently rather than trusting one port with all three.
+MCP surface agent frameworks call on `--mcp-addr`, so a network policy can treat
+each differently.
 
 | Flag | Default | What it decides | Env |
 |---|---|---|---|
@@ -1793,7 +1588,7 @@ deciding a task* differently rather than trusting one port with all three.
 | `--mcp-allowed-origin` | none | A browser `Origin` the MCP listener accepts; any other present `Origin` is `403`. Repeatable. | — |
 | `--mcp-agent` | every agent | An agent, by `metadata.name`, to serve on `--mcp-addr`; the others are left off. Without it every agent is served and each must declare `spec.input`. Repeatable. | — |
 | `--policy` | **no default** | The Cedar policy set. No default, because a permissive engine and no engine are the same behaviour and only one of them looks governed. | `AGENTPLANE_POLICY` |
-| `--tokens` | **no default** | The bearer tokens this plane accepts, each optionally carrying the `scope` and `not_after` of the chain that caller's runs act under. A token under 32 bytes, or one published in this project's examples, is refused at load. | `AGENTPLANE_TOKENS` |
+| `--tokens FILE` | **no default** | The bearer tokens this plane accepts, each optionally carrying the `scope` and `not_after` of the chain that caller's runs act under. A token under 32 bytes, or one published in this project's examples, is refused at load. | `AGENTPLANE_TOKENS_FILE` |
 | `--log-format` | `text` | `json` writes one JSON object per log line. | `AGENTPLANE_LOG_FORMAT` |
 | `--url` | none | The A2A endpoint callers reach this plane at — `/a2a` under the public address. Goes on the Agent Card, so it is the public URL rather than what you bind; refused unless it ends in `/a2a`. | `AGENTPLANE_URL` |
 | `--sweep-every` | 30s | How often deadlines, task expiry, dead letters and due timers are swept. `0` runs the sweep from your own scheduler instead. | `AGENTPLANE_SWEEP_EVERY` |
@@ -1803,20 +1598,14 @@ deciding a task* differently rather than trusting one port with all three.
 | `--peer NAME=URL` | none | An A2A peer the manifest grants under `tool://NAME/…`, called with the token in `AGENTPLANE_PEER_TOKEN_<NAME>` (`.` and `-` as `_`; two names sharing a variable are refused). The token names nobody → [peers](@/docs/interop.md#obtaining-the-credential). Needs `a2a`. | — |
 | `--push-host` | none | Permits A2A push notifications to that exact host. Repeatable. Without one, push is not wired and the Agent Card advertises it as absent rather than claiming a capability nothing serves. | — |
 
-The three repeatable flags take no environment variable; everything else does,
-which is how a container image is configured without editing its command line.
+The repeatable flags take no environment variable; everything else in the
+table does. The witness flags are under [the audit](#taking-the-record-away).
 
 ### Identity comes from the request, never from its body
 
-This is the whole design, and everything else in the module follows from it.
-
 Four-eyes is enforced in `TaskStore::claim`, which takes an actor and a set of
-roles. In-process both come from the embedder's own code, which is trusted. Over
-HTTP they would come from whoever is on the socket — and a reviewer who can name
-themselves can name the person who proposed the action. That is not a bypass of
-the control; it *is* the control, inverted.
-
-Discipline does not hold that. So the wire type has no field to hold it:
+roles. Over HTTP a reviewer who could name themselves could name the person who
+proposed the action, so the wire type has no field to hold it:
 
 ```rust
 pub struct DecisionRequest {   // no `actor`. no `roles`.
@@ -1827,21 +1616,12 @@ pub struct DecisionRequest {   // no `actor`. no `roles`.
 }
 ```
 
-The handler builds the `Decision` from the authenticated `Caller`, because there
-is no other source available to it. A later maintainer cannot be talked into
-reading the body's actor, since there is nothing to read.
+The handler builds the `Decision` from the authenticated `Caller`. What lands on
+the record is an `Operator` whose basis is `authenticated`; the same approval
+given at a terminal records `asserted`.
 
-What lands on the record is an `Operator` whose basis is `authenticated`, and
-this is the only surface entitled to claim it — an `Authenticator` named the
-caller before the route ran. The same approval given at a terminal records
-`asserted`, which says the name is whoever ran the command's own account of
-themselves. An auditor can tell the two apart, which is half of what an
-approval is worth as evidence.
-
-`deny_unknown_fields` is the other half. Without it, a body carrying
-`"actor": "alice"` is accepted and silently ignored — the integrator who wrote it
-believes they decided as Alice, the journal says Bob, and the disagreement
-surfaces at an audit months later. A `422` says so at the first call instead.
+The body is `deny_unknown_fields`, so one carrying `"actor": "alice"` is a `422`
+rather than silently ignored.
 
 `amendment` is not a note. On an approved call task it **is the call**: the
 runtime dispatches the reviewer's arguments in place of the model's, labelled
@@ -1858,13 +1638,8 @@ surface that stops there hands every authenticated caller the whole plane. So
 every route runs `gate()`, which authenticates, resolves the caller's tenant to
 a plane, and then authorizes through **that plane's** `PolicyEngine` under an
 `api:` action — and `Api::new` returns an error if any registered plane has
-none, or if none was registered at all.
-
-That refusal is deliberate. In-process an absent engine is a choice; on a socket
-it is a hole, and a permissive default is one nobody discovers until the port is
-reachable. `DenyAll` exists for wiring the surface up before the rules are
-written. One ungoverned tenant among governed ones is the one an attacker looks
-for, which is why the check is over every plane rather than the first.
+none, or if none was registered at all. `DenyAll` exists for wiring the surface
+up before the rules are written.
 
 ### Checking a driver against the real thing
 
@@ -1872,58 +1647,34 @@ for, which is why the check is over every plane rather than the first.
 the embedding wire against the actual APIs, loading keys from `.env`. Each
 battery skips on its own credential, so one key runs one battery and the rest
 say so. It is gated twice — `AGENTPLANE_LIVE=1` **and** the key — and is
-never part of `just ci`: a developer with `OPENAI_API_KEY` exported would
-otherwise be billed for running the test suite, and would find out at the end of
-the month.
+never part of `just ci`, so an exported `OPENAI_API_KEY` bills nobody for the
+test suite.
 
 The compatible-wire battery runs on `HF_TOKEN` against Hugging Face's router, or
-on `CHAT_COMPLETIONS_BASE_URL` pointed at a local engine — which is the more
-useful thing to do before trusting one.
-
-Worth having because a stubbed provider cannot have the defects a real one finds.
-It accepts any request shape and returns whatever it is told to, so a driver that
-sends a malformed body, or mis-reads a response, passes every offline test. What
-these catch is exactly that: a tool declaration in the wrong shape for the API
-being called, a plan format no provider with constrained decoding accepts, a
-prompt field mistaken for the wire's own.
+on `CHAT_COMPLETIONS_BASE_URL` pointed at a local engine.
 
 ### Putting a tenant on your telemetry
 
-Off by default, and the default is the interesting part. A tenant name is
-frequently a customer name, and an observability backend is usually the least
-protected system in a deployment: sampled into third-party services, on a
-dashboard nobody signs into, retained past every other record. A deployment that
-has not decided where its telemetry goes has not decided that customer names may
-travel there.
+Off by default: a tenant name is frequently a customer name, and an
+observability backend is usually the least protected system in a deployment.
 
 ```rust
 .tenant_label(TenantLabel::Name)
 ```
 
-**One policy, both signals.** It is the `tenant` field of every metric event and
-`agentplane.tenant` on the run span — because *which tenant is this* answered on
-the metrics and unanswerable on the traces is the same decision honoured on one
-channel. On the run span only: every other span is inside that run's trace, so
-repeating a per-plane constant on each of them is bytes without information.
+It is the `tenant` field of every metric event and `agentplane.tenant` on the
+run span (every other span is inside that run's trace). Under the default the
+attribute is **absent** rather than blank. The label is *this plane's* tenant,
+so cardinality is the number of planes you wired, never something a request
+can grow.
 
-Under the default the attribute is **absent** rather than blank, so a collector
-cannot read *not disclosed* as *no tenant*.
-
-**Cardinality is bounded by configuration, not by data.** The label is *this
-plane's* tenant, so the number of streams is the number of planes you wired.
-There is no request that can grow it — a tenant read from a request would be
-exactly the unbounded label that makes a metrics backend fall over.
-
-There is deliberately **no pseudonymous option**. Hashing the name here would
-cover one of the many places a tenant already appears — store keys, blob paths,
-the policy request, the checkpoint origin published to witnesses, and the
-`tenant` field on an Agent Card served unauthenticated at a well-known path. A
-control that covers one exit and not the other nine is worse than none, because
-it invites the belief that the name is contained.
-
-If customer names must not leak, **do not put them in the tenant id**.
-`TenantId::new("t-9f3a")` covers every one of those places at once, costs no
-code, and cannot fall out of step with a surface added later.
+There is **no pseudonymous option**: the tenant also appears in store keys, blob
+paths, the policy request, the checkpoint origin published to witnesses, and
+the `tenant` field on an Agent Card served unauthenticated. If customer names
+must not leak, **do not put them in the tenant id** — `TenantId::new("t-9f3a")`
+covers every one of those places at once. A tenant id is at most 64 characters
+and holds no `/`, `:`, control character, whitespace or `+`, because it becomes
+part of composite keys and of the checkpoint origin.
 
 ### Per-tenant ceilings
 
@@ -1944,21 +1695,13 @@ states the limits.
 })
 ```
 
-**The accounting is durable, and that is the whole point.** An in-process
-counter is a ceiling that vanishes the moment a second instance starts — and it
-fails *open*, silently doubling when somebody scales out, which is exactly when
-it was needed. The reservation is one transaction that counts and inserts, so
-two instances racing for the last slot serialise and one loses.
-
-What each ceiling bounds, stated precisely, because a limit believed to bound
-something it does not is worse than none:
+**The accounting is durable**, so a ceiling holds across instances. The
+reservation is one transaction that counts and inserts, so two instances racing
+for the last slot serialise and one loses.
 
 **Concurrency** bounds runs *executing*. A slot is taken at admission and given
-back when the instance finishes with the run — including when it **suspends**, since
-a suspended run costs a row and not a thread, and holding its slot would mean a
-tenant waiting on a hundred approvals could start nothing. It follows that a
-resume is not gated: that work was admitted already, and refusing it would
-strand a run waiting on something that has now happened.
+back when the instance finishes with the run — including when it **suspends**.
+A resume is not gated: that work was admitted already.
 
 **Spend** bounds a period by **reserving** each run's worst case at
 admission. A run can spend its own ceiling and end one call past it per step it
@@ -2005,9 +1748,8 @@ halt does not release a hold: the workload scopes stop admission, and only a
 `subject:` halt reaches work already running.
 
 Wiring a quota store records every active run even when all ceilings are
-`None`. That keeps `running()` truthful for operators and means adding a limit
-starts from the work actually in flight, not from an empty ledger manufactured
-by the previous unlimited configuration.
+`None`, so `running()` is truthful and adding a limit starts from the work
+actually in flight.
 
 Settlement is crash-safe rather than best-effort. Before a pass can dispatch an
 effect, `QuotaPassStarted` records its period and whether it owns the admission
@@ -2023,12 +1765,10 @@ released only after settlement succeeds. If settlement is unavailable, the
 lease expires still owned and the ordinary abandonment sweep derives the spend
 from the journal and retries it.
 
-The journal and quota store may be separate systems, so this is deliberately
-not described as one distributed transaction. The journal is durable intent;
-the quota receipt is idempotent application. The protocol tolerates failure on
-either side of the call and converges after a transient outage. It cannot make
-progress through a permanent partition or survive independent destructive loss
-of one backend while claiming the other is complete.
+The journal and quota store may be separate systems; this is not one
+distributed transaction. It converges after a transient outage on either side,
+and cannot make progress through a permanent partition or survive the loss of
+one backend.
 
 A plane with no quota store resumes a run only when none of its passes accrued
 spend to a period, and refuses one that did, since that spend would go unbilled.
@@ -2041,22 +1781,13 @@ a tenant spend ceiling has to give its runs a ceiling and a per-call bound too �
 otherwise every run is refused as unbounded rather than admitted past the
 ceiling. A manifest without `budgets` already fails validation.
 
-A refusal is `RuntimeError::QuotaExceeded`, deliberately not a policy denial: a
-denial means *you may not* and retrying is pointless; a ceiling means *not right
-now*. Over A2A it comes back as `-32029` with the `ErrorInfo` reason
-`QUOTA_EXHAUSTED` rather than an internal error, so a peer backs off instead of
-retrying a "fault" immediately.
+A refusal is `RuntimeError::QuotaExceeded`, not a policy denial: a ceiling
+means *not right now*. Over A2A it comes back as `-32029` with the `ErrorInfo`
+reason `QUOTA_EXHAUSTED`, so a peer backs off.
 
-Two failure choices worth knowing. An unreachable quota store **refuses** rather
-than admits — a ceiling that yields when its accounting is down is one an
-attacker removes by taking the accounting down. And concurrency is tracked as a
-*set of runs*, not a counter, so a process that dies mid-run strands a slot an
-operator can name and release, rather than a number nobody can audit.
-
-Naming them is `QuotaStore::running_runs(limit)`. `running()` answers *five of
-five*, and one of those five may not be a run at all: a slot is taken at
-admission and given back at settlement, so an instance that dies in between
-holds one forever, indistinguishable from live work in a count.
+An unreachable quota store **refuses** rather than admits. Concurrency is
+tracked as a *set of runs*, not a counter, so a process that dies mid-run
+strands a slot an operator can name: `QuotaStore::running_runs(limit)`.
 
 ```rust
 let held = quotas.running_runs(100).await?;
@@ -2065,8 +1796,7 @@ let stranded = journal.abandoned_runs(100).await?;
 // resumes it and settlement gives the slot back.
 ```
 
-The listing empties as runs settle, which is what makes it a queue rather than a
-record of everything that ever ran.
+The listing empties as runs settle.
 
 ### A tool's rate ceiling {#rate-ceiling}
 
@@ -2089,21 +1819,12 @@ the export, and they age out with the widest window stated for their tool.
 
 ### The emergency stop {#the-emergency-stop}
 
-Beside the ceilings sits a switch that is deliberately not one:
 `Runtime::set_halt(&scope, &by, at, reason)` stops **new work** from starting,
 across every instance, because the flag lives in the quota store rather than
-in the process — a stop that only stops the instance it was thrown on is the
-in-process-counter failure arriving during an incident. The refusal is its own
-error carrying the operator's reason, never a ceiling: a ceiling says *not
-right now* and invites the retry somebody pulling this switch is trying to
-stop.
+in the process. The refusal is its own error carrying the operator's reason,
+never a ceiling, which would invite a retry.
 
 #### It names what it stops
-
-A tenant-wide switch is the right answer when the plane is the incident and the
-wrong one when one agent of many on the plane is misbehaving — and hosting
-several agents is exactly what a multi-document manifest and
-`A2aServer::hosting` are for.
 
 | Scope | Stops | Reach for it when |
 |---|---|---|
@@ -2115,18 +1836,18 @@ several agents is exactly what a multi-document manifest and
 The first three ask *what is running*; the last asks *who it runs for*. That is
 read from the chain the **run** was admitted under — on a served plane, the
 caller's, not the operator's — and matches any link on it: the person at the
-root, each workload it was delegated through, and the one acting. Authority
-flows down the chain, so withdrawing `alice` stops the work `alice` asked for,
-including what a service is doing on her behalf, and leaves everyone else's
-alone.
+root, each workload it was delegated through, and the one acting — so
+withdrawing `alice` stops what a service is doing on her behalf too, and leaves
+everyone else's alone.
 
 **It is the only scope that reaches work already running, and it pauses.** A run
 under a withdrawn credential stops at its next step boundary as `withheld` — or
 sooner, at its next call to a peer that is told who asked, which reads the
-halts before presenting a credential and drops any it holds for the withdrawn
-subject. Its completed work stands, and after the lift a `replay` continues it. It is not unwound —
-reversing correct work because a credential lapsed is a second incident. To
-reverse it, cancel it.
+halts before presenting a credential. Throwing or lifting a subject halt drops
+the cached credentials held for that subject. The run's completed work stands,
+and after the lift a `replay` continues it; it is not unwound. To reverse it,
+cancel it. A step paused inside an open effect group leaves the group open; a
+cancel re-runs that step to abandon the group, starts no new work, then unwinds.
 
 Both halves are journaled: `AuthorityWithheld` at the pause and
 `AuthorityRestored` at the lift, the second beside the first. A reader takes the
@@ -2147,15 +1868,10 @@ principal anywhere on its delegation chain: the person at the root, a workload
 they delegated through, or the one acting. Those are the forms `HaltScope::parse` accepts, and
 the refusal you get for a typo lists them.
 
-**`--actor` is required to throw one, and the row says it was *asserted*.** The
-runtime cannot check an emergency stop: there is no verdict to re-derive and no
-policy that authorized the judgement, so the whole of its evidentiary weight is
-the name beside it. Through the operator API that name comes from the credential
-the authenticator verified and is recorded as `authenticated`; at a terminal
-nothing verified it, and what it proves is that whoever ran the command could
-open the store. Both are legitimate — the second is how an incident is handled
-when the plane itself is the problem — and the row keeps them apart so a reader
-two years on is not left guessing which they are looking at.
+**`--actor` is required to throw one, and the row says it was *asserted*.**
+Through the operator API the name comes from the verified credential and is
+recorded as `authenticated`; at a terminal it proves only that whoever ran the
+command could open the store.
 
 **A lift is recorded, and `--actor` is required for it too.** Before the row
 goes, the lift is written to the journal as the one `HaltLifted` record of a
@@ -2174,8 +1890,8 @@ does — the run's own journal also holds both halves, with the operator from th
 halt on `AuthorityWithheld`.
 
 Those commands open the store, and `redb` admits one writer **process** — so
-against the file an `agentplane serve` is holding they fail, saying so in those
-words. Two ways round it, and both are ordinary rather than workarounds:
+against the file an `agentplane serve` is holding they fail, saying so. Two ways
+round it:
 
 ```sh
 # 1. The operator API reaches a running plane, whichever backend is under it.
@@ -2191,15 +1907,12 @@ agentplane halt --store "$DATABASE_URL" --tenant acme \
 ```
 
 Throwing the stop and lifting it are **separate capabilities** —
-`api:halt.place` and `api:halt.lift`. Granting somebody the power to stop the
-plane says nothing about who may start it again, and one grant covering both
-would make that distinction unwritable. A lift over the API is recorded under
+`api:halt.place` and `api:halt.lift`. A lift over the API is recorded under
 the authenticated caller, and its answer names the lifter and the run holding
 the record; a lift at the terminal is recorded under `--actor`, as asserted.
 
-**A halt closes the door; it does not empty the room.** Runs already executing
-carry on, deliberately: cutting them mid-saga leaves reversals unrun and turns
-one incident into two. To reach work in flight, cancel it — and
+**A halt closes the door; it does not empty the room.** Under a workload scope
+runs already executing carry on. To reach work in flight, cancel it —
 `GET /runs/live` is the listing that tells you which, with the agent, the
 revision and the delegation subject beside each id. A slot marked `stranded`
 belongs to the recovery sweep, which resumes it; cancelling one unwinds work
@@ -2216,48 +1929,30 @@ curl -sX POST "$PLANE/halts" -H "authorization: Bearer $TOKEN" \
 curl -s "$PLANE/runs/live?subject=alice" -H "authorization: Bearer $TOKEN"
 ```
 
-**Scopes are independent rows, not one flag the last writer wins.** Halting the
-whole tenant while an agent is halted, and then lifting the agent's, leaves the
-tenant's standing — an incident that widens and then partly resolves is the
-ordinary shape, and a single overwritable flag gets it wrong in the direction
-that lets work through. Where several halts cover one run the **narrowest**
-match is the reason reported, because "the tenant is halted" told to the caller
-of agent 12 sends them to the wrong incident.
+**Scopes are independent rows.** Halting the whole tenant while an agent is
+halted, and then lifting the agent's, leaves the tenant's standing. Where
+several halts cover one run the **narrowest** match is the reason reported.
 
 An **ungoverned** run — a skill registered directly on the plane, with no
-manifest — is stopped only by a tenant halt. There is nothing narrower to key it
-on, and inventing a match would stop work for a reason nobody could look up.
+manifest — is stopped only by a tenant halt.
 
-Where a halt is answered, it is answered as itself. A peer over A2A receives
-`-32030` with the `ErrorInfo` reason `HALTED` and a fixed message that carries
-none of the operator's words — not the ceiling's `QUOTA_EXHAUSTED`, whose
-advice is *come back*, because a peer that backs off and retries is doing
-exactly what the switch exists to end. A batch pass returns the halt as its
-error and leaves the items it stopped pending: an admission that never
-happened is not an outcome of the item, and the next pass admits them again.
+A peer over A2A receives `-32030` with the `ErrorInfo` reason `HALTED` and a
+fixed message that carries none of the operator's words. A batch pass returns
+the halt as its error and leaves the items it stopped pending; the next pass
+admits them again.
 
-`--reason` is required to halt and refused to lift: the next person to look will
-be somebody else, possibly at three in the morning, and *why* is the whole
-question, while a lift needs no justification because it restores the default.
-*Who* is asked of both.
+`--reason` is required to halt and refused to lift. *Who* is asked of both.
 
 #### What a workload-scoped halt does not stop
 
-Runs already executing, and suspended runs resuming — deliberately. Those are
-existing work, and refusing to let them continue would strand them mid-saga with
-reversals unrun, turning one incident into two. Work in flight is stopped by
-*cancelling* it (`request_cancel`), which unwinds what it did and records who
-asked. `cargo run --example operator_stop` runs both brakes side by side, which
-is the clearest statement of the difference.
+Runs already executing, and suspended runs resuming. Work in flight is stopped
+by *cancelling* it (`request_cancel`), which unwinds what it did and records who
+asked. `cargo run --example operator_stop` runs both brakes side by side.
 
-**The `subject:` scope is the exception, and it is the one an incident most
-often needs.** It names an authority rather than a workload, so it *does* reach
-runs already executing — each pauses at its next step boundary as `withheld`,
-completed work standing, and after the lift a `replay` continues it. The
-response to `POST /halts` says which of the two you got, derived from the scope, because an
-operator who withdrew a credential and reads *cancel to reach work in flight*
-will unwind a week of correct work that the withdrawal had deliberately
-preserved.
+**The `subject:` scope is the exception**: it *does* reach runs already
+executing, which pause as `withheld`. The response to `POST /halts` says which
+of the two you got, derived from the scope — a credential withdrawal preserves
+work that a cancel would unwind.
 
 ### One surface, many tenants
 
@@ -2268,9 +1963,7 @@ derives from the credential exactly as it derives `actor` and `roles`.
 
 The gate hands each route its resolved plane, and `Api` holds no runtime of its
 own, so a handler cannot read a store without having established whose it is. A
-caller whose tenant has no plane is refused rather than served by a default: a
-fallback would turn an unregistered tenant into somebody else's data while
-looking like working software.
+caller whose tenant has no plane is refused rather than served by a default.
 
 The gate runs *before* the path is parsed, so a denied caller cannot learn
 whether a run id exists by comparing a `400` against a `404`.
@@ -2345,12 +2038,10 @@ alphanumeric or that shadows a core attribute. A store outage is a `503`, so
 a bus retries what a `4xx` would make it drop.
 
 The `source` a run is woken under is **the authenticated caller**, never the
-one in the body — otherwise a caller would hold both halves of `(source, id)`
-and could deduplicate against another party's messages by naming them. The
-producer's own `source` is not discarded either: it rides inside the buffered
-event's id, so a gateway relaying two counterparties that both number their
-messages from one still delivers two events rather than swallowing the second as
-a retry.
+one in the body, so a caller cannot deduplicate against another party's
+messages. The producer's own `source` rides inside the buffered event's id, so
+a gateway relaying two counterparties that both number their messages from one
+still delivers two events.
 
 **The `agentplane.` kind namespace is the plane's own.** A human task's answer
 reaches its run as an event of such a kind, so any kind in it is a `403` here,
@@ -2364,30 +2055,16 @@ expects to be woken by a bus correlates on the subject its counterparty will
 name. Extensions deliberately do not; a producer that must correlate on
 richer keys posts the native shape, where they are stated.
 
-Two details carry more weight than the plumbing:
+**A suspended run says what it is waiting for.** `GET /runs/{run}` reports the
+`SuspendReason` from the run's **last** record — whether to approve something,
+chase a counterparty, or page somebody.
 
-**A suspended run says what it is waiting for.** "Suspended" tells an operator a
-run is stuck; it does not tell them whether to approve something, chase a
-counterparty, or page somebody. The `SuspendReason` is on the record, so it costs
-nothing to answer properly.
-
-That status is read from the run's **last** record, not from whether a
-suspension appears anywhere in its history. Every run that has ever waited for a
-human has a `RunSuspended` in it, forever — scanning would report every completed
-approval flow as permanently stuck, which is worse than reporting nothing.
-
-**The worklist says when it was cut off.** The response is an object, not a
-bare array, because an array cannot express it: a queue of 140 items paged at
-100 returns 100 and reads exactly like a queue of 100. The flag comes from
-asking the store for one more than the page and dropping it — inferring it from
-`len() == limit` would cry wolf on every queue of exactly `limit`.
+**The worklist says when it was cut off.** The response is an object carrying
+`truncated`, taken by asking the store for one more than the page.
 
 **Each worklist item says whether *this* caller may decide it.** A reviewer
-barred by four-eyes still sees the task — hiding it leaves them wondering where
-it went — and is told on the item rather than by a refusal after they have read
-the case and made up their mind. The flag calls `Task::may_decide`, the same
-predicate the store enforces, rather than re-implementing it: a second copy of an
-authorization rule drifts, and the copy that drifts is the one people read.
+barred by four-eyes still sees the task and is told on the item. The flag calls
+`Task::may_decide`, the same predicate the store enforces.
 
 **Each item carries the text a person should read, beside the value a program
 reads.** `justification` is the structured value; `rendering` is the same task
@@ -2414,59 +2091,34 @@ Naming no digest compares nothing.
 
 ### No authenticator is shipped
 
-Same reasoning as the policy engine and the tracing exporter. `Authenticator` is
-handed the whole header map, because a deployment may authenticate by bearer
-token, mutual TLS, or a signed header from a gateway, and a parser baked in here
-would be wrong for one and load-bearing for the other. What is asked of yours
-instead is a contract — `testkit::conformance_auth`, and the rule in it that is
-easiest to get wrong is that `Missing` and `Rejected` are different answers
+`Authenticator` is handed the whole header map, so a deployment may
+authenticate by bearer token, mutual TLS, or a signed header from a gateway.
+Yours is held to `testkit::conformance_auth`, where the rule easiest to get
+wrong is that `Missing` and `Rejected` are different answers
 → [testing](@/docs/testing.md#holding-your-own-authenticator-to-the-contract).
 
 ### Claiming is what stops duplicated work
 
-`decide` alone makes the queue first-past-the-post at *decision* time: two
-reviewers read the same case in parallel and one of them discovers, at the moment
-they submit, that the work was wasted. `claim` reserves; `release` gives it back,
-and it is `release` that makes `claim` safe to use — without it, a reviewer who
-claims something they then cannot decide has parked it until somebody edits the
-database, so the queue learns not to claim and the reservation stops meaning
-anything.
-
-Claiming is not advisory. `TaskStore::claim` runs four-eyes and role eligibility
+`claim` reserves a task so two reviewers do not read the same case in
+parallel; `release` gives it back. Claiming is not advisory. `TaskStore::claim` runs four-eyes and role eligibility
 in the same transaction that reserves, so an ineligible reviewer is refused
 *before* they read the case rather than after they have made up their mind.
 
 #### Eligibility outranks availability
 
-A refused claim is a `403` or a `409`, and they ask different things of the
-reader — *this will never be yours* versus *try again, or ask Bob*. Checked
-availability first, a barred reviewer asking for a held task would be told
-"held by Bob", wait for Bob to release it, and then be refused for a reason
-nobody had mentioned — having learnt meanwhile who is reviewing what, from a
-queue they have no standing in.
-
-The order is part of the `TaskStore` contract, and the conformance battery
+A refused claim is a `403` (*this will never be yours*) or a `409` (*try
+again, or ask the holder*), and the permanent refusal is checked first. The order is part of the `TaskStore` contract, and the conformance battery
 holds both backends to it:
 
 ```
 NotFound → Excluded → WrongRole → NotPending → AlreadyClaimed
 ```
 
-The permanent refusal wins over the transient one, because the transient one
-hides it.
-
-The same classification rides every verb that can refuse, not only `claim`:
-an id that names nothing is a `404` wherever it appears — claim, decide,
-cancel — and a store outage is a `500`, never a `409`. A conflict tells its
-reader somebody else got there first; answered to a typo it sends an operator
-hunting for an interventionist who does not exist, and answered to an outage
-it teaches a client that a retryable failure is permanent.
-
-A release by somebody who does not hold the task reports `ClaimError::NotHeld`
-rather than succeeding — otherwise the caller is told the task is free while the
-holder still has it — and deliberately not `NotFound`: "the id is wrong" and "it
-is not yours" call for different responses. The battery holds both backends to
-it.
+Every verb that can refuse follows the same classification: an id that names
+nothing is a `404` wherever it appears — claim, decide, cancel — and a store
+outage is a `500`, never a `409`. A release by somebody who does not hold the
+task reports `ClaimError::NotHeld`, not success and not `NotFound`; the battery
+holds both backends to it.
 
 ### Escalation widens the audience — and then leaves the expiry scan
 
@@ -2481,25 +2133,15 @@ The escalated row stays in the ordinary queue, ranked and claimable — that
 queue, filtered by the caller's roles, is where the wider audience meets it.
 
 An escalated task does **not** reappear in the overdue scan, although it is
-still pending and past due. Escalation is the one policy that leaves its task
-in that condition forever — it is answered by a person or answered never — so
-a scan that kept returning escalated rows would accumulate them at the head of
-its bounded, oldest-first batch until the batch held nothing else, at which
-point the `deny` and `proceed` policies of every task behind them would
-silently stop firing. Reviewer attention is a finite resource; a queue that
-can be flooded is an oversight control that can be switched off.
+still pending and past due; otherwise escalated rows would fill the scan's
+bounded batch and the expiry policies of every task behind them would stop
+firing.
 
 ### A task id mixes in the run it belongs to
 
-An `EffectKey` is unique *within* a run — the journal enforces `(run, effect_key)`
-and needs nothing more — while the worklist is a table every run shares. Two runs
-of one plan reach the same step, at the same ordinal, with the same descriptor,
-so a task id derived from the key alone would collide, and `TaskStore::open` is
-idempotent by id: the second run's task would silently not be created, and it
-would wait for an answer nobody is ever shown.
-
-So `TaskId::derive` hashes the run in as well, and the field is private — the
-collision is unrepresentable rather than avoided by care. The `("task", …)`
+An `EffectKey` is unique *within* a run, while the worklist is a table every
+run shares and `TaskStore::open` is idempotent by id. So `TaskId::derive` hashes
+the run in as well, and the field is private. The `("task", …)`
 correlation key inherits that, being derived from the id.
 
 ## 🗄️ Retention and erasure {#retention-and-erasure}
@@ -2525,61 +2167,59 @@ What exists:
 
 - **Blob bytes can be erased, and the erasure is recorded.** `BlobStore::expire`
   drops the content and leaves a tombstone. A reader afterwards gets `Expired`
-  with the date and the reason — not `NotFound` — because "retention did its job"
-  and "data is missing and nobody knows why" are different answers and only one
-  of them is an incident. Expiring twice keeps the first tombstone, so a retry
-  cannot rewrite when the data went.
+  with the date and the reason — not `NotFound`. Expiring twice keeps the first
+  tombstone.
 
-**On scheduling, and why there is no TTL here.** Every object store this runs on
-already expires objects far better than a sweeper could — S3 lifecycle rules,
-GCS object lifecycle, Azure blob lifecycle — and they run without your process
-being alive. Reimplementing that would be a worse copy of a solved problem.
+**There is no TTL here.** Object-store lifecycle rules (S3, GCS, Azure) expire
+objects without your process — but **a lifecycle rule deletes, it does not
+tombstone**, so a blob removed that way reads as `NotFound`. Use lifecycle rules
+for bulk age-based expiry, and the erasure verbs for erasure requests, where
+*when and why* must stay answerable.
 
-The catch is worth knowing before you rely on it: **a lifecycle rule deletes,
-it does not tombstone.** A blob removed that way reads as `NotFound`, and the
-distinction between "retention did its job" and "data is missing and nobody
-knows why" is gone. So use lifecycle rules for bulk age-based expiry where that
-distinction does not matter, and call `expire` explicitly for erasure requests,
-where being able to say *when and why* is the entire point.
-
-**The erasure unit is the case**, which is the only unit anybody actually names —
-nobody asks to forget a digest. Write bytes through `cx.store_blob`, which
-records the link at the one moment it is knowable (a digest cannot be reversed to
-find its case), and answer a request with one call:
+**The erasure unit is the case.** A run bound to a case writes bytes through
+`cx.store_blob`, which records the link to the case; `cx.blobs()` is read-only
+for such a run. Answer a request with one call:
 
 ```rust
-let n = agentplane::blob::erase_case(
-    Some(blobs.as_ref()), cases.as_ref(), Some(keys.as_ref()), &tenant,
-    case, now, "art-17 request",
+let erased = agentplane::blob::erase_case(
+    Some(blobs.as_ref()), cases.as_ref(), Some(journal.as_ref()),
+    Some(keys.as_ref()), Some(disclosures.as_ref()),
+    &tenant, case, now, "art-17 request",
 ).await?;
+// erased.blobs: references tombstoned; erased.copies: disclosed copies it did not reach
 ```
 
-The key-ring and tenant arguments exist with the `keyring` feature. On a
-sealed plane, passing the ring destroys the case's wrapping key after every
-tombstone is written, so each sealed copy becomes unreadable at once; pass
-`None` on a plane that stores blobs unsealed, and the call is plain
-tombstoning.
+The key-ring argument exists with the `keyring` feature. On a sealed plane,
+passing the ring destroys the case's wrapping key after every tombstone is
+written, so each sealed copy becomes unreadable at once; pass `None` on a plane
+that stores blobs unsealed, and the call is plain tombstoning.
+
+Nothing is destroyed for a case under a legal hold, a case still open, or a case
+with a run that has not concluded under an outcome nothing resumes from —
+`EraseError::UnderLegalHold`, `CaseStillOpen`, `RunNotConcluded`. Without a
+journal, a case with runs is refused. The erasure is recorded on the case
+first, and an erased case refuses reopening, writes and holds
+(`StoreError::CaseErased`, `409` on the API). A retry of an erasure that did not
+complete runs again under the recorded instant and reason.
 
 Every blob that case produced is tombstoned with the same reason. Other cases
-are untouched — including ones that stored *identical bytes*, which land on the
-same digest by construction, so the link is what scopes the erasure rather than
-the content.
+are untouched — including ones that stored *identical bytes*: the link scopes
+the erasure, not the content. `blob::erase_run` erases a case-less run's sealed
+payloads and refuses a case-bound run or one that may still resume.
 
 **On a window, rather than one case at a time.** The same act on a clock is
-`Runtime::retain(older_than, at, reason)`, or:
+`Runtime::retain(older_than, at, reason)` — or
+`retention::retain(stores, journal, older_than, at, reason)` outside a
+runtime — and its plan:
 
 ```sh
 agentplane retention plan --store ./journal.redb --older-than-days 2555
 ```
 
-The CLI form lists — the binary wires no store that can erase, so it has no
-verb that claims to — and the pass itself is the library call. It erases
-**closed** cases only, and measures the window from `opened_at`: a case still
-open is a matter still running, and erasing underneath a live run
-turns a retention pass into an outage. Every pass returns `not_erasable` beside
-its count, and that list is the half that matters — a number with no coverage
-statement beside it is how a deployment comes to believe an obligation is
-discharged.
+The CLI form lists; the pass itself is the library call. It erases **closed**
+cases only, measures the window from `opened_at`, skips a case already erased,
+and returns `not_erasable` beside its count — read that list, it is the
+coverage statement.
 
 **What still cannot be erased** is anything written into a journal *record*. The
 chain is append-only by design, which is the point — keep personal data out of
@@ -2641,19 +2281,9 @@ grows with how much work was in flight:
    ```
 
    Or `GET /runs/waiting` on a serving plane, under `api:run.waiting`. Both
-   answer from the **journal**, not from the timer and subscription tables —
-   which is the whole reason they work here, since an export carries neither and
-   those registrations are exactly what a restore is missing. A run leaves the
-   listing by being resumed, so it is a worklist that drains rather than a page
-   that stops changing.
-
-   **What it costs to read.** An index maintained by the write path, holding one
-   row per *currently* waiting run rather than one per suspension ever recorded
-   — so its size is the backlog you are looking at, not the history. Postgres
-   serves it from `run_waiting_due` in index order with no sort; redb ranges the
-   tenant's slice in key order and reads nothing past the page. Scanning history
-   for `RunSuspended` is the answer that does not work, and not for cost: every
-   run that ever waited carries one forever.
+   answer from the **journal** — an index the write path maintains, one row per
+   *currently* waiting run — not from the timer and subscription tables a
+   restore is missing. A run leaves the listing by being resumed.
 
 ### The drill {#recovery-drill}
 
@@ -2691,15 +2321,12 @@ during an incident:
 | **Blob bytes** | Restoring the object store. The file carries each case's blob *digests*, which is what keeps erasure reachable, and never the objects |
 | **Key material** | Your key management. A sealed plane restored without its ring holds ciphertext, and `agentplane drill` reports a sealed state that neither opens nor was destroyed as a finding |
 
-`agentplane drill` is what turns the last two rows into an answer rather than an
-assumption: it walks every case, holds each reference against the live stores,
-and reports *unchecked* for a store it was not given. A restore that reads as
-sound while every artifact is unreachable is the outcome it exists to prevent.
+`agentplane drill` checks the last two rows: it walks every case, holds each
+reference against the live stores, and reports *unchecked* for a store it was
+not given.
 
-**The verdict stays on the plane.** An audit does not ask whether you *can*
-rehearse; it asks when you last did and whether it passed — and left in the
-job that ran the verb, that answer is a CI log that rotates. Every drill
-writes one row, which the next drill replaces:
+**The verdict stays on the plane.** Every drill writes one row, which the next
+drill replaces:
 
 ```sh
 agentplane drill --last --store "$DATABASE_URL" --tenant acme
@@ -2712,15 +2339,12 @@ agentplane drill --last --store "$DATABASE_URL" --tenant acme
 capability, so a read-only auditor credential need not carry the operational
 roll-up as well. Three things to read off it:
 
-* **`drilled: false` is a finding**, not a clean answer. *Nobody has rehearsed
-  this plane* is exactly what a missing log cannot tell you from a rotated
-  one, so both verbs exit non-zero on it.
+* **`drilled: false` is a finding**, not a clean answer; both verbs exit
+  non-zero on it.
 * **`origin` says which store it ran against**, from the plane's own
-  checkpoint. A drill over a restored copy proves that copy recoverable and
-  says nothing about production; without an origin the two read identically.
-* **`not_checked` sits beside `sound`, not inside it.** A pass over nothing is
-  not a pass — the example above checked cases and was given no key ring, and
-  a reader has to see that rather than infer it.
+  checkpoint — a drill over a restored copy says nothing about production.
+* **`not_checked` sits beside `sound`, not inside it** — the example above was
+  given no key ring.
 
 `agentplane attention` reports a failed rehearsal as `drill.failed`, and keeps
 reporting it until a later drill passes.
@@ -2731,16 +2355,13 @@ resume everything `awaiting` names, then open the gates.
 
 ### Evidence {#recovery-evidence}
 
-The drill is a test, not a procedure somebody remembers.
-`postgres_restores_a_plane_that_then_serves` runs the whole sequence against a real `PostgreSQL` server, restoring into a
-tenant of a database another tenant is already using, and asserts each claim
-above: equal roots at equal size, records hash-for-hash, the matter and its
-obligation and its artifact, isolation in both directions, a lease past the
-journal's highest epoch, a wait repaired by a resume — and then the part that
-separates a recovery from a backup, which is that the restored plane admits new
-work whose seal extends the log it restored. It ends by drilling the restored
-case layer without a blob store, because a report that said *sound* there would
-be saying it about bytes nobody had put back yet.
+`postgres_restores_a_plane_that_then_serves` runs the whole sequence against a
+real `PostgreSQL` server, restoring into a tenant of a database another tenant
+is already using, and asserts each claim above: equal roots at equal size,
+records hash-for-hash, the matter and its obligation and its artifact,
+isolation in both directions, a lease past the journal's highest epoch, a wait
+repaired by a resume, new work whose seal extends the restored log, and a drill
+of the restored case layer without a blob store reporting it unchecked.
 
 ## 🚑 Runbook {#runbook}
 
@@ -2750,5 +2371,5 @@ be saying it about bytes nobody had put back yet.
 | A run seems stuck | It is almost certainly suspended on an event, a timer, or a human. `GET /runs/{id}` reports *why* rather than only *that* |
 | An event was dead-lettered | Nothing was waiting for it, and the grace window elapsed. `GET /dead-letters` names it and the keys it was filed under — the mismatch is usually visible by reading them next to what the run subscribed to |
 | A webhook receiver stopped answering | Its registration is *parked*, not deleted: the cursor survives so nothing is lost. `GET /push` says which and what it answered last; `POST /push/rearm` resumes at the first record it never acknowledged |
-| Budget exhausted | A ceiling doing its job, not a fault. The status carries the limit **and** where consumption actually reached, so it says what to raise it to. A tool's full rate window reads the same way, and its remedy is time → [a tool's rate ceiling](#rate-ceiling) |
+| Budget exhausted | A ceiling doing its job, not a fault. The status carries the limit **and** where consumption actually reached, so it says what to raise it to. Inside an open effect group it is a pause: the group stays open and nothing is reversed. A tool's full rate window reads the same way, and its remedy is time → [a tool's rate ceiling](#rate-ceiling) |
 | `LeaseHeld` vs `Fenced` | Opposite responses. `LeaseHeld` means another instance is alive and you should wait; `Fenced` means this writer is stale and must drop the run, never retry |

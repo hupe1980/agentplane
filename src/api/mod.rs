@@ -1846,7 +1846,6 @@ fn not_found(what: &str) -> ApiError {
 /// Bounded by the same page the case history uses, and `truncated` says so: a
 /// history cut off at the limit is shaped exactly like a complete one, and a
 /// reader who cannot tell reads absence as evidence.
-#[cfg(feature = "http")]
 async fn run_history(
     State(api): State<Api>,
     headers: HeaderMap,
@@ -1893,7 +1892,6 @@ async fn run_history(
 }
 
 /// Where in a run's journal to read from.
-#[cfg(feature = "http")]
 #[derive(serde::Deserialize, JsonSchema)]
 struct HistoryQuery {
     from: Option<crate::core::Seq>,
@@ -2622,7 +2620,7 @@ async fn decide(
         approved: body.approved,
         decided: crate::core::Decided::By(
             crate::core::Operator::authenticated(s.caller.actor.clone())
-                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?,
+                .map_err(|e| unusable_caller(&e))?,
         ),
         reason: body.reason,
         amendment: body.amendment,
@@ -3196,6 +3194,7 @@ fn hold_refused(e: &crate::core::StoreError) -> ApiError {
         crate::core::StoreError::NotFound(_) => {
             ApiError(StatusCode::NOT_FOUND, "no such case".to_owned())
         }
+        crate::core::StoreError::CaseErased { .. } => ApiError(StatusCode::CONFLICT, e.to_string()),
         _ => store_failed(),
     }
 }
@@ -3537,6 +3536,10 @@ async fn deliver(
     // A kind this plane mints for itself is forbidden rather than conflicting:
     // it is a statement about who may send it, and no retry changes that.
     let delivery = s.plane.deliver(&event).await.map_err(|e| match e {
+        // An erased case is a statement about the request: no retry reopens it.
+        crate::core::RuntimeError::Store(crate::core::StoreError::CaseErased { .. }) => {
+            ApiError(StatusCode::CONFLICT, e.to_string())
+        }
         crate::core::RuntimeError::Store(_) => {
             tracing::error!(target: "agentplane::api", error = %e, "an event could not be delivered");
             ApiError(

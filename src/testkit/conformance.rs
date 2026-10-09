@@ -211,6 +211,25 @@ pub async fn memory(store: Arc<dyn crate::memory::MemoryStore>) {
          returned only trusted items is an agent that cannot see what it was told"
     );
 
+    // At equal trust and second the id decides, **by byte**. A truncated page
+    // is decided by the tie-break, so a backend ordering ids by a database
+    // collation keeps a different memory than the other backend from the same
+    // rows: `B` sorts before `a` by byte and after it in most locales.
+    for id in ["tie-a", "tie-B"] {
+        let mut tied = make(id, "team-tie", "support", json!({"id": id}));
+        tied.created_at = at(1_760_000_300);
+        store.remember(&tied).await.expect("tied");
+    }
+    let tied = store
+        .recall(&Recall::about("team-tie").limit(1))
+        .await
+        .expect("tied recall");
+    assert_eq!(
+        tied.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(),
+        ["tie-B"],
+        "ids at equal rank and second must break the tie by byte order"
+    );
+
     let moved = make("memory-a", "team-b", "support", json!({"value": 4}));
     assert!(
         store.remember(&moved).await.is_err(),
@@ -2469,6 +2488,46 @@ async fn the_log_only_grows(fresh: Factory<'_>, r: &mut Report) {
                     latest.size
                 ),
             );
+        }
+    }
+
+    proves_at_past_sizes(store.as_ref(), &history, latest.size, r).await;
+}
+
+/// Between any two checkpoints taken as the log grew, at the later one's size
+/// rather than the live log's: a witness is handed a checkpoint taken earlier,
+/// and a proof to a larger tree fails there as a fork. A store may refuse a
+/// size it cannot prove at — the trait's default answers only at the live
+/// size — but a proof it returns must verify, and at the live size it must
+/// answer.
+async fn proves_at_past_sizes(
+    store: &dyn crate::journal::JournalStore,
+    history: &[(u64, Digest)],
+    live: u64,
+    r: &mut Report,
+) {
+    for (at, (old_size, old_root)) in history.iter().enumerate() {
+        for (new_size, new_root) in &history[at..] {
+            let verified = match store.consistency_proof_at(*old_size, *new_size).await {
+                Ok(proof) => crate::core::merkle::verify_consistency(
+                    usize::try_from(*old_size).unwrap_or(0),
+                    old_root,
+                    usize::try_from(*new_size).unwrap_or(0),
+                    new_root,
+                    &proof,
+                ),
+                Err(_) => *new_size != live,
+            };
+            if !verified {
+                r.record(
+                    "merkle-log",
+                    format!(
+                        "the log could not prove size {old_size} extends to size {new_size} \
+                         as a checkpoint taken then — a witness handed that checkpoint \
+                         would read the proof as a fork"
+                    ),
+                );
+            }
         }
     }
 }

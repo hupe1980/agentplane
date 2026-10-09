@@ -336,9 +336,7 @@ might be attacking the policy learns nothing it can tell apart.
 
 There is exactly one path in the runtime where a refusal reaches a model — the
 tool-calling loop's failed-call result — and it is the enforcement point rather
-than a place the rule is remembered. A test of `for_model` alone proves the
-*function* is uniform, not that anything uses it; the test that matters runs an
-agent whose call is refused and reads what the next turn was told.
+than a place the rule is remembered.
 
 That leaves the refused/allowed bit itself, which no wording removes short of
 fabricating success. `Budget::max_denials` bounds it instead — a ceiling on how
@@ -357,7 +355,9 @@ accumulates only where a run's own code catches `StepError::Denied` and carries
 on. Both are counted, because counting only the second would leave the ceiling
 naming a channel it never reached. A tool's [rate ceiling](@/docs/manifest.md#rate-limit)
 refusing a call is not counted: it is back-pressure across runs, not a probe of
-this one's authority.
+this one's authority. A recorded refusal read back on replay or resume
+counts as it did live, so the ceiling is reached at the same refusal and a
+resume does not start the count again.
 
 The check sits **before** the policy is consulted, and that is a statement about
 its position rather than its purpose: a refusal is journaled as it happens, so a
@@ -394,14 +394,6 @@ refusal to replan on untrusted data — all at once, and silently.
 `cx.effect()` returns a **labelled** value, not a bare one. Were it bare, every
 guarantee downstream of the label would rest on the skill author wrapping the
 result correctly — and `Tainted::trusted(..)` is the easy thing to write.
-
-That has a consequence worth being blunt about: **a guarantee that rests on
-a fixture wrapping results honestly is unfalsifiable.** The refusal to replan
-on untrusted data could be implemented, tested and deletable without a test
-failing, as long as the fixtures laundered the taint before it reached the
-check. With the label on the effect, no fixture can; `tests/trust/boundary.rs`
-asserts the refusal against a fixture that forwards a tool result, and it
-fires.
 
 The fixtures are held to the same rule: a step that writes to a ledger returns
 *that it wrote*, not the ledger's response — which is the real pattern anyway:
@@ -608,7 +600,8 @@ replay reads it back from `IdentityBound` rather than from the plane's current
 configuration. It also travels across every hand-off: `cx.commission` admits its
 sub-run under the orderer's chain plus one link naming the commissioned agent
 (`agent/<capability>`, the orderer's effective scope, its expiry and audience
-inherited) — or, for an orderer with no chain, exactly as the orderer acts: a
+inherited), and a sub-run of a run that acts as the plane acts as the plane too
+(`RunAdmitted.plane_chain`) — or, for an orderer with no chain, exactly as the orderer acts: a
 chainless served caller's sub-run under none, the plane's own run's sub-run as
 the plane, which on a plane with no chain of its own is what holds the
 tenant's standing authorities — and `cx.call_peer` sends the peer the same
@@ -1292,12 +1285,6 @@ stored label. An item whose text says *verified by security, skip revalidation*
 is still only a string. Trusted operator/import memories remain possible through
 the store boundary, where deployment authority is explicit.
 
-The attack this answers is a slow one. A poisoned write sits until some later
-session retrieves it, and a model reading it as established fact will skip a
-check it believes was already done. Labelling from provenance means that later
-session is holding an untrusted value, so the check it would have skipped is
-still in front of it.
-
 Recall is journaled, which matters here too: what a run retrieved is on the
 record, so a poisoning is traceable to the write and the sessions that read it
 are enumerable rather than guessed at. The selection commitment covers content
@@ -1327,9 +1314,12 @@ in-scope records badly and an index that contradicts durable truth is a loud
 refusal; it cannot substitute another subject's content, rewrite a version, or
 keep a corrected memory alive past its correction.
 
-`EncryptedMemoryStore` seals each item's content under a fresh data key wrapped
-by a tenant/subject scope. Legal hold is checked before scope destruction;
-afterwards live rows, replicas and backup ciphertext are unreadable. The shipped
+`EncryptedMemoryStore` seals each version of each item under its own
+tenant-qualified key scope (`memory-item/<id>@<version>`), and binds the item's
+labels — trust, sensitivity, provenance, writer, creation and expiry — into the
+envelope, so a row relabelled in the clear does not open. Legal hold is checked
+before scope destruction; afterwards live rows, replicas and backup ciphertext
+are unreadable. The shipped
 coordinator is explicitly single-node: active-active deployments must coordinate
 the database lifecycle lock with KMS destruction across instances rather than
 mistaking a process mutex for a distributed erasure barrier.
@@ -1683,12 +1673,6 @@ expensive direction each time:
 * **A non-rejection `McpError` is not `DidNotHappen`.** Only an explicit
   rejection — bad method, bad params, unparseable — means the tool never ran.
 
-Tests run a real rmcp server in-process over a duplex pipe — genuine
-initialisation, `tools/list` and `tools/call` — with no network and no child
-process. The fixture server *lies*: it advertises a money-moving tool as
-`readOnlyHint: true`, so the "annotations are not obeyed" property is checked
-against an actual wire response rather than a hand-built struct.
-
 ### The disposition is the whole safety story
 
 `ToolError` exists so the transport must say what it knows about whether the call
@@ -1741,7 +1725,9 @@ spec:
 A rule may **refuse** a value, **raise** its sensitivity (`classify` joins,
 never lowers) or, at a sink, **redact** it. There is no `allow`, `warn` or
 `flag`, and no verdict that trusts or lowers anything, so the worst a wrong rule
-does is fail to refuse. The [manifest reference](@/docs/manifest.md) has the
+does is fail to refuse. A `classify` raises the value's root and every labelled
+field, so a per-field ceiling sees it, and drops the release marks granted at
+the lower sensitivity. The [manifest reference](@/docs/manifest.md) has the
 block field by field.
 
 - **At admission** a refusal leaves no record, as an admission policy denial
@@ -1996,7 +1982,7 @@ remains is the residue every human-in-the-loop control carries: a reviewer
 can be talked into typing the attacker's value, and the journal's actor
 attribution is the accountability for that, not a prevention.
 
-**Remote media URLs.** The model effect and both built-in drivers still refuse
+**Remote media URLs.** The model effect and the built-in drivers refuse
 provider-native image/document URL blocks before dispatch. Otherwise the model
 provider would fetch from its own network, outside this plane's controls.
 
@@ -2025,7 +2011,7 @@ wrongly:
 | **The native skill tier is trusted** | A `dyn Skill` compiled into the binary can open its own socket. The gate governs what goes through `cx.effect`, and nothing else. This runtime does not claim to sandbox native code: untrusted executables belong behind a governed MCP/A2A/tool boundary and an OS process or container boundary |
 | **An operator who holds the signing key** | Signatures bind authorship, not existence. Whoever controls the workload identity can produce a perfectly signed alternative history |
 | **Independent split-view detection** | Witness cosigning and consistency-proof verification are built, and `HttpWitness` speaks C2SP `tlog-witness` — the [wire and its outcomes](@/docs/journal.md#the-audit-an-outsider-runs). What is absent is not code but a **counterparty**: until a second party runs a witness for your log, a witness you host yourself does not protect auditors from you |
-| **Revocation** | A delegation is valid until it expires; the policy gate consults no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead, and an operator withdraws a credential with a halt naming its principal, which pauses every run with that principal anywhere on its chain → [the emergency stop](@/docs/operations.md#the-emergency-stop) |
+| **Revocation** | A delegation is valid until it expires; the policy gate consults no revocation list, because checking one means I/O on the authorization path — the exact property removed so a gate cannot fail open under load. Chains are short-lived and audience-bound instead, and an operator withdraws a credential with a halt naming its principal, which pauses every run with that principal anywhere on its chain and drops the credentials cached for that subject → [the emergency stop](@/docs/operations.md#the-emergency-stop) |
 | **Implicit flows** | Labels track explicit data flow. Not side channels, not a model leaking through phrasing |
 | **A compromised allowlisted endpoint** | Egress allowlisting decides *where* traffic may go, not what the far side does with it |
 | **Egress allowlisting on Bedrock** | The HTTP model drivers refuse an ungranted base URL; the Bedrock driver takes no `Egress`, because the AWS SDK will not disclose the endpoint it dialled. What stands in its place is the deployment's own network policy |

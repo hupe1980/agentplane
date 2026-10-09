@@ -269,6 +269,14 @@ impl JournalStore for SealedJournal {
         self.inner.consistency_proof(old_size).await
     }
 
+    async fn consistency_proof_at(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<Vec<Digest>, StoreError> {
+        self.inner.consistency_proof_at(old_size, new_size).await
+    }
+
     async fn inclusion_proof(&self, run: RunId) -> Result<Option<Inclusion>, StoreError> {
         self.inner.inclusion_proof(run).await
     }
@@ -603,6 +611,82 @@ mod tests {
         assert!(
             opened.is_err(),
             "non-UTF-8 plaintext was left sealed and reported as {opened:?}"
+        );
+    }
+
+    /// **A historical consistency proof reaches the store beneath the seal.**
+    ///
+    /// A witness submission proves an older checkpoint against the one it
+    /// carries, while runs keep sealing. Answered by the trait's default
+    /// rather than the store's own, the proof exists only while the live log
+    /// is exactly the size asked for, so a sealed plane's submission failed
+    /// whenever a run sealed mid-submission.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn a_historical_consistency_proof_reaches_the_store_beneath() {
+        use std::sync::Arc;
+
+        use crate::journal::{Append, JournalStore};
+
+        let tenant = crate::core::TenantId::default();
+        let raw = Arc::new(crate::store::RedbStore::open_in_memory().expect("store"))
+            as Arc<dyn JournalStore>;
+        let sealed = super::SealedJournal::wrap(
+            Arc::clone(&raw),
+            Arc::new(crate::testkit::MemoryKeyRing::new()),
+            tenant,
+        );
+        let mut sizes = Vec::new();
+        for _ in 0..3 {
+            let run = RunId::generate();
+            let lease = sealed
+                .acquire(run, "proof", std::time::Duration::from_mins(1))
+                .await
+                .expect("lease");
+            sealed
+                .append(
+                    lease.epoch,
+                    vec![Append::new(
+                        run,
+                        RecordKind::Note {
+                            text: "probe".into(),
+                        },
+                    )],
+                )
+                .await
+                .expect("append");
+            let head = sealed.head(run).await.expect("head");
+            sealed
+                .append(
+                    lease.epoch,
+                    vec![Append::new(
+                        run,
+                        RecordKind::RunConcluded {
+                            outcome: "succeeded".to_owned(),
+                            chain_head: head.hash,
+                            reason: None,
+                            exhaustion: None,
+                            live_spend: crate::core::Spend::default(),
+                        },
+                    )],
+                )
+                .await
+                .expect("conclude");
+            sealed
+                .seal(run, lease.epoch, "succeeded")
+                .await
+                .expect("seal");
+            sizes.push(sealed.checkpoint().await.expect("checkpoint").size);
+        }
+        let (old, new) = (sizes[0], sizes[1]);
+        assert_eq!(
+            sealed
+                .consistency_proof_at(old, new)
+                .await
+                .expect("a proof between two past sizes"),
+            raw.consistency_proof_at(old, new)
+                .await
+                .expect("the store's proof"),
         );
     }
 }

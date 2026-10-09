@@ -1,6 +1,6 @@
 # Formal specifications
 
-Eight TLA+ models covering the parts of the runtime that must be unconditionally
+TLA+ models covering the parts of the runtime that must be unconditionally
 correct, and that are hardest to convince yourself of by reading code:
 
 | Spec | Question it answers |
@@ -64,15 +64,11 @@ without a `.cfg` fails the run.
 
 ## Why the mutants matter more than the specs
 
-A spec nobody has run is documentation. A spec whose mutants also pass is worse
-— it is decoration that looks like evidence.
-
-`EffectProtocol` and `Fencing` both started out exactly that way. `EffectProtocol` originally
-modelled "act" and "record" as a *single atomic step*. That made the one state
+A spec whose mutants also pass is decoration that looks like evidence. Modelling
+"act" and "record" as a *single atomic step*, for example, makes the one state
 the protocol exists to survive — the action landed, the process died before
-recording it — **unreachable**, so `ExactlyOnce` was true by construction. TLC
-reported no errors. The verification was worthless, and reading the spec did not
-reveal it; only mutating it did.
+recording it — **unreachable**, so `ExactlyOnce` holds by construction and TLC
+reports no errors. Reading the spec does not reveal that; mutating it does.
 
 So the second pass injects real bugs and requires each one to be caught by the
 specific invariant written for it (see [`mutations.py`](mutations.py)):
@@ -86,6 +82,8 @@ specific invariant written for it (see [`mutations.py`](mutations.py)):
 | A run that left a mutation in doubt reports success | `RetrySafety` | `NoSuccessOnUnresolvedDoubt` |
 | A reconcilable effect is escalated without being asked about | `RetrySafety` | `NoQuarantineWithoutAsking` |
 | An attempt acts before its announcement is durable | `RetrySafety` | `DurableIntentPrecedesAction` |
+| A person's answer is a preference rather than a fact about the world | `RetrySafety` | `ExactlyOnce` |
+| A person answering a quarantine ends the run instead of supplying a fact | `RetrySafety` | `SuccessMeansComplete` |
 | A run holding an unknown outcome is unwound anyway | `Saga` | `NoUnwindUnderDoubt` |
 | The unwind continues past the point of no return | `Saga` | `PivotHolds` |
 | A step that declared no compensation is undone anyway | `Saga` | `UndeclaredIsNeverUndone` |
@@ -98,13 +96,15 @@ specific invariant written for it (see [`mutations.py`](mutations.py)):
 | A deferred failure after the atomic members committed aborts anyway | `EffectGroup` | `AbortIsComplete` |
 | A deferred member that externalised itself before failing aborts anyway | `EffectGroup` | `NoUnwindPastAnExternalisedDeferred` |
 | A group left open is committed rather than taken back | `EffectGroup` | `NoSilentCommit` |
-| A group reports aborted with a landed member never taken back | `EffectGroup` | `AbortIsComplete` |
+| A stopped unwind reports aborted with a member never taken back | `EffectGroup` | `AbortIsComplete` |
 | Store accepts a write without checking the epoch | `Fencing` | `EpochsNeverRegress` |
 | A renewal bumps the epoch as if it had taken the lease over | `Fencing` | `RenewalPreservesOwnership` |
 | A delegate is granted authority its delegator does not hold | `Delegation` | `ScopeNeverWidens` |
 | A chain loaded from storage is trusted rather than re-checked | `Delegation` | `RehydratedChainsAreWellFormed` |
 | Policy is re-evaluated while replaying a recorded run | `Authorization` | `ReplayNeverConsultsPolicy` |
 | A run stops on a denial without recording it | `Authorization` | `DenialIsDurable` |
+| The audit keeps the tallest anchor instead of checking each one | `Equivocation` | `EveryForkIsSeen` |
+| A witness cosigns without recording what it vouched for | `Equivocation` | `NoWitnessVouchesForTwoHistories` |
 | The effect protocol is checked without the fairness its termination needs | `EffectProtocol` | `Terminates` (property) |
 | The slot count skips a crashed or sealed run still holding its row | `Quota` | `AdmissionsWithinCeiling` |
 | A recorded pass is settled again without checking its receipt | `Quota` | `PassSettledOnce` |
@@ -172,8 +172,7 @@ The model deliberately loses both `inflight` and `acted` on every crash, because
 in-memory knowledge does not survive a process death. That is what makes an
 orphaned announcement genuinely undecidable and forces the escalate-to-a-human
 branch. A model that remembered across crashes would "prove" a protocol that
-cannot be built — which is precisely the failure the atomic-`Perform` version
-had.
+cannot be built.
 
 `Act`'s guard is likewise restricted to what the *implementation* can observe:
 "I announced this and have not acted on it yet". It never consults `world`,
@@ -189,10 +188,7 @@ because the outside world is not readable. Guarding on `world` would make
   first. A third attempt that lands is announced by its own record, and checking
   only attempt 1 would let an unannounced retry through.
 - `NoSuccessOnUnresolvedDoubt` — a run that timed out on a payment never ends
-  green *unless a probe settled the question*. "Unresolved" is doing the work
-  here, and it earned its keep: the formula originally forbade success after any
-  in-doubt failure at all, which was right only because nothing could resolve
-  one. TLC rejected it the moment `Probe` was added.
+  green *unless a probe settled the question*.
 - `NoQuarantineWithoutAsking` — an effect that could have been asked about is
   never escalated without asking. The complement of the one above: that says a
   run must not claim success it cannot support, this says it must not spend a
@@ -213,14 +209,8 @@ world **may or may not** have changed:
 ```
 
 TLC explores both branches. Collapsing it to either one would model a runtime
-that can tell the difference — and no runtime can, which is the entire problem.
-That is the same failure the atomic-`Perform` version of `EffectProtocol` had,
-and it is why the mutation pass exists.
-
-Writing this spec found a real gap in the rules: an effect that was *safe* to
-repeat, failing in doubt on its final attempt, had no applicable transition and
-deadlocked the model. The implementation handled that case; the specification
-did not. `GiveUp` now covers it.
+that can tell the difference — and no runtime can. `GiveUp` covers an effect
+that was *safe* to repeat failing in doubt on its final attempt.
 
 **`Saga`**
 
@@ -250,8 +240,7 @@ The bounds matter more here than anywhere else. The unwind stops at the *first*
 stopper it meets going backwards, so a config with the compensatable steps below
 the stoppers can never compensate more than one step — and `UnwindIsReverse` and
 `CompensatedAtMostOnce` then pass for want of a second element rather than
-because the protocol is right. The first version of this model did exactly that,
-in 25 states. See [`Saga.cfg`](Saga.cfg).
+because the protocol is right. See [`Saga.cfg`](Saga.cfg).
 
 **`EffectGroup`**
 
@@ -264,8 +253,7 @@ which is why this spec can talk about completeness at all.
   member has landed and the invariants hold. Stated over the frontier rather
   than over the outcome, because a member is legitimately released while the
   group is still open: commit is what *follows* the last release, not what
-  precedes the first. An earlier version said "only for a committed group" and
-  TLC rejected it in five states.
+  precedes the first.
 - `AbortIsComplete` — an aborted group has nothing standing: every member that
   landed was taken back, no gated member ever ran, and the atomic members never
   committed. The third conjunct is the atomic form of the same lie — a
@@ -298,13 +286,6 @@ and the second case is the only way `NoUnwindPastAnExternalisedDeferred` is
 reachable at all. With one gated member it would pass vacuously. See
 [`EffectGroup.cfg`](EffectGroup.cfg).
 
-This spec also produced the clearest example of why the mutation pass exists.
-Adding the transaction made an *existing* mutant survive: `txState # "pending"`
-transitively implies `invariantsHold`, because only `CommitTransaction` clears it
-and that requires the invariants — so a mutation removing `invariantsHold` alone
-left the property true for a second reason. A mutation that had been catching
-something quietly stopped, and nothing but running it would have said so.
-
 **`Authorization`**
 
 - `ReplayNeverConsultsPolicy` — the load-bearing one. If policy were re-evaluated
@@ -324,9 +305,8 @@ something quietly stopped, and nothing but running it would have said so.
 Denial is an initial-state *choice* (`banned \in SUBSET Forbidden`), not a
 constant fate: the run that permits everything reaches `done` and replays to
 `ReplayFinish`, the run with a refusal stops at `LiveDeny` and replays to
-`ReplayDenied`. With an unconditional `Forbidden = {3}` every live run was
-forced into the denial, `done` was unreachable, and `LiveFinish` /
-`ReplayFinish` were dead transitions TLC never exercised — see
+`ReplayDenied`. An unconditional `Forbidden` would force every live run into
+the denial and leave `LiveFinish` / `ReplayFinish` dead — see
 [`Authorization.cfg`](Authorization.cfg).
 
 **`Delegation`**
@@ -353,10 +333,7 @@ forced into the denial, `done` was unreachable, and `LiveFinish` /
 - `EpochsNeverRegress` — a superseded owner never appends after a takeover.
 - `SingleCurrentOwner` — at most one instance holds the current epoch, stated
   over the *same predicate the store's fence enforces on writes* — so it reads
-  "at most one instance can append", not "a value pattern holds". (It used to
-  be guarded with `leaseEpoch > 0` while `Write` accepted `held[i] >=
-  leaseEpoch`, which let two instances interleave epoch-0 appends the invariant
-  was worded to ignore.)
+  "at most one instance can append", not "a value pattern holds".
 - `NoWriteAboveCurrentEpoch` — nothing in the journal was written under an epoch
   the store had already moved past, or never issued.
 - `RenewalPreservesOwnership` — a renewal never moves the epoch or the owner:

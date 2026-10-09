@@ -279,6 +279,14 @@ impl JournalStore for StagedAtomic {
         self.inner.consistency_proof(old_size).await
     }
 
+    async fn consistency_proof_at(
+        &self,
+        old_size: u64,
+        new_size: u64,
+    ) -> Result<Vec<crate::core::Digest>, StoreError> {
+        self.inner.consistency_proof_at(old_size, new_size).await
+    }
+
     async fn inclusion_proof(
         &self,
         run: RunId,

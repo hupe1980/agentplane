@@ -99,10 +99,18 @@ impl SealedCases {
         let opened = super::envelope::open_or_erased(self.keys.as_ref(), aad.as_bytes(), &envelope)
             .await
             .map_err(|e| StoreError::Backend(e.to_string()))?;
-        Ok(match opened {
-            Some(plain) => serde_json::from_slice(&plain).unwrap_or(state),
-            None => state,
-        })
+        match opened {
+            // A state that opened and does not parse is an error, not the
+            // sealed wrapper handed back as if it were the state: nothing
+            // destroyed a key, so nothing explains it, and a caller reading
+            // the wrapper as the case's state would write it back sealed twice.
+            Some(plain) => serde_json::from_slice(&plain).map_err(|e| {
+                StoreError::Backend(format!(
+                    "case {case}'s sealed state opened and does not parse: {e}"
+                ))
+            }),
+            None => Ok(state),
+        }
     }
 
     /// Open one case's sealed state in place.
@@ -320,6 +328,23 @@ impl CaseStore for SealedCases {
         self.inner.hold(case).await
     }
 
+    async fn begin_erasure(
+        &self,
+        case: CaseId,
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<crate::case::ErasureStart, StoreError> {
+        self.inner.begin_erasure(case, at, reason).await
+    }
+
+    async fn complete_erasure(&self, case: CaseId) -> Result<(), StoreError> {
+        self.inner.complete_erasure(case).await
+    }
+
+    async fn erasure(&self, case: CaseId) -> Result<Option<crate::case::Erasure>, StoreError> {
+        self.inner.erasure(case).await
+    }
+
     async fn holds(
         &self,
         after: Option<CaseId>,
@@ -505,6 +530,38 @@ mod probe_tests {
                 Some(Err(super::super::KeyError::UnknownFormat { .. }))
             ),
             "a version skew must not reach the drill as a suspected loss"
+        );
+    }
+
+    /// **State that opens and does not parse is an error, not the envelope.**
+    ///
+    /// Nothing destroyed a key, so nothing explains it; handed back as the
+    /// state, the sealed wrapper reads as the case's data and a caller writing
+    /// it back seals it a second time.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn state_that_opens_and_does_not_parse_is_an_error() {
+        let ring = Arc::new(MemoryKeyRing::new());
+        let tenant = TenantId::default();
+        let cases = SealedCases::wrap(
+            Arc::new(crate::store::RedbStore::open_in_memory().expect("store")),
+            Arc::clone(&ring) as Arc<dyn KeyRing>,
+            tenant.clone(),
+        );
+        let case = matter();
+        let aad = format!("case-state:{tenant}:{case}");
+        let envelope = super::super::envelope::seal(
+            ring.as_ref(),
+            &super::super::scope(&tenant, &case.to_string()),
+            aad.as_bytes(),
+            b"not json",
+        )
+        .await
+        .expect("seal");
+        let opened = cases.open_state(case, payload::wrap(&envelope)).await;
+        assert!(
+            opened.is_err(),
+            "unparseable plaintext came back as the case's state: {opened:?}"
         );
     }
 }

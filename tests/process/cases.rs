@@ -699,7 +699,7 @@ async fn a_write_against_a_stale_read_is_refused() {
     // Run A reads at `at`, then goes off to call a model.
     // Run B reads at `at` too, and gets there first.
     let after_b = store.put_state(case, at, json!({"by": "B"})).await.unwrap();
-    assert_eq!(after_b, at.next());
+    assert_eq!(Some(after_b), at.next());
 
     // Run A comes back and writes against the version it read.
     let err = store
@@ -942,6 +942,7 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
         settles_on_due: std::sync::Mutex::default(),
         attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
         replaces_on_release: std::sync::Mutex::new(None),
+        hold_reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&counted))
@@ -1709,6 +1710,9 @@ struct InstrumentedCases {
     /// A hold the next conditional release places after releasing the
     /// standing one — another release and a re-place inside its window.
     replaces_on_release: std::sync::Mutex<Option<agentplane::core::LegalHold>>,
+    /// How many `hold` reads answer before the rest fail, standing in for a
+    /// store that stops answering partway through a pass.
+    hold_reads_left: std::sync::atomic::AtomicUsize,
 }
 
 const NO_CRASH: u8 = 0;
@@ -1747,7 +1751,37 @@ impl CaseStore for InstrumentedCases {
         &self,
         case: agentplane::core::CaseId,
     ) -> Result<Option<agentplane::core::LegalHold>, agentplane::core::StoreError> {
+        let left = self
+            .hold_reads_left
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.hold_reads_left
+            .store(left.saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
+        if left == 0 {
+            return Err(agentplane::core::StoreError::Backend(
+                "instrumented failure".to_owned(),
+            ));
+        }
         self.inner.hold(case).await
+    }
+    async fn begin_erasure(
+        &self,
+        case: agentplane::core::CaseId,
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<agentplane::case::ErasureStart, agentplane::core::StoreError> {
+        self.inner.begin_erasure(case, at, reason).await
+    }
+    async fn complete_erasure(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<(), agentplane::core::StoreError> {
+        self.inner.complete_erasure(case).await
+    }
+    async fn erasure(
+        &self,
+        case: agentplane::core::CaseId,
+    ) -> Result<Option<agentplane::case::Erasure>, agentplane::core::StoreError> {
+        self.inner.erasure(case).await
     }
     async fn holds(
         &self,
@@ -1989,6 +2023,7 @@ async fn strict_replay_does_not_re_register_an_obligation() {
         settles_on_due: std::sync::Mutex::default(),
         attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
         replaces_on_release: std::sync::Mutex::new(None),
+        hold_reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
     });
     let rt = Runtime::builder(store.clone() as Arc<dyn JournalStore>)
         .cases(cases)
@@ -2077,6 +2112,7 @@ async fn a_sweep_interrupted_before_the_breach_leaves_the_obligation_outstanding
         settles_on_due: std::sync::Mutex::default(),
         attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
         replaces_on_release: std::sync::Mutex::new(None),
+        hold_reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&crashing))
@@ -2190,6 +2226,7 @@ async fn an_obligation_met_during_the_sweep_is_not_breached() {
         settles_on_due: std::sync::Mutex::new(vec![(met, "respond-by"), (warned, "respond-by")]),
         attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
         replaces_on_release: std::sync::Mutex::new(None),
+        hold_reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(racing as Arc<dyn CaseStore>)
@@ -2418,6 +2455,7 @@ async fn crash_in_attach(when: u8) -> (Vec<agentplane::RunId>, Vec<agentplane::R
         settles_on_due: std::sync::Mutex::default(),
         attach_crashes: std::sync::atomic::AtomicU8::new(when),
         replaces_on_release: std::sync::Mutex::new(None),
+        hold_reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&cases) as Arc<dyn CaseStore>)
@@ -2502,6 +2540,7 @@ async fn a_refused_registration_concludes_over_its_own_head() {
         settles_on_due: std::sync::Mutex::default(),
         attach_crashes: std::sync::atomic::AtomicU8::new(ATTACH_FAILS),
         replaces_on_release: std::sync::Mutex::new(None),
+        hold_reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
     });
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .cases(Arc::clone(&cases) as Arc<dyn CaseStore>)
@@ -2534,5 +2573,72 @@ async fn a_refused_registration_concludes_over_its_own_head() {
         report.sound.contains(&runs[0]),
         "a run concluded after a refused registration audits as tampered: {:#?}",
         report.findings
+    );
+}
+
+/// **A hold that cannot be read is a failure of the pass, not a release.**
+///
+/// The pass names each held matter's hold from a second read. Read as *no
+/// hold* when that read failed, the report said a preservation order was
+/// released while the pass ran — a claim about a control nobody could see.
+#[tokio::test]
+async fn a_hold_the_retention_pass_cannot_read_is_a_failure() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let case = store
+        .correlate_or_open("matter", &[key("matter", "HELD-1")], Timestamp::UNIX_EPOCH)
+        .await
+        .unwrap()
+        .case_id();
+    store
+        .place_hold(
+            case,
+            &agentplane::core::LegalHold {
+                placed_at: Timestamp::UNIX_EPOCH,
+                reason: "preservation order".to_owned(),
+                by: agentplane::core::Operator::asserted("compliance").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    store.close(case).await.unwrap();
+    let cases: Arc<dyn CaseStore> = Arc::new(InstrumentedCases {
+        inner: Arc::clone(&store) as Arc<dyn CaseStore>,
+        registered: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        transitions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        escalation_fails: false,
+        settles_on_due: std::sync::Mutex::default(),
+        attach_crashes: std::sync::atomic::AtomicU8::new(NO_CRASH),
+        replaces_on_release: std::sync::Mutex::new(None),
+        // The plan's read answers; the report's does not.
+        hold_reads_left: std::sync::atomic::AtomicUsize::new(1),
+    });
+    let tenant = agentplane::core::TenantId::default();
+    let report = agentplane::retention::retain(
+        &agentplane::retention::Stores {
+            cases: &cases,
+            blobs: None,
+            #[cfg(feature = "keyring")]
+            keys: None,
+            tenant: &tenant,
+            disclosures: None,
+        },
+        store.as_ref(),
+        Timestamp::from_unix_timestamp(4_000_000_000).unwrap(),
+        Timestamp::from_unix_timestamp(4_000_000_000).unwrap(),
+        "retention",
+    )
+    .await
+    .unwrap();
+    assert!(
+        report.held.iter().all(|h| !h.contains("released")),
+        "an unreadable hold was reported as released: {:?}",
+        report.held
+    );
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|f| f.contains(&case.to_string())),
+        "an unreadable hold is not in the failures: {report:?}"
     );
 }

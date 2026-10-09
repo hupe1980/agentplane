@@ -25,9 +25,10 @@
 //!
 //! # When the stream ends
 //!
-//! The spec requires closing on a terminal state. `INPUT_REQUIRED` and
-//! `AUTH_REQUIRED` are interrupted rather than terminal, so they remain open:
-//! an out-of-band answer may resume the task without another client request.
+//! The stream stays open across `INPUT_REQUIRED`, which an out-of-band answer
+//! resumes without another client request, and ends when the run concludes —
+//! a withheld conclusion (`AUTH_REQUIRED`) included, which a client follows by
+//! re-subscribing.
 //! Intermediaries may reap a very idle connection; reconnecting is safe because
 //! the stream is rebuilt from the journal rather than resumed from memory.
 //!

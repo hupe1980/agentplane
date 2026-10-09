@@ -1021,8 +1021,8 @@ pub struct Label {""",
         "src/runtime/executor.rs",
         "a_run_acts_under_the_terms_chain_not_the_planes",
         "the plane's own chain gates a run whose terms carried the caller's",
-        "            Self::Plane | Self::Nobody => plane,\n            Self::Caller(chain) => Some(chain),",
-        "            Self::Plane | Self::Nobody | Self::Caller(_) => plane,",
+        "            Self::Plane | Self::Nobody => plane,\n            Self::Caller(chain) | Self::PlaneDelegate(chain) => Some(chain),",
+        "            Self::Plane | Self::Nobody | Self::Caller(_) => plane,\n            Self::PlaneDelegate(chain) => Some(chain),",
     ),
     "ThePlanesChainIsRecordedForTheCaller": (
         "src/runtime/executor.rs",
@@ -1723,11 +1723,11 @@ pub struct Label {""",
         '        Ok(release)',
     ),
     "AnErasureLeavesTheIndex": (
-        "src/memory/indexed.rs",
-        "an_erasure_reaches_the_semantic_index",
+        'src/memory/indexed.rs',
+        'an_erasure_reaches_the_semantic_index',
         'forgetting a subject leaves its embeddings in the semantic index, where a vector hidden from search is still reconstructible content',
-        '        self.tell(vec![Forgotten::Subject(subject.to_owned())])\n            .await?;',
-        '        let _ = Forgotten::Subject(subject.to_owned());',
+        '                    forgotten.push(Forgotten::Subject(subject.to_owned()));',
+        '                    let _ = Forgotten::Subject(subject.to_owned());',
     ),
     "AForgottenIdLeavesTheIndex": (
         "src/memory/indexed.rs",
@@ -1737,18 +1737,18 @@ pub struct Label {""",
         '        Ok(())',
     ),
     "ACascadeLeavesTheIndex": (
-        "src/memory/indexed.rs",
-        "an_erasure_the_index_missed_is_delivered_by_the_next_one",
+        'src/memory/indexed.rs',
+        'an_erasure_the_index_missed_is_delivered_by_the_next_one',
         'a cascading erasure removes rows and never tells the index, so every derivative it erased keeps its embedding',
-        '        self.tell(forgotten).await?;\n        Ok(cascade)',
-        '        let _ = forgotten;\n        Ok(cascade)',
+        '                if !cascade.erased.is_empty() {',
+        '                if false {',
     ),
     "AnExpirySweepLeavesTheIndex": (
-        "src/memory/indexed.rs",
-        "the_expiry_sweep_reaches_the_semantic_index",
+        'src/memory/indexed.rs',
+        'the_expiry_sweep_reaches_the_semantic_index',
         'the expiry sweep removes rows and never tells the index, so every expired memory keeps its embedding',
-        '        self.tell(forgotten).await?;\n        Ok(swept)',
-        '        let _ = forgotten;\n        Ok(swept)',
+        '                if !swept.is_empty() {',
+        '                if false {',
     ),
     "WhatTheIndexMissedIsDropped": (
         "src/memory/indexed.rs",
@@ -1893,47 +1893,19 @@ pub struct Label {""",
         "instead of being re-asked against the ledger now in force, so a run "
         "exhausted by max_effects stays exhausted under a ceiling that now "
         "admits it — the step-level twin resumes, this tier never does",
-        """        if !self.writes_enabled() {
+        """        if !self.writes_enabled() || self.abandoning {
             return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
         }""",
         """        if true {
             return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
         }""",
     ),
-    "AMidPrefixRefusalIsReadmitted": (
-        "src/runtime/ctx.rs",
-        "a_refusal_a_group_abort_already_answered_is_not_readmitted",
-        "a budget refusal inside the replayed prefix — one a group abort "
-        "already answered, with the reversals and settlement recorded after "
-        "it — is re-admitted under a raised ceiling, dispatching the member "
-        "where history holds the abort: divergence and a quarantine "
-        "manufactured out of an operator's raise",
-        """        if !self.writes_enabled() {
-            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
-        }
-        // Asked without taking the slot""",
-        """        if self.mode == Mode::Strict {
-            return Err(recorded_refusal(EffectReplay::Refused { limit, used }));
-        }
-        // Asked without taking the slot""",
-    ),
     "AReadmittedRefusalStillStopsAStrictReplay": (
-        "src/journal/replay.rs",
-        "an_effect_limited_run_resumes_under_a_raised_ceiling_and_not_under_the_same_one",
-        "a recorded re-admission no longer supersedes the refusal beside it, so "
-        "a strict replay of the resumed history stops at the stale refusal and "
-        "reports Exhausted about a run whose own later records show it "
-        "finishing — refusal-then-continuation read as divergence",
-        """            RecordKind::BudgetReadmitted { .. } => {
-                if let Some(pos) = self
-                    .effects
-                    .iter()
-                    .rposition(|e| e.key == key && matches!(e.replay, EffectReplay::Refused { .. }))
-                {
-                    self.effects.remove(pos);
-                }
-            }""",
-        """            RecordKind::BudgetReadmitted { .. } => {}""",
+        'src/journal/replay.rs',
+        'an_effect_limited_run_resumes_under_a_raised_ceiling_and_not_under_the_same_one',
+        'a recorded re-admission no longer supersedes the refusal beside it, so a strict replay of the resumed history stops at the stale refusal and reports Exhausted about a run whose own later records show it finishing — refusal-then-continuation read as divergence',
+        '            RecordKind::BudgetReadmitted { .. } => {\n                self.supersede_withheld(key);\n                if let Some(pos) = self\n                    .effects\n                    .iter()\n                    .rposition(|e| e.key == key && matches!(e.replay, EffectReplay::Refused { .. }))\n                {\n                    self.effects.remove(pos);\n                }\n            }',
+        '            RecordKind::BudgetReadmitted { .. } => {}',
     ),
     # ── Replanning ──────────────────────────────────────────────────────────
     "ReplanOnUntrusted": (
@@ -2000,13 +1972,11 @@ pub struct Label {""",
         """    let _ = scope;""",
     ),
     "AnUnknownCaseErasesToZero": (
-        "src/blob/mod.rs",
-        "erasing_an_unknown_case_is_not_found",
-        "an erasure naming a case this plane never held answers `Ok(0)` — the "
-        "same answer as a matter that stored nothing and was erased — so a "
-        "mistyped id closes the request while the real matter stays untouched",
-        """    if found.is_none() {""",
-        """    if false {""",
+        'src/blob/mod.rs',
+        'erasing_an_unknown_case_is_not_found',
+        'an erasure naming a case this plane never held answers `Ok(0)` — the same answer as a matter that stored nothing and was erased — so a mistyped id closes the request while the real matter stays untouched',
+        '        return Err(EraseError::Store(crate::core::StoreError::NotFound(\n            case.to_string(),\n        )));\n    };\n\n    // An erasure already begun',
+        '        return Ok(Erased { blobs: 0, copies: Vec::new() });\n    };\n\n    // An erasure already begun',
     ),
     "AnErasureExpiresTheBareDigest": (
         "src/blob/mod.rs",
@@ -2527,11 +2497,11 @@ pub struct Label {""",
         "    for anchor in std::iter::empty::<&Anchor>() {",
     ),
     "TheTreeIndexIsTheStoredIndex": (
-        "src/store/redb.rs",
-        "only_an_outside_checkpoint_detects_a_deletion",
+        'src/store/redb.rs',
+        'only_an_outside_checkpoint_detects_a_deletion',
         "a removed run still advances the tree position, so every later run's inclusion proof is off by one",
-        "                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    continue;\n                };\n                if let Some(slot) = wanted.get_mut(run_id.value()) {",
-        "                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    rank += 1;\n                    continue;\n                };\n                if let Some(slot) = wanted.get_mut(run_id.value()) {",
+        '            for entry in log\n                .range((tenant.as_str(), 0)..=(tenant.as_str(), u64::MAX))\n                .map_err(|e| be(&e))?\n            {\n                let (_, run_id) = entry.map_err(|e| be(&e))?;\n                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    continue;\n                };\n                let (_, head, _) = seal.value();\n                let head = digest(head)?;\n                if let Some(slot) = wanted.get_mut(run_id.value()) {\n                    *slot = Some((leaves.len() as u64, head));\n                }',
+        '            for (walked, entry) in log\n                .range((tenant.as_str(), 0)..=(tenant.as_str(), u64::MAX))\n                .map_err(|e| be(&e))?\n                .enumerate()\n            {\n                let (_, run_id) = entry.map_err(|e| be(&e))?;\n                let Some(seal) = seals.get(run_id.value()).map_err(|e| be(&e))? else {\n                    continue;\n                };\n                let (_, head, _) = seal.value();\n                let head = digest(head)?;\n                if let Some(slot) = wanted.get_mut(run_id.value()) {\n                    *slot = Some((walked as u64, head));\n                }',
     ),
     "ConsistencyProofsAreVacuous": (
         "src/core/merkle.rs",
@@ -3411,32 +3381,18 @@ pub struct Label {""",
             && let Some(schema) = request.schema""",
     ),
     "AnOpenObjectSchemaIsAccepted": (
-        "src/manifest/mod.rs",
-        "an_object_schema_a_model_may_add_to_is_refused",
-        "a declarative agent may declare an object schema the model can add "
-        "fields to — the vacuous `schema: {}` one level down, and the one "
-        "constrained decoding cannot bind, so the reviewed contract stops "
-        "holding at the moment it is supposed to",
-        """        if is_object && schema.get("additionalProperties") != Some(&serde_json::Value::Bool(false))
-        {""",
-        """        if false && is_object {""",
+        'src/manifest/mod.rs',
+        'an_object_schema_a_model_may_add_to_is_refused',
+        'a declarative agent may declare an object schema the model can add fields to — the vacuous `schema: {}` one level down, and the one constrained decoding cannot bind, so the reviewed contract stops holding at the moment it is supposed to',
+        '            if is_object && obj.get("additionalProperties") != Some(&serde_json::Value::Bool(false))\n            {',
+        '            if false && is_object {',
     ),
     "TheOpenObjectRuleStopsAtTheSurface": (
-        "src/manifest/mod.rs",
-        "an_object_schema_a_model_may_add_to_is_refused",
-        "only the outermost object is checked, so a nested one the model also "
-        "fills in stays open — and a reviewer reading a closed top level has "
-        "no way to see it",
-        """        if let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-            for (name, nested) in properties {
-                Self::refuse_open_objects(nested, &format!("{at}.{name}"))?;
-            }
-        }""",
-        """        if false && let Some(properties) = schema.get("properties").and_then(|p| p.as_object()) {
-            for (name, nested) in properties {
-                Self::refuse_open_objects(nested, &format!("{at}.{name}"))?;
-            }
-        }""",
+        'src/manifest/mod.rs',
+        'an_object_schema_a_model_may_add_to_is_refused',
+        'only the outermost object is checked, so a nested one the model also fills in stays open — and a reviewer reading a closed top level has no way to see it',
+        '            if problem.is_some() {\n                return;\n            }',
+        '            if problem.is_some() || path != at {\n                return;\n            }',
     ),
     "ASensitivityRendersAsRustRatherThanAsWritten": (
         "src/core/label.rs",
@@ -3615,6 +3571,809 @@ pub struct Label {""",
         "the cheap abort was the truthful settlement",
         """            _ => EffectError::Refused(error.to_string()),""",
         """            _ => EffectError::Other(error.to_string()),""",
+    ),
+    "TheJournalCeilingIsJudgedOnReplay": (
+        "src/runtime/ctx.rs",
+        "a_plane_without_a_manifest_can_bound_what_it_writes_down",
+        "the plane's journal ceiling is judged again on replay, so a strict "
+        "replay of a run it refused writes a second refusal and diverges from "
+        "the verdict the record holds",
+        """        if live_dispatch
+            && let Some(journal_ceiling) = journal_ceiling""",
+        """        if let Some(journal_ceiling) = journal_ceiling""",
+    ),
+    "TheHeartbeatGivesUpOnABlip": (
+        "src/runtime/executor.rs",
+        "a_failed_renewal_does_not_abandon_a_running_run",
+        "the lease heartbeat stops on any failed renewal, so one store blip "
+        "lets a run that is still executing lapse into the recovery sweep, "
+        "which takes it over beside the original",
+        """                    Err(crate::core::StoreError::LeaseNotHeld { .. }) => return,""",
+        """                    Err(crate::core::StoreError::LeaseNotHeld { .. }) => return,
+                    Err(_) => return,""",
+    ),
+    "ALiftedWithholdingOutlivesTheRefusalAfterIt": (
+        'src/journal/replay.rs',
+        'a_refusal_after_a_lifted_withholding_supersedes_it',
+        'a refusal recorded at a hop after its withholding was lifted does not supersede the withholding, so every resume re-raises a pause nobody holds any longer and the run never reaches the refusal',
+        '        self.supersede_withheld(key);\n        self.effects.push(Journaled {\n            key,\n            seq,\n            what: None,',
+        '        self.effects.push(Journaled {\n            key,\n            seq,\n            what: None,',
+    ),
+    "AManifestGrantWidensThePeerCeiling": (
+        "src/peers/mod.rs",
+        "a_manifest_grant_cannot_widen_the_wirings_peer_ceiling",
+        "a manifest grant replaces the operator wiring's ceiling for a peer "
+        "instead of tightening it, so a reviewed declaration sends a peer data "
+        "the deployment never allowed to reach it",
+        """        self.grant.max_sensitivity = self.grant.max_sensitivity.min(safety.max_sensitivity);""",
+        """        self.grant.max_sensitivity = safety.max_sensitivity;""",
+    ),
+    "AReplayDoesNotCountRecordedDenials": (
+        "src/runtime/ctx.rs",
+        "a_sink_refusal_counts_against_the_denial_ceiling",
+        "a recorded refusal read back on replay is not counted toward "
+        "max_denials, so a strict replay of a run stopped at its ceiling "
+        "diverges and a resume starts the count again and probes past it",
+        """        if let EffectReplay::Denied { action, .. } = &refusal {
+            let sink""",
+        """        if let EffectReplay::Withheld { subject: action, .. } = &refusal {
+            let sink""",
+    ),
+    "AnyIssuedTokenIsPresented": (
+        "src/peers/exchange.rs",
+        "an_issued_token_that_is_not_a_bearer_access_token_is_refused",
+        "the token endpoint's answer is taken as a bearer access token whatever "
+        "it says it issued, so a refresh token is sent to the peer as a bearer "
+        "and the refusal reads as the peer's failure",
+        """        if issued.issued_token_type.as_deref() != Some(ACCESS_TOKEN_TYPE) {""",
+        """        if false {""",
+    ),
+    "AnUnstatedLifetimeIsForever": (
+        "src/peers/exchange.rs",
+        "a_token_with_no_stated_lifetime_still_expires",
+        "a token whose issuer named no lifetime is held for ever, so it is "
+        "served past whatever expiry the issuer kept to itself",
+        """        let lifetime = issued.expires_in.map_or(UNSTATED_LIFETIME, |seconds| {""",
+        """        let lifetime = issued.expires_in.map_or(time::Duration::MAX, |seconds| {""",
+    ),
+    "ACommissionThatGaveNoAnswerSucceeds": (
+        "src/runtime/ctx.rs",
+        "a_failed_commission_is_not_commissioned_again",
+        "a sub-run that concluded without an answer is read as one that answered "
+        "nothing, so the delegating run carries on as if the specialist had "
+        "succeeded",
+        """        let Some(answer) = out.output else {""",
+        """        let Some(answer) = out.output.or_else(|| Some(Tainted::trusted(Value::Null))) else {""",
+    ),
+    "APauseInsideAGroupAbortsIt": (
+        "src/runtime/executor.rs",
+        "exhaustion_inside_a_group_pauses_and_a_cancel_still_unwinds_it",
+        "an exhausted ceiling or a withdrawn authority inside an open group "
+        "aborts the group, so a pause takes back work a raised ceiling or a "
+        "lifted halt would have continued",
+        """    if !cx.abandoning
+        && matches!(&result, Err(SkillError::Step(e)) if crate::runtime::group::is_pause(e))
+    {""",
+        """    if matches!(&result, Err(SkillError::Step(StepError::Suspended(_)))) {""",
+    ),
+    "ACancelLeavesAPausedGroupStanding": (
+        "src/runtime/executor.rs",
+        "exhaustion_inside_a_group_pauses_and_a_cancel_still_unwinds_it",
+        "a cancel of a run paused inside an open group unwinds the steps before "
+        "it and never the group, whose reversals only that step can build — so "
+        "the run quarantines with a held card and an authorisation standing",
+        """                if !abandon.is_empty() {""",
+        """                if abandon.is_empty() {""",
+    ),
+    "APeerTaskEscapesTheDeclaration": (
+        "src/runtime/ctx.rs",
+        "a_task_at_an_ungranted_peer_is_refused_by_the_declaration",
+        "reading or cancelling a task at a peer is not held to the declaration, "
+        "so a skill reaches a peer the agent's manifest never granted by "
+        "building a task handle for it",
+        """            "a2a.task/get" | "a2a.task/cancel" => {""",
+        """            "a2a.task/never" => {""",
+    ),
+    "AClassificationSkipsTheFieldLabels": (
+        "src/core/label.rs",
+        "a_raise_reaches_every_labelled_field",
+        "a content rule's classification raises only the root label, so a "
+        "protected field's own ceiling judges the field at its old sensitivity "
+        "and passes a value the rule found too sensitive",
+        """                .map(|(path, label)| (path.clone(), raise(label)))""",
+        """                .map(|(path, label)| (path.clone(), label.clone()))""",
+    ),
+    "AWiringFaultIsInDoubt": (
+        "src/runtime/group.rs",
+        "a_wiring_fault_beside_an_open_group_aborts_it",
+        "a step that asks for something the plane was not built with is read as "
+        "a call that may have landed, so an open group beside it is quarantined "
+        "for a person instead of being taken back",
+        """        // Anything else is a pre-dispatch refusal (a gate, a budget, a footprint""",
+        """        StepError::NotWired(_) => true,
+        // Anything else is a pre-dispatch refusal (a gate, a budget, a footprint""",
+    ),
+    "AnUncommittedAtomicMemberIsExpectedOnReplay": (
+        "src/runtime/group.rs",
+        "a_refused_second_atomic_member_replays_as_it_ran",
+        "a replay expects a record at every atomic member's key, so a group "
+        "whose second member was refused — the first gated, never committed, "
+        "nothing recorded — reads as divergent and a faithful run quarantines",
+        """            if self.replaying()
+                && !self.cursor_peek_is(key)""",
+        """            if false
+                && !self.cursor_peek_is(key)""",
+    ),
+    "A2aPushListShowsOperatorDestinations": (
+        'src/api/a2a.rs',
+        'a_peer_can_neither_see_nor_delete_an_operator_destination',
+        "ListTaskPushNotificationConfigs returns the deployment's operator destination (its internal URL) to the peer that owns the task",
+        '            .filter(|config| PushNamespace::Caller.owns_id(&config.id))',
+        '            .filter(|_| true)',
+    ),
+    "A2aPushGetDeleteReachOperatorDestinations": (
+        'src/api/a2a.rs',
+        'a_peer_can_neither_see_nor_delete_an_operator_destination',
+        "Get/DeleteTaskPushNotificationConfig accept an operator: id, so a peer reads the deployment's destination and deletes it with its cursor",
+        '    Ok((id, PushNamespace::Caller.owns_id(id)))',
+        '    Ok((id, true))',
+    ),
+    "A2aCancelRefusesResumableConclusions": (
+        'src/api/a2a.rs',
+        'cancel_task_reaches_a_failed_run',
+        "CancelTask refuses every concluded run on its own, so a failed/exhausted/withheld run the runtime's stop reaches cannot be stopped over A2A",
+        '    let fresh = server\n        .runtime\n        .request_cancel(',
+        '    if let RecordKind::RunConcluded { outcome, .. } = last.kind() {\n        return Err(RpcError::new(\n            code::TASK_NOT_CANCELABLE,\n            format!("this task already finished as \'{outcome}\'"),\n        ));\n    }\n    let fresh = server\n        .runtime\n        .request_cancel(',
+    ),
+    "A2aWithheldLiveIsTerminal": (
+        'src/api/a2a.rs',
+        'a_withheld_task_is_interrupted_not_terminal',
+        "a withheld run (authority withdrawn, resumable) is reported as terminal FAILED, closing the peer's stream and releasing its push registration",
+        '        RunStatus::Withheld { .. } => TaskState::AuthRequired,',
+        '        RunStatus::Withheld { .. } => TaskState::Failed,',
+    ),
+    "A2aWithheldSealedIsTerminal": (
+        'src/api/a2a.rs',
+        'a_live_status_and_its_sealed_outcome_agree',
+        'GetTask/streams/push report a withheld run as FAILED while SendMessage reports AUTH_REQUIRED',
+        '        "withheld" => TaskState::AuthRequired,',
+        '        "withheld" => TaskState::Failed,',
+    ),
+    "A2aPushReleasedAtWithheld": (
+        'src/api/a2a.rs',
+        'a_withheld_task_is_interrupted_not_terminal',
+        "the A2A push projection treats every RunConcluded as the end, so a withheld run's registration is deleted and the peer never hears how it ends",
+        '    super::a2a_stream::closes(sealed_state(outcome))\n}',
+        '    let _ = sealed_state(outcome);\n    true\n}',
+    ),
+    "A2aPerAgentCardsMissDeploymentFacts": (
+        'src/api/a2a.rs',
+        'every_agents_card_carries_the_tenant_push_flag_and_signature',
+        "each agent's own card is served without the tenant, push flag and signature the well-known card carries",
+        '            .chain(self.per_agent.values_mut())',
+        '            .chain(std::iter::empty())',
+    ),
+    "A2aOversizedMessageIdIsAFault": (
+        'src/api/a2a.rs',
+        'an_oversized_message_id_is_invalid_params',
+        "a messageId whose admission key exceeds the runtime's 512-byte cap reaches admission and comes back as -32603, which a client retries unchanged",
+        '        if key.len() > crate::runtime::MAX_ADMISSION_KEY_BYTES {',
+        '        if key.len() > usize::MAX - 1 {',
+    ),
+    "A2aListTotalShrinksOnContinuation": (
+        'src/api/a2a.rs',
+        'list_tasks_filters_context_and_uses_opaque_cursor_pages',
+        'ListTasks totalSize on a continuation page counts only the matches after the cursor',
+        '    let before = cursor.as_ref().map_or(0, |cursor| cursor.before);',
+        '    let before = cursor.as_ref().map_or(0_u64, |_| 0);',
+    ),
+    "A2aContinuationDropsPushConfig": (
+        'src/api/a2a.rs',
+        'a_continuation_refuses_a_push_configuration',
+        'a continuation silently drops configuration.taskPushNotificationConfig, telling the caller a webhook was registered that never is',
+        '    if message.task_id.is_some()\n        && configuration',
+        '    if message.task_id.is_none()\n        && message.task_id.is_some()\n        && configuration',
+    ),
+    "A2aWrongShapeIsParseError": (
+        'src/api/a2a.rs',
+        'the_json_rpc_envelope_refusals_carry_their_own_codes',
+        'valid JSON of the wrong shape (batch, no method) answers -32700 instead of -32600',
+        '                JsonRejection::JsonDataError(_) => RpcError::new(\n                    code::INVALID_REQUEST,',
+        '                JsonRejection::JsonDataError(_) => RpcError::new(\n                    code::PARSE_ERROR,',
+    ),
+    "A2aOversizedBodyIsParseError": (
+        'src/api/a2a.rs',
+        'the_json_rpc_envelope_refusals_carry_their_own_codes',
+        'a body over the size limit answers 200 with -32700 instead of HTTP 413',
+        '                JsonRejection::BytesRejection(_) => return rejection.into_response(),',
+        '                JsonRejection::BytesRejection(_) => RpcError::new(code::PARSE_ERROR, "too large"),',
+    ),
+    "A2aNonScalarIdAccepted": (
+        'src/api/a2a.rs',
+        'the_json_rpc_envelope_refusals_carry_their_own_codes',
+        'a JSON-RPC id that is an object or array is accepted and echoed back',
+        '    if !matches!(req.id, Value::Null | Value::String(_) | Value::Number(_)) {',
+        '    if matches!(req.id, Value::Bool(true)) {',
+    ),
+    "A2aRequestReadBeforeAuthentication": (
+        'src/api/a2a.rs',
+        'an_unauthenticated_caller_is_challenged_before_its_request_is_read',
+        'an unauthenticated caller is answered INVALID_PARAMS / METHOD_NOT_FOUND / tenant errors before the 401, mapping the surface without a credential',
+        '    let caller = match server.authenticate(&headers).await {',
+        '    if let Err(e) = parse_params(&req.method, &req.params) {\n        return e.with_id(id).into_response();\n    }\n    let caller = match server.authenticate(&headers).await {',
+    ),
+    "AcpUserChunkReadsTitle": (
+        'src/observe/acp.rs',
+        'an_acp_session_is_recorded_audited_and_never_reads_as_an_effect',
+        "a user_message_chunk's words are read from a `title` ACP v1 does not carry, so every recorded prompt has no text",
+        '                .filter(|block| block.kind == "text")\n                .and_then(|block| block.text.clone()),',
+        '                .and_then(|_| update.title.clone()),',
+    ),
+    "DecideUnusableCallerIs400": (
+        'src/api/mod.rs',
+        'a_decision_by_an_unusable_caller_is_refused_as_the_planes_fault',
+        "a decision by an actor no operator record can carry answers 400 (caller's fault) rather than the documented 500 every other write gives",
+        '            crate::core::Operator::authenticated(s.caller.actor.clone())\n                .map_err(|e| unusable_caller(&e))?,\n        ),\n        reason: body.reason,',
+        '            crate::core::Operator::authenticated(s.caller.actor.clone())\n                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?,\n        ),\n        reason: body.reason,',
+    ),
+    "CallInputOpenObjectUnderAnyOf": (
+        'src/model/mod.rs',
+        'a_call_input_with_an_open_object_under_any_of_is_refused',
+        'the shared schema walker stops descending union branches, so an open object under anyOf in a call input is accepted',
+        '"items" | "prefixItems" | "anyOf" | "oneOf" | "allOf" => match child {',
+        '"items" | "prefixItems" => match child {',
+    ),
+    "CallInputPatternPropertiesAccepted": (
+        'src/manifest/mod.rs',
+        'a_call_input_with_an_open_object_under_any_of_is_refused',
+        'a call input may declare patternProperties, admitting arguments nobody declared under any matching name',
+        '            if obj.contains_key("patternProperties") {',
+        '            if false && obj.contains_key("patternProperties") {',
+    ),
+    "CallInputRemoteRefAccepted": (
+        'src/manifest/mod.rs',
+        'a_call_input_with_an_open_object_under_defs_or_ref_is_refused',
+        "a $ref outside the document is accepted, so a call input's arguments are bound by a schema nothing here judged",
+        "                && !target.starts_with('#')",
+        '                && false',
+    ),
+    "CompletionTruncationRead": (
+        'src/runtime/declarative.rs',
+        'a_truncated_completion_fails_rather_than_answering',
+        "a completion agent settles a truncated answer as the run's output",
+        '                if cut_off {',
+        '                if false && cut_off {',
+    ),
+    "RegistryPublishUnchecked": (
+        'src/store/redb_registry.rs',
+        'publishing_an_unvalidated_manifest_is_refused_and_burns_no_version',
+        'the redb registry stores a manifest without checking it, burning the version on content no resolve can serve',
+        '        let (digest, yaml) = prepare_publish(manifest)?;',
+        '        let (digest, yaml) = (\n            manifest.digest().map_err(|source| RegistryError::Corrupt {\n                name: name.clone(),\n                version: version.clone(),\n                source,\n            })?,\n            crate::manifest::registry::to_yaml(manifest)?,\n        );',
+    ),
+    "TriageOnlyApproversAccepted": (
+        'src/manifest/mod.rs',
+        'triage_only_oversight_refuses_approvers_and_proceed',
+        'an oversight block that gates nothing accepts an approver list nothing reads',
+        '        if !gates && !o.approvers.is_empty() {',
+        '        if false && !o.approvers.is_empty() {',
+    ),
+    "TriageOnlyProceedAccepted": (
+        'src/manifest/mod.rs',
+        'triage_only_oversight_refuses_approvers_and_proceed',
+        'an oversight block that gates nothing accepts `on_expiry: proceed`, a consent to act past a wait that never happens',
+        '        if !gates && o.on_expiry == Expiry::Proceed {',
+        '        if false && o.on_expiry == Expiry::Proceed {',
+    ),
+    "ZeroTurnsAccepted": (
+        'src/manifest/mod.rs',
+        'max_turns_zero_is_refused',
+        '`execution.max_turns: 0` parses, an agent that can never take the turn its answer needs',
+        '            (_, Some(0)) => Err(ManifestError::Unenforceable {',
+        '            (_, Some(u32::MAX)) => Err(ManifestError::Unenforceable {',
+    ),
+    "TriageOnlyMaySuspend": (
+        'src/manifest/mod.rs',
+        'may_suspend_is_false_for_triage_only_oversight',
+        'a triage-only agent is judged able to suspend, so a host that cannot hold a task is denied an agent that never waits',
+        '                .is_some_and(|o| o.approval == Approval::Required)\n            || self.spec.tools',
+        '                .is_some_and(|_| true)\n            || self.spec.tools',
+    ),
+    "AFractionalRetryWindowFloors": (
+        'src/model/gemini.rs',
+        'gemini_retry_advice_in_the_body_reaches_the_driver',
+        "Gemini's fractional RetryInfo delay is floored, so a retry lands before the window the provider named",
+        "        .saturating_add(u64::from(fraction.bytes().any(|b| b != b'0')));",
+        "        .saturating_add(u64::from(fraction.bytes().any(|b| b == b'x')));",
+    ),
+    "ToolUsePromptTokensUnbilled": (
+        'src/model/gemini.rs',
+        'gemini_tool_use_prompt_tokens_are_billed_as_input',
+        "Gemini's tool-use prompt tokens are dropped from the input count, under-reporting a turn fed a built-in tool's results",
+        '                .saturating_add(count("toolUsePromptTokenCount")),',
+        '                .saturating_add(0),',
+    ),
+    "FourEyesExitsAsAnOutage": (
+        'src/bin/agentplane.rs',
+        'library_refusals_exit_by_the_published_table',
+        'a four-eyes refusal from `decide` exits 4, telling a scheduler to retry a decision the plane will refuse every time',
+        '            | ClaimError::Excluded { .. }\n',
+        '',
+    ),
+    "TheFormationCallIsUncounted": (
+        'src/bin/agentplane.rs',
+        'validate_counts_the_memory_formation_call',
+        "`validate`'s printed bound omits the memory-formation call, understating what one run may spend",
+        '        .map(|(n, _)| n.saturating_add(u32::from(forms_memory)));',
+        '        .map(|(n, _)| n.saturating_add(u32::from(forms_memory && false)));',
+    ),
+    "UnindexedCallsMerge": (
+        'src/model/chat_completions_stream.rs',
+        'calls_without_an_index_stay_separate_calls',
+        'two streamed tool calls sent without an index are filed under one key, concatenating their arguments into one call nobody made',
+        '            id.is_none_or(|id| known.is_empty() || known == id)',
+        '            id.is_none_or(|_| true)',
+    ),
+    "AnInStreamErrorIsSkipped": (
+        'src/model/chat_completions.rs',
+        'chat_completions_an_in_stream_error_surfaces_as_the_providers_error',
+        'an error object inside a chat-completions stream is skipped, so the `[DONE]` after it settles an empty answer as success',
+        '            if let Some(error) = acc.error() {',
+        '            if let Some(error) = acc.error().filter(|_| false) {',
+    ),
+    "AnOriginWithASpaceIsAccepted": (
+        'src/journal/store.rs',
+        'each_bad_origin_is_refused_at_the_builder_and_on_parse',
+        'a checkpoint origin with a Unicode space passes the rule, so a log is named that no conforming witness will cosign and the refusal arrives as an outage',
+        "            .find(|c| c.is_whitespace() || *c == '+' || u32::from(*c) < 0x20)",
+        "            .find(|c| *c == '+' || u32::from(*c) < 0x20)",
+    ),
+    "AnOriginPastTheBoundIsAccepted": (
+        'src/journal/store.rs',
+        'each_bad_origin_is_refused_at_the_builder_and_on_parse',
+        "an origin longer than tlog-cosignature's 255 bytes passes the rule, and a composed tenant origin past it reaches a witness that refuses it",
+        '        if origin.len() > Self::MAX_ORIGIN_BYTES {',
+        '        if false && origin.len() > Self::MAX_ORIGIN_BYTES {',
+    ),
+    "TheNoteParserSkipsTheOriginRule": (
+        'src/journal/store.rs',
+        'each_bad_origin_is_refused_at_the_builder_and_on_parse',
+        'a checkpoint note whose origin breaks the rule parses, so a file anchor names a log no witness holds',
+        '        Self::validate_origin(origin)?;',
+        '        let _ = origin;',
+    ),
+    "ACheckpointDeserialisesUnchecked": (
+        'src/journal/store.rs',
+        'each_bad_origin_is_refused_at_the_builder_and_on_parse',
+        'a checkpoint read as JSON — an export header, a checkpoint file — takes any origin, so the JSON door admits what the note door refuses',
+        '    Checkpoint::validate_origin(&origin).map_err(serde::de::Error::custom)?;',
+        '    let _ = Checkpoint::validate_origin(&origin);',
+    ),
+    "ATenantWithASpaceNamesALog": (
+        'src/core/tenant.rs',
+        'each_bad_origin_is_refused_at_the_builder_and_on_parse',
+        'a tenant with a space is accepted and composed into every checkpoint origin, which a conforming witness refuses',
+        "        if let Some(bad) = trimmed.chars().find(|c| c.is_whitespace() || *c == '+') {",
+        "        if let Some(bad) = trimmed.chars().find(|c| *c == '+') {",
+    ),
+    "AComposedOriginIsNotChecked": (
+        'src/store/redb.rs',
+        'each_bad_origin_is_refused_at_the_builder_and_on_parse',
+        'a base origin that conforms alone is composed with a tenant past 255 bytes and every checkpoint carries it',
+        '        let origin = self.log_origin();\n        crate::journal::Checkpoint::validate_origin(&origin)?;',
+        '        let origin = self.log_origin();',
+    ),
+    "AWitnessIsAskedAboutAnyOrigin": (
+        'src/journal/witness_http.rs',
+        'each_bad_origin_is_refused_at_the_builder_and_on_parse',
+        'the witness reader sends a request for an origin no log may have, and the refusal comes back as an outage',
+        '        crate::journal::Checkpoint::validate_origin(origin)\n            .map_err(|e| WitnessError::BadOrigin(e.to_string()))?;',
+        '        let _ = crate::journal::Checkpoint::validate_origin(origin);',
+    ),
+    "AKeyNameMayCarryAPlus": (
+        'src/journal/note.rs',
+        'a_key_name_that_would_break_the_line_is_refused',
+        "a note key name with a '+' is accepted although signed-note forbids it",
+        "            .find(|c| c.is_whitespace() || c.is_control() || *c == EM_DASH || *c == '+')",
+        '            .find(|c| c.is_whitespace() || c.is_control() || *c == EM_DASH)',
+    ),
+    "TheSecondReaderAcceptsAnyOrigin": (
+        'tools/verify_export.py',
+        'the_second_reader_refuses_every_origin_the_crate_refuses',
+        'the second reader takes an export header, note or anchor whose origin the crate refuses, so the two readers give one file two verdicts',
+        'def origin_refusal(origin: object) -> str | None:\n',
+        'def origin_refusal(origin: object) -> str | None:\n    return None\n',
+    ),
+    "ARecordNestsPastEveryReader": (
+        'src/journal/record.rs',
+        'a_record_nested_past_the_reader_limit_is_refused_at_seal',
+        "a record nested past serde_json's 127 levels seals, and every later read of its run fails on bytes the chain can never drop",
+        '        if depth > Self::MAX_RECORD_DEPTH {',
+        '        if false && depth > Self::MAX_RECORD_DEPTH {',
+    ),
+    "AShapedClearPayloadIsRefused": (
+        'src/export.rs',
+        'a_clear_payload_shaped_like_a_seal_restores',
+        'a clear payload shaped like a seal — {"$sealed":"x"} or text opening $sealed: — makes an unsealed history unrestorable',
+        '        _ => Ok(()),\n    };\n    for run in &parsed.runs {',
+        '        None => Err(StoreError::Backend(format!("{whose} carries an unreadable envelope"))),\n        Some(_) => Ok(()),\n    };\n    for run in &parsed.runs {',
+    ),
+    "AQuorumProvesAgainstTheLiveLog": (
+        'src/journal/witness.rs',
+        'a_checkpoint_taken_before_a_seal_is_proved_at_its_own_size',
+        'a consistency proof is built against the live log for an older checkpoint, so a run sealed mid-submission is reported by the witness as a fork',
+        '                    store\n                        .consistency_proof_at(witness_size, checkpoint.size)\n                        .await?',
+        '                    store.consistency_proof(witness_size).await?',
+    ),
+    "ARedbProofIsAtTheLiveSize": (
+        'src/store/redb.rs',
+        'a_checkpoint_taken_before_a_seal_is_proved_at_its_own_size',
+        'redb answers a consistency proof at a past size with one to the live log, which fails at the witness as a fork',
+        '        Ok(crate::core::merkle::consistency_proof(&leaves[..new], old))',
+        '        Ok(crate::core::merkle::consistency_proof(&leaves, old))',
+    ),
+    "AnIndexPastItsTreeIsARewrite": (
+        'src/audit.rs',
+        'an_inclusion_past_its_tree_is_unpinned_rather_than_a_rewrite',
+        'an inclusion whose index is at or past its own size is checked and reported BadInclusion, a rewrite finding over a read race',
+        '    if inc.size != current.size || inc.index >= inc.size {',
+        '    if inc.size != current.size {',
+    ),
+    "AQuorumCountsAnswers": (
+        'src/journal/witness.rs',
+        'a_quorum_counts_each_witness_key_once',
+        'one witness key answering twice meets a quorum of two',
+        '        self.distinct_keys() >= self.required',
+        '        self.cosignatures.len() >= self.required',
+    ),
+    "AResumedRunIsReadTwice": (
+        'src/export.rs',
+        'a_run_quarantined_and_resumed_is_read_once',
+        'a run quarantined and resumed is listed under its outcome and again in flight, and exported as two blocks claiming one run',
+        '            .filter(|run| listed.insert(*run))\n            .collect();',
+        '            .collect();',
+    ),
+    "ARestoreIgnoresItsTrailer": (
+        'src/export.rs',
+        'a_restore_refuses_a_line_it_would_have_to_skip',
+        'a restore does not hold run and record counts to the trailer, so a file with record lines removed restores as faithful',
+        '    if let Some(counts) = declared {\n        held_to_trailer(counts, run_blocks, records)?;\n    }',
+        '    let _ = (declared, run_blocks, records);',
+    ),
+    "ARestoreSkipsAnUnknownLine": (
+        'src/export.rs',
+        'a_restore_refuses_a_line_it_would_have_to_skip',
+        'a restore skips a line of a kind it does not know, rebuilding a history with that line missing',
+        '            Line::Unknown => {\n                return Err(refused(format!(',
+        '            Line::Unknown => {\n                if true {\n                    continue;\n                }\n                return Err(refused(format!(',
+    ),
+    "AnExportSwallowsAnUnplacedLog": (
+        'src/export.rs',
+        'an_export_whose_store_cannot_place_its_runs_fails',
+        'an export whose store cannot answer log positions writes every sealed run as open, and the file reads as tampered',
+        '    let positions = store.log_positions(runs).await.map_err(|e| as_io(&e))?;',
+        '    let positions = store\n        .log_positions(runs)\n        .await\n        .unwrap_or_else(|_| vec![None; runs.len()]);',
+    ),
+    "ALineCopyIsNotHeldToItsBytes": (
+        'src/export.rs',
+        'a_line_copy_that_disagrees_with_its_bytes_is_a_finding_in_both_readers',
+        "a record line's seq and prev_hash copies are ignored by the Rust reader and checked by the second, so one file has two verdicts",
+        '    if line_prev != Some(pass.prev) || line_seq != Some(body.seq) {',
+        '    if line_prev.is_none() && line_seq.is_none() {',
+    ),
+    "TheSecondReaderIgnoresALineSeq": (
+        'tools/verify_export.py',
+        'a_line_copy_that_disagrees_with_its_bytes_is_a_finding_in_both_readers',
+        "the second reader ignores a record line's seq copy that the Rust reader refuses",
+        '        if not same(value.get("seq"), seq):',
+        '        if False:',
+    ),
+    "AnIdHasManySpellings": (
+        'src/core/id.rs',
+        'a_non_canonical_spelling_of_an_id_is_refused',
+        'a lowercase or wrapped ULID parses as an alias of a canonical id, and each index keyed on the string holds another run',
+        '                if id.to_string() != bare {',
+        '                if false {',
+    ),
+    "TheLiveAuditHoldsOnlyTheLastConclusion": (
+        'src/audit.rs',
+        'every_conclusion_s_chain_head_is_held_by_the_live_audit',
+        "the live audit checks only the last record's chain_head claim, passing a history whose earlier conclusion the offline verifier refuses",
+        '    records.iter().all(|r| match r.kind() {',
+        '    records.iter().rev().take(1).all(|r| match r.kind() {',
+    ),
+    "ASealedNoteReadsAsPlaintext": (
+        'src/grader_verdict.rs',
+        'a_sealed_text_field_counts_as_a_sealed_payload',
+        'a sidecar over sealed note or failure text reports no sealed payloads',
+        '            SealedField::Text(t) => payload::is_sealed_text(t),',
+        '            SealedField::Text(_) => false,',
+    ),
+    "TheSecondReaderPlacesNumbersLikePython": (
+        'tools/verify_export.py',
+        'the_second_readers_canon_check_re_derives_every_vector',
+        'the second reader writes doubles in [1e-6, 1e-4) exponentially, where ECMAScript and the crate write them positionally',
+        '    if -6 < n <= 0:',
+        '    if -4 < n <= 0:',
+    ),
+    "TheSecondReaderReadsAnyVersion": (
+        'tools/verify_export.py',
+        'the_second_readers_self_test_reports_every_case',
+        'the second reader reads a record at a version it does not implement as the current shape',
+        '        if not same(wire.get("v"), RECORD_VERSION):',
+        '        if False:',
+    ),
+    "TheSecondReaderReadsAnyKind": (
+        'tools/verify_export.py',
+        'the_second_readers_self_test_reports_every_case',
+        'the second reader passes a record whose kind is outside the vocabulary',
+        '        elif not isinstance(wire.get("kind"), str) or wire["kind"] not in RECORD_KINDS:',
+        '        elif False:',
+    ),
+    "TheSecondReaderReadsNaN": (
+        'tools/verify_export.py',
+        'the_second_readers_self_test_reports_every_case',
+        'the second reader accepts NaN, Infinity and 1e400 and then crashes canonicalising them',
+        '    return json.loads(text, parse_constant=_no_constant, parse_float=_finite)',
+        '    return json.loads(text)',
+    ),
+    "TheSecondReaderReadsABoolAsAnInteger": (
+        'tools/verify_export.py',
+        'the_second_readers_self_test_reports_every_case',
+        'the second reader reads true and false as 1 and 0 for a size, index or seq',
+        '    return isinstance(value, int) and not isinstance(value, bool)',
+        '    return isinstance(value, int)',
+    ),
+    "AKeyedPlanSkipsItsHolder": (
+        "src/runtime/executor.rs",
+        "a_keyed_plan_admission_is_validated_and_answered_by_its_holder",
+        "a keyed plan admission is neither validated nor answered by the run "
+        "its key already admitted, so an empty key is claimed and a "
+        "redelivery fails with a store error instead of the original's answer",
+        """        validate_admission_key(&key)?;
+        if let Some(held) = self.holder_of(&key).await? {
+            return self.answer_with(held).await;
+        }
+        match self.admit_plan(plan, input, terms).await {""",
+        """        match self.admit_plan(plan, input, terms).await {""",
+    ),
+    "ALostKeyReadsAsAnErasure": (
+        "src/drill.rs",
+        "a_destroyed_key_with_no_erasure_record_is_a_finding",
+        "a sealed case whose key is gone counts as erased whether or not any "
+        "erasure record accounts for it, so a key lost to a restore into another "
+        "key service, or removed by hand, reads as erasure working",
+        """        Some(Err(KeyError::Destroyed { .. })) if erased => report.sealed_erased += 1,""",
+        """        Some(Err(KeyError::Destroyed { .. })) if erased || !erased => report.sealed_erased += 1,""",
+    ),
+    "AHoldIsWalkedPastByAnErasure": (
+        'src/store/redb_cases.rs',
+        'a_hold_placed_mid_erasure_either_stops_it_or_is_refused',
+        "the erasure record is written without deciding against the hold, so a hold placed after the erasure's read is accepted and the key destroyed anyway",
+        '                        (placed, row.to_owned())\n                    })',
+        '                        (placed, row.to_owned())\n                    })\n                    .filter(|_| false)',
+    ),
+    "AHoldLandsOnAnErasedCase": (
+        'src/store/redb_cases.rs',
+        'a_hold_placed_mid_erasure_either_stops_it_or_is_refused',
+        'a hold is accepted on a case whose erasure has begun, so the register reads as preserving a matter that is being destroyed',
+        '                refuse_erased(&w, &tenant, &key)?;\n                let mut h = w.open_table(CASE_HOLDS)',
+        '                let mut h = w.open_table(CASE_HOLDS)',
+    ),
+    "AnErasedCaseIsReopened": (
+        'src/store/redb_cases.rs',
+        'an_erased_case_cannot_be_reopened',
+        'an erased case can be reopened, re-claiming its correlation keys so the next message about the matter lands in a case whose key is gone',
+        '            refuse_erased(&w, &tenant, &key)?;\n            {\n                let mut cases = w.open_table(CASES)',
+        '            {\n                let mut cases = w.open_table(CASES)',
+    ),
+    "AnErasedCaseTakesState": (
+        'src/store/redb_cases.rs',
+        'an_erased_case_cannot_be_reopened',
+        'state is written into an erased case, under a scope whose key is gone',
+        '            refuse_erased(&w, &tenant, &key)?;\n            let result = {',
+        '            let result = {',
+    ),
+    "PostgresAHoldIsWalkedPastByAnErasure": (
+        'src/store/postgres_cases.rs',
+        'postgres_satisfies_the_case_layer_contracts',
+        'the SQL erasure record is written without deciding against the hold',
+        '        if let Some(h) = held {',
+        '        if let Some(h) = held.filter(|_| false) {',
+    ),
+    "PostgresAHoldLandsOnAnErasedCase": (
+        'src/store/postgres_cases.rs',
+        'postgres_satisfies_the_case_layer_contracts',
+        'the SQL backend accepts a hold on a case whose erasure has begun',
+        '        if let Some(erasure) = erasure_from(&row, 0)? {',
+        '        if let Some(erasure) = erasure_from(&row, 0)?.filter(|_| false) {',
+    ),
+    "PostgresAnErasedCaseIsReopened": (
+        'src/store/postgres_cases.rs',
+        'postgres_satisfies_the_case_layer_contracts',
+        'the SQL backend reopens an erased case',
+        '        if let Some(erasure) = erasure_from(&row, 1)? {\n            return Err(crate::case::case_erased(&case.to_string(), &erasure));\n        }\n        let was: String = row.get(0);',
+        '        let was: String = row.get(0);',
+    ),
+    "PostgresAnErasedCaseTakesState": (
+        'src/store/postgres_cases.rs',
+        'postgres_satisfies_the_case_layer_contracts',
+        'the SQL backend writes state into an erased case',
+        '                  WHERE case_id = $1 AND version = $4 AND tenant = $5\n                    AND erased_at IS NULL",',
+        '                  WHERE case_id = $1 AND version = $4 AND tenant = $5",',
+    ),
+    "AnErasureRunsUnderASuspendedRun": (
+        'src/blob/mod.rs',
+        'erasing_a_closed_case_with_a_suspended_run_is_refused',
+        'a closed case is erased while one of its runs is suspended, destroying the key the run resumes against',
+        '        if let Some((run, state)) = unconcluded(journal, &found.runs).await? {',
+        '        if let Some((run, state)) = unconcluded(journal, &[]).await? {',
+    ),
+    "ARunErasureReachesACaseBoundRun": (
+        'src/blob/mod.rs',
+        'erase_run_refuses_a_case_bound_run',
+        'erase_run destroys the own scope of a run bound to a case — a scope holding none of its payloads — and answers as if it had erased the run',
+        '    if let Some(case) = records.iter().find_map(|r| r.body.case) {',
+        '    if let Some(case) = records.iter().find_map(|r| r.body.case).filter(|_| false) {',
+    ),
+    "AMissingVaultKeyClaimsAnErasure": (
+        'src/keyring/vault.rs',
+        'a_missing_transit_key_does_not_claim_an_erasure',
+        'a transit key missing for any reason is reported as erased, so a drill counts a lost key as a completed erasure',
+        '                reason: MISSING_KEY.to_owned(),',
+        '                reason: MISSING_KEY.replace("whether it was erased", "it was erased"),',
+    ),
+    "AnIndexFailureStrandsMemoryKeys": (
+        'src/keyring/memory.rs',
+        'an_index_failure_does_not_strand_memory_keys',
+        'a subject erasure whose index could not be told returns before the keys are destroyed, so rows are gone and every backup still opens them',
+        '            let Reached::Subject(count) = reached else {',
+        '            if untold.is_some() {\n                return untold.map_or(Ok(0), Err);\n            }\n            let Reached::Subject(count) = reached else {',
+    ),
+    "ARedeliveredErasedEventIsAFault": (
+        'src/keyring/events.rs',
+        'a_redelivered_erased_event_is_a_duplicate',
+        'a counterparty retrying an erased message meets the destroyed key and is refused as a fault, so it retries for ever',
+        '                if self.inner.minter(&event.source, &event.id).await?.is_some() {',
+        '                if false && self.inner.minter(&event.source, &event.id).await?.is_some() {',
+    ),
+    "ARestatedObligationIsDropped": (
+        'src/store/redb_cases.rs',
+        'redb_satisfies_the_case_layer_contracts',
+        'a second registration of a named obligation with different terms is dropped silently while the journal records it as current',
+        '                    if r != resolved || dg != digest || wa != warn {',
+        '                    if false && (r != resolved || dg != digest || wa != warn) {',
+    ),
+    "PostgresARestatedObligationIsDropped": (
+        'src/store/postgres_cases.rs',
+        'postgres_satisfies_the_case_layer_contracts',
+        'the SQL backend drops a second registration with different terms',
+        '            let same = row.get::<_, i64>(0) == d.resolved_at.unix_timestamp()',
+        '            let same = true || row.get::<_, i64>(0) == d.resolved_at.unix_timestamp()',
+    ),
+    "AMemoryLabelIsNotBound": (
+        'src/keyring/memory.rs',
+        'a_relabelled_memory_row_does_not_open',
+        "a sealed memory's trust label is not bound to its ciphertext, so a row relabelled trusted opens as the same content",
+        '                &item.trust,',
+        '                &crate::core::Trust::Untrusted,',
+    ),
+    "RecallTiesFollowTheDatabaseCollation": (
+        'src/store/postgres_memory.rs',
+        'postgres_recall_breaks_ties_by_byte_under_a_locale_collation',
+        'a truncated recall breaks ties by the database collation, so the SQL backend keeps a different memory than redb from the same rows',
+        'item.id COLLATE \\"C\\" ASC LIMIT $5',
+        'item.id ASC LIMIT $5',
+    ),
+    "RetentionReErasesAnErasedCase": (
+        'src/retention.rs',
+        'a_legal_hold_stops_the_retention_sweep_and_lifting_it_lets_the_sweep_through',
+        'a retention pass erases a case whose erasure completed again, reporting the same matter erased on every date it runs',
+        '                    .is_some_and(|erasure| erasure.complete)',
+        '                    .is_some_and(|erasure| erasure.complete && false)',
+    ),
+    "AnUnreadableHoldReadsAsReleased": (
+        'src/retention.rs',
+        'a_hold_the_retention_pass_cannot_read_is_a_failure',
+        'a hold the pass cannot read is reported as released while it ran',
+        '        match stores.cases.hold(*case).await {',
+        '        match Ok::<_, crate::core::StoreError>(stores.cases.hold(*case).await.unwrap_or(None)) {',
+    ),
+    "ACaseVersionWraps": (
+        'src/core/case.rs',
+        'the_last_case_version_has_no_successor',
+        'the last case version wraps to zero, so a writer holding version 0 wins a compare-and-set it lost',
+        '        match self.0.checked_add(1) {',
+        '        match Some(self.0.wrapping_add(1)) {',
+    ),
+    "UnparseableCaseStateReadsAsTheEnvelope": (
+        'src/keyring/cases.rs',
+        'state_that_opens_and_does_not_parse_is_an_error',
+        'case state that opens and does not parse is answered as a value, so a caller reads the wrong state and writes it back',
+        '            Some(plain) => serde_json::from_slice(&plain).map_err(|e| {',
+        '            Some(plain) => serde_json::from_slice(&plain).or(Ok(Value::Null)).map_err(|e: serde_json::Error| {',
+    ),
+    "ASealedJournalAnswersHistoricalProofsByDefault": (
+        'src/keyring/journal.rs',
+        'a_historical_consistency_proof_reaches_the_store_beneath',
+        "a sealed journal answers a historical consistency proof with the trait's default, so a witness submission fails whenever a run seals mid-submission",
+        '        self.inner.consistency_proof_at(old_size, new_size).await',
+        '        let _ = &self.inner;\n        crate::journal::JournalStore::consistency_proof(self, old_size).await.and_then(|p| if new_size == 0 { Ok(p) } else { Err(StoreError::Backend(String::new())) })',
+    ),
+    "APeerWiredFromGrantsKeepsThePublicCeiling": (
+        "src/peers/mod.rs",
+        "a_peer_wired_from_its_grants_carries_their_ceiling",
+        "a peer wired from its manifest grants keeps the default public ceiling, "
+        "so every call the reviewed grant allows above public is refused and the "
+        "peer is never asked",
+        """            .max()
+            .unwrap_or(grant.max_sensitivity);""",
+        """            .min()
+            .map(|_| grant.max_sensitivity)
+            .unwrap_or(grant.max_sensitivity);""",
+    ),
+    "ACancelStartsNewWork": (
+        "src/runtime/ctx.rs",
+        "a_cancel_after_a_wait_ended_sends_nothing",
+        "the pass that abandons a cancelled run's open group dispatches forward "
+        "work past the frontier, so a wait that ended, a lifted withholding or a "
+        "raised ceiling lets the cancel send and commit what it was asked to stop",
+        """        if self.abandoning && !self.undoing() {
+            return Err(StepError::Effect""",
+        """        if self.abandoning && self.undoing() {
+            return Err(StepError::Effect""",
+    ),
+    "ACancelReadmitsARefusal": (
+        "src/runtime/ctx.rs",
+        "a_cancel_under_a_raised_ceiling_sends_nothing",
+        "the pass that abandons a cancelled run's open group re-admits a refused "
+        "member under a ceiling raised since the pause",
+        """        if !self.writes_enabled() || self.abandoning {""",
+        """        if !self.writes_enabled() {""",
+    ),
+    "AnExportForgetsAnErasure": (
+        "src/export.rs",
+        "an_erasure_record_survives_export_and_restore",
+        "an export writes no erasure record, so a restored plane holds an erased "
+        "matter as an ordinary closed case whose key reads as lost",
+        """    let erasure = cases.erasure(case.id).await.map_err(|e| as_io(&e))?;""",
+        """    let erasure: Option<crate::case::Erasure> = None;""",
+    ),
+    "ARestoreDropsAnErasure": (
+        "src/export.rs",
+        "an_erasure_record_survives_export_and_restore",
+        "a restore reads the erasure record and never marks the case, so the "
+        "recovered plane forgets it erased the matter",
+        """                if let Some(erasure) = &block.erasure {
+                    restore_erasure""",
+        """                if let Some(erasure) = block.erasure.as_ref().filter(|_| false) {
+                    restore_erasure""",
+    ),
+    "ASecondRunFailsOnItsMattersObligation": (
+        "src/runtime/ctx.rs",
+        "a_second_run_shares_the_obligation_its_matter_already_owes",
+        "a run joining a matter that already owes a named obligation fails on "
+        "its own arithmetic instead of sharing the standing terms, so two runs "
+        "waiting on one case depend on registering within the same second",
+        """                Err(crate::core::StoreError::DeadlineExists { .. }) => {""",
+        """                Err(e @ crate::core::StoreError::DeadlineExists { .. }) if true => {
+                    return Err(e.into());
+                }
+                Err(crate::core::StoreError::DeadlineExists { .. }) => {""",
+    ),
+    "ATasksRefusalIsABadArgument": (
+        "src/tools/serve.rs",
+        "a_host_without_tasks_is_offered_only_tools_that_cannot_suspend",
+        "a host without the Tasks extension calling a tool that may suspend is "
+        "told its arguments are invalid (-32602) rather than that it lacks a "
+        "capability (-32021), so it retries with other arguments instead of "
+        "declaring the extension",
+        """            return Err(McpError::missing_required_client_capability(
+                rmcp::model::ClientCapabilities::builder()
+                    .enable_tasks()
+                    .build(),
+            ));""",
+        """            return Err(McpError::invalid_params("io.modelcontextprotocol/tasks", None));""",
     ),
     "ACatalogueOffersWhatNothingProvides": (
         "src/tools/serve.rs",
@@ -4602,11 +5361,11 @@ pub struct Label {""",
         "        if let Some(problem) = None::<String> {",
     ),
     "TheSchemaIsRewrittenOnTheWayOut": (
-        "src/model/mod.rs",
-        "a_conformant_schema_is_not_rewritten",
-        "a conformant schema is rejected, making structured output unusable",
-        "    let mut problems = Vec::new();\n    walk(schema, \"schema\", &mut problems);",
-        "    let mut problems = vec![\"synthetic\".to_owned()];\n    walk(schema, \"schema\", &mut problems);",
+        'src/model/mod.rs',
+        'a_conformant_schema_is_not_rewritten',
+        'a conformant schema is rejected, making structured output unusable',
+        '    let mut problems = Vec::new();\n    for_each_subschema(schema, "schema", &mut |node, path| {',
+        '    let mut problems = vec!["synthetic".to_owned()];\n    for_each_subschema(schema, "schema", &mut |node, path| {',
     ),
     "SchemaIsASuggestion": (
         "src/model/openai.rs",
@@ -5940,24 +6699,11 @@ pub struct Label {""",
                 };""",
     ),
     "ARecordedDenialIsReDecidedOnResume": (
-        "src/runtime/group.rs",
-        "a_resumed_atomic_member_consumes_its_recorded_denial",
-        "the atomic-member path consumes a recorded gate refusal and then runs "
-        "the gate fresh, so a resume under a gate that has since relented "
-        "dispatches — and commits — a member the recorded run was refused, "
-        "appending a second history under the same key",
-        """                    Some(
-                        refusal @ (crate::journal::EffectReplay::Refused { .. }
-                        | crate::journal::EffectReplay::Denied { .. }),
-                    ) => {
-                        self.replayed_refusal(key, &descriptor, refusal, 0).await?;
-                    }""",
-        """                    Some(
-                        refusal @ (crate::journal::EffectReplay::Refused { .. }
-                        | crate::journal::EffectReplay::Denied { .. }),
-                    ) => {
-                        let _ = refusal;
-                    }""",
+        'src/runtime/group.rs',
+        'a_resumed_atomic_member_consumes_its_recorded_denial',
+        'the atomic-member path consumes a recorded gate refusal and then runs the gate fresh, so a resume under a gate that has since relented dispatches — and commits — a member the recorded run was refused, appending a second history under the same key',
+        "                        if let Err(stands) =\n                            self.replayed_refusal(key, &descriptor, refusal, 0).await\n                        {\n                            // Billed as the live pass's gate billed them.\n                            for _ in &pending {\n                                self.bill_replayed(crate::core::Spend::ZERO, 0);\n                            }\n                            return Err(stands);\n                        }",
+        '                        let _ = refusal;',
     ),
     "AGuardrailIsNotEffectIdentity": (
         "src/model/bedrock.rs",
@@ -6040,14 +6786,11 @@ pub struct Label {""",
         "            )))",
     ),
     "AReversalCannotAffordItself": (
-        "src/runtime/ctx.rs",
-        "a_group_is_taken_back_even_when_the_budget_is_exhausted",
-        "a group reversal is gated like a forward call, so a run that reaches "
-        "its ceiling mid-group cannot release the hold it already placed — a "
-        "charged card and no order, reached through the budget rather than "
-        "through a bug",
-        "        !self.phase.is_forward() || self.reversing",
-        "        !self.phase.is_forward()",
+        'src/runtime/ctx.rs',
+        'exhaustion_inside_a_group_pauses_and_a_cancel_still_unwinds_it',
+        'a group reversal is gated like a forward call, so a run that reaches its ceiling mid-group cannot release the hold it already placed — a charged card and no order, reached through the budget rather than through a bug',
+        '        !self.phase.is_forward() || self.reversing',
+        '        !self.phase.is_forward()',
     ),
     "AReportedFailureIsCalledSuccess": (
         "src/runtime/executor.rs",
@@ -6615,14 +7358,11 @@ pub struct Label {""",
         "                return self\n                    .settle(",
     ),
     "OversightNeverRegistersItsObligation": (
-        "src/runtime/declarative.rs",
-        "a_refused_answer_is_not_written_into_memory",
-        "the obligation bounding an oversight wait is never registered, so a "
-        "declarative agent — which writes no code and therefore cannot register "
-        "it either — fails outright in the one configuration the declarative "
-        "tier exists for",
-        "            cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)\n                .await?;",
-        "",
+        'src/runtime/declarative.rs',
+        'a_refused_answer_is_not_written_into_memory',
+        'the obligation bounding an oversight wait is never registered, so a declarative agent — which writes no code and therefore cannot register it either — fails outright in the one configuration the declarative tier exists for',
+        '        cx.deadline(deadline.name.clone(), &deadline.spec(), None)\n            .await?;',
+        '',
     ),
     "TheMediaBuilderAndItsDriverDrift": (
         "src/media/mod.rs",
@@ -7769,7 +8509,7 @@ pub struct Label {""",
         "a withdrawal never reaches a running run, so work carries on under a "
         "credential somebody withdrew — which is the harm the subject scope "
         "exists to stop, not a side effect of it",
-        "                let standing = self.withdrawn_authority(identity.as_ref()).await?;",
+        "                let standing = self\n                    .withdrawal_against(identity.as_ref())\n                    .await\n                    .map_err(RuntimeError::Store)?;",
         "                let standing: Option<Withdrawal> = None;",
     ),
     "AWithdrawalUnwindsTheWorkItPaused": (
@@ -9256,10 +9996,10 @@ pub struct Label {""",
         "`totalSize` is counted before the permission check, so the reply "
         "discloses how many tasks exist that the caller was just refused — the "
         "listing hides the rows and the number reports them",
-        """            if !server.permits(&caller, action::TASK_READ, &run.to_string(), owner) {
+        """            if !server.permits(caller, action::TASK_READ, &run.to_string(), owner) {
                 continue;
             }""",
-        """            if !server.permits(&caller, action::TASK_READ, &run.to_string(), owner) {
+        """            if !server.permits(caller, action::TASK_READ, &run.to_string(), owner) {
                 matched += 1;
                 continue;
             }""",
@@ -9369,11 +10109,11 @@ pub struct Label {""",
         "            for (written, want) in store.append(1, appends).await?.iter().zip(&mut claimed) {",
     ),
     "AnExportOmitsItsLogPositions": (
-        "src/export.rs",
-        "a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root",
-        "the export carries no Merkle log position for a sealed run, so a verifier can walk every chain and still not notice a whole run deleted from the middle — each surviving chain is internally consistent, and only the rebuilt tree can see the gap",
-        "    let positions = store\n        .log_positions(runs)\n        .await\n        .unwrap_or_else(|_| vec![None; runs.len()]);",
-        "    let positions: Vec<Option<(u64, crate::core::Digest)>> = vec![None; runs.len()];",
+        'src/export.rs',
+        'a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root',
+        'the export carries no Merkle log position for a sealed run, so a verifier can walk every chain and still not notice a whole run deleted from the middle — each surviving chain is internally consistent, and only the rebuilt tree can see the gap',
+        '    let positions = store.log_positions(runs).await.map_err(|e| as_io(&e))?;',
+        '    let positions: Vec<Option<(u64, crate::core::Digest)>> = vec![None; runs.len()];',
     ),
     "AVerifiedExportSkipsTheRehash": (
         "src/export.rs",
@@ -10390,9 +11130,15 @@ pub struct Label {""",
         "src/runtime/executor.rs",
         "a_duplicate_the_read_missed_is_still_answered_with_the_original",
         "a duplicate admission is reported as fresh, so a redelivery runs the work again",
-        """                run, ..
+        """        match self.admit(target, input, terms).await {
+            Ok(outcome) => Ok(Admission::Fresh(outcome)),
+            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
+                run, ..
             })) => self.answer_with(parse_holder(&run)?).await,""",
-        """                run, ..
+        """        match self.admit(target, input, terms).await {
+            Ok(outcome) => Ok(Admission::Fresh(outcome)),
+            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
+                run, ..
             })) => Ok(Admission::InFlight(parse_holder(&run)?)),""",
     ),
     "SuspendedRunIsNotAnAnswer": (
@@ -11790,13 +12536,11 @@ pub struct WrappedKey {""",
         "            if false {",
     ),
     "AnErasureRunsUnderLiveWork": (
-        "src/blob/mod.rs",
-        "erasing_a_case_that_is_still_open_is_refused",
-        "the rule that a matter must be closed before it is erased lives in the "
-        "retention pass's selection only, so the Article 17 path destroys the key "
-        "under runs that can then never be replayed or unwound",
-        """    if let Some(open) = found.filter(|c| c.status != crate::core::CaseStatus::Closed) {""",
-        """    if let Some(open) = found.filter(|_| false) {""",
+        'src/blob/mod.rs',
+        'erasing_a_case_that_is_still_open_is_refused',
+        "the rule that a matter must be closed before it is erased is not decided first, so an open matter with a live run is refused for the run rather than for being open — and closing it, the operator's next step, is not what the refusal says",
+        '        if found.status != crate::core::CaseStatus::Closed {',
+        '        if false {',
     ),
     "TheCeilingIgnoresReservations": (
         "src/quota/mod.rs",
@@ -12042,9 +12786,15 @@ pub struct WrappedKey {""",
     "ATaskIdIsReadBeforeTheCaller": (
         "src/api/a2a.rs",
         "every_method_is_authenticated",
-        "a task id is parsed before the caller is authenticated, so an unauthenticated caller with a malformed id is answered about tasks rather than challenged",
-        "        let caller = self.authenticate(headers).await?;\n        let run = task_id(params)?;",
-        "        let run = task_id(params)?;\n        let caller = self.authenticate(headers).await?;",
+        "a task id is parsed before the caller is authenticated, so an anonymous caller learns which task ids are well formed",
+        """    let caller = match server.authenticate(&headers).await {""",
+        """    if let Ok(params) = parse_params(&req.method, &req.params)
+        && params.id.is_some()
+        && let Err(e) = task_id(&params)
+    {
+        return e.with_id(id).into_response();
+    }
+    let caller = match server.authenticate(&headers).await {""",
     ),
     "APlaneOnAFullBackendIgnoresHalts": (
         "src/runtime/executor.rs",
@@ -12054,18 +12804,18 @@ pub struct WrappedKey {""",
         "",
     ),
     "ASealedHistoryRestoresUnderAnyTenant": (
-        "src/export.rs",
-        "a_sealed_export_is_refused_by_a_tenant_its_envelopes_do_not_name",
-        "a sealed export restores under a tenant its envelopes do not name, so every payload opens for nobody and erase_case there destroys a key that wraps none of it while reporting success",
-        "        Some(sealer) if sealer == tenant => Ok(()),",
-        "        Some(_) => Ok(()),",
+        'src/export.rs',
+        'a_sealed_export_is_refused_by_a_tenant_its_envelopes_do_not_name',
+        'a sealed export restores under a tenant its envelopes do not name, so every payload opens for nobody and erase_case there destroys a key that wraps none of it while reporting success',
+        '        Some(sealer) if sealer != tenant => Err(StoreError::Backend(format!(',
+        '        Some(sealer) if false => Err(StoreError::Backend(format!(',
     ),
     "TheLogPlacesEveryRunFirst": (
-        "src/store/redb.rs",
-        "redb_satisfies_the_journal_store_contract",
-        "the one-pass log walk places every sealed run at index 0, so an export stamps each run block with a position the Merkle log does not hold and the verifier reports tampering",
-        "                    *slot = Some((rank, digest(head)?));",
-        "                    *slot = Some((0, digest(head)?));",
+        'src/store/redb.rs',
+        'redb_satisfies_the_journal_store_contract',
+        'the one-pass log walk places every sealed run at index 0, so an export stamps each run block with a position the Merkle log does not hold and the verifier reports tampering',
+        '                    *slot = Some((leaves.len() as u64, head));',
+        '                    *slot = Some((0, head));',
     ),
     "TheInFlightWalkPagesByActivity": (
         "src/export.rs",
@@ -12222,11 +12972,11 @@ pub struct WrappedKey {""",
         "            Some(c) => {",
     ),
     "ACallerWithThePlanesChainIsThePlane": (
-        "src/runtime/executor.rs",
-        "a_caller_presenting_the_planes_chain_cannot_approve_its_run",
+        'src/runtime/executor.rs',
+        'a_caller_presenting_the_planes_chain_cannot_approve_its_run',
         "whether a run acts as the plane is read off the chain it holds, so a served caller presenting a chain equal to the plane's approves the run it asked for",
-        "            plane_chain: matches!(acting_as, Acting::Plane) && self.identity.is_some(),",
-        "            plane_chain: self.identity.is_some() && acting_as.resolve(self.identity.as_ref()) == self.identity.as_ref(),",
+        '                Acting::Plane => self.identity.is_some(),\n                Acting::PlaneDelegate(_) => true,\n                Acting::Caller(_) | Acting::Nobody => false,',
+        '                Acting::Plane => self.identity.is_some(),\n                Acting::PlaneDelegate(_) => true,\n                Acting::Caller(c) => Some(c) == self.identity.as_ref(),\n                Acting::Nobody => false,',
     ),
     "AForeignCanonRestoreIsAnOutage": (
         "src/bin/agentplane.rs",
@@ -12568,13 +13318,11 @@ pub struct WrappedKey {""",
                     return Err(subject_unbound(&e));""",
     ),
     "AnUnboundSubjectExitsAsAnOutage": (
-        "src/bin/agentplane.rs",
-        "an_unbound_subject_exits_as_usage",
-        "`agentplane run` reports an input its agent cannot read a subject from as "
-        "an operational failure, so a script retries an input that is refused "
-        "every time",
-        """        e @ agentplane::core::RuntimeError::SubjectUnbound { .. } => usage(e.to_string()),""",
-        """        e @ agentplane::core::RuntimeError::SubjectUnbound { .. } => e.to_string().into(),""",
+        'src/bin/agentplane.rs',
+        'an_unbound_subject_exits_as_usage',
+        '`agentplane run` reports an input its agent cannot read a subject from as an operational failure, so a script retries an input that is refused every time',
+        '        E::SubjectUnbound { .. }\n        | E::PlanContract(_)',
+        '        E::PlanContract(_)',
     ),
     "ALiteralDataSubjectIsAccepted": (
         "src/manifest/binding.rs",
@@ -13038,13 +13786,11 @@ pub struct WrappedKey {""",
         for id in stamped {""",
     ),
     "RestoreReadsAPackage": (
-        "src/export.rs",
-        "restore_refuses_a_disclosure_package",
-        "restore and a strict replay read a package as an export and refuse it "
-        "only for its format version, so the operator is told the file is from "
-        "another build rather than that it is one matter",
-        """            Some(DISCLOSURE_KIND) => return Err(std::io::Error::other(PACKAGE_REFUSED)),""",
-        """            Some(DISCLOSURE_KIND) => {}""",
+        'src/export.rs',
+        'restore_refuses_a_disclosure_package',
+        'restore and a strict replay read a package as an export and refuse it only for its format version, so the operator is told the file is from another build rather than that it is one matter',
+        '            Line::Header(DISCLOSURE_KIND) => return Err(std::io::Error::other(PACKAGE_REFUSED)),',
+        '            Line::Header(DISCLOSURE_KIND) => {}',
     ),
     "ReadRunsReadsAPackage": (
         "src/export.rs",
@@ -13917,23 +14663,18 @@ pub struct WrappedKey {""",
         """            let _ = (wiring, &withdrawal.subject);""",
     ),
     "AHopWithholdingIsNeverSuperseded": (
-        "src/journal/replay.rs",
-        "a_withdrawn_subjects_credential_is_not_presented",
-        "a hop's later announcement does not supersede its withholding, so a "
-        "strict replay stops at a pause the run's own records show it resuming "
-        "from",
-        """        self.supersede_withheld(key);
-        self.effects.push(Journaled {""",
-        """        self.effects.push(Journaled {""",
+        'src/journal/replay.rs',
+        'a_withdrawn_subjects_credential_is_not_presented',
+        "a hop's later announcement does not supersede its withholding, so a strict replay stops at a pause the run's own records show it resuming from",
+        '        self.supersede_withheld(key);\n        self.effects.push(Journaled {\n            key,\n            seq,\n            what: Some(',
+        '        self.effects.push(Journaled {\n            key,\n            seq,\n            what: Some(',
     ),
     "AnOlderWithholdingStillStands": (
-        "src/journal/replay.rs",
-        "a_hop_withheld_twice_stands_withheld_once",
-        "a hop withheld twice keeps both withholdings, so every resume consumes "
-        "the older one, never reaches the frontier, and the run cannot resume",
-        """        self.supersede_withheld(key);
-        self.unannounced(""",
-        """        self.unannounced(""",
+        'src/journal/replay.rs',
+        'a_hop_withheld_twice_stands_withheld_once',
+        'a hop withheld twice keeps both withholdings, so every resume consumes the older one, never reaches the frontier, and the run cannot resume',
+        '        self.supersede_withheld(key);\n        self.effects.push(Journaled {\n            key,\n            seq,\n            what: None,',
+        '        self.effects.push(Journaled {\n            key,\n            seq,\n            what: None,',
     ),
     "TheExchangeRequestOmitsTheActor": (
         "src/peers/exchange.rs",
@@ -14024,20 +14765,18 @@ pub struct WrappedKey {""",
         """            let _ = pin;""",
     ),
     "APinMismatchIsInDoubt": (
-        "src/runtime/ctx.rs",
-        "a_changed_callee_is_refused_after_approval",
-        "a pinned consultation refused before any sub-run existed reads as in "
-        "doubt, and the run quarantines over a call that never ran",
-        """                crate::core::RuntimeError::DeclarationPinMismatch { .. } => {""",
-        """                crate::core::RuntimeError::DeclarationPinMismatch { .. } if false => {""",
+        'src/runtime/ctx.rs',
+        'a_changed_callee_is_refused_after_approval',
+        'a pinned consultation refused before any sub-run existed reads as in doubt, and the run quarantines over a call that never ran',
+        '                crate::core::RuntimeError::Store(_) => crate::core::EffectError::Interrupted {',
+        '                crate::core::RuntimeError::Store(_)\n                | crate::core::RuntimeError::DeclarationPinMismatch { .. } => crate::core::EffectError::Interrupted {',
     ),
     "ACommissionHidesItsSubRun": (
-        "src/runtime/ctx.rs",
-        "an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody",
-        "a consultation's journaled answer names no run, so a reader of the "
-        "delegating run's journal cannot follow the delegation to the work",
-        """            run: Some(out.run_id.to_string()),""",
-        """            run: None,""",
+        'src/runtime/ctx.rs',
+        'an_agent_is_consulted_as_a_granted_tool_and_replay_wakes_nobody',
+        "a consultation's journaled answer names no run, so a reader of the delegating run's journal cannot follow the delegation to the work",
+        '        let run = Some(out.run_id.to_string());',
+        '        let run: Option<String> = None;',
     ),
     "AnOutcomeRecordsNoDuration": (
         "src/runtime/ctx.rs",

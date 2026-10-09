@@ -3826,3 +3826,67 @@ fn an_unpriced_embedder_is_refused_beside_a_money_ceiling() {
         "an embedder with no price was accepted under a money ceiling"
     );
 }
+
+/// **An index that could not be told does not strand the rows' keys.**
+///
+/// Sealed above an indexed store, an erasure removes the rows, then the index
+/// refuses, then the keys are due. Answering the index failure first left the
+/// rows gone and their keys alive — the one copy that reaches backups never
+/// destroyed, and nothing left that would name those versions again. The
+/// keys go whatever the index said; the failure is still the verb's answer.
+#[cfg(all(feature = "keyring", feature = "testkit"))]
+#[tokio::test]
+async fn an_index_failure_does_not_strand_memory_keys() {
+    use agentplane::keyring::{EncryptedMemoryStore, KeyError, KeyRing};
+    use agentplane::memory::IndexedMemoryStore;
+    use agentplane::testkit::MemoryKeyRing;
+
+    let tenant = TenantId::default();
+    let store = Arc::new(RedbStore::open_in_memory().expect("store"));
+    let inner = Arc::clone(&store) as Arc<dyn MemoryStore>;
+    let keys = Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>;
+    let offline = indexed(&inner, &[], true).await;
+    let sealed = EncryptedMemoryStore::new(
+        Arc::new(IndexedMemoryStore::new(
+            Arc::clone(&inner),
+            Arc::clone(&offline) as Arc<dyn SemanticRetriever>,
+        )),
+        Arc::clone(&keys),
+        tenant.clone(),
+    );
+    let mut expiring = item("x-1", "acct-x", json!({"n": 2}), Trust::Untrusted);
+    expiring.expires_at = Some(at(1_760_000_100));
+    for memory in [
+        item("s-1", "acct-s", json!({"n": 1}), Trust::Untrusted),
+        expiring,
+    ] {
+        sealed.remember(&memory).await.expect("remember");
+    }
+    let destroyed = |id: &str| {
+        let keys = Arc::clone(&keys);
+        let scope = agentplane::keyring::scope(&tenant, &format!("memory-item/{id}@1"));
+        async move { matches!(keys.data_key(&scope).await, Err(KeyError::Destroyed { .. })) }
+    };
+
+    sealed
+        .forget_subject("acct-s")
+        .await
+        .expect_err("an erasure the index missed reported success");
+    assert!(
+        inner.subject_ids("acct-s").await.expect("ids").is_empty(),
+        "the rows were not erased"
+    );
+    assert!(
+        destroyed("s-1").await,
+        "the rows went and their key was left: every backup still opens them"
+    );
+
+    sealed
+        .sweep_expired(at(1_760_000_200))
+        .await
+        .expect_err("a sweep the index missed reported success");
+    assert!(
+        destroyed("x-1").await,
+        "the sweep erased the row and left its key"
+    );
+}

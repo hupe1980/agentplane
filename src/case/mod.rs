@@ -192,6 +192,9 @@ pub trait CaseStore: Send + Sync + Debug {
     /// * [`StoreError::NotFound`] if there is no such case. Implementations must
     ///   tell these apart — reporting a missing case as a conflict sends the
     ///   caller into a re-read loop against something that will never exist.
+    /// * [`StoreError::CaseErased`] if the case carries an erasure marker:
+    ///   state written after the erasure began is sealed under a scope that is
+    ///   gone or going.
     async fn put_state(
         &self,
         case: CaseId,
@@ -212,6 +215,9 @@ pub trait CaseStore: Send + Sync + Debug {
     /// looks exactly like a live matter and is not one. A key another case has
     /// since claimed stays with that case: the identifier belongs to whichever
     /// matter is open for it now, and reopening must not take one back.
+    ///
+    /// **An erased case is refused**, whatever the status: reopening one would
+    /// re-claim its keys and route new work into a matter whose data is gone.
     async fn set_status(&self, case: CaseId, status: CaseStatus) -> Result<(), StoreError>;
 
     /// Close a case.
@@ -224,9 +230,16 @@ pub trait CaseStore: Send + Sync + Debug {
     /// Register an obligation. The resolved instant is stored as given and never
     /// recomputed.
     ///
+    /// **A name is registered once.** Registering it again with the same
+    /// instant, calendar and warning is the same registration and does
+    /// nothing; with anything different it is refused, because the journal
+    /// records each registration and a store that kept the first silently
+    /// would enforce terms the journal does not show as current.
+    ///
     /// # Errors
     ///
-    /// [`StoreError::CaseClosed`] if the matter is closed. [`close`](Self::close)
+    /// [`StoreError::DeadlineExists`] if the name is registered with other
+    /// terms. [`StoreError::CaseClosed`] if the matter is closed. [`close`](Self::close)
     /// refuses while an obligation is outstanding, and that check is worth
     /// nothing on its own: it holds at one instant, and this is the write that
     /// walks past it afterwards. Both halves are needed for *a closed case owes
@@ -342,10 +355,10 @@ pub trait CaseStore: Send + Sync + Debug {
 
     /// Preserve this matter against every erasure verb until somebody lifts it.
     ///
-    /// The only thing in this crate that makes an erasure **fail** rather than
-    /// succeed, and it exists because a retention pass is automatic: it runs on
-    /// a window nobody re-reads, and a matter under a preservation order looks
-    /// exactly like every other closed case old enough to sweep.
+    /// A held case refuses erasure. The hold exists because a retention pass
+    /// is automatic: it runs on a window nobody re-reads, and a matter under a
+    /// preservation order looks exactly like every other closed case old
+    /// enough to sweep.
     ///
     /// **Idempotent, first placement wins**, returning whether this call placed
     /// it — [`acknowledge_breach`](Self::acknowledge_breach)'s rule, for its
@@ -355,7 +368,9 @@ pub trait CaseStore: Send + Sync + Debug {
     ///
     /// [`StoreError::NotFound`] if the case does not exist — a hold on a matter
     /// that is not there preserves nothing and reads as effective in the
-    /// listing.
+    /// listing. [`StoreError::CaseErased`] if the case carries an erasure
+    /// marker ([`begin_erasure`](Self::begin_erasure)): a hold accepted on a
+    /// matter whose erasure has begun preserves nothing and reads as effective.
     async fn place_hold(&self, case: CaseId, hold: &LegalHold) -> Result<bool, StoreError>;
 
     /// Lift a hold, returning whether one was there to lift.
@@ -404,6 +419,54 @@ pub trait CaseStore: Send + Sync + Debug {
     ///
     /// The question every erasure verb asks before it destroys anything.
     async fn hold(&self, case: CaseId) -> Result<Option<LegalHold>, StoreError>;
+
+    /// Record that `case` is being erased, deciding against a hold in the same
+    /// write — the step [`erase_case`](crate::blob::erase_case) takes before it
+    /// destroys anything.
+    ///
+    /// A hold read and then acted on is a check a concurrent
+    /// [`place_hold`](Self::place_hold) walks past: the hold is accepted and
+    /// the key is destroyed anyway. Here the hold check, the status check and
+    /// the marker are one decision, and `place_hold` refuses a case carrying
+    /// the marker, so of a hold and an erasure racing exactly one wins and the
+    /// loser is told.
+    ///
+    /// Answers [`ErasureStart::Held`] or [`ErasureStart::NotClosed`] — writing
+    /// nothing — or [`ErasureStart::Marked`] with the marker that stands.
+    /// **First marker wins**: a retry gets the original instant and reason
+    /// back, so tombstones and key destructions written by the retry say what
+    /// the first attempt said.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the case does not exist.
+    async fn begin_erasure(
+        &self,
+        case: CaseId,
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<ErasureStart, StoreError>;
+
+    /// Record that the erasure [`begin_erasure`](Self::begin_erasure) marked
+    /// has destroyed everything it reaches. Idempotent.
+    ///
+    /// Separate from the marker because the marker has to land before the
+    /// destruction and this after it: a crash in between leaves an erasure
+    /// that is begun and not complete, which a retention pass runs again
+    /// rather than skipping.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] if the case does not exist, and an error if no
+    /// erasure was begun on it.
+    async fn complete_erasure(&self, case: CaseId) -> Result<(), StoreError>;
+
+    /// The erasure record on one matter, if an erasure was begun on it.
+    ///
+    /// The plane's own account of *erased by us*: a destroyed key with no
+    /// record here is a key that went missing, which is a finding rather than
+    /// a completed erasure.
+    async fn erasure(&self, case: CaseId) -> Result<Option<Erasure>, StoreError>;
 
     /// Every matter under hold, **oldest hold first**.
     ///
@@ -516,6 +579,73 @@ pub struct DrillRecord {
     pub origin: String,
     /// The checkpoint size at the time of the rehearsal.
     pub size: u64,
+}
+
+/// The record an erasure leaves on its case.
+///
+/// Written by [`CaseStore::begin_erasure`] before anything is destroyed and
+/// never removed, so it outlives the key it describes: a key service that
+/// keeps no tombstone (Vault transit does not) can say a key is missing, and
+/// only this says the plane erased it, when, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Erasure {
+    /// The instant the erasure was asked for, as its caller stated it.
+    pub at: Timestamp,
+    /// Why, in the words of whoever asked.
+    pub reason: String,
+    /// Whether every tombstone and the key destruction landed.
+    pub complete: bool,
+}
+
+/// What [`CaseStore::begin_erasure`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErasureStart {
+    /// The case carries an erasure marker — this call's, or an earlier
+    /// attempt's, whose instant and reason stand.
+    Marked(Erasure),
+    /// The case is under this hold; nothing was written.
+    Held(LegalHold),
+    /// The case is in this status rather than closed; nothing was written.
+    NotClosed(CaseStatus),
+}
+
+/// The refusal a write to an erased case gets.
+///
+/// One constructor, so every backend refuses with the same variant.
+#[cfg(any(feature = "redb", feature = "postgres"))]
+pub(crate) fn case_erased(case: &str, erasure: &Erasure) -> StoreError {
+    StoreError::CaseErased {
+        case: case.to_owned(),
+        at: erasure.at.to_string(),
+        reason: erasure.reason.clone(),
+    }
+}
+
+/// The refusal for a state write past the last version a case can carry.
+///
+/// Reachable only through an imported or damaged row — a case that wrote once
+/// a nanosecond would take centuries — so it is reported as the row's fault
+/// rather than wrapped back to zero, where a stale writer holding version 0
+/// would win.
+#[cfg(any(feature = "redb", feature = "postgres"))]
+pub(crate) fn version_exhausted(case: &str) -> StoreError {
+    StoreError::Corrupt {
+        seq: 0,
+        detail: format!(
+            "case {case} is at the last version a case can carry, so no further state \
+             write can be told apart from a stale one"
+        ),
+    }
+}
+
+/// The refusal a second, different registration of a named obligation gets.
+#[cfg(any(feature = "redb", feature = "postgres"))]
+pub(crate) fn deadline_exists(case: &str, name: &str) -> StoreError {
+    StoreError::DeadlineExists {
+        case: case.to_owned(),
+        name: name.to_owned(),
+    }
 }
 
 /// What the case store is currently holding.

@@ -2126,7 +2126,7 @@
   "info": {
     "description": "The operator API of an agentplane plane: the routes a person or their tooling uses to see what a plane is doing and to intervene — runs, tasks, cases, obligations, holds, halts, events and dead letters.\n\n**Scope.** This document describes the operator API only. The A2A surface is described by its own protocol and the Agent Card it serves; the MCP server by the tool listing MCP defines. Neither is here.\n\n**Tenant.** The tenant a request reaches comes from its credential, never from a path, query or body member; no operation takes one.\n\n**Refusals.** Every non-success answer is `{\"error\": \"<sentence>\"}`.\n\n**Compatibility.** This document is outside the project's compatibility promise, like the Rust API: an operation, a member or a status can change in any release. Pin the version your client was generated from.",
     "title": "agentplane operator API",
-    "version": "0.46.0"
+    "version": "0.47.0"
   },
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "openapi": "3.1.0",

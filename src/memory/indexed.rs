@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::{Cascade, Forgotten, MemoryItem, MemoryStore, Recall, SemanticRetriever};
+use super::{
+    Cascade, Forgotten, MemoryErasure, MemoryItem, MemoryStore, Reached, Recall, SemanticRetriever,
+};
 use crate::core::{StoreError, Timestamp};
 
 /// A [`MemoryStore`] that tells a [`SemanticRetriever`] what every erasure
@@ -16,6 +18,11 @@ use crate::core::{StoreError, Timestamp};
 /// index; an index that could not be told turns the call into an error naming
 /// what it still holds, so an erasure never reports success while a copy
 /// survives.
+///
+/// A sealing store above this one reads the verbs through
+/// [`erase_reaching`](MemoryStore::erase_reaching), which answers what the rows
+/// lost beside the index failure rather than instead of it — the keys of
+/// those rows are destroyed whatever the index said.
 ///
 /// What the index was not told is owed, not dropped: the store no longer
 /// holds those rows, so repeating the verb would find nothing to tell. Every
@@ -118,10 +125,11 @@ impl MemoryStore for IndexedMemoryStore {
     }
 
     async fn forget_subject(&self, subject: &str) -> Result<usize, StoreError> {
-        let count = self.inner.forget_subject(subject).await?;
-        self.tell(vec![Forgotten::Subject(subject.to_owned())])
-            .await?;
-        Ok(count)
+        match self.erase_reaching(MemoryErasure::Subject(subject)).await? {
+            (_, Some(untold)) => Err(untold),
+            (Reached::Subject(count), None) => Ok(count),
+            (other, None) => Err(super::mismatched("forget_subject", &other)),
+        }
     }
 
     async fn derivatives(&self, id: &str) -> Result<Vec<MemoryItem>, StoreError> {
@@ -129,18 +137,11 @@ impl MemoryStore for IndexedMemoryStore {
     }
 
     async fn forget_cascading(&self, id: &str) -> Result<Cascade, StoreError> {
-        let cascade = self.inner.forget_cascading(id).await?;
-        let mut forgotten = Vec::new();
-        if !cascade.erased.is_empty() {
-            forgotten.push(Forgotten::Ids(
-                cascade.erased.iter().map(|(id, _)| id.clone()).collect(),
-            ));
+        match self.erase_reaching(MemoryErasure::Cascading(id)).await? {
+            (_, Some(untold)) => Err(untold),
+            (Reached::Cascading(cascade), None) => Ok(cascade),
+            (other, None) => Err(super::mismatched("forget_cascading", &other)),
         }
-        if !cascade.trimmed.is_empty() {
-            forgotten.push(Forgotten::Versions(cascade.trimmed.clone()));
-        }
-        self.tell(forgotten).await?;
-        Ok(cascade)
     }
 
     async fn set_legal_hold(&self, id: &str, held: bool) -> Result<(), StoreError> {
@@ -160,18 +161,50 @@ impl MemoryStore for IndexedMemoryStore {
     }
 
     async fn sweep_expired(&self, at: Timestamp) -> Result<Vec<(String, u64)>, StoreError> {
-        let swept = self.inner.sweep_expired(at).await?;
-        let mut forgotten = Vec::new();
-        if !swept.is_empty() {
-            forgotten.push(Forgotten::Ids(
-                swept.iter().map(|(id, _)| id.clone()).collect(),
-            ));
+        match self.erase_reaching(MemoryErasure::Expired(at)).await? {
+            (_, Some(untold)) => Err(untold),
+            (Reached::Expired(swept), None) => Ok(swept),
+            (other, None) => Err(super::mismatched("sweep_expired", &other)),
         }
-        self.tell(forgotten).await?;
-        Ok(swept)
     }
 
     async fn touch(&self, ids: &[String], at: Timestamp) -> Result<(), StoreError> {
         self.inner.touch(ids, at).await
+    }
+
+    /// The rows' erasure, then the index's: a failure to tell the index is
+    /// the second element, beside what the rows lost, never in place of it.
+    async fn erase_reaching(
+        &self,
+        verb: MemoryErasure<'_>,
+    ) -> Result<(Reached, Option<StoreError>), StoreError> {
+        let (reached, below) = self.inner.erase_reaching(verb).await?;
+        let mut forgotten = Vec::new();
+        match &reached {
+            Reached::Subject(_) => {
+                if let MemoryErasure::Subject(subject) = verb {
+                    forgotten.push(Forgotten::Subject(subject.to_owned()));
+                }
+            }
+            Reached::Cascading(cascade) => {
+                if !cascade.erased.is_empty() {
+                    forgotten.push(Forgotten::Ids(
+                        cascade.erased.iter().map(|(id, _)| id.clone()).collect(),
+                    ));
+                }
+                if !cascade.trimmed.is_empty() {
+                    forgotten.push(Forgotten::Versions(cascade.trimmed.clone()));
+                }
+            }
+            Reached::Expired(swept) => {
+                if !swept.is_empty() {
+                    forgotten.push(Forgotten::Ids(
+                        swept.iter().map(|(id, _)| id.clone()).collect(),
+                    ));
+                }
+            }
+        }
+        let untold = self.tell(forgotten).await.err();
+        Ok((reached, below.or(untold)))
     }
 }

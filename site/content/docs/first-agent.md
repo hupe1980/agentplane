@@ -13,11 +13,9 @@ run. Nothing here needs an API key, a network, or a Rust toolchain — the model
 is the deterministic fake until the last section, which tells you exactly what
 changes to go live.
 
-One method note before the first command, because it is the method: **the
-format teaches by refusing.** We start with a file that is deliberately too
-small and let the parser tell us what is missing and why it matters. Every
-refusal below is real output, and each one names the fix — reading them *is*
-the tutorial.
+**The format teaches by refusing.** We start with a file that is deliberately
+too small and let the parser say what is missing. Every refusal below is real
+output, and each one names the fix.
 
 The [getting-started](@/docs/getting-started.md) page is the fast tour of the
 runtime's claims, and the Rust path — writing a `Skill` against the crate —
@@ -248,9 +246,10 @@ your laptop and a cluster, so grants are reviewed and wiring is deployed. Run
 it without wiring anything and the plane refuses at build, not on turn three:
 
 ```text
-agentplane: agent 'triage' declares `execution.kind: tool-calling` with
-1 tool grant(s), but this plane has no tool catalogue, so every run would fail
-identically …
+agentplane: agent 'triage' declares `execution.kind: tool-calling` and grants
+tools on tickets, but nothing reaches them. Name the process that serves each
+one: `--mcp tickets=<command>` for an MCP server, or `--peer <name>=<url>` for
+an A2A peer
 ```
 
 The wiring is one flag — `--mcp` names which command serves `tickets`
@@ -265,16 +264,14 @@ run run_01M13H94M4K11MZKYX4AE6THQX — Succeeded
 {"text":"fake answer to {\"system\":\"Support ticket triage\\n\\nClassify severity. Never promise a refund. Cite the ticket id.\",\"input\":{\"ticket\":\"T-1\"}}"}
 ```
 
-Honesty about what just happened: the wiring, the grant and the loop are all
-real, but the deterministic fake has no judgement, so it answered without
-choosing the tool. Watching a model actually *choose* — and watching the
+The wiring, the grant and the loop are all real, but the deterministic fake has
+no judgement, so it answered without choosing the tool. Watching a model
+actually *choose* — and watching the
 refusals that bound what it may choose — is
 `cargo run --example tool_loop --features redb,fake-model,manifest` in the
 repository, or this same file against a live model (step 8).
 
-One posture rule is worth meeting now, because you will hit it the first time
-a tool *changes* something. Declare a grant `mutates: true` with no field
-rules and the file is refused:
+Declare a grant `mutates: true` with no field rules and the file is refused:
 
 ```text
 agentplane: manifest is not well-formed: spec.tools: 'tool://tickets/close'

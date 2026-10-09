@@ -63,7 +63,7 @@ impl Declarative {
             Arc<crate::tools::ToolCatalog>,
             Arc<dyn crate::tools::ToolClient>,
         )>,
-        max_turns: u32,
+        max_turns: Option<u32>,
     ) -> Self {
         Self {
             kind,
@@ -71,7 +71,7 @@ impl Declarative {
             name,
             provider,
             tools,
-            max_turns,
+            max_turns: max_turns.unwrap_or(crate::manifest::Execution::DEFAULT_MAX_TURNS),
         }
     }
 
@@ -211,9 +211,9 @@ impl Declarative {
             // failure this runtime exists to make impossible.
             if completion.peek().truncated {
                 let reason = if completion.peek().tool_calls.is_empty() {
-                    "the model ran out of output budget mid-answer, so this is a partial answer and not the agent's answer — raise `max_output_tokens` for this role, or narrow what the agent is asked to produce"
+                    "the model ran out of output budget mid-answer, so this is a partial answer and not the agent's answer — raise `spec.models.<role>.max_tokens`, or narrow what the agent is asked to produce"
                 } else {
-                    "the model ran out of output budget while it was still asking for tools, so the last call's arguments are whatever survived the cut — running them would act on a request the model never finished writing. Raise `max_output_tokens` for this role"
+                    "the model ran out of output budget while it was still asking for tools, so the last call's arguments are whatever survived the cut — running them would act on a request the model never finished writing. Raise `spec.models.<role>.max_tokens`"
                 };
                 return Ok(Outcome::fail(reason));
             }
@@ -345,10 +345,10 @@ impl Declarative {
                                 .into(),
                         ));
                     };
-                    cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
-                        .await?;
+                    let deadline = spec.register_wait(cx).await?;
                     let reach = consulted(cx, &id).await?;
-                    let mut task = spec.approve_call(&reference, &asked.arguments, reach.clone());
+                    let mut task =
+                        spec.approve_call(deadline, &reference, &asked.arguments, reach.clone());
                     approved = reach;
                     // Consequences beside the instruction, when the grant names
                     // a dry run that can produce them.
@@ -518,11 +518,12 @@ impl Declarative {
             // in the only configuration it exists for. `register_deadline` is
             // idempotent by primary key, so a second run joining the same case
             // shares the obligation rather than colliding with it.
-            cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
-                .await?;
+            let deadline = spec.register_wait(cx).await?;
             // The proposal shown is the answer itself, not a description of it —
             // a reviewer who cannot see what will happen is not reviewing.
-            let decision = cx.task(&spec.approve_answer(answer.peek().clone())).await?;
+            let decision = cx
+                .task(&spec.approve_answer(deadline, answer.peek().clone()))
+                .await?;
             if !decision.approved {
                 // Named and quoted, because "the agent failed" is not something
                 // an operator can act on and "Carol refused, because X" is.
@@ -1247,6 +1248,19 @@ impl Skill for Declarative {
                         call
                     })
                     .await?;
+                // A cut-off answer is not the agent's answer, for the reason
+                // the tool loop gives: a partial result must never be shaped
+                // like a whole one, and with a result contract the part that
+                // survived may still validate.
+                let cut_off = completion.peek().truncated;
+                if cut_off {
+                    return Ok(Outcome::fail(
+                        "the model ran out of output budget mid-answer, so this is a partial \
+                         answer and not the agent's answer — raise \
+                         `spec.models.<role>.max_tokens`, or narrow what the agent is asked \
+                         to produce",
+                    ));
+                }
                 let label = completion.label().join(prompt.label());
                 let completion = Tainted::with_label(completion.into_unlabelled(), label);
                 let formed_source = Tainted::with_label(
@@ -1303,7 +1317,9 @@ impl Skill for Declarative {
 struct Proposal {
     approval: crate::manifest::Approval,
     approvers: Vec<String>,
-    deadline: crate::manifest::OversightDeadline,
+    /// Present whenever something gates; the parser refuses the block
+    /// otherwise, and refuses one when nothing does.
+    deadline: Option<crate::manifest::OversightDeadline>,
     on_expiry: crate::core::Expiry,
     /// Rules that open a task *beside* the answer rather than in front of it.
     triage: Vec<crate::manifest::TriageRule>,
@@ -1328,14 +1344,43 @@ impl Proposal {
         }
     }
 
+    /// The obligation a wait is bounded by, registered on the case.
+    ///
+    /// Unreachable without one through the parser, which requires a deadline
+    /// whenever something gates. Stated rather than unwrapped: a panic here
+    /// would be a crash for a wiring mistake.
+    async fn register_wait(
+        &self,
+        cx: &mut StepCtx<'_>,
+    ) -> Result<&crate::manifest::OversightDeadline, SkillError> {
+        let deadline = self.deadline.as_ref().ok_or_else(|| {
+            SkillError::Other(
+                "a wait was asked for and the oversight policy declares no deadline to bound it"
+                    .into(),
+            )
+        })?;
+        cx.deadline(deadline.name.clone(), &deadline.spec(), None)
+            .await?;
+        Ok(deadline)
+    }
+
     /// Whether the final answer waits, as opposed to only the calls that ask.
     const fn gates_the_answer(&self) -> bool {
         matches!(self.approval, crate::manifest::Approval::Required)
     }
 
     /// The task shown when a reviewer must approve the agent's **answer**.
-    fn approve_answer(&self, answer: Value) -> crate::core::TaskSpec {
-        self.task("agent.approve", "approve this agent's answer", answer)
+    fn approve_answer(
+        &self,
+        deadline: &crate::manifest::OversightDeadline,
+        answer: Value,
+    ) -> crate::core::TaskSpec {
+        self.task(
+            deadline,
+            "agent.approve",
+            "approve this agent's answer",
+            answer,
+        )
     }
 
     /// The task shown when a reviewer must approve a **tool call**.
@@ -1353,11 +1398,13 @@ impl Proposal {
     /// callee as well as the arguments.
     fn approve_call(
         &self,
+        deadline: &crate::manifest::OversightDeadline,
         reference: &str,
         arguments: &Value,
         reach: Option<crate::core::Reach>,
     ) -> crate::core::TaskSpec {
         let mut spec = self.task(
+            deadline,
             APPROVE_CALL_KIND,
             format!("approve this agent's call to {reference}"),
             json!({ "tool": reference, "arguments": arguments }),
@@ -1366,13 +1413,19 @@ impl Proposal {
         spec
     }
 
-    fn task(&self, kind: &str, summary: impl Into<String>, action: Value) -> crate::core::TaskSpec {
+    fn task(
+        &self,
+        deadline: &crate::manifest::OversightDeadline,
+        kind: &str,
+        summary: impl Into<String>,
+        action: Value,
+    ) -> crate::core::TaskSpec {
         let mut spec = crate::core::TaskSpec::new(
             kind,
             // Every summary this tier writes is the runtime's own, over the
             // operator's catalogue reference — never a model's prose.
             crate::core::Justification::new(Tainted::trusted(summary.into()), action),
-            self.deadline.name.clone(),
+            deadline.name.clone(),
         );
         spec.candidate_roles.clone_from(&self.approvers);
         spec.on_expiry = self.on_expiry.clone();
@@ -2030,10 +2083,9 @@ async fn dispatch_granted(
                     .into(),
             ));
         };
-        cx.deadline(spec.deadline.name.clone(), &spec.deadline.spec(), None)
-            .await?;
+        let deadline = spec.register_wait(cx).await?;
         let reach = consulted(cx, &id).await?;
-        let mut task = spec.approve_call(&reference, assembled.peek(), reach.clone());
+        let mut task = spec.approve_call(deadline, &reference, assembled.peek(), reach.clone());
         approved = reach;
         if let Some(preview) = grant.preview.as_deref() {
             let evidence = preview_evidence(cx, catalog, client, preview, &assembled).await;

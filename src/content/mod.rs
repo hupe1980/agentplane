@@ -797,7 +797,7 @@ fn walk(
         }
         Value::Object(map) => {
             for (key, item) in map {
-                let segment = key.replace('~', "~0").replace('/', "~1");
+                let segment = crate::core::canon::pointer_token(key);
                 let real = format!("{real}/{segment}");
                 let shown = if masks(key) {
                     format!("{shown}/*")

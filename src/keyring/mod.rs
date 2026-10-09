@@ -236,7 +236,9 @@ pub enum KeyError {
     /// the data may be gone. The honest answer is the one that fits in neither
     /// arm, so it has its own.
     #[error(
-        "this sealed envelope is a format version this build reads and its header is not one          it parses ({detail}) — either the bytes were damaged or another build wrote them,          and nothing here can tell which"
+        "this sealed envelope is a format version this build reads and its header is not one \
+         it parses ({detail}) — either the bytes were damaged or another build wrote them, \
+         and nothing here can tell which"
     )]
     UnreadableHeader { detail: String },
 

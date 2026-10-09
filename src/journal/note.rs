@@ -172,8 +172,8 @@ impl SignedNote {
     ///
     /// # Errors
     ///
-    /// If the name is empty, or contains whitespace, an em dash, or a control
-    /// character.
+    /// If the name is empty, or contains whitespace, an em dash, a `+` (which
+    /// `signed-note` forbids in a key name) or a control character.
     pub fn validate_name(name: &str) -> Result<(), StoreError> {
         let bad = |what: &str| StoreError::Backend(format!("signed note: a key name {what}"));
         if name.is_empty() {
@@ -181,7 +181,7 @@ impl SignedNote {
         }
         if let Some(c) = name
             .chars()
-            .find(|c| c.is_whitespace() || c.is_control() || *c == EM_DASH)
+            .find(|c| c.is_whitespace() || c.is_control() || *c == EM_DASH || *c == '+')
         {
             return Err(bad(&format!(
                 "contains {c:?}, which the signature line uses as structure — the note \

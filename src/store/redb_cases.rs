@@ -138,6 +138,42 @@ const CASE_HOLDS: TableDefinition<(&str, &str), (i64, &str)> =
 const CASE_HOLDS_BY_TIME: TableDefinition<(&str, i64, &str), ()> =
     TableDefinition::new("case_legal_holds_by_time");
 
+/// `(tenant, case_id) -> (at, reason, complete)`. The erasure record, written
+/// before anything is destroyed and never removed; every write that would put
+/// data back into the case reads it inside its own transaction.
+const CASE_ERASURES: TableDefinition<(&str, &str), (i64, &str, bool)> =
+    TableDefinition::new("case_erasures");
+
+/// The erasure record on `case`, read inside `w` so the decision built on it
+/// commits with the transaction that read it.
+fn erasure_in(
+    w: &redb::WriteTransaction,
+    tenant: &str,
+    case: &str,
+) -> Result<Option<crate::case::Erasure>, StoreError> {
+    let t = w.open_table(CASE_ERASURES).map_err(|e| be(&e))?;
+    let row = t.get((tenant, case)).map_err(|e| be(&e))?.map(|v| {
+        let (at, reason, complete) = v.value();
+        (at, reason.to_owned(), complete)
+    });
+    row.map(|(at, reason, complete)| {
+        Ok(crate::case::Erasure {
+            at: from_ts(at)?,
+            reason,
+            complete,
+        })
+    })
+    .transpose()
+}
+
+/// Refuse a write that would put data back into an erased case.
+fn refuse_erased(w: &redb::WriteTransaction, tenant: &str, case: &str) -> Result<(), StoreError> {
+    match erasure_in(w, tenant, case)? {
+        Some(erasure) => Err(crate::case::case_erased(case, &erasure)),
+        None => Ok(()),
+    }
+}
+
 fn ts(t: Timestamp) -> i64 {
     t.unix_timestamp()
 }
@@ -436,6 +472,7 @@ pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError
     w.open_table(CASES_BY_STATUS).map_err(|e| be(&e))?;
     w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
     w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
+    w.open_table(CASE_ERASURES).map_err(|e| be(&e))?;
     Ok(())
 }
 
@@ -1020,9 +1057,12 @@ impl CaseStore for RedbStore {
         let tenant = self.tenant_name();
         let key = case.to_string();
         let encoded = serde_json::to_string(&state)?;
-        let next = expected.next();
+        let next = expected
+            .next()
+            .ok_or_else(|| crate::case::version_exhausted(&key))?;
         self.with_db(move |db| {
             let w = begin_write(db)?;
+            refuse_erased(&w, &tenant, &key)?;
             let result = {
                 let mut cases = w.open_table(CASES).map_err(|e| be(&e))?;
                 let current = cases
@@ -1076,6 +1116,7 @@ impl CaseStore for RedbStore {
         let key = case.to_string();
         self.with_db(move |db| {
             let w = begin_write(db)?;
+            refuse_erased(&w, &tenant, &key)?;
             {
                 let mut cases = w.open_table(CASES).map_err(|e| be(&e))?;
                 let Some(row) = cases
@@ -1230,11 +1271,23 @@ impl CaseStore for RedbStore {
                 }
                 let (has_ack, ack_at, by, note) = ack_columns(ack.as_ref())?;
                 let mut d = w.open_table(DEADLINES).map_err(|e| be(&e))?;
-                // First registration wins, as `ON CONFLICT DO NOTHING` did.
-                if d.get((tenant.as_str(), case.as_str(), name.as_str()))
+                // A name is registered once. The same terms again are the same
+                // registration; different terms are refused rather than
+                // dropped, because the journal records the second one and a
+                // store that kept the first would enforce terms nobody reads
+                // as current.
+                let existing = d
+                    .get((tenant.as_str(), case.as_str(), name.as_str()))
                     .map_err(|e| be(&e))?
-                    .is_none()
-                {
+                    .map(|v| {
+                        let (r, dg, wa, has_warn, ..) = v.value();
+                        (r, dg.to_vec(), (has_warn != 0).then_some(wa))
+                    });
+                if let Some((r, dg, wa)) = existing {
+                    if r != resolved || dg != digest || wa != warn {
+                        return Err(crate::case::deadline_exists(&case, &name));
+                    }
+                } else {
                     d.insert(
                         (tenant.as_str(), case.as_str(), name.as_str()),
                         (
@@ -1684,6 +1737,11 @@ impl CaseStore for RedbStore {
                 {
                     return Err(StoreError::NotFound(key));
                 }
+                // Read in the transaction `begin_erasure` decides in: redb
+                // admits one writer, so either the erasure's marker is here
+                // and this refuses, or this hold lands first and the erasure
+                // refuses.
+                refuse_erased(&w, &tenant, &key)?;
                 let mut h = w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
                 // First placement wins. A retry must not move the instant or the
                 // reason: those are the two facts the hold exists to record.
@@ -1736,6 +1794,125 @@ impl CaseStore for RedbStore {
             .await?;
         row.map(|(at, row)| Ok(super::hold_from_row(from_ts(at)?, decode_hold(&row)?)))
             .transpose()
+    }
+
+    async fn begin_erasure(
+        &self,
+        case: CaseId,
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<crate::case::ErasureStart, StoreError> {
+        use crate::case::ErasureStart;
+        let tenant = self.tenant_name();
+        let key = case.to_string();
+        let reason = reason.to_owned();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            // One transaction for the hold, the status and the marker: redb
+            // admits one writer, so `place_hold` decides either wholly before
+            // this or wholly after it, and after it the marker refuses it.
+            let started = {
+                let status = w
+                    .open_table(CASES)
+                    .map_err(|e| be(&e))?
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| v.value().1.to_owned());
+                let Some(status) = status else {
+                    return Err(StoreError::NotFound(key));
+                };
+                if let Some(standing) = erasure_in(&w, &tenant, &key)? {
+                    ErasureStart::Marked(standing)
+                } else if let Some((placed, row)) = w
+                    .open_table(CASE_HOLDS)
+                    .map_err(|e| be(&e))?
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (placed, row) = v.value();
+                        (placed, row.to_owned())
+                    })
+                {
+                    ErasureStart::Held(super::hold_from_row(from_ts(placed)?, decode_hold(&row)?))
+                } else if status == CaseStatus::Closed.as_str() {
+                    w.open_table(CASE_ERASURES)
+                        .map_err(|e| be(&e))?
+                        .insert(
+                            (tenant.as_str(), key.as_str()),
+                            (ts(at), reason.as_str(), false),
+                        )
+                        .map_err(|e| be(&e))?;
+                    ErasureStart::Marked(crate::case::Erasure {
+                        at,
+                        reason,
+                        complete: false,
+                    })
+                } else {
+                    ErasureStart::NotClosed(status_from(&status)?)
+                }
+            };
+            w.commit().map_err(|e| be(&e))?;
+            Ok(started)
+        })
+        .await
+    }
+
+    async fn complete_erasure(&self, case: CaseId) -> Result<(), StoreError> {
+        let tenant = self.tenant_name();
+        let key = case.to_string();
+        self.with_db(move |db| {
+            let w = begin_write(db)?;
+            {
+                if w.open_table(CASES)
+                    .map_err(|e| be(&e))?
+                    .get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .is_none()
+                {
+                    return Err(StoreError::NotFound(key));
+                }
+                let Some(standing) = erasure_in(&w, &tenant, &key)? else {
+                    return Err(StoreError::Backend(format!(
+                        "no erasure was begun on case {key}, so none can be completed"
+                    )));
+                };
+                w.open_table(CASE_ERASURES)
+                    .map_err(|e| be(&e))?
+                    .insert(
+                        (tenant.as_str(), key.as_str()),
+                        (ts(standing.at), standing.reason.as_str(), true),
+                    )
+                    .map_err(|e| be(&e))?;
+            }
+            w.commit().map_err(|e| be(&e))?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn erasure(&self, case: CaseId) -> Result<Option<crate::case::Erasure>, StoreError> {
+        let tenant = self.tenant_name();
+        let key = case.to_string();
+        let row = self
+            .with_db(move |db| {
+                let r = db.begin_read().map_err(|e| be(&e))?;
+                let t = r.open_table(CASE_ERASURES).map_err(|e| be(&e))?;
+                Ok(t.get((tenant.as_str(), key.as_str()))
+                    .map_err(|e| be(&e))?
+                    .map(|v| {
+                        let (at, reason, complete) = v.value();
+                        (at, reason.to_owned(), complete)
+                    }))
+            })
+            .await?;
+        row.map(|(at, reason, complete)| {
+            Ok(crate::case::Erasure {
+                at: from_ts(at)?,
+                reason,
+                complete,
+            })
+        })
+        .transpose()
     }
 
     async fn holds(

@@ -3632,6 +3632,55 @@ async fn chat_completions_a_stream_severed_after_generation_is_not_free_to_retry
     assert_eq!(error.disposition(), Disposition::Landed);
 }
 
+/// **An error object inside the stream is the provider's error**, classified,
+/// not a chunk with no choices: skipped, the `[DONE]` after it settled an
+/// empty answer as a success.
+#[tokio::test]
+async fn chat_completions_an_in_stream_error_surfaces_as_the_providers_error() {
+    let url = serve_cc_sse(concat!(
+        "data: {\"error\":{\"message\":\"slow down\",\"type\":\"rate_limit_exceeded\"}}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    let driver = ChatCompletions::new(url).unwrap();
+    let model = ModelId::new("chat-completions", "m");
+    let error = driver
+        .complete(cc_request(&model, &json!("hello")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, ModelError::RateLimited { detail, .. } if detail.contains("slow down")),
+        "an in-stream rate limit was not reported as one: {error}"
+    );
+
+    // A numeric code goes through the status table.
+    let url = serve_cc_sse(concat!(
+        "data: {\"error\":{\"message\":\"bad schema\",\"code\":400}}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    let driver = ChatCompletions::new(url).unwrap();
+    let error = driver
+        .complete(cc_request(&model, &json!("hello")))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Refused { .. }), "{error}");
+
+    // After generation the cost is unknown, whatever the error says.
+    let url = serve_cc_sse(concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        "data: {\"error\":{\"message\":\"upstream died\",\"code\":500}}\n\n",
+        "data: [DONE]\n\n",
+    ))
+    .await;
+    let driver = ChatCompletions::new(url).unwrap();
+    let error = driver
+        .complete(cc_request(&model, &json!("hello")))
+        .await
+        .unwrap_err();
+    assert!(matches!(&error, ModelError::Unaccounted { .. }), "{error}");
+}
+
 #[tokio::test]
 async fn chat_completions_a_stream_severed_before_generation_is_safe_to_repeat() {
     let url = serve_cc_sse("").await;
@@ -3882,6 +3931,39 @@ fn gemini_request<'a>(
         continuation,
         stream: None,
     }
+}
+
+/// **Tool-use prompt tokens are billed input**, reported beside the prompt
+/// count rather than inside it — read only from `promptTokenCount`, a turn fed
+/// a built-in tool's results under-reports its bill by those results.
+#[tokio::test]
+async fn gemini_tool_use_prompt_tokens_are_billed_as_input() {
+    let (canned, _seen, _headers) = canned_observed(
+        200,
+        json!({
+            "candidates": [{
+                "content": { "role": "model", "parts": [{ "text": "ok" }] },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 20,
+                "toolUsePromptTokenCount": 9,
+                "candidatesTokenCount": 3,
+            },
+        }),
+    );
+    let url = serve(canned).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let model = ModelId::new("gemini", "gemini-3.5-flash");
+    let completion = driver
+        .complete(gemini_request(&model, &json!("hello"), &[], &[], None))
+        .await
+        .unwrap();
+    assert_eq!(
+        completion.usage.input_tokens, 29,
+        "20 prompt + 9 tool-use prompt"
+    );
+    assert_eq!(completion.usage.output_tokens, 3);
 }
 
 /// The request shape Gemini actually takes, asserted field by field.
@@ -4238,8 +4320,9 @@ async fn gemini_retry_advice_in_the_body_reaches_the_driver() {
         "the provider named its window inside the body and the driver dropped it"
     );
 
-    // A window nobody named stays absent rather than invented — a fractional
-    // sub-second delay floors to zero, which is no advice at all.
+    // A fractional window rounds up, never down: the provider named the
+    // earliest moment a retry may succeed, and `1.5s` floored to 1 would
+    // retry before it.
     let (served, _seen) = canned(
         429,
         json!({
@@ -4247,7 +4330,38 @@ async fn gemini_retry_advice_in_the_body_reaches_the_driver() {
                 "code": 429,
                 "status": "RESOURCE_EXHAUSTED",
                 "details": [
-                    { "@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0.5s" },
+                    { "@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "1.5s" },
+                ],
+            }
+        }),
+    );
+    let url = serve(served).await;
+    let driver = Gemini::new("k").unwrap().base(url).buffered();
+    let err = driver
+        .complete(gemini_request(&model, &json!("hello"), &[], &[], None))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ModelError::RateLimited {
+                retry_after: Some(2),
+                ..
+            }
+        ),
+        "a fractional delay was not rounded up: {err}"
+    );
+
+    // And a window of zero is no advice at all, rather than an instruction to
+    // retry at once.
+    let (served, _seen) = canned(
+        429,
+        json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    { "@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0s" },
                 ],
             }
         }),
@@ -4266,7 +4380,7 @@ async fn gemini_retry_advice_in_the_body_reaches_the_driver() {
                 ..
             }
         ),
-        "a sub-second delay is not advice this crate can act on: {err}"
+        "a zero delay is not advice this crate can act on: {err}"
     );
 }
 
