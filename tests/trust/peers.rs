@@ -1016,13 +1016,13 @@ async fn a_withdrawn_subjects_credential_is_not_presented() {
         "the refused hop was announced"
     );
 
-    rt.lift_halt(
-        &HaltScope::subject("user:alice"),
-        &agentplane::core::Operator::asserted("ops").expect("operator"),
-        ts(1_700_000_100),
-    )
-    .await
-    .expect("lift");
+    // Lifted in the store, as another instance of the plane lifts it: nothing
+    // on this instance hears of it, so only the hop's own drop keeps the
+    // withdrawn credential from being served again.
+    (Arc::clone(&store) as Arc<dyn QuotaStore>)
+        .lift_halt(&HaltScope::subject("user:alice"))
+        .await
+        .expect("lift");
     let resumed = rt.replay(out.run_id, Mode::Resume).await.expect("resumes");
     assert!(
         matches!(resumed.status, RunStatus::Succeeded),

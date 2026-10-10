@@ -5542,18 +5542,51 @@ pub struct Label {""",
         "every_blob_store_satisfies_the_contract",
         "the object-store backend takes a write to an erased address — the "
         "embedded one's refusal says nothing about the backend a deployment "
-        "actually erases in",
+        "actually erases in. Both tombstone checks go: each alone is covered "
+        "by the other in a sequential test",
         """        match self.absent(digest).await {
             // Nothing has been erased here, which is what "no tombstone" means
             // on the read path and the only answer that licenses a write.
             BlobError::NotFound(_) => {}
             refusal => return Err(refusal),
-        }""",
-        "",
+        }
+        self.op
+            .write(&self.path(digest), bytes.to_vec())
+            .await
+            .map_err(|e| backend(&e))?;
+        // And one read after it, because the read before is a check an
+        // `expire` can pass between: its tombstone lands after that read and
+        // its delete before this write, and the bytes come back under it. An
+        // object store offers no write conditional on another object's
+        // absence, so the write is checked again once it has landed. A
+        // tombstone found now means this write raced an erasure and lost: the
+        // bytes are deleted again and the write is refused. An `expire` that
+        // starts after this read deletes the bytes itself.
+        // Only a tombstone deletes: a read that failed says nothing about one,
+        // and the bytes at a content address may be another writer's.
+        match self.absent(digest).await {
+            BlobError::NotFound(_) => Ok(()),
+            refusal @ (BlobError::Expired { .. } | BlobError::UnreadableTombstone { .. }) => {
+                match self.op.delete(&self.path(digest)).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == opendal::ErrorKind::NotFound => {}
+                    Err(e) => return Err(backend(&e)),
+                }
+                Err(refusal)
+            }
+            other => Err(other),
+        }
+""",
+        """        self.op
+            .write(&self.path(digest), bytes.to_vec())
+            .await
+            .map_err(|e| backend(&e))?;
+        Ok(())
+""",
     ),
     "AnErasedWriteIsAStoreFault": (
         "src/blob/mod.rs",
-        "a_run_cannot_put_back_what_an_erasure_removed",
+        "an_erased_write_is_refused_as_a_rule_rather_than_a_fault",
         "a refusal to resurrect erased bytes is classified as a backend "
         "failure, so every caller that tells an outage from a rule reads an "
         "enforced erasure as a store having a bad day",
