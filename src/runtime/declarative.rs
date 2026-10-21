@@ -335,7 +335,15 @@ impl Declarative {
                 // arguments about to be sent — not a description of them, and
                 // not the answer they will produce.
                 let mut approved: Option<crate::core::Reach> = None;
-                if grant.requires_approval {
+                // Unless a person approved this call in advance: see
+                // `dispatch_granted` for why a consulted agent is never.
+                let standing = if grant.requires_approval && id.server != crate::tools::AGENT_SERVER
+                {
+                    cx.standing_approval(&reference, &asked.arguments).await?
+                } else {
+                    None
+                };
+                if grant.requires_approval && standing.is_none() {
                     let Some(spec) = oversight.as_ref() else {
                         // Unreachable through the parser, which refuses the
                         // pair. Stated rather than unwrapped: a panic here
@@ -2075,7 +2083,15 @@ async fn dispatch_granted(
 ) -> Result<Result<Tainted<Value>, String>, SkillError> {
     let reference = id.reference();
     let mut approved: Option<crate::core::Reach> = None;
-    if grant.requires_approval {
+    // A call somebody approved in advance opens no task. Not a consulted
+    // agent's: its approval pins the revision the reviewer was shown, and a
+    // rule issued beforehand showed nobody one.
+    let standing = if grant.requires_approval && id.server != crate::tools::AGENT_SERVER {
+        cx.standing_approval(&reference, assembled.peek()).await?
+    } else {
+        None
+    };
+    if grant.requires_approval && standing.is_none() {
         let Some(spec) = oversight else {
             return Err(SkillError::Other(
                 "a tool grant requires approval but the agent declares no oversight \

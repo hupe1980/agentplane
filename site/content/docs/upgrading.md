@@ -117,6 +117,15 @@ and 4 start the new build on an **empty** store rather than restoring:
 - Keep the old export and the old binary. They are the record of that history,
   and `agentplane verify` of that build checks the file offline.
 
+## When a coded skill changes {#skill-changes}
+
+A run resumed under a build whose skill asks for different effects quarantines
+at the first key that no longer matches. Work that has to continue across such
+a change continues as a **new run on the same case**: finish or cancel the old
+run, start the new one bound to the case, and read what the old one left with
+`StepCtx::case_state`. That read is journaled, versioned for compare-and-swap,
+and untrusted whatever wrote it. Tasks and their decisions stay on the case.
+
 ## Readers before writers {#readers-first}
 
 Every reader — each store, `verify` and `restore` — reads a record through the

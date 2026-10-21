@@ -101,6 +101,9 @@ struct WireUsage {
     cache_creation_input_tokens: Option<u64>,
     #[serde(default)]
     cache_read_input_tokens: Option<u64>,
+    /// The writes split by cache tier. Absent on a response that wrote none.
+    #[serde(default)]
+    cache_creation: Option<super::anthropic::CacheCreation>,
 }
 
 impl Accumulator {
@@ -404,6 +407,9 @@ impl Accumulator {
         if let Some(v) = w.cache_read_input_tokens {
             self.usage.cache_read_tokens = v;
         }
+        if let Some(split) = w.cache_creation {
+            self.usage.cache_write_1h_tokens = split.ephemeral_1h_input_tokens;
+        }
         if let Some(v) = w.input_tokens {
             // Cached tokens are reported *beside* `input_tokens` here, not
             // inside it, so they are added back — `Usage::input_tokens` means
@@ -431,6 +437,7 @@ impl Accumulator {
             self.usage.cache_write_tokens,
             self.usage.cache_read_tokens,
         )
+        .with_cache_write_1h(self.usage.cache_write_1h_tokens)
     }
 }
 
@@ -611,6 +618,30 @@ mod tests {
             "message_start already said so"
         );
         assert_eq!(acc.billed().output_tokens, 9);
+    }
+
+    /// The streamed twin of the buffered split: the same response, the same bill.
+    #[test]
+    fn the_one_hour_share_of_a_streamed_call_is_read() {
+        let mut acc = Accumulator::new();
+        acc.event(
+            "message_start",
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,
+                "cache_creation_input_tokens":300,"cache_read_input_tokens":50,
+                "cache_creation":{"ephemeral_5m_input_tokens":100,"ephemeral_1h_input_tokens":200},
+                "output_tokens":1}}}"#,
+        );
+        acc.event(
+            "message_delta",
+            r#"{"type":"message_delta","usage":{"output_tokens":4}}"#,
+        );
+        let billed = acc.billed();
+        assert_eq!(billed.cache_write_tokens, 300);
+        assert_eq!(
+            billed.cache_write_1h_tokens, 200,
+            "a delta without the split erased what message_start reported"
+        );
+        assert_eq!(billed.input_tokens, 360);
     }
 
     /// Cached tokens sit *beside* `input_tokens` here, not inside it.

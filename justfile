@@ -172,6 +172,14 @@ test-mcp:
 test-http:
     cargo test --features http,redb --test wire api::
 
+# the library embedding, with default features off: the profile builds alone,
+# and a governed coded agent runs under it
+#
+# `fake-model` is added only to run the example offline; it has no dependencies.
+test-embed:
+    cargo check --no-default-features --features embed --lib
+    cargo run --quiet --no-default-features --features embed,fake-model --example local_coded_agent
+
 # signed journals, including a wholesale rewrite
 test-attestation:
     cargo test --features signing,redb --test trust attestation::
@@ -248,7 +256,7 @@ test-a2a-server:
 
 # The union of every example's `required-features`, so the crate is compiled
 # once instead of once per example.
-EXAMPLE_FEATURES := "redb,testkit,manifest,keyring,media,mcp,mcp-server,a2a,a2a-server"
+EXAMPLE_FEATURES := "redb,testkit,manifest,keyring,media,mcp,mcp-server,a2a,a2a-server,embed"
 
 # run every example end to end
 #
@@ -276,7 +284,7 @@ examples:
         model_run media_run memory_run batch_run budget_pause answered_doubt \
         operator_stop recovered_run manifest_run mcp_tools serve_mcp blog_room \
         a2a_peer peer_call standing_authority streaming_run observability \
-        retention_hold
+        retention_hold local_coded_agent
     do
         printf '\n\033[1m── %s ─────────────────────────────────\033[0m\n' "$ex"
         ./target/debug/examples/"$ex"
@@ -503,7 +511,7 @@ audit:
 # warm.
 #
 # each feature seam compiled and linted with its own tests on
-seams: test-mcp test-http test-attestation test-drivers
+seams: test-mcp test-http test-attestation test-drivers test-embed
 
 # everything CI runs, minus the two slow layers
 ci: lint features anchors verify-golden audit test test-default test-minimal seams examples cli-smoke client-check client-smoke doc-examples docs site-check package

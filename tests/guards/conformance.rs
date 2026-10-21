@@ -187,6 +187,12 @@ struct NoExactlyOnce {
 
 #[async_trait::async_trait]
 impl JournalStore for NoExactlyOnce {
+    async fn watch(
+        &self,
+        run: agentplane::core::RunId,
+    ) -> Option<agentplane::journal::AppendWatch> {
+        self.inner.watch(run).await
+    }
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
@@ -505,6 +511,35 @@ async fn the_sealed_journal_satisfies_the_journal_store_contract() {
     })
     .await;
     report.assert_conforms("SealedJournal over RedbStore");
+}
+
+/// The sealing decorator forwards the append hint.
+///
+/// `None` is an honest answer from a store that cannot raise one, so the
+/// battery accepts it — which is exactly how a decorator that forgot to forward
+/// would pass it, leaving every follower behind it polling without a word.
+#[cfg(feature = "keyring")]
+#[tokio::test]
+async fn the_sealed_journal_forwards_the_append_hint() {
+    use agentplane::core::{RunId, TenantId};
+    use agentplane::keyring::{KeyRing, SealedJournal};
+    use agentplane::testkit::MemoryKeyRing;
+
+    let tenant = TenantId::new("sealed-journal").expect("tenant");
+    let inner = Arc::new(
+        RedbStore::open_in_memory()
+            .expect("store")
+            .for_tenant(tenant.clone()),
+    ) as Arc<dyn JournalStore>;
+    let sealed = SealedJournal::wrap(
+        inner,
+        Arc::new(MemoryKeyRing::new()) as Arc<dyn KeyRing>,
+        tenant,
+    );
+    assert!(
+        sealed.watch(RunId::generate()).await.is_some(),
+        "the store it wraps follows runs, so it must too"
+    );
 }
 
 /// **Every policy engine, against the contract the trait states in prose.**

@@ -18,9 +18,10 @@
 //! current state and continues, any instance can serve it, and the events cannot
 //! disagree with history because they *are* history.
 //!
-//! The cost is polling the journal for each open subscriber. It is a real cost
-//! and is stated rather than hidden: one indexed read per subscriber per
-//! interval, against a store that is already answering worse queries. What it
+//! A subscriber wakes on the store's append hint
+//! ([`JournalStore::watch`](crate::journal::JournalStore::watch)) and reads the
+//! journal; the hint carries no record, so it is not a second history. The poll
+//! stays as the fallback, one indexed read per subscriber per interval. What it
 //! buys is a stream that survives the things streams are asked to survive.
 //!
 //! # When the stream ends
@@ -54,9 +55,9 @@ use super::a2a::{
     task_artifacts,
 };
 
-/// How often a subscriber re-reads the journal.
+/// How often a subscriber re-reads the journal when no append wakes it first.
 ///
-/// Short enough that progress feels live, long enough that a hundred
+/// Short enough that a missed wake-up feels live, long enough that a hundred
 /// subscribers are not a hundred reads per millisecond.
 const POLL: Duration = Duration::from_millis(200);
 
@@ -221,6 +222,9 @@ fn frames(
             return;
         }
 
+        // Subscribed before the first read, so an append between the two still
+        // wakes the loop.
+        let mut follower = runtime.journal().watch(run).await;
         let mut next = from;
         loop {
             // A read that fails is not a run that failed. The stream ends rather
@@ -278,7 +282,16 @@ fn frames(
             if runtime.is_draining() {
                 return;
             }
-            tokio::time::sleep(POLL).await;
+            // Woken by the next append, or by the poll if the hint never comes:
+            // the poll is what keeps a missed wake-up a delay and not a stall.
+            match follower.as_mut() {
+                Some(watch) => {
+                    if let Ok(None) = tokio::time::timeout(POLL, watch.changed()).await {
+                        follower = None;
+                    }
+                }
+                None => tokio::time::sleep(POLL).await,
+            }
         }
     };
 

@@ -458,7 +458,8 @@ it goes behind the effect boundary as a tool instead.
 
 An embedded [redb](https://github.com/cberner/redb) store is the default backend
 — pure Rust, two crates deep, with a stable on-disk format and no C toolchain in
-your build. Everything else is opt-in:
+your build. Anything that speaks HTTPS (`providers`, and so `embed`) needs a C
+compiler for its TLS stack. Everything else is opt-in:
 
 ```sh
 cargo add agentplane
@@ -478,6 +479,7 @@ cargo add agentplane --features postgres,http,mcp,providers,bedrock,media,cedar,
 | feature | gives you |
 |---|---|
 | `redb` *(default)* | journal + case store, single node, embedded |
+| `embed` | the library embedding in one name: `redb`, `providers`, `mcp-stdio` and `manifest`, for coded agents that call models and tools in your own process. CI builds it with default features off |
 | `postgres` | the same contract, for several plane instances sharing a store |
 | `http` | the operator surface: worklist, decisions, run status |
 | `mcp` | MCP host: governed prompts, resources, tools, and asynchronous Tasks |

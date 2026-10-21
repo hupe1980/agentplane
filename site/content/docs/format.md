@@ -979,6 +979,11 @@ judged by, matched or not. A refusal at a sink is a `PolicyDenied` whose
 `action` is `effect:content`, which no policy engine is ever asked. All three
 are clear: they are the deployment's declaration, not the caller's data.
 
+**A pinned read that moved is on its failure.** `EffectFailed.unreproducible`,
+present only when an attempt failed because a blob answered with bytes other
+than its address names, holds what moved (`blob <digest>`). Clear: a digest,
+and strict replay quarantines the run from it without reading the store.
+
 **How long a call took is on its outcome.** `EffectDone.elapsed_ms` and
 `EffectFailed.elapsed_ms` are the wall time this process measured around the
 call — clear, absent where nothing was performed live, and read by nothing a

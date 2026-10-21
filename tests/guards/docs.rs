@@ -1608,7 +1608,7 @@ fn the_absorbed_summary_detector_recognises_what_it_is_for() {
 /// page shows is syntactically real, not whether an excerpt is a complete
 /// agent.
 #[test]
-// `serde_yaml_ng` is the `manifest` feature's parser, and gating on the
+// `serde_saphyr` is the `manifest` feature's parser, and gating on the
 // feature rather than vendoring a second YAML crate keeps the guard reading
 // these blocks with the same parser that will read them for real.
 #[cfg(feature = "manifest")]
@@ -1663,7 +1663,7 @@ fn every_published_yaml_fragment_is_well_formed() {
                 .map(|l| if l.len() >= indent { &l[indent..] } else { l })
                 .collect::<Vec<_>>()
                 .join("\n");
-            if let Err(error) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&dedented) {
+            if let Err(error) = serde_saphyr::from_str::<serde_json::Value>(&dedented) {
                 broken.push(format!("{rel}: {error}\n---\n{dedented}"));
             }
         }

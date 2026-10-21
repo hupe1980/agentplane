@@ -2262,3 +2262,105 @@ async fn erase_run_refuses_a_case_bound_run() {
     );
     assert!(alive(live).await, "the refused erasure destroyed a key");
 }
+
+/// Reads one blob through `cx.blobs()`, and either propagates a failure or
+/// swallows it and succeeds.
+#[derive(Debug)]
+struct ReadsBlob {
+    digest: Digest,
+    swallow: bool,
+}
+
+#[async_trait::async_trait]
+impl agentplane::core::Skill for ReadsBlob {
+    fn descriptor(&self) -> agentplane::core::SkillDescriptor {
+        agentplane::core::SkillDescriptor::new("reads-blob").provides("blob.read")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut agentplane::runtime::StepCtx<'_>,
+        _input: agentplane::core::Tainted<serde_json::Value>,
+    ) -> Result<agentplane::core::Outcome, agentplane::core::SkillError> {
+        let read = cx.blobs()?.get(self.digest).await;
+        if let Err(e) = read
+            && !self.swallow
+        {
+            return Err(agentplane::core::SkillError::Other(e.to_string()));
+        }
+        Ok(agentplane::core::Outcome::done(
+            agentplane::core::Tainted::trusted(serde_json::json!("read")),
+        ))
+    }
+}
+
+async fn read_blob(
+    blobs: &Arc<MemoryBlobs>,
+    digest: Digest,
+    swallow: bool,
+) -> (
+    Arc<agentplane::runtime::Runtime>,
+    agentplane::runtime::RunOutcome,
+) {
+    let store = Arc::new(agentplane::store::RedbStore::open_in_memory().expect("store"));
+    let rt = agentplane::runtime::Runtime::builder(store)
+        .blobs(Arc::clone(blobs) as Arc<dyn BlobStore>)
+        .skill(ReadsBlob { digest, swallow })
+        .build();
+    let out = rt
+        .run(
+            "blob.read",
+            agentplane::core::Tainted::trusted(serde_json::Value::Null),
+        )
+        .await
+        .expect("admitted");
+    (rt, out)
+}
+
+/// **I1: a blob rewritten under its address quarantines the run that reads
+/// it**, whatever the skill does with the error, and a strict replay reaches
+/// the same quarantine because it repeats the read.
+#[tokio::test]
+async fn a_blob_rewritten_under_a_run_quarantines_it() {
+    use agentplane::runtime::{Mode, RunStatus};
+    for swallow in [false, true] {
+        let blobs = Arc::new(MemoryBlobs::new());
+        let digest = blobs.put(b"the contract as signed").await.expect("put");
+        blobs.tamper_for_test(digest, b"the contract as altered".to_vec());
+
+        let (rt, out) = read_blob(&blobs, digest, swallow).await;
+        let RunStatus::Quarantined(reason) = &out.status else {
+            panic!("swallow={swallow}: a rewritten blob was {:?}", out.status);
+        };
+        assert!(reason.contains(&digest.to_string()), "{reason}");
+
+        let replayed = rt.replay(out.run_id, Mode::Strict).await.expect("replay");
+        assert!(
+            matches!(replayed.status, RunStatus::Quarantined(_)),
+            "swallow={swallow}: strict replay did not reach the quarantine: {:?}",
+            replayed.status
+        );
+    }
+}
+
+/// **An absent blob fails the run and never quarantines it.** Erasure is the
+/// lawful case of absence; a quarantine backlog full of erased evidence would
+/// hide the runs whose history actually moved.
+#[tokio::test]
+async fn an_erased_blob_fails_rather_than_quarantining() {
+    use agentplane::runtime::RunStatus;
+    let blobs = Arc::new(MemoryBlobs::new());
+    let erased = blobs.put(b"personal data").await.expect("put");
+    blobs
+        .expire(erased, ts(1), "erasure request")
+        .await
+        .expect("expire");
+    let never = Digest::of(b"never stored");
+    for digest in [erased, never] {
+        let (_, out) = read_blob(&blobs, digest, false).await;
+        assert!(
+            matches!(out.status, RunStatus::Failed(_)),
+            "an absent blob was {:?}",
+            out.status
+        );
+    }
+}

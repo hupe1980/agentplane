@@ -166,11 +166,11 @@ So `tla/verify.sh` runs two passes. The first checks the specs. The second
 checks the check: each spec is re-run against deliberately broken copies of
 itself, and each mutant must be caught by the specific invariant written for it
 — or, for a liveness claim, must make TLC report that property violated: a
-claim that still holds once the fairness it rests on is dropped holds for some
-other reason than the one stated. Every `.tla` is checked; there is no list to
-add a new one to.
-A selection — the full table, one entry per mutant, is `tla/mutations.py`
-(`python3 tla/mutations.py --list`):
+claim that still holds once the fairness it rests on is dropped or bent holds
+for some other reason than the one stated. A guard fails the build for a
+liveness property with no such mutant. Every `.tla` is checked; there is no list
+to add a new one to. A selection — the full table, one entry per mutant, is
+`tla/mutations.py` (`python3 tla/mutations.py --list`):
 
 | Mutation | Spec | Must be caught by |
 |---|---|---|

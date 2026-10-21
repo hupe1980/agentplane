@@ -685,6 +685,14 @@ pub enum EffectError {
         disposition: Disposition,
     },
 
+    /// A pinned read answered with other content than was written under its
+    /// address: a blob whose bytes no longer match their digest.
+    ///
+    /// Not a rejection to retry. I1 quarantines the run: its history cannot be
+    /// reproduced, which no second attempt changes.
+    #[error("{what} cannot be reproduced: {detail}")]
+    Unreproducible { what: String, detail: String },
+
     #[error("{0}")]
     Other(String),
 }
@@ -720,6 +728,7 @@ impl EffectError {
             | Self::Performed(_)
             | Self::OutputShape(_)
             | Self::Final { .. }
+            | Self::Unreproducible { .. }
             | Self::Other(_) => Spend::default(),
         }
     }
@@ -763,6 +772,7 @@ impl EffectError {
             Self::Performed(_) => "performed",
             Self::OutputShape(_) => "output_shape",
             Self::Final { .. } => "final",
+            Self::Unreproducible { .. } => "unreproducible",
             Self::Other(_) => "other",
         }
     }
@@ -775,7 +785,8 @@ impl EffectError {
             Self::Unavailable { .. }
             | Self::Rejected(_)
             | Self::RateLimited { .. }
-            | Self::Refused(_) => Disposition::DidNotHappen,
+            | Self::Refused(_)
+            | Self::Unreproducible { .. } => Disposition::DidNotHappen,
             Self::OutputShape(_) | Self::Performed(_) => Disposition::Landed,
             // `Other` shares the in-doubt arm deliberately: an error that does
             // not say what it did is treated as dangerous. A driver that wants

@@ -45,11 +45,11 @@ spec:
     privileged:
       provider: anthropic
       model: claude-sonnet-5
-      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375, cache_write_1h: 600 }
     quarantined:
       provider: anthropic
       model: claude-haiku-4-5
-      pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125 }
+      pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125, cache_write_1h: 200 }
   output:
     schema:
       type: object

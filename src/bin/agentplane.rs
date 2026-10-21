@@ -7939,8 +7939,7 @@ spec:
         .expect("the fixture parses")
     }
 
-    const PRICE: &str =
-        "pricing: { input: 1000000, output: 2000000, cache_read: 100000, cache_write: 1250000 }";
+    const PRICE: &str = "pricing: { input: 1000000, output: 2000000, cache_read: 100000, cache_write: 1250000, cache_write_1h: 2000000 }";
 
     /// Every term bounded: the figure is the formula, from the declaration.
     #[test]
@@ -7956,10 +7955,11 @@ spec:
         // 1000 per call; 10000 + 2 × 1000.
         assert_eq!(tokens["per_call"], 1000);
         assert_eq!(tokens["total"], 12_000);
-        // 900 input at the dearest input rate (1.25/token) + 100 output at 2.
+        // 900 input at the dearest input rate (the one-hour cache write, 2/token)
+        // + 100 output at 2.
         let money = &bound.json["units"]["minor_units"];
-        assert_eq!(money["per_call"], 1325);
-        assert_eq!(money["total"], 50_000 + 2 * 1325);
+        assert_eq!(money["per_call"], 2000);
+        assert_eq!(money["total"], 50_000 + 2 * 2000);
         assert_eq!(bound.json["turns"], 4);
         assert!(
             bound
@@ -9102,7 +9102,7 @@ spec:
     /// The tokens a token file holds, in file order.
     #[cfg(all(feature = "a2a-server", feature = "cedar", feature = "mcp-server-http"))]
     fn tokens_in(file: &str) -> Vec<(String, String)> {
-        let entries: Vec<serde_json::Value> = serde_yaml_ng::from_str(file).expect("yaml");
+        let entries: Vec<serde_json::Value> = serde_saphyr::from_str(file).expect("yaml");
         entries
             .iter()
             .map(|e| {
@@ -9250,7 +9250,7 @@ spec:
             "store.env does not connect with the generated password: {store}"
         );
         let compose = std::fs::read_to_string(dir.join("compose.yaml")).unwrap();
-        let yaml: serde_json::Value = serde_yaml_ng::from_str(&compose).expect("yaml");
+        let yaml: serde_json::Value = serde_saphyr::from_str(&compose).expect("yaml");
         let postgres = &yaml["services"]["postgres"];
         assert_eq!(
             postgres["environment"]["POSTGRES_PASSWORD_FILE"], "/run/secrets/postgres_password",

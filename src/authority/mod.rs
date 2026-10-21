@@ -76,6 +76,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::{EffectKey, Spend, StoreError, Timestamp};
 
+mod approval;
+pub use approval::{ApprovalRule, FieldMatch, Matcher, StandingApproval};
+
 /// Identifies one standing authority.
 ///
 /// Opaque to this crate: a mandate id, an approval reference, a purchase-order
@@ -177,6 +180,17 @@ pub struct StandingAuthority {
         with = "time::serde::rfc3339::option"
     )]
     pub expires_at: Option<Timestamp>,
+    /// Calls its holder's runs may make without an approval task.
+    ///
+    /// The person who issued it answered those tasks in advance. Each use is
+    /// a draw of nothing, so it is journaled, counted against `max_draws`, and
+    /// refused once revoked or expired, exactly as a spending draw is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approves: Vec<ApprovalRule>,
+    /// Who issued it. Required beside `approves`: a call nobody was asked
+    /// about is approved by whoever this names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_by: Option<crate::core::Operator>,
 }
 
 impl StandingAuthority {
@@ -195,7 +209,36 @@ impl StandingAuthority {
             ceiling,
             max_draws: None,
             expires_at: None,
+            approves: Vec::new(),
+            issued_by: None,
         }
+    }
+
+    /// A standing approval: `issuer` pre-answers the approval task for calls
+    /// matching `rule`, for runs acting for `holder`, until `expires_at`.
+    ///
+    /// It permits no spend. Add rules with [`approves`](Self::approves).
+    #[must_use]
+    pub fn approval(
+        id: impl Into<String>,
+        holder: Holder,
+        issuer: crate::core::Operator,
+        basis: impl Into<String>,
+        rule: ApprovalRule,
+        expires_at: Timestamp,
+    ) -> Self {
+        let mut authority = Self::new(id, holder, basis, Spend::default());
+        authority.approves.push(rule);
+        authority.issued_by = Some(issuer);
+        authority.expires_at = Some(expires_at);
+        authority
+    }
+
+    /// Approve another call shape.
+    #[must_use]
+    pub fn approves(mut self, rule: ApprovalRule) -> Self {
+        self.approves.push(rule);
+        self
     }
 
     /// Bound how many times it may be drawn on.
@@ -236,11 +279,28 @@ impl StandingAuthority {
                  is the thing an audit asks for first",
             ));
         }
-        if self.ceiling.is_free() {
+        if self.ceiling.is_free() && self.approves.is_empty() {
             return Err(AuthorityError::Malformed(
                 "the authority permits nothing — issue a ceiling, or do not issue it. \
                  Zero and unlimited are opposite readings of the same silence",
             ));
+        }
+        if !self.approves.is_empty() {
+            if self.issued_by.is_none() {
+                return Err(AuthorityError::Malformed(
+                    "a standing approval names nobody who issued it — the calls it lets \
+                     through would be approved by no one",
+                ));
+            }
+            if self.expires_at.is_none() {
+                return Err(AuthorityError::Malformed(
+                    "a standing approval has no expiry — an approval given once for good \
+                     is a grant, which the reviewed declaration makes",
+                ));
+            }
+            if let Some(problem) = self.approves.iter().find_map(ApprovalRule::problem) {
+                return Err(AuthorityError::Malformed(problem));
+            }
         }
         Ok(())
     }
@@ -494,6 +554,17 @@ pub trait AuthorityStore: Send + Sync + Debug {
     ///
     /// If the store cannot be reached.
     async fn state(&self, id: &AuthorityId) -> Result<Option<AuthorityState>, StoreError>;
+
+    /// Every authority `holder` holds in this tenant, ordered by id.
+    ///
+    /// Ordered so that a gate choosing among several reaches the same choice
+    /// on every instance. Revoked ones are included, with their revocation:
+    /// whether one still stands is the caller's to read, at its own instant.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be reached.
+    async fn held_by(&self, holder: &Holder) -> Result<Vec<AuthorityState>, StoreError>;
 }
 
 /// The five refusals, in the order they must be asked.

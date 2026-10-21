@@ -216,7 +216,7 @@ impl TokenAuthenticator {
     #[cfg(feature = "manifest")]
     pub fn from_yaml(source: &str) -> Result<Self, TokenFileError> {
         let entries: Vec<TokenEntry> =
-            serde_yaml_ng::from_str(source).map_err(|e| TokenFileError::Syntax(e.to_string()))?;
+            crate::yaml::from_str(source).map_err(TokenFileError::Syntax)?;
         Self::new(entries)
     }
 }

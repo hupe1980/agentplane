@@ -474,7 +474,7 @@ pub fn prepare_publish(manifest: &Manifest) -> Result<(Digest, String), Registry
 ///
 /// If the manifest cannot be serialized.
 pub fn to_yaml(manifest: &Manifest) -> Result<String, RegistryError> {
-    serde_yaml_ng::to_string(manifest).map_err(|e| RegistryError::Backend(e.to_string()))
+    crate::yaml::to_string(manifest).map_err(RegistryError::Backend)
 }
 
 /// A registry that lives in this process.

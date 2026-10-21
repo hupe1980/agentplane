@@ -632,6 +632,10 @@ pub struct Usage {
     /// as wrong.
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// Of `cache_write_tokens`, how many went to the one-hour tier, which is
+    /// priced apart — see [`CacheTtl`].
+    #[serde(default)]
+    pub cache_write_1h_tokens: u64,
     /// Money in minor units.
     ///
     /// Filled from the [`Pricing`] the call was configured with, at the effect
@@ -676,9 +680,25 @@ impl Usage {
             output_tokens,
             cache_write_tokens,
             cache_read_tokens,
+            cache_write_1h_tokens: 0,
             // Priced by the deployment, not guessed here.
             minor_units: 0,
         }
+    }
+
+    /// Say how many of the cache writes went to the one-hour tier.
+    ///
+    /// Clamped to the writes there were: the split is a subset, and a provider
+    /// reporting more long-tier writes than writes would otherwise bill tokens
+    /// nobody sent.
+    #[must_use]
+    pub const fn with_cache_write_1h(mut self, tokens: u64) -> Self {
+        self.cache_write_1h_tokens = if tokens < self.cache_write_tokens {
+            tokens
+        } else {
+            self.cache_write_tokens
+        };
+        self
     }
 
     /// What this counts against a run's ceilings.
@@ -721,10 +741,11 @@ impl Usage {
 /// guessed would be a ceiling that binds at the wrong place without saying so,
 /// so a deployment that declares a money ceiling states what its models cost.
 ///
-/// All four rates are required. Cache writes are billed at a premium and cache
+/// All five rates are required. Cache writes are billed at a premium and cache
 /// reads at a fraction of the input rate, and defaulting either to the input
 /// rate would be a guess in one direction or the other; a provider with no
-/// cache-write charge states `0`.
+/// cache-write charge states `0`. The one-hour cache tier is billed above the
+/// default one, and a provider with no such tier states `0` for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Pricing {
@@ -734,8 +755,10 @@ pub struct Pricing {
     pub output: u64,
     /// Input tokens served from a cache.
     pub cache_read: u64,
-    /// Input tokens written into a cache.
+    /// Input tokens written into the default cache tier.
     pub cache_write: u64,
+    /// Input tokens written into the one-hour cache tier.
+    pub cache_write_1h: u64,
 }
 
 impl Pricing {
@@ -751,7 +774,13 @@ impl Pricing {
             (usage.uncached_input_tokens(), self.input),
             (usage.output_tokens, self.output),
             (usage.cache_read_tokens, self.cache_read),
-            (usage.cache_write_tokens, self.cache_write),
+            (
+                usage
+                    .cache_write_tokens
+                    .saturating_sub(usage.cache_write_1h_tokens),
+                self.cache_write,
+            ),
+            (usage.cache_write_1h_tokens, self.cache_write_1h),
         ];
         let micro = parts.iter().fold(0u128, |sum, (tokens, rate)| {
             sum.saturating_add(u128::from(*tokens).saturating_mul(u128::from(*rate)))
@@ -1063,6 +1092,7 @@ impl ModelError {
                 input_tokens: 0,
                 output_tokens: 0,
                 cache_write_tokens: 0,
+                cache_write_1h_tokens: 0,
                 cache_read_tokens: 0,
                 minor_units: 0,
             },
@@ -1322,6 +1352,13 @@ pub struct ToolDeclaration {
     /// way this is not a security control: a well-formed argument is still an
     /// untrusted one, and the field-provenance check is what authorizes it.
     pub parameters: Value,
+    /// Cache everything up to and including this declaration, for this long.
+    ///
+    /// Tools render first in Anthropic's cache order (tools, system, messages),
+    /// so a breakpoint on the last declaration caches the whole tool prefix.
+    /// Drivers whose provider caches without being asked ignore it, which is
+    /// what lets one declaration serve every provider.
+    pub cache: Option<CacheTtl>,
 }
 
 impl ToolDeclaration {
@@ -1332,6 +1369,39 @@ impl ToolDeclaration {
             name: name.into(),
             description: description.into(),
             parameters,
+            cache: None,
+        }
+    }
+
+    /// Mark the end of a cached prefix here. See [`cache`](Self::cache).
+    #[must_use]
+    pub const fn cache_breakpoint(mut self, ttl: CacheTtl) -> Self {
+        self.cache = Some(ttl);
+        self
+    }
+}
+
+/// How long a provider keeps a cached prompt prefix.
+///
+/// Two tiers, because they are billed differently: Anthropic charges 1.25× the
+/// input rate to write the five-minute tier and 2× to write the one-hour tier,
+/// so which one a write went to is a fact about cost, and [`Pricing`] prices
+/// them separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CacheTtl {
+    /// The provider's default lifetime.
+    FiveMinutes,
+    /// Kept across longer gaps, at a higher write price.
+    OneHour,
+}
+
+impl CacheTtl {
+    /// The spelling the effect key records.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FiveMinutes => "5m",
+            Self::OneHour => "1h",
         }
     }
 }
@@ -1732,11 +1802,19 @@ impl Effect for ModelCall {
                 // prompt does. Omitting them would let strict replay consume a
                 // completion produced while a different capability surface was
                 // offered.
-                "tools": self.tools.iter().map(|tool| serde_json::json!({
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                })).collect::<Vec<_>>(),
+                "tools": self.tools.iter().map(|tool| {
+                    let mut declared = serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    });
+                    // A breakpoint is provider-visible, so it is in the key —
+                    // but only when set, so an unmarked tool keys as before.
+                    if let Some(ttl) = tool.cache {
+                        declared["cache"] = serde_json::json!(ttl.as_str());
+                    }
+                    declared
+                }).collect::<Vec<_>>(),
                 // A continuation is the original question plus the exact calls
                 // and results already observed. IDs, arguments, outputs and the
                 // failure bit all affect the next provider response.
@@ -2029,12 +2107,21 @@ async fn materialize_media(
                 reference.digest, reference.media_type
             )));
         }
-        let bytes = store.get(reference.digest).await.map_err(|error| {
-            EffectError::Rejected(format!(
-                "governed media {} could not be materialized: {error}",
-                reference.digest
-            ))
-        })?;
+        let bytes = store
+            .get(reference.digest)
+            .await
+            .map_err(|error| match error {
+                // Other bytes under the address: I1 quarantines, and no retry
+                // changes what the store holds.
+                crate::blob::BlobError::Corrupt { .. } => EffectError::Unreproducible {
+                    what: format!("blob {}", reference.digest),
+                    detail: error.to_string(),
+                },
+                error => EffectError::Rejected(format!(
+                    "governed media {} could not be materialized: {error}",
+                    reference.digest
+                )),
+            })?;
         crate::media::verify_materialized(&reference.media_type, &bytes)
             .map_err(EffectError::Rejected)?;
         let encoded = crate::core::b64::encode(bytes);
@@ -2278,6 +2365,57 @@ mod tests {
         );
     }
 
+    /// A breakpoint is in the effect key when set, and absent when not.
+    ///
+    /// Provider-visible, so a marked call is a different request. Absent when
+    /// unset, so every call recorded before the mark existed keys as it did.
+    #[test]
+    fn a_cache_breakpoint_is_in_the_key_only_when_set() {
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(RecordingProvider(Arc::new(AtomicUsize::new(0))));
+        let tool = ToolDeclaration::new("t", "a tool", json!({ "type": "object" }));
+        let key = |tool: ToolDeclaration| {
+            ModelCall::new(Arc::clone(&provider), ModelId::new("p", "m"), json!("hi"))
+                .with_tools([tool])
+                .descriptor()
+        };
+        let plain = key(tool.clone());
+        assert_eq!(
+            plain.args["tools"][0],
+            json!({ "name": "t", "description": "a tool", "parameters": { "type": "object" } }),
+            "an unmarked tool changed the key every recorded call was made under"
+        );
+        let marked = key(tool.cache_breakpoint(CacheTtl::OneHour));
+        assert_eq!(marked.args["tools"][0]["cache"], "1h");
+        assert_ne!(
+            plain, marked,
+            "a marked call read as the unmarked one on replay"
+        );
+    }
+
+    /// A one-hour cache write is billed at its own rate, and only once: one
+    /// rate for both tiers under-bills the long one, past a money ceiling.
+    #[test]
+    fn a_one_hour_cache_write_is_billed_at_its_own_rate() {
+        let pricing = Pricing {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 1_250_000,
+            cache_write_1h: 2_000_000,
+        };
+        let usage = Usage::with_cache_beside_input(0, 0, 300, 0).with_cache_write_1h(200);
+        // 100 default-tier writes at 1.25 and 200 one-hour writes at 2.
+        assert_eq!(pricing.price(&usage), 125 + 400);
+        assert_eq!(
+            Usage::with_cache_beside_input(0, 0, 300, 0)
+                .with_cache_write_1h(900)
+                .cache_write_1h_tokens,
+            300,
+            "a split larger than the writes billed tokens nobody sent"
+        );
+    }
+
     /// A price is per million tokens, split by rate, and rounded up.
     ///
     /// Up because it feeds a ceiling: a thousand sub-cent calls rounded down
@@ -2289,12 +2427,14 @@ mod tests {
             output: 1_500,
             cache_read: 30,
             cache_write: 375,
+            cache_write_1h: 600,
         };
         let usage = Usage {
             input_tokens: 1_000_000,
             output_tokens: 100_000,
             cache_write_tokens: 200_000,
             cache_read_tokens: 400_000,
+            cache_write_1h_tokens: 0,
             minor_units: 0,
         };
         // 400k uncached at 300, 100k out at 1500, 400k read at 30, 200k write at 375.

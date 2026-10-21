@@ -544,6 +544,34 @@ reading nothing.
 The drivers stream by default precisely so a severed call can report what it
 burned. You do not have to do anything to get that.
 
+## 💾 Cache a stable prefix {#cache-a-stable-prefix}
+
+An agent that resends the same tools and instructions every turn pays for them
+every turn unless the request marks them. Anthropic caches what comes before a
+breakpoint, in the order tools, system, messages:
+
+```rust
+use agentplane::model::{CacheTtl, ToolDeclaration};
+
+// The last declaration closes the tool prefix.
+let tools = [read_decl, write_decl.cache_breakpoint(CacheTtl::OneHour)];
+let prompt = json!({
+    // System and message blocks pass through verbatim, marks included.
+    "system": [{ "type": "text", "text": instructions, "cache_control": { "type": "ephemeral" } }],
+    "messages": history,
+});
+```
+
+The other drivers ignore the mark, so one declaration still serves every
+provider. A marked declaration is a different request, so it is a different
+effect key; an unmarked one does not change the key. The one-hour TTL needs no
+beta header.
+
+**The trap:** pricing every write at one rate. The provider bills a one-hour
+write at 2× the input rate and a five-minute one at 1.25×. The driver reads which
+tier each write went to, and `pricing` states both rates
+([what a model costs](@/docs/manifest.md#money)).
+
 ## 📐 Ask for structured output {#ask-for-structured-output}
 
 ```rust
@@ -689,11 +717,11 @@ spec:
     privileged:
       provider: anthropic
       model: claude-sonnet-5
-      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375, cache_write_1h: 600 }
     quarantined:
       provider: anthropic
       model: claude-haiku-4-5
-      pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125 }
+      pricing: { input: 100, output: 500, cache_read: 10, cache_write: 125, cache_write_1h: 200 }
   tools:
     - ref: "tool://validator/apply_correction"
       mutates: true
@@ -731,6 +759,35 @@ let runtime = Runtime::builder(store)
 // moved on — including the prompt, because `spec.identity` is inside the digest.
 let governed_by = m.digest()?;
 ```
+
+**The same declaration in Rust.** When the program that runs the agent is the
+only thing that declares it, `Manifest::builder` builds the declaration and
+`build()` validates it exactly as `parse` does. Each leaf constructor takes only
+what has no default, and `ToolGrant::new` mutates unless told otherwise, as the
+YAML does:
+
+```rust
+use agentplane::manifest::{Budgets, Manifest, ModelRef, Models, ToolGrant};
+
+let model = SourceId::new("model:anthropic/claude-sonnet-5");
+let m = Manifest::builder("auditor", "1.0.0")
+    .configure(|spec| {
+        spec.capabilities.provides.push("audit.correct".to_owned());
+        spec.models = Some(Models {
+            privileged: Some(ModelRef::new("anthropic", "claude-sonnet-5")),
+            ..Models::default()
+        });
+        spec.tools.push(ToolGrant {
+            protected_fields: vec![ProtectedField::from_sources("/correction", [model])],
+            ..ToolGrant::new("tool://validator/apply_correction")
+        });
+        spec.budgets = Some(Budgets { max_tokens: Some(120_000), ..Budgets::default() });
+    })
+    .build()?;
+```
+
+`examples/local_coded_agent.rs` runs a coded agent declared this way on a redb
+file, through a person's approval, under the `embed` features alone.
 
 Your skill reads the declaration from its context rather than holding a copy —
 **an agent has skills**, not the other way round:
@@ -2237,6 +2294,37 @@ subscriptions. A stream is a long poll over the journal, so one watching a run
 that has not concluded would keep its connection — and your graceful shutdown —
 open for as long as that run lasts.
 
+## 👀 Follow a run as it happens {#follow-a-run-as-it-happens}
+
+A view that shows a run's progress reads the journal; the store says when to
+look again:
+
+```rust
+// Subscribe first, then read: an append between the two still wakes you.
+let mut follower = store.watch(run).await;
+let mut next = 1;
+loop {
+    for record in store.read_page(run, next, 100).await? {
+        next = record.seq() + 1;
+        show(&record);
+    }
+    match follower.as_mut() {
+        Some(f) => { let _ = tokio::time::timeout(Duration::from_secs(1), f.changed()).await; }
+        None => tokio::time::sleep(Duration::from_secs(1)).await,
+    }
+}
+```
+
+The wake-up carries no record and is raised only after the append is durable,
+so what you read is what woke you. On redb it covers every append, because the
+file has one writing process. On `PostgreSQL` it crosses instances: the append's
+own transaction sends a notification, which the database delivers when it
+commits, and the first follower in a process opens one listening connection.
+
+**The trap:** dropping the poll. A listener that is reconnecting misses what was
+sent meanwhile, and a store that cannot raise a hint answers `None`. The poll is
+what turns either into a delay instead of a stall.
+
 ## 📤 Emit an event per run, without an outbox table {#emit-an-event-per-run-without-an-outbox-table}
 
 A2A push is **caller-shaped**: the URL comes from whoever created the task, which
@@ -2671,6 +2759,51 @@ retry draw again, which is the double-spend the receipt table exists to make
 impossible.
 
 ---
+
+## ✅ Approve a kind of call in advance {#approve-a-kind-of-call-in-advance}
+
+A grant with `requires_approval` asks a person before every call. When the
+hundredth call has the same shape as the first, a reviewer approving it by
+reflex is no longer reviewing. A standing approval answers those tasks in
+advance, in a named person's name, until it expires:
+
+```rust
+use agentplane::authority::{ApprovalRule, AuthorityStore, Holder, Matcher, StandingAuthority};
+
+let writes_under_src = ApprovalRule::new(
+    "tool://fs/write",
+    "/path",
+    Matcher::PathPrefix("src".into()),
+);
+authorities
+    .issue(
+        &StandingAuthority::approval(
+            "sam-src-writes",
+            Holder::subject("sam"),       // runs acting for sam may rely on it
+            Operator::asserted("sam")?,   // and sam is who approved them
+            "feature F-12, reviewed scope",
+            writes_under_src,
+            expires_at,
+        )
+        .max_draws(200),
+    )
+    .await?;
+```
+
+A matching call opens no task. The journal records the approvals the run saw
+and a draw on the one it used, so a replay reads that decision back instead of
+asking today's rules, and revoking the approval stops the next call, not the
+history. A call that matches nothing, or arrives after expiry, revocation or the
+last draw, goes to a person.
+
+`path_prefix` compares normalised segments, so `src/../etc/passwd` is not under
+`src`, and it does not resolve symlinks: resolving them is the tool's.
+`argv_prefix` compares whole elements, so `["cargo", "test"]` does not approve
+`cargo testify`. A rule must constrain at least one argument, and must expire.
+
+**The trap:** expecting a rule to widen the grant. It answers the approval and
+nothing else. The grant's field rules, policy and egress still judge the call at
+dispatch, so a rule cannot release an argument the grant refuses.
 
 ## 🧠 Give an agent a memory {#give-an-agent-a-memory}
 

@@ -439,7 +439,7 @@ mod tests {
     /// The YAML a manifest author actually writes, parsed.
     #[test]
     fn the_manifest_spelling_of_a_rule_parses() {
-        let rule: TriageRule = serde_yaml_ng::from_str(
+        let rule: TriageRule = crate::yaml::from_str(
             r#"
             name: breach
             summary: "a regulatory deadline was missed"

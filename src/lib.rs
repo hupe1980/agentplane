@@ -129,6 +129,8 @@ pub mod retention;
 pub mod runtime;
 pub mod subject;
 pub mod tools;
+#[cfg(feature = "manifest")]
+mod yaml;
 
 /// The random-number traits [`StepCtx::rng`] hands back.
 ///

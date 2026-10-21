@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::authority::{
-    AuthorityError, AuthorityId, AuthorityState, AuthorityStore, Drawn, Revocation,
+    AuthorityError, AuthorityId, AuthorityState, AuthorityStore, Drawn, Holder, Revocation,
     StandingAuthority,
 };
 use crate::core::{EffectKey, Spend, StoreError, Timestamp};
@@ -210,30 +210,67 @@ impl AuthorityStore for RedbStore {
             else {
                 return Ok(None);
             };
-            let authority: StandingAuthority = serde_json::from_str(raw.value())
-                .map_err(|e| StoreError::Backend(format!("stored authority is unreadable: {e}")))?;
-            let (tokens, minor, draws, revoked, revoked_at, reason) = balance
-                .get((tenant.as_str(), name.as_str()))
-                .map_err(|e| be(&e))?
-                .map_or((0, 0, 0, false, 0, String::new()), |v| {
-                    let (t, m, d, rv, at, why) = v.value();
-                    (t, m, d, rv, at, why.to_owned())
-                });
-            Ok(Some(AuthorityState {
-                authority,
-                drawn: Spend {
-                    tokens,
-                    minor_units: minor,
-                },
-                draws,
-                revoked: revoked.then(|| Revocation {
-                    at: Timestamp::from_unix_timestamp(revoked_at).unwrap_or(Timestamp::UNIX_EPOCH),
-                    reason,
-                }),
-            }))
+            state_of(&balance, &tenant, &name, raw.value()).map(Some)
         })
         .await
     }
+
+    async fn held_by(&self, holder: &Holder) -> Result<Vec<AuthorityState>, StoreError> {
+        let tenant = self.tenant_name();
+        let holder = holder.clone();
+        self.with_db(move |db| {
+            let r = db.begin_read().map_err(|e| be(&e))?;
+            let (Ok(terms), Ok(balance)) = (r.open_table(TERMS), r.open_table(BALANCE)) else {
+                return Ok(Vec::new());
+            };
+            let mut held = Vec::new();
+            // Keys are `(tenant, id)`, so this tenant's authorities are one
+            // contiguous range, already in id order.
+            for row in terms.range((tenant.as_str(), "")..).map_err(|e| be(&e))? {
+                let (key, raw) = row.map_err(|e| be(&e))?;
+                let (owner, name) = key.value();
+                if owner != tenant {
+                    break;
+                }
+                let state = state_of(&balance, &tenant, name, raw.value())?;
+                if state.authority.holder == holder {
+                    held.push(state);
+                }
+            }
+            Ok(held)
+        })
+        .await
+    }
+}
+
+/// One authority's terms and balance, as the store holds them.
+fn state_of(
+    balance: &impl ReadableTable<(&'static str, &'static str), BalanceRow<'static>>,
+    tenant: &str,
+    name: &str,
+    terms: &str,
+) -> Result<AuthorityState, StoreError> {
+    let authority: StandingAuthority = serde_json::from_str(terms)
+        .map_err(|e| StoreError::Backend(format!("stored authority is unreadable: {e}")))?;
+    let (tokens, minor, draws, revoked, revoked_at, reason) = balance
+        .get((tenant, name))
+        .map_err(|e| be(&e))?
+        .map_or((0, 0, 0, false, 0, String::new()), |v| {
+            let (t, m, d, rv, at, why) = v.value();
+            (t, m, d, rv, at, why.to_owned())
+        });
+    Ok(AuthorityState {
+        authority,
+        drawn: Spend {
+            tokens,
+            minor_units: minor,
+        },
+        draws,
+        revoked: revoked.then(|| Revocation {
+            at: Timestamp::from_unix_timestamp(revoked_at).unwrap_or(Timestamp::UNIX_EPOCH),
+            reason,
+        }),
+    })
 }
 
 /// The decision, inside the caller's transaction.

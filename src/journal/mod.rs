@@ -14,6 +14,7 @@ pub mod payload;
 
 mod record;
 mod replay;
+mod signal;
 mod store;
 mod upcast;
 pub mod view;
@@ -29,6 +30,7 @@ pub use record::{
 pub use replay::{
     Divergence, EffectReplay, ReplayCursor, StepCursor, Unconsumed, undecided_effects,
 };
+pub use signal::{AppendSignals, AppendWatch};
 pub use store::{Cancellation, Checkpoint, Head, Inclusion, JournalStore, Lease, WaitingRun};
 pub use upcast::{Identity, Upcaster, current_upcaster};
 pub use witness::{

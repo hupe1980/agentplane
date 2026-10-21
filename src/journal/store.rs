@@ -299,6 +299,20 @@ pub trait JournalStore: Send + Sync + Debug {
     /// again. A decorator that does not seal delegates.
     fn seals(&self) -> bool;
 
+    /// Follow a run: a wake-up each time its journal grows, after the append
+    /// is durable. A hint, not a record — see [`AppendWatch`](crate::journal::AppendWatch).
+    ///
+    /// No default, for the reason [`Self::is_shared`] has none: a decorator
+    /// that forgot to forward would answer *no signal* by saying nothing, and
+    /// every follower behind it would fall back to polling without a word. A
+    /// decorator delegates; a store that cannot raise one answers `None`.
+    ///
+    /// Covers every append the durable state accepts, whichever handle or
+    /// process made it, where the backend can know: `redb` admits one writing
+    /// process, and `PostgreSQL` delivers a notification sent inside the
+    /// append's transaction only when that transaction commits.
+    async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch>;
+
     /// This store's own transaction, when a co-located resource can join it.
     ///
     /// `None` — the default — means the backend cannot offer it, which is the

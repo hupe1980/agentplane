@@ -53,6 +53,7 @@ fn model() -> ModelId {
 
 fn weather_tool() -> ToolDeclaration {
     ToolDeclaration {
+        cache: None,
         name: "current_temperature".to_owned(),
         description: "The current temperature in a named city, in Celsius.".to_owned(),
         parameters: json!({

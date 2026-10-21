@@ -4077,6 +4077,7 @@ async fn gemini_returns_the_models_turn_verbatim_including_its_thought_signature
     let model = ModelId::new("gemini", "gemini-3.5-flash");
     let prompt = json!("look it up");
     let tools = [ToolDeclaration {
+        cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
         parameters: json!({ "type": "object", "properties": {} }),
@@ -5432,6 +5433,7 @@ async fn a_priced_embedder_refuses_a_reply_without_usage() {
         output: 0,
         cache_read: 0,
         cache_write: 0,
+        cache_write_1h: 0,
     };
     let openai = json!({ "data": [{ "embedding": [1.0] }] });
     let gemini = json!({ "embedding": { "values": [1.0] } });
@@ -5516,6 +5518,7 @@ async fn an_input_type_reaches_the_wire_and_the_revision() {
 async fn a_schema_and_a_tool_calling_turn_coexist_on_every_driver() {
     let sch = schema();
     let tool = || ToolDeclaration {
+        cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
         parameters: json!({ "type": "object", "properties": {} }),
@@ -5579,6 +5582,7 @@ async fn a_schema_and_a_tool_calling_turn_coexist_on_every_driver() {
 async fn a_schema_and_a_tool_calling_turn_coexist_on_the_compatible_wires() {
     let sch = schema();
     let tool = || ToolDeclaration {
+        cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
         parameters: json!({ "type": "object", "properties": {} }),
@@ -5678,6 +5682,7 @@ async fn gemini_two_tool_turns_accumulate_the_transcript_exactly_once() {
     let model = ModelId::new("gemini", "gemini-3.5-flash");
     let prompt = json!("start");
     let tools = [ToolDeclaration {
+        cache: None,
         name: "lookup".to_owned(),
         description: "Look something up.".to_owned(),
         parameters: json!({ "type": "object", "properties": {} }),

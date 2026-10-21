@@ -417,6 +417,11 @@ pub struct StepCtx<'a> {
     /// run was cancelled while paused, so the pause that ends this pass
     /// aborts the group instead of leaving it open again.
     pub(crate) abandoning: bool,
+    /// The first blob this step read whose bytes no longer match their
+    /// address. Set by the store [`blobs_scoped`](Self::blobs_scoped) hands
+    /// out, and by a recorded media failure; the executor quarantines the run
+    /// when it is set, whatever the skill did with the error.
+    moved_blob: Arc<std::sync::OnceLock<String>>,
 }
 
 impl<'a> StepCtx<'a> {
@@ -505,6 +510,7 @@ impl<'a> StepCtx<'a> {
             signer,
             recorded_groups,
             abandoning: false,
+            moved_blob: Arc::default(),
             reversing: false,
             open_group: None,
             member_dispatch: false,
@@ -3182,11 +3188,27 @@ impl<'a> StepCtx<'a> {
                     .await?;
                 Ok(Replayed::Continue(attempt))
             }
+            // A pinned read the live run found moved: the same quarantine,
+            // read from the record, since replay never reads the store again.
+            Some(EffectReplay::Failed {
+                error,
+                spend,
+                unreproducible: Some(what),
+                ..
+            }) => {
+                self.bill_replayed(spend, Self::outbound_size(effect));
+                let _ = self.moved_blob.set(what.clone());
+                Err(StepError::Unreproducible {
+                    what,
+                    detail: error,
+                })
+            }
             Some(EffectReplay::Failed {
                 error,
                 disposition,
                 spend,
                 permanent,
+                unreproducible: None,
             }) => Ok(Replayed::Continue(self.replay_recorded_failure(
                 descriptor,
                 ordinal,
@@ -4499,6 +4521,7 @@ impl<'a> StepCtx<'a> {
                             // An answer, not a fault — recorded so the replayed
                             // retry decision stops where the live one did.
                             permanent: permanent_failure(effect, &e),
+                            unreproducible: unreproducible(&e).map(str::to_owned),
                             elapsed_ms,
                         },
                     )
@@ -4508,6 +4531,14 @@ impl<'a> StepCtx<'a> {
                         key,
                         disposition: e.disposition(),
                         detail: format!("{e}; and recording that failure failed: {append_failed}"),
+                    });
+                }
+                // Not retried: a second read returns the same bytes.
+                if let crate::core::EffectError::Unreproducible { what, detail } = &e {
+                    let _ = self.moved_blob.set(what.clone());
+                    return Err(StepError::Unreproducible {
+                        what: what.clone(),
+                        detail: detail.clone(),
                     });
                 }
                 Ok(Err(e))
@@ -4733,6 +4764,73 @@ impl crate::blob::BlobStore for CaseBlobsReadOnly {
     }
     async fn has(&self, digest: crate::core::Digest) -> Result<bool, crate::blob::BlobError> {
         self.0.has(digest).await
+    }
+}
+
+/// A blob store whose reads the runtime classifies.
+///
+/// I1: a pinned read that answers with other bytes must quarantine the run,
+/// and an absent one must not. A skill sees the error either way and may do
+/// anything with it, so the runtime notes the mismatch here, before the skill
+/// sees it, and concludes the run from the note.
+#[derive(Debug)]
+struct ClassifiedBlobs {
+    inner: Arc<dyn crate::blob::BlobStore>,
+    moved: Arc<std::sync::OnceLock<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::blob::BlobStore for ClassifiedBlobs {
+    fn tenant(&self) -> &str {
+        self.inner.tenant()
+    }
+    async fn put(&self, bytes: &[u8]) -> Result<crate::core::Digest, crate::blob::BlobError> {
+        self.inner.put(bytes).await
+    }
+    async fn put_at(
+        &self,
+        digest: crate::core::Digest,
+        bytes: &[u8],
+    ) -> Result<(), crate::blob::BlobError> {
+        self.inner.put_at(digest, bytes).await
+    }
+    async fn get_raw(
+        &self,
+        digest: crate::core::Digest,
+    ) -> Result<Vec<u8>, crate::blob::BlobError> {
+        self.inner.get_raw(digest).await
+    }
+    async fn get(&self, digest: crate::core::Digest) -> Result<Vec<u8>, crate::blob::BlobError> {
+        use crate::blob::BlobError;
+        let read = self.inner.get(digest).await;
+        match &read {
+            // Content answered, and it is not what was written there.
+            Err(BlobError::Corrupt { .. }) => {
+                let _ = self.moved.set(format!("blob {digest}"));
+            }
+            // Absence and outage fail the run; they never quarantine it.
+            // Listed, so a new kind of failure is classed on purpose.
+            Ok(_)
+            | Err(
+                BlobError::Backend(_)
+                | BlobError::NotFound(_)
+                | BlobError::Expired { .. }
+                | BlobError::UnreadableTombstone { .. }
+                | BlobError::Unopened { .. },
+            ) => {}
+        }
+        read
+    }
+    async fn expire(
+        &self,
+        digest: crate::core::Digest,
+        at: Timestamp,
+        reason: &str,
+    ) -> Result<(), crate::blob::BlobError> {
+        self.inner.expire(digest, at, reason).await
+    }
+    async fn has(&self, digest: crate::core::Digest) -> Result<bool, crate::blob::BlobError> {
+        self.inner.has(digest).await
     }
 }
 
@@ -4974,6 +5072,86 @@ impl StepCtx<'_> {
             })
             .await?
             .into_unlabelled())
+    }
+
+    /// Whether somebody approved this call in advance.
+    ///
+    /// The standing approvals this run's holder holds are read (journaled),
+    /// the first in id order with a rule matching `tool` and `arguments` is
+    /// drawn on for nothing (journaled, and refused by the store once revoked,
+    /// expired or out of draws), and the one drawn names who approved. `None`
+    /// means a person has to be asked: no store, no holder, no rule, or every
+    /// matching one refused. It decides approval only — see
+    /// [`ApprovalRule`](crate::authority::ApprovalRule).
+    ///
+    /// # Errors
+    ///
+    /// When the authority store cannot answer — a person is not asked instead,
+    /// because "the store was down" is not "nobody approved this".
+    pub async fn standing_approval(
+        &mut self,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<Option<crate::authority::StandingApproval>, StepError> {
+        let Some(authorities) = self.authorities.clone() else {
+            return Ok(None);
+        };
+        let Some(holder) =
+            crate::authority::holder_of(self.identity.as_ref(), self.served_unchained().await?)
+        else {
+            return Ok(None);
+        };
+        let at = self.now().await?;
+        let standing = self
+            .effect(crate::runtime::effects::ListStandingApprovals {
+                authorities: Arc::clone(&authorities),
+                holder: holder.clone(),
+                at,
+            })
+            .await?
+            .into_unlabelled();
+        for authority in standing {
+            if !authority
+                .approves
+                .iter()
+                .any(|rule| rule.matches(tool, arguments))
+            {
+                continue;
+            }
+            let Some(issued_by) = authority.issued_by.clone() else {
+                continue;
+            };
+            let drawn = self
+                .effect(crate::runtime::effects::DrawOnAuthority {
+                    authorities: Arc::clone(&authorities),
+                    id: authority.id.clone(),
+                    holder: Some(holder.clone()),
+                    amount: crate::core::Spend::default(),
+                    at,
+                    key: None,
+                })
+                .await;
+            match drawn {
+                Ok(_) => {
+                    return Ok(Some(crate::authority::StandingApproval {
+                        authority: authority.id,
+                        issued_by,
+                        basis: authority.basis,
+                    }));
+                }
+                // Revoked, expired or spent since the listing: the store said
+                // no, nothing was drawn, and the next rule may still apply.
+                Err(StepError::Effect(
+                    crate::core::EffectError::Refused(_)
+                    | crate::core::EffectError::Final {
+                        disposition: crate::core::Disposition::DidNotHappen,
+                        ..
+                    },
+                )) => {}
+                Err(other) => return Err(other),
+            }
+        }
+        Ok(None)
     }
 
     /// Recall what this agent remembers about a subject.
@@ -5647,6 +5825,10 @@ impl StepCtx<'_> {
     /// this handle would land in the case's address space with no record, and
     /// an erasure would report success over bytes it never touched.
     ///
+    /// **A blob whose bytes no longer match their address quarantines the
+    /// run**, whatever the skill does with the `BlobError::Corrupt` it sees,
+    /// where an expired or missing blob is an ordinary failure.
+    ///
     /// # Errors
     ///
     /// If no blob store is configured, or the run belongs to no case while a
@@ -5669,6 +5851,23 @@ impl StepCtx<'_> {
     /// unit that does not own them; not sealing them would leave a hole in a
     /// deployment that asked for none.
     fn blobs_scoped(
+        &self,
+        scope: Option<&str>,
+    ) -> Result<Arc<dyn crate::blob::BlobStore>, StepError> {
+        Ok(Arc::new(ClassifiedBlobs {
+            inner: self.sealed_blobs(scope)?,
+            moved: Arc::clone(&self.moved_blob),
+        }))
+    }
+
+    /// What this step first found rewritten under its own address.
+    pub(crate) fn moved_blob(&self) -> Option<&str> {
+        self.moved_blob.get().map(String::as_str)
+    }
+
+    /// The store [`blobs_scoped`](Self::blobs_scoped) classifies: the raw one,
+    /// scoped to its erasure unit and sealed when a key ring is configured.
+    fn sealed_blobs(
         &self,
         scope: Option<&str>,
     ) -> Result<Arc<dyn crate::blob::BlobStore>, StepError> {
@@ -6638,6 +6837,14 @@ impl<E: Effect> BuildsEffect<E> for E {
 impl<T: Effect, Er: Into<StepError>> BuildsEffect<T> for Result<T, Er> {
     fn into_effect(self) -> Result<T, StepError> {
         self.map_err(Into::into)
+    }
+}
+
+/// What a failure could not reproduce, if it was a pinned read that moved.
+fn unreproducible(failure: &crate::core::EffectError) -> Option<&str> {
+    match failure {
+        crate::core::EffectError::Unreproducible { what, .. } => Some(what),
+        _ => None,
     }
 }
 

@@ -7097,6 +7097,7 @@ impl Runtime {
         );
 
         let result = skill.compensate(&mut ctx, &output).await;
+        let result = moved_blob_wins(&ctx, result);
         let mut slice = ctx.into_cursor();
         if let Err(crate::core::SkillError::Step(error)) = &result
             && let Some(divergence) =
@@ -7416,6 +7417,7 @@ impl Runtime {
             Err(e) => Err(crate::core::SkillError::Step(e)),
         };
         let result = settle_abandoned_group(&mut cx, result).await;
+        let result = moved_blob_wins(&cx, result);
         let wrote = cx.wrote_records();
         let mut cursor = cx.into_cursor();
         if let Err(crate::core::SkillError::Step(error)) = &result
@@ -8732,6 +8734,24 @@ fn resolve_arg(
             }
         }
     })
+}
+
+/// A step that read a blob rewritten under its address ends unreproducible,
+/// whatever the skill returned: its history cannot be reproduced, whether the
+/// skill propagated the error, retried it or swallowed it.
+fn moved_blob_wins<T>(
+    cx: &StepCtx<'_>,
+    result: Result<T, crate::core::SkillError>,
+) -> Result<T, crate::core::SkillError> {
+    match cx.moved_blob() {
+        Some(what) => Err(crate::core::SkillError::Step(
+            crate::core::StepError::Unreproducible {
+                what: what.to_owned(),
+                detail: "a pinned read returned other bytes under its address".to_owned(),
+            },
+        )),
+        None => result,
+    }
 }
 
 /// Settle a group the skill left open, because `Drop` cannot.

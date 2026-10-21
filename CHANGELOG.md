@@ -16,6 +16,69 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.48.0] — unreleased
+
+### Added
+
+- **`embed` feature**: `redb`, `providers`, `mcp-stdio` and `manifest`, the set
+  a library embedding that calls models and tools needs. CI builds it with
+  default features off and runs a governed agent under it.
+- **Manifest leaf constructors**: `ToolGrant::new`, `ModelRef::new`,
+  `Oversight::new` and `OversightDeadline::new` take only the fields with no
+  default and give the rest the values YAML gives. `ToolGrant::new` mutates, as
+  an unqualified YAML grant does. `examples/local_coded_agent.rs` declares a
+  coded agent with `Manifest::builder` and runs it on a redb file through an
+  approval.
+- **Prompt-cache breakpoints on tools**: `ToolDeclaration::cache_breakpoint`
+  with `CacheTtl::FiveMinutes` or `CacheTtl::OneHour` renders Anthropic's
+  `cache_control` on that tool; other drivers ignore it. A marked declaration
+  is part of the effect key, and an unmarked one keys as before.
+- **Standing approvals**: `StandingAuthority::approval` lets a named person
+  approve a call shape in advance (`exact`, `path_prefix` or `argv_prefix` on
+  an argument) until it expires. A matching call opens no approval task and is
+  journaled as a draw on the approval. `StepCtx::standing_approval` asks from a
+  coded skill.
+- **Following a run**: `JournalStore::watch` wakes a follower after each
+  committed append, across instances on `PostgreSQL`. A2A streams use it and
+  keep polling as the fallback.
+- **`Usage::cache_write_1h_tokens`**: the one-hour share of a call's cache
+  writes, read from Anthropic's `cache_creation` on buffered and streamed
+  responses.
+
+### Changed
+
+- **BREAKING: `pricing` requires `cache_write_1h`**, the rate for the one-hour
+  cache tier. A provider with no such tier states `0`. One-hour writes are
+  billed at it, and a role's per-call bound counts it among the input rates.
+- **YAML is read by `serde-saphyr`**, replacing `serde_yaml_ng` and the
+  unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449). What a manifest, token
+  file or content rule accepts is unchanged. A refusal names the field path,
+  the line and the document.
+- **BREAKING: a blob rewritten under its address quarantines the run**,
+  whatever the skill does with the error, and as governed media without calling
+  the model. `EffectFailed` gains `unreproducible`; `EffectError::Unreproducible`
+  is new. An expired or missing blob still fails the run.
+- **BREAKING: `AuthorityStore::held_by` is required**, listing a holder's
+  authorities in id order; `StandingAuthority` gained `approves` and
+  `issued_by`.
+- **BREAKING: `JournalStore::watch` is required.** A decorator forwards it to
+  what it wraps; a store that cannot raise a wake-up answers `None`.
+- **BREAKING: `ToolDeclaration` and `Usage` gained a public field each**
+  (`cache`, `cache_write_1h_tokens`). A struct literal names it, or is built
+  with `ToolDeclaration::new` / `..Usage::default()`.
+
+### Assurance
+
+- **Every liveness property in the TLA+ models has a mutant that refutes it**,
+  and a guard fails the build for one that does not.
+
+### Security
+
+- **rustls 0.23.46, rustls-webpki 0.103.16 and webpki-root-certs 1.0.10**, for
+  RUSTSEC-2026-0346 to 0349, 0382 and 0383. Every HTTPS client the crate builds
+  is affected; nothing to change but the lock file.
+
+
 ## [0.47.0] — 2026-10-09
 
 ### Changed

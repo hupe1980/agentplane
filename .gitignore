@@ -53,3 +53,6 @@ concepts/
 # Python bytecode from tools/mutants.py.
 __pycache__/
 *.py[cod]
+
+# Python placeholder package build output
+/python/dist/

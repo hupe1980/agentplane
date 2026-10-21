@@ -106,6 +106,13 @@ specific invariant written for it (see [`mutations.py`](mutations.py)):
 | The audit keeps the tallest anchor instead of checking each one | `Equivocation` | `EveryForkIsSeen` |
 | A witness cosigns without recording what it vouched for | `Equivocation` | `NoWitnessVouchesForTwoHistories` |
 | The effect protocol is checked without the fairness its termination needs | `EffectProtocol` | `Terminates` (property) |
+| No step that stops or finishes the run is fair | `Authorization` | `Settles` (property) |
+| Rehydration is never fair, while storing still is | `Delegation` | `EveryChainIsJudged` (property) |
+| No step that settles the group is fair | `EffectGroup` | `AlwaysSettles` (property) |
+| No step that completes the audit or the last round is fair | `Equivocation` | `RunsItsCourse` (property) |
+| No step that reaches the step bound is fair | `Fencing` | `RunsItsCourse` (property) |
+| No step that ends the call is fair | `RetrySafety` | `Terminates` (property) |
+| No step that ends the saga is fair | `Saga` | `Terminates` (property) |
 | The slot count skips a crashed or sealed run still holding its row | `Quota` | `AdmissionsWithinCeiling` |
 | A recorded pass is settled again without checking its receipt | `Quota` | `PassSettledOnce` |
 | A pass is settled into the current period, not the one it started in | `Quota` | `SpendInAdmittedPeriod` |

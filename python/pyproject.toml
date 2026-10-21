@@ -1,0 +1,22 @@
+[project]
+name = "pyagentplane"
+version = "0.0.1"
+description = "Placeholder for Python bindings to agentplane, a durable, replayable agent runtime."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.10"
+authors = [{ name = "hupe1980" }]
+keywords = ["agent", "durable-execution", "replay", "runtime", "llm"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://hupe1980.github.io/agentplane/"
+Repository = "https://github.com/hupe1980/agentplane"
+
+[build-system]
+requires = ["uv_build>=0.9,<0.14"]
+build-backend = "uv_build"

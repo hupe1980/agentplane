@@ -1737,7 +1737,7 @@ spec:
 fn swapping_a_model_changes_the_manifest_identity() {
     let with_models = GOOD.replace(
         "  tools:",
-        "  models:\n    privileged: { provider: anthropic, model: claude-sonnet-5, pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 } }\n  tools:",
+        "  models:\n    privileged: { provider: anthropic, model: claude-sonnet-5, pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375, cache_write_1h: 600 } }\n  tools:",
     );
     let a = Manifest::parse(&with_models).expect("parse");
     assert_eq!(
@@ -3341,7 +3341,7 @@ spec:
     privileged:
       provider: fake
       model: declared-1
-      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+      pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375, cache_write_1h: 600 }
   tools:
     - ref: tool://ledger/read
       mutates: false
@@ -3417,7 +3417,7 @@ metadata: { name: unpriced, version: "1.0.0" }
 spec:
   capabilities: { provides: [unpriced.ask] }
   models:
-    privileged: { provider: fake, model: declared-1, pricing: { input: 1, output: 1, cache_read: 1, cache_write: 1 } }
+    privileged: { provider: fake, model: declared-1, pricing: { input: 1, output: 1, cache_read: 1, cache_write: 1, cache_write_1h: 1 } }
     quarantined: { provider: fake, model: reader-1 }
   budgets: { max_minor_units: 250 }
 "#;
@@ -3448,8 +3448,8 @@ metadata: { name: bounded, version: "1.0.0" }
 spec:
   capabilities: { provides: [bounded.ask] }
   models:
-    privileged: { provider: fake, model: declared-1, max_tokens: 100, max_input_tokens: 900, pricing: { input: 1000000, output: 2000000, cache_read: 0, cache_write: 0 } }
-    quarantined: { provider: fake, model: reader-1, max_tokens: 50, max_input_tokens: 2000, pricing: { input: 1000000, output: 1000000, cache_read: 0, cache_write: 0 } }
+    privileged: { provider: fake, model: declared-1, max_tokens: 100, max_input_tokens: 900, pricing: { input: 1000000, output: 2000000, cache_read: 0, cache_write: 0, cache_write_1h: 0 } }
+    quarantined: { provider: fake, model: reader-1, max_tokens: 50, max_input_tokens: 2000, pricing: { input: 1000000, output: 1000000, cache_read: 0, cache_write: 0, cache_write_1h: 0 } }
   budgets: { max_tokens: 10000, max_minor_units: 50000 }
 "#;
     let m = Manifest::parse(yaml).expect("parses");
@@ -3458,6 +3458,18 @@ spec:
     // the reader's 2000 input + 50 output at one each.
     assert_eq!(budget.max_call_tokens, Some(2_050));
     assert_eq!(budget.max_call_minor_units, Some(2_050));
+
+    // Input may land in the one-hour cache tier, so its rate bounds a call too.
+    let long = Manifest::parse(&yaml.replace(
+        "output: 1000000, cache_read: 0, cache_write: 0, cache_write_1h: 0",
+        "output: 1000000, cache_read: 0, cache_write: 0, cache_write_1h: 3000000",
+    ))
+    .expect("parses");
+    assert_eq!(
+        long.budget().max_call_minor_units,
+        Some(6_050),
+        "a call whose input is written to the one-hour tier was bounded at the input rate"
+    );
 
     let open = Manifest::parse(&yaml.replace(", max_input_tokens: 2000", "")).expect("parses");
     assert_eq!(
@@ -3819,6 +3831,37 @@ fn the_programmatic_manifest_builder_uses_the_yaml_validation_path() {
         .expect("validated builder");
     assert_eq!(manifest.metadata.name, "built");
     assert_eq!(manifest.spec.capabilities.provides, ["built.run"]);
+}
+
+/// A leaf constructor is the parser's defaults, field for field.
+///
+/// The two spellings of one default are free to drift, and the one that matters
+/// is `mutates`: the parser says a grant mutates unless told otherwise, and a
+/// constructor that said the opposite would exempt every Rust-declared grant
+/// from the whole-value taint gate and retry it after a timeout.
+#[test]
+fn each_leaf_constructor_is_what_yaml_naming_only_its_arguments_parses_to() {
+    use agentplane::manifest::{Approval, ModelRef, Oversight, OversightDeadline, ToolGrant};
+    fn parsed<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
+        serde_saphyr::from_str(yaml).expect("the leaf parses")
+    }
+    assert_eq!(
+        ToolGrant::new("tool://fs/write"),
+        parsed::<ToolGrant>("ref: tool://fs/write")
+    );
+    assert!(ToolGrant::new("tool://fs/write").mutates);
+    assert_eq!(
+        ModelRef::new("anthropic", "claude-opus-5-5"),
+        parsed::<ModelRef>("{ provider: anthropic, model: claude-opus-5-5 }")
+    );
+    assert_eq!(
+        Oversight::new(Approval::ToolsOnly),
+        parsed::<Oversight>("approval: tools-only")
+    );
+    assert_eq!(
+        OversightDeadline::new("review", "hours"),
+        parsed::<OversightDeadline>("{ name: review, kind: hours }")
+    );
 }
 
 /// A tool-calling agent must be able to describe its tools.
@@ -4563,7 +4606,7 @@ fn the_extended_card_discloses_more_but_not_the_model() {
     // passes without exercising the disclosure it names.
     let m = Manifest::parse(&GOOD.replace(
         "  tools:",
-        "  models:\n    privileged: { provider: secret-provider, model: crown-model-7, pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 } }\n  tools:",
+        "  models:\n    privileged: { provider: secret-provider, model: crown-model-7, pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375, cache_write_1h: 600 } }\n  tools:",
     ))
     .expect("parse");
     let public = AgentCard::derive(&m, "https://plane/a2a").expect("public");

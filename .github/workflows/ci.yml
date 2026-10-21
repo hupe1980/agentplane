@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seam: [postgres, mcp, http, attestation, drivers]
+        seam: [postgres, mcp, http, attestation, drivers, embed]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

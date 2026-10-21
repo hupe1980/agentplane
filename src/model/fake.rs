@@ -343,6 +343,7 @@ fn usage_for(prompt: &Value) -> Usage {
         input_tokens: (len / 4).max(1),
         output_tokens: (len / 8).max(1),
         cache_write_tokens: 0,
+        cache_write_1h_tokens: 0,
         cache_read_tokens: 0,
         minor_units: 0,
     }

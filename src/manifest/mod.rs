@@ -72,6 +72,9 @@ pub const API_VERSION: &str = "agentplane.hupe1980.github.io/v1alpha1";
 pub const KIND: &str = "Agent";
 
 /// A parsed, validated agent declaration.
+///
+/// Read from YAML with [`Manifest::parse`], or declared in Rust with
+/// [`Manifest::builder`]. Both end in the same normalization and validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -594,6 +597,26 @@ pub struct Oversight {
     pub triage: Vec<TriageRule>,
 }
 
+impl Oversight {
+    /// Oversight naming only what is approved, as YAML gives a block that names
+    /// only `approval`.
+    ///
+    /// Gating needs a [`deadline`](Self::deadline) as well, and
+    /// [`Manifest::build`] refuses one that has none.
+    #[must_use]
+    pub fn new(approval: Approval) -> Self {
+        Self {
+            approval,
+            approvers: Vec::new(),
+            deadline: None,
+            on_expiry: Expiry::default(),
+            escalate_to: Vec::new(),
+            allow_unattended: false,
+            triage: Vec::new(),
+        }
+    }
+}
+
 /// The obligation that bounds an oversight wait.
 ///
 /// # Why this is not just a name
@@ -663,6 +686,19 @@ fn refuse_zero_ceilings(models: &Models) -> Result<(), ManifestError> {
 }
 
 impl OversightDeadline {
+    /// A deadline with no parameters, as YAML gives one that names only these.
+    ///
+    /// Set `params` afterwards for a kind that takes them, such as `hours`'s
+    /// `n`.
+    #[must_use]
+    pub fn new(name: impl Into<String>, kind: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            kind: kind.into(),
+            params: serde_json::Value::Null,
+        }
+    }
+
     /// Refuse a count `n` that is not a positive integer: a deadline of zero or
     /// fewer units is due, or overdue, the moment it is registered.
     fn validate_count(&self, field: &str) -> Result<(), ManifestError> {
@@ -1061,6 +1097,20 @@ pub struct ModelRef {
 }
 
 impl ModelRef {
+    /// A role naming only its driver and model, as YAML gives one that names
+    /// only those.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, model: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            model: model.into(),
+            max_tokens: None,
+            max_input_tokens: None,
+            reasoning_effort: None,
+            pricing: None,
+        }
+    }
+
     /// The most one call through this role can report, when the declaration
     /// bounds it: `max_input_tokens` plus the output ceiling in tokens, and
     /// those tokens at the declared price in money.
@@ -1082,7 +1132,11 @@ impl ModelRef {
                 .unwrap_or(crate::model::ModelCall::DEFAULT_MAX_OUTPUT_TOKENS),
         );
         let minor_units = self.pricing.map_or(0, |p| {
-            let rate = p.input.max(p.cache_read).max(p.cache_write);
+            let rate = p
+                .input
+                .max(p.cache_read)
+                .max(p.cache_write)
+                .max(p.cache_write_1h);
             let micro = u128::from(input)
                 .saturating_mul(u128::from(rate))
                 .saturating_add(u128::from(output).saturating_mul(u128::from(p.output)));
@@ -1435,6 +1489,28 @@ pub struct ToolGrant {
     pub rate_limit: Option<RateLimit>,
 }
 
+impl ToolGrant {
+    /// A grant naming only its tool, as YAML gives one that names only `ref`.
+    ///
+    /// So it **mutates**: the parser's default, and the safe one. A grant that
+    /// does not mutate skips the whole-value taint gate and is retried after a
+    /// timeout, so saying so is the author's job, never a constructor's.
+    #[must_use]
+    pub fn new(reference: impl Into<String>) -> Self {
+        Self {
+            reference: reference.into(),
+            mutates: yes(),
+            max_sensitivity: None,
+            protected_fields: Vec::new(),
+            description: None,
+            requires_approval: false,
+            preview: None,
+            arguments: None,
+            rate_limit: None,
+        }
+    }
+}
+
 /// A cross-run ceiling on one tool: see [`ToolGrant::rate_limit`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1613,8 +1689,7 @@ impl Manifest {
     /// security document is a mistake and not an extension. See
     /// [`Manifest::validate`] for the rest.
     pub fn parse(yaml: &str) -> Result<Self, ManifestError> {
-        let mut m: Self =
-            serde_yaml_ng::from_str(yaml).map_err(|e| ManifestError::Syntax(e.to_string()))?;
+        let mut m: Self = crate::yaml::from_str(yaml).map_err(ManifestError::Syntax)?;
         m.normalize();
         m.validate()?;
         Ok(m)
@@ -1641,17 +1716,11 @@ impl Manifest {
     /// refusal for two documents sharing one `metadata.name` — one file
     /// declaring the same agent twice is a merge conflict, not a room.
     pub fn parse_all(yaml: &str) -> Result<Vec<Self>, ManifestError> {
-        use serde::Deserialize as _;
-
         let mut manifests: Vec<Self> = Vec::new();
-        for (index, document) in serde_yaml_ng::Deserializer::from_str(yaml).enumerate() {
+        let documents = crate::yaml::documents(yaml).map_err(ManifestError::Syntax)?;
+        for (index, value) in documents.into_iter().enumerate() {
             let ordinal = index + 1;
-            let value = serde_yaml_ng::Value::deserialize(document)
-                .map_err(|e| ManifestError::Syntax(format!("document {ordinal}: {e}")))?;
-            if value.is_null() {
-                continue;
-            }
-            let mut m: Self = serde_yaml_ng::from_value(value)
+            let mut m: Self = crate::yaml::from_value(value)
                 .map_err(|e| ManifestError::Syntax(format!("document {ordinal}: {e}")))?;
             m.normalize();
             m.validate()?;

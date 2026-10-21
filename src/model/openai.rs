@@ -358,6 +358,7 @@ impl ApiResponse {
             // ordinary input, so leaving this zero is accurate rather than
             // unknown.
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             cache_read_tokens: u
                 .and_then(|u| u.input_tokens_details.as_ref())
                 .map_or(0, |d| d.cached_tokens),

@@ -868,6 +868,7 @@ impl Gemini {
                 .saturating_add(count("thoughtsTokenCount")),
             cache_read_tokens: count("cachedContentTokenCount"),
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             minor_units: 0,
         }
     }

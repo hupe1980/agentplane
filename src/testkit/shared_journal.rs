@@ -33,6 +33,9 @@ impl JournalStore for SharedJournal {
     fn is_shared(&self) -> bool {
         true
     }
+    async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
+        self.inner.watch(run).await
+    }
     fn seals(&self) -> bool {
         self.inner.seals()
     }

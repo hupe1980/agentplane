@@ -934,6 +934,53 @@ async fn strict_replay_does_not_read_media_blobs_or_call_the_model() {
     assert_eq!(provider.calls(), live_calls);
 }
 
+/// **I1: media rewritten under its address quarantines the run**, without a
+/// retry and without calling the model, and a strict replay — which never reads
+/// the store — reaches the same quarantine from the failure record.
+#[cfg(feature = "media")]
+#[tokio::test]
+async fn rewritten_governed_media_quarantines_and_verifies() {
+    use agentplane::blob::BlobStore;
+
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let blobs = CountingBlobs::new();
+    let digest = blobs.put(b"\x89PNG\r\n\x1a\nbody").await.unwrap();
+    blobs
+        .inner
+        .tamper_for_test(digest, b"\x89PNG\r\n\x1a\nother".to_vec());
+    let provider = FakeProvider::new();
+    let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(DescribesMedia {
+            provider: Arc::clone(&provider),
+            blobs: Arc::clone(&blobs),
+            digest,
+        })
+        .build();
+
+    let live = rt
+        .run("describe-media", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    assert!(
+        matches!(&live.status, RunStatus::Quarantined(reason) if reason.contains(&digest.to_string())),
+        "{:?}",
+        live.status
+    );
+    assert_eq!(
+        blobs.gets.load(Ordering::Relaxed),
+        1,
+        "a moved blob was read again"
+    );
+    assert_eq!(
+        provider.calls(),
+        0,
+        "the model was asked about bytes nobody wrote"
+    );
+
+    let verdict = rt.verify(live.run_id).await.unwrap();
+    assert!(verdict.is_verified(), "{verdict:?}");
+}
+
 // ── The instruction slot carries authority ──────────────────────────────────
 
 /// An instruction a model reasons *under* must be trusted.
@@ -1282,6 +1329,7 @@ fn usage_a_provider_invented_cannot_wrap_a_ceiling() {
         output_tokens: 1,
         cache_write_tokens: 0,
         cache_read_tokens: 0,
+        cache_write_1h_tokens: 0,
         minor_units: 0,
     };
     assert_eq!(
@@ -1301,6 +1349,7 @@ fn usage_a_provider_invented_cannot_wrap_a_ceiling() {
         output_tokens: 15,
         cache_write_tokens: 0,
         cache_read_tokens: 0,
+        cache_write_1h_tokens: 0,
         minor_units: 0,
     };
     assert_eq!(normal.spend().tokens, 70);

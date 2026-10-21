@@ -441,10 +441,10 @@ is refused for either ceiling, since no prompt is empty and no answer is either.
 Together they state what one call through the role can cost: `max_input_tokens`
 plus the output ceiling (`max_tokens`, or the default every call is sent with)
 in tokens, and those tokens at the role's `pricing` in money — input at the
-dearest of the input, cache-read and cache-write rates, because which of them a
-call's input lands in is the provider's decision. The run's per-call bound is
-the dearest declared role's, and it is **unbounded** while any role omits
-`max_input_tokens`.
+dearest of the input, cache-read and both cache-write rates, because which of
+them a call's input lands in is the provider's decision. The run's per-call
+bound is the dearest declared role's, and it is **unbounded** while any role
+omits `max_input_tokens`.
 
 That figure is what a tenant's spend quota reserves beside the run's ceiling —
 a run can end one call past `max_tokens` or `max_minor_units` per step in
@@ -491,10 +491,13 @@ models:
     provider: anthropic
     model: claude-sonnet-5
     # Your rates, not these: minor units per million tokens.
-    pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375 }
+    pricing: { input: 300, output: 1500, cache_read: 30, cache_write: 375, cache_write_1h: 600 }
 ```
 
-All four rates are required; a provider with no cache-write charge states `0`.
+All five rates are required. A provider with no cache-write charge states `0`
+for both, and one with no one-hour cache tier states `0` for `cache_write_1h`.
+A write is billed at the rate of the tier it went to, which the driver reads
+from the response.
 A metered failure — a stream that died after generating — is priced exactly as
 an answer is. `max_minor_units` beside a role with no `pricing` is **refused at
 load**: that role's calls would report no money, and the ceiling would never
@@ -583,7 +586,7 @@ exactly like one that replans without bound.
 | `max_sensitivity` | `public` | The highest sensitivity this tool may be *sent*. |
 | `description` | none | What the model is told. Required by a `tool-calling` or `planned` agent. In the digest, because text that steers tool selection belongs where the system prompt does. |
 | `arguments` | derived | JSON Schema. Omit it for a typed `Tool`: the schema comes from the Rust argument type, and stating it twice is refused because a second copy can only drift. |
-| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched. Needs `spec.oversight` and a kind that calls tools (`tool-calling`, `planned` or `call`); refused without either. See [approve with an amendment](#amendment). |
+| `requires_approval` | `false` | A person approves **this call**, seeing the exact tool and arguments, before it is dispatched, or approved its shape in advance ([standing approval](@/docs/cookbook.md#approve-a-kind-of-call-in-advance)). Needs `spec.oversight` and a kind that calls tools (`tool-calling`, `planned` or `call`); refused without either. See [approve with an amendment](#amendment). |
 | `protected_fields` | none | See below. |
 | `rate_limit` | none | `{ count, window_seconds }`: at most `count` calls in any `window_seconds`, across every run of the tenant. See [rate ceilings](#rate-limit). |
 

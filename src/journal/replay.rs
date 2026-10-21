@@ -90,6 +90,9 @@ pub enum EffectReplay {
         /// could not see this bit would expect a retry the live run never
         /// made.
         permanent: bool,
+        /// What the live run could not reproduce — see
+        /// [`RecordKind::EffectFailed`](crate::journal::RecordKind::EffectFailed).
+        unreproducible: Option<String>,
     },
     /// A limit refused it before it started.
     ///
@@ -471,6 +474,7 @@ impl StepCursor {
                 disposition,
                 spend,
                 permanent,
+                unreproducible,
                 elapsed_ms: _,
             } => {
                 self.settle(
@@ -480,6 +484,7 @@ impl StepCursor {
                         disposition: *disposition,
                         spend: *spend,
                         permanent: *permanent,
+                        unreproducible: unreproducible.clone(),
                     },
                 );
             }
@@ -524,6 +529,7 @@ impl StepCursor {
                 disposition,
                 spend: crate::core::Spend::default(),
                 permanent: false,
+                unreproducible: None,
             },
         }
     }
@@ -1410,6 +1416,7 @@ mod tests {
                     disposition: Disposition::DidNotHappen,
                     spend: crate::core::Spend::default(),
                     permanent: false,
+                    unreproducible: None,
                     elapsed_ms: None,
                 },
             ),
@@ -1422,6 +1429,7 @@ mod tests {
                 disposition: Disposition::DidNotHappen,
                 spend: crate::core::Spend::default(),
                 permanent: false,
+                unreproducible: None,
             })
         );
     }

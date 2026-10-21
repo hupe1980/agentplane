@@ -15,7 +15,7 @@
 use async_trait::async_trait;
 
 use crate::authority::{
-    AuthorityError, AuthorityId, AuthorityState, AuthorityStore, Drawn, Revocation,
+    AuthorityError, AuthorityId, AuthorityState, AuthorityStore, Drawn, Holder, Revocation,
     StandingAuthority,
 };
 use crate::core::{EffectKey, Spend, StoreError, Timestamp};
@@ -352,25 +352,35 @@ impl AuthorityStore for PostgresStore {
             return Ok(None);
         };
 
-        let authority: StandingAuthority = serde_json::from_str(row.get::<_, &str>(0))
-            .map_err(|e| StoreError::Backend(format!("stored authority is unreadable: {e}")))?;
-        let draws: i64 = row.get(3);
-        let revoked: bool = row.get(4);
-        let revoked_at: i64 = row.get(5);
-        let reason: String = row.get(6);
+        row_state(&row).map(Some)
+    }
 
-        Ok(Some(AuthorityState {
-            authority,
-            drawn: Spend {
-                tokens: amount_of(row.get(1)),
-                minor_units: amount_of(row.get(2)),
-            },
-            draws: u32::try_from(draws).unwrap_or(u32::MAX),
-            revoked: revoked.then(|| Revocation {
-                at: Timestamp::from_unix_timestamp(revoked_at).unwrap_or(Timestamp::UNIX_EPOCH),
-                reason,
-            }),
-        }))
+    async fn held_by(&self, holder: &Holder) -> Result<Vec<AuthorityState>, StoreError> {
+        let client = self.pool_ref().get().await.map_err(|e| {
+            StoreError::Backend(format!("the standing-authority store is unavailable: {e}"))
+        })?;
+        let tenant = self.tenant_name();
+        let rows = client
+            .query(
+                "SELECT t.terms, b.tokens, b.minor_units, b.draws,
+                        b.revoked, b.revoked_at, b.reason
+                 FROM authority_terms t
+                 JOIN authority_balance b
+                   ON b.tenant = t.tenant AND b.authority = t.authority
+                 WHERE t.tenant = $1
+                 ORDER BY t.authority COLLATE \"C\"",
+                &[&tenant],
+            )
+            .await
+            .map_err(|e| be(&e))?;
+        let mut held = Vec::new();
+        for row in &rows {
+            let state = row_state(row)?;
+            if &state.authority.holder == holder {
+                held.push(state);
+            }
+        }
+        Ok(held)
     }
 }
 
@@ -411,4 +421,27 @@ async fn receipt(
         },
         draws: u32::try_from(ordinal).unwrap_or(u32::MAX),
     }))
+}
+
+/// One authority's terms and balance, from a row of the join `state` and
+/// `held_by` both select.
+fn row_state(row: &tokio_postgres::Row) -> Result<AuthorityState, StoreError> {
+    let authority: StandingAuthority = serde_json::from_str(row.get::<_, &str>(0))
+        .map_err(|e| StoreError::Backend(format!("stored authority is unreadable: {e}")))?;
+    let draws: i64 = row.get(3);
+    let revoked: bool = row.get(4);
+    let revoked_at: i64 = row.get(5);
+    let reason: String = row.get(6);
+    Ok(AuthorityState {
+        authority,
+        drawn: Spend {
+            tokens: amount_of(row.get(1)),
+            minor_units: amount_of(row.get(2)),
+        },
+        draws: u32::try_from(draws).unwrap_or(u32::MAX),
+        revoked: revoked.then(|| Revocation {
+            at: Timestamp::from_unix_timestamp(revoked_at).unwrap_or(Timestamp::UNIX_EPOCH),
+            reason,
+        }),
+    })
 }

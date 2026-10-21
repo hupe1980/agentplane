@@ -375,7 +375,8 @@ deprecation. The journal record format and the storage schema will change.
 
 Rust **1.94.1+**. `#![forbid(unsafe_code)]`. One crate, feature-gated: an embedded
 [redb](https://github.com/cberner/redb) store by default — pure Rust, two crates
-deep, no C toolchain — with everything else opt-in.
+deep, no C toolchain — with everything else opt-in. Anything that speaks HTTPS
+(`providers`, and therefore `embed`) needs a C compiler for its TLS stack.
 
 Honest framing on regulation: agentplane is not "compliant" and cannot be.
 Compliance attaches to a system in a context, assessed by its provider or

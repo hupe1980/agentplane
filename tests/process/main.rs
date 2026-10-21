@@ -22,6 +22,7 @@ mod plans;
 mod reach;
 mod replanning;
 mod scoping;
+mod standing_approval;
 mod tasks;
 mod telemetry;
 mod timers;

@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.47.0"
+version      = "0.48.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -48,6 +48,10 @@ default = ["redb"]
 
 # Embedded journal + case store. Single-node; `postgres` backs active-active.
 redb = ["dep:redb"]
+# A library embedding that runs governed agents in-process: the embedded store,
+# the model providers, stdio MCP tools and the manifest that grants them. An
+# alias, so nothing is gated on it. No `cli`, no `bedrock`, no `fake-model`.
+embed = ["redb", "providers", "mcp-stdio", "manifest"]
 # PostgreSQL-backed journal: several plane instances sharing one store, where
 # fencing and exactly-once are arbitrated by the database rather than by hoping
 # the writers agree.
@@ -55,7 +59,7 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 # The agent declaration: tool grants, budgets, egress ceiling, oversight.
 # Off by default — the runtime is usable wired by builder calls; the
 # manifest is what makes those declarations reviewable.
-manifest = ["dep:serde_yaml_ng", "dep:jsonschema", "dep:regex", "dep:unicode-normalization"]
+manifest = ["dep:serde-saphyr", "dep:serde_path_to_error", "dep:jsonschema", "dep:regex", "dep:unicode-normalization"]
 # Everything the `agentplane` binary needs. `signing` and `witness-http` are
 # here for the audit verbs, for one reason: an `audit`/`verify` that could not
 # check a signature, or could not fetch an anchoring checkpoint from a witness,
@@ -210,8 +214,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 # --no-default-features --features cli -e normal --prefix none | sort -u | wc -l`.
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "env", "wrap_help"], optional = true }
 redb        = { version = "4", optional = true }
-# The maintained fork of serde_yaml, which is deprecated. Ten crates deep.
-serde_yaml_ng = { version = "0.10", optional = true }
+# YAML in safe Rust. Its options, and why `include` and `properties` stay off,
+# are in `src/yaml.rs`.
+serde-saphyr = { version = "2", optional = true, default-features = false, features = ["serialize", "deserialize"] }
+# Names the field a manifest refusal is about (`spec.tools[2].mutates`); the
+# parser gives the line, this gives the path.
+serde_path_to_error = { version = "0.1", optional = true }
 # Content rules: the linear-time engine (no backreferences, no look-around), so
 # a declared pattern cannot make a gate's cost depend on its input's shape.
 regex = { version = "1", optional = true }
@@ -319,6 +327,10 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 name              = "agentplane"
 path              = "src/bin/agentplane.rs"
 required-features = ["cli"]
+
+[[example]]
+name              = "local_coded_agent"
+required-features = ["embed", "fake-model"]
 
 [[example]]
 name              = "openai_live"

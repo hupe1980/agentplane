@@ -745,6 +745,12 @@ impl JournalStore for BlindToKeys {
     ) -> Result<Vec<agentplane::journal::Record>, agentplane::core::StoreError> {
         self.0.append(epoch, batch).await
     }
+    async fn watch(
+        &self,
+        run: agentplane::core::RunId,
+    ) -> Option<agentplane::journal::AppendWatch> {
+        self.0.watch(run).await
+    }
     fn is_shared(&self) -> bool {
         self.0.is_shared()
     }

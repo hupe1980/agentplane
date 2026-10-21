@@ -1297,6 +1297,7 @@ async fn one_erasure_reaches_every_copy_and_the_chain_still_verifies() {
                         spend: agentplane::core::Spend::default(),
                         disposition: agentplane::core::Disposition::DidNotHappen,
                         permanent: false,
+                        unreproducible: None,
                         elapsed_ms: None,
                     },
                 )

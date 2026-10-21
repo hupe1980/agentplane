@@ -101,7 +101,7 @@ fn schema_validator() -> jsonschema::Validator {
 }
 
 fn as_json(yaml: &str) -> serde_json::Value {
-    serde_yaml_ng::from_str(yaml).expect("well-formed YAML")
+    serde_saphyr::from_str(yaml).expect("well-formed YAML")
 }
 
 /// The file the site serves is the document the code generates.

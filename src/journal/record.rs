@@ -443,6 +443,14 @@ pub enum RecordKind {
         /// ordinary failure costs no bytes and no hash input.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         permanent: bool,
+        /// What could not be reproduced, when the attempt failed on a pinned
+        /// read that answered with other content (`blob <digest>`).
+        ///
+        /// On the record because replay never performs the effect again: the
+        /// quarantine the live run reached is reached on replay from this, not
+        /// from rewording the error. Absent for every other failure.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unreproducible: Option<String>,
         /// How long the attempt took before it failed, as `EffectDone`'s
         /// figure is measured.
         #[serde(default, skip_serializing_if = "Option::is_none")]

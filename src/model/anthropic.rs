@@ -254,6 +254,20 @@ struct ApiUsage {
     /// Served from the cache. **Not** included in `input_tokens` either.
     #[serde(default)]
     cache_read_input_tokens: u64,
+    /// The writes split by cache tier. Absent on a response that wrote none.
+    #[serde(default)]
+    cache_creation: Option<CacheCreation>,
+}
+
+/// How a call's cache writes divide between the two tiers.
+///
+/// Only the one-hour count is read: the rest of `cache_creation_input_tokens`
+/// is the default tier by subtraction, and reading both would be two answers
+/// to one question that can disagree.
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct CacheCreation {
+    #[serde(default)]
+    pub(super) ephemeral_1h_input_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +300,10 @@ impl ApiResponse {
             u.map_or(0, |u| u.output_tokens),
             write,
             read,
+        )
+        .with_cache_write_1h(
+            u.and_then(|u| u.cache_creation.as_ref())
+                .map_or(0, |c| c.ephemeral_1h_input_tokens),
         )
     }
 
@@ -465,6 +483,16 @@ fn messages(prompt: &Value) -> Value {
                 }
                 json!([{ "role": "user", "content": rest.to_string() }])
             }),
+    }
+}
+
+/// A cache breakpoint, as the Messages API spells one.
+///
+/// The five-minute tier is the API's default, so it carries no `ttl`.
+fn cache_control(ttl: super::CacheTtl) -> Value {
+    match ttl {
+        super::CacheTtl::FiveMinutes => json!({ "type": "ephemeral" }),
+        super::CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
     }
 }
 
@@ -735,12 +763,16 @@ impl Anthropic {
                         // applies, because the seam promises a caller writes
                         // one declaration for every provider.
                         let strict = strict_schema_problem(&t.parameters).is_none();
-                        json!({
+                        let mut tool = json!({
                             "name": t.name,
                             "description": t.description,
                             "input_schema": t.parameters,
                             "strict": strict,
-                        })
+                        });
+                        if let Some(ttl) = t.cache {
+                            tool["cache_control"] = cache_control(ttl);
+                        }
+                        tool
                     })
                     .collect(),
             );
@@ -1176,6 +1208,38 @@ mod tests {
         assert_eq!(calls[0].id, "c1");
     }
 
+    /// The one-hour share of a call's cache writes is read, and is a share.
+    ///
+    /// The two tiers bill at different rates, so a driver that reads only the
+    /// total prices a one-hour write as a five-minute one. The share is a
+    /// subset of the total, never added to it.
+    #[test]
+    fn the_one_hour_share_of_the_cache_writes_is_read() {
+        let parsed: ApiResponse = serde_json::from_value(json!({
+            "content": [],
+            "usage": {
+                "input_tokens": 10, "output_tokens": 4,
+                "cache_creation_input_tokens": 300, "cache_read_input_tokens": 50,
+                "cache_creation": { "ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200 },
+            }
+        }))
+        .expect("response envelope");
+        let usage = parsed.usage();
+        assert_eq!(usage.cache_write_tokens, 300);
+        assert_eq!(usage.cache_write_1h_tokens, 200);
+        assert_eq!(
+            usage.input_tokens, 360,
+            "the split was counted on top of the total"
+        );
+
+        let older: ApiResponse = serde_json::from_value(json!({
+            "content": [],
+            "usage": { "input_tokens": 10, "output_tokens": 4, "cache_creation_input_tokens": 300 }
+        }))
+        .expect("a response with no split still parses");
+        assert_eq!(older.usage().cache_write_1h_tokens, 0);
+    }
+
     #[test]
     fn a_malformed_buffered_tool_call_is_loud() {
         let parsed: ApiResponse = serde_json::from_value(json!({
@@ -1429,6 +1493,57 @@ mod tool_tests {
             "Read a ledger entry.",
             json!({ "type": "object", "properties": { "id": { "type": "string" } } }),
         )
+    }
+
+    /// A breakpoint on a declaration reaches the body as `cache_control`.
+    ///
+    /// Tools are the first block in Anthropic's cache order and usually the
+    /// largest stable one, so a declaration that cannot carry the mark leaves
+    /// the cheapest prefix uncached. System and message blocks pass through
+    /// verbatim, marks included, and this pins that too.
+    #[test]
+    fn a_tool_breakpoint_reaches_the_body_with_its_ttl() {
+        use crate::model::CacheTtl;
+        let prompt = json!({
+            "system": [{ "type": "text", "text": "be brief", "cache_control": { "type": "ephemeral" } }],
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "hi", "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+            ] }],
+        });
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &prompt,
+                None,
+                &[
+                    decl(),
+                    decl().cache_breakpoint(CacheTtl::OneHour),
+                    decl().cache_breakpoint(CacheTtl::FiveMinutes),
+                ],
+                &[],
+            )
+            .expect("a body with tools");
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "an unmarked tool was marked: {body}"
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert_eq!(
+            body["tools"][2]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "the default tier carries no ttl: {body}"
+        );
+        assert_eq!(
+            body["system"], prompt["system"],
+            "a system block's mark was not passed through"
+        );
+        assert_eq!(
+            body["messages"], prompt["messages"],
+            "a message block's mark was not passed through"
+        );
     }
 
     /// Anthropic takes the three fields at the top level, under `input_schema`.

@@ -992,6 +992,7 @@ mod bedrock_reply_tests {
             output: 0,
             cache_read: 0,
             cache_write: 0,
+            cache_write_1h: 0,
         };
         let refused = embedder(EmbeddingDialect::Cohere, r#"{"embeddings":[[1.0,0.0]]}"#)
             .pricing(price)

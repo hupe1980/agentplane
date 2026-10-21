@@ -126,6 +126,9 @@ impl JournalStore for SealedJournal {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
+    async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
+        self.inner.watch(run).await
+    }
     fn seals(&self) -> bool {
         true
     }

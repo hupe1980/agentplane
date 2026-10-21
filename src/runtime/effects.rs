@@ -997,6 +997,62 @@ impl Effect for OpenTask {
     }
 }
 
+/// The standing approvals a holder holds that still stand at `at`.
+///
+/// A read of mutable state outside the journal, so an effect: a replay matches
+/// against what the run saw, not against what the store holds now. Revoked and
+/// expired ones are left out here, at the run's journaled instant; the draw
+/// that follows a match checks both again, atomically, at the store.
+#[derive(Debug, Clone)]
+pub struct ListStandingApprovals {
+    pub(crate) authorities: std::sync::Arc<dyn crate::authority::AuthorityStore>,
+    pub(crate) holder: crate::authority::Holder,
+    pub(crate) at: Timestamp,
+}
+
+#[async_trait]
+impl Effect for ListStandingApprovals {
+    type Output = Vec<crate::authority::StandingAuthority>;
+
+    fn descriptor(&self) -> EffectDescriptor {
+        EffectDescriptor::new(
+            "authority.approvals",
+            json!({
+                "holder": self.holder,
+                "at": crate::core::format_timestamp(self.at),
+            }),
+        )
+    }
+
+    fn recovery(&self) -> Recovery {
+        Recovery::Retry
+    }
+
+    async fn perform(&self) -> Result<Self::Output, EffectError> {
+        let now = self.at.unix_timestamp();
+        let held =
+            self.authorities
+                .held_by(&self.holder)
+                .await
+                .map_err(|e| EffectError::Unavailable {
+                    driver: "authority-store".to_owned(),
+                    detail: e.to_string(),
+                })?;
+        Ok(held
+            .into_iter()
+            .filter(|state| {
+                !state.authority.approves.is_empty()
+                    && state.revoked.is_none()
+                    && state
+                        .authority
+                        .expires_at
+                        .is_some_and(|expires| now < expires.unix_timestamp())
+            })
+            .map(|state| state.authority)
+            .collect())
+    }
+}
+
 /// Drawing on a standing authority, as an effect.
 ///
 /// # Why this cannot be a plain call

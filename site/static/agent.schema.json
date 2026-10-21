@@ -981,7 +981,13 @@
           "type": "integer"
         },
         "cache_write": {
-          "description": "Input tokens written into a cache.",
+          "description": "Input tokens written into the default cache tier.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_write_1h": {
+          "description": "Input tokens written into the one-hour cache tier.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1003,7 +1009,8 @@
         "input",
         "output",
         "cache_read",
-        "cache_write"
+        "cache_write",
+        "cache_write_1h"
       ],
       "type": "object"
     },

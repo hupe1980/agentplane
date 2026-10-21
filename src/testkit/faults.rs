@@ -329,6 +329,9 @@ impl JournalStore for Faulty {
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }
+    async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
+        self.inner.watch(run).await
+    }
     fn seals(&self) -> bool {
         self.inner.seals()
     }
@@ -628,6 +631,9 @@ mod tests {
         }
         fn seals(&self) -> bool {
             false
+        }
+        async fn watch(&self, _run: RunId) -> Option<crate::journal::AppendWatch> {
+            None
         }
         fn atomic(&self) -> Option<&dyn crate::journal::AtomicJournal> {
             Some(self)

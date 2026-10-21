@@ -1307,7 +1307,58 @@ pub async fn check(fresh: Factory<'_>) -> Report {
     inclusion_at_a_past_size_verifies_against_that_checkpoint(fresh, &mut r).await;
     the_id_walk_does_not_move_under_writes(fresh, &mut r).await;
     only_a_concluded_run_is_sealed(fresh, &mut r).await;
+    a_follower_wakes_once_the_append_is_readable(fresh, &mut r).await;
     r
+}
+
+/// **A follower wakes once the append is readable.**
+///
+/// The hint is worth having only if it arrives after the commit: a follower
+/// that woke and read before it would find nothing, take the wake-up as spent
+/// and sleep with the record unread. A store that cannot raise one answers
+/// `None`, and its followers poll.
+async fn a_follower_wakes_once_the_append_is_readable(fresh: Factory<'_>, r: &mut Report) {
+    r.checked += 1;
+    let store = fresh().await;
+    let run = RunId::generate();
+    let Some(mut follower) = store.watch(run).await else {
+        return;
+    };
+    let Ok(lease) = store.acquire(run, "conformance", LEASE).await else {
+        r.record("fencing", "acquire() failed on a fresh run");
+        return;
+    };
+    let reader = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let head = tokio::time::timeout(Duration::from_secs(10), follower.changed()).await;
+            let seen = store.read(run, 1).await.map(|records| records.len());
+            (head, seen)
+        })
+    };
+    if let Err(e) = store
+        .append(lease.epoch, vec![admitted(run), admitted(run)])
+        .await
+    {
+        r.record("following", format!("append failed: {e}"));
+        return;
+    }
+    match reader.await {
+        Ok((Ok(Some(2)), Ok(2))) => {}
+        Ok((Ok(Some(2)), seen)) => r.record(
+            "following",
+            format!(
+                "the follower woke at head 2 and read {seen:?} — a wake-up raised before \
+                 the commit is spent on a journal that does not show the record yet"
+            ),
+        ),
+        Ok((Ok(head), _)) => r.record("following", format!("woke at {head:?}, not at head 2")),
+        Ok((Err(_), _)) => r.record(
+            "following",
+            "no wake-up within ten seconds of a committed append",
+        ),
+        Err(e) => r.record("following", format!("the follower panicked: {e}")),
+    }
 }
 
 /// **Only a run whose last record is its conclusion is sealed.**
@@ -3712,6 +3763,62 @@ pub async fn authority(store: Arc<dyn crate::authority::AuthorityStore>) {
 
     let key = |n: u8| EffectKey::from_hex(&format!("{n:064x}")).expect("32 bytes of hex");
     let at = Timestamp::UNIX_EPOCH;
+
+    // ── A holder's authorities are listed, in id order, revoked ones too ────
+    {
+        use crate::authority::Holder;
+        for (id, holder) in [
+            ("held-c", Holder::Tenant),
+            ("held-a", Holder::Tenant),
+            ("held-b", Holder::subject("alice")),
+        ] {
+            store
+                .issue(&StandingAuthority::new(
+                    id,
+                    holder,
+                    "conformance",
+                    Spend::money(1),
+                ))
+                .await
+                .expect("issue");
+        }
+        store
+            .revoke(&AuthorityId::new("held-c"), "conformance", at)
+            .await
+            .expect("revoke");
+        let held: Vec<String> = store
+            .held_by(&Holder::Tenant)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|state| state.authority.id.as_str().to_owned())
+            .filter(|id| id.starts_with("held-"))
+            .collect();
+        assert_eq!(
+            held,
+            ["held-a", "held-c"],
+            "a holder's authorities, in id order, revoked ones included — another \
+             holder's never: a gate choosing among them must reach one answer everywhere"
+        );
+        let alice = store
+            .held_by(&Holder::subject("alice"))
+            .await
+            .expect("list");
+        assert!(
+            alice.iter().any(|s| s.authority.id.as_str() == "held-b")
+                && alice
+                    .iter()
+                    .all(|s| s.authority.holder == Holder::subject("alice")),
+            "a subject's authorities were not listed apart from the tenant's"
+        );
+        let revoked = store.held_by(&Holder::Tenant).await.expect("list");
+        assert!(
+            revoked
+                .iter()
+                .any(|s| s.authority.id.as_str() == "held-c" && s.revoked.is_some()),
+            "a revoked authority was listed without its revocation"
+        );
+    }
 
     // ── Draws accumulate, and the ceiling is cumulative ──────────────────────
     let id = AuthorityId::new("conformance-accumulate");

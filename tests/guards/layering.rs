@@ -593,6 +593,100 @@ const CLAIMS: &[(&str, &str, &str)] = &[
 /// the runtime, so it is deliberately unmapped.
 const NOT_A_BEHAVIOURAL_CLAIM: &[&str] = &["TypeOK"];
 
+/// Every liveness property a spec checks has a mutant that makes TLC refute it.
+///
+/// A `<>` or `~>` property TLC never saw fail may hold for a reason nobody
+/// stated: a model that can only reach the goal, or constants that make every
+/// behaviour finite. A *property* row in `tla/mutations.py` takes the stated
+/// fairness away and shows the claim needs it. This holds the rule both ways —
+/// a liveness claim with no row, and a row naming no liveness claim — over
+/// specs and rows discovered from the tree, so a new spec cannot skip it.
+#[test]
+fn every_liveness_property_owes_a_property_mutant() {
+    let listed = std::process::Command::new("python3")
+        .args(["tla/mutations.py", "--list"])
+        .output()
+        .expect("python3 runs tla/mutations.py");
+    assert!(listed.status.success(), "tla/mutations.py --list failed");
+    let rows: Vec<(String, String)> = String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| {
+            let cols: Vec<&str> = line.split('\t').collect();
+            (cols.get(4) == Some(&"property")).then(|| (cols[1].to_owned(), cols[2].to_owned()))
+        })
+        .collect();
+
+    let mut liveness = Vec::new();
+    let mut safety = 0;
+    let mut faults = Vec::new();
+    for cfg in walk_ext("tla", "cfg") {
+        let spec = cfg
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(".cfg");
+        let config = read(&cfg);
+        let Some((_, after)) = config.split_once("PROPERT") else {
+            continue;
+        };
+        // `PROPERTY Name` on one line, or a `PROPERTIES` block below it.
+        let (head, block) = after.split_once('\n').unwrap_or((after, ""));
+        let names: Vec<&str> = head
+            .split_whitespace()
+            .skip(1)
+            .chain(
+                block
+                    .lines()
+                    .map(str::trim)
+                    .take_while(|l| !l.is_empty() && !l.chars().all(|c| c.is_ascii_uppercase()))
+                    .filter(|l| !l.starts_with('\\')),
+            )
+            .collect();
+        let source = read(&format!("tla/{spec}.tla"));
+        for name in names {
+            let Some((_, rest)) = source.split_once(&format!("\n{name} ==")) else {
+                faults.push(format!(
+                    "tla/{spec}.tla checks `{name}` and does not define it"
+                ));
+                continue;
+            };
+            let body = rest.split("\n\n").next().unwrap_or_default();
+            if body.contains("<>") || body.contains("~>") {
+                liveness.push((spec.to_owned(), name.to_owned()));
+            } else if body.trim_start().starts_with("[][") {
+                safety += 1;
+            } else {
+                faults.push(format!(
+                    "tla/{spec}.tla: `{name}` is neither `<>`/`~>` nor `[][..]_vars` in its own \
+                     definition — write the temporal operator there, so this guard can tell \
+                     which rule it owes"
+                ));
+            }
+        }
+    }
+    for (spec, name) in &liveness {
+        if !rows.iter().any(|(s, p)| s == spec && p == name) {
+            faults.push(format!(
+                "tla/{spec}.tla claims `{name}` and no property mutant in tla/mutations.py \
+                 takes its fairness away — TLC has never shown the claim needs it"
+            ));
+        }
+    }
+    for (spec, name) in &rows {
+        if !liveness.iter().any(|(s, p)| s == spec && p == name) {
+            faults.push(format!(
+                "tla/mutations.py has a property mutant for `{spec}`/`{name}`, which that \
+                 spec's .cfg does not check as a liveness property"
+            ));
+        }
+    }
+    assert!(
+        !liveness.is_empty() && safety > 0 && !rows.is_empty(),
+        "the guard found nothing to check — it is reading the wrong files"
+    );
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
 /// Every behavioural invariant in the TLA+ specs must have a test checking the
 /// same property against the code.
 ///

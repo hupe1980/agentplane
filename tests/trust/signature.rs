@@ -595,6 +595,12 @@ async fn a_sealed_run_served_as_a_consistent_prefix_is_a_finding() {
 
     #[async_trait::async_trait]
     impl JournalStore for Truncating {
+        async fn watch(
+            &self,
+            run: agentplane::core::RunId,
+        ) -> Option<agentplane::journal::AppendWatch> {
+            self.0.watch(run).await
+        }
         fn is_shared(&self) -> bool {
             self.0.is_shared()
         }
@@ -1749,6 +1755,12 @@ async fn a_log_growing_during_the_audit_is_not_a_deletion_finding() {
     impl JournalStore for StaleOnce {
         async fn append(&self, e: Epoch, b: Vec<Append>) -> Result<Vec<Record>, StoreError> {
             self.inner.append(e, b).await
+        }
+        async fn watch(
+            &self,
+            run: agentplane::core::RunId,
+        ) -> Option<agentplane::journal::AppendWatch> {
+            self.inner.watch(run).await
         }
         fn is_shared(&self) -> bool {
             self.inner.is_shared()

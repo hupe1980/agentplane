@@ -333,7 +333,32 @@ pub struct PostgresStore {
     /// What every read lifts a stored record through. The bytes and their
     /// hash are never touched; only the body this build reads is.
     upcaster: Arc<dyn crate::journal::Upcaster>,
+    /// Wake-ups for this process's followers, fed by the database's own
+    /// notifications, so an append another instance made wakes them too.
+    signals: Arc<crate::journal::AppendSignals>,
+    /// Where the notification listener connects, and whether it has started.
+    listener: Arc<Listener>,
 }
+
+/// The channel every append notifies on, inside its own transaction.
+const APPEND_CHANNEL: &str = "agentplane_append";
+
+/// The one connection that `LISTEN`s, opened by the first follower.
+#[derive(Debug)]
+struct Listener {
+    config: tokio_postgres::Config,
+    started: std::sync::atomic::AtomicBool,
+    /// `true` while a session is listening. A follower waits for it, so a
+    /// subscription is live when [`JournalStore::watch`] returns.
+    live: tokio::sync::watch::Sender<bool>,
+}
+
+/// How long a follower waits for the listener before taking a subscription
+/// that may miss the next append, which costs it one poll interval.
+const LISTEN_READY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often an idle listener checks that somebody still holds the store.
+const LISTEN_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl PostgresStore {
     /// Write records signed as this identity.
@@ -821,7 +846,83 @@ impl PostgresStore {
             origin: "agentplane".to_owned(),
             tenant: crate::core::TenantId::default(),
             upcaster: crate::journal::current_upcaster(),
+            signals: Arc::default(),
+            listener: Arc::new(Listener {
+                config: pg,
+                started: std::sync::atomic::AtomicBool::new(false),
+                live: tokio::sync::watch::channel(false).0,
+            }),
         })
+    }
+
+    /// Start the listener once, and wait until it is listening.
+    ///
+    /// It holds the signals weakly and ends once every handle onto this store
+    /// has gone. A lost connection is reopened.
+    async fn listen(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.listener.started.swap(true, Ordering::AcqRel) {
+            let listener = Arc::clone(&self.listener);
+            let signals = Arc::downgrade(&self.signals);
+            tokio::spawn(async move {
+                while signals.strong_count() > 0 {
+                    let _ = listen_once(&listener, &signals).await;
+                    listener.live.send_replace(false);
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            });
+        }
+        let mut live = self.listener.live.subscribe();
+        let _ = tokio::time::timeout(LISTEN_READY, live.wait_for(|up| *up)).await;
+    }
+}
+
+/// One `LISTEN` session, until its connection ends or nobody is left to wake.
+async fn listen_once(
+    listener: &Listener,
+    signals: &std::sync::Weak<crate::journal::AppendSignals>,
+) -> Result<(), tokio_postgres::Error> {
+    use futures_util::StreamExt as _;
+    let (client, mut connection) = listener.config.connect(NoTls).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut messages = futures_util::stream::poll_fn(move |cx| connection.poll_message(cx));
+        while let Some(Ok(message)) = messages.next().await {
+            if let tokio_postgres::AsyncMessage::Notification(n) = message
+                && tx.send(n.payload().to_owned()).is_err()
+            {
+                break;
+            }
+        }
+    });
+    client
+        .batch_execute(&format!("LISTEN {APPEND_CHANNEL}"))
+        .await?;
+    listener.live.send_replace(true);
+    loop {
+        let payload = tokio::select! {
+            next = rx.recv() => match next {
+                Some(payload) => payload,
+                None => return Ok(()),
+            },
+            () = tokio::time::sleep(LISTEN_IDLE) => {
+                if signals.strong_count() == 0 {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let Some(signals) = signals.upgrade() else {
+            return Ok(());
+        };
+        // `<run> <seq> <tenant>`: a tenant id holds no whitespace, so the last
+        // field is the rest of the payload.
+        let mut parts = payload.splitn(3, ' ');
+        if let (Some(run), Some(seq), Some(tenant)) = (parts.next(), parts.next(), parts.next())
+            && let (Ok(run), Ok(seq)) = (RunId::parse(run), seq.parse::<u64>())
+        {
+            signals.raise(tenant, run, seq);
+        }
     }
 }
 
@@ -983,6 +1084,15 @@ impl PostgresStore {
         self.touch_activity(tx, run, source).await?;
         self.derive_indexes(tx, run, claimed, conclusion, waiting)
             .await?;
+
+        // Inside the transaction, so the database delivers it only if the
+        // append commits — and to every instance listening, not only this one.
+        if let Some(last) = sealed.last() {
+            let payload = format!("{run} {} {}", last.seq(), self.tenant_name());
+            tx.execute("SELECT pg_notify($1, $2)", &[&APPEND_CHANNEL, &payload])
+                .await
+                .map_err(|e| be(&e))?;
+        }
 
         Ok(sealed)
     }
@@ -1152,6 +1262,13 @@ fn refused_insert(e: &tokio_postgres::Error, record: &Record, run: RunId, seq: u
 
 #[async_trait]
 impl JournalStore for PostgresStore {
+    async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
+        // Subscribed first, so an append during the wait is not missed.
+        let follower = self.signals.subscribe(&self.tenant_name(), run);
+        self.listen().await;
+        Some(follower)
+    }
+
     /// The topology an embedded store cannot serve: several plane instances
     /// sharing one store, with fencing and exactly-once arbitrated by the
     /// database rather than by hoping the writers agree.

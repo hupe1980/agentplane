@@ -209,6 +209,9 @@ pub struct RedbStore {
     /// What every read lifts a stored record through. The bytes and their
     /// hash are never touched; only the body this build reads is.
     upcaster: Arc<dyn crate::journal::Upcaster>,
+    /// Wake-ups for followers, shared by every handle onto this database: one
+    /// file has one writing process, so these see every append it accepts.
+    signals: Arc<crate::journal::AppendSignals>,
 }
 
 impl RedbStore {
@@ -281,6 +284,7 @@ impl RedbStore {
             origin: "agentplane".to_owned(),
             tenant: crate::core::TenantId::default(),
             upcaster: crate::journal::current_upcaster(),
+            signals: Arc::default(),
         })
     }
 
@@ -852,6 +856,10 @@ impl JournalStore for RedbStore {
     /// One file, one writer. That single writer is what makes exactly-once a
     /// table key and fencing race-free here — and it is why a plane that needs
     /// two instances needs `PostgreSQL` instead.
+    async fn watch(&self, run: RunId) -> Option<crate::journal::AppendWatch> {
+        Some(self.signals.subscribe(&self.tenant_name(), run))
+    }
+
     fn is_shared(&self) -> bool {
         false
     }
@@ -879,6 +887,7 @@ impl JournalStore for RedbStore {
         let run_id = run.to_string();
         let tenant = self.tenant_name();
         let upcaster = Arc::clone(&self.upcaster);
+        let signals = Arc::clone(&self.signals);
 
         self.with_db(move |db| {
             let w = begin_write(db)?;
@@ -1136,6 +1145,9 @@ impl JournalStore for RedbStore {
                 sealed
             };
             w.commit().map_err(|e| be(&e))?;
+            if let Some(last) = sealed.last() {
+                signals.raise(&tenant, run, last.seq());
+            }
             Ok(sealed)
         })
         .await

@@ -808,6 +808,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         disposition: Disposition::DidNotHappen,
                         spend: agentplane::core::Spend::default(),
                         permanent: false,
+                        unreproducible: None,
                         elapsed_ms: None,
                     },
                 )

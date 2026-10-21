@@ -240,6 +240,7 @@ impl ApiUsage {
             // The wire has no cache-write counter; a write bills as ordinary
             // input, so zero is accurate rather than unknown.
             cache_write_tokens: 0,
+            cache_write_1h_tokens: 0,
             cache_read_tokens: self
                 .prompt_tokens_details
                 .as_ref()

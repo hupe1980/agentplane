@@ -56,7 +56,6 @@ pub struct ContentRule {
     pub fields: Vec<String>,
     /// `refuse`, `{classify: <sensitivity>}` or `{redact: <token>}` — a map,
     /// not a YAML tag, in every format the manifest is read from.
-    #[serde(with = "serde_yaml_ng::with::singleton_map")]
     #[schemars(with = "RuleAction")]
     pub then: RuleAction,
 }
@@ -78,7 +77,6 @@ pub struct ContentCheck {
     /// calls returns.
     pub at: Positions,
     /// From the checker's declared categories to what each one does.
-    #[serde(with = "serde_yaml_ng::with::singleton_map_recursive")]
     #[schemars(with = "BTreeMap<String, CheckAction>")]
     pub on: BTreeMap<String, CheckAction>,
 }
@@ -817,7 +815,7 @@ mod tests {
     use super::*;
 
     fn rules(yaml: &str) -> Content {
-        let content: Content = serde_yaml_ng::from_str(yaml).expect("parses");
+        let content: Content = crate::yaml::from_str(yaml).expect("parses");
         content.validate().expect("valid");
         content
     }

@@ -6270,6 +6270,251 @@ pub struct Label {""",
         "    format!(\"{tenant}/{run}\")",
         "    run.to_owned()",
     ),
+    # ── Standing approvals ─────────────────────────────────────────────────
+    "APathEscapeStaysUnderItsPrefix": (
+        "src/authority/approval.rs",
+        "a_path_matches_by_segment_and_never_through_an_escape",
+        "`src/../etc/passwd` matches a rule for `src`, so a write a person "
+        "approved for the source tree lands anywhere the model names",
+        """            ".." => {
+                segments.pop()?;
+            }""",
+        """            ".." => {}""",
+    ),
+    "AnArgvPrefixMatchesPartOfAWord": (
+        "src/authority/approval.rs",
+        "an_argv_prefix_matches_whole_elements",
+        "a rule for `cargo test` approves `cargo testify`, a different program "
+        "nobody approved",
+        """                        .all(|(want, got)| got.as_str() == Some(want.as_str()))""",
+        """                        .all(|(want, got)| got.as_str().is_some_and(|g| g.starts_with(want.as_str())))""",
+    ),
+    "ARuleMayApproveAnyArguments": (
+        "src/authority/approval.rs",
+        "a_rule_that_could_approve_anything_is_refused",
+        "a standing approval with no field constraint is issued, approving "
+        "every call to the tool, which removes `requires_approval` without the "
+        "reviewed declaration saying so",
+        """        if self.fields.is_empty() {""",
+        """        if self.fields.is_empty() && false {""",
+    ),
+    "ASpentRuleFailsTheRun": (
+        "src/runtime/ctx.rs",
+        "a_revoked_or_spent_rule_leaves_the_call_to_a_person",
+        "a standing approval spent or revoked since it was listed fails the "
+        "whole run instead of asking a person, as if no approval meant no call",
+        """                    | crate::core::EffectError::Final {
+                        disposition: crate::core::Disposition::DidNotHappen,
+                        ..
+                    },""",
+        """                    | crate::core::EffectError::Final {
+                        disposition: crate::core::Disposition::InDoubt,
+                        ..
+                    },""",
+    ),
+    "TheLoopNeverReadsStandingApprovals": (
+        "src/runtime/declarative.rs",
+        "a_call_approved_in_advance_opens_no_task_and_replays_from_the_record",
+        "a call a person approved in advance opens a task anyway, and the "
+        "reviewer approves the hundredth identical call by reflex",
+        """                    cx.standing_approval(&reference, &asked.arguments).await?""",
+        """                    None::<crate::authority::StandingApproval>""",
+    ),
+    # ── Following a run ────────────────────────────────────────────────────
+    "TheWakeUpPrecedesTheCommit": (
+        "src/store/redb.rs",
+        "redb_satisfies_the_journal_store_contract",
+        "a follower is woken before the append is durable, reads a journal "
+        "that does not show the record yet, takes the wake-up as spent, and "
+        "sleeps with the record unread",
+        """            w.commit().map_err(|e| be(&e))?;
+            if let Some(last) = sealed.last() {
+                signals.raise(&tenant, run, last.seq());
+            }""",
+        """            if let Some(last) = sealed.last() {
+                signals.raise(&tenant, run, last.seq());
+            }
+            w.commit().map_err(|e| be(&e))?;""",
+    ),
+    "NoNotificationLeavesTheTransaction": (
+        "src/store/postgres.rs",
+        "an_append_on_one_instance_wakes_a_follower_on_another",
+        "an append on one plane instance wakes nobody on another, so every "
+        "follower served by the other instance waits out its poll",
+        """            tx.execute("SELECT pg_notify($1, $2)", &[&APPEND_CHANNEL, &payload])""",
+        """            tx.execute("SELECT $1::text, $2::text", &[&APPEND_CHANNEL, &payload])""",
+    ),
+    "TheSealedJournalSwallowsTheHint": (
+        "src/keyring/journal.rs",
+        "the_sealed_journal_forwards_the_append_hint",
+        "a plane with a key ring answers *no hint* for a store that has one, "
+        "and every follower behind it polls without a word",
+        """        self.inner.watch(run).await""",
+        """        {
+            let _ = run;
+            None
+        }""",
+    ),
+    # ── The YAML reader ────────────────────────────────────────────────────
+    "AYaml11BooleanIsABoolean": (
+        "src/yaml.rs",
+        "a_yaml_1_1_boolean_word_is_not_a_boolean",
+        "`mutates: no` reads as `false`, so a grant a reviewer read as a word "
+        "is read-only: exempt from the whole-value taint gate and retried after "
+        "a timeout",
+        """    options.strict_booleans = true;""",
+        """    options.strict_booleans = false;""",
+    ),
+    "AKeyWrittenTwiceLastWins": (
+        "src/yaml.rs",
+        "a_key_written_twice_is_refused",
+        "a manifest that states a ceiling twice is read with the second one, "
+        "so the line a reviewer approved may be the one ignored",
+        """    options.duplicate_keys = DuplicateKeyPolicy::Error;""",
+        """    options.duplicate_keys = DuplicateKeyPolicy::LastWins;""",
+    ),
+    "AMergeKeyIsExpanded": (
+        "src/yaml.rs",
+        "a_merge_key_is_refused",
+        "`<<: *base` copies a grant's fields from elsewhere in the file, so "
+        "what a grant says is no longer on the lines that declare it",
+        """    options.merge_keys = MergeKeyPolicy::Error;""",
+        """    options.merge_keys = MergeKeyPolicy::Merge;""",
+    ),
+    "AYamlTagChoosesAVariant": (
+        "src/yaml.rs",
+        "a_yaml_tag_does_not_choose_an_enum_variant",
+        "a `!classify` tag selects a content rule's action, a spelling a JSON "
+        "reader of the same document does not see",
+        """    options.reject_unsupported_tags = true;""",
+        """    options.reject_unsupported_tags = false;""",
+    ),
+    "TheAliasBudgetIsTheParsersDefault": (
+        "src/yaml.rs",
+        "an_alias_bomb_is_refused_quickly",
+        "a declaration may replay a million aliased nodes, a budget sized for "
+        "data files paid by anybody who can submit a manifest",
+        """const MAX_REPLAYED_EVENTS: usize = 100_000;""",
+        """const MAX_REPLAYED_EVENTS: usize = 1_000_000;""",
+    ),
+    "TheRefusalLosesItsFieldPath": (
+        "src/yaml.rs",
+        "a_content_rule_that_cannot_refuse_is_refused_at_parse",
+        "a refusal says which line but not which field, so a reviewer fixing "
+        "the third rule's action counts list items to find it",
+        """            path = Some(e.path().to_string());""",
+        """            path = Some(".".to_owned());""",
+    ),
+    "EverySyntaxErrorIsInTheFirstDocument": (
+        "src/yaml.rs",
+        "a_multi_document_error_names_its_document",
+        "a syntax error in a room's third agent is reported against its first, "
+        "and the author fixes the wrong file section",
+        """            ordinal += 1;""",
+        """            ordinal = 1;""",
+    ),
+    # ── A declaration in Rust ──────────────────────────────────────────────
+    "TheBuilderSkipsValidation": (
+        "src/manifest/mod.rs",
+        "the_programmatic_manifest_builder_uses_the_yaml_validation_path",
+        "a manifest built in Rust skips the validation `parse` runs, so a "
+        "declaration YAML would refuse — an unbounded budget, a grant claiming "
+        "an approval nothing applies — governs a run",
+        """        self.normalize();
+        self.validate()?;
+        Ok(self)""",
+        """        self.normalize();
+        Ok(self)""",
+    ),
+    "AToolGrantConstructorIsReadOnly": (
+        "src/manifest/mod.rs",
+        "each_leaf_constructor_is_what_yaml_naming_only_its_arguments_parses_to",
+        "a grant declared in Rust is read-only unless its author says it "
+        "mutates, so it skips the whole-value taint gate and a timed-out call "
+        "is sent again — the opposite of what the same grant in YAML means",
+        """            mutates: yes(),""",
+        """            mutates: false,""",
+    ),
+    # ── A blob that moved ──────────────────────────────────────────────────
+    "ARewrittenBlobIsOnlyAFailure": (
+        "src/runtime/ctx.rs",
+        "a_blob_rewritten_under_a_run_quarantines_it",
+        "a blob rewritten under its address reaches the skill as an error it "
+        "may swallow, and the run whose history cannot be reproduced succeeds",
+        """                let _ = self.moved.set(format!("blob {digest}"));""",
+        """                let _ = digest;""",
+    ),
+    "AnErasedBlobQuarantines": (
+        "src/runtime/ctx.rs",
+        "an_erased_blob_fails_rather_than_quarantining",
+        "an erased blob quarantines the run that reads it, and the quarantine "
+        "backlog fills with lawful absences that hide the runs whose history moved",
+        """            Err(BlobError::Corrupt { .. }) => {""",
+        """            Err(BlobError::Corrupt { .. } | BlobError::Expired { .. } | BlobError::NotFound(_)) => {""",
+    ),
+    "AMovedMediaIsOnlyARejection": (
+        "src/model/mod.rs",
+        "rewritten_governed_media_quarantines_and_verifies",
+        "media rewritten under its address is a rejection the retry loop "
+        "repeats and the run fails, instead of quarantining",
+        """                crate::blob::BlobError::Corrupt { .. } => EffectError::Unreproducible {""",
+        """                crate::blob::BlobError::Corrupt { .. } if false => EffectError::Unreproducible {""",
+    ),
+    "TheMovedMediaMarkIsNotReplayed": (
+        "src/journal/replay.rs",
+        "rewritten_governed_media_quarantines_and_verifies",
+        "strict replay reads a moved-media failure as an ordinary one and parts "
+        "from the quarantine the live run reached",
+        """                        unreproducible: unreproducible.clone(),""",
+        """                        unreproducible: None,""",
+    ),
+    # ── Liveness claims ────────────────────────────────────────────────────
+    "ALivenessClaimOwesNoMutant": (
+        "tla/mutations.py",
+        "every_liveness_property_owes_a_property_mutant",
+        "a liveness property loses the only mutant that takes its fairness "
+        "away, and the claim ships held for a reason TLC never examined",
+        r'''        "Spec == Init /\\ [][Next]_vars",
+        "property",''',
+        r'''        "Spec == Init /\\ [][Next]_vars",
+        "invariant",''',
+    ),
+    # ── Prompt-cache tiers ─────────────────────────────────────────────────
+    "TheLongCacheWriteIsPricedShort": (
+        "src/model/mod.rs",
+        "a_one_hour_cache_write_is_billed_at_its_own_rate",
+        "a one-hour cache write is billed at the five-minute rate, so a run "
+        "that caches for an hour reports 1.25x where the provider charges 2x "
+        "and passes a money ceiling it exceeded",
+        """            (usage.cache_write_1h_tokens, self.cache_write_1h),""",
+        """            (usage.cache_write_1h_tokens, self.cache_write),""",
+    ),
+    "TheCallBoundIgnoresTheLongCacheRate": (
+        "src/manifest/mod.rs",
+        "a_manifest_derives_its_per_call_bound_from_every_role",
+        "the per-call bound a spend quota reserves prices input at the dearest "
+        "rate but the one-hour cache write, so a call whose prompt is written "
+        "to that tier costs more than was reserved for it",
+        """                .max(p.cache_write_1h);""",
+        """                .max(p.cache_write);""",
+    ),
+    "TheToolBreakpointIsDropped": (
+        "src/model/anthropic.rs",
+        "a_tool_breakpoint_reaches_the_body_with_its_ttl",
+        "a declaration marked for caching reaches Anthropic unmarked, so the "
+        "tool prefix is re-billed at the full input rate on every turn",
+        """                            tool["cache_control"] = cache_control(ttl);""",
+        """                            let _ = cache_control(ttl);""",
+    ),
+    "ACacheBreakpointLeavesTheKey": (
+        "src/model/mod.rs",
+        "a_cache_breakpoint_is_in_the_key_only_when_set",
+        "a marked call and an unmarked one share an effect key, so strict "
+        "replay reads back a completion made under a request it is no longer "
+        "sending",
+        """                        declared["cache"] = serde_json::json!(ttl.as_str());""",
+        """                        let _ = ttl;""",
+    ),
     # ── Tool declarations ───────────────────────────────────────────────────
     "AnInertQuarantinedModelParses": (
         "src/manifest/mod.rs",
@@ -7449,20 +7694,20 @@ pub struct Label {""",
         "a tool grant asking for a human is dispatched without asking, so the "
         "mutation happens and the only review left is of the answer — which "
         "arrives after the money moved",
-        """                let mut approved: Option<crate::core::Reach> = None;
-                if grant.requires_approval {""",
-        """                let mut approved: Option<crate::core::Reach> = None;
-                if false && grant.requires_approval {""",
+        """                if grant.requires_approval && standing.is_none() {""",
+        """                if false && grant.requires_approval && standing.is_none() {""",
     ),
     "APlannedCallSkipsItsApproval": (
         "src/runtime/declarative.rs",
         "a_planned_step_waits_for_its_approval",
         "a planned step whose grant asks for a human dispatches without asking "
         "— the plan was reviewed by nobody and the call by nobody either",
-        """    let mut approved: Option<crate::core::Reach> = None;
-    if grant.requires_approval {""",
-        """    let mut approved: Option<crate::core::Reach> = None;
-    if false && grant.requires_approval {""",
+        """        None
+    };
+    if grant.requires_approval && standing.is_none() {""",
+        """        None
+    };
+    if false && grant.requires_approval && standing.is_none() {""",
     ),
     "TheAuditIsSilentAboutReleases": (
         "src/audit.rs",

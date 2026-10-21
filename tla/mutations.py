@@ -46,6 +46,67 @@ MUTATIONS: dict[str, tuple[str, ...]] = {
         "Spec == Init /\\ [][Next]_vars",
         "property",
     ),
+    # The seven below bend fairness rather than drop it: every step stays fair
+    # except the one that reaches the property's goal. TLC's counterexample is
+    # then a fair schedule that stalls one step short of the goal, not stuttering
+    # at `Init`, which would only show the property does not follow from safety.
+    "SettlingIsNeverFair": (
+        "Authorization",
+        "Settles",
+        "no step that stops or finishes the run is fair",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next /\\ ~(status \\in {\"stopped\", \"done\"})')",
+        "property",
+    ),
+    "SettlementIsNeverFair": (
+        "EffectGroup",
+        "AlwaysSettles",
+        "no step that settles the group is fair",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next /\\ ~(Terminal)')",
+        "property",
+    ),
+    "TheLastRoundIsNeverFair": (
+        "Equivocation",
+        "RunsItsCourse",
+        "no step that completes the audit or the last round is fair",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next /\\ ~(audited \\/ steps = MaxSteps)')",
+        "property",
+    ),
+    "TheLastLeaseStepIsNeverFair": (
+        "Fencing",
+        "RunsItsCourse",
+        "no step that reaches the step bound is fair",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next /\\ ~(steps = MaxSteps)')",
+        "property",
+    ),
+    "RetryEndingIsNeverFair": (
+        "RetrySafety",
+        "Terminates",
+        "no step that ends the call is fair",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next /\\ ~(Terminal)')",
+        "property",
+    ),
+    "SagaEndingIsNeverFair": (
+        "Saga",
+        "Terminates",
+        "no step that ends the saga is fair",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next)",
+        "Spec == Init /\\ [][Next]_vars /\\ WF_vars(Next /\\ ~(Terminal)')",
+        "property",
+    ),
+    "TheVerdictIsNeverFair": (
+        "Delegation",
+        "EveryChainIsJudged",
+        "rehydration is never fair, while storing still is",
+        """             /\\ WF_vars(Store)
+             /\\ WF_vars(Rehydrate \\/ RejectRehydrate)""",
+        """             /\\ WF_vars(Store)""",
+        "property",
+    ),
     # Retrying an orphaned effect instead of escalating: the tempting,
     # helpful-looking bug that issues the invoice twice.
     "BlindRetry": (

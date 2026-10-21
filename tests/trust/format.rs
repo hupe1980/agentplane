@@ -204,6 +204,7 @@ fn effects() -> Vec<RecordKind> {
             spend: Spend::tokens(70),
             disposition: Disposition::InDoubt,
             permanent: true,
+            unreproducible: Some(format!("blob {}", digest())),
             elapsed_ms: Some(30_000),
         },
         RecordKind::EffectReconciled {

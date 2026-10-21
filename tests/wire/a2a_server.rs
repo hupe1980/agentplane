@@ -5954,6 +5954,12 @@ impl CountsReads {
 
 #[async_trait::async_trait]
 impl JournalStore for CountsReads {
+    async fn watch(
+        &self,
+        run: agentplane::core::RunId,
+    ) -> Option<agentplane::journal::AppendWatch> {
+        self.inner.watch(run).await
+    }
     fn is_shared(&self) -> bool {
         self.inner.is_shared()
     }

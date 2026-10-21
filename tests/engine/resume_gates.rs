@@ -843,6 +843,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         disposition: Disposition::InDoubt,
                         spend: agentplane::core::Spend::default(),
                         permanent: false,
+                        unreproducible: None,
                         elapsed_ms: None,
                     },
                 )

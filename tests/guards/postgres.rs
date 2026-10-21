@@ -126,6 +126,61 @@ async fn postgres_satisfies_the_journal_store_contract() {
     older.assert_conforms("PostgresStore under an upcaster");
 }
 
+/// An append one instance makes wakes a follower on another.
+///
+/// Two connections are two plane instances as far as the database knows. The
+/// notification is sent inside the append's transaction, so it reaches every
+/// listener once the append commits, and the follower reads what woke it.
+#[tokio::test]
+async fn an_append_on_one_instance_wakes_a_follower_on_another() {
+    use agentplane::core::RunId;
+    use agentplane::journal::{Append, RecordKind};
+    let Ok(container) = Postgres::default().with_tag(PG).start().await else {
+        eprintln!("skipping: no Docker daemon available");
+        return;
+    };
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let follower_side = connect_retrying(&url).await;
+    let writer_side = connect_retrying(&url).await;
+
+    let run = RunId::generate();
+    let mut follower = follower_side
+        .watch(run)
+        .await
+        .expect("postgres follows runs");
+    let lease = writer_side
+        .acquire(run, "writer", std::time::Duration::from_secs(60))
+        .await
+        .expect("lease");
+    let admitted = Append::new(
+        run,
+        RecordKind::RunAdmitted {
+            capability: "follow".into(),
+            governed_by: None,
+            input_label: agentplane::core::Label::trusted(),
+            input: serde_json::Value::Null,
+            policy_bundle: None,
+            canon: agentplane::core::canon::VERSION,
+            idempotency_key: None,
+            admitted_by: None,
+            served_unchained: false,
+            plane_chain: false,
+        },
+    );
+    writer_side
+        .append(lease.epoch, vec![admitted])
+        .await
+        .expect("append on the other instance");
+
+    let head = tokio::time::timeout(std::time::Duration::from_secs(10), follower.changed())
+        .await
+        .expect("a follower on another instance was never woken");
+    assert_eq!(head, Some(1));
+    let seen = follower_side.read(run, 1).await.expect("read");
+    assert_eq!(seen.len(), 1, "woken before the append was readable here");
+}
+
 /// Standing authority has the same semantics on the active-active backend.
 ///
 /// This is the backend the guarantee is about. On redb a single writer
