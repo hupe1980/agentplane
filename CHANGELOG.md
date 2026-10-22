@@ -16,7 +16,89 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
-## [0.48.0] — unreleased
+## [0.49.0] — 2026-10-22
+
+### Added
+
+- **A protected field may name the whole value**, `path: ""`, as a release
+  scope already does. An argument-less mutating tool is granted with
+  `one_of: [{}]` — exactly the empty call — or with `allowed_sources` naming who
+  may author the call. Before, no rule could admit it: a model's `{}` is
+  untrusted, and a grant with no field rules refuses any untrusted value.
+- **`StrictSubset`**: `OpenAi` and `Anthropic`, each with `problem(schema)`
+  naming every keyword and path its strict mode refuses.
+- **`Transcript`**, a tool loop's conversation with the label of everything in
+  it, and **`StepCtx::relayed`**, what a failed call may tell a model and with
+  which label. `examples/coded_tool_loop.rs` drives a loop with both.
+- **`Effect::carried` and `Effect::rebind_carried`**: what an effect sends
+  beside its bound arguments, which the sink judges like them.
+- **`StoreError::InUse` and `StoreError::Unreadable`**: opening a redb store
+  another handle holds, or bytes that are not a store this build reads (another
+  format, a corrupted file, an older build's table shapes), answers by type
+  instead of as `Backend` text to match.
+- **`ModelId::source()`**, the `model:{provider}/{model}` identity a
+  completion carries and a source rule names.
+- **`ToolGrant::drafted_from`** drafts a grant from what an MCP server says a
+  tool is: its description and schema, mutating whatever its annotations
+  claim, with no field rules. **`Discovered::drift`** names a description or
+  schema the server has changed since a grant reviewed it, and `serve --mcp`
+  prints it.
+
+### Changed
+
+- **BREAKING: Cedar 4.14, language version 4.6.** `policy::CEDAR_LANGUAGE` is
+  `4.6.0`, so every Cedar policy bundle digest moves once: an open run resumed
+  across this release is refused and must be re-admitted. The language adds
+  `external` declarations for partial schemas, which the validator refuses;
+  Cedar names no decision that changes for an existing policy set.
+- **BREAKING: `McpClient::discover` returns `Vec<Discovered>`**: the id,
+  annotations, description, input schema and a digest over them, where it
+  returned `(ToolId, Advertised)` pairs.
+- **BREAKING: `ModelCall::continuing` takes a `&Transcript`**, and
+  `ModelCall::with_continuation` is removed: `Transcript::asked` keeps the
+  provider state. Build the transcript with `Transcript::new(&prompt)`, record
+  each answer with `asked` and each result with `answered` or `failed`.
+- **BREAKING: `strict_schema_problem` answers for every provider**, prefixing
+  each problem with the provider that refuses it. Ask `StrictSubset` for one
+  provider.
+- **A typed tool's generated schema is strict-ready more often.** A documented
+  field of struct type is wrapped so its `$ref` stands alone, and an `Option`
+  field is listed in `required` with its `null` branch, which the tool reads as
+  `None`.
+- **`planned` plans and memory formation no longer put `maxItems` or
+  `minLength` in their schemas.** Anthropic's strict mode refuses both. The step
+  ceiling and the memory ceiling were already enforced by the runtime; an empty
+  memory key is now skipped there too.
+
+### Fixed
+
+- **The strict-mode check passed schemas the provider rejects.** Probed against
+  OpenAI, it passed sixteen of thirty shapes that come back as a 400 — an object
+  with no `properties` (every argument-less tool), a `$ref` with a sibling
+  `description`, a string `format` outside nine, a non-object root, `not`, `if`,
+  `uniqueItems` and more — so those tools were sent `strict: true` and the
+  request failed. It also refused `default`, which OpenAI accepts. It is now an
+  allow-list per provider.
+- **Anthropic was sent every qualifying tool strict, and native response
+  schemas unchecked.** A request past twenty strict tools, or with a response
+  schema using `maximum` or `maxItems`, was a 400 that never succeeds. The
+  driver keeps the request within Anthropic's documented budget and refuses an
+  unusable response schema before sending, naming the problem.
+- **`Effect::perform` did not say it must not block.** A blocking `perform` on
+  a current-thread runtime stalls the lease heartbeat, and past the lease TTL
+  the run's lease lapses. Its documentation now says so; use `spawn_blocking`,
+  or `StepCtx::task` for a person's decision.
+
+### Security
+
+- **A coded tool loop sent tool results past every sink gate.** Relayed
+  results reached the provider as bare values: the egress ceiling judged the
+  prompt alone, so a confidential result went to a model with a lower ceiling,
+  the answer was labelled as if it had read nothing, and sink content rules
+  never read them. The model sink now judges what a call carries, and a
+  redaction rewrites it. The declarative loop shares the same implementation.
+
+## [0.48.0] — 2026-10-21
 
 ### Added
 

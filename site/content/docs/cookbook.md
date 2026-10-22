@@ -1996,6 +1996,49 @@ for a test — derive it with `ToolCatalog::from_manifest(&m)`, which reads the
 reach off the declaration instead of restating it. See
 `examples/governed_transfer.rs`.
 
+## 🔁 Drive a tool loop from a skill you wrote {#drive-a-tool-loop-from-a-skill-you-wrote}
+
+Build the prompt once, keep a `Transcript`, and hand it to every turn:
+
+```rust
+let mut transcript = Transcript::new(&prompt);
+loop {
+    let answer = cx
+        .complete_with(&prompt, |call| call.with_tools(declared.clone()).continuing(&transcript))
+        .await?;
+    let calls = transcript.asked(&answer);
+    if calls.is_empty() {
+        return Ok(Outcome::done(answer.map(|c| json!({ "text": c.text }))));
+    }
+    for call in calls {
+        let arguments = Tainted::with_label(call.arguments.clone(), answer.label().clone());
+        match cx.call_tool(tool_for(&call), arguments).await {
+            Ok(output) => transcript.answered(call, &output),
+            Err(error) => match cx.relayed(&error) {
+                Some(detail) => transcript.failed(call, detail),
+                None => return Err(error.into()),
+            },
+        }
+    }
+}
+```
+
+The transcript holds every relayed result with its label, and the model sink
+judges it beside the prompt: a confidential result cannot reach a model whose
+ceiling is lower, the sink's content rules read it, and the next answer is
+labelled with it — so a field rule that admits only the model's authorship
+refuses arguments a tool's output steered. `/system` keeps its own label
+throughout. `cx.relayed` answers what a failed call may tell the model, labelled
+by whoever wrote it, or `None` for an error the executor must see.
+
+**The trap:** fixing the instruction's label by hand. Re-wrapping it —
+`Tainted::trusted(prompt.peek()["system"].clone())` — asserts trust over
+whatever the prompt was built from; joining the conversation's label into the
+whole prompt taints it, and the next turn is refused for untrusted data in
+`/system`. Build the prompt once and let the transcript carry the rest.
+`examples/coded_tool_loop.rs` runs a three-turn loop, including an
+argument-less mutating tool granted by its one call.
+
 ## 🔌 Call tools on an MCP server you already run {#call-tools-on-an-mcp-server-you-already-run}
 
 The tool tier is not "your tools, MCP-shaped". `tools::McpClient` is a real MCP
@@ -2091,7 +2134,7 @@ wired the other would get a **successful answer from the wrong server** under th
 first one's operator safety. A server nobody wired is `Unreachable`, and a grant naming
 one is refused at build rather than at the first call.
 
-### `discover()` is a diff, not a source
+### `discover()` drafts and diffs a grant; it is not a source {#discover-is-a-diff-not-a-source}
 
 An MCP server advertises its tools with annotations — `readOnlyHint`,
 `destructiveHint`, `idempotentHint` — and the obvious convenience is to import
@@ -2106,21 +2149,32 @@ server that marked its own money-moving tool read-only would be choosing, from
 the far side of the trust boundary, the one condition under which this runtime
 does something twice.
 
-So `discover()` returns what the server says **for comparison**:
+So `discover()` returns what the server says — annotations, description,
+argument schema and a digest over them — **to draft a grant and to compare a
+reviewed one with**:
 
 ```rust
-for (id, advertised) in tickets.discover().await? {
-    if let Some(safety) = catalog.safety(&id) {
+for found in tickets.discover().await? {
+    if let Some(safety) = catalog.safety(&found.id) {
         // Not an error — a server is entitled to describe itself and an
         // operator is entitled to disagree. It is worth an alert because a
         // server that *starts* claiming to be read-only after an update is
         // what a swapped-out or compromised server looks like from here.
-        if advertised.overclaims(safety) {
-            tracing::warn!(%id, "server claims more safety than the operator granted");
+        if found.advertised.overclaims(safety) {
+            tracing::warn!(id = %found.id, "server claims more safety than the operator granted");
         }
     }
 }
 ```
+
+The description and schema are what a model reads, and the server writes
+them: instructions hidden in a description are tool poisoning, and one changed
+after review is a rug pull. So they reach a model only through a grant.
+`ToolGrant::drafted_from(&found)` drafts one that mutates whatever the
+annotations claim and grants no field; a reviewer reads the text, adds the
+field rules and commits it under the manifest digest. `found.drift(&grant)` then
+names what the server has changed since — `agentplane serve --mcp` prints it —
+and an embedder with no grant file pins `found.digest`.
 
 **The trap:** treating discovery as configuration. A tool absent from the
 operator's catalogue cannot be called however the server advertises it, and that
@@ -3283,11 +3337,11 @@ The chunking is whitespace with the separator kept on the preceding chunk, so
 concatenating every delta reproduces `Completion::text` exactly — which is the
 property an observer that appends into a buffer actually depends on.
 
-OpenAI and Anthropic declarative tool loops preserve reasoning automatically.
+OpenAI and Anthropic tool loops preserve reasoning automatically.
 `Completion::continuation` carries opaque OpenAI output items or Anthropic
-thinking/signature blocks. A custom loop must pass that value through
-`ModelCall::with_continuation` beside `continuing(exchanges)`; otherwise a
-reasoning-enabled continuation fails closed.
+thinking/signature blocks, and `Transcript::asked` keeps it for the next turn,
+so a coded loop that continues with `ModelCall::continuing(&transcript)` passes
+it through without handling it.
 
 ## 🗜️ Compact a memory without laundering it {#compact-a-memory-without-laundering-it}
 

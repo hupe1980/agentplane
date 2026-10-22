@@ -417,6 +417,30 @@ pub trait Effect: Send + Sync {
         false
     }
 
+    /// What this effect sends beside its bound arguments, with the label of
+    /// everything in it.
+    ///
+    /// The sink gates judge [`sink_arguments`](Self::sink_arguments) and the
+    /// label handed beside them, so anything else the far side receives crosses
+    /// them only if it is declared here. A model call continuing a tool loop
+    /// sends every relayed tool result beside a prompt that never held them:
+    /// declared, their label joins the outbound label before every gate, the
+    /// sink's content rules read them, and the answer is labelled with them,
+    /// since they shaped it. `None`, the default, means the bound arguments are
+    /// the whole request.
+    fn carried(&self) -> Option<crate::core::Tainted<Value>> {
+        None
+    }
+
+    /// Bind a redacted copy of [`carried`](Self::carried), where the effect can.
+    ///
+    /// `false`, the default, refuses a redaction the carried data needs rather
+    /// than sending it whole — the rule [`rebind`](Self::rebind) keeps for the
+    /// bound arguments.
+    fn rebind_carried(&mut self, _carried: Value) -> bool {
+        false
+    }
+
     /// How many bytes dispatching this effect sends out of the plane.
     ///
     /// What an egress ceiling counts. Defaults to the canonical size of
@@ -545,6 +569,14 @@ pub trait Effect: Send + Sync {
 
     /// Do the thing. Called at most once per key per run; never called during
     /// replay.
+    ///
+    /// **Must not block its thread.** It runs on the executor that also renews
+    /// the run's lease: on a current-thread runtime, a `perform` that blocks —
+    /// a terminal prompt, a synchronous HTTP client, a long computation —
+    /// stops every other task, and past the lease TTL the lease lapses and its
+    /// heartbeat ends. Move blocking work to `tokio::task::spawn_blocking` and
+    /// await it. A person's decision is not an effect to wait inside at all:
+    /// `StepCtx::task` suspends the run durably until it is made.
     async fn perform(&self) -> Result<Self::Output, EffectError>;
 
     /// Ask the provider whether a call landed.
@@ -666,6 +698,8 @@ pub trait AnyEffect: Send + Sync {
     fn max_sensitivity(&self) -> Sensitivity;
     fn sink_arguments(&self) -> Option<&Value>;
     fn rebind_erased(&mut self, arguments: Value) -> bool;
+    fn carried(&self) -> Option<crate::core::Tainted<Value>>;
+    fn rebind_carried_erased(&mut self, carried: Value) -> bool;
     fn outbound_bytes(&self) -> u64;
     fn credential_binding(&self) -> Option<CredentialBinding>;
     fn protected_fields(&self) -> &[ProtectedField];
@@ -712,6 +746,12 @@ where
     }
     fn rebind_erased(&mut self, arguments: Value) -> bool {
         Effect::rebind(self, arguments)
+    }
+    fn carried(&self) -> Option<crate::core::Tainted<Value>> {
+        Effect::carried(self)
+    }
+    fn rebind_carried_erased(&mut self, carried: Value) -> bool {
+        Effect::rebind_carried(self, carried)
     }
     fn outbound_bytes(&self) -> u64 {
         Effect::outbound_bytes(self)
@@ -816,6 +856,12 @@ impl Effect for Box<dyn AnyEffect + '_> {
     }
     fn rebind(&mut self, arguments: Value) -> bool {
         (**self).rebind_erased(arguments)
+    }
+    fn carried(&self) -> Option<crate::core::Tainted<Value>> {
+        (**self).carried()
+    }
+    fn rebind_carried(&mut self, carried: Value) -> bool {
+        (**self).rebind_carried_erased(carried)
     }
     fn outbound_bytes(&self) -> u64 {
         (**self).outbound_bytes()

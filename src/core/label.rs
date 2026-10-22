@@ -556,7 +556,7 @@ impl ProtectedField {
     #[must_use]
     pub fn trusted(path: impl Into<String>) -> Self {
         let path = path.into();
-        assert_json_pointer(&path);
+        assert_protected_path(&path);
         Self {
             path,
             require_trusted: true,
@@ -581,7 +581,7 @@ impl ProtectedField {
         sources: impl IntoIterator<Item = SourceId>,
     ) -> Self {
         let path = path.into();
-        assert_json_pointer(&path);
+        assert_protected_path(&path);
         let allowed_sources = sources.into_iter().collect::<BTreeSet<_>>();
         assert!(
             !allowed_sources.is_empty(),
@@ -683,8 +683,10 @@ impl ProtectedField {
     /// Constructors enforce these invariants for Rust callers; manifests and
     /// other serialized inputs must prove them after deserialization.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if !is_json_pointer(&self.path) {
-            return Err("path must be a non-empty absolute RFC 6901 JSON Pointer");
+        if !is_protected_path(&self.path) {
+            return Err(
+                "path must be `\"\"` (the whole value) or an absolute RFC 6901 JSON Pointer",
+            );
         }
         if self.require_trusted && !self.allowed_sources.is_empty() {
             return Err("require_trusted and allowed_sources are mutually exclusive");
@@ -705,11 +707,20 @@ impl ProtectedField {
     }
 }
 
-fn assert_json_pointer(path: &str) {
+fn assert_protected_path(path: &str) {
     assert!(
-        is_json_pointer(path),
-        "a protected field path must be a non-empty absolute RFC 6901 JSON Pointer"
+        is_protected_path(path),
+        "a protected field path must be `\"\"` (the whole value) or an absolute RFC 6901 JSON Pointer"
     );
+}
+
+/// What a protected field may name: the whole value, spelled `""` as a release
+/// scope spells it, or one field of it.
+///
+/// The whole value is what an argument-less tool needs: its call carries no
+/// field to name, and the decision a rule must bound is the call itself.
+fn is_protected_path(path: &str) -> bool {
+    path.is_empty() || is_json_pointer(path)
 }
 
 fn is_json_pointer(path: &str) -> bool {
@@ -886,7 +897,6 @@ impl<T> Tainted<T> {
     /// Release marks do not survive: absorbing a dependency is a mix, and no
     /// release covers data it was never granted over — the same rule
     /// [`zip`](Self::zip) applies. Losing a mark refuses more, never less.
-    #[cfg(feature = "manifest")]
     pub(crate) fn with_joined_label(&self, other: &Label) -> Self
     where
         T: Clone,
@@ -2380,7 +2390,7 @@ mod release_validation_tests {
 
     /// The safe constructors refuse a path that is not a JSON Pointer.
     ///
-    /// `assert_json_pointer` replaced with `()` survived. The first attempt at
+    /// `assert_protected_path` replaced with `()` survived. The first attempt at
     /// this test aimed at `Release::fields`, which panics through `validate`
     /// rather than through the assert — so it passed with the mutation applied
     /// and proved nothing. The assert's only callers are the two
@@ -2403,6 +2413,24 @@ mod release_validation_tests {
         // The acceptance, so a panic-on-everything change cannot pass.
         let ok = ProtectedField::trusted("/recipient");
         assert_eq!(ok.path(), "/recipient");
+    }
+
+    /// `""` names the whole value, in every constructor and in `validate`.
+    ///
+    /// An argument-less tool's call carries no field, so without it no rule can
+    /// bound the one decision such a call is. `is_json_pointer` keeps refusing
+    /// `""`: a release scope admits it by its own rule, and a pointer that
+    /// silently meant "everything" there would widen what a field release covers.
+    #[test]
+    fn the_whole_value_is_a_protected_path() {
+        let menu = ProtectedField::one_of("", [serde_json::json!({})]);
+        let sourced = ProtectedField::from_sources("", [SourceId::new("model:fake/m")]);
+        let trusted = ProtectedField::trusted("");
+        for field in [&menu, &sourced, &trusted] {
+            assert_eq!(field.path(), "");
+            assert_eq!(field.validate(), Ok(()));
+        }
+        assert!(!is_json_pointer(""));
     }
 
     /// Evidence is the difference between a decision and an assertion.

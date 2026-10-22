@@ -1292,23 +1292,25 @@ impl Skill for Continues {
         cx: &mut StepCtx<'_>,
         _input: Tainted<Value>,
     ) -> Result<Outcome, SkillError> {
-        let exchange = agentplane::model::ToolExchange::ok(
+        let prompt = Tainted::trusted(json!("hi"));
+        let mut transcript = agentplane::model::Transcript::new(&prompt);
+        transcript.answered(
             agentplane::model::ToolCall {
                 id: "c1".to_owned(),
                 name: "export".to_owned(),
                 arguments: json!({}),
             },
-            json!({ "rows": "r".repeat(1_000_000) }),
+            &Tainted::trusted(json!({ "rows": "r".repeat(1_000_000) })),
         );
         let provider: Arc<dyn agentplane::model::ModelProvider> =
             Arc::new(CountingModel(Arc::clone(&self.0)));
-        cx.sink_with(&Tainted::trusted(json!("hi")), |prompt| {
+        cx.sink_with(&prompt, |prompt| {
             agentplane::model::ModelCall::new(
                 provider,
                 agentplane::model::ModelId::new("custom", "m"),
                 prompt,
             )
-            .continuing([exchange])
+            .continuing(&transcript)
         })
         .await?;
         Ok(Outcome::done(Tainted::trusted(json!({ "done": true }))))

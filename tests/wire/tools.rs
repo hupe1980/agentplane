@@ -1057,6 +1057,100 @@ async fn untrusted_data_from_an_allowed_source_may_select_a_protected_argument()
     assert_eq!(client.calls.lock().unwrap().as_slice(), ["ledger/transfer"]);
 }
 
+/// Sends one labelled value, whole, to the mutating `ledger/transfer`.
+///
+/// The value is the fixture: an argument-less call is `{}` with the label of
+/// whoever chose to make it.
+#[derive(Debug)]
+struct SendsValue {
+    catalog: ToolCatalog,
+    client: Arc<Fake>,
+    value: Tainted<Value>,
+}
+
+#[async_trait::async_trait]
+impl Skill for SendsValue {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("sends-value").provides("sends-value")
+    }
+
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        _input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let arguments = self.value.clone();
+        let call = ToolCall::prepare(
+            &self.catalog,
+            Arc::clone(&self.client) as Arc<dyn ToolClient>,
+            transfer(),
+            arguments.peek().clone(),
+            None,
+        )
+        .map_err(|error| SkillError::Other(error.to_string()))?;
+        let out = cx.sink(call, &arguments).await?;
+        Ok(Outcome::done(out))
+    }
+}
+
+async fn send_whole(rule: ProtectedField, value: Tainted<Value>) -> (RunStatus, Vec<String>) {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let client = Fake::ok();
+    let catalog = ToolCatalog::new().allow(
+        transfer(),
+        ToolSafety::default()
+            .max_sensitivity(Sensitivity::Secret)
+            .protect(rule),
+    );
+    let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+        .skill(SendsValue {
+            catalog,
+            client: Arc::clone(&client),
+            value,
+        })
+        .build()
+        .run("sends-value", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    let calls = client.calls.lock().unwrap().clone();
+    (out.status, calls)
+}
+
+fn from_model(value: Value) -> Tainted<Value> {
+    Tainted::from_source(value, SourceId::new("model:fake/m"))
+}
+
+/// **An argument-less mutating tool is granted with a menu of one call.**
+///
+/// The model's `{}` is untrusted, and the call it chooses *is* the act, so it
+/// is not "no data": with no rule the whole-value gate refuses it. `""` names
+/// the whole value, and `one_of: [{}]` admits exactly the empty call — the
+/// same model asking with any argument is refused, naming the rule's path.
+#[tokio::test]
+async fn a_whole_value_menu_admits_exactly_an_empty_call() {
+    let menu = || ProtectedField::one_of("", [json!({})]);
+
+    let (status, calls) = send_whole(menu(), from_model(json!({}))).await;
+    assert!(
+        matches!(status, RunStatus::Succeeded),
+        "an untrusted empty call was refused by a menu that lists it: {status:?}"
+    );
+    assert_eq!(calls, ["ledger/transfer"]);
+
+    let (status, calls) = send_whole(menu(), from_model(json!({ "path": "/etc" }))).await;
+    match status {
+        RunStatus::Failed(reason) => assert!(
+            reason.contains("''"),
+            "the refusal does not name the whole-value rule: {reason}"
+        ),
+        other => panic!("a call outside the menu was admitted: {other:?}"),
+    }
+    assert!(
+        calls.is_empty(),
+        "the tool was called with arguments nobody listed"
+    );
+}
+
 /// An untrusted value outside a field's declared set never reaches the tool.
 ///
 /// The content discipline: the manifest enumerates what may stand in the
@@ -2472,7 +2566,11 @@ async fn a_refusal_tells_the_model_nothing_it_can_differentiate() {
     // the model's own untrusted (`Internal`) arguments are refused at the
     // ceiling — the sharpest oracle there is.
     let (out, provider) = run_tool_calling::<Declines>("").await;
-    assert!(matches!(out.status, RunStatus::Succeeded));
+    assert!(
+        matches!(out.status, RunStatus::Succeeded),
+        "{:?}",
+        out.status
+    );
 
     let told: Vec<String> = provider
         .asked()

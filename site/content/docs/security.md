@@ -1751,6 +1751,12 @@ block field by field.
 No record, error or log line carries matched text. A refusal names the rule
 and a JSON pointer, and writes an object key any rule matches as `*`.
 
+**At a model sink, a rule also reads what a tool loop relays.** Each tool
+result a continuing call carries beside its prompt is judged by the sink's
+rules and checks as the prompt is — refused, raised or redacted, with the
+record over the redacted bytes. A rule with `fields` does not: its pointers
+address the prompt.
+
 **What a rule proves is narrow:** rule R refused, raised or redacted values
 whose strings, after Unicode NFC, matched P at boundary B. Homoglyphs, base64
 and other encodings, and a value split across two fields evade a pattern; the

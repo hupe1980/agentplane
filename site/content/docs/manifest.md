@@ -669,6 +669,21 @@ a mutating tool with **no** protected fields refuses untrusted arguments
 outright, and declaring which fields a model may influence is how you permit the
 useful part without permitting the dangerous part.
 
+`path: ""` names the **whole value**. A tool that takes no arguments has no
+field to name, and calling it *is* the act, so the rule bounds the call itself:
+
+```yaml
+  - ref: "tool://repo/format"
+    mutates: true
+    protected_fields:
+      - path: ""
+        one_of: [{}]          # exactly the empty call, and nothing else
+```
+
+`allowed_sources` at `""` names who may author the whole call, and
+`require_trusted` at `""` states the conservative gate out loud. Every rule at
+`""` sits beside any field rules, and all of them must pass.
+
 `one_of` is the content discipline — the select-from-a-menu pattern made
 declarative. Every entry was reviewed, so an untrusted influence choosing
 *among* them discloses only which approved option was chosen; matching is
@@ -688,7 +703,8 @@ parse: declaring protected fields is what lifts the whole-object taint gate,
 and a ceiling bounds how *secret* an argument may be, not who authored it —
 so the model's own untrusted completion would fill every authority-bearing
 field unconstrained. A source rule names the **concrete** source an effect's
-output carries: `tool://server/name`, `model:{provider}/{model}`,
+output carries: `tool://server/name`, `model:{provider}/{model}`
+(`ModelId::source()` in Rust),
 `agent/{capability}`, or an operator identity of your own.
 
 ### Which grants went unused {#unused-grants}
@@ -791,12 +807,11 @@ a driver handed an open object either refuses the call or generates without
 constraint. A **coded** agent is exempt — nothing generates against its
 schemas.
 
-The rest of the constrained-decoding subset is not checked here, because
-providers spell it differently, but the OpenAI driver refuses the call before
-sending if it is missed: every property in `required`, every array with `items`,
-optionality as `type: [string, null]`, no `oneOf`, `allOf` or `default`, and a
-`type` on every subschema. `agentplane::model::strict_schema_problem` answers
-for one schema, naming the rule it breaks.
+The rest of the constrained-decoding subset is each provider's, and the
+drivers apply it: a response schema outside it is refused before sending, and a
+tool is sent non-strict ([model providers](@/docs/interop.md#model-providers-providers-bedrock)).
+`agentplane::model::strict_schema_problem` names every rule a schema breaks, on
+every provider.
 
 ## `spec.oversight`
 

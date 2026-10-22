@@ -59,7 +59,7 @@ use rmcp::service::{
 use rmcp::transport::IntoTransport;
 use serde_json::Value;
 
-use super::{Advertised, ToolClient, ToolError, ToolId};
+use super::{Advertised, Discovered, ToolClient, ToolError, ToolId};
 use crate::core::{Effect, EffectDescriptor, EffectError, Recovery, Sensitivity, Trust};
 
 /// Data-flow limits for one MCP prompt or resource grant.
@@ -555,15 +555,17 @@ impl McpClient {
         })
     }
 
-    /// What this server says its tools are.
+    /// What this server says its tools are: annotations, description and
+    /// argument schema, each with a digest.
     ///
-    /// Returned for comparison against the operator's catalogue, never to build
-    /// one. See the module docs.
+    /// Returned to draft a grant and to compare a reviewed one with, never to
+    /// build a catalogue or reach a model. See [`Discovered`] and the module
+    /// docs.
     ///
     /// # Errors
     ///
     /// If the server cannot be listed.
-    pub async fn discover(&self) -> Result<Vec<(ToolId, Advertised)>, ToolError> {
+    pub async fn discover(&self) -> Result<Vec<Discovered>, ToolError> {
         let listed = bounded(self.timeout, self.service.list_all_tools())
             .await
             .map_err(|e| Self::classify(&ToolId::new(&self.server, "tools/list"), &e))?;
@@ -572,13 +574,15 @@ impl McpClient {
             .into_iter()
             .map(|t| {
                 let annotations = t.annotations.as_ref();
-                (
+                Discovered::new(
                     ToolId::new(&self.server, t.name.to_string()),
                     Advertised {
                         read_only: annotations.and_then(|a| a.read_only_hint),
                         destructive: annotations.and_then(|a| a.destructive_hint),
                         idempotent: annotations.and_then(|a| a.idempotent_hint),
                     },
+                    t.description.as_deref().unwrap_or_default(),
+                    Value::Object((*t.input_schema).clone()),
                 )
             })
             .collect())

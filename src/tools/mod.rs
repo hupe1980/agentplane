@@ -383,6 +383,64 @@ pub struct Advertised {
     pub idempotent: Option<bool>,
 }
 
+/// What a server says one of its tools is: a draft for a grant, and the
+/// reference a reviewed grant is compared with.
+///
+/// The description and schema are **model-steering text from the far side of
+/// a trust boundary** — a server can write instructions into them (tool
+/// poisoning) or change them after a person approved the tool (a rug pull). So
+/// nothing here reaches a model or decides anything. The grant does both: it
+/// carries the description and argument schema an operator reviewed, under the
+/// manifest digest, and [`drift`](Self::drift) names where the server has since
+/// moved away from it. [`digest`](Self::digest) pins what was reviewed for an
+/// embedder that keeps no grant file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Discovered {
+    /// Keyed by the name this plane knows the server by, never the server's own.
+    pub id: ToolId,
+    pub advertised: Advertised,
+    pub description: String,
+    pub input_schema: Value,
+    /// Over the tool's name, description, schema and annotations, canonically.
+    pub digest: crate::core::Digest,
+}
+
+impl Discovered {
+    /// Assemble one, computing its digest.
+    #[must_use]
+    pub fn new(
+        id: ToolId,
+        advertised: Advertised,
+        description: impl Into<String>,
+        input_schema: Value,
+    ) -> Self {
+        let description = description.into();
+        let digest =
+            crate::core::Digest::of(&crate::core::canon::value_bytes(&serde_json::json!({
+                "name": id.tool,
+                "description": description,
+                "input_schema": input_schema,
+                "annotations": advertised,
+            })));
+        Self {
+            id,
+            advertised,
+            description,
+            input_schema,
+            digest,
+        }
+    }
+}
+
+/// Where a server's tool has moved away from the grant an operator reviewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Drift {
+    /// The server now describes the tool differently.
+    Description,
+    /// The server now takes a different argument schema.
+    Arguments,
+}
+
 impl Advertised {
     /// Whether the server claims more safety than the operator granted.
     ///

@@ -49,9 +49,9 @@ use serde_json::{Value, json};
 
 use crate::core::Secret;
 
+use super::AnthropicBudget;
 #[cfg(test)]
 use super::ModelCall;
-use super::strict_schema_problem;
 use super::wire::{RESPOND_TOOL, classify_status, classify_transport, structured};
 use super::{
     Completion, ModelError, ModelId, ModelProvider, Request, SchemaMode, Usage, anthropic_stream,
@@ -753,16 +753,29 @@ impl Anthropic {
         // Anthropic takes declarations at the top level: `name`, `description`,
         // `input_schema` — no `function` wrapper, and `input_schema` rather than
         // `parameters`. Rendered here so a caller writes one declaration.
+        //
+        // One strict budget per request. A native response schema is charged
+        // first, because the answer cannot do without it; a tool past the
+        // budget, or outside Anthropic's subset, goes non-strict rather than
+        // turning the whole request into a 400.
+        let mut budget = AnthropicBudget::default();
+        if let Some(schema) = schema
+            && self.mode_for(model) == SchemaMode::Native
+            && let Err(problem) = budget.admit(schema)
+        {
+            return Err(ModelError::Refused {
+                model: model.clone(),
+                detail: format!(
+                    "the schema cannot be used with strict constrained decoding: {problem}"
+                ),
+            });
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(
                 tools
                     .iter()
                     .map(|t| {
-                        // Strict only where the schema meets the strict
-                        // subset — the same per-tool gate the OpenAI driver
-                        // applies, because the seam promises a caller writes
-                        // one declaration for every provider.
-                        let strict = strict_schema_problem(&t.parameters).is_none();
+                        let strict = budget.tool(&t.parameters);
                         let mut tool = json!({
                             "name": t.name,
                             "description": t.description,
@@ -835,7 +848,7 @@ impl Anthropic {
                         "name": RESPOND_TOOL,
                         "description": "Return the answer in the required shape.",
                         "input_schema": schema,
-                        "strict": strict_schema_problem(schema).is_none(),
+                        "strict": budget.tool(schema),
                     }]);
                     body["tool_choice"] = json!({ "type": "tool", "name": RESPOND_TOOL });
                 }
@@ -1495,6 +1508,69 @@ mod tool_tests {
         )
     }
 
+    fn strict_tool(name: &str) -> ToolDeclaration {
+        ToolDeclaration::new(
+            name,
+            "Read one thing.",
+            json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+                "additionalProperties": false,
+            }),
+        )
+    }
+
+    /// **A request carries at most twenty strict tools.**
+    ///
+    /// Anthropic documents twenty strict tools per request, and past it the
+    /// request is a 400 rather than a degraded one. Every tool here qualifies
+    /// on its own, so marking each that qualifies made a large catalogue a
+    /// request that never succeeds; the twenty-first goes non-strict instead.
+    #[test]
+    fn anthropic_marks_at_most_twenty_tools_strict() {
+        let tools: Vec<ToolDeclaration> = (0..21).map(|i| strict_tool(&format!("t{i}"))).collect();
+        let body = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "messages": [] }),
+                None,
+                &tools,
+                &[],
+            )
+            .expect("a body with tools");
+        let strict = body["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter(|t| t["strict"] == true)
+            .count();
+        assert_eq!(strict, 20, "{body}");
+        assert_eq!(body["tools"][20]["strict"], false);
+    }
+
+    /// A native response schema outside Anthropic's subset is refused before
+    /// it is sent, naming the problem — the 400 it would have been, made local.
+    #[test]
+    fn an_unsupported_native_schema_is_refused_before_it_is_sent() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer", "maximum": 9 } },
+            "required": ["n"],
+            "additionalProperties": false,
+        });
+        let err = driver()
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                &json!({ "messages": [] }),
+                Some(&schema),
+                &[],
+                &[],
+            )
+            .expect_err("a schema Anthropic answers with a 400 was sent");
+        assert!(err.to_string().contains("maximum"), "{err}");
+    }
+
     /// A breakpoint on a declaration reaches the body as `cache_control`.
     ///
     /// Tools are the first block in Anthropic's cache order and usually the
@@ -1568,7 +1644,7 @@ mod tool_tests {
         assert_eq!(tool["name"], "ledger.read");
         assert_eq!(
             tool["strict"], false,
-            "this schema has an optional property, which strict mode rejects — an \
+            "this schema leaves its object open, which strict mode rejects — an \
              unconditional `strict: true` made one declaration work on OpenAI and \
              400 here: {body}"
         );
@@ -1618,7 +1694,7 @@ mod tool_tests {
         // output, so the answer's shape is obtained by forcing a synthetic tool.
         let model = ModelId::new("anthropic", "claude-x");
         let forced = driver().structured_via(SchemaMode::ForcedTool);
-        let schema = json!({ "type": "object" });
+        let schema = json!({ "type": "object", "properties": {}, "required": [], "additionalProperties": false });
         let out = forced.body(
             &model,
             &json!({ "messages": [] }),

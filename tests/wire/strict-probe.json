@@ -1,0 +1,1379 @@
+{
+ "as": "function tool parameters, strict: true",
+ "cases": {
+  "additionalProperties_schema": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": {
+     "type": "string"
+    },
+    "properties": {},
+    "required": [],
+    "type": "object"
+   }
+  },
+  "allOf": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "allOf": [
+       {
+        "type": "string"
+       }
+      ]
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "anyOf_branch_open_object": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "anyOf": [
+       {
+        "properties": {
+         "a": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "a"
+        ],
+        "type": "object"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "anyOf_nested": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "anyOf": [
+       {
+        "anyOf": [
+         {
+          "type": "string"
+         }
+        ]
+       },
+       {
+        "type": "null"
+       }
+      ]
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "anyOf_sibling_desc": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "d"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "anyOf_sibling_type": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "anyOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "type": "string"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "comment": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "$comment": "c",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "const": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "c": {
+      "const": "x"
+     }
+    },
+    "required": [
+     "c"
+    ],
+    "type": "object"
+   }
+  },
+  "const_with_type": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "c": {
+      "const": "x",
+      "type": "string"
+     }
+    },
+    "required": [
+     "c"
+    ],
+    "type": "object"
+   }
+  },
+  "contains": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "contains": {
+       "type": "string"
+      },
+      "items": {
+       "type": "string"
+      },
+      "type": "array"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "default": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "default": "x",
+      "type": "string"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "definitions_ref": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "definitions": {
+     "X": {
+      "additionalProperties": false,
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": "object"
+     }
+    },
+    "properties": {
+     "x": {
+      "$ref": "#/definitions/X"
+     }
+    },
+    "required": [
+     "x"
+    ],
+    "type": "object"
+   }
+  },
+  "defs_ref": {
+   "accepted": true,
+   "schema": {
+    "$defs": {
+     "X": {
+      "additionalProperties": false,
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": "object"
+     }
+    },
+    "additionalProperties": false,
+    "properties": {
+     "x": {
+      "$ref": "#/$defs/X"
+     }
+    },
+    "required": [
+     "x"
+    ],
+    "type": "object"
+   }
+  },
+  "defs_unused_open": {
+   "accepted": false,
+   "schema": {
+    "$defs": {
+     "X": {
+      "type": "object"
+     }
+    },
+    "additionalProperties": false,
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "a"
+    ],
+    "type": "object"
+   }
+  },
+  "dependentRequired": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "dependentRequired": {
+     "a": [
+      "b"
+     ]
+    },
+    "properties": {
+     "a": {
+      "type": "string"
+     },
+     "b": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "a",
+     "b"
+    ],
+    "type": "object"
+   }
+  },
+  "deprecated": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "deprecated": true,
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "depth_10": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "a": {
+      "additionalProperties": false,
+      "properties": {
+       "a": {
+        "additionalProperties": false,
+        "properties": {
+         "a": {
+          "additionalProperties": false,
+          "properties": {
+           "a": {
+            "additionalProperties": false,
+            "properties": {
+             "a": {
+              "additionalProperties": false,
+              "properties": {
+               "a": {
+                "additionalProperties": false,
+                "properties": {
+                 "a": {
+                  "additionalProperties": false,
+                  "properties": {
+                   "a": {
+                    "additionalProperties": false,
+                    "properties": {
+                     "a": {
+                      "additionalProperties": false,
+                      "properties": {
+                       "a": {
+                        "type": "string"
+                       }
+                      },
+                      "required": [
+                       "a"
+                      ],
+                      "type": "object"
+                     }
+                    },
+                    "required": [
+                     "a"
+                    ],
+                    "type": "object"
+                   }
+                  },
+                  "required": [
+                   "a"
+                  ],
+                  "type": "object"
+                 }
+                },
+                "required": [
+                 "a"
+                ],
+                "type": "object"
+               }
+              },
+              "required": [
+               "a"
+              ],
+              "type": "object"
+             }
+            },
+            "required": [
+             "a"
+            ],
+            "type": "object"
+           }
+          },
+          "required": [
+           "a"
+          ],
+          "type": "object"
+         }
+        },
+        "required": [
+         "a"
+        ],
+        "type": "object"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": "object"
+     }
+    },
+    "required": [
+     "a"
+    ],
+    "type": "object"
+   }
+  },
+  "depth_11": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "a": {
+      "additionalProperties": false,
+      "properties": {
+       "a": {
+        "additionalProperties": false,
+        "properties": {
+         "a": {
+          "additionalProperties": false,
+          "properties": {
+           "a": {
+            "additionalProperties": false,
+            "properties": {
+             "a": {
+              "additionalProperties": false,
+              "properties": {
+               "a": {
+                "additionalProperties": false,
+                "properties": {
+                 "a": {
+                  "additionalProperties": false,
+                  "properties": {
+                   "a": {
+                    "additionalProperties": false,
+                    "properties": {
+                     "a": {
+                      "additionalProperties": false,
+                      "properties": {
+                       "a": {
+                        "additionalProperties": false,
+                        "properties": {
+                         "a": {
+                          "type": "string"
+                         }
+                        },
+                        "required": [
+                         "a"
+                        ],
+                        "type": "object"
+                       }
+                      },
+                      "required": [
+                       "a"
+                      ],
+                      "type": "object"
+                     }
+                    },
+                    "required": [
+                     "a"
+                    ],
+                    "type": "object"
+                   }
+                  },
+                  "required": [
+                   "a"
+                  ],
+                  "type": "object"
+                 }
+                },
+                "required": [
+                 "a"
+                ],
+                "type": "object"
+               }
+              },
+              "required": [
+               "a"
+              ],
+              "type": "object"
+             }
+            },
+            "required": [
+             "a"
+            ],
+            "type": "object"
+           }
+          },
+          "required": [
+           "a"
+          ],
+          "type": "object"
+         }
+        },
+        "required": [
+         "a"
+        ],
+        "type": "object"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": "object"
+     }
+    },
+    "required": [
+     "a"
+    ],
+    "type": "object"
+   }
+  },
+  "empty_properties": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {},
+    "required": [],
+    "type": "object"
+   }
+  },
+  "empty_schema_prop": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "x": {}
+    },
+    "required": [
+     "x"
+    ],
+    "type": "object"
+   }
+  },
+  "enum_mixed": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "e": {
+      "enum": [
+       "a",
+       1,
+       null
+      ]
+     }
+    },
+    "required": [
+     "e"
+    ],
+    "type": "object"
+   }
+  },
+  "enum_object": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "e": {
+      "enum": [
+       {
+        "a": 1
+       }
+      ]
+     }
+    },
+    "required": [
+     "e"
+    ],
+    "type": "object"
+   }
+  },
+  "enum_with_type": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "e": {
+      "enum": [
+       "a",
+       "b"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [
+     "e"
+    ],
+    "type": "object"
+   }
+  },
+  "examples": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "examples": [
+       "a"
+      ],
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "exclusiveMinimum": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "exclusiveMinimum": 0,
+      "type": "number"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "format_uint32": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "format_uri": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "u": {
+      "format": "uri",
+      "type": "string"
+     }
+    },
+    "required": [
+     "u"
+    ],
+    "type": "object"
+   }
+  },
+  "id": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "$id": "x",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "if_then": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "if": {
+       "type": "integer"
+      },
+      "then": {
+       "type": "integer"
+      },
+      "type": "integer"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "int_format_int64": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "format": "int64",
+      "type": "integer"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "items_array_tuple": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "t": {
+      "items": false,
+      "prefixItems": [
+       {
+        "type": "string"
+       }
+      ],
+      "type": "array"
+     }
+    },
+    "required": [
+     "t"
+    ],
+    "type": "object"
+   }
+  },
+  "items_missing": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "type": "array"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "items_true": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "items": true,
+      "type": "array"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "maxItems": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 3,
+      "type": "array"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "maxLength": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "maxLength": 3,
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "minItems": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "items": {
+       "type": "string"
+      },
+      "minItems": 2,
+      "type": "array"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "minProperties": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "minProperties": 1,
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "a"
+    ],
+    "type": "object"
+   }
+  },
+  "multipleOf": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "multipleOf": 2,
+      "type": "number"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "nested_no_properties": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "o": {
+      "additionalProperties": false,
+      "type": "object"
+     }
+    },
+    "required": [
+     "o"
+    ],
+    "type": "object"
+   }
+  },
+  "nested_title": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "title": "S",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "no_properties": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "type": "object"
+   }
+  },
+  "not": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "not": {
+       "const": 1
+      },
+      "type": "integer"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "nullable_openapi": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "nullable": true,
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "nullable_type_array": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "o": {
+      "type": [
+       "string",
+       "null"
+      ]
+     }
+    },
+    "required": [
+     "o"
+    ],
+    "type": "object"
+   }
+  },
+  "num_format_float": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "format": "float",
+      "type": "number"
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "oneOf": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "oneOf": [
+       {
+        "type": "string"
+       },
+       {
+        "type": "integer"
+       }
+      ]
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "pattern": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "pattern": "^a+$",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "patternProperties": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "patternProperties": {
+     "^x": {
+      "type": "string"
+     }
+    },
+    "properties": {},
+    "required": [],
+    "type": "object"
+   }
+  },
+  "propertyNames": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {},
+    "propertyNames": {
+     "type": "string"
+    },
+    "required": [],
+    "type": "object"
+   }
+  },
+  "readOnly": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "readOnly": true,
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "recursion_root": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "c": {
+      "items": {
+       "$ref": "#"
+      },
+      "type": "array"
+     }
+    },
+    "required": [
+     "c"
+    ],
+    "type": "object"
+   }
+  },
+  "ref_sibling_desc": {
+   "accepted": false,
+   "schema": {
+    "$defs": {
+     "X": {
+      "additionalProperties": false,
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": "object"
+     }
+    },
+    "additionalProperties": false,
+    "properties": {
+     "x": {
+      "$ref": "#/$defs/X",
+      "description": "d"
+     }
+    },
+    "required": [
+     "x"
+    ],
+    "type": "object"
+   }
+  },
+  "ref_sibling_title": {
+   "accepted": false,
+   "schema": {
+    "$defs": {
+     "X": {
+      "additionalProperties": false,
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": "object"
+     }
+    },
+    "additionalProperties": false,
+    "properties": {
+     "x": {
+      "$ref": "#/$defs/X",
+      "title": "t"
+     }
+    },
+    "required": [
+     "x"
+    ],
+    "type": "object"
+   }
+  },
+  "required_extra": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "a",
+     "b"
+    ],
+    "type": "object"
+   }
+  },
+  "root_anyOf": {
+   "accepted": false,
+   "schema": {
+    "anyOf": [
+     {
+      "additionalProperties": false,
+      "properties": {
+       "n": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "n"
+      ],
+      "type": "object"
+     }
+    ]
+   }
+  },
+  "root_array": {
+   "accepted": false,
+   "schema": {
+    "items": {
+     "type": "string"
+    },
+    "type": "array"
+   }
+  },
+  "str_format_byte": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "format": "byte",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "str_format_datetime": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "format": "date-time",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "str_format_email": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "format": "email",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "str_format_regex": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "format": "regex",
+      "type": "string"
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  },
+  "type_any_list": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "x": {
+      "type": [
+       "string",
+       "integer"
+      ]
+     }
+    },
+    "required": [
+     "x"
+    ],
+    "type": "object"
+   }
+  },
+  "type_array_object_null_closed": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "additionalProperties": false,
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": [
+       "object",
+       "null"
+      ]
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "type_object_null_open": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "a"
+      ],
+      "type": [
+       "object",
+       "null"
+      ]
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "unevaluatedProperties": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "a": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "a"
+    ],
+    "type": "object",
+    "unevaluatedProperties": false
+   }
+  },
+  "uniqueItems": {
+   "accepted": false,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "n": {
+      "items": {
+       "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+     }
+    },
+    "required": [
+     "n"
+    ],
+    "type": "object"
+   }
+  },
+  "writeOnly": {
+   "accepted": true,
+   "schema": {
+    "additionalProperties": false,
+    "properties": {
+     "s": {
+      "type": "string",
+      "writeOnly": true
+     }
+    },
+    "required": [
+     "s"
+    ],
+    "type": "object"
+   }
+  }
+ },
+ "endpoint": "POST /v1/responses",
+ "model": "gpt-4o-mini",
+ "probed": "2026-10-22",
+ "refused_by_choice": {
+  "additionalProperties_schema": "an open object is refused everywhere else; one shape the API happens to accept is not worth a second rule",
+  "patternProperties": "the walk descends only keywords it accepts, and a dead keyword beside additionalProperties: false is not worth a second place a schema can hide"
+ }
+}

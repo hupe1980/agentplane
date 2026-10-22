@@ -120,7 +120,7 @@ use crate::runtime::telemetry;
 /// statement of what can change an authorization answer. A release that moves
 /// it fails the guard that compares this against the linked crate, so widening
 /// the claim is a deliberate act with a changelog entry behind it.
-pub const CEDAR_LANGUAGE: &str = "4.5.0";
+pub const CEDAR_LANGUAGE: &str = "4.6.0";
 
 /// This adapter's own revision, which covers everything Cedar's language
 /// version does not: entity mapping, schema-aware context parsing, which

@@ -196,6 +196,10 @@ pub enum At<'a> {
     Admission,
     Source(&'a str),
     Sink(&'a str),
+    /// What a sink's effect sends beside its bound value — a tool loop's
+    /// relayed outputs. The sink's rules apply, except those with `fields`,
+    /// whose pointers address the bound value.
+    Carried(&'a str),
 }
 
 /// Where a rule matched. The pointer names an object key any applying rule
@@ -294,7 +298,7 @@ impl Content {
         self.checks.iter().filter(move |c| match at {
             At::Admission => false,
             At::Source(kind) => c.at.sources.iter().any(|b| b.kind() == kind),
-            At::Sink(kind) => c.at.sinks.iter().any(|b| b.kind() == kind),
+            At::Sink(kind) | At::Carried(kind) => c.at.sinks.iter().any(|b| b.kind() == kind),
         })
     }
 
@@ -482,6 +486,9 @@ impl Rule {
             At::Admission => self.at.admission,
             At::Source(kind) => self.at.sources.iter().any(|b| b.kind() == kind),
             At::Sink(kind) => self.at.sinks.iter().any(|b| b.kind() == kind),
+            At::Carried(kind) => {
+                self.fields.is_empty() && self.at.sinks.iter().any(|b| b.kind() == kind)
+            }
         }
     }
 

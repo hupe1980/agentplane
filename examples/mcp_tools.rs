@@ -19,8 +19,8 @@
 //!    here marks its state-changing `close` tool `readOnlyHint: true`. Believing
 //!    that would make the call retryable after a timeout — the one condition
 //!    under which this runtime does something twice.
-//! 4. **Discovery grants nothing.** `discover()` is a diff against the
-//!    operator's catalogue, never a source for it.
+//! 4. **Discovery grants nothing.** `discover()` drafts a grant and is a
+//!    diff against a reviewed one, never a catalogue.
 
 use std::sync::Arc;
 
@@ -201,8 +201,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 1. Discovery is a diff, never a source ─────────────────────────────
     println!("1. what the server says about itself");
-    for (id, advertised) in tickets.discover().await? {
-        println!("   {id}: read_only_hint={:?}", advertised.read_only);
+    for found in tickets.discover().await? {
+        println!(
+            "   {}: read_only_hint={:?}, digest={}",
+            found.id,
+            found.advertised.read_only,
+            &found.digest.to_hex()[..12]
+        );
     }
     println!(
         "   → recorded for comparison. Nothing here entered a catalogue: a tool\n\

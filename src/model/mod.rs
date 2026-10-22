@@ -134,8 +134,24 @@ pub mod openai;
 mod openai_stream;
 #[cfg(feature = "providers")]
 mod sse;
+#[cfg(any(
+    feature = "providers",
+    feature = "bedrock",
+    feature = "fake-model",
+    feature = "manifest"
+))]
+mod strict;
 #[cfg(feature = "providers")]
 pub(crate) mod wire;
+#[cfg(feature = "providers")]
+pub(crate) use strict::AnthropicBudget;
+#[cfg(any(
+    feature = "providers",
+    feature = "bedrock",
+    feature = "fake-model",
+    feature = "manifest"
+))]
+pub use strict::{StrictSubset, strict_schema_problem};
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -245,12 +261,11 @@ fn provider_side_media_refusal(kind: &str) -> String {
 /// `else`, `anyOf`/`oneOf`/`allOf`) and the definition tables a `$ref` points
 /// into (`$defs`, `definitions`). A boolean schema is visited too; a caller
 /// that only judges objects ignores it.
-#[cfg(any(
-    feature = "providers",
-    feature = "bedrock",
-    feature = "fake-model",
-    feature = "manifest"
-))]
+///
+/// The strict-mode check does not use it, and the rule above is why: that
+/// check descends only the keywords it accepts and refuses every other, so the
+/// subschemas it never visits are ones it has already refused.
+#[cfg(feature = "manifest")]
 pub(crate) fn for_each_subschema(
     schema: &serde_json::Value,
     path: &str,
@@ -290,111 +305,6 @@ pub(crate) fn for_each_subschema(
             _ => {}
         }
     }
-}
-
-/// Why a schema cannot be used with strict constrained decoding, if it cannot.
-///
-/// `OpenAI`'s strict mode accepts a **subset** of JSON Schema, and a schema that
-/// is perfectly valid elsewhere is rejected with a 400 that does not say which
-/// rule it broke. Checking here turns that into a refusal naming the exact
-/// problem, before anything is sent and before anything is billed.
-///
-/// Deliberately **not** auto-corrected. Rewriting the caller's schema would mean
-/// the effect key records one shape and the wire carries another — and a run
-/// whose journal disagrees with what it asked for is exactly the class of quiet
-/// divergence this crate exists to prevent. The caller fixes the schema.
-#[cfg(any(
-    feature = "providers",
-    feature = "bedrock",
-    feature = "fake-model",
-    feature = "manifest"
-))]
-pub fn strict_schema_problem(schema: &serde_json::Value) -> Option<String> {
-    fn check(node: &serde_json::Value, path: &str, out: &mut Vec<String>) {
-        let Some(obj) = node.as_object() else { return };
-
-        if obj.contains_key("default") {
-            out.push(format!(
-                "`{path}` uses `default`, which strict mode rejects"
-            ));
-        }
-
-        // `anyOf` is the one union strict mode takes; the other two are
-        // rejected outright, and walking into them as if they were fine let a
-        // schema through that came back as a 400.
-        for combinator in ["oneOf", "allOf"] {
-            if obj.contains_key(combinator) {
-                out.push(format!(
-                    "`{path}` uses `{combinator}`, which strict mode does not permit — \
-                     `anyOf` is the union it takes"
-                ));
-            }
-        }
-
-        // Every subschema must say what it is. `anyOf` says it by branching,
-        // `$ref` by pointing, `enum` and `const` by enumerating; a bare
-        // `{ "description": ... }` says nothing and is refused.
-        if !["type", "anyOf", "$ref", "enum", "const"]
-            .iter()
-            .any(|key| obj.contains_key(*key))
-        {
-            out.push(format!(
-                "`{path}` has no `type`, which strict mode requires"
-            ));
-        }
-
-        let is_array = match obj.get("type") {
-            Some(serde_json::Value::String(name)) => name == "array",
-            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "array"),
-            _ => false,
-        };
-        if is_array && !obj.contains_key("items") {
-            out.push(format!(
-                "`{path}` is an array without `items`, which strict mode requires"
-            ));
-        }
-
-        // `["object", "null"]` is how strict mode spells an optional object,
-        // and it is still an object: reading only the string form let a
-        // nullable one skip both checks below and reach the provider as a 400.
-        let is_object = match obj.get("type") {
-            Some(serde_json::Value::String(name)) => name == "object",
-            Some(serde_json::Value::Array(names)) => names.iter().any(|n| n == "object"),
-            _ => false,
-        };
-        if is_object {
-            if obj.get("additionalProperties") != Some(&serde_json::Value::Bool(false)) {
-                out.push(format!(
-                    "`{path}` is an object without `additionalProperties: false`"
-                ));
-            }
-            let properties = obj.get("properties").and_then(|p| p.as_object());
-            if let Some(properties) = properties {
-                let required: Vec<&str> = obj
-                    .get("required")
-                    .and_then(|r| r.as_array())
-                    .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-                for key in properties.keys() {
-                    if !required.contains(&key.as_str()) {
-                        out.push(format!(
-                            "`{path}.{key}` is optional; strict mode requires every \
-                             property to be listed in `required`"
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    let mut problems = Vec::new();
-    for_each_subschema(schema, "schema", &mut |node, path| {
-        check(node, path, &mut problems);
-    });
-    if problems.is_empty() {
-        return None;
-    }
-    Some(problems.join("; "))
 }
 
 /// A continuation with no tool exchanges behind it.
@@ -584,6 +494,16 @@ impl ModelId {
             provider: provider.into(),
             model: model.into(),
         }
+    }
+
+    /// The source identity this model's answers carry: `model:{provider}/{model}`.
+    ///
+    /// The name a field rule's `allowed_sources` matches to admit what this
+    /// model wrote. Ask for it rather than spelling it, so the rule and the
+    /// provenance cannot name one model two ways.
+    #[must_use]
+    pub fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new(format!("model:{self}"))
     }
 }
 
@@ -1342,6 +1262,13 @@ pub struct ToolDeclaration {
     /// The name the model will use when it asks for this tool.
     pub name: String,
     /// What it does, for the model's benefit.
+    ///
+    /// **Model-steering text outside every label.** The model reads it as it
+    /// reads the instruction, and no sink gate judges it, so it must come from
+    /// a reviewed declaration — a grant's `description`, or a typed tool's own
+    /// doc — never straight from a far side. An MCP server's description is
+    /// drafted into a grant for review (`ToolGrant::drafted_from`), not copied
+    /// here.
     pub description: String,
     /// JSON Schema for the arguments.
     ///
@@ -1465,6 +1392,102 @@ impl ToolExchange {
     }
 }
 
+/// A tool loop's conversation so far, and the label of everything in it.
+///
+/// What a loop hands back to the model each turn — the calls the model made,
+/// what each tool answered, and the provider's own state from the turn before
+/// — together with the one fact a bare list of outputs loses: what that data
+/// is. It starts from the prompt's label, joins the label of each relayed
+/// output and failure, and [`ModelCall::continuing`] carries it to the sink. So
+/// a confidential tool result cannot reach a model whose ceiling is lower, the
+/// answer it shaped is labelled with it, and `/system` keeps its own label
+/// throughout: nothing a loop relays is folded into the instruction.
+///
+/// ```ignore
+/// let mut transcript = Transcript::new(&prompt);
+/// loop {
+///     let answer = cx
+///         .complete_with(&prompt, |call| call.with_tools(tools.clone()).continuing(&transcript))
+///         .await?;
+///     let calls = transcript.asked(&answer);
+///     if calls.is_empty() { break; }
+///     for call in calls {
+///         match cx.call_tool(tool_for(&call), arguments_of(&call, &answer)).await {
+///             Ok(output) => transcript.answered(call, &output),
+///             Err(e) => match cx.relayed(&e) {
+///                 Some(detail) => transcript.failed(call, detail),
+///                 None => return Err(e.into()),
+///             },
+///         }
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Transcript {
+    exchanges: Vec<ToolExchange>,
+    continuation: Option<ProviderContinuation>,
+    label: crate::core::Label,
+}
+
+impl Transcript {
+    /// A conversation that has, so far, only its prompt.
+    #[must_use]
+    pub fn new(prompt: &crate::core::Tainted<Value>) -> Self {
+        Self {
+            exchanges: Vec::new(),
+            continuation: None,
+            label: prompt.label().clone(),
+        }
+    }
+
+    /// The model answered: its words are now part of the conversation.
+    ///
+    /// Adopts the provider state the answer left, starts a new turn's
+    /// exchanges, and returns the tools it asked for — empty when it answered
+    /// instead.
+    ///
+    /// The answer's label is not joined. Its words go back to the model that
+    /// wrote them, and everything that shaped them is already in this label;
+    /// what the answer adds is the floor every completion carries, which would
+    /// refuse a loop's second turn at the ceiling its first turn passed.
+    pub fn asked(&mut self, completion: &crate::core::Tainted<Completion>) -> Vec<ToolCall> {
+        self.continuation
+            .clone_from(&completion.peek().continuation);
+        self.exchanges.clear();
+        completion.peek().tool_calls.clone()
+    }
+
+    /// A tool answered `call`; the model will read `output`.
+    pub fn answered(&mut self, call: ToolCall, output: &crate::core::Tainted<Value>) {
+        self.label = self.label.join(output.label());
+        self.exchanges
+            .push(ToolExchange::ok(call, output.peek().clone()));
+    }
+
+    /// `call` failed; the model will read `detail`.
+    ///
+    /// Labelled by whoever wrote it: a refusal this plane composed is trusted,
+    /// a far side's error text carries that side's label —
+    /// [`StepCtx::relayed`](crate::runtime::StepCtx::relayed) answers both.
+    pub fn failed(&mut self, call: ToolCall, detail: crate::core::Tainted<String>) {
+        self.label = self.label.join(detail.label());
+        self.exchanges
+            .push(ToolExchange::failed(call, detail.into_unlabelled()));
+    }
+
+    /// The join of everything the conversation holds.
+    #[must_use]
+    pub fn label(&self) -> &crate::core::Label {
+        &self.label
+    }
+
+    /// This turn's calls and what came back.
+    #[must_use]
+    pub fn exchanges(&self) -> &[ToolExchange] {
+        &self.exchanges
+    }
+}
+
 /// One completion.
 #[derive(Debug)]
 pub struct ModelCall {
@@ -1474,6 +1497,8 @@ pub struct ModelCall {
     tools: Vec<ToolDeclaration>,
     exchanges: Vec<ToolExchange>,
     continuation: Option<ProviderContinuation>,
+    /// The label of the transcript this call continues, when it continues one.
+    carried: Option<crate::core::Label>,
     stream: Option<Arc<dyn ModelStreamObserver>>,
     max_output_tokens: u32,
     /// What one call may send, when a role declared it. Checked against the
@@ -1520,6 +1545,7 @@ impl ModelCall {
             tools: Vec::new(),
             exchanges: Vec::new(),
             continuation: None,
+            carried: None,
             stream: None,
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
             max_input_tokens: None,
@@ -1587,28 +1613,23 @@ impl ModelCall {
         self
     }
 
-    /// Continue after tools ran, showing the model what came back.
-    ///
-    /// Each exchange carries the call *and* its output: a provider matches them
-    /// by the id it issued, and an output without its call is rejected.
+    /// Continue a tool loop: show the model what its tools answered, with the
+    /// provider state its last turn left.
     ///
     /// The prompt stays what it was. A continuation is the same question with
     /// more known, so re-stating it would change the effect key and make each
     /// turn of a loop a different call for replay purposes.
-    #[must_use]
-    pub fn continuing(mut self, exchanges: impl IntoIterator<Item = ToolExchange>) -> Self {
-        self.exchanges = exchanges.into_iter().collect();
-        self
-    }
-
-    /// Continue with exact provider-native state from the preceding response.
     ///
-    /// This state is not interpreted, synthesized, or fetched by id. It is
-    /// journaled as part of this call's identity and returned only to the
-    /// provider that produced it.
+    /// The transcript's label travels with it: the sink judges it beside the
+    /// prompt's, its relayed outputs are read by the sink's content rules, and
+    /// the answer is labelled with it. That is why a continuation can only be
+    /// handed over as a [`Transcript`] — a bare list of outputs would reach the
+    /// provider outside every gate.
     #[must_use]
-    pub fn with_continuation(mut self, continuation: ProviderContinuation) -> Self {
-        self.continuation = Some(continuation);
+    pub fn continuing(mut self, transcript: &Transcript) -> Self {
+        self.exchanges.clone_from(&transcript.exchanges);
+        self.continuation.clone_from(&transcript.continuation);
+        self.carried = Some(transcript.label.clone());
         self
     }
 
@@ -1888,6 +1909,37 @@ impl Effect for ModelCall {
         true
     }
 
+    /// The relayed tool outputs, under the transcript's label.
+    ///
+    /// The provider continuation is not offered to content rules: it is the
+    /// model's own earlier output, often encrypted, and its label is already in
+    /// the transcript's.
+    fn carried(&self) -> Option<crate::core::Tainted<Value>> {
+        let label = self.carried.clone()?;
+        let outputs = self
+            .exchanges
+            .iter()
+            .map(|exchange| exchange.output.clone())
+            .collect();
+        Some(crate::core::Tainted::with_label(
+            Value::Array(outputs),
+            label,
+        ))
+    }
+
+    fn rebind_carried(&mut self, carried: Value) -> bool {
+        let Value::Array(outputs) = carried else {
+            return false;
+        };
+        if outputs.len() != self.exchanges.len() {
+            return false;
+        }
+        for (exchange, output) in self.exchanges.iter_mut().zip(outputs) {
+            exchange.output = output;
+        }
+        true
+    }
+
     /// Everything the provider is sent, not only the prompt the sink gate
     /// binds.
     ///
@@ -1921,7 +1973,7 @@ impl Effect for ModelCall {
     /// the live stream label has always carried, now derived in one place so
     /// the terminal completion and the stream cannot name one answer two ways.
     fn source(&self) -> crate::core::SourceId {
-        crate::core::SourceId::new(format!("model:{}", self.model))
+        self.model.source()
     }
 
     fn gen_ai_request(&self) -> Option<crate::core::GenAiRequest> {

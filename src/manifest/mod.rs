@@ -1509,6 +1509,49 @@ impl ToolGrant {
             rate_limit: None,
         }
     }
+
+    /// A grant drafted from what a server says its tool is, for review.
+    ///
+    /// It carries the server's description and argument schema, so the text a
+    /// model will read is in the reviewed document and under its digest. It
+    /// **mutates whatever the server's annotations claim**, since a server
+    /// that marks its own tool read-only chooses the one condition under which
+    /// this runtime retries it, and it has no field rules: who may author
+    /// which argument is the reviewer's to add. Read the description before
+    /// granting it — it is instructions from the far side.
+    #[must_use]
+    pub fn drafted_from(discovered: &crate::tools::Discovered) -> Self {
+        Self {
+            description: Some(discovered.description.clone()),
+            arguments: Some(discovered.input_schema.clone()),
+            ..Self::new(discovered.id.reference())
+        }
+    }
+}
+
+impl crate::tools::Discovered {
+    /// Where the server has moved away from `grant` since it was reviewed:
+    /// the description, the argument schema, or both. A half the grant does
+    /// not state is not compared, since nothing was reviewed there.
+    #[must_use]
+    pub fn drift(&self, grant: &ToolGrant) -> Vec<crate::tools::Drift> {
+        let mut drift = Vec::new();
+        if grant
+            .description
+            .as_ref()
+            .is_some_and(|reviewed| *reviewed != self.description)
+        {
+            drift.push(crate::tools::Drift::Description);
+        }
+        if grant
+            .arguments
+            .as_ref()
+            .is_some_and(|reviewed| *reviewed != self.input_schema)
+        {
+            drift.push(crate::tools::Drift::Arguments);
+        }
+        drift
+    }
 }
 
 /// A cross-run ceiling on one tool: see [`ToolGrant::rate_limit`].
@@ -2249,8 +2292,9 @@ impl Manifest {
                      mutating call with no field rules is refused by the taint gate on \
                      every served run. Declare the authority-bearing arguments in \
                      `protected_fields` — `allowed_sources` naming the caller \
-                     (`peer:<actor>`) or a `one_of` menu — or set `mutates: false` if the \
-                     call really does not change anything",
+                     (`peer:<actor>`) or a `one_of` menu, at `path: \"\"` for the whole \
+                     value when the call takes no arguments — or set `mutates: false` if \
+                     the call really does not change anything",
                     grant.reference
                 )));
             }
@@ -2264,7 +2308,9 @@ impl Manifest {
                      a capability and is decoration. Three honest fixes: declare \
                      the authority-bearing arguments in `protected_fields` \
                      (ordinary untrusted content may sit beside them, which is \
-                     what the feature is for); or use `execution.kind: planned`, \
+                     what the feature is for; a tool that takes no arguments \
+                     names the whole value, `path: \"\"` with `one_of: [{{}}]`); \
+                     or use `execution.kind: planned`, \
                      whose step arguments are resolved by the runtime and keep \
                      the input's labels; or set `mutates: false` if the call \
                      really does not change anything",
@@ -3245,9 +3291,8 @@ impl Manifest {
     /// digest-covered, and rewriting it would mean the file a reviewer signed
     /// and the shape that runs are two different documents.
     ///
-    /// Every subschema is judged, through the one walker
-    /// [`strict_schema_problem`](crate::model::strict_schema_problem) also
-    /// uses: an object under `anyOf`, in `$defs`, or as the schema of
+    /// Every subschema is judged, through the walker that visits every
+    /// keyword holding a schema: an object under `anyOf`, in `$defs`, or as the schema of
     /// `additionalProperties` is as much an object somebody fills in as one
     /// under `properties`. A node is an object when its `type` says so or when
     /// it declares `properties`, `patternProperties` or `additionalProperties`

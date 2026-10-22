@@ -458,21 +458,28 @@ fn build_deadline(case: &str, name: &str, row: DeadlineRow<'_>) -> Result<Deadli
 /// redb creates a table on first *write*, so `case()` reading `CASE_RUNS` for a
 /// case with no runs yet would otherwise fail rather than return an empty list.
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
-    w.open_table(CASES).map_err(|e| be(&e))?;
-    w.open_table(CORR_OPEN).map_err(|e| be(&e))?;
-    w.open_table(CORR_ALL).map_err(|e| be(&e))?;
-    w.open_table(DEADLINES_UNACCOUNTED).map_err(|e| be(&e))?;
-    w.open_table(DEADLINES_UNNOTED).map_err(|e| be(&e))?;
-    w.open_table(CASE_RUNS).map_err(|e| be(&e))?;
-    w.open_table(CASE_BLOBS).map_err(|e| be(&e))?;
-    w.open_table(CASE_RUN_SEEN).map_err(|e| be(&e))?;
-    w.open_table(DEADLINES).map_err(|e| be(&e))?;
-    w.open_table(DEADLINES_DUE).map_err(|e| be(&e))?;
-    w.open_table(CASES_OPEN).map_err(|e| be(&e))?;
-    w.open_table(CASES_BY_STATUS).map_err(|e| be(&e))?;
-    w.open_table(CASE_HOLDS).map_err(|e| be(&e))?;
-    w.open_table(CASE_HOLDS_BY_TIME).map_err(|e| be(&e))?;
-    w.open_table(CASE_ERASURES).map_err(|e| be(&e))?;
+    w.open_table(CASES).map_err(super::redb::table_error)?;
+    w.open_table(CORR_OPEN).map_err(super::redb::table_error)?;
+    w.open_table(CORR_ALL).map_err(super::redb::table_error)?;
+    w.open_table(DEADLINES_UNACCOUNTED)
+        .map_err(super::redb::table_error)?;
+    w.open_table(DEADLINES_UNNOTED)
+        .map_err(super::redb::table_error)?;
+    w.open_table(CASE_RUNS).map_err(super::redb::table_error)?;
+    w.open_table(CASE_BLOBS).map_err(super::redb::table_error)?;
+    w.open_table(CASE_RUN_SEEN)
+        .map_err(super::redb::table_error)?;
+    w.open_table(DEADLINES).map_err(super::redb::table_error)?;
+    w.open_table(DEADLINES_DUE)
+        .map_err(super::redb::table_error)?;
+    w.open_table(CASES_OPEN).map_err(super::redb::table_error)?;
+    w.open_table(CASES_BY_STATUS)
+        .map_err(super::redb::table_error)?;
+    w.open_table(CASE_HOLDS).map_err(super::redb::table_error)?;
+    w.open_table(CASE_HOLDS_BY_TIME)
+        .map_err(super::redb::table_error)?;
+    w.open_table(CASE_ERASURES)
+        .map_err(super::redb::table_error)?;
     Ok(())
 }
 

@@ -164,18 +164,26 @@ const PARKED: TableDefinition<(&str, &str, &str), i64> =
 const EVENTS_ERASED: TableDefinition<(&str, &str), ()> = TableDefinition::new("inbound_erased");
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
-    w.open_table(EVENTS_ERASED).map_err(|e| be(&e))?;
-    w.open_table(EVENTS).map_err(|e| be(&e))?;
-    w.open_table(EVENT_CORR).map_err(|e| be(&e))?;
-    w.open_table(EVENT_BY_KEY).map_err(|e| be(&e))?;
-    w.open_table(SUBS).map_err(|e| be(&e))?;
-    w.open_table(SUBS_BY_KEY).map_err(|e| be(&e))?;
-    w.open_table(EVENTS_LIVE).map_err(|e| be(&e))?;
-    w.open_table(EVENTS_DEAD).map_err(|e| be(&e))?;
-    w.open_table(EVENTS_CLAIMED).map_err(|e| be(&e))?;
-    w.open_table(EVENTS_TARGETED).map_err(|e| be(&e))?;
-    w.open_table(SUBS_BY_TIME).map_err(|e| be(&e))?;
-    w.open_table(PARKED).map_err(|e| be(&e))?;
+    w.open_table(EVENTS_ERASED)
+        .map_err(super::redb::table_error)?;
+    w.open_table(EVENTS).map_err(super::redb::table_error)?;
+    w.open_table(EVENT_CORR).map_err(super::redb::table_error)?;
+    w.open_table(EVENT_BY_KEY)
+        .map_err(super::redb::table_error)?;
+    w.open_table(SUBS).map_err(super::redb::table_error)?;
+    w.open_table(SUBS_BY_KEY)
+        .map_err(super::redb::table_error)?;
+    w.open_table(EVENTS_LIVE)
+        .map_err(super::redb::table_error)?;
+    w.open_table(EVENTS_DEAD)
+        .map_err(super::redb::table_error)?;
+    w.open_table(EVENTS_CLAIMED)
+        .map_err(super::redb::table_error)?;
+    w.open_table(EVENTS_TARGETED)
+        .map_err(super::redb::table_error)?;
+    w.open_table(SUBS_BY_TIME)
+        .map_err(super::redb::table_error)?;
+    w.open_table(PARKED).map_err(super::redb::table_error)?;
     Ok(())
 }
 

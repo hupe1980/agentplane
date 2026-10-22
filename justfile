@@ -212,6 +212,9 @@ test-live:
     fi
     set -a; . ./.env; set +a
     AGENTPLANE_LIVE=1 cargo test --features providers,redb,testkit --test live -- --nocapture --test-threads=1
+    # The strict-mode probe table the offline test holds the checker to,
+    # measured again against the API it was taken from.
+    python3 tools/probe_strict.py
 
 # Same discipline as `test-live`: the key comes from .env, which is gitignored,
 # because a credential being available is not a decision to spend it. The
@@ -284,7 +287,7 @@ examples:
         model_run media_run memory_run batch_run budget_pause answered_doubt \
         operator_stop recovered_run manifest_run mcp_tools serve_mcp blog_room \
         a2a_peer peer_call standing_authority streaming_run observability \
-        retention_hold local_coded_agent
+        retention_hold local_coded_agent coded_tool_loop
     do
         printf '\n\033[1m── %s ─────────────────────────────────\033[0m\n' "$ex"
         ./target/debug/examples/"$ex"

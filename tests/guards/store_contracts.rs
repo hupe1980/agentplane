@@ -59,8 +59,56 @@ mod embedded {
         let refused = RedbStore::open(&path);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            refused.is_err(),
-            "a store holding the old subscription row opened"
+            matches!(refused, Err(agentplane::core::StoreError::Unreadable(_))),
+            "a store holding the old subscription row did not answer as unreadable: {:?}",
+            refused.err()
+        );
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        #[allow(clippy::disallowed_methods)]
+        let dir = std::env::temp_dir().join(format!(
+            "agentplane-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// **A store another handle holds is in use, by type.** An embedder that
+    /// told "in use" from "broken" by matching the message moved a healthy
+    /// journal aside whenever the wording did not match.
+    #[test]
+    fn a_store_another_handle_holds_is_in_use() {
+        let dir = scratch("held");
+        let path = dir.join("journal.redb");
+        let held = RedbStore::open(&path).expect("the first open");
+        let second = RedbStore::open(&path);
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(second, Err(agentplane::core::StoreError::InUse(_))),
+            "a held store did not answer as in use: {:?}",
+            second.err()
+        );
+    }
+
+    /// Bytes that are not a store are unreadable, not an outage to retry.
+    #[test]
+    fn bytes_that_are_not_a_store_are_unreadable() {
+        let dir = scratch("garbage");
+        let path = dir.join("journal.redb");
+        std::fs::write(&path, vec![0x5a; 64 * 1024]).expect("write");
+        let opened = RedbStore::open(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            matches!(opened, Err(agentplane::core::StoreError::Unreadable(_))),
+            "garbage did not answer as unreadable: {:?}",
+            opened.err()
         );
     }
 

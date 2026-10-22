@@ -1049,12 +1049,15 @@ Details worth stating:
   `strict: true` inside a *function definition* works on every tool-capable
   model while native `text.format` is newer-models-only, so emulation there is
   the more compatible option at the same strictness.
-* **A schema strict mode cannot accept is refused before it is sent.** OpenAI's
-  strict mode takes a subset of JSON Schema — `additionalProperties: false`
-  everywhere, every property in `required`, no `default` — and rejects the rest
-  with a 400 that does not say which rule broke. The driver names the rule, and
-  does not rewrite the schema: that would make the effect key record one shape
-  while the wire carried another.
+* **A schema strict mode cannot accept is refused before it is sent.** Each
+  provider accepts its own subset of JSON Schema and answers the rest with a
+  400. `StrictSubset` holds each as an allow-list — OpenAI's as probed against
+  its API, Anthropic's as documented, with its per-request budget of twenty
+  strict tools — and names the keyword and path it refuses. A response schema
+  outside the subset is refused; a tool is sent non-strict. A caller's schema
+  is never rewritten, since the effect key would record one shape and the wire
+  carry another; a typed tool's generated schema is made strict-ready where it
+  is generated.
 * **Provider enforcement is not blindly trusted.** Returned structured output is
   parsed and validated locally against the exact requested schema. External
   schema reference resolution is disabled, so validation cannot become hidden

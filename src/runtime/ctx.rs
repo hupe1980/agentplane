@@ -49,6 +49,49 @@ fn output_label(
     base.with_sensitivity(sensitivity)
 }
 
+/// The value with what its effect carries joined at the root only, so a field
+/// label such as a trusted `/system` stays what it was: relayed data is beside
+/// the instruction, not in it.
+fn joined<'v>(
+    args: std::borrow::Cow<'v, Tainted<Value>>,
+    carried: Option<&crate::core::Label>,
+) -> std::borrow::Cow<'v, Tainted<Value>> {
+    match carried {
+        Some(label) => std::borrow::Cow::Owned(args.with_joined_label(label)),
+        None => args,
+    }
+}
+
+/// The sink's view of a value where no content rule can apply: the value, no
+/// rule ids, and the label of what the effect carries.
+#[cfg(not(feature = "manifest"))]
+fn judged_without_rules<'v, E: Effect>(
+    effect: &E,
+    args: &'v Tainted<Value>,
+) -> (
+    std::borrow::Cow<'v, Tainted<Value>>,
+    Vec<String>,
+    Option<crate::core::Label>,
+) {
+    let carried = effect.carried().map(|carried| carried.label().clone());
+    (
+        joined(std::borrow::Cow::Borrowed(args), carried.as_ref()),
+        Vec::new(),
+        carried,
+    )
+}
+
+/// An answer shaped by what its effect carried is at least what that was.
+fn shaped_by<T>(out: Tainted<T>, carried: Option<&crate::core::Label>) -> Tainted<T> {
+    match carried {
+        Some(carried) => {
+            let label = out.label().join(carried);
+            Tainted::with_label(out.into_unlabelled(), label)
+        }
+        None => out,
+    }
+}
+
 /// What the wiring declares about an effect's data ceilings, carried to the
 /// manifest gate beside the descriptor.
 ///
@@ -520,15 +563,51 @@ impl<'a> StepCtx<'a> {
         }
     }
 
-    /// Take the label the last failed effect's output would have carried.
+    /// What a failed call may tell a model, labelled by whoever wrote it — or
+    /// `None` when the error is not the model's business and must leave the
+    /// loop.
     ///
-    /// Set whenever an effect fails with an [`EffectError`], from the same
-    /// declaration a success is labelled with. `None` when the last failure
-    /// was not the effect's own — a policy refusal, whose text this plane
-    /// wrote.
-    #[cfg(feature = "manifest")]
-    pub(crate) fn take_failed_output_label(&mut self) -> Option<crate::core::Label> {
-        self.failed_output.take()
+    /// `None` hands the error back to the executor, which reaches the verdict
+    /// it would reach for any other skill. Suspension, budget ceilings, store
+    /// failures and divergence each have a handler above a tool loop, and each
+    /// is silently disarmed by being turned into a chat message. An unknown
+    /// outcome ([`Disposition::InDoubt`](crate::core::Disposition::InDoubt))
+    /// is the sharpest case: reported to the model as a failed call, the
+    /// quarantine it owes never happens, the model apologises, and the run
+    /// ends `Succeeded` over a mutation nobody can account for.
+    ///
+    /// **A refusal is [`REFUSED`](crate::core::REFUSED) and nothing else.**
+    /// Every [`PolicyError`] message is written for an operator and is precise
+    /// on purpose — which sink, which field, which ceiling — so handing it to
+    /// a model turns the policy into a queryable service: injected content
+    /// varies the request, watches which variants are refused, and reads the
+    /// boundary off the answers. The journal keeps the full reason. The text is
+    /// this plane's, so it is trusted.
+    ///
+    /// **A far side's own answer reaches the model**, because the model needs
+    /// it to try something else and the far side controls it already. It is
+    /// its output as much as a success is — an MCP tool's `isError` content is
+    /// rendered straight into it — so it carries the label a success from that
+    /// effect would have carried, and a confidential tool cannot reach a model
+    /// with a lower ceiling by failing instead of answering.
+    ///
+    /// Call it on the error the last dispatch returned; it consumes that
+    /// effect's failure label.
+    pub fn relayed(&mut self, error: &StepError) -> Option<Tainted<String>> {
+        let failed = self.failed_output.take();
+        match error {
+            StepError::Policy(denial) => Some(Tainted::trusted(denial.for_model().to_owned())),
+            // `disposition` is the crate's own name for "the far side spoke,
+            // or demonstrably did not", read rather than re-derived from the
+            // variant list.
+            StepError::Effect(inner)
+                if inner.disposition() != crate::core::Disposition::InDoubt =>
+            {
+                let label = failed.unwrap_or_else(crate::core::Label::trusted);
+                Some(Tainted::with_label(inner.to_string(), label))
+            }
+            _ => None,
+        }
     }
 
     /// Whether this step appended anything — the executor's "did new work" bit.
@@ -3805,11 +3884,10 @@ impl<'a> StepCtx<'a> {
         Self::bound_as_sent(&effect, args, sink_name.clone())?;
 
         #[cfg(feature = "manifest")]
-        let (judged, content_rules) = self.content_at_sink(&mut effect, args).await?;
-        #[cfg(feature = "manifest")]
-        let args = judged.as_ref().unwrap_or(args);
+        let (judged, content_rules, carried) = self.judged_at_sink(&mut effect, args).await?;
         #[cfg(not(feature = "manifest"))]
-        let content_rules: Vec<String> = Vec::new();
+        let (judged, content_rules, carried) = judged_without_rules(&effect, args);
+        let args = judged.as_ref();
 
         // The label these gates judge is the **effective label at this sink**:
         // the base label improved by exactly the release marks granted for
@@ -3818,8 +3896,7 @@ impl<'a> StepCtx<'a> {
         // effective label is also what policy is asked over and what the
         // dispatch journals as its outbound label, because it is the label the
         // verdict was reached over.
-        let label = args.effective_label(&sink_id);
-        let label = &label;
+        let label = &args.effective_label(&sink_id);
 
         // **Every sink gate applies to live dispatch only**, and "live
         // dispatch" is a property of the *cursor*, not of the mode.
@@ -3985,14 +4062,116 @@ impl<'a> StepCtx<'a> {
 
         // The same label the gates above enforced, handed to the deployment's
         // own rules. See `authorize` for why it belongs there too.
-        self.effect_after_sink_gate(
-            effect,
-            Some(Outbound {
-                label,
-                content_rules: &content_rules,
-            }),
-        )
-        .await
+        let out = self
+            .effect_after_sink_gate(
+                effect,
+                Some(Outbound {
+                    label,
+                    content_rules: &content_rules,
+                }),
+            )
+            .await?;
+        Ok(shaped_by(out, carried.as_ref()))
+    }
+
+    /// The value as the sink's gates judge it, the content rule and check ids
+    /// that read it, and the label of what the effect carries beside it.
+    ///
+    /// The bound value is judged by the content rules first; what the effect
+    /// sends beside it — a tool loop's relayed outputs — next, and its label
+    /// is [`joined`] to the value's.
+    #[cfg(feature = "manifest")]
+    async fn judged_at_sink<'v, E: Effect>(
+        &mut self,
+        effect: &mut E,
+        args: &'v Tainted<Value>,
+    ) -> Result<
+        (
+            std::borrow::Cow<'v, Tainted<Value>>,
+            Vec<String>,
+            Option<crate::core::Label>,
+        ),
+        StepError,
+    > {
+        let (judged, mut ids) = self.content_at_sink(effect, args).await?;
+        let args = judged.map_or(std::borrow::Cow::Borrowed(args), std::borrow::Cow::Owned);
+        let carried = self.carried_at_sink(effect, &mut ids).await?;
+        Ok((joined(args, carried.as_ref()), ids, carried))
+    }
+
+    /// Judge what an effect carries beside its bound value, and answer its
+    /// label once judged.
+    ///
+    /// The sink's content rules that read no `fields` and its checks read the
+    /// carried value, exactly as they read the bound one: a refusal refuses the
+    /// dispatch, a redaction is bound into the effect or refuses it, and a
+    /// classification raises the label. A rule with `fields` addresses the
+    /// bound value's pointers and does not apply here.
+    #[cfg(feature = "manifest")]
+    async fn carried_at_sink<E: Effect>(
+        &mut self,
+        effect: &mut E,
+        ids: &mut Vec<String>,
+    ) -> Result<Option<crate::core::Label>, StepError> {
+        let Some(carried) = effect.carried() else {
+            return Ok(None);
+        };
+        {
+            let kind = effect.descriptor().kind;
+            let at = crate::content::At::Carried(&kind);
+            let outcome = match self.content_at(at, carried.peek()) {
+                Err(denial) if self.writes_enabled() => {
+                    return Err(self
+                        .refuse_sink(&effect.descriptor(), crate::core::ACTION_CONTENT, denial)
+                        .await);
+                }
+                Err(_) => crate::content::Outcome::default(),
+                Ok(outcome) => outcome,
+            };
+            let rebound = match &outcome.redacted {
+                Some(value) => effect.rebind_carried(value.clone()),
+                None => true,
+            };
+            if let Some(hit) = outcome
+                .refused
+                .first()
+                .cloned()
+                .or_else(|| outcome.redactions.first().cloned().filter(|_| !rebound))
+                && self.writes_enabled()
+            {
+                let denial = PolicyError::Content {
+                    rule: hit.rule,
+                    pointer: hit.pointer,
+                };
+                return Err(self
+                    .refuse_sink(&effect.descriptor(), crate::core::ACTION_CONTENT, denial)
+                    .await);
+            }
+            let sent = match outcome.redacted.filter(|_| rebound) {
+                Some(value) => carried.redacted(value),
+                None => carried,
+            };
+            let (checks, verdict) = self.run_checks(at, &sent).await?;
+            if let Some(refused) = verdict.refused.clone()
+                && self.writes_enabled()
+            {
+                let denial = PolicyError::Content {
+                    rule: refused.rule,
+                    pointer: refused.pointer,
+                };
+                return Err(self
+                    .refuse_sink(&effect.descriptor(), crate::core::ACTION_CONTENT, denial)
+                    .await);
+            }
+            let raised = [outcome.sensitivity, verdict.sensitivity]
+                .into_iter()
+                .fold(sent.label().sensitivity, crate::core::content_joined);
+            ids.extend(outcome.evaluated);
+            ids.extend(checks);
+            let label = sent.label().clone();
+            let sensitivity = label.sensitivity.max(raised);
+            Ok(Some(label.with_sensitivity(sensitivity)))
+        }
     }
 
     /// The whole-object taint gate and the per-field rules, judged over the
@@ -5740,13 +5919,11 @@ impl StepCtx<'_> {
             .as_array()
             .ok_or_else(|| unusable("`memories` is not an array"))?
             .clone();
-        // The declared bound, enforced by the runtime rather than by the
-        // schema alone: `maxItems` above holds only where the `jsonschema`
-        // validator is in the build, and a declared ceiling that depends on a
-        // feature flag is a control that yields where nobody is looking. The
-        // truncation is silent toward the model on purpose — an over-long
-        // answer is not worth failing a run that has already paid for it, and
-        // which proposals survive is the declaration's order, first wins.
+        // The declared bound is enforced here, not by the schema: no
+        // provider's strict mode takes `maxItems` everywhere. The truncation
+        // is silent toward the model on purpose — an over-long answer is not
+        // worth failing a run that has already paid for it, and which
+        // proposals survive is the declaration's order, first wins.
         let mut written = Vec::with_capacity(proposals.len().min(formation.max_items));
         let mut seen = std::collections::BTreeSet::new();
         for proposal in proposals {
@@ -5761,7 +5938,10 @@ impl StepCtx<'_> {
             // back, with the *later* proposal silently superseding the one the
             // declaration's order preferred — and a duplicate is not a
             // distinct fact, so it does not spend a `max_items` slot either.
-            if !seen.insert(key.to_owned()) {
+            // An empty key names nothing to recall the fact by. Held here
+            // rather than in the schema, which no provider's strict mode takes
+            // a length bound in everywhere.
+            if key.trim().is_empty() || !seen.insert(key.to_owned()) {
                 continue;
             }
             let id = format!(
@@ -6239,13 +6419,15 @@ fn formation_schema(max_items: usize) -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
+            // No `maxItems` or `minLength`: Anthropic's strict mode refuses
+            // both, and the runtime enforces each when the answer arrives.
             "memories": {
                 "type": "array",
-                "maxItems": max_items,
+                "description": format!("at most {max_items} memories"),
                 "items": {
                     "type": "object",
                     "properties": {
-                        "key": {"type": "string", "minLength": 1},
+                        "key": {"type": "string", "description": "non-empty"},
                         // A memory is a durable fact stated plainly, so the
                         // permissive spelling was never buying what it cost.
                         "content": {"type": "string"}

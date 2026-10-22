@@ -508,50 +508,40 @@ pub struct Label {""",
         "    let mut label = original.label().clone();",
     ),
     "RefusalsTeachTheModel": (
-        "src/runtime/declarative.rs",
+        "src/runtime/ctx.rs",
         "a_refusal_tells_the_model_nothing_it_can_differentiate",
         "the tool-calling loop hands the model the precise policy refusal, "
         "turning the policy into a queryable service",
-        "        crate::core::StepError::Policy(p) => Some(p.for_model().to_owned()),",
-        "        crate::core::StepError::Policy(p) => Some(p.to_string()),",
+        "            StepError::Policy(denial) => Some(Tainted::trusted(denial.for_model().to_owned())),",
+        "            StepError::Policy(denial) => Some(Tainted::trusted(denial.to_string())),",
     ),
     "AnUnknownOutcomeBecomesAChatMessage": (
-        "src/runtime/declarative.rs",
+        "src/runtime/ctx.rs",
         "an_undecidable_tool_call_quarantines_rather_than_answering_the_model",
         "every error the tool-calling loop meets is stringified back to the "
         "model, so an undecidable outcome never reaches the executor and the "
         "run ends Succeeded instead of quarantined",
-        "        _ => None,\n    }\n}",
-        "        _ => Some(e.to_string()),\n    }\n}",
+        "                Some(Tainted::with_label(inner.to_string(), label))\n            }\n            _ => None,",
+        "                Some(Tainted::with_label(inner.to_string(), label))\n            }\n            _ => Some(Tainted::trusted(error.to_string())),",
     ),
     "AnInDoubtEffectIsAnApology": (
-        "src/runtime/declarative.rs",
+        "src/runtime/ctx.rs",
         "an_in_doubt_tool_call_does_not_become_a_chat_message",
         "an in-doubt effect error is reported to the model as a failed call, so "
         "the loop invites it to reach the same effect another way while the "
         "first may still be in flight",
-        """        crate::core::StepError::Effect(inner)
-            if inner.disposition() != crate::core::Disposition::InDoubt =>
-        {
-            Some(inner.to_string())
-        }""",
-        """        crate::core::StepError::Effect(inner) => Some(inner.to_string()),""",
+        """            StepError::Effect(inner)
+                if inner.disposition() != crate::core::Disposition::InDoubt =>
+            {""",
+        """            StepError::Effect(inner) => {""",
     ),
     "EveryFailureLooksLikeARefusal": (
-        "src/runtime/declarative.rs",
+        "src/runtime/ctx.rs",
         "a_tool_that_ran_and_failed_reports_its_own_words",
         "the far side's own answer is replaced by the uniform refusal, blinding "
         "the model to the one thing it can act on",
-        """        crate::core::StepError::Effect(inner)
-            if inner.disposition() != crate::core::Disposition::InDoubt =>
-        {
-            Some(inner.to_string())
-        }""",
-        """        crate::core::StepError::Effect(inner)
-            if inner.disposition() != crate::core::Disposition::InDoubt =>
-        {
-            Some(crate::core::REFUSED.to_owned())
-        }""",
+        "                Some(Tainted::with_label(inner.to_string(), label))",
+        "                Some(Tainted::with_label(crate::core::REFUSED.to_owned(), label))",
     ),
     "TheTaintGateTakesTheCatalogueAtItsWord": (
         "src/runtime/ctx.rs",
@@ -652,6 +642,90 @@ pub struct Label {""",
         "untrusted data may select an authority-bearing protected field",
         "            if field.requires_trusted() && field_label.is_untrusted() {",
         "            if false && field.requires_trusted() && field_label.is_untrusted() {",
+    ),
+    "AWholeValueRuleIsSkipped": (
+        "src/runtime/ctx.rs",
+        "a_whole_value_menu_admits_exactly_an_empty_call",
+        "a protected-field rule naming the whole value is skipped at the sink, so declaring it lifts the whole-value gate while judging nothing, and a model-chosen call to an argument-less mutating tool goes out with any arguments it likes",
+        "        for field in protected {",
+        "        for field in protected.iter().filter(|f| !f.path().is_empty()) {",
+    ),
+    "AWholeValueRuleCannotBeWritten": (
+        "src/core/label.rs",
+        "the_whole_value_is_a_protected_path",
+        "`\"\"` is refused as a protected path, so an argument-less mutating tool cannot be granted to a model at all and an embedder passes the model's call as trusted instead",
+        "    path.is_empty() || is_json_pointer(path)",
+        "    is_json_pointer(path)",
+    ),
+    "AnObjectNeedsNoProperties": (
+        "src/model/strict.rs",
+        "every_probed_shape_is_classified_as_openai_did",
+        "an object with no `properties` passes the strict check, so every argument-less tool is sent `strict: true` and OpenAI answers the whole request with a 400",
+        "            self.refuse(path, \"is an object without `properties`\");",
+        "            let _ = path;",
+    ),
+    "ARefMayCarrySiblings": (
+        "src/model/strict.rs",
+        "every_probed_shape_is_classified_as_openai_did",
+        "a `$ref` with a sibling `description` passes the strict check, which is what schemars emits for every documented field of struct type, and OpenAI answers it with a 400",
+        "            if obj.len() > 1 {",
+        "            if false && obj.len() > 1 {",
+    ),
+    "AnthropicTakesEveryToolStrict": (
+        "src/model/strict.rs",
+        "anthropic_marks_at_most_twenty_tools_strict",
+        "every qualifying tool is marked strict, so a request with more than twenty tools exceeds Anthropic's documented ceiling and is a 400 that never succeeds",
+        "        if self.tools >= ANTHROPIC_STRICT_TOOLS || self.admit(schema).is_err() {",
+        "        if self.admit(schema).is_err() {",
+    ),
+    "AGeneratedRefKeepsItsSiblings": (
+        "src/tools/typed.rs",
+        "a_struct_field_and_an_optional_field_stay_strict",
+        "a generated `$ref` keeps its sibling `description`, so a typed tool with a documented struct field is never strict on OpenAI",
+        "    if map.contains_key(\"$ref\") && map.len() > 1 {",
+        "    if false && map.contains_key(\"$ref\") && map.len() > 1 {",
+    ),
+    "ACarriedLabelIsNotJudged": (
+        "src/runtime/ctx.rs",
+        "a_confidential_relayed_output_is_refused_at_a_lower_ceiling",
+        "what a model call carries beside its prompt never joins the label the sink gates judge, so a confidential tool result relayed in a loop reaches a model whose ceiling is lower",
+        "        Some(label) => std::borrow::Cow::Owned(args.with_joined_label(label)),",
+        "        Some(_) => args,",
+    ),
+    "ACarriedLabelDoesNotReachTheAnswer": (
+        "src/runtime/ctx.rs",
+        "a_completion_is_labelled_with_what_it_was_shown",
+        "an answer shaped by relayed tool results is labelled as if it read nothing, so it is less sensitive than what it contains and a field rule naming only the model admits arguments a tool's output steered",
+        "            let label = out.label().join(carried);",
+        "            let label = {\n                let _ = carried;\n                out.label().clone()\n            };",
+    ),
+    "RelayedOutputsSkipContentRules": (
+        "src/content/mod.rs",
+        "a_sink_redact_rule_rewrites_a_relayed_output",
+        "a sink content rule never reads the tool results a loop relays, so a card number a tool returned reaches the model a redaction was declared to keep it from",
+        "                self.fields.is_empty() && self.at.sinks.iter().any(|b| b.kind() == kind)",
+        "                false && self.fields.is_empty() && self.at.sinks.iter().any(|b| b.kind() == kind)",
+    ),
+    "DriftIgnoresTheDescription": (
+        "src/manifest/mod.rs",
+        "a_changed_description_is_drift",
+        "a server that rewrites a reviewed tool description is not reported, so a rug pull — instructions added after review — goes unnoticed where the operator is looking",
+        "            .is_some_and(|reviewed| *reviewed != self.description)",
+        "            .is_some_and(|reviewed| false && *reviewed != self.description)",
+    ),
+    "ADraftBelievesReadOnlyHint": (
+        "src/manifest/mod.rs",
+        "a_drafted_grant_mutates_whatever_the_server_says",
+        "a grant drafted from discovery believes the server's `readOnlyHint`, so a money-moving tool that calls itself read-only skips the whole-value taint gate and is retried after a timeout",
+        "            arguments: Some(discovered.input_schema.clone()),",
+        "            arguments: Some(discovered.input_schema.clone()),\n            mutates: discovered.advertised.read_only != Some(true),",
+    ),
+    "ALockedStoreIsABackendFault": (
+        "src/store/redb.rs",
+        "a_store_another_handle_holds_is_in_use",
+        "a store another handle holds answers as an unnamed backend fault, so an embedder tells \"wait\" from \"broken\" by matching a message and moves a healthy journal aside when the wording changes",
+        "        redb::DatabaseError::DatabaseAlreadyOpen => StoreError::InUse(e.to_string()),",
+        "        redb::DatabaseError::DatabaseAlreadyOpen => be(&e),",
     ),
     "ProtectedFieldSourceIgnored": (
         "src/runtime/ctx.rs",
@@ -758,13 +832,12 @@ pub struct Label {""",
         "                    let _ = failure_label;",
     ),
     "ARelayedFailureKeepsTheConversationLabel": (
-        "src/runtime/declarative.rs",
+        "src/runtime/ctx.rs",
         "a_tool_failure_above_the_model_ceiling_never_reenters_the_provider",
-        "the tool loop relays a failure's text to the model without joining its "
-        "label, so the next turn's sink gate judges a conversation the model "
-        "does not read",
-        "        *conversation_label = conversation_label.join(&failed);",
-        "        let _ = failed;",
+        "the tool loop relays a failure's text to the model without its label, "
+        "so the next turn's sink gate judges a conversation the model does not read",
+        "                let label = failed.unwrap_or_else(crate::core::Label::trusted);",
+        "                let label = crate::core::Label::trusted();\n                let _ = failed;",
     ),
     # ── The offline re-derivation (`policy check`) ──────────────────────────
     "TheEffectGateAddsAKeyOutsideTheBuilder": (
@@ -1691,7 +1764,7 @@ pub struct Label {""",
         "src/store/redb_events.rs",
         "a_store_with_the_old_subscription_row_refuses_to_open",
         'the subscriptions table is not opened at store open, so a file holding the older row shape opens and fails only at the first wait or delivery',
-        '    w.open_table(SUBS).map_err(|e| be(&e))?;',
+        '    w.open_table(SUBS).map_err(super::redb::table_error)?;',
         '    let _ = SUBS;',
     ),
     "ADeadlineOfNoTimeResolves": (
@@ -5357,15 +5430,15 @@ pub struct Label {""",
         "src/model/openai.rs",
         "an_incompatible_schema_is_refused_with_the_reason",
         "a schema strict mode cannot accept is sent anyway, for an opaque 400",
-        "        if let Some(problem) = strict_schema_problem(schema) {",
+        "        if let Some(problem) = StrictSubset::OpenAi.problem(schema) {",
         "        if let Some(problem) = None::<String> {",
     ),
     "TheSchemaIsRewrittenOnTheWayOut": (
-        'src/model/mod.rs',
+        'src/model/strict.rs',
         'a_conformant_schema_is_not_rewritten',
         'a conformant schema is rejected, making structured output unusable',
-        '    let mut problems = Vec::new();\n    for_each_subschema(schema, "schema", &mut |node, path| {',
-        '    let mut problems = vec!["synthetic".to_owned()];\n    for_each_subschema(schema, "schema", &mut |node, path| {',
+        '            problems: Vec::new(),',
+        '            problems: vec!["synthetic".to_owned()],',
     ),
     "SchemaIsASuggestion": (
         "src/model/openai.rs",
@@ -6538,7 +6611,7 @@ pub struct Label {""",
         "a_declared_tool_is_rendered_in_openais_shape",
         "declared tools drop strict mode, so arguments are checked after the "
         "tokens are paid for rather than enforced during generation",
-        "                        let strict = strict_schema_problem(&t.parameters).is_none();",
+        "                        let strict = StrictSubset::OpenAi.problem(&t.parameters).is_none();",
         "                        let strict = false;",
     ),
     "AModelsToolNameResolvesApproximately": (

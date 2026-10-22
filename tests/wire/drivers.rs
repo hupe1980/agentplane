@@ -368,7 +368,12 @@ async fn reasoning_effort_uses_each_providers_native_request_shape() {
     let anthropic_url = serve(anthropic_canned).await;
     let anthropic = Anthropic::new("k").unwrap().base(anthropic_url).buffered();
     let id = ModelId::new("anthropic", "claude-opus-5");
-    let schema = json!({"type": "object"});
+    let schema = json!({
+        "type": "object",
+        "properties": { "ok": { "type": "boolean" } },
+        "required": ["ok"],
+        "additionalProperties": false,
+    });
     anthropic
         .complete(agentplane::model::Request {
             model: &id,
@@ -2100,8 +2105,8 @@ async fn an_ignored_forced_tool_is_caught_even_by_a_schema_that_permits_null() {
 ///
 /// Strict mode takes a subset of JSON Schema: every object needs
 /// `additionalProperties: false`, every property must be listed in `required`,
-/// and `default` is rejected outright. A perfectly valid schema that breaks one
-/// of those comes back from the provider as a 400 that does not say which.
+/// and keywords such as `uniqueItems` are rejected outright. A perfectly valid
+/// schema that breaks one of those comes back from the provider as a 400.
 /// Catching it here costs nothing and names the rule.
 #[tokio::test]
 async fn an_incompatible_schema_is_refused_with_the_reason() {
@@ -2119,9 +2124,10 @@ async fn an_incompatible_schema_is_refused_with_the_reason() {
         ),
         (
             json!({ "type": "object", "additionalProperties": false,
-                    "properties": { "a": { "type": "string", "default": "x" } },
+                    "properties": { "a": { "type": "array", "items": { "type": "string" },
+                                           "uniqueItems": true } },
                     "required": ["a"] }),
-            "default",
+            "uniqueItems",
         ),
     ];
 

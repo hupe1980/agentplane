@@ -221,7 +221,7 @@ impl RedbStore {
     ///
     /// If the file cannot be opened or the tables cannot be created.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let db = Database::create(path).map_err(|e| be(&e))?;
+        let db = Database::create(path).map_err(open_error)?;
         Self::init(db)
     }
 
@@ -259,18 +259,18 @@ impl RedbStore {
     fn init(db: Database) -> Result<Self, StoreError> {
         let w = begin_write(&db)?;
         {
-            w.open_table(JOURNAL).map_err(|e| be(&e))?;
-            w.open_table(JOURNAL_BY_CASE).map_err(|e| be(&e))?;
-            w.open_table(EFFECT_ONCE).map_err(|e| be(&e))?;
-            w.open_table(RUN_LEASE).map_err(|e| be(&e))?;
-            w.open_table(RUN_SEAL).map_err(|e| be(&e))?;
-            w.open_table(RUN_BY_OUTCOME).map_err(|e| be(&e))?;
-            w.open_table(RUN_OUTCOME).map_err(|e| be(&e))?;
-            w.open_table(RUN_WAITING).map_err(|e| be(&e))?;
-            w.open_table(RUN_WAITING_AT).map_err(|e| be(&e))?;
-            w.open_table(SEAL_LOG).map_err(|e| be(&e))?;
-            w.open_table(RUN_CANCEL).map_err(|e| be(&e))?;
-            w.open_table(COUNTERS).map_err(|e| be(&e))?;
+            w.open_table(JOURNAL).map_err(table_error)?;
+            w.open_table(JOURNAL_BY_CASE).map_err(table_error)?;
+            w.open_table(EFFECT_ONCE).map_err(table_error)?;
+            w.open_table(RUN_LEASE).map_err(table_error)?;
+            w.open_table(RUN_SEAL).map_err(table_error)?;
+            w.open_table(RUN_BY_OUTCOME).map_err(table_error)?;
+            w.open_table(RUN_OUTCOME).map_err(table_error)?;
+            w.open_table(RUN_WAITING).map_err(table_error)?;
+            w.open_table(RUN_WAITING_AT).map_err(table_error)?;
+            w.open_table(SEAL_LOG).map_err(table_error)?;
+            w.open_table(RUN_CANCEL).map_err(table_error)?;
+            w.open_table(COUNTERS).map_err(table_error)?;
             super::redb_cases::create_tables(&w)?;
             super::redb_events::create_tables(&w)?;
             super::redb_tasks::create_tables(&w)?;
@@ -704,6 +704,38 @@ pub(super) fn is_sealed(
         .get(run_key_in(tenant, run).as_str())
         .map_err(|e| be(&e))?
         .is_some())
+}
+
+/// Why a store did not open, in the terms its caller acts on: wait for a
+/// holder, recreate the file, or treat it as an outage.
+fn open_error(e: redb::DatabaseError) -> StoreError {
+    match e {
+        redb::DatabaseError::DatabaseAlreadyOpen => StoreError::InUse(e.to_string()),
+        redb::DatabaseError::UpgradeRequired(_)
+        | redb::DatabaseError::RepairAborted
+        | redb::DatabaseError::Storage(redb::StorageError::Corrupted(_)) => {
+            StoreError::Unreadable(e.to_string())
+        }
+        // How redb says the file is not a redb database at all.
+        redb::DatabaseError::Storage(redb::StorageError::Io(ref io))
+            if io.kind() == std::io::ErrorKind::InvalidData =>
+        {
+            StoreError::Unreadable(e.to_string())
+        }
+        other => be(&other),
+    }
+}
+
+/// A table that does not have the shape this build declares was written by
+/// another build: unreadable here, not an outage.
+pub(super) fn table_error(e: redb::TableError) -> StoreError {
+    match e {
+        redb::TableError::TableTypeMismatch { .. }
+        | redb::TableError::TypeDefinitionChanged { .. }
+        | redb::TableError::TableIsMultimap(_)
+        | redb::TableError::TableIsNotMultimap(_) => StoreError::Unreadable(e.to_string()),
+        other => be(&other),
+    }
 }
 
 pub(super) fn be<E: std::fmt::Display>(e: &E) -> StoreError {

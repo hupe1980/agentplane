@@ -42,11 +42,11 @@ const BY_CASE: TableDefinition<(&str, &str, i64, &str), ()> = TableDefinition::n
 const PENDING: TableDefinition<(&str, &str), ()> = TableDefinition::new("tasks_pending");
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
-    w.open_table(TASKS).map_err(|e| be(&e))?;
-    w.open_table(QUEUE).map_err(|e| be(&e))?;
-    w.open_table(OVERDUE).map_err(|e| be(&e))?;
-    w.open_table(BY_CASE).map_err(|e| be(&e))?;
-    w.open_table(PENDING).map_err(|e| be(&e))?;
+    w.open_table(TASKS).map_err(super::redb::table_error)?;
+    w.open_table(QUEUE).map_err(super::redb::table_error)?;
+    w.open_table(OVERDUE).map_err(super::redb::table_error)?;
+    w.open_table(BY_CASE).map_err(super::redb::table_error)?;
+    w.open_table(PENDING).map_err(super::redb::table_error)?;
     Ok(())
 }
 

@@ -228,39 +228,99 @@ impl Debug for ToolBox {
     }
 }
 
-/// Say `additionalProperties: false` on every object the generator left open.
+/// Make a generated schema one strict decoding can hold a model to.
 ///
-/// Constrained decoding needs it, and a driver handed an open object drops
-/// silently to unconstrained generation — which makes a tool's arguments a
-/// suggestion rather than the constraint this crate says a schema is, with
-/// nothing failing to say so.
+/// Constrained decoding needs every object closed, and a driver handed a schema
+/// outside its provider's subset drops silently to unconstrained generation —
+/// which makes a tool's arguments a suggestion rather than the constraint this
+/// crate says a schema is, with nothing failing to say so.
 ///
 /// Applied rather than refused because this schema is *generated*, not
-/// authored: there is no author to send it back to, and the closed form is what
-/// the body already enforces — `serde` hands the tool its declared fields and
-/// no others.
+/// authored: there is no author to send it back to, and every rewrite here says
+/// what the body already enforces.
 ///
-/// `required` is left alone: a type with an `Option` field has a genuinely
-/// optional property, strict mode has no such thing, and forcing it in would
-/// make the field impossible to omit. Such a tool keeps falling back, which is
-/// the honest outcome.
-fn close_objects(node: &mut Value) {
-    if node.get("type") == Some(&serde_json::json!("object"))
-        && let Some(map) = node.as_object_mut()
-    {
+/// - Every object is closed: `serde` hands the tool its declared fields and no
+///   others.
+/// - An optional property that admits `null` is listed in `required`: `serde`
+///   reads `null` as `None` exactly as it reads an absent field, and strict
+///   mode has no optional properties. A property optional for another reason
+///   (`#[serde(default)]`) is left alone and keeps the tool non-strict, which
+///   is the honest outcome.
+/// - A `$ref` with siblings — a documented field of struct type — becomes a
+///   one-branch `anyOf` carrying them, since a `$ref` takes none.
+/// - The root's `$schema` is dropped: it names the dialect, constrains
+///   nothing, and is not a keyword every provider accepts.
+fn strict_ready(node: &mut Value) {
+    if let Some(map) = node.as_object_mut() {
+        map.remove("$schema");
+    }
+    close(node);
+}
+
+fn close(node: &mut Value) {
+    let Some(map) = node.as_object_mut() else {
+        return;
+    };
+    if map.contains_key("$ref") && map.len() > 1 {
+        let target = map.remove("$ref").expect("checked above");
+        map.insert("anyOf".to_owned(), serde_json::json!([{ "$ref": target }]));
+    }
+    if map.get("type") == Some(&serde_json::json!("object")) {
         map.entry("additionalProperties")
             .or_insert_with(|| serde_json::json!(false));
+        let nullable: Vec<String> = map
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|properties| {
+                properties
+                    .iter()
+                    .filter(|(_, schema)| admits_null(schema))
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !nullable.is_empty() {
+            let required = map
+                .entry("required")
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Some(required) = required.as_array_mut() {
+                for name in nullable {
+                    if !required.iter().any(|r| r == name.as_str()) {
+                        required.push(Value::String(name));
+                    }
+                }
+            }
+        }
     }
     for key in ["properties", "$defs", "definitions"] {
         if let Some(children) = node.get_mut(key).and_then(Value::as_object_mut) {
             for child in children.values_mut() {
-                close_objects(child);
+                close(child);
             }
         }
     }
     if let Some(items) = node.get_mut("items") {
-        close_objects(items);
+        close(items);
     }
+    if let Some(branches) = node.get_mut("anyOf").and_then(Value::as_array_mut) {
+        for branch in branches {
+            close(branch);
+        }
+    }
+}
+
+/// Whether a property's schema accepts `null`: a type array naming it, or a
+/// union with a `null` branch.
+fn admits_null(schema: &Value) -> bool {
+    let null = serde_json::json!("null");
+    match schema.get("type") {
+        Some(Value::Array(types)) if types.contains(&null) => return true,
+        _ => {}
+    }
+    schema
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .is_some_and(|branches| branches.iter().any(|b| b.get("type") == Some(&null)))
 }
 
 impl ToolBox {
@@ -277,7 +337,7 @@ impl ToolBox {
     pub fn with<T: Tool>(mut self) -> Self {
         let mut schema = serde_json::to_value(schemars::schema_for!(T))
             .expect("a schemars-generated schema must serialize to JSON");
-        close_objects(&mut schema);
+        strict_ready(&mut schema);
         // Keep the type's description for inspection and for deployments with
         // no manifest presentation. A declarative agent deliberately uses the
         // manifest's description instead: it is model-steering text, so a
@@ -545,6 +605,58 @@ mod tests {
             None,
             "schema: {schema}"
         );
+    }
+
+    /// Where a transfer goes.
+    #[cfg(feature = "providers")]
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Destination {
+        /// The account number.
+        account: String,
+    }
+
+    /// Move money: a documented field of struct type, and an optional one.
+    #[cfg(feature = "providers")]
+    #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+    struct Pays {
+        /// Where it goes.
+        to: Destination,
+        /// A note for the statement, if any.
+        memo: Option<String>,
+    }
+
+    #[cfg(feature = "providers")]
+    #[async_trait::async_trait]
+    impl Tool for Pays {
+        const SERVER: &'static str = "ledger";
+        const NAME: &'static str = "pay";
+        async fn call(self) -> Result<Value, ToolFailure> {
+            Ok(json!({ "to": self.to.account, "memo": self.memo }))
+        }
+    }
+
+    /// **The shapes a typed tool most often has stay strict.**
+    ///
+    /// A documented field of struct type is generated as a `$ref` with a
+    /// `description` beside it, which `OpenAI` answers with a 400; an `Option`
+    /// field is generated optional, which `OpenAI` strict mode does not have.
+    /// Both are said again in a form strict decoding takes, and the body still
+    /// reads a `null` memo as `None`.
+    #[test]
+    #[cfg(feature = "providers")]
+    fn a_struct_field_and_an_optional_field_stay_strict() {
+        let box_ = ToolBox::new().with::<Pays>();
+        let (_, schema, _) = box_
+            .declared(&ToolId::new("ledger", "pay"))
+            .expect("the tool was registered");
+        assert_eq!(
+            crate::model::StrictSubset::OpenAi.problem(schema),
+            None,
+            "schema: {schema}"
+        );
+        let paid: Pays = serde_json::from_value(json!({ "to": { "account": "1" }, "memo": null }))
+            .expect("a null memo reads as None");
+        assert!(paid.memo.is_none());
     }
 
     /// Each failure keeps its disposition, and gains the right identity.

@@ -23,8 +23,8 @@ const ITEMS: TableDefinition<(&str, &str, &str), ItemRow<'static>> =
     TableDefinition::new("batch_items");
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
-    w.open_table(BATCHES).map_err(|e| be(&e))?;
-    w.open_table(ITEMS).map_err(|e| be(&e))?;
+    w.open_table(BATCHES).map_err(super::redb::table_error)?;
+    w.open_table(ITEMS).map_err(super::redb::table_error)?;
     Ok(())
 }
 

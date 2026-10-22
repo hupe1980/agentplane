@@ -48,7 +48,7 @@ use crate::core::Secret;
 
 #[cfg(test)]
 use super::ModelCall;
-use super::strict_schema_problem;
+use super::StrictSubset;
 use super::wire::{RESPOND_TOOL, classify_status, classify_transport, structured};
 use super::{
     Completion, ModelError, ModelId, ModelProvider, Request, SchemaMode, Usage, openai_stream, sse,
@@ -248,7 +248,7 @@ impl OpenAi {
         // effect key records one shape while the wire carries another, and a run
         // whose journal disagrees with what it asked is the quiet divergence
         // this crate exists to prevent.
-        if let Some(problem) = strict_schema_problem(schema) {
+        if let Some(problem) = StrictSubset::OpenAi.problem(schema) {
             return Err(ModelError::Refused {
                 model: model.clone(),
                 detail: format!(
@@ -728,7 +728,7 @@ impl OpenAi {
                         // and make the wire's weaker guarantee explicit rather
                         // than turning every optional Rust field into a remote
                         // 400 response.
-                        let strict = strict_schema_problem(&t.parameters).is_none();
+                        let strict = StrictSubset::OpenAi.problem(&t.parameters).is_none();
                         json!({
                             "type": "function",
                             "name": t.name,
@@ -1471,7 +1471,7 @@ mod tool_tests {
             .body(
                 &ModelId::new("openai", "gpt-x"),
                 &json!({ "input": "hi" }),
-                Some(&json!({ "type": "object", "additionalProperties": false })),
+                Some(&json!({ "type": "object", "properties": {}, "required": [], "additionalProperties": false })),
                 &[],
                 &[],
             )

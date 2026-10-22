@@ -43,5 +43,6 @@ mod policy;
 mod policy_check;
 mod signature;
 mod subject;
+mod transcript;
 mod witness;
 mod yaml;

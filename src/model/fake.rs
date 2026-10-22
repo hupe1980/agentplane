@@ -489,7 +489,7 @@ impl ModelProvider for FakeProvider {
 
         // The other refusal a real driver makes before it sends anything, and
         // the one no stand-in had: a schema outside the subset constrained
-        // decoding accepts. Without it the fake is the only provider in the
+        // decoding accepts — on any provider, since each refuses its own. Without it the fake is the only provider in the
         // world that will enforce any schema you hand it, so an agent whose
         // result contract or plan format cannot be asked for passes every
         // offline test and fails on its first real call.
@@ -972,7 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn it_records_what_it_was_asked() {
-        let schema = json!({"type": "string"});
+        let schema = json!({ "type": "object", "properties": {}, "required": [], "additionalProperties": false });
         let p = FakeProvider::new();
         p.complete(ask(None)).await.unwrap();
         p.complete(ask(Some(&schema))).await.unwrap();

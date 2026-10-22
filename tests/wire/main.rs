@@ -26,6 +26,7 @@ mod mcp_server;
 mod media;
 mod model;
 mod outbox;
+mod strict;
 mod token_exchange;
 mod tools;
 mod witness_http;

@@ -1341,6 +1341,17 @@ pub enum StoreError {
     #[error("backend: {0}")]
     Backend(String),
 
+    /// Another handle holds the store. Nothing is wrong with it: wait for the
+    /// other holder, or stop it.
+    #[error("the store is in use by another handle: {0}")]
+    InUse(String),
+
+    /// The store's bytes are not a store this build can open — corrupted, or
+    /// written in a format it does not read. Open it with the build that wrote
+    /// it, or recreate it; retrying will not help.
+    #[error("the store cannot be read by this build: {0}")]
+    Unreadable(String),
+
     #[error("not found: {0}")]
     NotFound(String),
 

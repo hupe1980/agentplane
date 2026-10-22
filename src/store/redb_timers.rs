@@ -45,8 +45,8 @@ const TIMERS_DUE: TableDefinition<(&str, i64, &str, &str), ()> = TableDefinition
 const CLAIM_LEASE: i64 = 60;
 
 pub(super) fn create_tables(w: &redb::WriteTransaction) -> Result<(), StoreError> {
-    w.open_table(TIMERS).map_err(|e| be(&e))?;
-    w.open_table(TIMERS_DUE).map_err(|e| be(&e))?;
+    w.open_table(TIMERS).map_err(super::redb::table_error)?;
+    w.open_table(TIMERS_DUE).map_err(super::redb::table_error)?;
     Ok(())
 }
 

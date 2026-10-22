@@ -143,9 +143,9 @@ impl Declarative {
         // the caller's data. `/system` is a protected field precisely so that
         // conflation is refused rather than obeyed.
         let prompt = prompt_object(&system, input, remembered);
-        let mut exchanges: Vec<crate::model::ToolExchange> = Vec::new();
-        let mut continuation: Option<crate::model::ProviderContinuation> = None;
-        let mut conversation_label = prompt.label().clone();
+        // The conversation the model reads back each turn, with its label: the
+        // sink judges it beside the prompt and labels each answer with it.
+        let mut transcript = crate::model::Transcript::new(&prompt);
 
         for _turn in 0..self.max_turns {
             // No `with_output_sensitivity`: the completion's floor derives
@@ -153,13 +153,12 @@ impl Declarative {
             // the conversation label could only ever agree — dispatch refuses
             // a conversation above the ceiling — and the derived spelling
             // cannot be forgotten at the next call site.
-            let outbound = prompt.with_joined_label(&conversation_label);
             let completion = cx
-                .sink_with(&outbound, |value| {
+                .sink_with(&prompt, |value| {
                     let mut call = ModelCall::new(Arc::clone(&provider), role.model.clone(), value)
                         .observed_by(stream.clone())
                         .with_tools(declared.clone())
-                        .continuing(exchanges.clone());
+                        .continuing(&transcript);
                     // The declared output shape rides on **every** turn, not
                     // only the last. Which turn answers is the model's choice,
                     // so there is no moment before dispatch at which "this is
@@ -178,9 +177,6 @@ impl Declarative {
                     if let Some(schema) = output_schema.clone() {
                         call = call.expecting(schema);
                     }
-                    if let Some(state) = continuation.take() {
-                        call = call.with_continuation(state);
-                    }
                     call = role.applied_to(call);
                     if let Some(ceiling) = egress {
                         call = call.with_max_sensitivity(ceiling);
@@ -188,8 +184,6 @@ impl Declarative {
                     call
                 })
                 .await?;
-            let label = completion.label().join(&conversation_label);
-            let completion = Tainted::with_label(completion.into_unlabelled(), label);
 
             // **A cut-off turn is not a turn.**
             //
@@ -264,8 +258,6 @@ impl Declarative {
                     .await;
             }
 
-            continuation.clone_from(&completion.peek().continuation);
-            exchanges.clear();
             // Providers may emit several calls in one response. Execute them in
             // response order: `StepCtx` is the deterministic admission boundary
             // and cannot be borrowed concurrently without moving journal,
@@ -274,7 +266,7 @@ impl Declarative {
             // journals completion order; spawning here would trade latency for
             // replay correctness. Callers needing concurrency should expose one
             // aggregate tool whose own implementation owns that contract.
-            for asked in completion.peek().tool_calls.clone() {
+            for asked in transcript.asked(&completion) {
                 // Matched byte for byte. A name that resolves to nothing
                 // is reported back as a failed call rather than ending
                 // the run: the model gets to correct itself, and it never
@@ -288,24 +280,28 @@ impl Declarative {
                         .find(|(offered, _)| *offered == id)
                         .map(|(_, grant)| (id, *grant))
                 }) else {
-                    exchanges.push(crate::model::ToolExchange::failed(
+                    transcript.failed(
                         asked,
-                        "no tool of that name is granted to this agent",
-                    ));
+                        Tainted::trusted(
+                            "no tool of that name is granted to this agent".to_owned(),
+                        ),
+                    );
                     continue;
                 };
 
                 let Some(declaration) = declared.iter().find(|tool| tool.name == asked.name) else {
-                    exchanges.push(crate::model::ToolExchange::failed(
+                    transcript.failed(
                         asked,
-                        "the selected tool has no model-facing declaration",
-                    ));
+                        Tainted::trusted(
+                            "the selected tool has no model-facing declaration".to_owned(),
+                        ),
+                    );
                     continue;
                 };
                 if let Err(detail) =
                     crate::model::validate_schema(&declaration.parameters, &asked.arguments)
                 {
-                    exchanges.push(crate::model::ToolExchange::failed(asked, detail));
+                    transcript.failed(asked, Tainted::trusted(detail));
                     continue;
                 }
 
@@ -372,10 +368,10 @@ impl Declarative {
                         // text steering the next turn is untrusted content in
                         // the one slot this design keeps clean; the reason
                         // belongs in the journal, where the operator reads it.
-                        exchanges.push(crate::model::ToolExchange::failed(
+                        transcript.failed(
                             asked,
-                            "a reviewer did not approve this call",
-                        ));
+                            Tainted::trusted("a reviewer did not approve this call".to_owned()),
+                        );
                         continue;
                     }
                     // What dispatches is what the approval authorized — the
@@ -387,7 +383,7 @@ impl Declarative {
                     args = match approved_arguments(&decision, &declaration.parameters, args) {
                         Ok(args) => args,
                         Err(detail) => {
-                            exchanges.push(crate::model::ToolExchange::failed(asked, detail));
+                            transcript.failed(asked, Tainted::trusted(detail));
                             continue;
                         }
                     };
@@ -405,14 +401,10 @@ impl Declarative {
                 if id.server == crate::tools::AGENT_SERVER {
                     match consult(cx, &id.tool, args, approved.as_ref()).await {
                         Ok(answer) => {
-                            conversation_label = conversation_label.join(answer.label());
-                            exchanges
-                                .push(crate::model::ToolExchange::ok(asked, answer.peek().clone()));
+                            transcript.answered(asked, &answer);
                         }
-                        Err(e) => match relayed_failure(cx, &mut conversation_label, &e) {
-                            Some(detail) => {
-                                exchanges.push(crate::model::ToolExchange::failed(asked, detail));
-                            }
+                        Err(e) => match cx.relayed(&e) {
+                            Some(detail) => transcript.failed(asked, detail),
                             // Not something to tell the model and carry on —
                             // the specialist may have acted before failing, and
                             // the executor reaches its own verdict, exactly as
@@ -431,14 +423,10 @@ impl Declarative {
                 if let Some(peer) = cx.peer_named(&id.server) {
                     match cx.call_peer(&peer, &id.tool, &args).await {
                         Ok(answer) => {
-                            conversation_label = conversation_label.join(answer.label());
-                            exchanges
-                                .push(crate::model::ToolExchange::ok(asked, answer.peek().clone()));
+                            transcript.answered(asked, &answer);
                         }
-                        Err(e) => match relayed_failure(cx, &mut conversation_label, &e) {
-                            Some(detail) => {
-                                exchanges.push(crate::model::ToolExchange::failed(asked, detail));
-                            }
+                        Err(e) => match cx.relayed(&e) {
+                            Some(detail) => transcript.failed(asked, detail),
                             None => return Err(e.into()),
                         },
                     }
@@ -464,14 +452,10 @@ impl Declarative {
                     .await;
                 match dispatched {
                     Ok(result) => {
-                        conversation_label = conversation_label.join(result.label());
-                        exchanges
-                            .push(crate::model::ToolExchange::ok(asked, result.peek().clone()));
+                        transcript.answered(asked, &result);
                     }
-                    Err(e) => match relayed_failure(cx, &mut conversation_label, &e) {
-                        Some(detail) => {
-                            exchanges.push(crate::model::ToolExchange::failed(asked, detail));
-                        }
+                    Err(e) => match cx.relayed(&e) {
+                        Some(detail) => transcript.failed(asked, detail),
                         // Not something to tell the model and carry on. It
                         // leaves this loop the way it would leave a hand-written
                         // skill, so the executor reaches its own verdict.
@@ -1674,8 +1658,10 @@ fn plan_schema(max_steps: u32) -> Value {
         "properties": {
             "steps": {
                 "type": "array",
+                // The ceiling is in the description and enforced after the
+                // answer arrives: Anthropic's strict mode refuses `maxItems`.
+                "description": format!("between 1 and {max_steps} steps"),
                 "minItems": 1,
-                "maxItems": max_steps,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2199,90 +2185,6 @@ fn declared_arguments<'a>(
 
 fn privileged(m: &Manifest) -> Option<ModelRole> {
     m.privileged_role()
-}
-
-/// What a failed tool call may tell the model, if anything.
-///
-/// `Some(text)` continues the loop with that text as the tool's result.
-/// **`None` means the error is not the model's business and must leave the
-/// loop**, so the executor reaches the verdict it would reach for a
-/// hand-written skill.
-///
-/// # A refusal produced here is an oracle
-///
-/// Every [`PolicyError`](crate::core::PolicyError) message is written for an
-/// operator reading a journal and is precise on purpose: which sink, which
-/// field, what sensitivity, which ceiling. Handing that to a model turns the
-/// policy into a queryable service — injected content varies the request,
-/// watches which variants come back refused, and reads the boundary off the
-/// answers. `EgressCeiling` is the sharpest: it names the *sensitivity of the
-/// data*, so a few probes classify what the run was never allowed to reveal
-/// without any of it crossing the boundary.
-///
-/// So a refusal is [`REFUSED`](crate::core::REFUSED) and nothing else. The
-/// journal still keeps the full reason. `PolicyError::for_model` is the one
-/// rendering a model sees; `Display` is for the journal and the operator.
-///
-/// # An unknown outcome is not a failed call
-///
-/// [`StepError::Undecidable`](crate::core::StepError::Undecidable) is the
-/// runtime saying it cannot tell "never applied" from "applied,
-/// acknowledgement lost" — a timed-out payment may well have been taken. The
-/// executor quarantines on it. Reported to the model as a failed call, the
-/// quarantine never happens: the model apologises, the loop continues, and the
-/// run ends **`Succeeded`** over a mutation nobody can account for. That is I5
-/// inverted by an error-handling convenience.
-///
-/// Suspension, budget ceilings, store failures and divergence leave for the
-/// same reason: each has a handler above this loop, and each is silently
-/// disarmed by being turned into a chat message.
-///
-/// # What does reach the model
-///
-/// The far side's own answer, and only that. A tool that was unreachable,
-/// declined the request, or ran and reported failure is information the model
-/// needs in order to try something else — and it is text the far side already
-/// controls, so withholding it protects nothing from the far side. It is not
-/// unlabelled, though: see [`relayed_failure`].
-fn model_facing(e: &crate::core::StepError) -> Option<String> {
-    match e {
-        crate::core::StepError::Policy(p) => Some(p.for_model().to_owned()),
-        // The far side spoke, or demonstrably did not — and `disposition` is
-        // the crate's own name for that distinction, so this reads it rather
-        // than re-deriving it from the variant list and drifting from it.
-        // `InDoubt` never becomes a chat message: whether it also quarantines
-        // is the recovery policy's call, made above this loop, and reporting it
-        // here would take that call away.
-        crate::core::StepError::Effect(inner)
-            if inner.disposition() != crate::core::Disposition::InDoubt =>
-        {
-            Some(inner.to_string())
-        }
-        _ => None,
-    }
-}
-
-/// What a failed call tells the model, with the failure's label joined into
-/// the conversation's.
-///
-/// A far side's error text is its output as much as its answer is — an MCP
-/// tool's `isError` content is rendered straight into it — so it carries the
-/// label an answer from that effect would have carried. Joined here exactly as
-/// a success's label is joined, so the next turn's sink gate judges the
-/// conversation the model will actually read: a confidential tool cannot reach
-/// a model with a lower ceiling by failing instead of answering.
-fn relayed_failure(
-    cx: &mut StepCtx<'_>,
-    conversation_label: &mut crate::core::Label,
-    e: &crate::core::StepError,
-) -> Option<String> {
-    let detail = model_facing(e)?;
-    if matches!(e, crate::core::StepError::Effect(_))
-        && let Some(failed) = cx.take_failed_output_label()
-    {
-        *conversation_label = conversation_label.join(&failed);
-    }
-    Some(detail)
 }
 
 #[cfg(all(test, feature = "providers"))]

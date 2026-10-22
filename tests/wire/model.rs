@@ -26,7 +26,7 @@ use agentplane::core::{
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::model::{
     Completion, ModelCall, ModelError, ModelId, ModelProvider, ModelStreamEvent,
-    ModelStreamObserver, ToolCall, ToolDeclaration, ToolExchange, Usage,
+    ModelStreamObserver, ToolCall, ToolDeclaration, Transcript, Usage,
 };
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
@@ -719,10 +719,14 @@ fn changed_tool_exchanges_are_a_different_effect() {
         name: "read_balance".to_owned(),
         arguments: json!({ "account": "A-1" }),
     };
+    let prompt = Tainted::trusted(json!({ "q": "balance" }));
+    let mut answered = Transcript::new(&prompt);
+    answered.answered(call.clone(), &Tainted::trusted(json!({ "balance": 42 })));
+    let mut failed = Transcript::new(&prompt);
+    failed.failed(call, Tainted::trusted("ledger unavailable".to_owned()));
     let a = ModelCall::new(Arc::clone(&provider), model(), json!({ "q": "balance" }))
-        .continuing([ToolExchange::ok(call.clone(), json!({ "balance": 42 }))]);
-    let b = ModelCall::new(provider, model(), json!({ "q": "balance" }))
-        .continuing([ToolExchange::failed(call, "ledger unavailable")]);
+        .continuing(&answered);
+    let b = ModelCall::new(provider, model(), json!({ "q": "balance" })).continuing(&failed);
 
     assert_ne!(
         a.descriptor().args,

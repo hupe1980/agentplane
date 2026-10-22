@@ -6526,6 +6526,21 @@ spec:
     ))
     .expect("a grant that names its protected field is reachable and must parse");
 
+    //    A tool that takes no arguments has no field to name: the whole value
+    //    is `""`, and a menu of the one empty call bounds the act itself.
+    let message = Manifest::parse(&agent("tool-calling", ""))
+        .expect_err("still refused")
+        .to_string();
+    assert!(
+        message.contains(r#"path: """#),
+        "the refusal does not name the whole-value rule an argument-less tool needs: {message}"
+    );
+    Manifest::parse(&agent(
+        "tool-calling",
+        "      protected_fields:\n        - path: ''\n          one_of: [{}]",
+    ))
+    .expect("an argument-less tool granted with a menu of the empty call must parse");
+
     // 2. A plan resolves its own arguments, so the completion's label never
     //    reaches them.
     Manifest::parse(&agent("planned", "")).expect("planned resolves arguments by reference");
