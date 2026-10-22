@@ -256,11 +256,24 @@ mod tests {
             .build()
             .expect("a client");
         let outcome = client.get(format!("http://localhost:{port}/")).send().await;
-        assert!(
-            outcome.is_err(),
+        // The refusal must be the resolver's. Any error would also pass on a
+        // runner where the listener's close resets the connection, and then a
+        // client with no address rule reads as one that has it.
+        let error = outcome.expect_err(
             "a public-only client reached a server on this machine, so the \
              address rule is not attached to the client and every pre-flight \
-             that passes it is the only check there is"
+             that passes it is the only check there is",
+        );
+        let mut chain = error.to_string();
+        let mut cause: &dyn std::error::Error = &error;
+        while let Some(next) = cause.source() {
+            chain.push_str(": ");
+            chain.push_str(&next.to_string());
+            cause = next;
+        }
+        assert!(
+            chain.contains("forbidden address"),
+            "the request failed, but not because the address rule refused it: {chain}"
         );
 
         served.abort();
