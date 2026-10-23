@@ -3865,10 +3865,15 @@ impl Runtime {
             .await?;
 
         let plane = Arc::clone(self);
-        tokio::spawn(async move {
-            let _ticket = ticket;
-            plane.execute_admitted(admitted).await
-        });
+        // In the caller's span, as a blocking run is: a background run's
+        // trace is still the trace of whatever started it.
+        tokio::spawn(
+            async move {
+                let _ticket = ticket;
+                plane.execute_admitted(admitted).await
+            }
+            .in_current_span(),
+        );
         Ok(run)
     }
 
@@ -5469,9 +5474,12 @@ impl Runtime {
         // leaves an operator a verb when the plan can no longer be read at all
         // — which is an ordinary state, because erasing a case's key erases
         // the plan of every run in it.
-        let input = records.iter().find_map(recorded_input).ok_or_else(|| {
-            RuntimeError::PlanContract("journal has no RunAdmitted record".into())
-        })?;
+        let input = records
+            .iter()
+            .find_map(Record::admitted_input)
+            .ok_or_else(|| {
+                RuntimeError::PlanContract("journal has no RunAdmitted record".into())
+            })?;
         let (plan, successors) =
             frozen_plans(run, &records).map_err(|e| self.sealed_or_erased(e))?;
 
@@ -5601,6 +5609,8 @@ impl Runtime {
             { telemetry::TENANT } = tracing::field::Empty,
             { telemetry::OUTCOME } = tracing::field::Empty,
             { telemetry::SEMCONV } = telemetry::SEMCONV_VERSION,
+            { telemetry::OTEL_NAME } = format!("{} {}", telemetry::GEN_AI_INVOKE_AGENT, plan.agent),
+            { telemetry::OTEL_KIND } = "internal",
         );
         if !self.meter.tenant().is_empty() {
             span.record(telemetry::TENANT, self.meter.tenant());
@@ -8581,26 +8591,6 @@ fn recorded_subjects(run: RunId, records: &[Record]) -> BTreeSet<crate::core::Su
             _ => None,
         })
         .unwrap_or_default()
-}
-
-/// The admitted input, label and all.
-///
-/// Read back rather than recomputed: a replay that re-labelled would reach a
-/// different verdict at every taint gate than the run it reproduces.
-fn recorded_input(r: &Record) -> Option<Tainted<Value>> {
-    match r.kind() {
-        RecordKind::RunAdmitted {
-            input,
-            input_label,
-            input_field_labels,
-            ..
-        } => Some(Tainted::with_field_labels(
-            input.clone(),
-            input_label.clone(),
-            input_field_labels.clone(),
-        )),
-        _ => None,
-    }
 }
 
 /// Refuse a history this build cannot re-derive.

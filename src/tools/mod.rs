@@ -57,7 +57,7 @@ pub use mcp::{
 /// a direct dependency would have to be re-unified by hand on every upgrade.
 #[cfg(feature = "mcp")]
 pub use rmcp;
-pub use typed::{Tool, ToolBox, ToolFailure};
+pub use typed::{Tool, ToolBox, ToolFailure, strict_schema};
 
 /// The MCP revision this plane serves and offers.
 ///
@@ -147,6 +147,16 @@ impl ToolId {
     #[must_use]
     pub fn reference(&self) -> String {
         format!("{TOOL_SCHEME}{}/{}", self.server, self.tool)
+    }
+
+    /// The source a call to this tool labels its result with.
+    ///
+    /// The name a field rule's `allowed_sources` matches to admit what this
+    /// tool returned. Ask for it rather than spelling it, so the rule and the
+    /// provenance cannot name one tool two ways.
+    #[must_use]
+    pub fn source(&self) -> crate::core::SourceId {
+        crate::core::SourceId::new(self.reference())
     }
 
     /// The inverse of [`reference`](Self::reference).
@@ -1133,7 +1143,7 @@ impl Effect for ToolCall {
     /// come from the CRM" was unsatisfiable strictly, and satisfiable loosely
     /// by whichever tool an injected prompt reached first.
     fn source(&self) -> crate::core::SourceId {
-        crate::core::SourceId::new(self.id.reference())
+        self.id.source()
     }
 
     fn attach(&mut self, provenance: &crate::core::Provenance) {

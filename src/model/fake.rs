@@ -455,6 +455,9 @@ fn sample(schema: &Value) -> Value {
 
 #[async_trait]
 impl ModelProvider for FakeProvider {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        None
+    }
     async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
         self.asked.lock().expect("fake").push(Ask {
             model: request.model.clone(),

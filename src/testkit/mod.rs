@@ -46,6 +46,8 @@ pub mod conformance_push;
 pub mod conformance_quota;
 #[cfg(feature = "manifest")]
 pub mod conformance_registry;
+#[cfg(feature = "redb")]
+pub mod crash;
 pub mod faults;
 #[cfg(feature = "keyring")]
 pub mod memory_keyring;
@@ -67,4 +69,6 @@ pub use stub_signer::StubSigner;
 pub use crate::model::fake::{Ask, FakeProvider};
 pub use backstop::assert_replay_was_not_backstopped;
 pub use conformance::{Report, Violation, check as check_journal_store};
+#[cfg(feature = "redb")]
+pub use crash::{CrashPoint, assert_resumed_honestly, crash_points};
 pub use faults::{Fault, Faulty, Schedule};

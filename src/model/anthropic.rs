@@ -1094,6 +1094,9 @@ fn stream_error(
 
 #[async_trait]
 impl ModelProvider for Anthropic {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        Some("anthropic")
+    }
     fn request_profile(&self, model: &ModelId) -> Value {
         let schema_mode = match self.mode_for(model) {
             SchemaMode::Native => "native",

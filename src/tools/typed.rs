@@ -250,6 +250,11 @@ impl Debug for ToolBox {
 ///   one-branch `anyOf` carrying them, since a `$ref` takes none.
 /// - The root's `$schema` is dropped: it names the dialect, constrains
 ///   nothing, and is not a keyword every provider accepts.
+/// - A number's `format`, and a `minimum` or `maximum` equal to its Rust
+///   type's own bound, are dropped: `schemars` derives them from the type and
+///   `serde` refuses what they exclude. A range somebody declared is a
+///   different number and stays, keeping the tool non-strict where a provider
+///   refuses it.
 fn strict_ready(node: &mut Value) {
     if let Some(map) = node.as_object_mut() {
         map.remove("$schema");
@@ -261,6 +266,7 @@ fn close(node: &mut Value) {
     let Some(map) = node.as_object_mut() else {
         return;
     };
+    drop_type_bounds(map);
     if map.contains_key("$ref") && map.len() > 1 {
         let target = map.remove("$ref").expect("checked above");
         map.insert("anyOf".to_owned(), serde_json::json!([{ "$ref": target }]));
@@ -309,6 +315,55 @@ fn close(node: &mut Value) {
     }
 }
 
+/// The bounds `schemars` derives from a Rust number type, by its `format`.
+const NUMBER_FORMATS: &[(&str, Option<i64>, Option<i64>)] = &[
+    ("int8", Some(-128), Some(127)),
+    ("int16", Some(-32_768), Some(32_767)),
+    ("int32", None, None),
+    ("int64", None, None),
+    ("int128", None, None),
+    ("int", None, None),
+    ("uint8", Some(0), Some(255)),
+    ("uint16", Some(0), Some(65_535)),
+    ("uint32", Some(0), None),
+    ("uint64", Some(0), None),
+    ("uint128", Some(0), None),
+    ("uint", Some(0), None),
+    ("float", None, None),
+    ("double", None, None),
+];
+
+fn drop_type_bounds(map: &mut serde_json::Map<String, Value>) {
+    let Some((_, min, max)) = map
+        .get("format")
+        .and_then(Value::as_str)
+        .and_then(|format| NUMBER_FORMATS.iter().find(|(name, ..)| *name == format))
+    else {
+        return;
+    };
+    map.remove("format");
+    for (key, bound) in [("minimum", min), ("maximum", max)] {
+        if bound.is_some() && map.get(key).and_then(Value::as_i64) == *bound {
+            map.remove(key);
+        }
+    }
+}
+
+/// The schema of `T`, made ready for strict decoding as a typed tool's is.
+///
+/// What [`ToolBox::with`] declares, for a schema an embedder generates and
+/// sends itself. It changes nothing `serde` would not refuse anyway; whether a
+/// provider then takes it strictly is [`StrictSubset::problem`]'s answer.
+///
+/// [`StrictSubset::problem`]: crate::model::StrictSubset::problem
+#[must_use]
+pub fn strict_schema<T: schemars::JsonSchema>() -> Value {
+    let mut schema = serde_json::to_value(schemars::schema_for!(T))
+        .expect("a schemars-generated schema must serialize to JSON");
+    strict_ready(&mut schema);
+    schema
+}
+
 /// Whether a property's schema accepts `null`: a type array naming it, or a
 /// union with a `null` branch.
 fn admits_null(schema: &Value) -> bool {
@@ -335,9 +390,7 @@ impl ToolBox {
     /// and the arguments the body receives are the same declaration.
     #[must_use]
     pub fn with<T: Tool>(mut self) -> Self {
-        let mut schema = serde_json::to_value(schemars::schema_for!(T))
-            .expect("a schemars-generated schema must serialize to JSON");
-        strict_ready(&mut schema);
+        let schema = strict_schema::<T>();
         // Keep the type's description for inspection and for deployments with
         // no manifest presentation. A declarative agent deliberately uses the
         // manifest's description instead: it is model-steering text, so a

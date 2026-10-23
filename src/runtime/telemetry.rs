@@ -86,14 +86,16 @@
 //! to the reason an operator reads through the API — which honours erasure — and
 //! says nothing on its own.
 //!
-//! Three more the convention defines that this plane does not emit, each for its
-//! own reason. `gen_ai.response.id`, because no shared part of a [`Completion`]
-//! carries one. `gen_ai.provider.name` on the **run** span, because the agent is
-//! executed here rather than served by anyone — the completion spans beneath it
-//! each name the provider that answered them. And `server.address`, because a
-//! driver's endpoint is deployment configuration that is identical for every call
-//! it makes: that belongs on the `OTel` *resource*, which the embedder owns,
-//! rather than repeated on every span this crate opens.
+//! The convention defines more that this plane does not emit, each for its own
+//! reason. `gen_ai.response.id`, because no shared part of a [`Completion`]
+//! carries one. `gen_ai.tool.call.id`, because a coded skill calls a tool by its
+//! id and its arguments, and the model's call id never reaches the call.
+//! `gen_ai.provider.name` on the **run** span, because the agent is executed here
+//! rather than served by anyone — the completion spans beneath it each name the
+//! provider that answered them. And `server.address`, because a driver's endpoint
+//! is deployment configuration that is identical for every call it makes: that
+//! belongs on the `OTel` *resource*, which the embedder owns, rather than
+//! repeated on every span this crate opens.
 //!
 //! [`Completion`]: crate::model::Completion
 
@@ -102,7 +104,7 @@
 /// Emitted on the run span so a collector can tell which vocabulary produced a
 /// trace, and so a future change is a visible migration rather than a silent
 /// reinterpretation of old data.
-pub const SEMCONV_VERSION: &str = "genai-2026-07-28/development";
+pub const SEMCONV_VERSION: &str = "genai-2026-10-21/development";
 
 // ── Span names ──────────────────────────────────────────────────────────────
 
@@ -114,6 +116,17 @@ pub const STEP_SPAN: &str = "agentplane.step";
 pub const EFFECT_SPAN: &str = "agentplane.effect";
 
 // ── Attributes ──────────────────────────────────────────────────────────────
+
+/// The span's name as an `OTel` bridge exports it.
+///
+/// The convention's `{operation} {target}` (`chat gpt-5`, `execute_tool
+/// fs/write`, `invoke_agent support`), where the `tracing` name stays this
+/// crate's own. `tracing-opentelemetry` reads it; another subscriber sees a
+/// plain field.
+pub const OTEL_NAME: &str = "otel.name";
+/// The span's kind as an `OTel` bridge exports it: `client` for a call that
+/// leaves the process, `internal` otherwise.
+pub const OTEL_KIND: &str = "otel.kind";
 
 /// From the `GenAI` conventions: this span is an agent invocation.
 pub const GEN_AI_OPERATION: &str = "gen_ai.operation.name";

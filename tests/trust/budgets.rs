@@ -1258,6 +1258,9 @@ struct CountingModel(Arc<AtomicUsize>);
 
 #[async_trait::async_trait]
 impl agentplane::model::ModelProvider for CountingModel {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        None
+    }
     async fn complete(
         &self,
         request: agentplane::model::Request<'_>,

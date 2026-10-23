@@ -3155,9 +3155,22 @@ impl<'a> StepCtx<'a> {
             { telemetry::GEN_AI_OUTPUT_TOKENS } = tracing::field::Empty,
             { telemetry::GEN_AI_CACHE_READ_TOKENS } = tracing::field::Empty,
             { telemetry::GEN_AI_CACHE_WRITE_TOKENS } = tracing::field::Empty,
+            { telemetry::OTEL_NAME } = tracing::field::Empty,
+            { telemetry::OTEL_KIND } = tracing::field::Empty,
         );
         if let Some(op) = effect.gen_ai_operation() {
             span.record(telemetry::GEN_AI_OPERATION, op);
+            // A completion leaves the process; a tool runs on the plane's
+            // side of its transport, which is what the convention's
+            // `execute_tool` span describes.
+            span.record(
+                telemetry::OTEL_KIND,
+                if op == telemetry::GEN_AI_CHAT {
+                    "client"
+                } else {
+                    "internal"
+                },
+            );
             // The convention splits the name by operation: a completion names
             // a model, a tool call names a tool, and neither key means the
             // other. Read from the effect rather than guessed from the kind.
@@ -3168,6 +3181,10 @@ impl<'a> StepCtx<'a> {
                 } else {
                     span.record(telemetry::GEN_AI_TOOL_NAME, request.name.as_str());
                 }
+                span.record(
+                    telemetry::OTEL_NAME,
+                    format!("{op} {}", request.name).as_str(),
+                );
             }
         }
         // `Instrument`, never `enter()`. An `Entered` guard held across an

@@ -1373,6 +1373,19 @@ name, so a new effect type cannot pick up a label by accident — and the keys d
 not cross, because a completion naming a tool would make every model call look
 like a tool invocation.
 
+Exported through `tracing-opentelemetry`, spans take the convention's names and
+kinds from `otel.name` and `otel.kind`: `invoke_agent {agent}` (internal),
+`chat {model}` (client), `execute_tool {server/tool}` (internal). The `tracing`
+names above stay this crate's own. `gen_ai.provider.name` is the driver's
+well-known value (`openai`, `anthropic`, `aws.bedrock`, `gcp.gemini`); a
+chat-completions endpoint names its service with
+`ChatCompletions::gen_ai_provider`, or reports the name its model is routed by.
+
+**An embedder's own attributes go on its own span.** A run's span is a child of
+the span current where the run starts, awaited or `spawn`ed, so a span the
+embedder opens around it — its task, its verdict, its policy decision — sits
+above the run in one trace.
+
 **Where the convention names a fact, the convention's name is what is emitted.**
 An agent's name and a conversation's identity are `gen_ai.agent.name` and
 `gen_ai.conversation.id`, not a second spelling in this crate's namespace that no
@@ -1408,8 +1421,10 @@ What a deployment gets instead is the **shape** of every call — who was asked,
 what it cost, which tool ran, how it ended — and the journal for the content,
 where the same values are sealed, labelled and erasable.
 
-Three more the convention defines that this plane does not emit, each for its own
+The convention defines more that this plane does not emit, each for its own
 reason. `gen_ai.response.id`, because no shared part of a completion carries one.
+`gen_ai.tool.call.id`, because a coded skill calls a tool by its id and its
+arguments, and the model's call id never reaches the call.
 `gen_ai.provider.name` on the **run** span, because the agent is executed here
 rather than served by anyone — the completion spans beneath it each name the
 provider that answered them. And `server.address`, because a driver's endpoint is
@@ -1432,8 +1447,10 @@ a media source's URL routinely carries a bearer secret, so an outbound error is
 rendered with the **host** it failed at and never the URL — in a parked push
 registration, a log line and an effect's failure alike.
 
-The conventions are still pre-1.0, so the revision targeted is pinned in
-`telemetry::SEMCONV_VERSION` rather than tracked. An upstream change becomes a
+The conventions are still pre-1.0 and published without releases, so the
+revision targeted is pinned in `telemetry::SEMCONV_VERSION` by the date of the
+`semantic-conventions-genai` commit it was read at, rather than tracked. An
+upstream change becomes a
 deliberate migration instead of a silent shift in what your dashboards mean.
 
 Further decisions worth knowing:

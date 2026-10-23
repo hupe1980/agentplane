@@ -1,6 +1,6 @@
 [package]
 name         = "agentplane"
-version      = "0.50.0"
+version      = "0.51.0"
 edition      = "2024"
 rust-version = "1.94.1"
 license      = "MIT OR Apache-2.0"
@@ -317,6 +317,8 @@ tower = { version = "0.5.3", features = ["util"] }
 # source contains. An instrumentation test that greps is checking the author's
 # intent; this checks the runtime's behaviour.
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry"] }
+# `Subscriber::current_span`'s type, which `tracing` does not re-export.
+tracing-core = "0.1"
 
 # The CLI that makes the declarative tier need no Rust at all.
 #

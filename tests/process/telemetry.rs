@@ -52,6 +52,8 @@ struct Recorder {
     /// Currently entered, innermost last.
     stack: Arc<Mutex<Vec<(u64, String)>>>,
     next: Arc<Mutex<u64>>,
+    /// Each span's metadata, by id, so the recorder can answer `current_span`.
+    metas: Arc<Mutex<Vec<&'static Metadata<'static>>>>,
     /// Values written *after* a span opened, as `field=value`.
     ///
     /// Needed because an attribute the runtime only knows once it has the
@@ -111,6 +113,7 @@ impl Subscriber for Recorder {
     }
     fn new_span(&self, attrs: &span::Attributes<'_>) -> span::Id {
         let name = attrs.metadata().name().to_owned();
+        self.metas.lock().unwrap().push(attrs.metadata());
         attrs.record(&mut Fields(&self.fields));
         self.spans.lock().unwrap().push(name.clone());
         let parent = self.stack.lock().unwrap().last().map(|(_, n)| n.clone());
@@ -157,6 +160,13 @@ impl Subscriber for Recorder {
             .get(usize::try_from(id.into_u64() - 1).unwrap_or(usize::MAX))
             .map_or_else(|| "?".to_owned(), |(n, _)| n.clone());
         self.stack.lock().unwrap().push((id.into_u64(), name));
+    }
+    fn current_span(&self) -> tracing_core::span::Current {
+        let Some((id, _)) = self.stack.lock().unwrap().last().cloned() else {
+            return tracing_core::span::Current::none();
+        };
+        let meta = self.metas.lock().unwrap()[usize::try_from(id - 1).unwrap()];
+        tracing_core::span::Current::new(span::Id::from_u64(id), meta)
     }
     fn exit(&self, id: &span::Id) {
         let mut stack = self.stack.lock().unwrap();
@@ -1140,4 +1150,131 @@ async fn a_failed_compensations_event_carries_no_error_text() {
         rec.events()
     );
     assert_no_canary(&rec, "a failed compensation");
+}
+
+/// A driver that knows which service it speaks to.
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+struct ReportsAs(Arc<agentplane::testkit::FakeProvider>);
+
+#[cfg(feature = "testkit")]
+#[async_trait::async_trait]
+impl agentplane::model::ModelProvider for ReportsAs {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        Some("gcp.gemini")
+    }
+    async fn complete(
+        &self,
+        request: agentplane::model::Request<'_>,
+    ) -> Result<agentplane::model::Completion, agentplane::model::ModelError> {
+        self.0.complete(request).await
+    }
+}
+
+#[cfg(feature = "testkit")]
+#[derive(Debug)]
+struct AsksVia(Arc<dyn agentplane::model::ModelProvider>);
+
+#[cfg(feature = "testkit")]
+#[async_trait::async_trait]
+impl Skill for AsksVia {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("support").provides("demo.via")
+    }
+    async fn invoke(
+        &self,
+        cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        let prompt = Tainted::trusted(json!("hello"));
+        let call = agentplane::model::ModelCall::new(
+            Arc::clone(&self.0),
+            agentplane::model::ModelId::new("gemini", "m"),
+            prompt.peek().clone(),
+        );
+        cx.sink(call, &prompt).await?;
+        Ok(Outcome::done(input))
+    }
+}
+
+/// **The spans a `GenAI` backend reads are named and kinded as the convention
+/// says**, and the provider is the driver's well-known value rather than the
+/// name a deployment routes the model by.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn gen_ai_spans_carry_the_conventions_name_kind_and_provider() {
+    let rec = Recorder::default();
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let fake = agentplane::testkit::FakeProvider::new();
+    fake.will_say("ok");
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .owner("test")
+        .skill(AsksVia(Arc::new(ReportsAs(fake))))
+        .build();
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let out = rt
+        .run("demo.via", Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    drop(guard);
+    assert_eq!(out.status, RunStatus::Succeeded);
+
+    let fields = rec.fields();
+    for want in [
+        format!("{}=chat m", telemetry::OTEL_NAME),
+        format!("{}=client", telemetry::OTEL_KIND),
+        format!("{}=internal", telemetry::OTEL_KIND),
+        format!("{}=gcp.gemini", telemetry::GEN_AI_PROVIDER),
+    ] {
+        assert!(fields.contains(&want), "no `{want}`; fields: {fields:?}");
+    }
+    assert!(
+        fields
+            .iter()
+            .any(|f| f.starts_with(&format!("{}=invoke_agent ", telemetry::OTEL_NAME))),
+        "the run span is not named `invoke_agent {{agent}}`: {fields:?}"
+    );
+}
+
+/// **A background run's trace is its caller's**, as a blocking run's is: the
+/// embedder's span is the run span's parent, so whatever it records — a task,
+/// a verdict — sits above the run in one trace.
+#[tokio::test]
+async fn a_spawned_run_is_a_child_of_the_callers_span() {
+    use tracing::Instrument as _;
+    let rec = Recorder::default();
+    let (store, rt) = runtime(healthy());
+
+    let _ambient = crate::ambient_subscriber();
+    let guard = tracing::subscriber::set_default(rec.clone());
+    let run = rt
+        .spawn("demo.one", Tainted::trusted(json!({})))
+        .instrument(tracing::info_span!("embedder.task"))
+        .await
+        .unwrap();
+    let mut concluded = false;
+    for _ in 0..10_000 {
+        tokio::task::yield_now().await;
+        let records = store.read(run, 1).await.unwrap();
+        if records.iter().any(|r| {
+            matches!(
+                r.kind(),
+                agentplane::journal::RecordKind::RunConcluded { .. }
+            )
+        }) {
+            concluded = true;
+            break;
+        }
+    }
+    drop(guard);
+    assert!(concluded, "the background run never concluded");
+
+    let parent = rec
+        .tree()
+        .into_iter()
+        .find(|(name, _)| name == telemetry::RUN_SPAN)
+        .and_then(|(_, parent)| parent);
+    assert_eq!(parent.as_deref(), Some("embedder.task"));
 }

@@ -703,8 +703,8 @@ parse: declaring protected fields is what lifts the whole-object taint gate,
 and a ceiling bounds how *secret* an argument may be, not who authored it —
 so the model's own untrusted completion would fill every authority-bearing
 field unconstrained. A source rule names the **concrete** source an effect's
-output carries: `tool://server/name`, `model:{provider}/{model}`
-(`ModelId::source()` in Rust),
+output carries: `tool://server/name` (`ToolId::source()` in Rust),
+`model:{provider}/{model}` (`ModelId::source()`),
 `agent/{capability}`, or an operator identity of your own.
 
 ### Which grants went unused {#unused-grants}
@@ -811,7 +811,10 @@ The rest of the constrained-decoding subset is each provider's, and the
 drivers apply it: a response schema outside it is refused before sending, and a
 tool is sent non-strict ([model providers](@/docs/interop.md#model-providers-providers-bedrock)).
 `agentplane::model::strict_schema_problem` names every rule a schema breaks, on
-every provider.
+every provider. A schema you generate yourself is made ready the way a typed
+tool's is with `agentplane::tools::strict_schema::<T>()`: objects closed,
+nullable optionals required, and the bounds a Rust number type implies dropped,
+because `serde` enforces them.
 
 ## `spec.oversight`
 

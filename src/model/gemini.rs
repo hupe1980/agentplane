@@ -1160,6 +1160,9 @@ fn retry_info_seconds(body: &str) -> Option<u64> {
 
 #[async_trait]
 impl ModelProvider for Gemini {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        Some("gcp.gemini")
+    }
     fn request_profile(&self, model: &ModelId) -> Value {
         json!({
             "driver": "google-gemini-generatecontent/v1",

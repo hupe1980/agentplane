@@ -70,6 +70,9 @@ impl Provider {
 
 #[async_trait]
 impl crate::model::ModelProvider for Provider {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        None
+    }
     fn request_profile(&self, model: &crate::model::ModelId) -> Value {
         self.profiles
             .get(&(model.provider.clone(), model.model.clone()))

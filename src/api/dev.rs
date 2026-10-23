@@ -176,6 +176,7 @@ impl crate::runtime::RunStreamObserver for StreamHub {
     ) {
         let trust = event.label().trust;
         let line = match event.into_unlabelled() {
+            crate::model::ModelStreamEvent::Started => json!({ "type": "started", "trust": trust }),
             crate::model::ModelStreamEvent::TextDelta(text) => {
                 json!({ "type": "text_delta", "value": crate::core::visible::escape(&text).0, "trust": trust })
             }

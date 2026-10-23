@@ -16,6 +16,55 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.51.0] — 2026-10-23
+
+### Added
+
+- **`testkit::crash_points` and `assert_resumed_honestly`**: every crash point
+  of a run you recorded, as a store to resume, and the check of what the
+  journal can show — the chain verifies, replay read finished effects back,
+  and a refusal or quarantine has a cause in the prefix.
+- **`tools::strict_schema::<T>()`**: a generated schema made strict-ready as a
+  typed tool's is, for a schema an embedder sends itself.
+- **`model::env::from_env`**: a shipped driver by provider name, configured from
+  the environment as the CLI configures it; `model::env::shipped` lists them.
+- **`ToolId::source()`** and **`Record::admitted_input()`**: the source a tool's
+  result is labelled with, and a run's input with its labels, without spelling
+  either by hand. `CacheTtl` reads and writes as `5m` and `1h`.
+- **`ChatCompletions::gen_ai_provider`** names the service behind an
+  OpenAI-compatible endpoint for telemetry.
+
+### Changed
+
+- **BREAKING: `ModelProvider::gen_ai_provider` is required.** A span's
+  `gen_ai.provider.name` is the driver's well-known value — `aws.bedrock` and
+  `gcp.gemini`, where it was the routing name `bedrock` or `gemini` — and `None`
+  falls back to the routing name.
+- **BREAKING: `ModelStreamEvent::Started` opens every attempt.** A retry's text
+  no longer joins the failed attempt's on a live view; a `match` needs the arm.
+- **Spans export under the `GenAI` convention's names and kinds** (`chat
+  {model}`, `execute_tool {tool}`, `invoke_agent {agent}`) through
+  `tracing-opentelemetry`, and `SEMCONV_VERSION` is
+  `genai-2026-10-21/development`.
+- **A typed tool with number fields is strict on Anthropic.** The format and
+  bounds `schemars` derives from a Rust number type are dropped; a declared
+  range stays.
+
+### Fixed
+
+- **A spawned run started a trace of its own.** Its span is now a child of the
+  caller's, as an awaited run's is.
+
+### Known
+
+- **`gen_ai.tool.call.id` is not emitted**, which the convention requires when
+  a model supplied one: a coded skill's tool call never sees the model's call id.
+
+### Security
+
+- **`ctutils` 0.4.5** (RUSTSEC-2026-0385: non-constant-time mask generation and
+  `u128` comparisons), reached through the RustCrypto signing and hashing stack.
+
 ## [0.50.0] — 2026-10-23
 
 ### Changed

@@ -390,7 +390,8 @@ Keys come from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 and a local or Hugging Face model is `provider: chat-completions` with
 `CHAT_COMPLETIONS_BASE_URL` pointing at any OpenAI-compatible server — Ollama,
 TGI, vLLM, llama.cpp, or `https://router.huggingface.co/v1` with
-`CHAT_COMPLETIONS_API_KEY=$HF_TOKEN`.
+`CHAT_COMPLETIONS_API_KEY=$HF_TOKEN`. An embedder builds a driver under the
+same conventions with `model::env::from_env`.
 Only the providers the manifest *names* are registered, so exporting the wrong
 variable cannot make the agent runnable on a model its declaration never named.
 

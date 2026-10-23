@@ -43,6 +43,9 @@ struct Counted {
 
 #[async_trait::async_trait]
 impl ModelProvider for Counted {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        self.inner.gen_ai_provider()
+    }
     async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.complete(request).await

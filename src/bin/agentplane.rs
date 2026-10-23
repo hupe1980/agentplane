@@ -53,7 +53,6 @@ use std::sync::Arc;
 use agentplane::core::Tainted;
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
-use agentplane::model::ModelProvider;
 use agentplane::runtime::{Mode, RunStatus, Runtime, RuntimeBuilder};
 use agentplane::store::RedbStore;
 
@@ -7216,7 +7215,7 @@ fn in_cli_terms(error: &agentplane::runtime::BuildError, manifests: &[Manifest])
         ),
         BuildError::UnknownProvider { agent, provider } => format!(
             "agent '{agent}' names provider '{provider}', and this binary ships {}",
-            shipped_providers().join(", ")
+            agentplane::model::env::shipped().join(", ")
         ),
         other => other.to_string(),
     }
@@ -7594,7 +7593,9 @@ async fn with_providers(
             seen.push(m.provider.clone());
             builder = builder.provider(
                 m.provider.clone(),
-                driver(&m.provider).await.map_err(usage)?,
+                agentplane::model::env::from_env(&m.provider)
+                    .await
+                    .map_err(usage)?,
             );
         }
     }
@@ -7656,98 +7657,6 @@ fn entry_capability(manifests: &[Manifest], asked: Option<&str>) -> Result<Strin
             .collect::<Vec<_>>()
             .join(", ")
     ))
-}
-
-async fn driver(name: &str) -> Result<Arc<dyn ModelProvider>, String> {
-    match name {
-        #[cfg(feature = "providers")]
-        "anthropic" => Ok(Arc::new(
-            agentplane::model::anthropic::Anthropic::new(key("ANTHROPIC_API_KEY")?)
-                .map_err(|e| e.to_string())?,
-        )),
-        #[cfg(feature = "bedrock")]
-        "bedrock" => Ok(Arc::new(
-            agentplane::model::bedrock::Bedrock::from_env(
-                std::env::var("AWS_REGION").map_err(|_| {
-                    "AWS_REGION is not set, and the manifest names Bedrock".to_owned()
-                })?,
-            )
-            .await?,
-        )),
-        // `GEMINI_API_KEY`, falling back to `GOOGLE_API_KEY`: both are in wide
-        // use, and a deployment that exported the other one would otherwise
-        // meet an authentication failure naming neither.
-        #[cfg(feature = "providers")]
-        "gemini" => Ok(Arc::new(
-            agentplane::model::gemini::Gemini::from_env().map_err(|e| e.to_string())?,
-        )),
-        #[cfg(feature = "providers")]
-        "openai" => Ok(Arc::new(
-            agentplane::model::openai::OpenAi::new(key("OPENAI_API_KEY")?)
-                .map_err(|e| e.to_string())?,
-        )),
-        // The OpenAI-compatible wire every self-hosted server speaks — TGI,
-        // vLLM, Ollama, llama.cpp, and Hugging Face's hosted router. The base
-        // URL is deployment wiring, so it comes from the environment like a
-        // key does; the token is optional because the common local server
-        // needs none.
-        #[cfg(feature = "providers")]
-        "chat-completions" => {
-            let base = key("CHAT_COMPLETIONS_BASE_URL").map_err(|_| {
-                "CHAT_COMPLETIONS_BASE_URL is not set, and the manifest names the \
-                 chat-completions provider. Point it at the server: Ollama is \
-                 http://localhost:11434, vLLM http://localhost:8000, TGI \
-                 http://localhost:8080, Hugging Face's router \
-                 https://router.huggingface.co/v1"
-                    .to_owned()
-            })?;
-            let mut driver = agentplane::model::chat_completions::ChatCompletions::new(base)
-                .map_err(|e| e.to_string())?;
-            if let Ok(token) = std::env::var("CHAT_COMPLETIONS_API_KEY") {
-                driver = driver.bearer(token);
-            }
-            Ok(Arc::new(driver))
-        }
-        #[cfg(feature = "fake-model")]
-        "fake" => {
-            let fake = agentplane::model::fake::FakeProvider::new();
-            // Its deltas reach an observer only where one listens.
-            fake.streaming();
-            Ok(fake)
-        }
-        other => Err(format!(
-            "no driver for provider '{other}'. This binary ships {}; anything else is an \
-             embedder's own driver, registered through RuntimeBuilder::provider",
-            shipped_providers().join(", "),
-        )),
-    }
-}
-
-/// Every provider name *this* binary can construct.
-///
-/// Assembled from the same `cfg`s as the dispatch above, rather than written
-/// out as prose. A hand-written list is true only for whichever feature set
-/// the author had in mind: the moment a driver becomes opt-in, the sentence
-/// starts telling a reader their build has something it does not, and the
-/// compiler has nothing to say about a string. A list derived from the build
-/// cannot disagree with the build.
-fn shipped_providers() -> Vec<&'static str> {
-    #[allow(unused_mut)]
-    let mut names: Vec<&'static str> = Vec::new();
-    #[cfg(feature = "providers")]
-    names.extend(["anthropic", "chat-completions", "gemini", "openai"]);
-    #[cfg(feature = "bedrock")]
-    names.push("bedrock");
-    #[cfg(feature = "fake-model")]
-    names.push("fake");
-    names.sort_unstable();
-    names
-}
-
-#[cfg(feature = "providers")]
-fn key(var: &str) -> Result<String, String> {
-    std::env::var(var)
-        .map_err(|_| format!("{var} is not set, and the manifest names a provider that needs it"))
 }
 
 #[cfg(test)]

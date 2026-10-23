@@ -1048,6 +1048,9 @@ fn severed(model: &ModelId, acc: &openai_stream::Accumulator, detail: &str) -> M
 
 #[async_trait]
 impl ModelProvider for OpenAi {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        Some("openai")
+    }
     fn request_profile(&self, model: &ModelId) -> Value {
         let schema_mode = match self.mode_for(model) {
             SchemaMode::Native => "native",

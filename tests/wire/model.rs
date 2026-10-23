@@ -51,6 +51,9 @@ struct EmitsStream;
 
 #[async_trait::async_trait]
 impl ModelProvider for EmitsStream {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        None
+    }
     async fn complete(
         &self,
         request: agentplane::model::Request<'_>,
@@ -118,7 +121,8 @@ async fn live_model_stream_is_labelled_and_strict_replay_is_silent() {
         .unwrap();
     {
         let events = capture.0.lock().unwrap();
-        assert_eq!(events.len(), 2);
+        // `Started`, the delta and the usage.
+        assert_eq!(events.len(), 3);
         assert!(
             events
                 .iter()
@@ -134,7 +138,7 @@ async fn live_model_stream_is_labelled_and_strict_replay_is_silent() {
     assert_eq!(replay.output, live.output);
     assert_eq!(
         capture.0.lock().unwrap().len(),
-        2,
+        3,
         "strict replay emitted live provider deltas"
     );
 }
@@ -180,12 +184,19 @@ async fn the_fake_provider_streams_deltas_that_reassemble_exactly() {
         .iter()
         .filter_map(|event| match event.peek() {
             ModelStreamEvent::TextDelta(delta) => Some(delta.clone()),
-            ModelStreamEvent::Usage(_) => None,
+            _ => None,
         })
         .collect();
     assert_eq!(
         text, ANSWER,
         "the deltas do not reassemble into the completion the run was given"
+    );
+    assert!(
+        matches!(
+            events.first().map(Tainted::peek),
+            Some(ModelStreamEvent::Started)
+        ),
+        "an attempt opens with `Started`, or a retry's text joins the failed attempt's"
     );
     assert!(
         events
@@ -1102,6 +1113,9 @@ struct IgnoresSchema(Option<Value>);
 
 #[async_trait::async_trait]
 impl ModelProvider for IgnoresSchema {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        None
+    }
     async fn complete(
         &self,
         _request: agentplane::model::Request<'_>,
@@ -1435,7 +1449,7 @@ spec:
         .filter(|(run, _)| *run == out.run_id)
         .filter_map(|(_, event)| match event {
             agentplane::model::ModelStreamEvent::TextDelta(delta) => Some(delta.clone()),
-            agentplane::model::ModelStreamEvent::Usage(_) => None,
+            _ => None,
         })
         .collect();
     assert_eq!(
@@ -1452,4 +1466,29 @@ spec:
         before,
         "a replay streamed output"
     );
+}
+
+/// A cache tier reads from configuration as the effect key spells it, so a
+/// config file and the journal cannot name one tier two ways.
+#[test]
+fn a_cache_tier_is_written_as_the_effect_key_spells_it() {
+    use agentplane::model::CacheTtl;
+    for ttl in [CacheTtl::FiveMinutes, CacheTtl::OneHour] {
+        assert_eq!(serde_json::to_value(ttl).unwrap(), json!(ttl.as_str()));
+        assert_eq!(
+            serde_json::from_value::<CacheTtl>(json!(ttl.as_str())).unwrap(),
+            ttl
+        );
+    }
+}
+
+/// An unknown provider names what this build ships; a known one asks for its
+/// variable by name.
+#[tokio::test]
+async fn a_driver_from_the_environment_names_what_it_needs() {
+    let unknown = agentplane::model::env::from_env("nope").await.unwrap_err();
+    for name in agentplane::model::env::shipped() {
+        assert!(unknown.contains(name), "{unknown}");
+    }
+    assert!(agentplane::model::env::shipped().contains(&"openai"));
 }

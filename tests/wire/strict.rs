@@ -156,3 +156,35 @@ fn anthropic_refuses_what_its_limitations_list() {
     });
     assert_eq!(StrictSubset::Anthropic.problem(&shared), None);
 }
+
+/// **A typed tool with numbers is strict-ready for both providers.** `schemars`
+/// derives a `format` and the type's own bounds, which Anthropic refuses and
+/// `serde` already enforces; a range somebody declared is kept.
+#[test]
+fn a_rust_number_type_does_not_cost_a_tool_its_strictness() {
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct Counts {
+        small: u8,
+        signed: i16,
+        count: u32,
+        total: u64,
+        index: usize,
+        offset: i64,
+        ratio: f64,
+    }
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct Ranged {
+        #[schemars(range(min = 1, max = 10))]
+        pages: u32,
+    }
+
+    let counts = agentplane::tools::strict_schema::<Counts>();
+    for subset in [StrictSubset::OpenAi, StrictSubset::Anthropic] {
+        assert_eq!(subset.problem(&counts), None, "{subset:?}: {counts}");
+    }
+    let ranged = agentplane::tools::strict_schema::<Ranged>();
+    assert_eq!(ranged["properties"]["pages"]["minimum"], 1, "{ranged}");
+    assert_eq!(ranged["properties"]["pages"]["maximum"], 10, "{ranged}");
+}

@@ -58,12 +58,12 @@ use std::sync::{Arc, Mutex};
 
 use agentplane::core::{
     ArgSource, Compensation, Effect, EffectDescriptor, EffectError, Outcome, PlanIR, PlanNode,
-    Recovery, RetryPolicy, RunId, Skill, SkillDescriptor, SkillError, StepId, Tainted,
+    Recovery, RetryPolicy, Skill, SkillDescriptor, SkillError, StepId, Tainted,
 };
-use agentplane::journal::{Append, JournalStore, Record, RecordKind};
+use agentplane::journal::{JournalStore, Record, RecordKind};
 use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
 use agentplane::store::RedbStore;
-use agentplane::testkit::assert_replay_was_not_backstopped;
+use agentplane::testkit::{assert_resumed_honestly, crash_points};
 use serde_json::{Value, json};
 
 /// Every performance of an externally visible effect, by name.
@@ -166,39 +166,6 @@ fn chain() -> PlanIR {
     ])
 }
 
-/// Rebuild a journal prefix into a fresh store.
-///
-/// A crash truncates an append-only log, so a prefix *is* a crash. Replaying the
-/// records through `append` re-forms the chain exactly as the original run did,
-/// which is also a check on the chain being a pure function of its contents.
-async fn crash_at(records: &[Record], n: usize, run: RunId) -> Arc<RedbStore> {
-    let store = Arc::new(RedbStore::open_in_memory().unwrap());
-    let lease = store
-        .acquire(run, "sim", std::time::Duration::from_mins(5))
-        .await
-        .unwrap();
-
-    for r in &records[..n] {
-        let mut a = Append::new(run, r.kind().clone()).phase(r.body.phase);
-        if let Some(s) = r.body.step {
-            a = a.step(s);
-        }
-        if let Some(c) = r.body.case {
-            a = a.case(c);
-        }
-        if let Some(k) = r.effect_key() {
-            a = a.effect(k);
-        }
-        store.append(lease.epoch, vec![a]).await.unwrap();
-    }
-    // The rebuilt store models a store whose owner is gone. Released rather
-    // than waited out: `acquire` is a pure claim now, so a held lease — the
-    // fixture's own included — refuses the resume the way a live owner's
-    // would, and what a crash actually leaves is a lease anyone may claim.
-    store.release_lease(run, lease.epoch).await.unwrap();
-    store
-}
-
 /// Effects the prefix already records as having reached the world.
 fn already_done(prefix: &[Record]) -> BTreeSet<String> {
     let mut started: BTreeMap<agentplane::core::EffectKey, String> = BTreeMap::new();
@@ -224,6 +191,9 @@ fn already_done(prefix: &[Record]) -> BTreeSet<String> {
 
 /// The sweep. `failing` names a step that refuses after mutating, which drives
 /// the run into an unwind so compensation is explored too.
+///
+/// What the journal can show is the testkit's; what reached the world is
+/// checked here, against the effects each prefix records as done.
 async fn sweep(failing: Option<&'static str>) {
     let origin = Arc::new(RedbStore::open_in_memory().unwrap());
     let world = Arc::new(Mutex::new(Vec::new()));
@@ -233,64 +203,22 @@ async fn sweep(failing: Option<&'static str>) {
         .run_plan(chain(), Tainted::trusted(json!({})))
         .await
         .unwrap();
-    let records = origin.read(out.run_id, 1).await.unwrap();
-    assert!(records.len() > 6, "a journal worth truncating");
+    let points = crash_points(&*origin, out.run_id).await.unwrap();
+    assert!(points.len() > 5, "a journal worth truncating");
 
-    for n in 1..records.len() {
-        let prefix = &records[..n];
-        let survived = already_done(prefix);
-
-        let store = crash_at(&records, n, out.run_id).await;
-        store
-            .verify(out.run_id)
-            .await
-            .unwrap_or_else(|e| panic!("crash@{n}: the truncated chain must verify: {e}"));
+    for point in points {
+        let n = point.appended;
+        let records = origin.read(out.run_id, 1).await.unwrap();
+        let survived = already_done(&records[..n]);
 
         let after = Arc::new(Mutex::new(Vec::new()));
-        let resumed = runtime(&store, &after, failing);
-        let outcome = resumed.replay(out.run_id, Mode::Resume).await;
+        let resumed = runtime(&point.store, &after, failing)
+            .replay(out.run_id, Mode::Resume)
+            .await;
+        assert_resumed_honestly(&point, out.run_id, &resumed).await;
+        let Ok(outcome) = resumed else { continue };
 
-        // A resume may refuse, but only for a reason the design names. Anything
-        // else — a store constraint, a broken chain — means replay is not doing
-        // its job, and the *absence* of a duplicated effect then proves nothing:
-        // it was the database's unique index that stopped it, not replay.
-        //
-        // Tolerating every failure here is how this sweep first passed while a
-        // deliberately broken replay path went undetected.
-        let outcome = match outcome {
-            Ok(o) => o,
-            Err(e) => {
-                let why = e.to_string();
-                // The named legitimate refusals, and only these:
-                //
-                //   * the crash landed before the plan was frozen, so there is
-                //     no run to resume — it never really started;
-                //   * an effect's outcome is undecidable and its recovery mode
-                //     forbids guessing.
-                let legitimate = why.contains("no PlanFrozen")
-                    || why.contains("no RunAdmitted")
-                    || why.contains("undecidable")
-                    || why.contains("quarantin");
-                assert!(
-                    legitimate,
-                    "crash@{n}: resume failed for a reason the design does not \
-                     name: {why}"
-                );
-                store.verify(out.run_id).await.unwrap_or_else(|e| {
-                    panic!("crash@{n}: chain broken after a refused resume: {e}")
-                });
-                continue;
-            }
-        };
-
-        // Likewise for a run that *reports* failure: an unwind is a legitimate
-        // ending, a store rejecting a duplicate announcement is not. The check
-        // lives in the testkit because it was written here first, then missed
-        // in `tests/faults.rs` — see `testkit::backstop` for why the outcome
-        // never shows it.
-        assert_replay_was_not_backstopped(&format!("crash@{n}"), &Ok(outcome.clone()));
-
-        // ── ExactlyOnce ────────────────────────────────────────────────────
+        // ── ExactlyOnce, in the world ──────────────────────────────────────
         for did in after.lock().unwrap().iter() {
             assert!(
                 !survived.contains(did),
@@ -300,19 +228,14 @@ async fn sweep(failing: Option<&'static str>) {
             );
         }
 
-        // ── The chain survives every resume ────────────────────────────────
-        store
-            .verify(out.run_id)
-            .await
-            .unwrap_or_else(|e| panic!("crash@{n}: chain broken after resume: {e}"));
+        let full: Vec<String> = survived
+            .iter()
+            .cloned()
+            .chain(after.lock().unwrap().iter().cloned())
+            .collect();
 
         // ── SuccessMeansComplete ───────────────────────────────────────────
         if outcome.status == RunStatus::Succeeded {
-            let full: Vec<String> = survived
-                .iter()
-                .cloned()
-                .chain(after.lock().unwrap().iter().cloned())
-                .collect();
             for name in ["a", "b", "c"] {
                 assert!(
                     full.contains(&format!("do:{name}")),
@@ -322,11 +245,6 @@ async fn sweep(failing: Option<&'static str>) {
         }
 
         // ── CompensationFollowsCompletion ──────────────────────────────────
-        let full: Vec<String> = survived
-            .iter()
-            .cloned()
-            .chain(after.lock().unwrap().iter().cloned())
-            .collect();
         for name in ["a", "b", "c"] {
             if full.contains(&format!("undo:{name}")) {
                 assert!(
@@ -350,4 +268,38 @@ async fn no_crash_point_breaks_a_successful_run() {
 #[tokio::test]
 async fn no_crash_point_breaks_an_unwinding_run() {
     sweep(Some("c")).await;
+}
+
+/// A crash point after the plan froze, for the kit's own refusals.
+async fn a_point_past_the_plan() -> (agentplane::testkit::CrashPoint, agentplane::core::RunId) {
+    let origin = Arc::new(RedbStore::open_in_memory().unwrap());
+    let world = Arc::new(Mutex::new(Vec::new()));
+    let out = runtime(&origin, &world, None)
+        .run_plan(chain(), Tainted::trusted(json!({})))
+        .await
+        .unwrap();
+    let points = crash_points(&*origin, out.run_id).await.unwrap();
+    (points.into_iter().last().unwrap(), out.run_id)
+}
+
+/// A resume refused for a reason the prefix does not explain is not honest.
+#[tokio::test]
+#[should_panic(expected = "refused, though the prefix froze a plan")]
+async fn a_refusal_the_prefix_does_not_explain_fails_the_sweep() {
+    let (point, run) = a_point_past_the_plan().await;
+    let refused = Err(agentplane::core::RuntimeError::PlanContract("lost".into()));
+    assert_resumed_honestly(&point, run, &refused).await;
+}
+
+/// A quarantine with nothing in flight at the crash is not honest.
+#[tokio::test]
+#[should_panic(expected = "quarantined with no effect in flight")]
+async fn a_quarantine_with_nothing_in_flight_fails_the_sweep() {
+    let (point, run) = a_point_past_the_plan().await;
+    let mut outcome = runtime(&point.store, &Arc::new(Mutex::new(Vec::new())), None)
+        .replay(run, Mode::Resume)
+        .await
+        .unwrap();
+    outcome.status = RunStatus::Quarantined("invented".into());
+    assert_resumed_honestly(&point, run, &Ok(outcome)).await;
 }

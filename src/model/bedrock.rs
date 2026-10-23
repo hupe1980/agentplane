@@ -1015,6 +1015,9 @@ impl Bedrock {
 
 #[async_trait]
 impl ModelProvider for Bedrock {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        Some("aws.bedrock")
+    }
     fn request_profile(&self, _model: &ModelId) -> Value {
         json!({
             "driver": "aws-bedrock-converse/v1",

@@ -90,6 +90,8 @@ pub struct ChatCompletions {
     egress: Option<crate::core::Egress>,
     /// Whole HTTP request, including a streamed response body.
     timeout: std::time::Duration,
+    /// The service behind the endpoint, as `gen_ai.provider.name` names it.
+    gen_ai_provider: Option<String>,
 }
 
 impl std::fmt::Debug for ChatCompletions {
@@ -140,6 +142,7 @@ impl ChatCompletions {
             stream: true,
             egress: None,
             timeout: Self::DEFAULT_TIMEOUT,
+            gen_ai_provider: None,
         })
     }
 
@@ -177,6 +180,15 @@ impl ChatCompletions {
     #[must_use]
     pub fn egress(mut self, egress: crate::core::Egress) -> Self {
         self.egress = Some(egress);
+        self
+    }
+
+    /// Name the service behind the endpoint for telemetry, with the `GenAI`
+    /// convention's well-known value where one applies (`groq`, `mistral`,
+    /// `deepseek`). Unset, a call reports the name its model is routed by.
+    #[must_use]
+    pub fn gen_ai_provider(mut self, name: impl Into<String>) -> Self {
+        self.gen_ai_provider = Some(name.into());
         self
     }
 
@@ -910,6 +922,9 @@ fn accumulate_continuation(
 
 #[async_trait]
 impl ModelProvider for ChatCompletions {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        self.gen_ai_provider.as_deref()
+    }
     fn request_profile(&self, model: &ModelId) -> Value {
         let schema_mode = match self.mode_for(model) {
             SchemaMode::Native => "native",

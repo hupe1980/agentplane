@@ -664,13 +664,12 @@ function onStreamEvent(event) {
   const run = event.run;
   if (!state.live.has(run)) state.live.set(run, { text: '', usage: null, lagged: false, ended: false });
   const live = state.live.get(run);
-  if (event.type === 'text_delta') {
-    // Usage closes a call; text after it is the next call's.
-    if (live.ended) {
-      live.text = '';
-      live.usage = null;
-      live.ended = false;
-    }
+  if (event.type === 'started') {
+    // An attempt began: what streamed before it is not this answer.
+    live.text = '';
+    live.usage = null;
+    live.ended = false;
+  } else if (event.type === 'text_delta') {
     live.text = (live.text + event.value).slice(-LIVE_LIMIT);
   } else if (event.type === 'usage') {
     live.usage = event.value;

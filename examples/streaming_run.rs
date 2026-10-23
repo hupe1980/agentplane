@@ -67,6 +67,8 @@ impl ModelStreamObserver for Printer {
         assert_eq!(event.label().trust, Trust::Untrusted);
 
         match event.peek() {
+            // A retry starts its answer over; a terminal would clear the line.
+            ModelStreamEvent::Started => {}
             ModelStreamEvent::TextDelta(delta) => {
                 print!("{delta}");
                 // Flushed per delta: line buffering would hold the whole answer

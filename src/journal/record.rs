@@ -1468,6 +1468,26 @@ impl Record {
         }
     }
 
+    /// The input a run was admitted with, label and field labels and all —
+    /// what the run's steps read, live and in replay. `None` for every other
+    /// record.
+    #[must_use]
+    pub fn admitted_input(&self) -> Option<crate::core::Tainted<serde_json::Value>> {
+        match self.kind() {
+            RecordKind::RunAdmitted {
+                input,
+                input_label,
+                input_field_labels,
+                ..
+            } => Some(crate::core::Tainted::with_field_labels(
+                input.clone(),
+                input_label.clone(),
+                input_field_labels.clone(),
+            )),
+            _ => None,
+        }
+    }
+
     /// The same record with its payload opened — a **read-time view**.
     ///
     /// `raw`, `hash` and `prev_hash` are untouched, so the chain still

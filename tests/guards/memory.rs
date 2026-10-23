@@ -1828,6 +1828,9 @@ struct Summarises;
 
 #[async_trait::async_trait]
 impl agentplane::model::ModelProvider for Summarises {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        None
+    }
     async fn complete(
         &self,
         _request: agentplane::model::Request<'_>,

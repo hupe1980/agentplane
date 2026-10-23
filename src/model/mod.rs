@@ -121,6 +121,7 @@ mod chat_completions_stream;
 // embedder's type so a gate that configures one out fails *this* crate's build.
 #[cfg(any(feature = "providers", feature = "bedrock"))]
 pub mod embeddings;
+pub mod env;
 /// The deterministic stand-in provider. See [`fake`] for why it ships.
 #[cfg(feature = "fake-model")]
 pub mod fake;
@@ -831,6 +832,10 @@ pub struct ProviderContinuation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type", content = "value")]
 pub enum ModelStreamEvent {
+    /// An attempt at the call began. Text streamed before it is not this
+    /// attempt's: it belongs to an earlier call, or to an attempt that failed
+    /// and is being retried.
+    Started,
     /// Visible answer text only. Opaque reasoning is never exposed here.
     TextDelta(String),
     /// The latest provider-reported usage snapshot.
@@ -1217,6 +1222,12 @@ pub enum SchemaMode {
 /// Talks to a provider.
 #[async_trait]
 pub trait ModelProvider: Send + Sync + Debug {
+    /// The `gen_ai.provider.name` this driver's calls report: the `GenAI`
+    /// convention's well-known value for the service it speaks to
+    /// (`openai`, `anthropic`, `aws.bedrock`, `gcp.gemini`), or `None` when
+    /// it cannot know, and a call reports the name its model is routed by.
+    fn gen_ai_provider(&self) -> Option<&str>;
+
     /// Stable, non-secret configuration that changes the provider wire request.
     ///
     /// It is part of [`ModelCall`]'s effect identity. A provider switching from
@@ -1314,11 +1325,13 @@ impl ToolDeclaration {
 /// input rate to write the five-minute tier and 2× to write the one-hour tier,
 /// so which one a write went to is a fact about cost, and [`Pricing`] prices
 /// them separately.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum CacheTtl {
     /// The provider's default lifetime.
+    #[serde(rename = "5m")]
     FiveMinutes,
     /// Kept across longer gaps, at a higher write price.
+    #[serde(rename = "1h")]
     OneHour,
 }
 
@@ -1978,7 +1991,12 @@ impl Effect for ModelCall {
 
     fn gen_ai_request(&self) -> Option<crate::core::GenAiRequest> {
         Some(crate::core::GenAiRequest {
-            provider: Some(self.model.provider.clone()),
+            provider: Some(
+                self.provider
+                    .gen_ai_provider()
+                    .unwrap_or(&self.model.provider)
+                    .to_owned(),
+            ),
             name: self.model.model.clone(),
         })
     }
@@ -2028,6 +2046,12 @@ impl Effect for ModelCall {
         // plane twice, once labelled and once laundered, differing only in
         // whether the caller read them live.
         stream_label.sensitivity = stream_label.sensitivity.max(self.declared_output_floor());
+        if let Some(observer) = &self.stream {
+            observer.event(crate::core::Tainted::with_label(
+                ModelStreamEvent::Started,
+                stream_label.clone(),
+            ));
+        }
         let answered = self
             .provider
             .complete(Request {
@@ -2335,6 +2359,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for RecordingProvider {
+        fn gen_ai_provider(&self) -> Option<&str> {
+            None
+        }
         async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Err(ModelError::Unavailable {
@@ -2568,6 +2595,9 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for StreamLabelProbe {
+        fn gen_ai_provider(&self) -> Option<&str> {
+            None
+        }
         async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
             *self.0.lock().unwrap() = request.stream.map(|(_, label)| label.clone());
             Ok(Completion {
@@ -2760,6 +2790,9 @@ mod tests {
     #[cfg(feature = "media")]
     #[async_trait]
     impl ModelProvider for CapturingProvider {
+        fn gen_ai_provider(&self) -> Option<&str> {
+            None
+        }
         async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
             *self.0.lock().unwrap() = Some(request.prompt.clone());
             Ok(Completion {

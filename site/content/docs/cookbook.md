@@ -2688,8 +2688,25 @@ use agentplane::testkit::{Fault, Faulty, Schedule};
 let store = Faulty::new(inner, Schedule::seeded(42).then(Fault::CommittedThenLost));
 ```
 
-**The trap:** thinking a truncated journal covers it. Every *prefix* of a journal
-is a clean crash, and `tests/engine/simulation.rs` sweeps all of them. What a
+Every *prefix* of a journal is a clean crash, and the testkit hands you each
+one of a run you recorded, so a resume is checked at every effect boundary:
+
+```rust
+use agentplane::testkit::{assert_resumed_honestly, crash_points};
+
+for point in crash_points(&*store, run).await? {
+    let resumed = build(Arc::clone(&point.store)).replay(run, Mode::Resume).await;
+    assert_resumed_honestly(&point, run, &resumed).await;
+    // Your world: nothing in `point.done()` may have happened twice.
+}
+```
+
+`assert_resumed_honestly` checks what the journal can show: the chain
+verifies, replay read every finished effect back rather than being stopped by
+the store's exactly-once index, and a refusal or a quarantine has a cause in
+the prefix. What your effects did to files or processes is yours to check.
+
+**The trap:** thinking a truncated journal covers it. What a
 prefix structurally cannot reach is the **unclean** one: a write that committed
 while the caller was told it failed. History is then *ahead* of what the process
 believes it wrote, and blindly retrying the append is how a chain acquires two
@@ -3309,7 +3326,9 @@ nothing live. Observers should enqueue quickly and enforce network backpressure
 outside the provider callback. To follow every model call a plane makes —
 declarative agents build their own — register a `RunStreamObserver` with
 `RuntimeBuilder::observe_model_streams`: it receives the same events with the
-run each belongs to, and a call carrying its own observer keeps it.
+run each belongs to, and a call carrying its own observer keeps it. Every
+attempt opens with `ModelStreamEvent::Started`; text before it belongs to an
+earlier call or to an attempt being retried, so a view clears it there.
 
 The split is worth stating, because getting it backwards produces either a
 useless log or an unreplayable run. **The completion is the truth** — one

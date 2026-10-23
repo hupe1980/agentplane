@@ -88,6 +88,9 @@ impl Watched {
 
 #[async_trait::async_trait]
 impl ModelProvider for Watched {
+    fn gen_ai_provider(&self) -> Option<&str> {
+        self.inner.gen_ai_provider()
+    }
     async fn complete(&self, request: Request<'_>) -> Result<Completion, ModelError> {
         self.seen.lock().expect("seen").push(Seen {
             model: request.model.model.clone(),
