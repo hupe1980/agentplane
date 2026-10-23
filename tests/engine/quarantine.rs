@@ -363,7 +363,8 @@ async fn attention_names_each_condition_and_what_it_could_not_check() {
 /// A run stopped on an unanswerable payment, with the booking standing.
 async fn quarantined(f: &Fixture) -> RunId {
     let out =
-        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+        f.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
     assert!(
@@ -707,7 +708,8 @@ async fn a_run_that_is_not_quarantined_refuses_both_decisions() {
     let f = fixture();
     // A booking on its own succeeds.
     let out =
-        f.rt.run("demo.book", Tainted::trusted(json!({})))
+        f.rt.start("demo.book", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);

@@ -462,28 +462,39 @@ fn accumulate_continuation(
 
 /// The prompt shape this driver accepts.
 ///
-/// Either a bare string, the API's own `messages` array, or an object carrying
-/// `messages` beside a `system` instruction. Accepting all three keeps the
-/// simple case simple without hiding the real shape from a caller who needs it —
-/// and the prompt is part of the effect key either way, so a changed prompt is a
+/// The API's own `messages` list, alone or beside a `system` instruction, or
+/// the shared prompt every driver reads (see [`Prompt`](super::Prompt)). The
+/// prompt is part of the effect key either way, so a changed prompt is a
 /// changed effect rather than a quietly different run.
 fn messages(prompt: &Value) -> Value {
-    match prompt {
-        Value::String(s) => json!([{ "role": "user", "content": s }]),
-        Value::Array(_) => prompt.clone(),
-        other => crate::model::prompt_envelope(other, "messages")
-            .cloned()
-            .unwrap_or_else(|| {
-                // An object with no `messages` is content, not an envelope — except
-                // for `system`, which is an instruction *about* the content and
-                // would otherwise be shown to the model as part of the question.
-                let mut rest = other.clone();
-                if let Some(map) = rest.as_object_mut() {
-                    map.remove("system");
-                }
-                json!([{ "role": "user", "content": rest.to_string() }])
-            }),
+    match super::prompt::turns(prompt, &["messages"]) {
+        super::prompt::Turns::Native(turns) => Value::Array(turns.to_vec()),
+        super::prompt::Turns::Parts(parts) => {
+            json!([{ "role": "user", "content": blocks(&parts) }])
+        }
     }
+}
+
+/// Text parts as Messages content: a lone uncached part as the plain string
+/// the API also takes, anything else as text blocks carrying their breakpoints.
+fn blocks(parts: &[super::prompt::Part<'_>]) -> Value {
+    if let [only] = parts
+        && only.cache.is_none()
+    {
+        return json!(only.text);
+    }
+    Value::Array(
+        parts
+            .iter()
+            .map(|part| {
+                let mut block = json!({ "type": "text", "text": part.text });
+                if let Some(ttl) = part.cache {
+                    block["cache_control"] = cache_control(ttl);
+                }
+                block
+            })
+            .collect(),
+    )
 }
 
 /// A cache breakpoint, as the Messages API spells one.
@@ -503,7 +514,10 @@ fn cache_control(ttl: super::CacheTtl) -> Value {
 /// expressed through this driver at all until it was lifted out here, and one
 /// supplied in the obvious place was silently dropped.
 fn system(prompt: &Value) -> Option<Value> {
-    prompt.get("system").cloned().filter(|s| !s.is_null())
+    Some(match super::prompt::system(prompt)? {
+        super::prompt::System::Parts(parts) => blocks(&parts),
+        super::prompt::System::Native(other) => other.clone(),
+    })
 }
 
 /// Everything a response yielded, however it arrived.
@@ -1910,5 +1924,72 @@ mod continuation_tests {
             )
             .expect("body");
         assert_eq!(plain["messages"].as_array().expect("messages").len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use serde_json::json;
+
+    use super::{Anthropic, ModelId};
+    use crate::core::{SourceId, Tainted};
+    use crate::model::{CacheTtl, Prompt};
+
+    fn body(prompt: &serde_json::Value) -> serde_json::Value {
+        Anthropic::new("test-key")
+            .expect("build the driver")
+            .body(
+                &ModelId::new("anthropic", "claude-x"),
+                prompt,
+                None,
+                &[],
+                &[],
+            )
+            .expect("body")
+    }
+
+    /// **A breakpoint in the shared prompt reaches the wire as
+    /// `cache_control`**, on the block it closes, in both slots.
+    #[test]
+    fn a_prompt_part_carries_its_breakpoint() {
+        let prompt = Prompt::new()
+            .system_cached(Tainted::trusted("policy".to_owned()), CacheTtl::OneHour)
+            .system(Tainted::trusted("plan".to_owned()))
+            .input_cached(
+                Tainted::from_source("the repo".to_owned(), SourceId::new("worktree")),
+                CacheTtl::FiveMinutes,
+            )
+            .input(Tainted::from_source(
+                "the task".to_owned(),
+                SourceId::new("user"),
+            ))
+            .build();
+        let body = body(prompt.peek());
+        assert_eq!(
+            body["system"],
+            json!([
+                { "type": "text", "text": "policy", "cache_control": { "type": "ephemeral", "ttl": "1h" } },
+                { "type": "text", "text": "plan" },
+            ])
+        );
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": [
+                { "type": "text", "text": "the repo", "cache_control": { "type": "ephemeral" } },
+                { "type": "text", "text": "the task" },
+            ] }])
+        );
+    }
+
+    /// **`{ system, input }` asks the question `input` holds**, as every other
+    /// driver reads it — not a JSON object wrapping it.
+    #[test]
+    fn the_shared_envelope_asks_its_input() {
+        let body = body(&json!({ "system": "be brief", "input": "hi" }));
+        assert_eq!(
+            body["messages"],
+            json!([{ "role": "user", "content": "hi" }])
+        );
+        assert_eq!(body["system"], "be brief");
     }
 }

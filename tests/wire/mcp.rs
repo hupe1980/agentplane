@@ -469,8 +469,8 @@ async fn a_servers_annotations_are_read_but_do_not_decide_anything() {
 ///
 /// The server marks its money-moving tool read-only. A draft that believed it
 /// would skip the whole-value taint gate and retry after a timeout; it mutates,
-/// carries the server's description and schema for a reviewer to read, and
-/// grants no field to anyone.
+/// carries the server's description and its schema narrowed to a strict-ready
+/// form for a reviewer to read, and grants no field to anyone.
 #[cfg(feature = "manifest")]
 #[tokio::test]
 async fn a_drafted_grant_mutates_whatever_the_server_says() {
@@ -488,7 +488,21 @@ async fn a_drafted_grant_mutates_whatever_the_server_says() {
     assert!(grant.mutates, "a draft believed `readOnlyHint`");
     assert_eq!(grant.protected_fields, []);
     assert_eq!(grant.description.as_deref(), Some("moves money"));
-    assert_eq!(grant.arguments.as_ref(), Some(&transfer.input_schema));
+    let arguments = grant
+        .arguments
+        .as_ref()
+        .expect("the draft carries a schema");
+    assert_eq!(
+        *arguments,
+        agentplane::tools::closed_schema(&transfer.input_schema)
+    );
+    for subset in agentplane::model::StrictSubset::ALL {
+        assert_eq!(
+            subset.problem(arguments),
+            None,
+            "{subset:?}: the reviewed form is not the strict one: {arguments}"
+        );
+    }
     assert!(
         transfer.drift(&grant).is_empty(),
         "a draft drifts from itself"

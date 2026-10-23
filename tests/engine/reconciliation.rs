@@ -202,7 +202,8 @@ async fn a_probe_that_finds_it_landed_completes_the_effect_without_repeating_it(
     let f = fixture(Probe::SaysItLanded);
 
     let out =
-        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+        f.rt.start("demo.pay", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -230,7 +231,8 @@ async fn a_probe_that_finds_it_never_landed_permits_a_retry() {
         .build();
 
     let out = rt
-        .run("demo.pay", Tainted::trusted(json!({})))
+        .start("demo.pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(
@@ -259,7 +261,8 @@ async fn a_probe_that_cannot_tell_still_escalates() {
     let f = fixture(Probe::CannotTell);
 
     let out =
-        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+        f.rt.start("demo.pay", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1, "never sent twice");
@@ -279,7 +282,8 @@ async fn an_unreachable_probe_escalates_rather_than_assuming() {
     let f = fixture(Probe::Unreachable);
 
     let out =
-        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+        f.rt.start("demo.pay", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -303,7 +307,8 @@ async fn the_verdict_is_journaled_even_when_it_resolves_nothing() {
     ] {
         let f = fixture(probe);
         let out =
-            f.rt.run("demo.pay", Tainted::trusted(json!({})))
+            f.rt.start("demo.pay", Tainted::trusted(json!({})))
+                .run()
                 .await
                 .unwrap();
         let records = f.store.read(out.run_id, 1).await.unwrap();
@@ -321,7 +326,8 @@ async fn the_verdict_is_journaled_even_when_it_resolves_nothing() {
 async fn a_failed_probe_records_why() {
     let f = fixture(Probe::Unreachable);
     let out =
-        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+        f.rt.start("demo.pay", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let records = f.store.read(out.run_id, 1).await.unwrap();
@@ -345,7 +351,8 @@ async fn replay_reads_the_verdict_back_instead_of_probing_again() {
     let f = fixture(Probe::SaysItLanded);
 
     let first =
-        f.rt.run("demo.pay", Tainted::trusted(json!({})))
+        f.rt.start("demo.pay", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -563,7 +570,8 @@ async fn a_reconciled_attempt_replays_at_what_it_actually_spent() {
         .build();
 
     let live = rt
-        .run("demo.pay", Tainted::trusted(json!({})))
+        .start("demo.pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(live.status, RunStatus::Succeeded);

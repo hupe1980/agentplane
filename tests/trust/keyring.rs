@@ -450,12 +450,12 @@ async fn sealed_case_with_blob(
         .skill(Keeps)
         .build();
     let out = rt
-        .run_correlated(
-            "records.keep",
-            Tainted::trusted(json!({})),
-            "claim",
-            &[CorrelationKey::new("claim", "CLM-1")],
+        .start("records.keep", Tainted::trusted(json!({})))
+        .terms(
+            agentplane::runtime::RunTerms::default()
+                .correlated("claim", &[CorrelationKey::new("claim", "CLM-1")]),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -1633,7 +1633,8 @@ async fn an_erased_low_entropy_value_is_recoverable_from_the_export() {
         .skill(SendsConsent)
         .build();
     let out = rt
-        .run("demo.consent", Tainted::trusted(json!({})))
+        .start("demo.consent", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
@@ -2828,11 +2829,12 @@ async fn an_erased_run_names_the_erasure_and_can_still_be_abandoned() {
         .expect("open case")
         .case_id();
     let run = rt
-        .run_in_case(
+        .start(
             "demo.stalls",
             agentplane::core::Tainted::trusted(serde_json::json!({})),
-            case,
         )
+        .terms(agentplane::runtime::RunTerms::default().in_case(case))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -2925,10 +2927,11 @@ async fn sealed_run(
         })
         .build();
     let out = rt
-        .run(
+        .start(
             "demo.stalls",
             agentplane::core::Tainted::trusted(serde_json::json!({})),
         )
+        .run()
         .await
         .expect("run");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");

@@ -207,7 +207,10 @@ async fn time(
     expected: usize,
 ) -> Result<(Duration, Duration), Box<dyn std::error::Error>> {
     let started = Instant::now();
-    let outcome = runtime.run(capability, Tainted::trusted(json!({}))).await?;
+    let outcome = runtime
+        .start(capability, Tainted::trusted(json!({})))
+        .run()
+        .await?;
     let live = started.elapsed();
 
     // Replay performs nothing and reads every effect back, so this is the cost

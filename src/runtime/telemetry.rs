@@ -395,10 +395,10 @@ pub fn reason_digest(text: &str) -> String {
 
 /// How a run is being executed, as a span attribute.
 #[must_use]
-pub const fn mode_str(mode: super::Mode) -> &'static str {
+pub(crate) const fn mode_str(mode: super::ctx::Pass) -> &'static str {
     match mode {
-        super::Mode::Live => "live",
-        super::Mode::Resume => "resume",
-        super::Mode::Strict => "strict",
+        super::ctx::Pass::Live => "live",
+        super::ctx::Pass::Resume => "resume",
+        super::ctx::Pass::Strict => "strict",
     }
 }

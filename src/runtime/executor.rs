@@ -22,7 +22,7 @@ use crate::core::{
 use crate::journal::{Append, JournalStore, Record, RecordKind, ReplayCursor, StepCursor};
 use crate::runtime::BuildError;
 
-use super::ctx::{CaseContext, Mode, StepCtx};
+use super::ctx::{CaseContext, Mode, Pass, StepCtx};
 use super::metrics;
 use super::telemetry;
 use tracing::Instrument;
@@ -36,21 +36,31 @@ pub(crate) enum CaseBinding {
     Existing(crate::core::CaseId),
 }
 
-/// What a caller asks admission for, beyond the capability and the input.
+/// What a run is bound to, beyond its target and input: who it acts for,
+/// which matter it belongs to, who asked, which declaration it was reviewed
+/// against. Handed to [`RunRequest::terms`].
 ///
-/// The named `run`/`spawn` methods each fix one combination of these; this is
-/// the general form, for a caller that needs a combination they do not name —
-/// above all a chain **per run**. A front door that authenticates many callers
-/// admits each one's run under the chain that caller presented, and there is
-/// no fixed method for "in this case, once, acting as her", nor should there
-/// be: the axes multiply, the methods would not.
+/// The value a front door computes per caller — above all a chain **per run**:
+/// a door that authenticates many callers admits each one's run under the
+/// chain that caller presented. Whether the run happens at most once is not a
+/// term; it is [`RunRequest::once`], because it changes what the answer is.
 ///
-/// ```ignore
-/// let terms = RunTerms::default()
-///     .correlated("order", &keys)
-///     .once(&message.dedup_key())
-///     .acting_as(caller_chain);
-/// let admission = runtime.run_under("order.settle", input, terms).await?;
+/// **Authority is chosen once, by constructor**: [`default`](Self::default)
+/// acts as the plane, [`acting_as`](Self::acting_as) under a caller's chain,
+/// [`served`](Self::served) for a served caller that may have presented none.
+///
+/// ```no_run
+/// # use agentplane::runtime::RunTerms;
+/// # fn f(chain: agentplane::core::Delegation, keys: &[agentplane::core::CorrelationKey]) {
+/// let terms = RunTerms::acting_as(chain).correlated("order", keys);
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use agentplane::runtime::RunTerms;
+/// # fn f(chain: agentplane::core::Delegation) {
+/// let terms = RunTerms::served(None).acting_as(chain);
+/// # }
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct RunTerms {
@@ -132,17 +142,6 @@ impl Acting {
 }
 
 impl RunTerms {
-    fn bound(case: CaseBinding) -> Self {
-        Self {
-            case: Some(case),
-            idempotency_key: None,
-            acting_as: Acting::Plane,
-            admitted_by: None,
-            expected_declaration: None,
-            subjects: Vec::new(),
-        }
-    }
-
     /// Run inside a case that already exists.
     #[must_use]
     pub fn in_case(mut self, case: crate::core::CaseId) -> Self {
@@ -160,13 +159,6 @@ impl RunTerms {
         self
     }
 
-    /// Admit at most once under this key — see [`Runtime::run_once`].
-    #[must_use]
-    pub fn once(mut self, idempotency_key: &str) -> Self {
-        self.idempotency_key = Some(idempotency_key.to_owned());
-        self
-    }
-
     /// Act under this chain rather than the plane's own.
     ///
     /// Checked at admission exactly as the plane's chain is: the plan must be
@@ -176,9 +168,11 @@ impl RunTerms {
     ///
     /// [`Delegation::admissible`]: crate::core::Delegation::admissible
     #[must_use]
-    pub fn acting_as(mut self, chain: crate::core::Delegation) -> Self {
-        self.acting_as = Acting::Caller(chain);
-        self
+    pub fn acting_as(chain: crate::core::Delegation) -> Self {
+        Self {
+            acting_as: Acting::Caller(chain),
+            ..Self::default()
+        }
     }
 
     /// Act under `chain` as the plane: a commission from a run the plane
@@ -195,9 +189,11 @@ impl RunTerms {
     /// [`acting_as`](Self::acting_as) alone cannot say "this caller presented
     /// nothing", and leaving it unset means the plane's own chain.
     #[must_use]
-    pub fn served(mut self, chain: Option<crate::core::Delegation>) -> Self {
-        self.acting_as = chain.map_or(Acting::Nobody, Acting::Caller);
-        self
+    pub fn served(chain: Option<crate::core::Delegation>) -> Self {
+        Self {
+            acting_as: chain.map_or(Acting::Nobody, Acting::Caller),
+            ..Self::default()
+        }
     }
 
     /// Record who asked for this run: the authenticated caller a served
@@ -240,8 +236,9 @@ impl RunTerms {
         self
     }
 
-    fn keyed(self, key: &str) -> Self {
-        self.once(key)
+    fn keyed(mut self, key: &str) -> Self {
+        self.idempotency_key = Some(key.to_owned());
+        self
     }
 }
 
@@ -317,7 +314,7 @@ impl RunOutcome {
     /// off a run that quarantined. This folds the pair into one `?`:
     ///
     /// ```ignore
-    /// let answer = runtime.run("greet", input).await?.success()?;
+    /// let answer = runtime.start("greet", input).run().await?.success()?;
     /// ```
     ///
     /// `status` stays public for the callers whose branches genuinely differ —
@@ -402,19 +399,9 @@ impl Admission {
             Self::InFlight(_) => None,
         }
     }
-
-    /// What the run produced, owned, if it has produced anything yet.
-    #[must_use]
-    pub fn into_outcome(self) -> Option<RunOutcome> {
-        match self {
-            Self::Fresh(outcome) | Self::Replayed(outcome) => Some(outcome),
-            Self::InFlight(_) => None,
-        }
-    }
 }
 
-/// What an idempotent [`spawn_correlated_once`](Runtime::spawn_correlated_once)
-/// did.
+/// What a keyed [`spawn`](RunRequest::spawn) did.
 ///
 /// Separate from [`Admission`] because a spawn returns before the work happens,
 /// so it has no outcome to report.
@@ -425,6 +412,229 @@ pub struct Spawned {
     pub run: RunId,
     /// False when the key was already held, so nothing new was started.
     pub fresh: bool,
+}
+
+/// What a run starts from.
+#[derive(Debug, Clone)]
+pub enum Target {
+    /// A capability a registered skill answers — the degenerate one-node plan.
+    Capability(String),
+    /// A plan, validated and frozen before its first step: one that would
+    /// fail at step seven must not begin at step one.
+    Plan(PlanIR),
+}
+
+impl From<&str> for Target {
+    fn from(capability: &str) -> Self {
+        Self::Capability(capability.to_owned())
+    }
+}
+
+impl From<String> for Target {
+    fn from(capability: String) -> Self {
+        Self::Capability(capability)
+    }
+}
+
+impl From<&String> for Target {
+    fn from(capability: &String) -> Self {
+        Self::Capability(capability.clone())
+    }
+}
+
+impl From<PlanIR> for Target {
+    fn from(plan: PlanIR) -> Self {
+        Self::Plan(plan)
+    }
+}
+
+/// A request with no admission key: answered by what the run did.
+#[derive(Debug, Clone, Copy)]
+pub struct Unkeyed;
+
+/// A request under an admission key: answered by what the key admitted.
+#[derive(Debug, Clone)]
+pub struct Keyed(String);
+
+/// A run about to start — see [`Runtime::start`].
+///
+/// The answer's type follows the key. Unkeyed, a run answers with its
+/// [`RunOutcome`] and a spawn with its [`RunId`]; under
+/// [`once`](Self::once), with an [`Admission`] or a [`Spawned`], because a
+/// key already held is answered by the run that holds it, and a caller must
+/// say what it does then.
+///
+/// ```compile_fail
+/// # async fn f(rt: std::sync::Arc<agentplane::runtime::Runtime>, input: agentplane::core::Tainted<serde_json::Value>) {
+/// let _: agentplane::runtime::RunOutcome = rt.start("c", input).once("k").run().await.unwrap();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # async fn f(rt: std::sync::Arc<agentplane::runtime::Runtime>, input: agentplane::core::Tainted<serde_json::Value>) {
+/// rt.start("c", input).once("a").once("b");
+/// # }
+/// ```
+///
+/// ```no_run
+/// # async fn f(rt: std::sync::Arc<agentplane::runtime::Runtime>, input: agentplane::core::Tainted<serde_json::Value>) {
+/// let _: agentplane::runtime::RunOutcome = rt.start("c", input.clone()).run().await.unwrap();
+/// let _: agentplane::runtime::Admission = rt.start("c", input).once("k").run().await.unwrap();
+/// # }
+/// ```
+#[must_use = "a run request does nothing until it is run, spawned or settled"]
+#[derive(Debug)]
+pub struct RunRequest<'a, K> {
+    runtime: &'a Runtime,
+    target: Target,
+    input: Tainted<Value>,
+    terms: RunTerms,
+    key: K,
+}
+
+impl<K> RunRequest<'_, K> {
+    /// Bind the run: a case, a caller's chain, who asked, a pinned
+    /// declaration. A second call replaces the first, as one value.
+    pub fn terms(mut self, terms: RunTerms) -> Self {
+        self.terms = terms;
+        self
+    }
+}
+
+impl<'a> RunRequest<'a, Unkeyed> {
+    /// Admit at most once per tenant under this key.
+    ///
+    /// The door for an at-least-once emitter: a bus that retries until it sees
+    /// a 2xx, a webhook fan-out, a queue with redelivery. The store claims the
+    /// key in the same transaction that writes the run's first record, so a
+    /// second request under it cannot admit a second run — not on a retry, not
+    /// across a restart, not from another instance sharing the store.
+    ///
+    /// **The key must carry its producer.** An id is unique only within one
+    /// emitter, so a bare message id lets two counterparties swallow each
+    /// other's messages as apparent retries.
+    /// [`InboundEvent::dedup_key`](crate::core::InboundEvent::dedup_key) is the
+    /// ready-made spelling.
+    ///
+    /// Not the event buffer: an event nobody subscribes to is dead-lettered by
+    /// [`sweep`](Runtime::sweep), so using the buffer as a ledger would spend
+    /// that signal to buy deduplication.
+    pub fn once(self, key: impl Into<String>) -> RunRequest<'a, Keyed> {
+        RunRequest {
+            runtime: self.runtime,
+            target: self.target,
+            input: self.input,
+            terms: self.terms,
+            key: Keyed(key.into()),
+        }
+    }
+
+    /// Run, and wait until it rests.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::NoProvider`] when no skill provides the capability, and
+    /// whatever admission refuses — policy, quota, a halted tenant, an
+    /// instance draining, a chain this plane may not act under.
+    pub async fn run(self) -> Result<RunOutcome, RuntimeError> {
+        self.runtime
+            .admit_target(self.target, self.input, self.terms)
+            .await
+    }
+
+    /// Admit, and let the run proceed in the background, returning its id.
+    ///
+    /// **Admission happens before this returns.** The policy gate, the lease
+    /// and the admission records are written first, so a refusal is an error
+    /// here and not a task that never appears, and the id can be read at once.
+    /// The run is durable: a process that dies mid-flight leaves a journal
+    /// another instance resumes.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, as the rest of this crate's timing does.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub async fn spawn(self) -> Result<RunId, RuntimeError> {
+        self.runtime
+            .owned()
+            .spawn_target(self.target, self.input, self.terms)
+            .await
+    }
+}
+
+impl RunRequest<'_, Keyed> {
+    /// Run under the key. A key already held comes back as
+    /// [`Admission::Replayed`] or [`Admission::InFlight`], not an error.
+    ///
+    /// # Errors
+    ///
+    /// As [`RunRequest::run`], and [`RuntimeError::PlanContract`] for an empty
+    /// key or one over [`MAX_ADMISSION_KEY_BYTES`].
+    pub async fn run(self) -> Result<Admission, RuntimeError> {
+        let runtime = self.runtime;
+        let terms = self.terms.keyed(&self.key.0);
+        // Boxed: admission is the largest future in the crate, and the claim
+        // would otherwise carry it inline into every keyed caller's future.
+        let admit = Box::pin(runtime.admit_target(self.target, self.input, terms));
+        match runtime.claimed(&self.key.0, admit).await? {
+            Claimed::Fresh(outcome) => Ok(Admission::Fresh(outcome)),
+            Claimed::Held(run) => runtime.answer_with(run).await,
+        }
+    }
+
+    /// Spawn under the key. A key already held names its run, with `fresh`
+    /// false.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run).
+    pub async fn spawn(self) -> Result<Spawned, RuntimeError> {
+        let runtime = self.runtime.owned();
+        let terms = self.terms.keyed(&self.key.0);
+        let admit = Box::pin(runtime.spawn_target(self.target, self.input, terms));
+        Ok(match runtime.claimed(&self.key.0, admit).await? {
+            Claimed::Fresh(run) => Spawned { run, fresh: true },
+            Claimed::Held(run) => Spawned { run, fresh: false },
+        })
+    }
+
+    /// Run under the key until the run it admitted rests, whoever admitted it,
+    /// and answer with its outcome.
+    ///
+    /// The shape a process that may have been killed mid-run wants on restart:
+    /// the same request again. An unused key runs. A key whose run has rested
+    /// answers with that run, its value re-derived by strict replay, which
+    /// performs nothing. A key whose run is still working is resumed when
+    /// nobody holds its lease — its holder has gone — and otherwise followed
+    /// on the journal until it rests or its lease lapses.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Self::run), and whatever resuming or replaying the held run
+    /// refuses.
+    pub async fn settle(self) -> Result<RunOutcome, RuntimeError> {
+        let runtime = self.runtime;
+        match self.run().await? {
+            Admission::Fresh(outcome) => Ok(outcome),
+            Admission::Replayed(rested) => runtime.with_output(rested).await,
+            Admission::InFlight(run) => runtime.settled(run).await,
+        }
+    }
+}
+
+/// What a keyed claim found.
+enum Claimed<T> {
+    /// The key was unused, and this admitted.
+    Fresh(T),
+    /// The key already admitted this run.
+    Held(RunId),
 }
 
 /// The stores a full plane runs on, as handles rather than as one type.
@@ -1912,7 +2122,7 @@ impl Runtime {
         // concluded inside the resume, from the record just written. The run
         // still stands quarantined on the record, so it keeps its listing
         // whatever this pass does.
-        self.replay_releasing(run, Mode::Resume, Some(lease), Claim::Standing)
+        self.replay_releasing(run, Pass::Resume, Some(lease), Claim::Standing)
             .await
     }
 
@@ -2650,8 +2860,8 @@ impl Runtime {
     /// decide whether it happened — the right answer to an accident, and an
     /// expensive one to schedule on every deploy.
     ///
-    /// Admission closes **first**: every later [`run`](Self::run),
-    /// [`spawn`](Self::spawn) and plan is refused
+    /// Admission closes **first**: every later [`start`](Self::start) is
+    /// refused
     /// [`RuntimeError::Draining`](crate::core::RuntimeError::Draining), leaving
     /// no lease, no slot and no journal. Then this waits up to `grace` for the
     /// runs it put on a background task to reach a journaled resting point.
@@ -2927,10 +3137,7 @@ impl Runtime {
 
     /// This **process instance's** identity, as it appears in run leases.
     ///
-    /// Not the agent's name. Several instances of one agent are normal, and a
-    /// lease is renewed without a fencing bump only when the holder is the same
-    /// owner — so two instances sharing this string would each renew the other's
-    /// lease and both write to one run. See
+    /// Not the agent's name: several instances of one agent are normal. See
     /// [`RuntimeBuilder::owner`].
     ///
     /// Public because "which instance holds this run" is a question an operator
@@ -3624,10 +3831,10 @@ impl Runtime {
     async fn start_replay_quota_pass(
         &self,
         run: RunId,
-        mode: Mode,
+        mode: Pass,
         width: usize,
     ) -> Result<QuotaPass, RuntimeError> {
-        let (Mode::Resume, Some(quotas)) = (mode, self.quotas.as_ref()) else {
+        let (Pass::Resume, Some(quotas)) = (mode, self.quotas.as_ref()) else {
             return Ok(QuotaPass::disabled());
         };
         let pass = QuotaPass::at(&self.quota, now_for_admission(), false).sized_for(width);
@@ -3766,84 +3973,91 @@ impl Runtime {
         })
     }
 
-    /// Execute a fresh run with no case attached.
+    /// Start a run: a capability a skill answers, or a plan.
+    ///
+    /// The one door. What the run is bound to — a case, a caller's chain, a
+    /// pinned declaration — goes in [`RunRequest::terms`]; whether it runs at
+    /// most once goes in [`RunRequest::once`], which changes what the answer
+    /// is; and the terminal says whether to wait for it.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use agentplane::core::Tainted;
+    /// # use agentplane::runtime::{Runtime, RunTerms};
+    /// # async fn f(rt: Arc<Runtime>, input: Tainted<serde_json::Value>) -> Result<(), agentplane::RuntimeError> {
+    /// let outcome = rt.start("order.settle", input.clone()).run().await?;
+    /// let admission = rt
+    ///     .start("order.settle", input)
+    ///     .terms(RunTerms::default().correlated("order", &[]))
+    ///     .once("billing:msg-7")
+    ///     .run()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
     ///
     /// The input arrives **labelled**, and that is the whole of the decision.
     /// [`Tainted::trusted`](crate::core::Tainted::trusted) is what an operator
     /// writes for a literal, a constant or a configuration value they vouch for;
     /// anything that came from outside — an inbound event, a queue message, a
-    /// counterparty's payload — keeps the label it arrived with.
-    ///
-    /// This took a bare `Value` and admitted it as `Trusted` by default. A
-    /// deployment whose runs are started by inbound events passed counterparty
-    /// data straight in, and three controls went quiet at once: `require_trusted`
-    /// protected fields were satisfied by attacker-chosen values, the egress
-    /// ceiling had nothing untrusted to join with, and the journal recorded no
-    /// contact with outside data. Nothing failed and the suite stayed green,
-    /// which is the profile of every other default this crate declines to offer.
-    ///
-    /// A `run_trusted`/`run_tainted` pair was tried first and is worse: it
-    /// doubles every shape, puts `run_trusted_in_case` one word away from
-    /// `run_tainted_in_case`, and still lets `run_trusted(cap, payload)` compile
-    /// over data nobody vouched for. A label is a **value** — it can be
-    /// computed, threaded through an adapter, or derived from where a message
-    /// arrived, none of which a method name can do. [`spawn`](Self::spawn)
-    /// already worked this way; `run` was the outlier.
-    ///
-    /// # Errors
-    ///
-    /// [`RuntimeError::NoProvider`] when no skill provides `target`, and
-    /// whatever admission refuses — policy, quota, a halted tenant, an instance
-    /// draining, a lease.
-    pub async fn run(
+    /// counterparty's payload — keeps the label it arrived with. A bare value
+    /// admitted as trusted would satisfy `require_trusted` fields with
+    /// attacker-chosen data and give the egress ceiling nothing to join with.
+    pub fn start(
         &self,
-        target: &str,
+        target: impl Into<Target>,
         input: Tainted<Value>,
+    ) -> RunRequest<'_, Unkeyed> {
+        RunRequest {
+            runtime: self,
+            target: target.into(),
+            input,
+            terms: RunTerms::default(),
+            key: Unkeyed,
+        }
+    }
+
+    /// This plane as the handle a background run keeps.
+    ///
+    /// Every `Runtime` is built inside an `Arc` that holds `self_ref`, and a
+    /// borrow of it is a borrow of that `Arc`, so the upgrade cannot fail
+    /// while `&self` exists.
+    fn owned(&self) -> Arc<Self> {
+        self.self_ref
+            .upgrade()
+            .expect("a runtime is only reachable through the Arc its builder made")
+    }
+
+    /// Admit and execute, blocking until the run rests.
+    async fn admit_target(
+        &self,
+        target: Target,
+        input: Tainted<Value>,
+        terms: RunTerms,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, RunTerms::default()).await
+        match target {
+            Target::Capability(capability) => self.admit(&capability, input, terms).await,
+            Target::Plan(plan) => self.admit_plan(plan, input, terms).await,
+        }
     }
 
-    /// Admit a run and let it proceed in the background, returning its id.
-    ///
-    /// The asynchronous counterpart to [`run`](Self::run), for
-    /// callers that want a handle rather than an answer — A2A's
-    /// `return_immediately`, a queue worker, an operator kicking something off.
-    ///
-    /// **Admission happens before this returns.** The policy gate, the lease and
-    /// the admission records are all written first, so a refusal is an error
-    /// here and not a task that never appears, and the id handed back can be
-    /// read immediately. What continues in the background is the *work*.
-    ///
-    /// The run is durable, so a process that dies mid-flight leaves a journal
-    /// another instance resumes; the background task is where the work happens,
-    /// not where it is kept.
-    ///
-    /// # Panics
-    ///
-    /// Outside a Tokio runtime, as the rest of this crate's timing does.
-    ///
-    /// # Errors
-    ///
-    /// As [`run`](Self::run) — anything admission itself refuses.
-    pub async fn spawn(
+    /// Admit, and let the run proceed in the background.
+    async fn spawn_target(
         self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-    ) -> Result<RunId, RuntimeError> {
-        self.spawn_bound(target, input, RunTerms::default()).await
-    }
-
-    async fn spawn_bound(
-        self: &Arc<Self>,
-        target: &str,
+        target: Target,
         input: Tainted<Value>,
         terms: RunTerms,
     ) -> Result<RunId, RuntimeError> {
         // Resolved before the id is minted: an unknown capability is the
         // caller's mistake and must be an error, not a run that exists and
-        // immediately fails.
-        let skill = self.resolve(target)?;
-        let capability = first_capability(&skill.descriptor());
+        // immediately fails. A plan is validated inside admission, which also
+        // precedes the id becoming visible.
+        let plan = match target {
+            Target::Capability(capability) => {
+                let skill = self.resolve(&capability)?;
+                PlanIR::single(first_capability(&skill.descriptor()))
+            }
+            Target::Plan(plan) => plan,
+        };
 
         let run = RunId::generate();
         // Registered before admission, not after. Admission is several store
@@ -3855,13 +4069,7 @@ impl Runtime {
         // refuses and drops the ticket on the way out.
         let ticket = self.inflight.enter(run);
         let admitted = self
-            .admit_only(
-                run,
-                PlanIR::single(capability),
-                input,
-                terms,
-                Entry::Outside,
-            )
+            .admit_only(run, plan, input, terms, Entry::Outside)
             .await?;
 
         let plane = Arc::clone(self);
@@ -3877,235 +4085,8 @@ impl Runtime {
         Ok(run)
     }
 
-    /// Start a new immutable run inside a case that already exists.
-    pub async fn run_in_case(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-        case: crate::core::CaseId,
-    ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(target, input, RunTerms::bound(CaseBinding::Existing(case)))
-            .await
-    }
-
-    /// Join or open a case by business key, then run.
-    ///
-    /// Correlation happens **before planning**, because which case a message
-    /// belongs to is a question of fact, not of judgement: it is a deterministic
-    /// lookup on business keys, never a model call. If an open case matches any
-    /// key the run joins it; otherwise a case is opened.
-    pub async fn run_correlated(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-        case_kind: &str,
-        keys: &[CorrelationKey],
-    ) -> Result<RunOutcome, RuntimeError> {
-        self.admit(
-            target,
-            input,
-            RunTerms::default().correlated(case_kind, keys),
-        )
-        .await
-    }
-
-    /// Run under an admission key, at most once per tenant.
-    ///
-    /// The entry point for an at-least-once emitter: a bus that retries until it
-    /// sees a 2xx, a webhook fan-out, a queue with redelivery. The store claims
-    /// the key in the same transaction that writes the run's first record, so a
-    /// second call under it cannot admit a second run — not on a retry, not
-    /// across a restart, not from another instance sharing the store.
-    ///
-    /// # The key must carry its producer
-    ///
-    /// An id is unique only within one emitter, so a bare message id lets two
-    /// counterparties swallow each other's messages as apparent retries.
-    /// [`InboundEvent::dedup_key`](crate::core::InboundEvent::dedup_key) is the
-    /// ready-made spelling, and the same identity the event buffer uses.
-    ///
-    /// # Not the event buffer
-    ///
-    /// [`EventStore::buffer`](crate::case::EventStore::buffer) also reports
-    /// "already seen" for a `(source, id)` over the same store, and looks like
-    /// the primitive. It is not: an event nobody subscribes to is dead-lettered
-    /// by [`sweep`](Self::sweep), and a non-empty dead-letter list means a
-    /// correlation key is wrong somewhere. Using the buffer as an idempotency
-    /// ledger would dead-letter nearly every message admitted directly, spending
-    /// that signal to buy deduplication. Two concerns can share an identity
-    /// without sharing a table.
-    ///
-    /// # Errors
-    ///
-    /// As [`run`](Self::run). A key already held is not an error — it comes back
-    /// as [`Admission::Replayed`] or [`Admission::InFlight`].
-    pub async fn run_once(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-        idempotency_key: &str,
-    ) -> Result<Admission, RuntimeError> {
-        self.admit_once(target, input, RunTerms::default().keyed(idempotency_key))
-            .await
-    }
-
-    /// Join or open a case by business key and run, at most once per admission
-    /// key.
-    ///
-    /// The shape an inbound message actually has: it names a matter by business
-    /// key *and* carries its own identity. Correlation decides **which case**,
-    /// the admission key decides **whether at all** — correlation alone would
-    /// join the duplicate to the right case and start a second run inside it.
-    ///
-    /// # Errors
-    ///
-    /// As [`run_correlated`](Self::run_correlated).
-    pub async fn run_correlated_once(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-        case_kind: &str,
-        keys: &[CorrelationKey],
-        idempotency_key: &str,
-    ) -> Result<Admission, RuntimeError> {
-        self.admit_once(
-            target,
-            input,
-            RunTerms::default()
-                .correlated(case_kind, keys)
-                .keyed(idempotency_key),
-        )
-        .await
-    }
-
-    /// Correlate and spawn, at most once per admission key.
-    ///
-    /// # Panics
-    ///
-    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
-    ///
-    /// # Errors
-    ///
-    /// As [`spawn`](Self::spawn).
-    pub async fn spawn_correlated_once(
-        self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-        case_kind: &str,
-        keys: &[CorrelationKey],
-        idempotency_key: &str,
-    ) -> Result<Spawned, RuntimeError> {
-        self.spawn_bound_once(
-            target,
-            input,
-            RunTerms::default()
-                .correlated(case_kind, keys)
-                .keyed(idempotency_key),
-        )
-        .await
-    }
-
-    /// Execute an explicit multi-step plan.
-    ///
-    /// The plan is validated and frozen *before the first step runs*: one that
-    /// would fail at step seven must not begin at step one.
-    pub async fn run_plan(
-        &self,
-        plan: PlanIR,
-        input: Tainted<Value>,
-    ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, RunTerms::default()).await
-    }
-
-    /// Execute an explicit plan inside a long-lived case.
-    pub async fn run_plan_correlated(
-        &self,
-        plan: PlanIR,
-        input: Tainted<Value>,
-        case_kind: &str,
-        keys: &[CorrelationKey],
-    ) -> Result<RunOutcome, RuntimeError> {
-        self.admit_plan(plan, input, RunTerms::default().correlated(case_kind, keys))
-            .await
-    }
-
-    /// Run under explicit [`RunTerms`] — the general form of every `run_*`.
-    ///
-    /// Keyed terms behave as [`run_once`](Self::run_once): a duplicate comes
-    /// back as [`Admission::Replayed`] or [`Admission::InFlight`]. Unkeyed
-    /// terms always admit, and the answer is [`Admission::Fresh`].
-    ///
-    /// # Errors
-    ///
-    /// As [`run`](Self::run), plus [`RuntimeError::Delegation`] when the terms
-    /// carry a chain this plane may not act under now.
-    pub async fn run_under(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-        terms: RunTerms,
-    ) -> Result<Admission, RuntimeError> {
-        if terms.idempotency_key.is_some() {
-            self.admit_once(target, input, terms).await
-        } else {
-            self.admit(target, input, terms).await.map(Admission::Fresh)
-        }
-    }
-
-    /// Spawn under explicit [`RunTerms`] — the general form of every `spawn_*`.
-    ///
-    /// # Panics
-    ///
-    /// Outside a Tokio runtime, as [`spawn`](Self::spawn) does.
-    ///
-    /// # Errors
-    ///
-    /// As [`run_under`](Self::run_under).
-    pub async fn spawn_under(
-        self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-        terms: RunTerms,
-    ) -> Result<Spawned, RuntimeError> {
-        if terms.idempotency_key.is_some() {
-            self.spawn_bound_once(target, input, terms).await
-        } else {
-            let run = self.spawn_bound(target, input, terms).await?;
-            Ok(Spawned { run, fresh: true })
-        }
-    }
-
-    /// Execute an explicit plan under [`RunTerms`].
-    ///
-    /// Keyed terms admit once, as every `_once` entry point does: the key is
-    /// validated, and a redelivery is answered by the run it already admitted.
-    ///
-    /// # Errors
-    ///
-    /// As [`run_plan`](Self::run_plan) and [`run_under`](Self::run_under).
-    pub async fn run_plan_under(
-        &self,
-        plan: PlanIR,
-        input: Tainted<Value>,
-        terms: RunTerms,
-    ) -> Result<Admission, RuntimeError> {
-        let Some(key) = terms.idempotency_key.clone() else {
-            return Ok(Admission::Fresh(self.admit_plan(plan, input, terms).await?));
-        };
-        validate_admission_key(&key)?;
-        if let Some(held) = self.holder_of(&key).await? {
-            return self.answer_with(held).await;
-        }
-        match self.admit_plan(plan, input, terms).await {
-            Ok(outcome) => Ok(Admission::Fresh(outcome)),
-            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
-                run, ..
-            })) => self.answer_with(parse_holder(&run)?).await,
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Admission under a key, for the blocking `_once` entry points.
+    /// Admission under a key: the one copy, for blocking and background,
+    /// capability and plan.
     ///
     /// Two gates, and only the second arbitrates. The read below is an
     /// optimisation — it saves a redelivery the cost of a policy evaluation, a
@@ -4113,53 +4094,61 @@ impl Runtime {
     /// nothing, since two instances racing both see nothing here. The
     /// constraint inside `append` decides, on the same division
     /// `CaseStore::correlate_or_open` runs on.
-    async fn admit_once(
-        &self,
-        target: &str,
-        input: Tainted<Value>,
-        terms: RunTerms,
-    ) -> Result<Admission, RuntimeError> {
-        let key = terms
-            .idempotency_key
-            .clone()
-            .expect("admit_once is only reached with a key");
-        validate_admission_key(&key)?;
-        if let Some(held) = self.holder_of(&key).await? {
-            return self.answer_with(held).await;
+    async fn claimed<T, F>(&self, key: &str, admit: F) -> Result<Claimed<T>, RuntimeError>
+    where
+        F: Future<Output = Result<T, RuntimeError>>,
+    {
+        validate_admission_key(key)?;
+        if let Some(held) = self.holder_of(key).await? {
+            return Ok(Claimed::Held(held));
         }
-        match self.admit(target, input, terms).await {
-            Ok(outcome) => Ok(Admission::Fresh(outcome)),
+        match admit.await {
+            Ok(fresh) => Ok(Claimed::Fresh(fresh)),
             Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
                 run, ..
-            })) => self.answer_with(parse_holder(&run)?).await,
+            })) => Ok(Claimed::Held(parse_holder(&run)?)),
             Err(e) => Err(e),
         }
     }
 
-    /// [`admit_once`](Self::admit_once) for the non-blocking pair.
-    async fn spawn_bound_once(
-        self: &Arc<Self>,
-        target: &str,
-        input: Tainted<Value>,
-        terms: RunTerms,
-    ) -> Result<Spawned, RuntimeError> {
-        let key = terms
-            .idempotency_key
-            .clone()
-            .expect("spawn_bound_once is only reached with a key");
-        validate_admission_key(&key)?;
-        if let Some(run) = self.holder_of(&key).await? {
-            return Ok(Spawned { run, fresh: false });
+    /// Wait until `run` rests and answer with its outcome — the value
+    /// re-derived by strict replay when it concluded.
+    ///
+    /// A run whose lease is free is resumed here: its holder has gone. One
+    /// whose lease is held is followed on the journal until it rests or the
+    /// lease lapses, so a holder that dies mid-wait is taken over rather than
+    /// waited for forever.
+    async fn settled(&self, run: RunId) -> Result<RunOutcome, RuntimeError> {
+        loop {
+            if let Some(rested) = self.recorded_outcome(run).await? {
+                return self.with_output(rested).await;
+            }
+            // Subscribed before the attempt, so an append between the two
+            // still wakes the wait below.
+            let mut follower = self.store.watch(run).await;
+            match self.replay(run, Mode::Resume).await {
+                Err(RuntimeError::LeaseHeld { remaining_secs, .. }) => {
+                    let lapse = Duration::from_secs(remaining_secs.max(1));
+                    match follower.as_mut() {
+                        Some(follower) => {
+                            let _ = tokio::time::timeout(lapse, follower.changed()).await;
+                        }
+                        None => tokio::time::sleep(lapse).await,
+                    }
+                }
+                resumed => return resumed,
+            }
         }
-        match self.spawn_bound(target, input, terms).await {
-            Ok(run) => Ok(Spawned { run, fresh: true }),
-            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
-                run, ..
-            })) => Ok(Spawned {
-                run: parse_holder(&run)?,
-                fresh: false,
-            }),
-            Err(e) => Err(e),
+    }
+
+    /// A rested run's outcome with its value: strict replay re-derives what a
+    /// concluded run answered, performing nothing. A suspension has no answer
+    /// yet, and is returned as recorded.
+    async fn with_output(&self, rested: RunOutcome) -> Result<RunOutcome, RuntimeError> {
+        if rested.status == RunStatus::Succeeded {
+            self.replay(rested.run_id, Mode::Strict).await
+        } else {
+            Ok(rested)
         }
     }
 
@@ -4888,7 +4877,7 @@ impl Runtime {
                 quota: a.quota,
                 plan: &a.plan,
                 input: a.input,
-                mode: Mode::Live,
+                mode: Pass::Live,
                 case: a.case,
                 budget: a.budget,
                 agent: a.agent,
@@ -5138,6 +5127,7 @@ impl Runtime {
     /// journal. That is the whole point — a resumed run does not re-issue the
     /// invoice it already issued.
     pub async fn replay(&self, run: RunId, mode: Mode) -> Result<RunOutcome, RuntimeError> {
+        let mode = Pass::from(mode);
         // ── Ownership before observation ───────────────────────────────────
         //
         // Resume writes, so it takes the lease *before* it reads. The old
@@ -5149,7 +5139,7 @@ impl Runtime {
         // under this instance's own fence. Strict verifies and never writes,
         // so it needs no lease — and must not take one, or every regression
         // check would fence a run somebody may be legitimately running.
-        let lease = if mode == Mode::Resume {
+        let lease = if mode == Pass::Resume {
             Some(
                 self.store
                     .acquire(run, &self.owner, self.lease_ttl)
@@ -5237,7 +5227,7 @@ impl Runtime {
         let replayed = self
             .replay_under(
                 run,
-                Mode::Strict,
+                Pass::Strict,
                 None,
                 Claim::Standing,
                 &mut dispatched,
@@ -5311,7 +5301,7 @@ impl Runtime {
         run: RunId,
         lease: crate::journal::Lease,
     ) -> Result<RunOutcome, RuntimeError> {
-        self.replay_releasing(run, Mode::Resume, Some(lease), Claim::Unlisted)
+        self.replay_releasing(run, Pass::Resume, Some(lease), Claim::Unlisted)
             .await
     }
 
@@ -5333,7 +5323,7 @@ impl Runtime {
             .await
             .map_err(RuntimeError::from_store)?;
         match self
-            .replay_releasing(run, Mode::Resume, Some(lease.clone()), Claim::Recovering)
+            .replay_releasing(run, Pass::Resume, Some(lease.clone()), Claim::Recovering)
             .await
         {
             Err(error) if recurs_on_every_resume(&error) => {
@@ -5356,7 +5346,7 @@ impl Runtime {
     async fn replay_releasing(
         &self,
         run: RunId,
-        mode: Mode,
+        mode: Pass,
         lease: Option<crate::journal::Lease>,
         claim: Claim,
     ) -> Result<RunOutcome, RuntimeError> {
@@ -5402,7 +5392,7 @@ impl Runtime {
     async fn replay_under(
         &self,
         run: RunId,
-        mode: Mode,
+        mode: Pass,
         lease: Option<&crate::journal::Lease>,
         claim: Claim,
         dispatched: &mut bool,
@@ -5430,7 +5420,7 @@ impl Runtime {
 
         ensure_replayable_canon(&records)?;
 
-        if mode == Mode::Resume
+        if mode == Pass::Resume
             && let Some(outcome) = self
                 .recover_quota_before_resume(
                     run,
@@ -5443,7 +5433,7 @@ impl Runtime {
             return Ok(outcome);
         }
 
-        if mode == Mode::Resume
+        if mode == Pass::Resume
             && let Some(outcome) = self
                 .closed_resume_outcome(run, &records, lease.expect("resume holds a lease"))
                 .await?
@@ -5455,7 +5445,7 @@ impl Runtime {
         // quarantined partway through an unwind is exactly the one an operator
         // has no other way to close, and it must not be the one this refuses to
         // close.
-        if mode == Mode::Resume
+        if mode == Pass::Resume
             && let Some(outcome) = self
                 .abandon_if_decided(run, &records, lease.expect("resume holds a lease"))
                 .await?
@@ -5463,7 +5453,7 @@ impl Runtime {
             return Ok(outcome);
         }
 
-        if mode == Mode::Resume {
+        if mode == Pass::Resume {
             refuse_resume_over_undone_work(run, &records)?;
         }
 
@@ -5489,7 +5479,7 @@ impl Runtime {
         // its policy or declarations with the run's: a mismatch there says
         // nothing about the run, and quarantining it would stop a run this
         // plane could never have continued.
-        if mode == Mode::Resume {
+        if mode == Pass::Resume {
             self.refuse_undrivable(std::iter::once(&plan).chain(&successors))?;
             self.refuse_caseless(run, &records)?;
         }
@@ -5508,7 +5498,7 @@ impl Runtime {
         // on and a person must decide*, it is listed and counted, and both of
         // its answers work here — reopen on a plane holding the recorded
         // revision, or abandon.
-        if mode == Mode::Resume
+        if mode == Pass::Resume
             && let Some(refusal) = self.resume_refusal(&records)?
         {
             let lease = lease.expect("resume holds a lease");
@@ -5519,7 +5509,7 @@ impl Runtime {
 
         // A resume executes the run, so it registers it first: what it adds is
         // whatever an admission that failed or died partway never wrote.
-        if mode == Mode::Resume {
+        if mode == Pass::Resume {
             self.register(run, recorded_case_id(&records))
                 .await
                 .map_err(RuntimeError::from_store)?;
@@ -5654,7 +5644,7 @@ impl Runtime {
         } = plan;
         // Every value derived from what the run took in carries its subjects.
         let input = input.attributed(&subjects);
-        let writing = !matches!(mode, Mode::Strict);
+        let writing = !matches!(mode, Pass::Strict);
         let case_id = case.as_ref().map(super::ctx::CaseContext::id);
         let stamp = |a: Append| match case_id {
             Some(c) => a.case(c),
@@ -5995,7 +5985,7 @@ impl Runtime {
             // finished with journaled effects still unread is the same
             // quarantine-grade finding as a key mismatch, named by the first
             // effect nothing requested.
-            if mode == Mode::Strict {
+            if mode == Pass::Strict {
                 for &(step, ref status, _) in &outcomes {
                     // A step that stopped — suspended, failed, refused — ended
                     // where its history says it ended, and the stop itself is
@@ -6114,7 +6104,7 @@ impl Runtime {
         // longer reaches, a compensation slice nothing requested. Either way the
         // record holds work this build cannot account for, and "verified" must
         // not be the answer.
-        if mode == Mode::Strict
+        if mode == Pass::Strict
             && let Some((step, phase, missing)) = cursor.first_unconsumed()
         {
             cursor.note_divergence(crate::journal::Divergence::unconsumed(
@@ -6514,7 +6504,7 @@ impl Runtime {
         &self,
         ready: &[StepId],
         ledger: &Arc<std::sync::Mutex<Ledger>>,
-        mode: Mode,
+        mode: Pass,
         recorded: Option<&(StepId, String, String)>,
         cursor: &ReplayCursor,
         journal: Journalling<'_>,
@@ -6526,7 +6516,7 @@ impl Runtime {
             if let Some((at, limit, used)) = recorded
                 && *at == step
             {
-                if mode == Mode::Strict {
+                if mode == Pass::Strict {
                     // Verbatim: the recorded run stopped here, and a
                     // verification pass reaches the same conclusion without
                     // consulting today's ledger.
@@ -6576,9 +6566,9 @@ impl Runtime {
             }
 
             let verdict = match mode {
-                Mode::Strict => Ok(()),
-                Mode::Resume if !cursor.exhausted(step, Phase::Forward) => Ok(()),
-                Mode::Live | Mode::Resume => ledger
+                Pass::Strict => Ok(()),
+                Pass::Resume if !cursor.exhausted(step, Phase::Forward) => Ok(()),
+                Pass::Live | Pass::Resume => ledger
                     .lock()
                     .expect("budget mutex")
                     .admit_step(admitted.len()),
@@ -7602,9 +7592,7 @@ impl Runtime {
         //
         // Whatever the outcome — sealed, suspended, exhausted — this instance is
         // finished with the run. Holding the lease until expiry would make every
-        // failover wait out the TTL for nothing, and that wait is precisely the
-        // pressure that tempts a deployment into giving all its replicas one
-        // owner string, which silently disables fencing.
+        // failover wait out the TTL for nothing.
         //
         // Best-effort on purpose. A release that fails costs a TTL of patience;
         // turning it into a run failure would convert a tidiness problem into a
@@ -7937,7 +7925,7 @@ struct Batch<'a> {
     run: RunId,
     epoch: u64,
     ir: &'a PlanIR,
-    mode: Mode,
+    mode: Pass,
     case: &'a Option<CaseContext>,
     ledger: &'a Arc<std::sync::Mutex<Ledger>>,
     writing: bool,
@@ -8029,7 +8017,7 @@ struct Unwind<'a> {
     run: RunId,
     epoch: u64,
     ir: &'a PlanIR,
-    mode: Mode,
+    mode: Pass,
     case: Option<CaseContext>,
     ledger: &'a Arc<std::sync::Mutex<Ledger>>,
     writing: bool,
@@ -8048,7 +8036,7 @@ struct StepRun<'a> {
     epoch: u64,
     node: &'a PlanNode,
     phase: Phase,
-    mode: Mode,
+    mode: Pass,
     case: Option<CaseContext>,
     ledger: &'a Arc<std::sync::Mutex<Ledger>>,
     writing: bool,
@@ -8076,7 +8064,7 @@ struct StepFrame {
     epoch: crate::core::Epoch,
     step: StepId,
     phase: Phase,
-    mode: Mode,
+    mode: Pass,
     case: Option<CaseContext>,
     ledger: Arc<std::sync::Mutex<Ledger>>,
     identity: Option<crate::core::Delegation>,
@@ -8156,11 +8144,11 @@ fn recorded_conclusion(records: &[Record]) -> Option<String> {
 /// Whether this pass writes a step-level record: always live, never under
 /// strict verification, and on a resume only when `new_fact` — the record is
 /// not already in the journal, or the step did new work.
-const fn writes_step_record(mode: Mode, new_fact: bool) -> bool {
+const fn writes_step_record(mode: Pass, new_fact: bool) -> bool {
     match mode {
-        Mode::Live => true,
-        Mode::Resume => new_fact,
-        Mode::Strict => false,
+        Pass::Live => true,
+        Pass::Resume => new_fact,
+        Pass::Strict => false,
     }
 }
 
@@ -8986,7 +8974,7 @@ struct Execution<'a> {
     quota: QuotaPass,
     plan: &'a PlanIR,
     input: Tainted<Value>,
-    mode: Mode,
+    mode: Pass,
     case: Option<CaseContext>,
     budget: Budget,
     /// The run's data-subject references: from the `DataSubjectBound` just
@@ -9917,17 +9905,15 @@ impl RuntimeBuilder {
 
     /// This **process instance's** identity, as it appears in run leases.
     ///
-    /// Not the agent's name, and the distinction is load-bearing. A lease is
-    /// renewed without bumping the epoch when the holder is *the same owner*, so
-    /// two processes sharing an owner string each read the other's lease as
-    /// their own: no fencing, no epoch bump, and two writers on one run. That is
-    /// precisely the failure the epoch exists to prevent.
+    /// Not the agent's name. Fencing rests on the epoch — a claim never renews,
+    /// and a renewal names the exact epoch it holds — so a shared string costs
+    /// no safety; it costs the answer to *which process holds this run*, which
+    /// is what an operator asks of a stuck one and what `LeaseHeld` reports.
     ///
-    /// So it must be unique per running process, which is what the default is —
-    /// override it only if you have a better instance identity than a random
-    /// one, such as a pod name. An agent's *name* is
-    /// [`Manifest::metadata`](crate::manifest::Metadata::name); several
-    /// instances of one agent are normal and must not share this.
+    /// So keep it unique per running process, which is what the default is —
+    /// override it only with a better instance identity than a random one,
+    /// such as a pod name. An agent's *name* is
+    /// [`Manifest::metadata`](crate::manifest::Metadata::name).
     ///
     /// The owner lives in the lease table and never in the chain, so it has no
     /// bearing on replay.

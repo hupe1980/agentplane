@@ -139,7 +139,7 @@
   <dl class="stats">
     <div><dt>14</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
     <div><dt>78</dt><dd>deliberately broken specs; each must trip its own check</dd></div>
-    <div><dt>1540</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>1560</dt><dd>code mutations, each naming the one test that must fail</dd></div>
     <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
   </dl>
   <p class="fine">
@@ -157,12 +157,10 @@
 
   <pre class="code"><code>let store: Arc&lt;dyn JournalStore&gt; = Arc::new(RedbStore::open_in_memory()?);
 
-let runtime = Runtime::builder(Arc::clone(&amp;store))
-    .owner("my-service")
-    .skill(Triage)
-    .build();
+let runtime = Runtime::builder(Arc::clone(&amp;store)).skill(Triage).build();
 
-let out = runtime.run("ticket.triage", Tainted::trusted(json!({ "text": "printer on fire" }))).await?;
+let input = Tainted::trusted(json!({ "text": "printer on fire" }));
+let out = runtime.start("ticket.triage", input).run().await?;
 
 <span class="c">// Re-executes the logic and reads every effect back. Nothing is performed again.</span>
 let replayed = runtime.replay(out.run_id, Mode::Strict).await?;

@@ -209,7 +209,7 @@ pub const IDEMPOTENCY_META_KEY: &str = "io.agentplane/idempotencyKey";
 /// One agent, as this catalogue offers it.
 #[derive(Debug, Clone)]
 struct Served {
-    /// The capability `run_under` is called with — and the tool's name, because
+    /// The capability a call starts — and the tool's name, because
     /// a second spelling is a second thing to keep in step.
     capability: String,
     agent: String,
@@ -752,15 +752,15 @@ impl ServerHandler for McpServer {
         // caller's own chain or none — never the plane's, which is for the
         // runs its embedder starts.
         let terms = match &asker.caller {
-            Some(caller) => RunTerms::default()
-                .once(&key)
-                .served(caller.acting_as.clone())
-                .admitted_by(&caller.actor),
-            None => RunTerms::default().once(&key).served(None),
+            Some(caller) => RunTerms::served(caller.acting_as.clone()).admitted_by(&caller.actor),
+            None => RunTerms::served(None),
         };
         let admission = match self
             .runtime
-            .run_under(&served.capability, input, terms)
+            .start(&served.capability, input)
+            .terms(terms)
+            .once(key)
+            .run()
             .await
         {
             Ok(admission) => admission,

@@ -227,18 +227,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Day 0: the request goes out ────────────────────────────────────────
     // Rita asks for it, and the run records that she did.
-    let agentplane::runtime::Admission::Fresh(sent) = rt
-        .run_under(
+    let sent = rt
+        .start(
             "switch.request",
             Tainted::trusted(json!({ "document": "DOC-4711", "meter": "51238696781" })),
+        )
+        .terms(
             agentplane::runtime::RunTerms::default()
                 .correlated("supplier-switch", &keys)
                 .admitted_by("rita"),
         )
-        .await?
-    else {
-        unreachable!("an unkeyed admission is always fresh");
-    };
+        .run()
+        .await?;
     println!("day 0  request   → {}", sent.status.as_str());
     if let RunStatus::Suspended(reason) = &sent.status {
         println!("       waiting   → {reason}");
@@ -420,12 +420,12 @@ async fn demonstrate_early_arrival(rt: &Runtime) -> Result<(), Box<dyn std::erro
     println!("\nearly reply      → {:?}", rt.deliver(&early).await?);
 
     let racy = rt
-        .run_correlated(
+        .start(
             "switch.request",
             Tainted::trusted(json!({ "document": "DOC-9999", "meter": "51238696782" })),
-            "supplier-switch",
-            &early_keys,
         )
+        .terms(agentplane::runtime::RunTerms::default().correlated("supplier-switch", &early_keys))
+        .run()
         .await?;
     println!("then the request → {}", racy.status.as_str());
     println!("                   the buffered reply satisfied the wait immediately");

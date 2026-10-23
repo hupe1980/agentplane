@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Spend, Tainted, TenantId};
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::quota::{Period, QuotaError, QuotaSettlement, QuotaStore, SpendHold, TenantQuota};
-use agentplane::runtime::{RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -456,7 +456,7 @@ async fn a_refused_run_writes_nothing() {
         },
     );
 
-    let refused = rt.run("work", Tainted::trusted(json!({}))).await;
+    let refused = rt.start("work", Tainted::trusted(json!({}))).run().await;
     assert!(
         matches!(
             refused,
@@ -489,7 +489,8 @@ async fn a_finished_run_frees_its_slot() {
 
     for _ in 0..3 {
         let out = rt
-            .run("work", Tainted::trusted(json!({})))
+            .start("work", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         assert_eq!(out.status, RunStatus::Succeeded);
@@ -527,7 +528,8 @@ async fn an_unlimited_wired_quota_tracks_active_runs() {
         })
         .build();
 
-    rt.spawn("blocking-work", Tainted::trusted(json!({})))
+    rt.start("blocking-work", Tainted::trusted(json!({})))
+        .spawn()
         .await
         .expect("admit");
     entered.wait().await;
@@ -600,7 +602,8 @@ async fn replay_does_not_consult_the_quota() {
     );
 
     let out = rt
-        .run("work", Tainted::trusted(json!({})))
+        .start("work", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -646,7 +649,7 @@ async fn a_quota_refusal_is_not_a_policy_denial() {
         },
     );
 
-    match rt.run("work", Tainted::trusted(json!({}))).await {
+    match rt.start("work", Tainted::trusted(json!({}))).run().await {
         Err(RuntimeError::QuotaExceeded(QuotaError::TooManyRuns { running, .. })) => {
             assert_eq!(running, 0, "the refusal must report the count it saw");
         }
@@ -666,6 +669,7 @@ async fn a_quota_refusal_is_not_a_policy_denial() {
 /// properties, and the last is the one a single overwritable flag fails.
 #[cfg(feature = "manifest")]
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn a_halt_can_name_one_agent_and_leave_the_rest_running() {
     use agentplane::core::RuntimeError;
     use agentplane::manifest::Manifest;
@@ -715,7 +719,7 @@ spec:
     .await
     .expect("halt one agent");
 
-    match rt.run("pay.do", Tainted::trusted(json!({}))).await {
+    match rt.start("pay.do", Tainted::trusted(json!({}))).run().await {
         Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, reason, .. })) => {
             assert_eq!(scope, HaltScope::agent("payments-clerk"));
             assert!(
@@ -729,7 +733,8 @@ spec:
     // The whole point: everything else on the plane keeps running.
     for capability in ["support.do", "work"] {
         assert_eq!(
-            rt.run(capability, Tainted::trusted(json!({})))
+            rt.start(capability, Tainted::trusted(json!({})))
+                .run()
                 .await
                 .expect("run")
                 .status,
@@ -742,7 +747,8 @@ spec:
     // switch thrown in one process.
     let two = plane();
     assert!(
-        two.run("pay.do", Tainted::trusted(json!({})))
+        two.start("pay.do", Tainted::trusted(json!({})))
+            .run()
             .await
             .is_err(),
         "a halt on one instance must reach the others"
@@ -767,7 +773,11 @@ spec:
     )
     .await
     .expect("narrow the stop");
-    match rt.run("support.do", Tainted::trusted(json!({}))).await {
+    match rt
+        .start("support.do", Tainted::trusted(json!({})))
+        .run()
+        .await
+    {
         Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, .. })) => {
             assert_eq!(scope, HaltScope::Tenant);
         }
@@ -778,7 +788,8 @@ spec:
         .await
         .expect("lift");
     assert_eq!(
-        rt.run("pay.do", Tainted::trusted(json!({})))
+        rt.start("pay.do", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run")
             .status,
@@ -841,7 +852,8 @@ spec:
 
     assert!(
         running_broken
-            .run("pay.do", Tainted::trusted(json!({})))
+            .start("pay.do", Tainted::trusted(json!({})))
+            .run()
             .await
             .is_err(),
         "the stopped revision must not be admitted"
@@ -850,7 +862,8 @@ spec:
     // The fix, published as a new version, is a different digest — and runs.
     assert_eq!(
         plane(&fixed)
-            .run("pay.do", Tainted::trusted(json!({})))
+            .start("pay.do", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run")
             .status,
@@ -881,7 +894,8 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
 
     // The positive half, first: nothing is refused before the switch is thrown.
     assert_eq!(
-        one.run("work", Tainted::trusted(json!({})))
+        one.start("work", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run")
             .status,
@@ -898,7 +912,7 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
     .expect("halt");
 
     for (which, rt) in [("the halting instance", &one), ("a second instance", &two)] {
-        match rt.run("work", Tainted::trusted(json!({}))).await {
+        match rt.start("work", Tainted::trusted(json!({}))).run().await {
             Err(agentplane::core::RuntimeError::QuotaExceeded(
                 agentplane::quota::QuotaError::Halted {
                     tenant,
@@ -922,7 +936,8 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
     let other = plane(&store, "globex", TenantQuota::default());
     assert_eq!(
         other
-            .run("work", Tainted::trusted(json!({})))
+            .start("work", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run")
             .status,
@@ -938,7 +953,8 @@ async fn a_halt_refuses_new_runs_on_every_instance_and_names_the_reason() {
     .await
     .expect("lift");
     assert_eq!(
-        two.run("work", Tainted::trusted(json!({})))
+        two.start("work", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run")
             .status,
@@ -1035,7 +1051,8 @@ async fn a_resumed_run_accrues_its_spend_once() {
         .build();
 
     let out = rt
-        .run("spender", Tainted::trusted(json!({})))
+        .start("spender", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(out.status.is_suspended(), "the sleep must suspend the run");
@@ -1089,7 +1106,8 @@ async fn a_strict_pass_accrues_no_spend() {
         .build();
 
     let out = rt
-        .run("spends-once", Tainted::trusted(json!({})))
+        .start("spends-once", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -1142,7 +1160,8 @@ async fn a_failed_quota_settlement_is_recovered_exactly_once() {
         .build();
 
     let error = rt
-        .run("spends-once", Tainted::trusted(json!({})))
+        .start("spends-once", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("the injected settlement outage must reach the caller");
     let run = match error {
@@ -1249,7 +1268,8 @@ async fn a_failed_recovery_keeps_the_run_in_the_retry_queue() {
         .build();
 
     let error = rt
-        .run("spends-once", Tainted::trusted(json!({})))
+        .start("spends-once", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("the injected settlement outage must reach the caller");
     let run = match error {
@@ -1334,7 +1354,8 @@ async fn settlement_recovery_preserves_an_open_failure() {
         .build();
 
     let error = rt
-        .run("spends-then-fails", Tainted::trusted(json!({})))
+        .start("spends-then-fails", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("the injected settlement outage must reach the caller");
     let run = match error {
@@ -1507,11 +1528,9 @@ async fn a_halt_can_name_the_authority_a_run_acts_for() {
     .expect("withdraw an authority");
 
     match rt
-        .run_under(
-            "work",
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(caller()),
-        )
+        .start("work", Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(caller()))
+        .run()
         .await
     {
         Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, reason, .. })) => {
@@ -1526,17 +1545,16 @@ async fn a_halt_can_name_the_authority_a_run_acts_for() {
 
     // Another caller is untouched: a withdrawal is not a halt on the agent.
     let bob = Delegation::root(Principal::new("bob", Scope::root()));
-    rt.run_under(
-        "work",
-        Tainted::trusted(json!({})),
-        RunTerms::default().acting_as(bob),
-    )
-    .await
-    .expect("a different subject is not withdrawn");
+    rt.start("work", Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(bob))
+        .run()
+        .await
+        .expect("a different subject is not withdrawn");
 
     // And the plane's own runs are untouched too, which is the half that tells
     // `subject:` apart from `tenant:`.
-    rt.run("work", Tainted::trusted(json!({})))
+    rt.start("work", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("the plane's own chain is not the withdrawn one");
 
@@ -1548,13 +1566,11 @@ async fn a_halt_can_name_the_authority_a_run_acts_for() {
     )
     .await
     .expect("lift");
-    rt.run_under(
-        "work",
-        Tainted::trusted(json!({})),
-        RunTerms::default().acting_as(caller()),
-    )
-    .await
-    .expect("a lifted withdrawal admits again");
+    rt.start("work", Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(caller()))
+        .run()
+        .await
+        .expect("a lifted withdrawal admits again");
 }
 
 use agentplane::core::{
@@ -1686,12 +1702,12 @@ async fn a_withheld_run() -> (Arc<RedbStore>, Arc<Runtime>, agentplane::core::Ru
             .terminal(),
     ]);
     let out = rt
-        .run_plan_correlated(
-            plan,
-            Tainted::trusted(json!({})),
+        .start(plan, Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated(
             "claim",
             &[agentplane::core::CorrelationKey::new("claim", "CLM-1")],
-        )
+        ))
+        .run()
         .await
         .expect("admitted before any withdrawal");
     let run = out.run_id;
@@ -1913,7 +1929,8 @@ async fn a_commission_accrues_to_the_tenant_period_once() {
         .build();
 
     let out = rt
-        .run("delegator", Tainted::trusted(json!({})))
+        .start("delegator", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -2006,7 +2023,7 @@ async fn a_period_ceiling_bounds_suspended_runs() {
 
     let mut admitted = 0;
     for attempt in 0..5 {
-        match rt.run("burner", Tainted::trusted(json!({}))).await {
+        match rt.start("burner", Tainted::trusted(json!({}))).run().await {
             Ok(out) => {
                 assert!(out.status.is_suspended(), "{:?}", out.status);
                 admitted += 1;
@@ -2066,7 +2083,8 @@ async fn a_settled_run_releases_its_unspent_reservation() {
     let period = this_period(&quota);
 
     let out = rt
-        .run("spends-once", Tainted::trusted(json!({})))
+        .start("spends-once", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -2120,7 +2138,8 @@ async fn a_suspended_pass_is_not_charged_twice() {
     let period = this_period(&quota);
 
     let out = rt
-        .run("spender", Tainted::trusted(json!({})))
+        .start("spender", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(out.status.is_suspended());
@@ -2154,7 +2173,11 @@ async fn a_run_with_no_money_ceiling_is_refused_under_a_money_quota() {
     let budget = agentplane::core::Budget::unlimited().call_minor_units(10);
     let rt = reserving_plane(&scoped, quota, budget);
 
-    match rt.run("spends-once", Tainted::trusted(json!({}))).await {
+    match rt
+        .start("spends-once", Tainted::trusted(json!({})))
+        .run()
+        .await
+    {
         Err(agentplane::core::RuntimeError::QuotaExceeded(QuotaError::Unbounded {
             field, ..
         })) => assert_eq!(field, "max_minor_units"),
@@ -2176,7 +2199,8 @@ async fn a_run_with_no_ceiling_is_admitted_without_a_quota() {
     let scoped = Arc::new(store.for_tenant(tenant("acme")));
     let rt = reserving_plane(&scoped, slots(4), agentplane::core::Budget::unlimited());
     let out = rt
-        .run("spends-once", Tainted::trusted(json!({})))
+        .start("spends-once", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("an unbudgeted run under a concurrency-only quota is admitted");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -2198,7 +2222,8 @@ async fn a_resume_past_the_ceiling_is_not_refused() {
     let period = this_period(&quota);
 
     let out = rt
-        .run("burner", Tainted::trusted(json!({})))
+        .start("burner", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(out.status.is_suspended());
@@ -2256,7 +2281,8 @@ async fn a_resume_across_a_period_boundary_follows_the_stated_rule() {
     let period = this_period(&quota);
 
     let out = rt
-        .run("burner", Tainted::trusted(json!({})))
+        .start("burner", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(out.status.is_suspended());
@@ -2305,7 +2331,8 @@ async fn a_full_period_names_the_runs_that_hold_it() {
     let rt = reserving_plane(&scoped, quota, budget);
 
     let out = rt
-        .run("burner", Tainted::trusted(json!({})))
+        .start("burner", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(
@@ -2369,7 +2396,8 @@ async fn a_reservation_covers_every_step_in_flight() {
         let rt = reserving_plane(&scoped, quota, budget);
         let plan = agentplane::core::PlanIR::fan_out(["burner", "spender", "spends-once"], "work");
         let out = rt
-            .run_plan(plan, Tainted::trusted(json!({})))
+            .start(plan, Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("admitted");
         let holds = QuotaStore::reservations(scoped.as_ref(), 10)
@@ -2431,7 +2459,8 @@ async fn a_no_op_resume_under_a_quota_repeats_no_conclusion() {
         .skill(Declines)
         .build();
     let out = rt
-        .run("declines", Tainted::trusted(json!({})))
+        .start("declines", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     assert!(
@@ -2500,7 +2529,8 @@ async fn a_working_resume_marks_its_pass_before_its_first_record() {
         .skill(SpendThenSleep)
         .build();
     let out = rt
-        .run("spender", Tainted::trusted(json!({})))
+        .start("spender", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(out.status.is_suspended());
@@ -2556,7 +2586,8 @@ async fn a_plane_with_no_ledger_resumes_what_no_pass_billed() {
         .skill(Declines)
         .build();
     let unbilled = wired
-        .run("declines", Tainted::trusted(json!({})))
+        .start("declines", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     let resumed = bare
@@ -2577,7 +2608,8 @@ async fn a_plane_with_no_ledger_resumes_what_no_pass_billed() {
         .skill(Declines)
         .build();
     let billed = billing
-        .run("declines", Tainted::trusted(json!({})))
+        .start("declines", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     let refused = bare
@@ -2618,16 +2650,14 @@ async fn a_halt_naming_a_person_reaches_the_work_delegated_from_them() {
 
     // In flight: suspended before the withdrawal.
     let waiting = rt
-        .run_under(
-            "waits",
-            Tainted::trusted(json!({})),
-            RunTerms::default()
-                .acting_as(delegated())
+        .start("waits", Tainted::trusted(json!({})))
+        .terms(
+            RunTerms::acting_as(delegated())
                 .correlated("claim", &[CorrelationKey::new("claim", "CLM-1")]),
         )
+        .run()
         .await
         .expect("admitted before any withdrawal");
-    let waiting = waiting.outcome().expect("ran to a pause").clone();
     assert!(waiting.status.is_suspended(), "got {:?}", waiting.status);
 
     rt.set_halt(
@@ -2640,11 +2670,9 @@ async fn a_halt_naming_a_person_reaches_the_work_delegated_from_them() {
     .expect("withdraw the person");
 
     match rt
-        .run_under(
-            "work",
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(delegated()),
-        )
+        .start("work", Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(delegated()))
+        .run()
         .await
     {
         Err(RuntimeError::QuotaExceeded(QuotaError::Halted { scope, .. })) => {
@@ -2683,7 +2711,7 @@ async fn a_plane_on_a_full_backend_obeys_halts_without_being_told_to() {
     let rt = Runtime::builder_with(agentplane::runtime::Stores::on(Arc::clone(&store)))
         .skill(Work)
         .build();
-    match rt.run("work", Tainted::trusted(json!({}))).await {
+    match rt.start("work", Tainted::trusted(json!({}))).run().await {
         Err(agentplane::core::RuntimeError::QuotaExceeded(QuotaError::Halted {
             scope, ..
         })) => assert_eq!(scope, HaltScope::Tenant),
@@ -2711,7 +2739,8 @@ async fn a_resume_that_only_concludes_names_the_head_it_sits_on() {
         .tenant(tenant("acme"))
         .skill(Work)
         .build()
-        .run("work", Tainted::trusted(json!({})))
+        .start("work", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     let run = first.run_id;
@@ -2814,7 +2843,8 @@ async fn a_sealed_run_still_holding_a_slot_is_released() {
         .quota(quotas.clone() as Arc<dyn QuotaStore>, quota)
         .skill(Work)
         .build();
-    rt.run("work", Tainted::trusted(json!({})))
+    rt.start("work", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("the injected settlement outage must reach the caller");
     assert_eq!(quotas.running().await.expect("running"), 1);

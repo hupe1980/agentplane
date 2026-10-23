@@ -10,7 +10,7 @@ use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, StepError, T
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::manifest::Manifest;
 use agentplane::model::{ModelCall, ModelId, ModelProvider};
-use agentplane::runtime::{Agent, Mode, RunOutcome, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Agent, Mode, RunOutcome, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use agentplane::testkit::FakeProvider;
 use serde_json::{Value, json};
@@ -120,7 +120,8 @@ impl Plane {
 
     async fn run(&self, manifest: &Manifest, prompt: Value, attempts: usize) -> RunOutcome {
         self.runtime(manifest, prompt, attempts)
-            .run("work.do", Tainted::trusted(json!({})))
+            .start("work.do", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run")
     }
@@ -493,7 +494,8 @@ async fn a_source_escalation_survives_strict_replay_without_the_rule() {
     let provider = FakeProvider::new();
     provider.will_say(AWS_KEY).will_say("relayed");
     let out = relay(&store, &provider, rule)
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     let RunStatus::Failed(reason) = &out.status else {
@@ -533,7 +535,8 @@ async fn a_source_escalation_survives_strict_replay_without_the_rule() {
     let provider = FakeProvider::new();
     provider.will_say(AWS_KEY).will_say("relayed");
     let out = relay(&unruled, &provider, "")
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -555,7 +558,8 @@ async fn a_classification_below_the_declared_level_changes_nothing() {
     let provider = FakeProvider::new();
     provider.will_say(AWS_KEY).will_say("relayed");
     let out = relay(&store, &provider, rule)
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -595,7 +599,8 @@ async fn a_source_refusal_is_recorded_beside_the_output_and_replayed() {
     let provider = FakeProvider::new();
     provider.will_say(AWS_KEY).will_say("relayed");
     let out = relay(&store, &provider, rule)
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     let RunStatus::Failed(reason) = &out.status else {
@@ -640,10 +645,11 @@ async fn an_admission_rule_refuses_hidden_code_points_with_nothing_recorded() {
     );
     let refused = plane
         .runtime(&ruled, json!({}), 1)
-        .run(
+        .start(
             "work.do",
             Tainted::trusted(json!({ "msg": "pay\u{E0041}me" })),
         )
+        .run()
         .await
         .expect_err("refused at admission")
         .to_string();
@@ -664,10 +670,11 @@ async fn an_admission_rule_refuses_hidden_code_points_with_nothing_recorded() {
     plane.provider.will_say("ok");
     let admitted = plane
         .runtime(&ruled, json!({ "q": "hi" }), 1)
-        .run(
+        .start(
             "work.do",
             Tainted::trusted(json!({ "msg": "the salary table" })),
         )
+        .run()
         .await
         .expect("run");
     let label = plane
@@ -732,19 +739,14 @@ async fn a_source_rule_applies_to_an_event_delivered_while_suspended() {
         .correlate(agentplane::core::CorrelationKey::new("document", "D-1"))
     };
     let start = |rt: Arc<Runtime>| async move {
-        rt.run_under(
-            "work.do",
-            Tainted::trusted(json!({})),
-            agentplane::runtime::RunTerms::default().correlated(
+        rt.start("work.do", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated(
                 "matter",
                 &[agentplane::core::CorrelationKey::new("document", "D-1")],
-            ),
-        )
-        .await
-        .expect("admitted")
-        .outcome()
-        .expect("a fresh run")
-        .clone()
+            ))
+            .run()
+            .await
+            .expect("admitted")
     };
     let judged = |store: Arc<RedbStore>, run| async move {
         store
@@ -953,7 +955,8 @@ async fn a_redact_rule_at_a_prebuilt_sink_refuses() {
                 sent: Arc::clone(&sent),
             }))
             .build()
-            .run("work.do", Tainted::trusted(json!({})))
+            .start("work.do", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         assert!(
@@ -1130,7 +1133,8 @@ async fn a_checker_outage_refuses_the_guarded_call() {
                 .build()
         };
         let out = build(Scripted::new(vec![answer]))
-            .run("work.do", Tainted::trusted(json!({})))
+            .start("work.do", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         let records = store.read(out.run_id, 1).await.expect("history");
@@ -1180,10 +1184,11 @@ async fn a_value_above_the_checkers_ceiling_refuses_the_guarded_call() {
             }),
         )
         .build()
-        .run(
+        .start(
             "work.do",
             Tainted::with_label(json!({}), agentplane::core::Label::trusted()),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -1201,7 +1206,8 @@ async fn a_value_above_the_checkers_ceiling_refuses_the_guarded_call() {
             }),
         )
         .build()
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -1235,7 +1241,8 @@ async fn a_check_at_a_source_judges_what_the_call_returned() {
             .build()
     };
     let out = build(Scripted::new(vec![Ok(vec!["S7"])]))
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     let RunStatus::Failed(reason) = &out.status else {
@@ -1264,7 +1271,8 @@ async fn a_sink_classification_raises_the_label_the_gates_judge() {
     let provider = FakeProvider::new();
     provider.will_say("the salary table").will_say("relayed");
     let out = relay(&store, &provider, rule)
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(

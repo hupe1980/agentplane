@@ -277,10 +277,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 1. The live run ─────────────────────────────────────────────────────
     let out = rt
-        .run(
+        .start(
             "support.refund",
             Tainted::trusted(json!({ "customer": "AC-1" })),
         )
+        .run()
         .await?;
     println!("1. planned run  → {:?}", out.status);
     println!("   spend         → {} tokens", out.spend().tokens);
@@ -337,7 +338,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         json!({ "customer": "AC-1" }),
         agentplane::core::Label::untrusted(agentplane::core::SourceId::new("inbox")),
     );
-    let refused = rt.run("support.refund", hostile).await?;
+    let refused = rt.start("support.refund", hostile).run().await?;
     println!("\n4. untrusted input → {:?}", refused.status);
     assert_eq!(
         watched.seen().len(),

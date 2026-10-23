@@ -23,7 +23,7 @@ use agentplane::core::{
     SkillError, StepError, Tainted,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{Admission, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Admission, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -195,27 +195,21 @@ async fn a_redelivery_under_one_key_admits_one_run() {
     let k = dedup_key("urn:test:bus", "EV-1");
 
     let first =
-        f.rt.run_correlated_once(
-            "demo.counts",
-            Tainted::trusted(json!({ "order": "O-1" })),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.counts", Tainted::trusted(json!({ "order": "O-1" })))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .run()
+            .await
+            .unwrap();
     assert!(first.is_fresh(), "the first delivery admits: {first:?}");
 
     let again =
-        f.rt.run_correlated_once(
-            "demo.counts",
-            Tainted::trusted(json!({ "order": "O-1" })),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.counts", Tainted::trusted(json!({ "order": "O-1" })))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .run()
+            .await
+            .unwrap();
 
     assert!(
         matches!(again, Admission::Replayed(_)),
@@ -249,30 +243,24 @@ async fn a_run_waiting_for_a_human_answers_its_own_redelivery() {
     let k = dedup_key("urn:test:bus", "EV-2");
 
     let first =
-        f.rt.run_correlated_once(
-            "demo.waits",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.waits", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .run()
+            .await
+            .unwrap();
     assert!(matches!(
         first,
         Admission::Fresh(ref o) if o.status.is_suspended()
     ));
 
     let again =
-        f.rt.run_correlated_once(
-            "demo.waits",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.waits", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .run()
+            .await
+            .unwrap();
 
     let Admission::Replayed(outcome) = &again else {
         panic!("a suspended run is a resting point and must be replayed: {again:?}");
@@ -311,30 +299,24 @@ async fn a_failed_run_still_holds_its_key() {
     let k = dedup_key("urn:test:bus", "EV-3");
 
     let first =
-        f.rt.run_correlated_once(
-            "demo.fails",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.fails", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .run()
+            .await
+            .unwrap();
     assert!(matches!(
         first,
         Admission::Fresh(ref o) if matches!(o.status, RunStatus::Failed(_))
     ));
 
     let again =
-        f.rt.run_correlated_once(
-            "demo.fails",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.fails", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .run()
+            .await
+            .unwrap();
 
     let Admission::Replayed(outcome) = &again else {
         panic!("a concluded run must be replayed, got {again:?}");
@@ -360,7 +342,9 @@ async fn an_exhausted_run_keeps_its_typed_status_on_redelivery() {
     let key = dedup_key("urn:test:bus", "EV-exhausted");
 
     let first =
-        f.rt.run_once("demo.exhausts", Tainted::trusted(json!({})), &key)
+        f.rt.start("demo.exhausts", Tainted::trusted(json!({})))
+            .once(&key)
+            .run()
             .await
             .unwrap();
     assert!(matches!(
@@ -373,7 +357,9 @@ async fn an_exhausted_run_keeps_its_typed_status_on_redelivery() {
     ));
 
     let again =
-        f.rt.run_once("demo.exhausts", Tainted::trusted(json!({})), &key)
+        f.rt.start("demo.exhausts", Tainted::trusted(json!({})))
+            .once(&key)
+            .run()
             .await
             .unwrap();
     let Admission::Replayed(outcome) = again else {
@@ -401,15 +387,12 @@ async fn distinct_keys_admit_distinct_runs() {
     let mut ids = Vec::new();
     for id in ["EV-a", "EV-b", "EV-c"] {
         let out =
-            f.rt.run_correlated_once(
-                "demo.counts",
-                Tainted::trusted(json!({})),
-                "matter",
-                &[key("D-1")],
-                &dedup_key("urn:test:bus", id),
-            )
-            .await
-            .unwrap();
+            f.rt.start("demo.counts", Tainted::trusted(json!({})))
+                .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+                .once(dedup_key("urn:test:bus", id))
+                .run()
+                .await
+                .unwrap();
         assert!(out.is_fresh(), "{id} was refused as a duplicate");
         ids.push(out.run_id());
     }
@@ -432,15 +415,12 @@ async fn one_id_from_two_emitters_is_two_messages() {
     let f = fixture();
     for source in ["urn:test:bus-a", "urn:test:bus-b"] {
         let out =
-            f.rt.run_correlated_once(
-                "demo.counts",
-                Tainted::trusted(json!({})),
-                "matter",
-                &[key("D-1")],
-                &dedup_key(source, "EV-1"),
-            )
-            .await
-            .unwrap();
+            f.rt.start("demo.counts", Tainted::trusted(json!({})))
+                .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+                .once(dedup_key(source, "EV-1"))
+                .run()
+                .await
+                .unwrap();
         assert!(
             out.is_fresh(),
             "{source}'s message was swallowed as another emitter's retry"
@@ -465,15 +445,12 @@ async fn one_emitter_cannot_spell_anothers_pair() {
         ("urn:test:bus", "x\u{1f}EV-1"),
     ] {
         let out =
-            f.rt.run_correlated_once(
-                "demo.counts",
-                Tainted::trusted(json!({})),
-                "matter",
-                &[key("D-2")],
-                &dedup_key(source, id),
-            )
-            .await
-            .unwrap();
+            f.rt.start("demo.counts", Tainted::trusted(json!({})))
+                .terms(RunTerms::default().correlated("matter", &[key("D-2")]))
+                .once(dedup_key(source, id))
+                .run()
+                .await
+                .unwrap();
         assert!(
             out.is_fresh(),
             "{source:?}/{id:?} was swallowed as another emitter's retry"
@@ -502,13 +479,10 @@ async fn a_denied_admission_leaves_its_key_free() {
     let k = dedup_key("urn:test:bus", "EV-4");
 
     let refused = rt
-        .run_correlated_once(
-            "demo.counts",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
+        .start("demo.counts", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+        .once(&k)
+        .run()
         .await;
     assert!(refused.is_err(), "the policy was set to deny");
     assert_eq!(
@@ -519,13 +493,10 @@ async fn a_denied_admission_leaves_its_key_free() {
 
     gate.deny.store(false, Ordering::SeqCst);
     let out = rt
-        .run_correlated_once(
-            "demo.counts",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
+        .start("demo.counts", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+        .once(&k)
+        .run()
         .await
         .unwrap();
     assert!(
@@ -552,14 +523,11 @@ async fn racing_redeliveries_admit_one_run() {
         let rt = Arc::clone(&f.rt);
         let k = k.clone();
         racers.push(tokio::spawn(async move {
-            rt.run_correlated_once(
-                "demo.counts",
-                Tainted::trusted(json!({})),
-                "matter",
-                &[key("D-1")],
-                &k,
-            )
-            .await
+            rt.start("demo.counts", Tainted::trusted(json!({})))
+                .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+                .once(&k)
+                .run()
+                .await
         }));
     }
 
@@ -606,27 +574,21 @@ async fn spawning_twice_under_one_key_starts_one_run() {
     let k = dedup_key("urn:test:bus", "EV-5");
 
     let first =
-        f.rt.spawn_correlated_once(
-            "demo.counts",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.counts", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .spawn()
+            .await
+            .unwrap();
     assert!(first.fresh);
 
     let again =
-        f.rt.spawn_correlated_once(
-            "demo.counts",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.counts", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .spawn()
+            .await
+            .unwrap();
     assert!(
         !again.fresh,
         "the second spawn reported that it started the work"
@@ -648,11 +610,15 @@ async fn a_plane_without_cases_still_admits_once() {
     let k = dedup_key("urn:test:bus", "EV-6");
 
     let first = rt
-        .run_once("demo.counts", Tainted::trusted(json!({})), &k)
+        .start("demo.counts", Tainted::trusted(json!({})))
+        .once(&k)
+        .run()
         .await
         .unwrap();
     let again = rt
-        .run_once("demo.counts", Tainted::trusted(json!({})), &k)
+        .start("demo.counts", Tainted::trusted(json!({})))
+        .once(&k)
+        .run()
         .await
         .unwrap();
 
@@ -672,15 +638,12 @@ async fn the_key_is_recorded_on_the_run_it_admitted() {
     let k = dedup_key("urn:test:bus", "EV-7");
 
     let out =
-        f.rt.run_correlated_once(
-            "demo.counts",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-            &k,
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.counts", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .once(&k)
+            .run()
+            .await
+            .unwrap();
 
     let records = f.store.read(out.run_id(), 1).await.unwrap();
     let recorded = records
@@ -708,14 +671,11 @@ async fn the_key_is_recorded_on_the_run_it_admitted() {
 async fn an_ordinary_run_claims_no_key() {
     let f = fixture();
     for _ in 0..2 {
-        f.rt.run_correlated(
-            "demo.counts",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-2")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.counts", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-2")]))
+            .run()
+            .await
+            .unwrap();
     }
     assert_eq!(f.runs.load(Ordering::SeqCst), 2);
     assert_eq!(f.store.admitted_as("").await.unwrap(), None);
@@ -918,13 +878,17 @@ async fn a_duplicate_the_read_missed_is_still_answered_with_the_original() {
     let k = dedup_key("urn:test:bus", "EV-blind");
 
     let first = rt
-        .run_once("demo.counts", Tainted::trusted(json!({})), &k)
+        .start("demo.counts", Tainted::trusted(json!({})))
+        .once(&k)
+        .run()
         .await
         .unwrap();
     assert!(first.is_fresh());
 
     let again = rt
-        .run_once("demo.counts", Tainted::trusted(json!({})), &k)
+        .start("demo.counts", Tainted::trusted(json!({})))
+        .once(&k)
+        .run()
         .await
         .unwrap();
 
@@ -957,7 +921,9 @@ async fn an_empty_admission_key_is_refused() {
     let f = fixture();
     for key in ["", "   "] {
         let refused =
-            f.rt.run_once("demo.counts", Tainted::trusted(json!({})), key)
+            f.rt.start("demo.counts", Tainted::trusted(json!({})))
+                .once(key)
+                .run()
                 .await;
         assert!(
             refused.is_err(),
@@ -979,14 +945,18 @@ async fn an_oversized_admission_key_is_refused() {
     let f = fixture();
     let huge = "x".repeat(agentplane::runtime::MAX_ADMISSION_KEY_BYTES + 1);
     assert!(
-        f.rt.run_once("demo.counts", Tainted::trusted(json!({})), &huge)
+        f.rt.start("demo.counts", Tainted::trusted(json!({})))
+            .once(&huge)
+            .run()
             .await
             .is_err()
     );
     // The bound itself is usable: one byte under is an ordinary key.
     let ok = "x".repeat(agentplane::runtime::MAX_ADMISSION_KEY_BYTES);
     assert!(
-        f.rt.run_once("demo.counts", Tainted::trusted(json!({})), &ok)
+        f.rt.start("demo.counts", Tainted::trusted(json!({})))
+            .once(&ok)
+            .run()
             .await
             .is_ok(),
         "the limit refuses a key at the limit, so it is one byte too tight"
@@ -1001,14 +971,11 @@ async fn an_oversized_admission_key_is_refused() {
 async fn reading_a_recorded_outcome_does_not_disturb_the_run() {
     let f = fixture();
     let out =
-        f.rt.run_correlated(
-            "demo.waits",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.waits", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .run()
+            .await
+            .unwrap();
     let before = f.store.head(out.run_id).await.unwrap();
 
     let read =
@@ -1100,11 +1067,9 @@ spec:
         .build();
 
     let refused = rt
-        .run_under(
-            "demo.pinned",
-            Tainted::trusted(json!({})),
-            RunTerms::default().expect_declaration(other),
-        )
+        .start("demo.pinned", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().expect_declaration(other))
+        .run()
         .await;
     match refused {
         Err(RuntimeError::DeclarationPinMismatch {
@@ -1117,11 +1082,9 @@ spec:
     }
 
     let coded = rt
-        .run_under(
-            "demo.counts",
-            Tainted::trusted(json!({})),
-            RunTerms::default().expect_declaration(reviewed),
-        )
+        .start("demo.counts", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().expect_declaration(reviewed))
+        .run()
         .await;
     assert!(
         matches!(
@@ -1136,13 +1099,195 @@ spec:
     );
 
     gate.deny.store(false, Ordering::SeqCst);
-    let admitted = rt
-        .run_under(
-            "demo.pinned",
-            Tainted::trusted(json!({})),
-            RunTerms::default().expect_declaration(reviewed),
-        )
+    rt.start("demo.pinned", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().expect_declaration(reviewed))
+        .run()
         .await
         .expect("the reviewed revision is admitted");
-    assert!(admitted.is_fresh());
+}
+
+// ── Settling a key ──────────────────────────────────────────────────────────
+
+/// Parks its first pass until released, so a test can hold a run in flight
+/// under its lease. Only the first: a replay re-runs the body, and a body that
+/// waited on the test again would never finish.
+#[derive(Debug)]
+struct Held {
+    release: Arc<tokio::sync::Notify>,
+    waited: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Skill for Held {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("held").provides("demo.held")
+    }
+    async fn invoke(
+        &self,
+        _cx: &mut StepCtx<'_>,
+        input: Tainted<Value>,
+    ) -> Result<Outcome, SkillError> {
+        if !self.waited.swap(true, Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        Ok(Outcome::done(input))
+    }
+}
+
+/// **An unused key settles by running**, and the answer carries its value.
+#[tokio::test]
+async fn settling_an_unused_key_runs_it() {
+    let f = fixture();
+    let out =
+        f.rt.start("demo.counts", Tainted::trusted(json!({ "n": 1 })))
+            .once(dedup_key("urn:test:bus", "EV-S1"))
+            .settle()
+            .await
+            .expect("settled");
+    assert_eq!(out.status, RunStatus::Succeeded);
+    assert_eq!(out.output.expect("a value").peek(), &json!({ "n": 1 }));
+}
+
+/// **A rested key settles with the value its run answered**, re-derived by
+/// strict replay — nothing is written, and the answer is not the empty one a
+/// recorded outcome carries.
+#[tokio::test]
+async fn settling_a_rested_key_answers_with_its_value() {
+    let f = fixture();
+    let k = dedup_key("urn:test:bus", "EV-S2");
+    let first =
+        f.rt.start("demo.counts", Tainted::trusted(json!({ "n": 2 })))
+            .once(&k)
+            .run()
+            .await
+            .expect("admitted");
+    assert!(first.is_fresh());
+    let recorded = f.store.read(first.run_id(), 1).await.unwrap().len();
+
+    let again =
+        f.rt.start("demo.counts", Tainted::trusted(json!({ "n": 2 })))
+            .once(&k)
+            .settle()
+            .await
+            .expect("settled");
+    assert_eq!(again.run_id, first.run_id());
+    assert_eq!(
+        again.output.expect("the rested run's value").peek(),
+        &json!({ "n": 2 })
+    );
+    assert_eq!(
+        f.store.read(first.run_id(), 1).await.unwrap().len(),
+        recorded,
+        "settling a rested run wrote to its history"
+    );
+}
+
+/// **A suspended run settles as suspended.** It has rested and has no answer
+/// yet; waiting for it would wait for a person.
+#[tokio::test]
+async fn settling_a_suspended_key_does_not_wait_for_a_person() {
+    let f = fixture();
+    let k = dedup_key("urn:test:bus", "EV-S3");
+    let terms = RunTerms::default().correlated("matter", &[key("D-S3")]);
+    f.rt.start("demo.waits", Tainted::trusted(json!({})))
+        .terms(terms.clone())
+        .once(&k)
+        .run()
+        .await
+        .expect("admitted");
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        f.rt.start("demo.waits", Tainted::trusted(json!({})))
+            .terms(terms)
+            .once(&k)
+            .settle(),
+    )
+    .await
+    .expect("settle waited on a suspension")
+    .expect("settled");
+    assert!(out.status.is_suspended(), "{:?}", out.status);
+}
+
+/// **A run another task is executing is followed, not taken over.** Its lease
+/// is held, so settling waits on the journal until it rests, then answers
+/// with its value.
+#[tokio::test]
+async fn settling_a_live_key_waits_for_its_holder() {
+    let store = Arc::new(RedbStore::open_in_memory().unwrap());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let rt = Runtime::builder(store as Arc<dyn JournalStore>)
+        .skill(Held {
+            release: Arc::clone(&release),
+            waited: std::sync::atomic::AtomicBool::new(false),
+        })
+        .build();
+    let k = dedup_key("urn:test:bus", "EV-S4");
+    let spawned = rt
+        .start("demo.held", Tainted::trusted(json!({ "n": 4 })))
+        .once(&k)
+        .spawn()
+        .await
+        .expect("spawned");
+
+    let waiter = {
+        let rt = Arc::clone(&rt);
+        let k = k.clone();
+        tokio::spawn(async move {
+            rt.start("demo.held", Tainted::trusted(json!({ "n": 4 })))
+                .once(&k)
+                .settle()
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !waiter.is_finished(),
+        "settle answered before the run rested"
+    );
+    release.notify_one();
+
+    let out = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+        .await
+        .expect("settle never woke")
+        .expect("joined")
+        .expect("settled");
+    assert_eq!(out.run_id, spawned.run);
+    assert_eq!(out.output.expect("a value").peek(), &json!({ "n": 4 }));
+}
+
+/// **A run whose holder died settles by resuming**, at every point a crash
+/// could have left it: the same request again is the whole recovery.
+#[cfg(feature = "testkit")]
+#[tokio::test]
+async fn settling_a_crashed_key_resumes_it() {
+    let f = fixture();
+    let k = dedup_key("urn:test:bus", "EV-S5");
+    let recorded =
+        f.rt.start("demo.counts", Tainted::trusted(json!({ "n": 5 })))
+            .once(&k)
+            .run()
+            .await
+            .expect("recorded")
+            .run_id();
+
+    let points = agentplane::testkit::crash_points(&*f.store, recorded)
+        .await
+        .expect("crash points");
+    let last = points.len();
+    for point in points {
+        let rt = Runtime::builder(Arc::clone(&point.store) as Arc<dyn JournalStore>)
+            .skill(Counts(Arc::new(AtomicUsize::new(0))))
+            .build();
+        let settled = rt
+            .start("demo.counts", Tainted::trusted(json!({ "n": 5 })))
+            .once(&k)
+            .settle()
+            .await;
+        agentplane::testkit::assert_resumed_honestly(&point, recorded, &settled).await;
+        if point.appended == last {
+            let out = settled.expect("the last crash point resumes");
+            assert_eq!(out.run_id, recorded);
+            assert_eq!(out.output.expect("a value").peek(), &json!({ "n": 5 }));
+        }
+    }
 }

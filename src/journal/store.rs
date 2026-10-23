@@ -738,12 +738,8 @@ pub trait JournalStore: Send + Sync + Debug {
     /// Hand a lease back, so the next instance need not wait out the TTL.
     ///
     /// The counterpart to [`acquire`](Self::acquire), and the difference between
-    /// a graceful shutdown and a crash. Without it every restart waits for
-    /// expiry, and the temptation is to make the owner string constant so that
-    /// the replacement "renews" instead — which quietly disables fencing,
-    /// because two live instances then read each other's lease as their own.
-    ///
-    /// A release primitive is what lets the owner stay unique per process.
+    /// a graceful shutdown and a crash: without it every handover waits out the
+    /// TTL.
     ///
     /// Takes the caller's `epoch` and releases only if it is the one holding the
     /// lease. A fenced caller must not be able to free the lease of the instance

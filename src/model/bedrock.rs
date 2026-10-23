@@ -10,19 +10,20 @@ use async_trait::async_trait;
 use aws_sdk_bedrockruntime::Client;
 use aws_sdk_bedrockruntime::config::Region;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ConversationRole, DocumentBlock, DocumentFormat, DocumentSource, ImageBlock,
-    ImageFormat, ImageSource, InferenceConfiguration, JsonSchemaDefinition, Message, OutputConfig,
-    OutputFormat, OutputFormatStructure, OutputFormatType, ReasoningContentBlock,
-    ReasoningTextBlock, SpecificToolChoice, StopReason, SystemContentBlock, Tool, ToolChoice,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
-    ToolSpecification, ToolUseBlock,
+    CachePointBlock, CachePointType, CacheTtl as WireCacheTtl, ContentBlock, ConversationRole,
+    DocumentBlock, DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource,
+    InferenceConfiguration, JsonSchemaDefinition, Message, OutputConfig, OutputFormat,
+    OutputFormatStructure, OutputFormatType, ReasoningContentBlock, ReasoningTextBlock,
+    SpecificToolChoice, StopReason, SystemContentBlock, Tool, ToolChoice, ToolConfiguration,
+    ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification,
+    ToolUseBlock,
 };
 use aws_smithy_types::{Blob, Document, Number};
 use serde_json::{Value, json};
 
 use super::{
-    Completion, ModelError, ModelId, ModelProvider, ProviderContinuation, Request, SchemaMode,
-    ToolDeclaration, ToolExchange, Usage,
+    AnthropicBudget, CacheTtl, Completion, ModelError, ModelId, ModelProvider,
+    ProviderContinuation, Request, SchemaMode, ToolDeclaration, ToolExchange, Usage,
 };
 
 const RESPOND_TOOL: &str = "__agentplane_respond";
@@ -507,29 +508,26 @@ impl Bedrock {
         exchanges: &[ToolExchange],
         continuation: Option<&ProviderContinuation>,
     ) -> Result<Vec<Message>, ModelError> {
-        let source = crate::model::prompt_envelope(prompt, "messages")
-            .or_else(|| crate::model::prompt_envelope(prompt, "input"))
-            .unwrap_or(prompt);
-        let mut messages = match source {
-            Value::Array(items) => items
+        let mut messages = match crate::model::prompt::turns(prompt, &["messages", "input"]) {
+            crate::model::prompt::Turns::Native(items) => items
                 .iter()
                 .map(|item| Self::message_from_value(model, item))
                 .collect::<Result<Vec<_>, _>>()?,
-            Value::String(text) => vec![Self::text_message(ConversationRole::User, text, model)?],
-            other => {
-                // `system` is an instruction about the content, not content —
-                // it rides in Converse's own system block, and leaving it in
-                // the stringified object would show the instruction to the
-                // model twice, once as text it may quote back.
-                let mut rest = other.clone();
-                if let Some(map) = rest.as_object_mut() {
-                    map.remove("system");
+            crate::model::prompt::Turns::Parts(parts) => {
+                let mut content = Vec::with_capacity(parts.len());
+                for part in &parts {
+                    content.push(ContentBlock::Text(part.text.clone().into_owned()));
+                    if let Some(ttl) = part.cache {
+                        content.push(ContentBlock::CachePoint(cache_point(ttl, model)?));
+                    }
                 }
-                vec![Self::text_message(
-                    ConversationRole::User,
-                    &rest.to_string(),
-                    model,
-                )?]
+                vec![
+                    Message::builder()
+                        .role(ConversationRole::User)
+                        .set_content(Some(content))
+                        .build()
+                        .map_err(|error| Self::refused(model, error.to_string()))?,
+                ]
             }
         };
 
@@ -646,12 +644,17 @@ impl Bedrock {
             ));
         }
         let mut builder = ToolConfiguration::builder();
+        // Converse holds a strict tool to the same subset and per-request
+        // ceilings Anthropic does; a schema outside them is sent non-strict
+        // rather than turning the request into a 400.
+        let mut budget = AnthropicBudget::default();
         if let Some(schema) = schema.filter(|_| mode == SchemaMode::ForcedTool) {
             builder = builder
                 .tools(tool(
                     RESPOND_TOOL,
                     "Return the answer in the required shape.",
                     schema,
+                    budget.tool(schema),
                     model,
                 )?)
                 .tool_choice(ToolChoice::Tool(
@@ -666,8 +669,12 @@ impl Bedrock {
                     &declaration.name,
                     &declaration.description,
                     &declaration.parameters,
+                    budget.tool(&declaration.parameters),
                     model,
                 )?);
+                if let Some(ttl) = declaration.cache {
+                    builder = builder.tools(Tool::CachePoint(cache_point(ttl, model)?));
+                }
             }
         }
         if (schema.is_none() || mode == SchemaMode::Native) && tools.is_empty() {
@@ -732,11 +739,9 @@ impl Bedrock {
             // only the half nobody exercises is wrong.
             .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::stream_config))
             .set_additional_model_request_fields(reasoning_config);
-        if let Some(system) = prompt.get("system") {
-            let text = system.as_str().ok_or_else(|| {
-                Self::refused(model, "Bedrock's system instruction must be a string")
-            })?;
-            operation = operation.system(SystemContentBlock::Text(text.to_owned()));
+        let system = system_blocks(prompt, model)?;
+        if !system.is_empty() {
+            operation = operation.set_system(Some(system));
         }
         let output = tokio::time::timeout_at(deadline, operation.send())
             .await
@@ -878,16 +883,7 @@ impl Bedrock {
         // Anthropic convention — so the shared fold is what makes
         // `Usage::input_tokens` mean everything the provider processed here
         // as on every other driver.
-        let usage = output.usage().map_or_else(Usage::default, |usage| {
-            Usage::with_cache_beside_input(
-                u64::try_from(usage.input_tokens()).unwrap_or_default(),
-                u64::try_from(usage.output_tokens()).unwrap_or_default(),
-                u64::try_from(usage.cache_write_input_tokens().unwrap_or_default())
-                    .unwrap_or_default(),
-                u64::try_from(usage.cache_read_input_tokens().unwrap_or_default())
-                    .unwrap_or_default(),
-            )
-        });
+        let usage = output.usage().map_or_else(Usage::default, usage_from);
         // An allowlist. `end_turn`, `tool_use` and `stop_sequence` are an
         // answer; `max_tokens` and a full context window are a typed
         // truncation; everything else ended without one. A guardrail
@@ -1103,11 +1099,9 @@ impl ModelProvider for Bedrock {
             // only the half nobody exercises is wrong.
             .set_guardrail_config(self.guardrail.as_ref().map(Guardrail::config))
             .set_additional_model_request_fields(reasoning_config);
-        if let Some(system) = prompt.get("system") {
-            let text = system.as_str().ok_or_else(|| {
-                Self::refused(model, "Bedrock's system instruction must be a string")
-            })?;
-            operation = operation.system(SystemContentBlock::Text(text.to_owned()));
+        let system = system_blocks(prompt, model)?;
+        if !system.is_empty() {
+            operation = operation.set_system(Some(system));
         }
 
         let result = tokio::time::timeout(self.timeout, operation.send())
@@ -1188,17 +1182,72 @@ fn accumulate_continuation(
     current.state = Value::Array(transcript);
 }
 
+/// A breakpoint, as Converse spells one: a block of its own after what it
+/// closes.
+fn cache_point(ttl: CacheTtl, model: &ModelId) -> Result<CachePointBlock, ModelError> {
+    CachePointBlock::builder()
+        .r#type(CachePointType::Default)
+        .ttl(match ttl {
+            CacheTtl::FiveMinutes => WireCacheTtl::FiveMinutes,
+            CacheTtl::OneHour => WireCacheTtl::OneHour,
+        })
+        .build()
+        .map_err(|error| Bedrock::refused(model, error.to_string()))
+}
+
+/// The instruction as Converse system blocks, each breakpoint a block of its
+/// own after the part it closes.
+fn system_blocks(prompt: &Value, model: &ModelId) -> Result<Vec<SystemContentBlock>, ModelError> {
+    let Some(system) = crate::model::prompt::system(prompt) else {
+        return Ok(Vec::new());
+    };
+    let crate::model::prompt::System::Parts(parts) = system else {
+        return Err(Bedrock::refused(
+            model,
+            "Bedrock's system instruction must be a string or a list of text parts",
+        ));
+    };
+    let mut blocks = Vec::with_capacity(parts.len());
+    for part in parts {
+        blocks.push(SystemContentBlock::Text(part.text.into_owned()));
+        if let Some(ttl) = part.cache {
+            blocks.push(SystemContentBlock::CachePoint(cache_point(ttl, model)?));
+        }
+    }
+    Ok(blocks)
+}
+
+/// Converse's usage, folded as every driver folds it, with the one-hour share
+/// of the cache writes read from its per-tier detail.
+pub(crate) fn usage_from(usage: &aws_sdk_bedrockruntime::types::TokenUsage) -> Usage {
+    let count = |n: i32| u64::try_from(n).unwrap_or_default();
+    let one_hour = usage
+        .cache_details()
+        .iter()
+        .filter(|detail| *detail.ttl() == WireCacheTtl::OneHour)
+        .map(|detail| count(detail.input_tokens()))
+        .sum::<u64>();
+    Usage::with_cache_beside_input(
+        count(usage.input_tokens()),
+        count(usage.output_tokens()),
+        count(usage.cache_write_input_tokens().unwrap_or_default()),
+        count(usage.cache_read_input_tokens().unwrap_or_default()),
+    )
+    .with_cache_write_1h(one_hour)
+}
+
 fn tool(
     name: &str,
     description: &str,
     schema: &Value,
+    strict: bool,
     model: &ModelId,
 ) -> Result<Tool, ModelError> {
     let specification = ToolSpecification::builder()
         .name(name)
         .description(description)
         .input_schema(ToolInputSchema::Json(document_from_json(schema)))
-        .strict(true)
+        .strict(strict)
         .build()
         .map_err(|error| Bedrock::refused(model, error.to_string()))?;
     Ok(Tool::ToolSpec(specification))
@@ -2232,5 +2281,103 @@ mod tests {
         assert!(messages[1].content()[0].is_reasoning_content());
         assert!(messages[2].content()[0].is_tool_result());
         assert!(messages[3].content()[0].is_tool_result());
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use aws_sdk_bedrockruntime::types::{
+        CacheDetail, CacheTtl as WireCacheTtl, ContentBlock, SystemContentBlock, TokenUsage, Tool,
+    };
+    use serde_json::json;
+
+    use super::{Bedrock, ModelId, SchemaMode, ToolDeclaration};
+    use crate::core::Tainted;
+    use crate::model::{CacheTtl, Prompt};
+
+    fn model() -> ModelId {
+        ModelId::new("bedrock", "anthropic.claude-x")
+    }
+
+    /// **A breakpoint is a `cachePoint` after the block it closes**, in the
+    /// instruction and in the question — Converse caches nothing unasked.
+    #[test]
+    fn a_prompt_part_carries_its_breakpoint() {
+        let prompt = Prompt::new()
+            .system_cached(Tainted::trusted("policy".to_owned()), CacheTtl::OneHour)
+            .input_cached(
+                Tainted::trusted("context".to_owned()),
+                CacheTtl::FiveMinutes,
+            )
+            .input(Tainted::trusted("task".to_owned()))
+            .build();
+        let system = super::system_blocks(prompt.peek(), &model()).expect("system");
+        assert!(matches!(&system[0], SystemContentBlock::Text(t) if t == "policy"));
+        assert!(
+            matches!(&system[1], SystemContentBlock::CachePoint(p) if p.ttl() == Some(&WireCacheTtl::OneHour)),
+            "{system:?}"
+        );
+        let messages = Bedrock::messages(&model(), prompt.peek(), &[], None).expect("messages");
+        let content = messages[0].content();
+        assert!(matches!(&content[0], ContentBlock::Text(t) if t == "context"));
+        assert!(
+            matches!(&content[1], ContentBlock::CachePoint(p) if p.ttl() == Some(&WireCacheTtl::FiveMinutes)),
+            "{content:?}"
+        );
+        assert!(matches!(&content[2], ContentBlock::Text(t) if t == "task"));
+    }
+
+    /// **A tool breakpoint is honoured, and a tool outside the strict subset
+    /// is sent non-strict** rather than turning the request into a 400.
+    #[test]
+    fn a_tool_is_strict_only_where_the_subset_holds_it() {
+        let tools = [
+            ToolDeclaration::new(
+                "closed",
+                "d",
+                json!({ "type": "object", "properties": {}, "required": [], "additionalProperties": false }),
+            )
+            .cache_breakpoint(CacheTtl::OneHour),
+            ToolDeclaration::new("open", "d", json!({ "type": "object" })),
+        ];
+        let config = Bedrock::tool_config(&model(), None, &tools, SchemaMode::Native)
+            .expect("tool config")
+            .expect("tools were declared");
+        let strict: Vec<Option<bool>> = config
+            .tools()
+            .iter()
+            .filter_map(|tool| match tool {
+                Tool::ToolSpec(spec) => Some(spec.strict()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(strict, [Some(true), Some(false)]);
+        assert!(
+            matches!(&config.tools()[1], Tool::CachePoint(p) if p.ttl() == Some(&WireCacheTtl::OneHour)),
+            "{config:?}"
+        );
+    }
+
+    /// **The one-hour share of the cache writes is read from the per-tier
+    /// detail**, so a priced run bills it at its own rate.
+    #[test]
+    fn the_one_hour_writes_are_counted() {
+        let usage = TokenUsage::builder()
+            .input_tokens(10)
+            .output_tokens(5)
+            .total_tokens(15)
+            .cache_write_input_tokens(300)
+            .cache_details(
+                CacheDetail::builder()
+                    .ttl(WireCacheTtl::OneHour)
+                    .input_tokens(200)
+                    .build()
+                    .expect("detail"),
+            )
+            .build()
+            .expect("usage");
+        let usage = super::usage_from(&usage);
+        assert_eq!(usage.cache_write_tokens, 300);
+        assert_eq!(usage.cache_write_1h_tokens, 200);
     }
 }

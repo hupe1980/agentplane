@@ -57,14 +57,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let out = rt
-        .run_correlated(
+        .start(
             "claim.intake",
             Tainted::trusted(
                 json!({ "claimant": "Ada Lovelace", "iban": "GB29 NWBK 6016 1331 9268 19" }),
             ),
-            "claim",
-            &[CorrelationKey::new("claim", "CLM-42")],
         )
+        .terms(
+            agentplane::runtime::RunTerms::default()
+                .correlated("claim", &[CorrelationKey::new("claim", "CLM-42")]),
+        )
+        .run()
         .await?;
     println!("1. run            → {:?}", out.status);
 

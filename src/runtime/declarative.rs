@@ -1964,8 +1964,8 @@ fn resolve_subject(
         MemorySubject::Case => cx.case_id().map(|id| id.to_string()).ok_or_else(|| {
             refuse(format!(
                 "`{field}.subject: $case` needs the run to belong to a case, and \
-                 this run has none. Admit it with `run_correlated(..)` or `run_in_case(..)` \
-                 — filing the memory under a constant instead would pool every matter's \
+                 this run has none. Start it with `RunTerms::correlated(..)` or \
+                 `RunTerms::in_case(..)` — filing the memory under a constant instead would pool every matter's \
                  facts under one key"
             ))
         }),

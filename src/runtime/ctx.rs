@@ -187,11 +187,25 @@ enum Replayed<T> {
     Live,
 }
 
-/// How a step is being executed.
+/// How [`Runtime::replay`](crate::runtime::Runtime::replay) reads a run's
+/// history.
+///
+/// Two ways, and no third: a run is started live with
+/// [`Runtime::start`](crate::runtime::Runtime::start), never by replaying it.
+///
+/// ```compile_fail
+/// # async fn f(rt: std::sync::Arc<agentplane::runtime::Runtime>, run: agentplane::core::RunId) {
+/// rt.replay(run, agentplane::runtime::Mode::Live).await;
+/// # }
+/// ```
+///
+/// ```no_run
+/// # async fn f(rt: std::sync::Arc<agentplane::runtime::Runtime>, run: agentplane::core::RunId) {
+/// rt.replay(run, agentplane::runtime::Mode::Resume).await;
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Normal execution: effects are performed and journaled.
-    Live,
     /// Re-execution from history. Effects are read back, never performed.
     ///
     /// When the cursor runs out, execution continues live — which is exactly
@@ -212,9 +226,28 @@ pub enum Mode {
     Strict,
 }
 
-impl Mode {
-    #[must_use]
-    pub fn is_replaying(self) -> bool {
+/// How a step is being executed: a [`Mode`] of replay, or live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pass {
+    /// Normal execution: effects are performed and journaled.
+    Live,
+    /// See [`Mode::Resume`].
+    Resume,
+    /// See [`Mode::Strict`].
+    Strict,
+}
+
+impl From<Mode> for Pass {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Resume => Self::Resume,
+            Mode::Strict => Self::Strict,
+        }
+    }
+}
+
+impl Pass {
+    pub(crate) const fn is_replaying(self) -> bool {
         matches!(self, Self::Resume | Self::Strict)
     }
 }
@@ -231,7 +264,7 @@ pub(crate) struct Frame {
     pub step: StepId,
     /// Whether this frame is doing the work or undoing it.
     pub phase: Phase,
-    pub mode: Mode,
+    pub mode: Pass,
     pub case: Option<CaseContext>,
     /// Durable wake-ups. Deliberately *not* inside `CaseContext`: a timer has
     /// nothing to correlate and no business horizon to bound it, so requiring a
@@ -366,7 +399,7 @@ pub struct StepCtx<'a> {
     step: StepId,
     phase: Phase,
     ordinal: u32,
-    mode: Mode,
+    mode: Pass,
     cursor: StepCursor,
     rng: ChaCha8Rng,
     case: Option<CaseContext>,
@@ -650,7 +683,7 @@ impl<'a> StepCtx<'a> {
     }
 
     pub(crate) const fn is_strict(&self) -> bool {
-        matches!(self.mode, Mode::Strict)
+        matches!(self.mode, Pass::Strict)
     }
 
     pub(crate) fn cursor_next(
@@ -1888,7 +1921,7 @@ impl<'a> StepCtx<'a> {
         // both write to the journal being verified. Falling through to the
         // `Retry` arm would make verifying a crashed run re-perform its
         // interrupted effect for real and append to the history under check.
-        if self.mode == Mode::Strict {
+        if self.mode == Pass::Strict {
             return Err(StepError::Undecidable {
                 key,
                 recovery: recovery.clone(),
@@ -2166,13 +2199,13 @@ impl<'a> StepCtx<'a> {
                 // registration below with the announcement skipped and would
                 // otherwise be the one pass that waits for free.
                 self.bill_replayed(crate::core::Spend::default(), 0);
-                if self.mode == Mode::Resume {
+                if self.mode == Pass::Resume {
                     Ok(Some(ReplayedWait::Repair))
                 } else {
                     Err(StepError::Suspended(self.suspend_reason(spec, cx).await?))
                 }
             }
-            None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun {
+            None if self.mode == Pass::Strict => Err(StepError::ReplayOverrun {
                 actual: key,
                 kind: descriptor.kind.clone(),
             }),
@@ -3347,7 +3380,7 @@ impl<'a> StepCtx<'a> {
             }
             // History exhausted: this attempt runs live, unless a strict pass
             // is verifying — where reaching the end is itself the finding.
-            None if self.mode == Mode::Strict => Err(StepError::ReplayOverrun {
+            None if self.mode == Pass::Strict => Err(StepError::ReplayOverrun {
                 actual: key,
                 kind: descriptor.kind.clone(),
             }),
@@ -3413,7 +3446,7 @@ impl<'a> StepCtx<'a> {
         // It would have retried, so it died between recording this failure and
         // starting the next attempt. A strict pass reports that rather than
         // performing anything; a resume carries on live.
-        if self.mode == Mode::Strict {
+        if self.mode == Pass::Strict {
             return Err(StepError::ReplayOverrun {
                 actual: next,
                 kind: descriptor.kind.clone(),
@@ -3626,7 +3659,7 @@ impl<'a> StepCtx<'a> {
                     // Announced on the record, so this pass bills the wait —
                     // the re-arm below writes no second announcement.
                     self.bill_replayed(crate::core::Spend::default(), 0);
-                    if self.mode == Mode::Resume {
+                    if self.mode == Pass::Resume {
                         timers
                             .arm(&crate::core::Timer {
                                 run: self.run,
@@ -3642,7 +3675,7 @@ impl<'a> StepCtx<'a> {
                         crate::core::SuspendReason::AwaitingTime { until },
                     ));
                 }
-                None if self.mode == Mode::Strict => {
+                None if self.mode == Pass::Strict => {
                     return Err(StepError::ReplayOverrun {
                         actual: key,
                         kind: descriptor.kind.clone(),
@@ -4366,7 +4399,7 @@ impl<'a> StepCtx<'a> {
                         kind: descriptor.kind.clone(),
                     });
                 }
-                None if self.mode == Mode::Strict => {
+                None if self.mode == Pass::Strict => {
                     return Err(StepError::ReplayOverrun {
                         actual: key,
                         kind: descriptor.kind.clone(),
@@ -4485,9 +4518,9 @@ impl<'a> StepCtx<'a> {
     ///   regression test.
     fn writes_enabled(&self) -> bool {
         match self.mode {
-            Mode::Live => true,
-            Mode::Resume => self.cursor.exhausted(),
-            Mode::Strict => false,
+            Pass::Live => true,
+            Pass::Resume => self.cursor.exhausted(),
+            Pass::Strict => false,
         }
     }
 
@@ -6153,7 +6186,7 @@ impl StepCtx<'_> {
         let digest = crate::core::Digest::of(bytes);
         // Through `blobs()`, so a sealed deployment seals these too rather than
         // having one write path that encrypts and another that does not.
-        let blobs = if self.mode == Mode::Strict {
+        let blobs = if self.mode == Pass::Strict {
             None
         } else {
             Some(self.blobs_scoped(None)?)
@@ -6222,7 +6255,7 @@ impl StepCtx<'_> {
         let arguments = Tainted::object([("url".to_owned(), url.map(Value::String))]);
         let case_link = if let Some(cx) = self.case.clone() {
             let at = self.now().await?;
-            (self.mode != Mode::Strict).then_some(crate::media::MediaCaseLink {
+            (self.mode != Pass::Strict).then_some(crate::media::MediaCaseLink {
                 cases: cx.cases,
                 case: cx.case_id,
                 at,
@@ -6348,7 +6381,7 @@ impl StepCtx<'_> {
         // obligations would mutate the case layer every time someone ran a
         // regression check — including re-arming a deadline an operator had
         // since cancelled.
-        if self.mode != Mode::Strict {
+        if self.mode != Pass::Strict {
             match cx.cases.register_deadline(&deadline).await {
                 Ok(()) => {}
                 // Another run on this matter registered the name first. The
@@ -7356,8 +7389,8 @@ impl Effect for Commission {
             (Some(chain), _) if self.plane_chain => {
                 super::RunTerms::default().acting_as_plane(chain.clone())
             }
-            (Some(chain), _) => super::RunTerms::default().acting_as(chain.clone()),
-            (None, true) => super::RunTerms::default().served(None),
+            (Some(chain), _) => super::RunTerms::acting_as(chain.clone()),
+            (None, true) => super::RunTerms::served(None),
             (None, false) => super::RunTerms::default(),
         };
         if let Some(initiator) = self.initiator.as_deref() {

@@ -11,7 +11,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::media::{GovernedMedia, MediaPolicy};
-use agentplane::runtime::{RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -75,7 +75,8 @@ async fn an_untrusted_url_cannot_select_even_a_read_only_media_destination() {
         ),
         true,
     )
-    .run("fetches-media", Tainted::trusted(json!({})))
+    .start("fetches-media", Tainted::trusted(json!({})))
+    .run()
     .await
     .unwrap();
 
@@ -91,7 +92,8 @@ async fn an_untrusted_url_cannot_select_even_a_read_only_media_destination() {
 #[tokio::test]
 async fn case_linked_media_is_refused_when_there_is_no_case_to_link() {
     let out = runtime(GovernedMedia::new(policy()), false)
-        .run("fetches-media", Tainted::trusted(json!({})))
+        .start("fetches-media", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -145,12 +147,12 @@ async fn externally_retained_media_has_its_own_handle() {
         )))
         .build();
     let out = rt
-        .run_correlated(
-            "external-handle",
-            Tainted::trusted(json!({})),
+        .start("external-handle", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated(
             "matter",
             &[agentplane::core::CorrelationKey::new("doc", "D-1")],
-        )
+        ))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);

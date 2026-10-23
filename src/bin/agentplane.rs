@@ -7316,16 +7316,12 @@ fn execute(manifests: &[Manifest], opts: &RunArgs) -> Result<ExitCode, Fault> {
         if let Some(digest) = pinned {
             terms = terms.expect_declaration(digest);
         }
-        // No admission key, so the admission is always fresh.
-        let agentplane::runtime::Admission::Fresh(outcome) = agent
-            .run_under(&capability, Tainted::trusted(input), terms)
+        let outcome = agent
+            .start(&capability, Tainted::trusted(input))
+            .terms(terms)
+            .run()
             .await
-            .map_err(runtime_fault)?
-        else {
-            return Err("an unkeyed run was answered as a keyed one"
-                .to_owned()
-                .into());
-        };
+            .map_err(runtime_fault)?;
 
         Ok(conclude(
             &outcome,
@@ -8325,10 +8321,11 @@ spec:
                 .provider("acme", agentplane::model::fake::FakeProvider::new())
                 .agent(agentplane::runtime::Agent::new(&manifests[0]))
                 .build()
-                .run(
+                .start(
                     "support.summarise",
                     agentplane::core::Tainted::trusted(serde_json::json!({ "t": 1 })),
                 )
+                .run()
                 .await
                 .expect("recorded");
 
@@ -8439,10 +8436,11 @@ spec:
                 .provider("acme", agentplane::model::fake::FakeProvider::new())
                 .agent(agentplane::runtime::Agent::new(&manifest))
                 .build()
-                .run(
+                .start(
                     "support.summarise",
                     agentplane::core::Tainted::trusted(serde_json::json!({ "t": 1 })),
                 )
+                .run()
                 .await
                 .expect("a sealed run");
 

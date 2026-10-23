@@ -170,7 +170,8 @@ async fn deliver(destination: Destination, seen: &Arc<Mutex<Vec<Received>>>) -> 
         .outbox(Arc::clone(&outbox))
         .try_build()
         .expect("a coherent plane");
-    rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+    rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -396,7 +397,8 @@ async fn a_failed_runs_event_carries_the_reason_the_seal_records() {
         .outbox(Arc::clone(&outbox))
         .try_build()
         .expect("a coherent plane");
-    rt.run("answer", Tainted::trusted(json!({})))
+    rt.start("answer", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("a failed run still concludes");
 

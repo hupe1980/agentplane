@@ -189,7 +189,8 @@ async fn a_clean_refusal_is_retried_and_can_succeed() {
     let f = fixture(e, calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -207,7 +208,8 @@ async fn a_mutating_effect_is_retried_when_the_call_provably_did_not_land() {
     let f = fixture(e.mutating(), calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -225,7 +227,8 @@ async fn a_timeout_on_a_mutating_effect_is_never_retried() {
     let f = fixture(e.mutating(), calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(
@@ -258,7 +261,8 @@ async fn a_refusal_that_is_an_answer_is_not_retried() {
     let f = fixture(e, calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(
@@ -297,7 +301,8 @@ async fn a_timeout_is_retried_when_recovery_declares_it_safe() {
     let f = fixture(e.recovery(Recovery::Retry), calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -317,7 +322,8 @@ async fn an_idempotency_key_makes_a_mutating_timeout_retryable() {
     );
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -339,7 +345,8 @@ async fn an_effect_that_landed_is_never_repeated() {
     );
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -355,7 +362,8 @@ async fn attempts_are_exhausted_and_the_error_says_so() {
     let f = fixture(e.policy(RetryPolicy::attempts(3)), calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 3, "exactly the limit");
@@ -375,7 +383,8 @@ async fn a_never_policy_performs_exactly_one_attempt() {
     let f = fixture(e.policy(RetryPolicy::never()), calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -393,7 +402,8 @@ async fn raising_max_attempts_does_not_make_an_in_doubt_call_retryable() {
     let f = fixture(e.mutating().policy(RetryPolicy::attempts(10)), calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(f.calls.load(Ordering::SeqCst), 1);
@@ -412,7 +422,8 @@ async fn every_attempt_is_journaled_with_its_number_and_disposition() {
     let f = fixture(e, calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -480,7 +491,8 @@ async fn a_named_retry_window_is_waited_rather_than_a_computed_one() {
     );
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -519,7 +531,8 @@ async fn a_window_longer_than_the_policy_allows_is_clamped_not_obeyed() {
     );
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -547,7 +560,8 @@ async fn a_window_applies_to_the_next_attempt_only() {
     );
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -576,7 +590,8 @@ async fn a_throttle_without_a_window_falls_back_to_the_schedule() {
     let f = fixture(e.mutating().recovery(Recovery::RequiresOperator), calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(
@@ -602,7 +617,8 @@ async fn attempts_do_not_share_an_effect_key() {
     let f = fixture(e, calls);
 
     let out =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let records = f.store.read(out.run_id, 1).await.unwrap();
@@ -627,7 +643,8 @@ async fn replay_reproduces_a_retry_sequence_without_repeating_it() {
     let f = fixture(e, calls);
 
     let first =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -655,7 +672,8 @@ async fn replay_follows_history_even_when_the_policy_has_since_shrunk() {
     let f = fixture(e, Arc::clone(&calls));
 
     let first =
-        f.rt.run("demo.once", Tainted::trusted(json!({})))
+        f.rt.start("demo.once", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -707,7 +725,8 @@ async fn every_attempt_is_admitted_against_the_budget() {
         .build();
 
     let out = rt
-        .run("demo.once", Tainted::trusted(json!({})))
+        .start("demo.once", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(
@@ -900,7 +919,8 @@ async fn an_interrupted_connection_is_in_doubt_not_retried() {
         .build();
 
     let out = rt
-        .run("demo.cut", Tainted::trusted(json!({})))
+        .start("demo.cut", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(
@@ -943,7 +963,8 @@ async fn a_skill_can_reject_its_input() {
         .build();
 
     let out = rt
-        .run("demo.picky", Tainted::trusted(json!(42)))
+        .start("demo.picky", Tainted::trusted(json!(42)))
+        .run()
         .await
         .unwrap();
     match &out.status {
@@ -1018,7 +1039,8 @@ async fn exhausting_the_attempts_keeps_the_driver_s_verdict() {
         .build();
 
     let out = rt
-        .run("demo.reports", Tainted::trusted(json!({})))
+        .start("demo.reports", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(
@@ -1053,7 +1075,8 @@ async fn the_window_a_peer_named_is_on_the_record() {
         let (e, calls) = scripted(script);
         let f = fixture(e, calls);
         let out =
-            f.rt.run("demo.once", Tainted::trusted(json!({})))
+            f.rt.start("demo.once", Tainted::trusted(json!({})))
+                .run()
                 .await
                 .unwrap();
         assert!(
@@ -1147,10 +1170,11 @@ async fn a_failed_commission_is_not_commissioned_again() {
         .skill(Flaky(std::sync::Arc::clone(&calls)))
         .build();
     let out = rt
-        .run(
+        .start(
             "demo.orders",
             agentplane::core::Tainted::trusted(serde_json::json!({})),
         )
+        .run()
         .await
         .unwrap();
     assert!(

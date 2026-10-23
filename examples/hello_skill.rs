@@ -51,7 +51,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::builder(Arc::clone(&store)).skill(Greet).build();
 
     let outcome = runtime
-        .run("greet", Tainted::trusted(json!({ "name": "world" })))
+        .start("greet", Tainted::trusted(json!({ "name": "world" })))
+        .run()
         .await?;
 
     // Re-executes the logic and reads every effect back from the journal.

@@ -169,12 +169,15 @@ async fn stop_one_run() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let run = rt
-        .run_correlated(
+        .start(
             "dispute.hold",
             Tainted::trusted(json!({ "dispute": "D-311" })),
+        )
+        .terms(agentplane::runtime::RunTerms::default().correlated(
             "dispute",
             &[agentplane::core::CorrelationKey::new("dispute", "D-311")],
-        )
+        ))
+        .run()
         .await?;
     println!("1. a run places a hold, then waits for a person");
     println!("   run       → {}", run.status.as_str());
@@ -287,7 +290,11 @@ async fn halt_the_front_door() -> Result<(), Box<dyn std::error::Error>> {
     // Both instances refuse new work at admission — the flag is in the store,
     // and the refusal is its own error, not a ceiling inviting a retry.
     for (name, rt) in [("one", &one), ("two", &two)] {
-        match rt.run("desk.ack", Tainted::trusted(json!({}))).await {
+        match rt
+            .start("desk.ack", Tainted::trusted(json!({})))
+            .run()
+            .await
+        {
             Err(refusal) => println!("   instance {name} → refused: {refusal}"),
             Ok(out) => panic!("a halted tenant admitted a run: {:?}", out.status),
         }
@@ -296,7 +303,10 @@ async fn halt_the_front_door() -> Result<(), Box<dyn std::error::Error>> {
     // Lifting is recorded too: the journal names who let the work start again.
     one.lift_halt(&HaltScope::Tenant, &operator("ops-dave"), test_instant())
         .await?;
-    let lifted = two.run("desk.ack", Tainted::trusted(json!({}))).await?;
+    let lifted = two
+        .start("desk.ack", Tainted::trusted(json!({})))
+        .run()
+        .await?;
     println!(
         "   lifted     → instance two admits again ({})",
         lifted.status.as_str()

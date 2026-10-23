@@ -70,7 +70,10 @@ async fn the_agent_answers_and_replays_without_asking_again() {
         .toolbox(ToolBox::new().with::<ReadBalance>())
         .build();
 
-    let out = rt.run("ledger.ask", Tainted::trusted(json!({ "question": "what is in AC-1?" }))).await?;
+    let out = rt
+        .start("ledger.ask", Tainted::trusted(json!({ "question": "what is in AC-1?" })))
+        .run()
+        .await?;
     assert_eq!(out.status, RunStatus::Succeeded);
 
     // The claim worth testing, and the one most runtimes cannot make.

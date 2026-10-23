@@ -203,10 +203,11 @@ async fn a_planned_agent_routes_data_by_reference_not_through_a_model() {
     let rt = wired(&manifest, &provider, read_only_catalog(), &client);
 
     let out = rt
-        .run(
+        .start(
             "pay.invoice",
             Tainted::trusted(json!({ "customer": "AC-1" })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -265,7 +266,7 @@ async fn a_planned_agent_refuses_untrusted_input() {
         json!({ "customer": "AC-1" }),
         agentplane::core::Label::untrusted(agentplane::core::SourceId::new("inbox")),
     );
-    let out = rt.run("pay.invoice", input).await.expect("run");
+    let out = rt.start("pay.invoice", input).run().await.expect("run");
     match out.status {
         RunStatus::Failed(reason) => assert!(
             reason.contains("refuses untrusted input"),
@@ -291,10 +292,11 @@ async fn a_plan_naming_an_ungranted_tool_fails_before_any_dispatch() {
     let rt = wired(&manifest, &provider, read_only_catalog(), &client);
 
     let out = rt
-        .run(
+        .start(
             "pay.invoice",
             Tainted::trusted(json!({ "customer": "AC-1" })),
         )
+        .run()
         .await
         .expect("run");
     match out.status {
@@ -355,10 +357,11 @@ async fn a_plan_naming_the_dotted_spelling_is_told_the_wire_name() {
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run(
+        .start(
             "pay.invoice",
             Tainted::trusted(json!({ "customer": "AC-1" })),
         )
+        .run()
         .await
         .expect("run");
     match out.status {
@@ -392,10 +395,11 @@ async fn a_plan_naming_nothing_at_all_gets_no_spelling_hint() {
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run(
+        .start(
             "pay.invoice",
             Tainted::trusted(json!({ "customer": "AC-1" })),
         )
+        .run()
         .await
         .expect("run");
     match out.status {
@@ -463,10 +467,11 @@ async fn a_reference_keeps_provenance_a_literal_does_not() {
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, Arc::clone(&catalog), &client);
     let out = rt
-        .run(
+        .start(
             "pay.invoice",
             Tainted::trusted(json!({ "payee": "treasury@example.com" })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -489,10 +494,11 @@ async fn a_reference_keeps_provenance_a_literal_does_not() {
     let client = Arc::new(Recorder::default());
     let rt = wired(&manifest, &provider, catalog, &client);
     let out = rt
-        .run(
+        .start(
             "pay.invoice",
             Tainted::trusted(json!({ "payee": "treasury@example.com" })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -567,10 +573,11 @@ async fn a_parse_runs_on_the_quarantined_model() {
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run(
+        .start(
             "read.contact",
             Tainted::trusted(json!({ "url": "https://example.com" })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -648,10 +655,11 @@ spec:
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run(
+        .start(
             "read.contact",
             Tainted::trusted(json!({ "url": "https://example.com" })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -722,10 +730,11 @@ spec:
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run(
+        .start(
             "read.contact",
             Tainted::trusted(json!({ "url": "https://example.com" })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -762,10 +771,11 @@ async fn a_parse_shortfall_fails_the_run_rather_than_guessing() {
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run(
+        .start(
             "read.contact",
             Tainted::trusted(json!({ "url": "https://example.com" })),
         )
+        .run()
         .await
         .expect("run");
     match out.status {
@@ -814,10 +824,11 @@ async fn a_parse_step_carrying_args_is_refused() {
     let rt = wired(&manifest, &provider, catalog, &client);
 
     let out = rt
-        .run(
+        .start(
             "read.contact",
             Tainted::trusted(json!({ "url": "https://example.com" })),
         )
+        .run()
         .await
         .expect("run");
     match out.status {
@@ -1078,7 +1089,7 @@ async fn data_above_the_journal_ceiling_is_refused_before_it_is_recorded() {
         agentplane::core::Label::trusted()
             .with_sensitivity(agentplane::core::Sensitivity::Confidential),
     );
-    let out = rt.run("intake.record", input).await.expect("run");
+    let out = rt.start("intake.record", input).run().await.expect("run");
 
     match out.status {
         RunStatus::Failed(reason) => {
@@ -1187,7 +1198,8 @@ async fn a_plane_without_a_manifest_can_bound_what_it_writes_down() {
     assert!(
         matches!(
             plane(None)
-                .run("intake.record", confidential(json!({ "iban": "GB-4471" })))
+                .start("intake.record", confidential(json!({ "iban": "GB-4471" })))
+                .run()
                 .await
                 .expect("run")
                 .status,
@@ -1199,7 +1211,8 @@ async fn a_plane_without_a_manifest_can_bound_what_it_writes_down() {
     // With one, the same value is refused before it reaches the chain.
     let refusing = plane(Some(Sensitivity::Internal));
     let out = refusing
-        .run("intake.record", confidential(json!({ "iban": "GB-4471" })))
+        .start("intake.record", confidential(json!({ "iban": "GB-4471" })))
+        .run()
         .await
         .expect("run");
     // And a strict replay reads that refusal back rather than judging it again:
@@ -1247,13 +1260,14 @@ async fn a_plane_without_a_manifest_can_bound_what_it_writes_down() {
     assert!(
         matches!(
             plane(Some(Sensitivity::Internal))
-                .run(
+                .start(
                     "intake.record",
                     Tainted::with_label(
                         json!({ "ticket": "T-1" }),
                         Label::trusted().with_sensitivity(Sensitivity::Internal)
                     )
                 )
+                .run()
                 .await
                 .expect("run")
                 .status,
@@ -1292,7 +1306,8 @@ async fn the_plane_and_the_manifest_journal_ceilings_take_the_stricter() {
         Some(Sensitivity::Secret),
     );
     match rt
-        .run("intake.record", confidential.clone())
+        .start("intake.record", confidential.clone())
+        .run()
         .await
         .expect("run")
         .status
@@ -1321,7 +1336,13 @@ async fn the_plane_and_the_manifest_journal_ceilings_take_the_stricter() {
         json!({ "customer": "AC-1" }),
         Label::trusted().with_sensitivity(Sensitivity::Internal),
     );
-    match rt.run("intake.record", internal).await.expect("run").status {
+    match rt
+        .start("intake.record", internal)
+        .run()
+        .await
+        .expect("run")
+        .status
+    {
         RunStatus::Failed(reason) => assert!(
             reason.contains("journal ceiling"),
             "a stricter plane ceiling must bind: {reason}"
@@ -1350,7 +1371,7 @@ async fn data_within_the_journal_ceiling_still_runs() {
         agentplane::core::Label::trusted()
             .with_sensitivity(agentplane::core::Sensitivity::Internal),
     );
-    let out = rt.run("intake.record", input).await.expect("run");
+    let out = rt.start("intake.record", input).run().await.expect("run");
     assert!(
         matches!(out.status, RunStatus::Succeeded),
         "internal data was refused by a ceiling set at internal: {:?}",

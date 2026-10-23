@@ -573,10 +573,11 @@ async fn a_run_this_surface_did_not_admit_is_no_task_of_its_own() {
     let client = connect(server).await;
 
     let embedded = plane
-        .spawn(
+        .start(
             "audit.anomaly-detection",
             Tainted::trusted(json!({ "ledger": "internal" })),
         )
+        .spawn()
         .await
         .expect("an in-process run");
     let task_id = embedded.to_string();

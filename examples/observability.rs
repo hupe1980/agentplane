@@ -311,7 +311,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── A live run: one effect that reached the world ───────────────────────
     let out = plane
-        .run("ledger.post", Tainted::trusted(json!({})))
+        .start("ledger.post", Tainted::trusted(json!({})))
+        .run()
         .await?;
     assert_eq!(out.status, RunStatus::Succeeded);
 

@@ -17,7 +17,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
-use agentplane::runtime::{Agent, RunStatus, Runtime, RuntimeBuilder, StepCtx};
+use agentplane::runtime::{Agent, RunStatus, RunTerms, Runtime, RuntimeBuilder, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -182,12 +182,12 @@ async fn proposed_by(
     let provider = agentplane::testkit::FakeProvider::new();
     provider.will_call_tool("call_1", tool, json!({ "invoice": "INV-7" }));
     let rt = plane(store, &provider, desk, payer, add);
-    rt.run_correlated(
+    rt.start(
         "desk.settle",
         Tainted::trusted(json!({ "q": "settle INV-7" })),
-        "settlement",
-        &[key("INV-7")],
     )
+    .terms(RunTerms::default().correlated("settlement", &[key("INV-7")]))
+    .run()
     .await
     .expect("the run suspends on the approval");
     let task = store.queue(&[], 10).await.unwrap().pop().expect("a task");
@@ -386,7 +386,8 @@ async fn a_changed_callee_is_refused_after_approval() {
         b.skill(PinnedConsultation(approved))
     });
     let out = rt
-        .run("desk.pinned", Tainted::trusted(json!({})))
+        .start("desk.pinned", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     let reason = match &out.status {
@@ -429,7 +430,8 @@ async fn a_changed_callee_is_refused_after_approval() {
         b.skill(PinnedConsultation(auditor))
     });
     let out = rt
-        .run("desk.pinned", Tainted::trusted(json!({})))
+        .start("desk.pinned", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
@@ -501,12 +503,12 @@ async fn a_finished_consultation_replays_after_its_callee_is_redeployed() {
         json!({ "invoice": "INV-7" }),
     );
     let rt = plane(&store, &provider, DESK, &payer, |b| b);
-    rt.run_correlated(
+    rt.start(
         "desk.settle",
         Tainted::trusted(json!({ "q": "settle INV-7" })),
-        "settlement",
-        &[key("INV-7")],
     )
+    .terms(RunTerms::default().correlated("settlement", &[key("INV-7")]))
+    .run()
     .await
     .expect("the run suspends on the approval");
     let task = store.queue(&[], 10).await.unwrap().pop().expect("a task");

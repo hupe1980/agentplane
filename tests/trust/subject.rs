@@ -639,15 +639,11 @@ mod intake {
         target: &str,
         subject: Option<&str>,
     ) -> agentplane::runtime::RunOutcome {
-        let admission = rt
-            .run_under(
-                target,
-                Tainted::trusted(json!({ "customer": "x" })),
-                terms(subject),
-            )
+        rt.start(target, Tainted::trusted(json!({ "customer": "x" })))
+            .terms(terms(subject))
+            .run()
             .await
-            .expect("admitted");
-        admission.outcome().expect("a fresh run").clone()
+            .expect("admitted")
     }
 
     fn reply(id: &str) -> InboundEvent {

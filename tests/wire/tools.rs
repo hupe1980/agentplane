@@ -487,7 +487,8 @@ async fn a_tool_call_is_performed_once_and_replayed_from_the_journal() {
     };
 
     let out = build()
-        .run("call", Tainted::trusted(json!({})))
+        .start("call", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Succeeded));
@@ -534,7 +535,8 @@ async fn a_tool_that_ran_and_failed_is_retried_only_when_declared() {
             })
             .build();
         let out = rt
-            .run("call", Tainted::trusted(json!({})))
+            .start("call", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         let calls = client.calls.lock().unwrap().len();
@@ -609,7 +611,8 @@ async fn tool_output_cannot_steer_a_mutating_call() {
             client: Arc::clone(&client),
         })
         .build()
-        .run("naive", Tainted::trusted(json!({})))
+        .start("naive", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -676,7 +679,8 @@ async fn a_sink_cannot_check_one_argument_value_and_send_another() {
         .build();
 
     let out = runtime
-        .run("substitutes", Tainted::trusted(json!({})))
+        .start("substitutes", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -736,7 +740,8 @@ async fn a_tool_call_cannot_bypass_sink_gates_through_effect() {
             client: Arc::clone(&client),
         })
         .build()
-        .run("bypass-sink", Tainted::trusted(json!({})))
+        .start("bypass-sink", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -812,7 +817,8 @@ async fn untrusted_content_may_accompany_a_trusted_protected_tool_argument() {
             recipient_label: Label::trusted(),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -837,7 +843,8 @@ async fn untrusted_data_cannot_select_a_protected_tool_argument() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -927,7 +934,8 @@ async fn a_protected_path_that_matches_no_field_refuses_the_call() {
             client: Arc::clone(&client),
         })
         .build()
-        .run("trusted-structured", Tainted::trusted(json!({})))
+        .start("trusted-structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -965,7 +973,8 @@ async fn untrusted_data_cannot_select_a_protected_read_only_argument() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -997,7 +1006,8 @@ async fn a_protected_tool_argument_must_derive_only_from_allowed_sources() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1044,7 +1054,8 @@ async fn untrusted_data_from_an_allowed_source_may_select_a_protected_argument()
             recipient_label: Label::untrusted(SourceId::new("run.input")),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1109,7 +1120,8 @@ async fn send_whole(rule: ProtectedField, value: Tainted<Value>) -> (RunStatus, 
             value,
         })
         .build()
-        .run("sends-value", Tainted::trusted(json!({})))
+        .start("sends-value", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let calls = client.calls.lock().unwrap().clone();
@@ -1178,7 +1190,8 @@ async fn a_value_outside_the_declared_set_is_refused_before_the_tool() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1220,7 +1233,8 @@ async fn an_untrusted_choice_among_declared_values_may_select_a_protected_argume
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1259,7 +1273,8 @@ async fn a_declared_value_from_a_disallowed_source_is_still_refused() {
             recipient_label: Label::untrusted(SourceId::new("model.complete")),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1354,7 +1369,8 @@ async fn pay_via(lookup: ToolId, rule: ProtectedField) -> (RunStatus, Vec<String
             lookup,
         })
         .build()
-        .run("pays", Tainted::trusted(json!({})))
+        .start("pays", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let calls = client.calls.lock().unwrap().clone();
@@ -1430,7 +1446,8 @@ async fn a_protected_tool_argument_honours_its_own_sensitivity_ceiling() {
             recipient_label: Label::trusted().with_sensitivity(Sensitivity::Confidential),
         })
         .build()
-        .run("structured", Tainted::trusted(json!({})))
+        .start("structured", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -2187,7 +2204,8 @@ spec:
             client: Arc::clone(&client),
         }))
         .build()
-        .run("ledger.ask", Tainted::trusted(json!({})))
+        .start("ledger.ask", Tainted::trusted(json!({})))
+        .run()
         .await;
 
     assert!(
@@ -2412,7 +2430,8 @@ async fn run_tool_calling_in<T: agentplane::tools::Tool>(
         .build();
 
     let out = rt
-        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .run()
         .await
         .expect("the run completes");
     (out, provider)
@@ -2458,7 +2477,8 @@ async fn a_truncated_turn_asking_for_tools_never_runs_them() {
         .build();
 
     let out = rt
-        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -2506,7 +2526,8 @@ async fn a_truncated_answer_is_not_settled_as_the_runs_output() {
         .build();
 
     let out = rt
-        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -2704,7 +2725,8 @@ async fn an_in_doubt_tool_call_does_not_become_a_chat_message() {
         .tools(Arc::new(catalog), Arc::new(Times) as Arc<dyn ToolClient>)
         .agent(Agent::new(&manifest))
         .build()
-        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -2775,7 +2797,8 @@ async fn run_shaped_teller(
         .agent(Agent::new(&manifest))
         .toolbox(ToolBox::new().with::<ReadBalance>())
         .build()
-        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .run()
         .await
         .expect("the run completes")
 }
@@ -3014,7 +3037,8 @@ async fn a_builder_that_refuses_stops_the_step_and_calls_nothing() {
             tool: transfer(),
         })
         .build()
-        .run("sends-via", Tainted::trusted(json!({})))
+        .start("sends-via", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -3036,7 +3060,8 @@ async fn a_builder_that_refuses_stops_the_step_and_calls_nothing() {
             tool: transfer(),
         })
         .build()
-        .run("sends-via", Tainted::trusted(json!({})))
+        .start("sends-via", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     match out.status {

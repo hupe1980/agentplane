@@ -182,13 +182,12 @@ impl Workbench for Bench {
         let capability = super::entry_capability(&manifests, request.capability.as_deref())?;
         let keys = super::correlation(&request.correlate)?;
         let terms = agentplane::runtime::RunTerms::default().correlated(&capability, &keys);
-        let agentplane::runtime::Admission::Fresh(outcome) = plane
-            .run_under(&capability, Tainted::trusted(request.input), terms)
+        let outcome = plane
+            .start(&capability, Tainted::trusted(request.input))
+            .terms(terms)
+            .run()
             .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Err("an unkeyed run was answered as a keyed one".to_owned());
-        };
+            .map_err(|e| e.to_string())?;
         Ok(Started {
             run: outcome.run_id.to_string(),
             status: outcome.status.as_str().to_owned(),

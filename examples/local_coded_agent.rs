@@ -29,11 +29,11 @@ use agentplane::core::{
     CorrelationKey, DeadlineSpec, Decision, Justification, Operator, ProtectedField, SourceId,
     TaskSpec,
 };
-use agentplane::manifest::{Budgets, Manifest, ModelRef, Models, ToolGrant};
+use agentplane::manifest::{Budgets, Manifest, ModelRef, ToolGrant};
 use agentplane::model::ModelProvider;
 use agentplane::model::fake::FakeProvider;
 use agentplane::prelude::*;
-use agentplane::runtime::Agent;
+use agentplane::runtime::{Agent, RunTerms};
 use agentplane::tools::{Tool, ToolFailure};
 use serde_json::{Value, json};
 
@@ -106,28 +106,23 @@ impl Skill for Patch {
 fn declaration() -> Result<Manifest, agentplane::manifest::ManifestError> {
     let model = SourceId::new("model:fake/coder-1");
     Manifest::builder("patcher", "1.0.0")
-        .configure(|spec| {
-            spec.capabilities.provides.push("code.patch".to_owned());
-            spec.models = Some(Models {
-                privileged: Some(ModelRef::new("fake", "coder-1")),
-                ..Models::default()
-            });
-            // A model's answer is labelled `internal`, and the default egress
-            // ceiling is `public`: what may leave is declared, never assumed.
-            spec.security.max_sensitivity_egress = Some(Sensitivity::Internal);
-            spec.tools.push(ToolGrant {
-                description: Some("Write a file in the working tree.".to_owned()),
-                max_sensitivity: Some(Sensitivity::Internal),
-                protected_fields: vec![
-                    ProtectedField::from_sources("/path", [model.clone()]),
-                    ProtectedField::from_sources("/contents", [model]),
-                ],
-                ..ToolGrant::new("tool://fs/write")
-            });
-            spec.budgets = Some(Budgets {
-                max_tokens: Some(100_000),
-                ..Budgets::default()
-            });
+        .provides("code.patch")
+        .privileged_model(ModelRef::new("fake", "coder-1"))
+        // A model's answer is labelled `internal`, and the default egress
+        // ceiling is `public`: what may leave is declared, never assumed.
+        .egress_ceiling(Sensitivity::Internal)
+        .tool(ToolGrant {
+            description: Some("Write a file in the working tree.".to_owned()),
+            max_sensitivity: Some(Sensitivity::Internal),
+            protected_fields: vec![
+                ProtectedField::from_sources("/path", [model.clone()]),
+                ProtectedField::from_sources("/contents", [model]),
+            ],
+            ..ToolGrant::new("tool://fs/write")
+        })
+        .budgets(Budgets {
+            max_tokens: Some(100_000),
+            ..Budgets::default()
         })
         .build()
 }
@@ -157,12 +152,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 3. A person sees the exact call ───────────────────────────────────
     let run = rt
-        .run_correlated(
+        .start(
             "code.patch",
             Tainted::trusted(json!("make `answer` return 42")),
-            "feature",
-            &[CorrelationKey::new("feature", "F-1")],
         )
+        .terms(RunTerms::default().correlated("feature", &[CorrelationKey::new("feature", "F-1")]))
+        .run()
         .await?;
     println!("1. the model proposes a write, and the run waits");
     println!("   run      → {}", run.status.as_str());

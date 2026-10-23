@@ -26,7 +26,7 @@ use agentplane::core::{
     Justification, Outcome, Recovery, RunId, Skill, SkillDescriptor, SkillError, Tainted, TaskSpec,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -155,14 +155,11 @@ fn key(v: &str) -> CorrelationKey {
 
 async fn suspended_run(f: &Fixture, target: &str) -> RunId {
     let out =
-        f.rt.run_correlated(
-            target,
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[key("INV-1")],
-        )
-        .await
-        .unwrap();
+        f.rt.start(target, Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("dispute", &[key("INV-1")]))
+            .run()
+            .await
+            .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
     out.run_id
 }
@@ -385,12 +382,9 @@ async fn a_stop_will_not_unwind_around_an_unknown_outcome() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "demo.post",
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[key("INV-2")],
-        )
+        .start("demo.post", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("dispute", &[key("INV-2")]))
+        .run()
         .await;
     assert!(
         !faulty.injected().is_empty(),
@@ -475,10 +469,11 @@ async fn stopping_a_finished_run_does_not_reopen_it() {
         .skill(Quick)
         .build();
     let out = rt
-        .run_plan(
+        .start(
             agentplane::core::PlanIR::single("demo.quick"),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Succeeded));
@@ -552,7 +547,11 @@ async fn cancelling_a_running_run_acknowledges_and_lands_at_the_boundary() {
 
     let running = {
         let rt = Arc::clone(&rt);
-        tokio::spawn(async move { rt.run("demo.slow", Tainted::trusted(json!({}))).await })
+        tokio::spawn(async move {
+            rt.start("demo.slow", Tainted::trusted(json!({})))
+                .run()
+                .await
+        })
     };
     // Wait until the step is genuinely in flight.
     let run = loop {
@@ -710,12 +709,9 @@ async fn a_stopped_resume_unwinds_with_the_recorded_outputs_in_reverse_completio
             .terminal(),
     ]);
     let out = rt
-        .run_plan_correlated(
-            plan,
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[key("INV-2")],
-        )
+        .start(plan, Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("dispute", &[key("INV-2")]))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -768,12 +764,9 @@ async fn a_stop_on_a_mixed_ready_set_unwinds_with_the_recorded_outputs() {
             .terminal(),
     ]);
     let out = rt
-        .run_plan_correlated(
-            plan,
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[key("INV-3")],
-        )
+        .start(plan, Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("dispute", &[key("INV-3")]))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);

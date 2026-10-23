@@ -470,27 +470,26 @@ impl ApiResponse {
 
 /// The prompt shapes this driver accepts.
 ///
-/// A bare string, the API's own `input` array, or an envelope carrying one —
-/// `prompt_envelope` decides when an object counts as the second rather than
-/// as content. Whatever the shape, it is part
-/// of the effect key, so a changed prompt is a changed effect and shows up on
+/// The API's own `input` list, alone or beside a `system` instruction, or the
+/// shared prompt every driver reads (see [`Prompt`](super::Prompt)): a lone
+/// part is sent as the plain string the API also takes, several as one user
+/// message of `input_text` parts. A breakpoint is dropped — this provider
+/// caches every prefix without being asked. Whatever the shape, it is part of
+/// the effect key, so a changed prompt is a changed effect and shows up on
 /// replay as divergence rather than as a run that quietly did something else.
 fn input(prompt: &Value) -> Value {
-    match prompt {
-        Value::String(s) => json!(s),
-        Value::Array(_) => prompt.clone(),
-        other => crate::model::prompt_envelope(other, "input")
-            .cloned()
-            .unwrap_or_else(|| {
-                // `system` is an instruction about the content, not content; leaving
-                // it in would show the caller's instruction to the model as part of
-                // the question it is answering.
-                let mut rest = other.clone();
-                if let Some(map) = rest.as_object_mut() {
-                    map.remove("system");
-                }
-                json!(rest.to_string())
-            }),
+    match super::prompt::turns(prompt, &["input"]) {
+        super::prompt::Turns::Native(items) => Value::Array(items.to_vec()),
+        super::prompt::Turns::Parts(parts) => match parts.as_slice() {
+            [only] => json!(only.text),
+            parts => json!([{
+                "role": "user",
+                "content": parts
+                    .iter()
+                    .map(|part| json!({ "type": "input_text", "text": part.text }))
+                    .collect::<Vec<_>>(),
+            }]),
+        },
     }
 }
 
@@ -583,7 +582,7 @@ fn accumulate_continuation(
 /// point of the seam: a prompt written once should not have to know which
 /// driver is linked.
 fn instructions(prompt: &Value) -> Option<Value> {
-    prompt.get("system").cloned().filter(|s| !s.is_null())
+    super::prompt::system_text(prompt).map(Value::String)
 }
 
 impl OpenAi {
@@ -1679,5 +1678,51 @@ mod continuation_tests {
         assert_eq!(state[0]["encrypted_content"], "first");
         assert_eq!(state[1]["type"], "function_call_output");
         assert_eq!(state[2]["call_id"], "call_2");
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use serde_json::json;
+
+    use super::{ModelId, OpenAi};
+    use crate::core::Tainted;
+    use crate::model::{CacheTtl, Prompt};
+
+    fn body(prompt: &serde_json::Value) -> serde_json::Value {
+        OpenAi::new("test-key")
+            .expect("build the driver")
+            .body(&ModelId::new("openai", "gpt-x"), prompt, None, &[], &[])
+            .expect("body")
+    }
+
+    /// **The shared prompt's parts reach Responses as `input_text` parts**,
+    /// and its instruction as the one string `instructions` takes. A
+    /// breakpoint is dropped: this provider caches every prefix unasked.
+    #[test]
+    fn prompt_parts_become_input_text() {
+        let prompt = Prompt::new()
+            .system_cached(Tainted::trusted("policy".to_owned()), CacheTtl::OneHour)
+            .system(Tainted::trusted("plan".to_owned()))
+            .input(Tainted::trusted("context".to_owned()))
+            .input(Tainted::trusted("task".to_owned()))
+            .build();
+        let body = body(prompt.peek());
+        assert_eq!(body["instructions"], "policy\n\nplan");
+        assert_eq!(
+            body["input"],
+            json!([{ "role": "user", "content": [
+                { "type": "input_text", "text": "context" },
+                { "type": "input_text", "text": "task" },
+            ] }])
+        );
+    }
+
+    /// **An object question is sent as its JSON text**, never as the
+    /// `input` field itself, which takes only a string or a list.
+    #[test]
+    fn an_object_input_is_sent_as_text() {
+        let body = body(&json!({ "system": "s", "input": { "order": 7 } }));
+        assert_eq!(body["input"], r#"{"order":7}"#);
     }
 }

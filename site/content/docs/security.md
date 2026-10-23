@@ -595,7 +595,7 @@ them, and a peer whose credential permits less acting with more.
 For `agentplane serve`, a token-file entry with `scope` (and optionally
 `not_after`) is that caller's chain: rooted at the actor, bound to the entry's
 tenant as its audience. An embedder with its own front door does the same
-through `Runtime::run_under` / `spawn_under` with `RunTerms::acting_as`.
+through `Runtime::start` with `RunTerms::acting_as`.
 
 The chain the run was admitted under is the one every step acts under: it is
 what `effect:perform` and `release` requests carry as `owner`/`subject`, and a

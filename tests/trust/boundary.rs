@@ -37,7 +37,7 @@ use agentplane::core::{
     Tainted, Trust,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -283,7 +283,7 @@ async fn an_effect_output_is_untrusted_by_default() {
         })
         .build();
 
-    rt.run_plan(
+    rt.start(
         PlanIR::new(vec![
             PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
             PlanNode::new(1, "b")
@@ -292,6 +292,7 @@ async fn an_effect_output_is_untrusted_by_default() {
         ]),
         Tainted::trusted(json!({})),
     )
+    .run()
     .await
     .unwrap();
 
@@ -367,7 +368,7 @@ async fn plan_argument_assembly_preserves_field_level_provenance() {
         .skill(ChecksFields)
         .build();
     let out = runtime
-        .run_plan(
+        .start(
             PlanIR::new(vec![
                 PlanNode::new(0, "produces-fields").arg("input", ArgSource::run_input()),
                 PlanNode::new(1, "checks-fields")
@@ -377,6 +378,7 @@ async fn plan_argument_assembly_preserves_field_level_provenance() {
             ]),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
 
@@ -401,7 +403,7 @@ async fn a_trusted_effect_does_not_taint_the_run() {
         })
         .build();
 
-    rt.run_plan(
+    rt.start(
         PlanIR::new(vec![
             PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
             PlanNode::new(1, "b")
@@ -410,6 +412,7 @@ async fn a_trusted_effect_does_not_taint_the_run() {
         ]),
         Tainted::trusted(json!({})),
     )
+    .run()
     .await
     .unwrap();
 
@@ -436,7 +439,7 @@ async fn declared_sensitivity_raises_but_cannot_lower() {
         })
         .build();
 
-    rt.run_plan(
+    rt.start(
         PlanIR::new(vec![
             PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
             PlanNode::new(1, "b")
@@ -445,6 +448,7 @@ async fn declared_sensitivity_raises_but_cannot_lower() {
         ]),
         Tainted::trusted(json!({})),
     )
+    .run()
     .await
     .unwrap();
 
@@ -481,7 +485,7 @@ async fn an_undeclared_effect_keeps_the_sensitivity_its_provenance_implies() {
         })
         .build();
 
-    rt.run_plan(
+    rt.start(
         PlanIR::new(vec![
             PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
             PlanNode::new(1, "b")
@@ -490,6 +494,7 @@ async fn an_undeclared_effect_keeps_the_sensitivity_its_provenance_implies() {
         ]),
         Tainted::trusted(json!({})),
     )
+    .run()
     .await
     .unwrap();
 
@@ -557,7 +562,8 @@ async fn a_sink_binding_mismatch_says_where_the_two_values_differ() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("mismatched", Tainted::trusted(json!({})))
+        .start("mismatched", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -622,7 +628,8 @@ async fn a_default_payload_beside_a_labeled_object_reports_the_root() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("unset", Tainted::trusted(json!({})))
+        .start("unset", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -676,7 +683,8 @@ async fn tool_output_cannot_reach_a_mutating_sink() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("naive", Tainted::trusted(json!({})))
+        .start("naive", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -744,7 +752,8 @@ async fn releasing_is_the_only_label_improvement_and_it_is_journaled() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("reviewed", Tainted::trusted(json!({})))
+        .start("reviewed", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -819,7 +828,7 @@ async fn a_run_holding_tool_output_may_not_replan() {
         .skill(Fetches)
         .skill(Reroutes)
         .build()
-        .run_plan(
+        .start(
             PlanIR::new(vec![
                 PlanNode::new(0, "fetches").arg("input", ArgSource::run_input()),
                 PlanNode::new(1, "reroutes")
@@ -828,6 +837,7 @@ async fn a_run_holding_tool_output_may_not_replan() {
             ]),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
 
@@ -877,7 +887,8 @@ async fn a_replayed_effect_carries_the_same_label() {
     ]);
 
     let out = build(&seen)
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let live = seen.lock().unwrap().clone();
@@ -969,7 +980,8 @@ async fn lowering_a_declared_sensitivity_does_not_declassify_history() {
     };
 
     let live = build(Sensitivity::Secret)
-        .run("reads", Tainted::trusted(json!({})))
+        .start("reads", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(
@@ -1072,7 +1084,8 @@ async fn a_release_for_one_destination_is_refused_at_another_sink() {
         .build();
 
     let refused = rt
-        .run("routed", Tainted::trusted(json!({ "to": "mail" })))
+        .start("routed", Tainted::trusted(json!({ "to": "mail" })))
+        .run()
         .await
         .unwrap();
     let RunStatus::Failed(why) = &refused.status else {
@@ -1098,7 +1111,8 @@ async fn a_release_for_one_destination_is_refused_at_another_sink() {
     // The positive half: the exact destination the release named accepts the
     // same value. Without this, a refuse-everything change reads as enforcement.
     let allowed = rt
-        .run("routed", Tainted::trusted(json!({ "to": "ledger" })))
+        .start("routed", Tainted::trusted(json!({ "to": "ledger" })))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1127,12 +1141,14 @@ async fn a_destination_scoped_release_replays_to_the_same_verdicts() {
     };
 
     let allowed = build()
-        .run("routed", Tainted::trusted(json!({ "to": "ledger" })))
+        .start("routed", Tainted::trusted(json!({ "to": "ledger" })))
+        .run()
         .await
         .unwrap();
     assert!(matches!(allowed.status, RunStatus::Succeeded));
     let refused = build()
-        .run("routed", Tainted::trusted(json!({ "to": "mail" })))
+        .start("routed", Tainted::trusted(json!({ "to": "mail" })))
+        .run()
         .await
         .unwrap();
     assert!(matches!(refused.status, RunStatus::Failed(_)));
@@ -1195,7 +1211,8 @@ async fn a_released_value_written_to_memory_keeps_its_base_trust() {
         .memory(Arc::clone(&store) as Arc<dyn MemoryStore>)
         .skill(Remembers)
         .build()
-        .run("remembers", Tainted::trusted(json!({})))
+        .start("remembers", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1265,7 +1282,11 @@ async fn taint_survives_a_handoff_between_agents() {
         .build();
 
     // The hand-off carries the label.
-    let out = rt.run("demo.report", from_specialist).await.expect("run");
+    let out = rt
+        .start("demo.report", from_specialist)
+        .run()
+        .await
+        .expect("run");
 
     let seen = out.output.as_ref().unwrap().peek()["trust"]
         .as_str()
@@ -1323,7 +1344,8 @@ async fn a_refused_sink_strict_replays_to_the_same_refusal() {
             .build()
     };
     let out = build()
-        .run("naive2", Tainted::trusted(json!({})))
+        .start("naive2", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -1392,7 +1414,8 @@ async fn a_sink_records_how_many_bytes_crossed_it() {
             arguments: payload.clone(),
         })
         .build()
-        .run("sink", Tainted::trusted(json!({})))
+        .start("sink", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
@@ -1477,7 +1500,8 @@ async fn a_release_naming_a_field_the_value_lacks_is_refused() {
             .policy(std::sync::Arc::new(PermitsReleases))
             .skill(ReleasesField(path))
             .build()
-            .run("releases-field", Tainted::trusted(json!({})))
+            .start("releases-field", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap()
             .status
@@ -1560,14 +1584,13 @@ async fn an_allowed_sources_field_answers_the_same_for_a_subject_bound_value() {
             json!({ "recipient": "acct-9" }),
             SourceId::new("sender:acme"),
         );
-        let terms = subject.map_or_else(agentplane::runtime::RunTerms::default, |s| {
-            agentplane::runtime::RunTerms::default().subject(s)
-        });
-        let admission = runtime
-            .run_under("forward", input, terms)
+        let terms = subject.map_or_else(RunTerms::default, |s| RunTerms::default().subject(s));
+        let out = runtime
+            .start("forward", input)
+            .terms(terms)
+            .run()
             .await
             .expect("admitted");
-        let out = admission.outcome().expect("a fresh run");
         assert_eq!(
             out.status,
             RunStatus::Succeeded,
@@ -1622,7 +1645,7 @@ async fn an_admitted_input_keeps_its_field_labels() {
             ),
         ),
     ]);
-    let out = build(&seen).run("fields", input).await.unwrap();
+    let out = build(&seen).start("fields", input).run().await.unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
     build(&seen).replay(out.run_id, Mode::Strict).await.unwrap();
 

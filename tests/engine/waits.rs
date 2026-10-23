@@ -34,7 +34,7 @@ use agentplane::core::{
     Seq, Skill, SkillDescriptor, SkillError, StoreError, Tainted, Timestamp,
 };
 use agentplane::journal::{Append, Head, JournalStore, Lease, Record, RecordKind};
-use agentplane::runtime::{Mode, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -122,7 +122,8 @@ async fn an_orphaned_sleep_is_rearmed_on_resume_and_then_fires() {
         .build();
 
     let out = rt
-        .run("demo.nap", Tainted::trusted(json!({})))
+        .start("demo.nap", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -243,12 +244,9 @@ async fn an_orphaned_event_wait_is_resubscribed_on_resume() {
         .build();
 
     let out = rt
-        .run_plan_correlated(
-            await_plan(),
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-1")],
-        )
+        .start(await_plan(), Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[CorrelationKey::new("matter", "M-1")]))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -372,12 +370,9 @@ async fn a_run_awaiting_a_message() -> (RunId, Vec<u8>) {
         .build();
 
     let out = rt
-        .run_plan_correlated(
-            await_plan(),
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-2")],
-        )
+        .start(await_plan(), Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[CorrelationKey::new("matter", "M-2")]))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -702,7 +697,8 @@ async fn a_timer_wake_resumes_under_its_own_lease_and_releases_it_after() {
         .build();
 
     let out = rt
-        .run("demo.nap", Tainted::trusted(json!({})))
+        .start("demo.nap", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended());
@@ -776,12 +772,9 @@ async fn a_wake_whose_resume_was_fenced_still_happened() {
 
     // A delivery.
     let waiting = rt
-        .run_plan_correlated(
-            await_plan(),
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-7")],
-        )
+        .start(await_plan(), Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[CorrelationKey::new("matter", "M-7")]))
+        .run()
         .await
         .unwrap();
     assert!(waiting.status.is_suspended(), "got {:?}", waiting.status);
@@ -811,7 +804,8 @@ async fn a_wake_whose_resume_was_fenced_still_happened() {
 
     // A timer.
     let sleeping = rt
-        .run("demo.nap", Tainted::trusted(json!({})))
+        .start("demo.nap", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(sleeping.status.is_suspended());

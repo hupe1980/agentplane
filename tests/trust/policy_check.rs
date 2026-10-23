@@ -297,12 +297,14 @@ async fn a_rebuilt_request_equals_the_one_the_gate_was_asked() {
     let engine = Recording::new(PERMIT_ALL);
 
     let chainless = plane(&store, engine.clone(), None)
-        .run_plan(two_steps(), Tainted::trusted(json!({ "ticket": "T-1" })))
+        .start(two_steps(), Tainted::trusted(json!({ "ticket": "T-1" })))
+        .run()
         .await
         .unwrap();
     assert_eq!(chainless.status, RunStatus::Succeeded, "{chainless:?}");
     let chained = plane(&store, engine.clone(), Some(chain()))
-        .run_plan(two_steps(), Tainted::trusted(json!({ "ticket": "T-2" })))
+        .start(two_steps(), Tainted::trusted(json!({ "ticket": "T-2" })))
+        .run()
         .await
         .unwrap();
     assert_eq!(chained.status, RunStatus::Succeeded, "{chained:?}");
@@ -394,7 +396,8 @@ async fn pays_under(engine: Arc<dyn PolicyEngine>) -> (Arc<RedbStore>, RunId, Ru
         .policy(engine)
         .skill(Pays)
         .build()
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     (store, out.run_id, out.status)
@@ -497,7 +500,8 @@ async fn an_ungoverned_run_is_not_reported_clean() {
         .owner("policy-check")
         .skill(Pays)
         .build()
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let file = export(&store, &[out.run_id]).await;

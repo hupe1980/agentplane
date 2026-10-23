@@ -470,29 +470,27 @@ impl Gemini {
 
     /// The `contents` array, from whatever shape the caller supplied.
     ///
-    /// A bare string is one user turn. An array is already `contents` and is
-    /// passed through untouched — which is how governed media reaches this
-    /// driver, as `inlineData` parts the caller assembled and the runtime
-    /// materialised. An object is read for `messages` only when
-    /// `prompt_envelope` says it is an envelope rather than content; anything
-    /// else is one user turn carrying the object.
+    /// An array of `contents` passes through untouched — which is how governed
+    /// media reaches this driver, as `inlineData` parts the caller assembled
+    /// and the runtime materialised — and so does a `messages` envelope.
+    /// Anything else is the shared prompt every driver reads (see
+    /// [`Prompt`](crate::model::Prompt)), as one user turn of text parts. A
+    /// breakpoint is dropped: Gemini caches implicitly or through a cached
+    /// content resource, never by marking a prefix.
     fn contents(prompt: &Value) -> Value {
-        match prompt {
-            Value::String(text) => json!([{ "role": "user", "parts": [{ "text": text }] }]),
-            Value::Array(_) => prompt.clone(),
-            other => crate::model::prompt_envelope(other, "messages")
-                .cloned()
-                .unwrap_or_else(|| {
-                    // `system` is an instruction *about* the content and is lifted
-                    // out separately; leaving it here would show the model its own
-                    // orders as part of the question.
-                    let mut rest = other.clone();
-                    if let Some(map) = rest.as_object_mut() {
-                        map.remove("system");
-                    }
-                    json!([{ "role": "user", "parts": [{ "text": rest.to_string() }] }])
-                }),
+        match crate::model::prompt::turns(prompt, &["messages"]) {
+            crate::model::prompt::Turns::Native(turns) => Value::Array(turns.to_vec()),
+            crate::model::prompt::Turns::Parts(parts) => {
+                json!([{ "role": "user", "parts": Self::text_parts(&parts) }])
+            }
         }
+    }
+
+    fn text_parts(parts: &[crate::model::prompt::Part<'_>]) -> Vec<Value> {
+        parts
+            .iter()
+            .map(|part| json!({ "text": part.text }))
+            .collect()
     }
 
     /// The system instruction, if the caller set one.
@@ -502,12 +500,13 @@ impl Gemini {
     /// model an instruction it treats as ordinary content — and the instruction
     /// slot is authority-bearing here, so that is not a cosmetic difference.
     fn system_instruction(prompt: &Value) -> Option<Value> {
-        let system = prompt.get("system").filter(|s| !s.is_null())?;
-        Some(match system {
-            Value::String(text) => json!({ "parts": [{ "text": text }] }),
+        Some(match crate::model::prompt::system(prompt)? {
+            crate::model::prompt::System::Parts(parts) => {
+                json!({ "parts": Self::text_parts(&parts) })
+            }
             // Already a `Content` — passed through, so a caller can supply
-            // several parts.
-            other => other.clone(),
+            // several parts in the wire's own shape.
+            crate::model::prompt::System::Native(other) => other.clone(),
         })
     }
 
@@ -1238,5 +1237,37 @@ impl ModelProvider for Gemini {
         }
         Self::accumulate_continuation(&mut completion, request.continuation, request.exchanges);
         Ok(completion)
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use serde_json::json;
+
+    use super::Gemini;
+    use crate::core::Tainted;
+    use crate::model::{CacheTtl, Prompt};
+
+    /// **The shared prompt's parts are parts of one Gemini turn**, and
+    /// `{ system, input }` asks the question `input` holds.
+    #[test]
+    fn prompt_parts_are_parts() {
+        let prompt = Prompt::new()
+            .system_cached(Tainted::trusted("policy".to_owned()), CacheTtl::OneHour)
+            .input(Tainted::trusted("context".to_owned()))
+            .input(Tainted::trusted("task".to_owned()))
+            .build();
+        assert_eq!(
+            Gemini::system_instruction(prompt.peek()),
+            Some(json!({ "parts": [{ "text": "policy" }] }))
+        );
+        assert_eq!(
+            Gemini::contents(prompt.peek()),
+            json!([{ "role": "user", "parts": [{ "text": "context" }, { "text": "task" }] }])
+        );
+        assert_eq!(
+            Gemini::contents(&json!({ "system": "s", "input": "hi" })),
+            json!([{ "role": "user", "parts": [{ "text": "hi" }] }])
+        );
     }
 }

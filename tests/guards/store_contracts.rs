@@ -97,6 +97,45 @@ mod embedded {
         );
     }
 
+    /// **A lease taken under an earlier open is free at the next one.** One
+    /// file has one opener, so its holder is gone: a CLI killed mid-run and
+    /// started again resumes at once rather than after the TTL. The epoch still
+    /// climbs, the dead holder cannot renew, and the run is listed as
+    /// abandoned for the recovery sweep.
+    #[tokio::test]
+    async fn a_lease_from_an_earlier_open_is_lapsed() {
+        let dir = scratch("lapsed");
+        let path = dir.join("journal.redb");
+        let run = RunId::generate();
+        let first = {
+            let store = RedbStore::open(&path).expect("the first open");
+            store
+                .acquire(run, "killed", Duration::from_secs(3600))
+                .await
+                .expect("a fresh run is free")
+        };
+
+        let store = RedbStore::open(&path).expect("the reopen");
+        let abandoned = store.abandoned_runs(10).await.expect("abandoned_runs");
+        let renewed = store
+            .renew(run, "killed", first.epoch, Duration::from_secs(3600))
+            .await;
+        let claimed = store
+            .acquire(run, "restarted", Duration::from_secs(30))
+            .await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            abandoned,
+            [run],
+            "the crashed run is not offered to recovery"
+        );
+        assert!(renewed.is_err(), "the dead holder renewed a lease");
+        let claimed = claimed.expect("the run is held by an open that ended");
+        assert!(claimed.epoch > first.epoch, "the dead holder is not fenced");
+    }
+
     /// Bytes that are not a store are unreadable, not an outage to retry.
     #[test]
     fn bytes_that_are_not_a_store_are_unreadable() {

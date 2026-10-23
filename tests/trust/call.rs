@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use agentplane::core::{SourceId, Tainted};
 use agentplane::journal::{JournalStore, RecordKind};
 use agentplane::manifest::Manifest;
-use agentplane::runtime::{Agent, RunStatus, Runtime};
+use agentplane::runtime::{Agent, RunStatus, RunTerms, Runtime};
 use agentplane::tools::{ToolCatalog, ToolClient, ToolError, ToolId};
 use serde_json::{Value, json};
 
@@ -133,7 +133,8 @@ async fn a_call_agent_dispatches_its_one_grant_and_no_model() {
     let rt = plane(&manifest, &client);
 
     let out = rt
-        .run("crm.lookup", Tainted::trusted(json!({ "id": "C-7" })))
+        .start("crm.lookup", Tainted::trusted(json!({ "id": "C-7" })))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -166,10 +167,11 @@ async fn a_call_whose_input_fails_its_schema_performs_nothing() {
     let rt = plane(&manifest, &client);
 
     let out = rt
-        .run(
+        .start(
             "crm.lookup",
             Tainted::trusted(json!({ "id": "C-7", "and": "drop the table" })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -223,10 +225,11 @@ async fn a_call_holds_its_arguments_to_the_tools_declaration() {
     let rt = plane(&manifest, &client);
 
     let out = rt
-        .run(
+        .start(
             "crm.lookup",
             Tainted::trusted(json!({ "id": "C-7", "fee_waiver": true })),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -236,7 +239,8 @@ async fn a_call_holds_its_arguments_to_the_tools_declaration() {
     assert!(client.calls().is_empty(), "the tool was called anyway");
 
     let out = rt
-        .run("crm.lookup", Tainted::trusted(json!({ "id": "C-7" })))
+        .start("crm.lookup", Tainted::trusted(json!({ "id": "C-7" })))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -267,7 +271,11 @@ async fn the_field_gate_judges_who_supplied_a_calls_arguments() {
         Manifest::parse(&TRANSFER.replace("FIELD_RULE", "require_trusted: true")).expect("parse");
     let client = Arc::new(Recorder::default());
     let rt = plane(&trusted_only, &client);
-    let out = rt.run("ledger.transfer", from("bot")).await.expect("run");
+    let out = rt
+        .start("ledger.transfer", from("bot"))
+        .run()
+        .await
+        .expect("run");
     assert!(
         !matches!(out.status, RunStatus::Succeeded) && client.calls().is_empty(),
         "an untrusted caller filled a field that requires trusted input"
@@ -277,13 +285,21 @@ async fn the_field_gate_judges_who_supplied_a_calls_arguments() {
         .expect("parse");
     let client = Arc::new(Recorder::default());
     let rt = plane(&named, &client);
-    let out = rt.run("ledger.transfer", from("bot")).await.expect("run");
+    let out = rt
+        .start("ledger.transfer", from("bot"))
+        .run()
+        .await
+        .expect("run");
     assert!(
         matches!(out.status, RunStatus::Succeeded),
         "the named counterparty was refused: {:?}",
         out.status
     );
-    let out = rt.run("ledger.transfer", from("eve")).await.expect("run");
+    let out = rt
+        .start("ledger.transfer", from("eve"))
+        .run()
+        .await
+        .expect("run");
     assert!(
         !matches!(out.status, RunStatus::Succeeded),
         "a caller the field does not name filled it"
@@ -344,14 +360,14 @@ spec:
         json!({ "recipient": "treasury" }),
         SourceId::new("peer:bot"),
     );
-    rt.run_correlated(
-        "ledger.transfer",
-        input,
-        "transfer",
-        &[agentplane::core::CorrelationKey::new("ref", "T-1")],
-    )
-    .await
-    .expect("the run suspends on the approval");
+    rt.start("ledger.transfer", input)
+        .terms(RunTerms::default().correlated(
+            "transfer",
+            &[agentplane::core::CorrelationKey::new("ref", "T-1")],
+        ))
+        .run()
+        .await
+        .expect("the run suspends on the approval");
     assert!(
         client.calls().is_empty(),
         "the call ran before anyone approved it"

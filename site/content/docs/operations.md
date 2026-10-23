@@ -59,11 +59,11 @@ configured that way would lose runs under load and nowhere else.
 
 ### The owner string identifies a *process*, not an agent
 
-This is the one piece of the mechanism you can defeat by accident. A lease is
-renewed **without bumping the epoch** when the claimant is the same owner —
-that is what lets a live instance keep its own run. So two instances sharing an
-owner string each read the other's lease as their own, renew it, and both write
-under one epoch. Fencing is gone, and nothing reports an error.
+Fencing rests on the epoch, not the owner: `acquire` refuses every live lease,
+the caller's own included, and `renew` names the exact epoch it holds. What the
+owner answers is *which process holds this run* — the question an operator asks
+of a stuck one, and what `LeaseHeld` reports. Two processes sharing a string
+still cannot both write; an operator just cannot tell which one holds the run.
 
 `Runtime::owner_id()` therefore defaults to a value that is unique per process
 and per runtime instance. Override it with a real instance identity — a pod name
@@ -88,6 +88,11 @@ row: the epoch lives there, and without it `append` has nothing to fence against
 while the next `acquire` starts again at 1 — so a writer already fenced at 2
 outranks the new owner and the mechanism inverts. Releasing marks the row expired
 instead, and the next takeover advances the epoch as any takeover does.
+
+A crash releases nothing, so the embedded store lapses every live lease when it
+opens: its file admits one opener, so such a lease belongs to a process that is
+gone. A restarted process resumes its runs at once. The shared store cannot know
+that, and waits out the TTL.
 
 **Releasing is something a run does, never something a shutdown does.** A
 release says *takeover is safe now*; for a run still inside a tool call it is

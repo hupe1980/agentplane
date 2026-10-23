@@ -172,10 +172,11 @@ async fn checkout(
         .build();
 
     let out = runtime
-        .run(
+        .start(
             "shop.checkout",
             Tainted::trusted(json!({ "order": "ORD-42" })),
         )
+        .run()
         .await?;
 
     // The group is bracketed in the journal, so "was this taken or taken back?"

@@ -19,7 +19,7 @@ is calling real systems that move real money.
 
 ```rust
 // Performs its effects once, and journals everything.
-let outcome = runtime.run("reconcile", Tainted::trusted(input)).await?;
+let outcome = runtime.start("reconcile", Tainted::trusted(input)).run().await?;
 
 // Replay re-executes the logic and reads every effect back from the journal.
 // No tool is called again. No clock is read again. No invoice is issued twice.

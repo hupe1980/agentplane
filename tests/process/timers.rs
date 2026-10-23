@@ -87,7 +87,8 @@ async fn a_sleeping_run_suspends_and_holds_nothing() {
     let f = fixture(Duration::from_secs(3600));
 
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -121,7 +122,8 @@ async fn sleeping_without_a_timer_store_is_refused() {
         .build();
 
     let out = rt
-        .run("demo.sleep", Tainted::trusted(json!({})))
+        .start("demo.sleep", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     match &out.status {
@@ -138,7 +140,8 @@ async fn a_sweep_wakes_a_run_whose_instant_arrived() {
     let f = fixture(Duration::from_mins(1));
 
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert!(out.status.is_suspended());
@@ -183,7 +186,8 @@ async fn a_sweep_wakes_a_run_whose_instant_arrived() {
 async fn a_refired_timer_does_not_duplicate_the_recorded_wake() {
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let timer = f
@@ -260,7 +264,8 @@ async fn a_refired_timer_does_not_duplicate_the_recorded_wake() {
 async fn a_timer_fires_exactly_once_across_two_sweeps() {
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert!(out.status.is_suspended());
@@ -286,7 +291,8 @@ async fn a_timer_fires_exactly_once_across_two_sweeps() {
 #[tokio::test]
 async fn a_fired_timer_is_reported_but_is_not_an_incident() {
     let f = fixture(Duration::from_mins(1));
-    f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+    f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -311,7 +317,8 @@ async fn a_fired_timer_is_reported_but_is_not_an_incident() {
 async fn the_wake_instant_is_journaled_not_recomputed() {
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -348,7 +355,8 @@ async fn the_wake_instant_is_journaled_not_recomputed() {
 async fn a_late_sweep_records_the_due_instant_not_its_own() {
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let due = f.store.armed_timer_rows(out.run_id).await.unwrap()[0].fire_at;
@@ -373,7 +381,8 @@ async fn a_late_sweep_records_the_due_instant_not_its_own() {
 async fn replay_reads_the_sleep_back_instead_of_sleeping_again() {
     let f = fixture(Duration::from_mins(1));
     let first =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     f.rt.fire_timers(later(120)).await.unwrap();
@@ -394,7 +403,8 @@ async fn replay_reads_the_sleep_back_instead_of_sleeping_again() {
 async fn replaying_a_sleeping_run_does_not_reset_its_clock() {
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let armed = f.store.armed_timer_rows(out.run_id).await.unwrap();
@@ -589,7 +599,8 @@ async fn two_concurrent_siblings_can_both_sleep() {
     ]);
 
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -636,7 +647,8 @@ async fn two_concurrent_siblings_can_both_sleep() {
 async fn a_run_still_in_flight_is_named_by_nothing_the_outcome_indexes_hold() {
     let f = fixture(Duration::from_secs(3600));
     let sleeping =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert!(
@@ -677,7 +689,8 @@ async fn a_run_still_in_flight_is_named_by_nothing_the_outcome_indexes_hold() {
         .skill(Finishes)
         .build();
     let done = finisher
-        .run("demo.finish", Tainted::trusted(json!({})))
+        .start("demo.finish", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -738,7 +751,8 @@ impl Skill for Finishes {
 async fn a_restored_wait_is_armed_by_nothing_until_the_run_is_resumed() {
     let f = fixture(Duration::from_secs(3600));
     let sleeping =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let run = sleeping.run_id;
@@ -832,7 +846,8 @@ async fn a_restored_wait_is_armed_by_nothing_until_the_run_is_resumed() {
 async fn a_cancelled_sleeping_run_leaves_no_timer_armed() {
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert!(out.status.is_suspended());
@@ -874,7 +889,8 @@ async fn a_timer_for_a_concluded_run_finishes_it_rather_than_waking_it() {
 
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let lease = f
@@ -932,7 +948,8 @@ async fn a_timer_for_a_concluded_run_finishes_it_rather_than_waking_it() {
 async fn a_sealed_runs_leftover_timer_is_retired_not_fired() {
     let f = fixture(Duration::from_mins(1));
     let out =
-        f.rt.run("demo.sleep", Tainted::trusted(json!({})))
+        f.rt.start("demo.sleep", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     let timers = f.store.clone() as Arc<dyn TimerStore>;

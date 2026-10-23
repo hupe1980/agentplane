@@ -224,7 +224,7 @@ pub struct Label {""",
         "a_strict_replay_under_an_edited_declaration_leaves_the_store_unchanged",
         "a strict replay writes as a live pass does, so verifying an edit appends "
         "a quarantine for a divergence nobody ran into the run's history",
-        """        let writing = !matches!(mode, Mode::Strict);""",
+        "        let writing = !matches!(mode, Pass::Strict);",
         """        let writing = true;""",
     ),
     "AFaithfulFailureIsAFailure": (
@@ -679,7 +679,7 @@ pub struct Label {""",
         "        if self.admit(schema).is_err() {",
     ),
     "AGeneratedRefKeepsItsSiblings": (
-        "src/tools/typed.rs",
+        "src/tools/schema.rs",
         "a_struct_field_and_an_optional_field_stay_strict",
         "a generated `$ref` keeps its sibling `description`, so a typed tool with a documented struct field is never strict on OpenAI",
         "    if map.contains_key(\"$ref\") && map.len() > 1 {",
@@ -717,8 +717,152 @@ pub struct Label {""",
         "src/manifest/mod.rs",
         "a_drafted_grant_mutates_whatever_the_server_says",
         "a grant drafted from discovery believes the server's `readOnlyHint`, so a money-moving tool that calls itself read-only skips the whole-value taint gate and is retried after a timeout",
+        "            description: Some(discovered.description.clone()),",
+        "            description: Some(discovered.description.clone()),\n            mutates: discovered.advertised.read_only != Some(true),",
+    ),
+    "ADraftIsNotTheOfferedForm": (
+        "src/manifest/mod.rs",
+        "a_drafted_grant_mutates_whatever_the_server_says",
+        "a grant drafted from discovery carries the server's open schema, so a reviewed MCP tool is sent non-strict",
+        "            arguments: Some(crate::tools::closed_schema(&discovered.input_schema)),",
         "            arguments: Some(discovered.input_schema.clone()),",
-        "            arguments: Some(discovered.input_schema.clone()),\n            mutates: discovered.advertised.read_only != Some(true),",
+    ),
+    "DriftComparesTheRawSchema": (
+        "src/manifest/mod.rs",
+        "a_drafted_grant_mutates_whatever_the_server_says",
+        "every drafted grant reports argument drift against an unchanged server, so drift stops meaning anything",
+        "            .is_some_and(|reviewed| *reviewed != crate::tools::closed_schema(&self.input_schema))",
+        "            .is_some_and(|reviewed| *reviewed != self.input_schema)",
+    ),
+    "AKilledOpenHoldsItsRuns": (
+        "src/store/redb.rs",
+        "a_lease_from_an_earlier_open_is_lapsed",
+        "a CLI killed mid-run and started again finds its own run held for the rest of a lease nobody can renew, and recovery cannot see it",
+        "            lapse_every_lease(&w)?;",
+        "            let _ = lapse_every_lease;",
+    ),
+    "APromptBreakpointNeverReachesAnthropic": (
+        "src/model/anthropic.rs",
+        "a_prompt_part_carries_its_breakpoint",
+        "a cached prompt prefix is written to Anthropic as ordinary input on every call, billed in full each time",
+        '                    block["cache_control"] = cache_control(ttl);',
+        "                    let _ = ttl;",
+    ),
+    "TheSharedEnvelopeIsContent": (
+        "src/model/prompt.rs",
+        "the_shared_envelope_asks_its_input",
+        "a `{ system, input }` prompt asks Anthropic and Gemini a JSON object wrapping the question, while the other drivers ask the question",
+        '    if let Some(input) = super::prompt_envelope(prompt, "input") {',
+        "    if let Some(input) = None::<&Value> {",
+    ),
+    "APromptPartIsTrustedByTheBuilder": (
+        "src/model/prompt.rs",
+        "each_part_keeps_its_label",
+        "an untrusted part handed to the prompt builder fills the protected instruction slot as trusted",
+        "    text.map(|text| match cache {",
+        "    Tainted::trusted(text.peek().clone()).map(|text| match cache {",
+    ),
+    "BedrockSendsEveryToolStrict": (
+        "src/model/bedrock.rs",
+        "a_tool_is_strict_only_where_the_subset_holds_it",
+        "a Bedrock tool outside the strict subset is sent `strict: true` and the whole request is refused",
+        "                    budget.tool(&declaration.parameters),",
+        "                    true,",
+    ),
+    "BedrockDropsAToolBreakpoint": (
+        "src/model/bedrock.rs",
+        "a_tool_is_strict_only_where_the_subset_holds_it",
+        "a tool breakpoint is silently dropped on Bedrock, which caches nothing unasked",
+        "                    builder = builder.tools(Tool::CachePoint(cache_point(ttl, model)?));",
+        "                    let _ = ttl;",
+    ),
+    "BedrockDropsASystemBreakpoint": (
+        "src/model/bedrock.rs",
+        "a_prompt_part_carries_its_breakpoint",
+        "a cached instruction is billed in full on every Bedrock call",
+        "            blocks.push(SystemContentBlock::CachePoint(cache_point(ttl, model)?));",
+        "            let _ = ttl;",
+    ),
+    "BedrockDropsAnInputBreakpoint": (
+        "src/model/bedrock.rs",
+        "a_prompt_part_carries_its_breakpoint",
+        "a cached question prefix is billed in full on every Bedrock call",
+        "                        content.push(ContentBlock::CachePoint(cache_point(ttl, model)?));",
+        "                        let _ = ttl;",
+    ),
+    "BedrockBillsOneHourWritesAsFiveMinute": (
+        "src/model/bedrock.rs",
+        "the_one_hour_writes_are_counted",
+        "a priced Bedrock run bills its one-hour cache writes at the five-minute rate",
+        "    .with_cache_write_1h(one_hour)",
+        "    .with_cache_write_1h(0 * one_hour)",
+    ),
+    "AKeyedSpawnReadsAsFresh": (
+        "src/runtime/executor.rs",
+        "spawning_twice_under_one_key_starts_one_run",
+        "a keyed spawn whose key is already held reports that it started the work, so a redelivery's caller believes it ran twice",
+        "            Claimed::Held(run) => Spawned { run, fresh: false },",
+        "            Claimed::Held(run) => Spawned { run, fresh: true },",
+    ),
+    "AChainlessServedTermsAreThePlanes": (
+        "src/runtime/executor.rs",
+        "a_caller_without_a_chain_does_not_act_under_the_planes",
+        "a served caller that presented no chain acts under the plane's own, so the operator's authority is an ambient credential every authenticated peer holds",
+        "            acting_as: chain.map_or(Acting::Nobody, Acting::Caller),",
+        "            acting_as: chain.map_or(Acting::Plane, Acting::Caller),",
+    ),
+    "ASettledRunHasNoValue": (
+        "src/runtime/executor.rs",
+        "settling_a_rested_key_answers_with_its_value",
+        "settling a key whose run rested answers with the recorded outcome, which carries no value, so a restarted caller reads success with nothing in it",
+        "            Admission::Replayed(rested) => runtime.with_output(rested).await,",
+        "            Admission::Replayed(rested) => Ok(rested),",
+    ),
+    "ASettleGivesUpOnAnInFlightRun": (
+        "src/runtime/executor.rs",
+        "settling_a_crashed_key_resumes_it",
+        "settling a key whose holder died answers with whatever is recorded, so a killed process restarted with the same request finds its run stranded",
+        "            Admission::InFlight(run) => runtime.settled(run).await,",
+        "            Admission::InFlight(run) => runtime.recorded_outcome(run).await?.ok_or(RuntimeError::Draining),",
+    ),
+    "TheRuntimeDocGuardReadsNothing": (
+        "tests/guards/docs.rs",
+        "every_documented_runtime_method_exists",
+        "the page walk for Runtime calls reads no receiver, so a page naming a removed start method passes",
+        '            for marker in ["rt.", "runtime.", "plane.", "Runtime::"] {',
+        '            for marker in ["no.such.receiver."] {',
+    ),
+    "ASpawnAdmitsInTheBackground": (
+        "src/runtime/executor.rs",
+        "a_spawned_plan_is_admitted_before_spawn_returns",
+        "a spawn returns an id before admission, so a refused plan is a run that never appears and an id that reads as nothing",
+        """        let admitted = self
+            .admit_only(run, plan, input, terms, Entry::Outside)
+            .await?;
+
+        let plane = Arc::clone(self);
+        // In the caller's span, as a blocking run is: a background run's
+        // trace is still the trace of whatever started it.
+        tokio::spawn(
+            async move {
+                let _ticket = ticket;
+                plane.execute_admitted(admitted).await
+            }
+            .in_current_span(),
+        );""",
+        """        let plane = Arc::clone(self);
+        tokio::spawn(
+            async move {
+                let _ticket = ticket;
+                if let Ok(admitted) = plane
+                    .admit_only(run, plan, input, terms, Entry::Outside)
+                    .await
+                {
+                    let _ = plane.execute_admitted(admitted).await;
+                }
+            }
+            .in_current_span(),
+        );""",
     ),
     "ALockedStoreIsABackendFault": (
         "src/store/redb.rs",
@@ -791,11 +935,32 @@ pub struct Label {""",
         "                    .gen_ai_provider().filter(|_| false)",
     ),
     "ARustNumberCostsStrictness": (
-        "src/tools/typed.rs",
+        "src/tools/schema.rs",
         "a_rust_number_type_does_not_cost_a_tool_its_strictness",
         "every typed tool with an integer field is sent non-strict to Anthropic, for a bound serde already enforces",
-        "    drop_type_bounds(map);",
-        "    let _ = drop_type_bounds;",
+        "        drop_type_bounds(map);",
+        "        let _ = drop_type_bounds;",
+    ),
+    "AnArgumentLessToolIsNeverStrict": (
+        "src/tools/schema.rs",
+        "an_argument_less_tool_does_not_cost_its_strictness",
+        "every tool that takes no arguments is sent non-strict to both providers, which refuse an object with no `properties`",
+        '            map.insert("properties".to_owned(), json!({}));',
+        "            let _ = json!({});",
+    ),
+    "AForeignSchemaIsRewrittenAsSerdeWould": (
+        "src/tools/schema.rs",
+        "a_foreign_schema_is_narrowed_and_never_rewritten",
+        "an MCP server's optional argument is sent as `null` and its declared bound is dropped, rewrites only serde makes harmless",
+        "    close(&mut closed, Grounds::Narrowing);",
+        "    close(&mut closed, Grounds::Serde);",
+    ),
+    "ClosingWidensAOneOf": (
+        "src/tools/schema.rs",
+        "closing_never_widens_a_composed_schema",
+        "closing the branches of a `oneOf` admits a value that matched two branches, which the schema refused",
+        "    if composes(schema) {",
+        "    if false && composes(schema) {",
     ),
     "ACrashSweepBelievesARefusal": (
         "src/testkit/crash.rs",
@@ -1057,8 +1222,8 @@ pub struct Label {""",
         "the_policy_check_is_reachable_from_no_executor_path",
         "the executor can reach the offline check, so a policy edit could "
         "re-judge history on resume",
-        "use super::ctx::{CaseContext, Mode, StepCtx};\n",
-        "use super::ctx::{CaseContext, Mode, StepCtx};\n#[allow(unused_imports)]\nuse crate::policy::check::Check;\n",
+        "use super::ctx::{CaseContext, Mode, Pass, StepCtx};\n",
+        "use super::ctx::{CaseContext, Mode, Pass, StepCtx};\n#[allow(unused_imports)]\nuse crate::policy::check::Check;\n",
     ),
     "ACheckThatReadNothingPasses": (
         "src/policy/check.rs",
@@ -1233,7 +1398,7 @@ pub struct Label {""",
         "a_commissioned_run_acts_under_the_orderers_chain_plus_one_link",
         "a commissioned sub-run is admitted under the plane's chain, so the "
         "orderer's owner, expiry and audience stop at the hand-off",
-        "            (Some(chain), _) => super::RunTerms::default().acting_as(chain.clone()),",
+        "            (Some(chain), _) => super::RunTerms::acting_as(chain.clone()),",
         "            (Some(_), _) => super::RunTerms::default(),",
     ),
     "APlanesCommissionIsServed": (
@@ -1243,7 +1408,7 @@ pub struct Label {""",
         "chainless served caller, so the sub-run journals served_unchained "
         "and cannot draw the tenant mandate its parent holds",
         "            (None, false) => super::RunTerms::default(),",
-        "            (None, false) => super::RunTerms::default().served(None),",
+        "            (None, false) => super::RunTerms::served(None),",
     ),
     "AServedCommissionActsAsThePlane": (
         "src/runtime/ctx.rs",
@@ -1251,7 +1416,7 @@ pub struct Label {""",
         "a chainless served caller's commission admits its sub-run as the "
         "plane's own, so a peer that holds nothing draws the tenant's "
         "mandate one hand-off down",
-        "            (None, true) => super::RunTerms::default().served(None),",
+        "            (None, true) => super::RunTerms::served(None),",
         "            (None, true) => super::RunTerms::default(),",
     ),
     "ARepairedSealKeepsTheRunsWaits": (
@@ -1297,9 +1462,8 @@ pub struct Label {""",
         "the A2A server admits every peer's run under the plane's own chain — an "
         "ambient credential with the caller's name on the message and the "
         "owner's on the record",
-        """        .served(caller.acting_as.clone())
-        .admitted_by(&caller.actor);""",
-        """        .admitted_by(&caller.actor);""",
+        "        crate::runtime::RunTerms::served(caller.acting_as.clone()).admitted_by(&caller.actor);",
+        "        crate::runtime::RunTerms::default().admitted_by(&caller.actor);",
     ),
     "AChainlessCallerEscapesThePlanesCeiling": (
         "src/runtime/executor.rs",
@@ -4294,12 +4458,13 @@ pub struct Label {""",
         "a keyed plan admission is neither validated nor answered by the run "
         "its key already admitted, so an empty key is claimed and a "
         "redelivery fails with a store error instead of the original's answer",
-        """        validate_admission_key(&key)?;
-        if let Some(held) = self.holder_of(&key).await? {
-            return self.answer_with(held).await;
+        """        validate_admission_key(key)?;
+        if let Some(held) = self.holder_of(key).await? {
+            return Ok(Claimed::Held(held));
         }
-        match self.admit_plan(plan, input, terms).await {""",
-        """        match self.admit_plan(plan, input, terms).await {""",
+""",
+        """        let _ = (validate_admission_key, Self::holder_of);
+""",
     ),
     "ALostKeyReadsAsAnErasure": (
         "src/drill.rs",
@@ -4581,11 +4746,8 @@ pub struct Label {""",
         "a call over HTTP is admitted under no chain and names no admitter, so "
         "the journal cannot say who started the run and the caller's own "
         "authority never bounds it",
-        """            Some(caller) => RunTerms::default()
-                .once(&key)
-                .served(caller.acting_as.clone())
-                .admitted_by(&caller.actor),""",
-        """            Some(_) => RunTerms::default().once(&key).served(None),""",
+        "            Some(caller) => RunTerms::served(caller.acting_as.clone()).admitted_by(&caller.actor),",
+        "            Some(_) => RunTerms::served(None),",
     ),
     "AnHttpCallIsKeyedAsNobody": (
         "src/tools/serve.rs",
@@ -4939,8 +5101,8 @@ pub struct Label {""",
         "a_retried_call_with_the_same_key_is_one_run",
         "tools/call admits under no key, so a host that resends a call after "
         "losing the response runs the agent twice",
-        "            None => RunTerms::default().once(&key).served(None),",
-        "            None => RunTerms::default().served(None),",
+        "            .once(key)\n",
+        '            .once(format!("{key}{:?}", std::time::Instant::now()))\n',
     ),
     "AnMcpCloneSharesItsSession": (
         "src/tools/serve.rs",
@@ -11572,16 +11734,8 @@ pub struct Label {""",
         "src/runtime/executor.rs",
         "a_duplicate_the_read_missed_is_still_answered_with_the_original",
         "a duplicate admission is reported as fresh, so a redelivery runs the work again",
-        """        match self.admit(target, input, terms).await {
-            Ok(outcome) => Ok(Admission::Fresh(outcome)),
-            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
-                run, ..
-            })) => self.answer_with(parse_holder(&run)?).await,""",
-        """        match self.admit(target, input, terms).await {
-            Ok(outcome) => Ok(Admission::Fresh(outcome)),
-            Err(RuntimeError::Store(crate::core::StoreError::DuplicateAdmission {
-                run, ..
-            })) => Ok(Admission::InFlight(parse_holder(&run)?)),""",
+        "            })) => Ok(Claimed::Held(parse_holder(&run)?)),",
+        "            })) => Err(RuntimeError::Store(crate::core::StoreError::Backend(run))),",
     ),
     "SuspendedRunIsNotAnAnswer": (
         "src/runtime/executor.rs",
@@ -11910,12 +12064,8 @@ pub struct Label {""",
         "`input_tokens`, so the count under-reports by the whole cached "
         "prefix and the token ceiling reads a fraction of the real spend — a "
         "bill nobody can reconcile rather than a failure",
-        """        let usage = output.usage().map_or_else(Usage::default, |usage| {
-            Usage::with_cache_beside_input(
-                u64::try_from(usage.input_tokens()).unwrap_or_default(),""",
-        """        let usage = output.usage().map_or_else(Usage::default, |usage| {
-            Usage::with_cache_beside_input(
-                u64::try_from(usage.input_tokens()).unwrap_or_default() * 0,""",
+        "        count(usage.input_tokens()),",
+        "        count(usage.input_tokens()) * 0,",
     ),
     "AGuardrailInterventionIsAnAnswer": (
         "src/model/bedrock.rs",
@@ -12212,11 +12362,11 @@ pub struct Label {""",
         "step admission ignores what it has already handed out in this wave, so "
         "a whole ready set asks the same unmoved figure and every branch is "
         "admitted under a ceiling of two",
-        """                Mode::Live | Mode::Resume => ledger
+        """                Pass::Live | Pass::Resume => ledger
                     .lock()
                     .expect("budget mutex")
                     .admit_step(admitted.len()),""",
-        """                Mode::Live | Mode::Resume => ledger
+        """                Pass::Live | Pass::Resume => ledger
                     .lock()
                     .expect("budget mutex")
                     .admit_step(0),""",

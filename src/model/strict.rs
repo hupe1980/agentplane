@@ -29,7 +29,7 @@ pub enum StrictSubset {
 }
 
 /// What one schema costs against Anthropic's per-request strict budget.
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StrictCost {
     /// Properties not listed in their object's `required`.
@@ -40,11 +40,11 @@ struct StrictCost {
 
 /// Anthropic's per-request ceilings across every strict schema in a request,
 /// as documented: past them the request is a 400, not a degraded one.
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 const ANTHROPIC_STRICT_TOOLS: usize = 20;
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 const ANTHROPIC_OPTIONAL: usize = 24;
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 const ANTHROPIC_UNIONS: usize = 16;
 
 /// What is left of one Anthropic request's strict budget.
@@ -52,14 +52,14 @@ const ANTHROPIC_UNIONS: usize = 16;
 /// A schema is admitted strict only if it is in the subset **and** fits what
 /// remains; the first to arrive is served first, so a driver charges the
 /// response schema before any tool.
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 #[derive(Debug, Default)]
 pub(crate) struct AnthropicBudget {
     tools: usize,
     spent: StrictCost,
 }
 
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 impl AnthropicBudget {
     /// Admit `schema` as a strict tool if it qualifies and fits.
     pub(crate) fn tool(&mut self, schema: &Value) -> bool {
@@ -538,7 +538,7 @@ fn recursive_ref(schema: &Value) -> Option<String> {
         .find(|start| cycles(start, &mut Vec::new(), &definition))
 }
 
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 fn count_cost(node: &Value, cost: &mut StrictCost) {
     let Some(obj) = node.as_object() else { return };
     if let Some(properties) = obj.get("properties").and_then(Value::as_object) {

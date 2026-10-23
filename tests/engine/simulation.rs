@@ -200,7 +200,8 @@ async fn sweep(failing: Option<&'static str>) {
     let rt = runtime(&origin, &world, failing);
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let points = crash_points(&*origin, out.run_id).await.unwrap();
@@ -275,7 +276,8 @@ async fn a_point_past_the_plan() -> (agentplane::testkit::CrashPoint, agentplane
     let origin = Arc::new(RedbStore::open_in_memory().unwrap());
     let world = Arc::new(Mutex::new(Vec::new()));
     let out = runtime(&origin, &world, None)
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let points = crash_points(&*origin, out.run_id).await.unwrap();

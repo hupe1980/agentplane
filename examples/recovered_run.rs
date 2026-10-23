@@ -127,10 +127,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let a = Arc::clone(&a);
         async move {
             let _ = a
-                .run(
+                .start(
                     "billing.settle",
                     Tainted::trusted(json!({ "invoice": "INV-9" })),
                 )
+                .run()
                 .await;
         }
     });

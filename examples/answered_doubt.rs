@@ -235,7 +235,10 @@ fn plane() -> Result<Plane, Box<dyn std::error::Error>> {
 }
 
 async fn stuck(p: &Plane) -> Result<RunId, Box<dyn std::error::Error>> {
-    let out = p.rt.run_plan(plan(), Tainted::trusted(json!({}))).await?;
+    let out =
+        p.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
+            .await?;
     assert!(matches!(out.status, RunStatus::Quarantined(_)));
     Ok(out.run_id)
 }

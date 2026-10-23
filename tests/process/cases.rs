@@ -21,7 +21,7 @@ use agentplane::core::{
     Outcome, Skill, SkillDescriptor, Tainted, Timestamp,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -161,21 +161,15 @@ async fn messages_sharing_a_key_join_one_case() {
     let keys = [key("document", "DOC-4711")];
 
     let first = rt
-        .run_correlated(
-            "accumulates",
-            Tainted::trusted(json!("request")),
-            "supplier-switch",
-            &keys,
-        )
+        .start("accumulates", Tainted::trusted(json!("request")))
+        .terms(RunTerms::default().correlated("supplier-switch", &keys))
+        .run()
         .await
         .unwrap();
     let second = rt
-        .run_correlated(
-            "accumulates",
-            Tainted::trusted(json!("acknowledgement")),
-            "supplier-switch",
-            &keys,
-        )
+        .start("accumulates", Tainted::trusted(json!("acknowledgement")))
+        .terms(RunTerms::default().correlated("supplier-switch", &keys))
+        .run()
         .await
         .unwrap();
 
@@ -200,12 +194,9 @@ async fn the_case_binding_is_journaled() {
     let rt = runtime_with_cases(&store);
 
     let out = rt
-        .run_correlated(
-            "accumulates",
-            Tainted::trusted(json!(1)),
-            "matter",
-            &[key("meter", "M-1")],
-        )
+        .start("accumulates", Tainted::trusted(json!(1)))
+        .terms(RunTerms::default().correlated("matter", &[key("meter", "M-1")]))
+        .run()
         .await
         .unwrap();
 
@@ -248,22 +239,16 @@ async fn unrelated_keys_do_not_collide() {
     let store = Arc::new(RedbStore::open_in_memory().unwrap());
     let rt = runtime_with_cases(&store);
 
-    rt.run_correlated(
-        "accumulates",
-        Tainted::trusted(json!(1)),
-        "m",
-        &[key("document", "A")],
-    )
-    .await
-    .unwrap();
-    rt.run_correlated(
-        "accumulates",
-        Tainted::trusted(json!(1)),
-        "m",
-        &[key("document", "B")],
-    )
-    .await
-    .unwrap();
+    rt.start("accumulates", Tainted::trusted(json!(1)))
+        .terms(RunTerms::default().correlated("m", &[key("document", "A")]))
+        .run()
+        .await
+        .unwrap();
+    rt.start("accumulates", Tainted::trusted(json!(1)))
+        .terms(RunTerms::default().correlated("m", &[key("document", "B")]))
+        .run()
+        .await
+        .unwrap();
 
     let a = store
         .correlate(&[key("document", "A")])
@@ -328,12 +313,9 @@ async fn the_resolved_instant_is_journaled_with_its_calendar() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "obliges",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("document", "D-1")],
-        )
+        .start("obliges", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("document", "D-1")]))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -385,12 +367,9 @@ async fn replay_does_not_recompute_a_deadline() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "obliges",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("document", "D-2")],
-        )
+        .start("obliges", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("document", "D-2")]))
+        .run()
         .await
         .unwrap();
 
@@ -440,14 +419,11 @@ async fn a_case_with_an_open_obligation_refuses_to_close() {
         })
         .build();
 
-    rt.run_correlated(
-        "obliges",
-        Tainted::trusted(json!({})),
-        "matter",
-        &[key("document", "D-3")],
-    )
-    .await
-    .unwrap();
+    rt.start("obliges", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("document", "D-3")]))
+        .run()
+        .await
+        .unwrap();
 
     let case_id = store
         .correlate(&[key("document", "D-3")])
@@ -481,12 +457,9 @@ async fn meeting_an_obligation_permits_closing_and_is_journaled() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "obliges",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("document", "D-4")],
-        )
+        .start("obliges", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("document", "D-4")]))
+        .run()
         .await
         .unwrap();
 
@@ -575,12 +548,9 @@ async fn correlation_without_a_case_store_is_refused() {
         .build();
 
     let err = rt
-        .run_correlated(
-            "accumulates",
-            Tainted::trusted(json!(1)),
-            "m",
-            &[key("document", "X")],
-        )
+        .start("accumulates", Tainted::trusted(json!(1)))
+        .terms(RunTerms::default().correlated("m", &[key("document", "X")]))
+        .run()
         .await
         .unwrap_err();
     assert!(err.to_string().contains("case store"), "got: {err}");
@@ -594,7 +564,9 @@ async fn case_state_survives_resume() {
     let keys = [key("document", "D-6")];
 
     let out = rt
-        .run_correlated("accumulates", Tainted::trusted(json!("first")), "m", &keys)
+        .start("accumulates", Tainted::trusted(json!("first")))
+        .terms(RunTerms::default().correlated("m", &keys))
+        .run()
         .await
         .unwrap();
     let resumed = rt.replay(out.run_id, Mode::Resume).await.unwrap();
@@ -623,7 +595,9 @@ async fn a_strict_replay_reads_case_state_from_the_journal_not_the_store() {
     let keys = [key("document", "D-REPLAY")];
 
     let out = rt
-        .run_correlated("accumulates", Tainted::trusted(json!("first")), "m", &keys)
+        .start("accumulates", Tainted::trusted(json!("first")))
+        .terms(RunTerms::default().correlated("m", &keys))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.output.as_ref().unwrap().peek()["seen"], json!(1));
@@ -653,7 +627,9 @@ async fn a_strict_replay_does_not_rewrite_case_state() {
     let keys = [key("document", "D-NOWRITE")];
 
     let out = rt
-        .run_correlated("accumulates", Tainted::trusted(json!("first")), "m", &keys)
+        .start("accumulates", Tainted::trusted(json!("first")))
+        .terms(RunTerms::default().correlated("m", &keys))
+        .run()
         .await
         .unwrap();
 
@@ -797,12 +773,9 @@ async fn a_step_whose_case_moved_under_it_is_refused() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "stale",
-            Tainted::trusted(json!({})),
-            "m",
-            &[key("document", "D-STALE")],
-        )
+        .start("stale", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("m", &[key("document", "D-STALE")]))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -862,12 +835,9 @@ async fn case_state_does_not_launder_untrusted_data() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "demo.launder",
-            Tainted::trusted(json!({})),
-            "audit",
-            &[key("audit", "L-1")],
-        )
+        .start("demo.launder", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("audit", &[key("audit", "L-1")]))
+        .run()
         .await
         .expect("run");
 
@@ -951,12 +921,9 @@ async fn changing_a_case_status_is_journaled_and_not_repeated_on_replay() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "case.close",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("matter", "M-9")],
-        )
+        .start("case.close", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("matter", "M-9")]))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
@@ -1598,7 +1565,8 @@ async fn a_quarantined_run_can_be_found_afterwards() {
         .build();
 
     let out = rt
-        .run("ledger.transfer", Tainted::trusted(json!({})))
+        .start("ledger.transfer", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1610,7 +1578,8 @@ async fn a_quarantined_run_can_be_found_afterwards() {
     // A genuinely-succeeding run, so the selectivity check below has a real
     // succeeded run to place — not the same skill again, which also quarantines.
     let ok = rt
-        .run("ledger.settle", Tainted::trusted(json!({})))
+        .start("ledger.settle", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1656,12 +1625,9 @@ async fn case_of_reads_the_binding_off_the_run() {
     let rt = runtime_with_cases(&store);
 
     let correlated = rt
-        .run_correlated(
-            "accumulates",
-            Tainted::trusted(json!("request")),
-            "supplier-switch",
-            &[key("document", "DOC-9")],
-        )
+        .start("accumulates", Tainted::trusted(json!("request")))
+        .terms(RunTerms::default().correlated("supplier-switch", &[key("document", "DOC-9")]))
+        .run()
         .await
         .unwrap();
     let case = rt
@@ -1680,7 +1646,8 @@ async fn case_of_reads_the_binding_off_the_run() {
 
     // A run in no case is `None` rather than an error.
     let lone = rt
-        .run("accumulates", Tainted::trusted(json!("alone")))
+        .start("accumulates", Tainted::trusted(json!("alone")))
+        .run()
         .await
         .unwrap();
     assert_eq!(rt.case_of(lone.run_id).await.expect("readable"), None);
@@ -2035,12 +2002,9 @@ async fn strict_replay_does_not_re_register_an_obligation() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "obliges",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("document", "D-strict")],
-        )
+        .start("obliges", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("document", "D-strict")]))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -2466,13 +2430,10 @@ async fn crash_in_attach(when: u8) -> (Vec<agentplane::RunId>, Vec<agentplane::R
     let admitting = {
         let rt = Arc::clone(&rt);
         tokio::spawn(async move {
-            rt.run_correlated(
-                "demo.answers",
-                Tainted::trusted(json!({})),
-                "matter",
-                &[key("matter", "M-1")],
-            )
-            .await
+            rt.start("demo.answers", Tainted::trusted(json!({})))
+                .terms(RunTerms::default().correlated("matter", &[key("matter", "M-1")]))
+                .run()
+                .await
         })
     };
     assert!(admitting.await.is_err(), "the admission was meant to die");
@@ -2546,14 +2507,11 @@ async fn a_refused_registration_concludes_over_its_own_head() {
         .cases(Arc::clone(&cases) as Arc<dyn CaseStore>)
         .skill(Answers)
         .build();
-    rt.run_correlated(
-        "demo.answers",
-        Tainted::trusted(json!({})),
-        "matter",
-        &[key("matter", "M-1")],
-    )
-    .await
-    .expect_err("the registration was refused");
+    rt.start("demo.answers", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("matter", "M-1")]))
+        .run()
+        .await
+        .expect_err("the registration was refused");
 
     let journal = Arc::clone(&store) as Arc<dyn JournalStore>;
     let runs = journal.runs_by_id(None, 10).await.unwrap();

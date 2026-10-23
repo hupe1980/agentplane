@@ -213,7 +213,8 @@ async fn replay_does_not_re_perform_effects() {
         .build();
 
     let first = rt
-        .run("calls-tool", Tainted::trusted(json!({})))
+        .start("calls-tool", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -245,7 +246,8 @@ async fn replay_reproduces_the_recorded_output() {
         .build();
 
     let first = rt
-        .run("calls-tool", Tainted::trusted(json!({"x": 1})))
+        .start("calls-tool", Tainted::trusted(json!({"x": 1})))
+        .run()
         .await
         .unwrap();
     let again = rt.replay(first.run_id, Mode::Strict).await.unwrap();
@@ -265,7 +267,8 @@ async fn the_clock_is_journaled_not_re_read() {
     let rt = Runtime::builder(store()).skill(ReadsClock).build();
 
     let first = rt
-        .run("reads-clock", Tainted::trusted(json!({})))
+        .start("reads-clock", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -283,7 +286,8 @@ async fn the_clock_is_journaled_not_re_read() {
 async fn effects_at_different_ordinals_are_distinct() {
     let rt = Runtime::builder(store()).skill(ReadsClock).build();
     let out = rt
-        .run("reads-clock", Tainted::trusted(json!({})))
+        .start("reads-clock", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
@@ -309,7 +313,8 @@ async fn strict_replay_rejects_a_build_that_does_more_than_the_record() {
         .build();
 
     let first = rt
-        .run("variable", Tainted::trusted(json!({})))
+        .start("variable", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -341,7 +346,8 @@ async fn strict_replay_rejects_a_build_that_does_something_different() {
         .build();
 
     let first = rt
-        .run("variable", Tainted::trusted(json!({})))
+        .start("variable", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -439,7 +445,8 @@ async fn a_strict_pass_that_stops_early_still_checks_unconsumed_effects() {
         .build();
 
     let first = rt
-        .run("fails-after", Tainted::trusted(json!({})))
+        .start("fails-after", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
@@ -588,7 +595,8 @@ async fn the_journal_chain_verifies() {
     let calls = Arc::new(AtomicUsize::new(0));
     let rt = Runtime::builder(store()).skill(CallsTool { calls }).build();
     let out = rt
-        .run("calls-tool", Tainted::trusted(json!({})))
+        .start("calls-tool", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -612,7 +620,8 @@ async fn replay_refuses_a_tampered_journal() {
         .skill(CallsTool { calls })
         .build();
     let out = rt
-        .run("calls-tool", Tainted::trusted(json!({"v": 1})))
+        .start("calls-tool", Tainted::trusted(json!({"v": 1})))
+        .run()
         .await
         .unwrap();
 
@@ -640,7 +649,11 @@ async fn a_sink_refuses_data_above_its_ceiling() {
         })
         .build();
 
-    let out = rt.run("sinks", Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .start("sinks", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     match out.status {
         RunStatus::Failed(msg) => assert!(msg.contains("exceeds"), "got: {msg}"),
         other => panic!("expected the ceiling to reject, got {other:?}"),
@@ -659,7 +672,11 @@ async fn untrusted_data_cannot_reach_a_mutating_sink() {
         })
         .build();
 
-    let out = rt.run("sinks", Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .start("sinks", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     match out.status {
         RunStatus::Failed(msg) => {
             assert!(msg.contains("untrusted"), "got: {msg}");
@@ -681,7 +698,11 @@ async fn untrusted_data_may_reach_a_read_only_sink() {
         })
         .build();
 
-    let out = rt.run("sinks", Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .start("sinks", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
 }
 
@@ -723,7 +744,8 @@ async fn release_is_journaled_with_its_evidence() {
         .skill(Releases)
         .build();
     let out = rt
-        .run("demo.release", Tainted::trusted(json!({})))
+        .start("demo.release", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
@@ -772,7 +794,11 @@ async fn a_failing_skill_does_not_succeed() {
     }
 
     let rt = Runtime::builder(store()).skill(Claims).build();
-    let out = rt.run("claims", Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .start("claims", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
 }
 
@@ -781,7 +807,8 @@ async fn a_failing_skill_does_not_succeed() {
 async fn an_unknown_target_is_refused_before_anything_happens() {
     let rt = Runtime::builder(store()).build();
     let err = rt
-        .run("nonexistent", Tainted::trusted(json!({})))
+        .start("nonexistent", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap_err();
     assert!(matches!(
@@ -801,7 +828,8 @@ async fn skills_resolve_by_capability() {
         })
         .build();
     let out = rt
-        .run("demo.call", Tainted::trusted(json!({})))
+        .start("demo.call", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -829,7 +857,8 @@ async fn a_divergence_names_the_call_that_moved() {
         .build();
 
     let first = rt
-        .run("demo.named", Tainted::trusted(json!({})))
+        .start("demo.named", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -894,7 +923,8 @@ async fn strict_replay_writes_nothing() {
         .skill(Releases)
         .build();
     let out = rt
-        .run("demo.release", Tainted::trusted(json!({})))
+        .start("demo.release", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -941,7 +971,8 @@ async fn notes_are_journaled_next_to_their_effects() {
 
     let rt = Runtime::builder(store()).skill(Explains).build();
     let out = rt
-        .run("explains", Tainted::trusted(json!({})))
+        .start("explains", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let records = rt.store().read(out.run_id, 1).await.unwrap();
@@ -1038,7 +1069,8 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
     // And the positive half: a run this build wrote replays normally, or the
     // check above would be satisfied by refusing everything.
     let fresh = rt
-        .run("calls-tool", Tainted::trusted(json!({})))
+        .start("calls-tool", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     rt.replay(fresh.run_id, Mode::Strict)
@@ -1116,7 +1148,8 @@ async fn an_effects_outcome_records_how_long_it_took() {
         .skill(CallsSlowly)
         .build();
     let out = rt
-        .run("slowly", agentplane::core::Tainted::trusted(json!({})))
+        .start("slowly", agentplane::core::Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);

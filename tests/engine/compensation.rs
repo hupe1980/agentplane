@@ -222,7 +222,8 @@ async fn a_failing_step_unwinds_the_completed_ones_in_reverse() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -253,7 +254,8 @@ async fn compensating_effects_are_journaled_in_their_own_phase() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let records = store.read(out.run_id, 1).await.unwrap();
@@ -295,7 +297,8 @@ async fn compensation_effects_do_not_collide_with_forward_ones() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let records = store.read(out.run_id, 1).await.unwrap();
@@ -328,7 +331,8 @@ async fn a_pivot_stops_the_unwind() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -355,7 +359,8 @@ async fn an_unnecessary_declaration_is_skipped_without_stopping_the_unwind() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -382,7 +387,8 @@ async fn an_undeclared_step_that_changed_nothing_needs_no_compensation() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -410,7 +416,8 @@ async fn an_undeclared_step_that_changed_something_escalates() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     match &out.status {
@@ -445,7 +452,8 @@ async fn a_failed_compensation_quarantines_and_names_the_step() {
     );
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     match &out.status {
@@ -521,7 +529,8 @@ async fn a_quarantined_run_is_never_unwound() {
         .build();
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -560,7 +569,8 @@ async fn an_exhausted_run_pauses_with_its_work_standing() {
         .build();
 
     let out = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -606,7 +616,8 @@ async fn replay_reproduces_an_unwind_without_repeating_it() {
     );
 
     let first = rt
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let during = entries(&l);
@@ -708,12 +719,12 @@ async fn a_compensation_may_wait_for_a_human_and_the_unwind_resumes() {
 
     let key = CorrelationKey::new("matter", "M-1");
     let out = rt
-        .run_plan_correlated(
-            chain(),
-            Tainted::trusted(json!({})),
-            "matter",
-            std::slice::from_ref(&key),
+        .start(chain(), Tainted::trusted(json!({})))
+        .terms(
+            agentplane::runtime::RunTerms::default()
+                .correlated("matter", std::slice::from_ref(&key)),
         )
+        .run()
         .await
         .unwrap();
 
@@ -813,7 +824,8 @@ async fn a_succeeding_sibling_is_compensated_when_its_neighbour_fails() {
     ]);
 
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -896,12 +908,12 @@ async fn a_failure_beats_a_siblings_suspension() {
     ]);
 
     let out = rt
-        .run_plan_correlated(
-            plan,
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-9")],
+        .start(plan, Tainted::trusted(json!({})))
+        .terms(
+            agentplane::runtime::RunTerms::default()
+                .correlated("matter", &[CorrelationKey::new("matter", "M-9")]),
         )
+        .run()
         .await
         .unwrap();
 
@@ -1032,12 +1044,12 @@ async fn a_failures_unwind_compensates_the_interrupted_siblings_landed_mutation(
     ]);
 
     let out = rt
-        .run_plan_correlated(
-            plan,
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-11")],
+        .start(plan, Tainted::trusted(json!({})))
+        .terms(
+            agentplane::runtime::RunTerms::default()
+                .correlated("matter", &[CorrelationKey::new("matter", "M-11")]),
         )
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1135,7 +1147,7 @@ async fn a_failed_steps_landed_mutation_is_undone_and_its_rejected_one_is_not() 
         .skill(LandsThenFails(Arc::clone(&l)))
         .build();
     let out = rt
-        .run_plan(
+        .start(
             PlanIR::new(vec![
                 PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
                 PlanNode::new(1, "lands")
@@ -1144,6 +1156,7 @@ async fn a_failed_steps_landed_mutation_is_undone_and_its_rejected_one_is_not() 
             ]),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1169,7 +1182,7 @@ async fn a_failed_steps_landed_mutation_is_undone_and_its_rejected_one_is_not() 
         .skill(Step::new("refuses", &l2).failing())
         .build();
     let out2 = rt2
-        .run_plan(
+        .start(
             PlanIR::new(vec![
                 PlanNode::new(0, "a").arg("input", ArgSource::run_input()),
                 PlanNode::new(1, "refuses")
@@ -1178,6 +1191,7 @@ async fn a_failed_steps_landed_mutation_is_undone_and_its_rejected_one_is_not() 
             ]),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1265,7 +1279,8 @@ async fn a_quarantined_run_is_never_unwound_without_a_mutating_doubt() {
         .skill(Step::new("b", &l))
         .skill(UndecidableRead(Arc::clone(&l)))
         .build()
-        .run_plan(chain(), Tainted::trusted(json!({})))
+        .start(chain(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1380,12 +1395,12 @@ async fn an_interrupted_siblings_landed_work_is_unwound_with_nothing_completed()
     ]);
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        rt.run_plan_correlated(
-            plan,
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-12")],
-        ),
+        rt.start(plan, Tainted::trusted(json!({})))
+            .terms(
+                agentplane::runtime::RunTerms::default()
+                    .correlated("matter", &[CorrelationKey::new("matter", "M-12")]),
+            )
+            .run(),
     )
     .await
     .expect("the run concludes")
@@ -1461,7 +1476,8 @@ async fn a_failed_run_standing_on_landed_work_is_on_the_attention_roll_up() {
         .skill(SaysNo)
         .build();
     let landed = rt
-        .run("lands-and-fails", Tainted::trusted(json!({})))
+        .start("lands-and-fails", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1470,7 +1486,8 @@ async fn a_failed_run_standing_on_landed_work_is_on_the_attention_roll_up() {
         landed.status
     );
     let clean = rt
-        .run("says-no", Tainted::trusted(json!({})))
+        .start("says-no", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(

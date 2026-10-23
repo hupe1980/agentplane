@@ -1063,7 +1063,8 @@ async fn memory_security_metadata_is_part_of_replay_identity() {
         .skill(Remembers(Trust::Untrusted))
         .build();
     let run = live
-        .run("remembers", Tainted::trusted(json!({})))
+        .start("remembers", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("live");
     assert_eq!(run.status, RunStatus::Succeeded);
@@ -1119,7 +1120,8 @@ async fn a_replayed_recall_does_not_search_again() {
         .build();
 
     let out = rt
-        .run("recalls", Tainted::trusted(json!({})))
+        .start("recalls", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -1230,7 +1232,8 @@ async fn a_replayed_semantic_recall_does_not_rerank_the_index() {
         .build();
 
     let live = rt
-        .run("semantic-recalls", Tainted::trusted(json!({})))
+        .start("semantic-recalls", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("live semantic recall");
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -1377,7 +1380,8 @@ async fn a_stale_semantic_index_is_screened_not_served_and_not_fatal() {
         .skill(SemanticRecallsAll)
         .build();
     let run = rt
-        .run("semantic-recalls-all", Tainted::trusted(json!({})))
+        .start("semantic-recalls-all", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(
@@ -1422,7 +1426,8 @@ async fn a_replayed_expiry_sweep_does_not_erase_again() {
         .build();
 
     let live = rt
-        .run("sweeps-memory", Tainted::trusted(json!({})))
+        .start("sweeps-memory", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("live sweep");
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -1469,7 +1474,8 @@ async fn a_replayed_recall_does_not_refresh_access_retention_again() {
         .skill(RecallsAndRefreshes)
         .build();
     let live = rt
-        .run("recalls-refreshes", Tainted::trusted(json!({})))
+        .start("recalls-refreshes", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("live recall");
     assert_eq!(touches.load(Ordering::SeqCst), 1);
@@ -1929,7 +1935,8 @@ async fn a_summary_inherits_the_join_of_what_it_summarised() {
         .skill(Compacts)
         .build();
     let out = rt
-        .run("compacts", Tainted::trusted(json!({})))
+        .start("compacts", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
@@ -1975,7 +1982,8 @@ async fn a_summary_records_the_versions_it_was_made_from() {
         .memory(Arc::clone(&memories))
         .skill(Compacts)
         .build();
-    rt.run("compacts", Tainted::trusted(json!({})))
+    rt.start("compacts", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -2023,7 +2031,8 @@ async fn forgetting_a_source_can_reach_what_was_derived_from_it() {
         .memory(Arc::clone(&memories))
         .skill(Compacts)
         .build();
-    rt.run("compacts", Tainted::trusted(json!({})))
+    rt.start("compacts", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -2124,7 +2133,8 @@ async fn compaction_cannot_exceed_the_sensitivity_ceiling() {
     memories.remember(&secret).await.expect("remember");
 
     let refused = rt
-        .run("compacts_at", Tainted::trusted(json!({})))
+        .start("compacts_at", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_ne!(
@@ -2145,7 +2155,8 @@ async fn compaction_cannot_exceed_the_sensitivity_ceiling() {
     secret.sensitivity = Sensitivity::Confidential;
     memories.remember(&secret).await.expect("remember");
     assert_eq!(
-        rt.run("compacts_at", Tainted::trusted(json!({})))
+        rt.start("compacts_at", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run")
             .status,
@@ -2248,7 +2259,8 @@ async fn an_embedding_above_its_declared_ceiling_is_refused() {
         .build();
 
     let run = rt
-        .run("embeds", Tainted::trusted(json!({})))
+        .start("embeds", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("the run itself completes; the effect inside it is refused");
     let RunStatus::Failed(why) = &run.status else {
@@ -2324,7 +2336,8 @@ async fn a_retriever_that_overruns_the_limit_is_refused() {
         .build();
 
     let run = rt
-        .run("overrun-search", Tainted::trusted(json!({})))
+        .start("overrun-search", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("the run completes; the search inside it is refused");
     let RunStatus::Failed(why) = &run.status else {
@@ -2476,7 +2489,8 @@ async fn a_replayed_run_reads_its_embedding_back_rather_than_asking_again() {
         .build();
 
     let live = rt
-        .run("embeds", Tainted::trusted(json!({})))
+        .start("embeds", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("live embed");
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -2922,7 +2936,8 @@ async fn a_memory_rewritten_under_a_run_quarantines_it() {
         .build();
 
     let honest = rt
-        .run("recalls", Tainted::trusted(json!({})))
+        .start("recalls", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(
@@ -2933,7 +2948,8 @@ async fn a_memory_rewritten_under_a_run_quarantines_it() {
 
     active.store(true, std::sync::atomic::Ordering::SeqCst);
     let out = rt
-        .run("recalls", Tainted::trusted(json!({})))
+        .start("recalls", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("the run concludes");
 
@@ -3029,7 +3045,8 @@ async fn a_recall_cutoff_in_the_past_does_not_resurrect_an_expired_memory() {
         .skill(RecallsAsOfThePast)
         .build();
     let out = rt
-        .run("recalls-past", Tainted::trusted(json!({})))
+        .start("recalls-past", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
@@ -3737,7 +3754,8 @@ async fn the_expiry_sweep_reaches_the_semantic_index() {
         .build();
 
     let out = rt
-        .run("sweeps-memory", Tainted::trusted(json!({})))
+        .start("sweeps-memory", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("sweep");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -3795,7 +3813,8 @@ async fn an_embedding_counts_against_the_token_ceiling() {
         .build();
 
     let out = rt
-        .run("embeds-twice", Tainted::trusted(json!({})))
+        .start("embeds-twice", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("the run concludes");
     assert!(

@@ -139,10 +139,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1. live run — deltas as they arrive\n");
     print!("     ");
     let outcome = runtime
-        .run(
+        .start(
             "desk.answer",
             Tainted::trusted(json!({"q": "when does GB-4471 clear?"})),
         )
+        .run()
         .await?;
 
     let streamed = printer.buffered.lock().expect("not poisoned").clone();

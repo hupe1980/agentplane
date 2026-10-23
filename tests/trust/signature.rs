@@ -58,10 +58,11 @@ async fn signed_run(signer: Arc<Ed25519Signer>) -> (Arc<RedbStore>, Vec<Record>)
         .skill(Trivial)
         .build();
     let out = rt
-        .run_plan(
+        .start(
             agentplane::core::PlanIR::single("demo.trivial"),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
     let records = (store.clone() as Arc<dyn JournalStore>)
@@ -243,10 +244,11 @@ async fn an_unsigned_plane_is_ordinary_not_broken() {
         .skill(Trivial)
         .build();
     let out = rt
-        .run_plan(
+        .start(
             agentplane::core::PlanIR::single("demo.trivial"),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
 
@@ -325,10 +327,11 @@ async fn sealed_runs(store: &Arc<RedbStore>, n: usize) -> Vec<agentplane::core::
     let mut runs = Vec::new();
     for _ in 0..n {
         let out = rt
-            .run_plan(
+            .start(
                 agentplane::core::PlanIR::single("demo.trivial"),
                 Tainted::trusted(json!({})),
             )
+            .run()
             .await
             .unwrap();
         runs.push(out.run_id);
@@ -1092,10 +1095,11 @@ async fn an_audit_with_a_key_checks_who_wrote_it() {
         .skill(Trivial)
         .build();
     let out = rt
-        .run_plan(
+        .start(
             agentplane::core::PlanIR::single("demo.trivial"),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
     let s = store.clone() as Arc<dyn JournalStore>;
@@ -1257,7 +1261,8 @@ async fn the_audit_reports_who_raised_a_label_and_on_what_evidence() {
         .skill(Releases)
         .build();
     let out = rt
-        .run("demo.release", Tainted::trusted(serde_json::json!({})))
+        .start("demo.release", Tainted::trusted(serde_json::json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1354,7 +1359,8 @@ async fn an_audit_reports_what_authorized_each_run() {
         .skill(Quiet)
         .build();
     let out = rt
-        .run("demo.quiet", Tainted::trusted(serde_json::json!({})))
+        .start("demo.quiet", Tainted::trusted(serde_json::json!({})))
+        .run()
         .await
         .unwrap();
     let s = Arc::clone(&store) as Arc<dyn JournalStore>;
@@ -1380,7 +1386,8 @@ async fn an_audit_reports_what_authorized_each_run() {
         .skill(Quiet)
         .build();
     let out = rt
-        .run("demo.quiet", Tainted::trusted(serde_json::json!({})))
+        .start("demo.quiet", Tainted::trusted(serde_json::json!({})))
+        .run()
         .await
         .unwrap();
     let s = Arc::clone(&store) as Arc<dyn JournalStore>;
@@ -1584,7 +1591,8 @@ async fn a_missing_leaf_is_a_finding_only_for_a_sealed_conclusion() {
         .skill(Failing)
         .build();
     let open = rt
-        .run("demo.failing", Tainted::trusted(json!({})))
+        .start("demo.failing", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1975,10 +1983,11 @@ async fn an_audit_report_carries_no_caller_payload() {
         .skill(Echoes)
         .build();
     let out = rt
-        .run_plan(
+        .start(
             agentplane::core::PlanIR::single("demo.echo"),
             Tainted::trusted(json!({ "note": SECRET })),
         )
+        .run()
         .await
         .unwrap();
 

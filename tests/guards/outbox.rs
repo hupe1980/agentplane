@@ -141,7 +141,8 @@ impl Fixture {
 async fn a_completed_run_becomes_one_cloud_event() {
     let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
     let out =
-        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+            .run()
             .await
             .expect("the run completes");
 
@@ -181,7 +182,8 @@ async fn a_completed_run_becomes_one_cloud_event() {
 async fn a_receiver_that_was_down_catches_up_from_the_journal() {
     let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
     f.transport.fail_next(1);
-    f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+    f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -205,7 +207,8 @@ async fn two_destinations_are_delivered_to_independently() {
         Destination::new("bus", "https://bus.internal/events"),
         Destination::new("audit", "https://audit.internal/events"),
     ]);
-    f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+    f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -269,7 +272,8 @@ async fn one_stalled_receiver_does_not_hold_up_the_others() {
         .outbox(outbox)
         .try_build()
         .expect("a coherent plane");
-    rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+    rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -351,7 +355,8 @@ async fn a_sweep_opens_no_more_connections_than_its_ceiling() {
         .outbox(outbox)
         .try_build()
         .expect("a coherent plane");
-    rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+    rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+        .run()
         .await
         .expect("the run completes");
 
@@ -387,7 +392,8 @@ async fn a_sweep_opens_no_more_connections_than_its_ceiling() {
 async fn a_destination_is_registered_before_the_run_does_anything() {
     let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
     let out =
-        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+            .run()
             .await
             .expect("the run completes");
 
@@ -413,7 +419,8 @@ async fn a_destination_is_registered_before_the_run_does_anything() {
 async fn an_operator_worker_leaves_a_callers_webhook_alone() {
     let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
     let out =
-        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+            .run()
             .await
             .expect("the run completes");
 
@@ -467,7 +474,8 @@ async fn an_operator_worker_leaves_a_callers_webhook_alone() {
 async fn foreign_rows_at_the_head_of_the_window_neither_starve_nor_hide() {
     let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
     let out =
-        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+            .run()
             .await
             .expect("the run completes");
 
@@ -553,10 +561,11 @@ fn a_duplicate_destination_name_is_refused() {
 #[tokio::test]
 async fn the_default_projection_carries_the_outcome_and_not_the_answer() {
     let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
-    f.rt.run(
+    f.rt.start(
         "answer",
         Tainted::trusted(json!({ "iban": "DE00 0000 0000 0000 0000 00" })),
     )
+    .run()
     .await
     .expect("the run completes");
     f.worker().run_once(10, 10).await.expect("a sweep");
@@ -683,7 +692,8 @@ async fn a_gone_receiver_is_parked_at_once_and_a_failing_one_is_not() {
     ] {
         let f = fixture(vec![Destination::new("bus", "https://bus.internal/events")]);
         f.transport.answering(answer.clone());
-        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+            .run()
             .await
             .expect("the run completes");
 
@@ -715,7 +725,8 @@ async fn a_receivers_retry_after_is_honoured_and_bounded() {
             status: 503,
             retry_after: advice,
         });
-        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+            .run()
             .await
             .expect("the run completes");
         assert_eq!(f.worker().run_once(10, 10).await.unwrap().retries, 1);
@@ -761,7 +772,8 @@ async fn registrations_that_failed_together_do_not_come_back_together() {
     );
     f.transport.fail_next(u32::MAX);
     let run =
-        f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+        f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+            .run()
             .await
             .expect("the run completes");
 
@@ -820,7 +832,8 @@ async fn a_parked_registration_keeps_its_cursor_and_can_be_re_armed() {
         status: 410,
         retry_after: None,
     });
-    f.rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+    f.rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+        .run()
         .await
         .expect("the run completes");
     assert_eq!(f.worker().run_once(10, 10).await.unwrap().parked, 1);
@@ -979,7 +992,8 @@ async fn a_resume_registers_the_destinations_its_admission_could_not() {
         .try_build()
         .expect("a coherent plane");
 
-    rt.run("answer", Tainted::trusted(json!({ "q": 1 })))
+    rt.start("answer", Tainted::trusted(json!({ "q": 1 })))
+        .run()
         .await
         .expect_err("an admission whose registration failed is refused");
     let run = *store

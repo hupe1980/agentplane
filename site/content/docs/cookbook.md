@@ -124,7 +124,10 @@ let rt = Runtime::builder(Arc::clone(&store))
     .build();
 
 // One capability: no plan needed.
-let out = rt.run("ticket.triage", Tainted::trusted(json!({ "text": "printer on fire" }))).await?;
+let out = rt
+    .start("ticket.triage", Tainted::trusted(json!({ "text": "printer on fire" })))
+    .run()
+    .await?;
 
 // Several: name the order, and what feeds what.
 let plan = PlanIR::new(vec![
@@ -133,7 +136,10 @@ let plan = PlanIR::new(vec![
         .arg("triage", ArgSource::node(StepId(0)))
         .terminal(),
 ]);
-let out = rt.run_plan(plan, Tainted::trusted(json!({ "text": "printer on fire" }))).await?;
+let out = rt
+    .start(plan, Tainted::trusted(json!({ "text": "printer on fire" })))
+    .run()
+    .await?;
 ```
 
 ### Which one: a plan, or a commission?
@@ -160,7 +166,7 @@ plan is checkable in advance and a commission is not; the commission's advantage
 is that it does not need to be.
 
 Most agents need neither, and most of the examples in this repository are the
-evidence: `rt.run(capability, Tainted::trusted(input))` is one capability and no
+evidence: `rt.start(capability, input).run()` is one capability and no
 graph.
 
 ### Fan out to several specialists at once
@@ -174,7 +180,7 @@ let plan = PlanIR::fan_out(
     ["billing.anomaly", "billing.regulatory"],   // run concurrently
     "billing.decide",                            // then combine
 );
-let out = rt.run_plan(plan, Tainted::trusted(document)).await?;
+let out = rt.start(plan, Tainted::trusted(document)).run().await?;
 ```
 
 The aggregator receives one argument per branch, **keyed by the capability that
@@ -335,13 +341,15 @@ let rt = Runtime::builder(store)
     .agent(Agent::new(&m))
     .build();
 
-let out = rt.run("support.summarise", Tainted::trusted(ticket)).await?;
+let out = rt.start("support.summarise", Tainted::trusted(ticket)).run().await?;
 ```
 
-Rust-generated declarations use `Manifest::builder(name, version)` with
-`.configure(|spec| ...)` or `.spec(spec)`, then `.build()`. The builder is
-deliberately thin: nested values remain the same public typed `Spec` used by
-Serde, and build runs the same normalization and validation as YAML. Direct
+Rust-generated declarations use `Manifest::builder(name, version)`, its typed
+steps for the common fields (`provides`, `tool`, `privileged_model`,
+`quarantined_model`, `budgets`, `egress_ceiling`), and `.configure(|spec| ...)`
+or `.spec(spec)` for the rest, then `.build()`. Nested values remain the same
+public typed `Spec` used by Serde, and build runs the same normalization and
+validation as YAML. Direct
 struct construction should finish with `manifest.build()`; otherwise the value
 has not earned the guarantees a parsed manifest has.
 
@@ -547,25 +555,28 @@ burned. You do not have to do anything to get that.
 ## 💾 Cache a stable prefix {#cache-a-stable-prefix}
 
 An agent that resends the same tools and instructions every turn pays for them
-every turn unless the request marks them. Anthropic caches what comes before a
-breakpoint, in the order tools, system, messages:
+every turn unless the request marks them. Mark a declaration, and build the
+prompt with `Prompt`, whose parts each keep their label and may close a cached
+prefix:
 
 ```rust
-use agentplane::model::{CacheTtl, ToolDeclaration};
+use agentplane::model::{CacheTtl, Prompt, ToolDeclaration};
 
 // The last declaration closes the tool prefix.
 let tools = [read_decl, write_decl.cache_breakpoint(CacheTtl::OneHour)];
-let prompt = json!({
-    // System and message blocks pass through verbatim, marks included.
-    "system": [{ "type": "text", "text": instructions, "cache_control": { "type": "ephemeral" } }],
-    "messages": history,
-});
+let prompt = Prompt::new()
+    .system_cached(Tainted::trusted(policy), CacheTtl::OneHour)
+    .system_cached(Tainted::trusted(plan), CacheTtl::FiveMinutes)
+    .input(task) // a Tainted<String> with whatever label it came with
+    .build();
 ```
 
-The other drivers ignore the mark, so one declaration still serves every
-provider. A marked declaration is a different request, so it is a different
-effect key; an unmarked one does not change the key. The one-hour TTL needs no
-beta header.
+Order the parts from most to least stable. Each driver spells the mark its own
+way: `cache_control` on Anthropic, a `cachePoint` block on Bedrock. Responses
+caches every prefix unasked and Gemini caches implicitly, so those drivers drop
+the mark, as do OpenAI-compatible servers, which join the parts with a blank
+line. A marked part is a different request, so it is a different effect key.
+The one-hour TTL needs no beta header.
 
 **The trap:** pricing every write at one rate. The provider bills a one-hour
 write at 2× the input rate and a five-minute one at 1.25×. The driver reads which
@@ -767,22 +778,17 @@ what has no default, and `ToolGrant::new` mutates unless told otherwise, as the
 YAML does:
 
 ```rust
-use agentplane::manifest::{Budgets, Manifest, ModelRef, Models, ToolGrant};
+use agentplane::manifest::{Budgets, Manifest, ModelRef, ToolGrant};
 
 let model = SourceId::new("model:anthropic/claude-sonnet-5");
 let m = Manifest::builder("auditor", "1.0.0")
-    .configure(|spec| {
-        spec.capabilities.provides.push("audit.correct".to_owned());
-        spec.models = Some(Models {
-            privileged: Some(ModelRef::new("anthropic", "claude-sonnet-5")),
-            ..Models::default()
-        });
-        spec.tools.push(ToolGrant {
-            protected_fields: vec![ProtectedField::from_sources("/correction", [model])],
-            ..ToolGrant::new("tool://validator/apply_correction")
-        });
-        spec.budgets = Some(Budgets { max_tokens: Some(120_000), ..Budgets::default() });
+    .provides("audit.correct")
+    .privileged_model(ModelRef::new("anthropic", "claude-sonnet-5"))
+    .tool(ToolGrant {
+        protected_fields: vec![ProtectedField::from_sources("/correction", [model])],
+        ..ToolGrant::new("tool://validator/apply_correction")
     })
+    .budgets(Budgets { max_tokens: Some(120_000), ..Budgets::default() })
     .build()?;
 ```
 
@@ -833,7 +839,10 @@ A month-long process is a **case** plus short runs. Start a run correlated by
 business key, and it joins the existing case or opens one:
 
 ```rust
-rt.run_correlated("claim.assess", Tainted::trusted(input), "claim", &[CorrelationKey::new("claim", "CLM-9")]).await?;
+rt.start("claim.assess", Tainted::trusted(input))
+    .terms(RunTerms::default().correlated("claim", &[CorrelationKey::new("claim", "CLM-9")]))
+    .run()
+    .await?;
 ```
 
 Inside the skill, case state is versioned and every access is journaled:
@@ -1385,13 +1394,13 @@ itself, use the `openai` driver — Responses is the current primitive there.
 ## 🔁 Act on an at-least-once message exactly once {#act-on-an-at-least-once-message-exactly-once}
 
 ```rust
-match rt.run_correlated_once(
-    "claim.assess",
-    Tainted::from_source(body, SourceId::new("bus")),   // it came from outside
-    "claim",
-    &[CorrelationKey::new("claim", &claim_id)],
-    &event.dedup_key(),          // source ␟ id — the message's own identity
-).await? {
+match rt
+    .start("claim.assess", Tainted::from_source(body, SourceId::new("bus"))) // it came from outside
+    .terms(RunTerms::default().correlated("claim", &[CorrelationKey::new("claim", &claim_id)]))
+    .once(event.dedup_key()) // source ␟ id — the message's own identity
+    .run()
+    .await?
+{
     Admission::Fresh(outcome)    => /* we admitted it */,
     Admission::Replayed(outcome) => /* already done, or already waiting */,
     Admission::InFlight(run)     => /* already running — answer 202, not 500 */,
@@ -1428,9 +1437,14 @@ a **suspended** run is a resting point — a redelivery of a message whose run i
 parked on a four-eyes decision is told *this is already waiting for you*, rather
 than opening a second identical approval.
 
-`spawn_correlated_once` is the non-blocking form and returns
-`Spawned { run, fresh }`. Any other combination — a case binding, a chain per
-run — goes through `spawn_under` with `RunTerms`, which composes all of them.
+`.spawn()` in place of `.run()` is the non-blocking form and returns
+`Spawned { run, fresh }`. A case binding, a chain per run, who asked — all go
+in `RunTerms`, which composes them.
+
+**Restarting after a kill?** Send the same request with `.settle()` in place of
+`.run()`. It answers with the value of the run the key admitted: run now if the
+key is unused, re-derived by strict replay if the run rested, resumed if its
+holder is gone, followed on the journal until it rests if not.
 
 **The third trap:** an empty key. A missing header or an unset variable arrives
 as `""`, and `""` is a perfectly good key — the first message claims it and every
@@ -2525,7 +2539,11 @@ let delivery = verifier.verify(
     now,         // the clock is the caller's, as everywhere else in this crate
 )?;
 
-rt.run_correlated_once(cap, input, kind, keys, &delivery.id).await?;
+rt.start(cap, input)
+    .terms(RunTerms::default().correlated(kind, keys))
+    .once(&delivery.id)
+    .run()
+    .await?;
 ```
 
 The interesting half of verification is not the HMAC — it is the two things
@@ -2538,7 +2556,7 @@ verifies, and the failure is a replay nobody sees.
 
 `verify` refuses the first — five minutes either way, `within()` to change it —
 and hands back `delivery.id` for the second, which is exactly what
-`run_correlated_once` takes as its admission key.
+`.once(..)` takes as its admission key.
 
 **The trap:** verifying a parsed body. The signature covers the bytes received;
 checking it against a re-serialization is what makes a whitespace-insensitive

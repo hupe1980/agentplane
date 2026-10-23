@@ -19,7 +19,7 @@ use agentplane::core::{
     SkillError, Tainted,
 };
 use agentplane::journal::JournalStore;
-use agentplane::runtime::{Invariant, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Invariant, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -316,7 +316,8 @@ async fn run(world: &Arc<World>, script: Value) -> agentplane::runtime::RunOutco
             world: Arc::clone(world),
         })
         .build();
-    rt.run("checkout", Tainted::trusted(script))
+    rt.start("checkout", Tainted::trusted(script))
+        .run()
         .await
         .expect("run")
 }
@@ -626,7 +627,8 @@ async fn a_reversal_is_journaled_and_is_not_repeated_on_replay() {
         .build();
 
     let out = rt
-        .run("checkout", Tainted::trusted(json!({})))
+        .start("checkout", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -726,7 +728,8 @@ async fn a_group_survives_a_suspension_without_being_reversed() {
         .build();
 
     let out = rt
-        .run("waits", Tainted::trusted(json!({})))
+        .start("waits", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -785,7 +788,8 @@ async fn exhaustion_inside_a_group_pauses_and_a_cancel_still_unwinds_it() {
         .build();
 
     let out = rt
-        .run("checkout", Tainted::trusted(json!({})))
+        .start("checkout", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -877,7 +881,8 @@ async fn a_group_left_open_behind_a_replan_is_still_reversed() {
         .build();
 
     let out = rt
-        .run("replans", Tainted::trusted(json!({})))
+        .start("replans", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -997,7 +1002,8 @@ async fn a_probe_decides_whether_a_group_member_needs_reversing() {
                 landed,
             })
             .build();
-        rt.run("probes", Tainted::trusted(json!({})))
+        rt.start("probes", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
 
@@ -1103,7 +1109,8 @@ async fn a_committed_group_is_still_undone_by_the_step_s_own_compensation() {
             .terminal(),
     ]);
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -1204,7 +1211,8 @@ async fn concurrent_steps_each_get_their_own_group() {
             .arg("r", ArgSource::node(StepId(1)))
             .terminal(),
     ]);
-    rt.run_plan(plan, Tainted::trusted(json!({})))
+    rt.start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -1275,12 +1283,11 @@ async fn a_group_survives_waiting_for_an_event() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "awaits",
-            Tainted::trusted(json!({})),
-            "shipment",
-            &[CorrelationKey::new("shipment", "S-1")],
+        .start("awaits", Tainted::trusted(json!({})))
+        .terms(
+            RunTerms::default().correlated("shipment", &[CorrelationKey::new("shipment", "S-1")]),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -1389,7 +1396,8 @@ async fn the_gate_exemption_ends_with_the_reversal() {
         .build();
 
     let out = rt
-        .run("aborts", Tainted::trusted(json!({})))
+        .start("aborts", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -1495,7 +1503,8 @@ async fn a_member_that_binds_outbound_arguments_is_refused_at_registration() {
             .build();
 
         let out = rt
-            .run("registers", Tainted::trusted(json!({})))
+            .start("registers", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         // Deferred: nothing has run, so it is an ordinary refusal and the group
@@ -1577,7 +1586,8 @@ async fn a_gated_member_that_fails_after_another_landed_does_not_unwind() {
         .build();
 
     let out = rt
-        .run("two.sends", Tainted::trusted(json!({})))
+        .start("two.sends", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -1656,7 +1666,8 @@ async fn a_group_spanning_a_suspension_is_announced_once() {
         .build();
 
     let out = rt
-        .run("waits2", Tainted::trusted(json!({})))
+        .start("waits2", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(out.status.is_suspended());
@@ -1807,7 +1818,8 @@ async fn an_atomic_member_commits_with_the_journal() {
         .build();
 
     let out = rt
-        .run("books", Tainted::trusted(json!({})))
+        .start("books", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -1862,7 +1874,8 @@ async fn a_refused_atomic_member_leaves_nothing_behind() {
         .build();
 
     let out = rt
-        .run("books", Tainted::trusted(json!({})))
+        .start("books", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -1923,7 +1936,8 @@ async fn a_lost_commit_acknowledgement_quarantines_the_group() {
         .build();
 
     let out = rt
-        .run("books", Tainted::trusted(json!({})))
+        .start("books", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -1975,7 +1989,8 @@ async fn a_replayed_atomic_member_is_not_applied_again() {
         .build();
 
     let out = rt
-        .run("books", Tainted::trusted(json!({})))
+        .start("books", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -2028,7 +2043,8 @@ async fn an_atomic_member_is_refused_by_a_store_that_cannot_enlist() {
         .build();
 
     let out = rt
-        .run("books", Tainted::trusted(json!({})))
+        .start("books", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     let RunStatus::Failed(why) = &out.status else {
@@ -2087,7 +2103,8 @@ async fn an_atomic_member_is_authorized_before_it_commits() {
         .build();
 
     let out = rt
-        .run("books", Tainted::trusted(json!({})))
+        .start("books", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -2181,7 +2198,8 @@ async fn a_deferred_failure_after_an_atomic_commit_is_not_an_abort() {
         .build();
 
     let out = rt
-        .run("post.then.send", Tainted::trusted(json!({})))
+        .start("post.then.send", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -2365,7 +2383,8 @@ async fn a_resume_does_not_settle_a_settled_group_again() {
         .build();
 
     let out = rt
-        .run("commits-then-fails", Tainted::trusted(json!({})))
+        .start("commits-then-fails", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -2493,7 +2512,8 @@ async fn two_settlements_of_one_name_both_record_and_neither_repeats() {
         .build();
 
     let out = rt
-        .run("settles-twice", Tainted::trusted(json!({})))
+        .start("settles-twice", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -2594,7 +2614,8 @@ async fn a_send_whose_outcome_could_not_be_recorded_is_not_reported_taken_back()
         .build();
 
     let out = rt
-        .run("send.only", Tainted::trusted(json!({})))
+        .start("send.only", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
 
@@ -2689,7 +2710,8 @@ async fn a_refusal_inside_a_group_is_continued_by_a_raised_ceiling() {
 
     let capped = build(agentplane::core::Budget::default().effects(1));
     let out = capped
-        .run("hold.then.send", Tainted::trusted(json!({})))
+        .start("hold.then.send", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -2744,7 +2766,8 @@ async fn a_cancel_under_a_raised_ceiling_sends_nothing() {
 
     let capped = build(agentplane::core::Budget::default().effects(1));
     let out = capped
-        .run("hold.then.send", Tainted::trusted(json!({})))
+        .start("hold.then.send", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -2841,7 +2864,8 @@ async fn a_cancel_after_a_wait_ended_sends_nothing() {
         .build();
 
     let out = rt
-        .run("hold.wait.send", Tainted::trusted(json!({})))
+        .start("hold.wait.send", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -2932,7 +2956,8 @@ async fn a_resumed_atomic_member_consumes_its_recorded_denial() {
         .build();
 
     let out = rt
-        .run("books", Tainted::trusted(json!({})))
+        .start("books", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -3037,7 +3062,8 @@ async fn a_cleanly_aborted_group_leaves_its_step_nothing_to_unwind() {
             .terminal(),
     ]);
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({ "ending": "invariant" })))
+        .start(plan, Tainted::trusted(json!({ "ending": "invariant" })))
+        .run()
         .await
         .expect("run");
 
@@ -3108,7 +3134,8 @@ async fn a_wiring_fault_beside_an_open_group_aborts_it() {
         })
         .build();
     let out = rt
-        .run("sleeps", Tainted::trusted(json!({})))
+        .start("sleeps", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -3207,7 +3234,8 @@ async fn a_refused_second_atomic_member_replays_as_it_ran() {
         })
         .build();
     let out = rt
-        .run("transfers", Tainted::trusted(json!({})))
+        .start("transfers", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(

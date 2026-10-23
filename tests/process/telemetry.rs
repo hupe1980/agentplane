@@ -302,7 +302,8 @@ async fn a_run_produces_run_step_and_effect_spans() {
 
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.one", Tainted::trusted(json!({})))
+        .start("demo.one", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -341,7 +342,8 @@ async fn an_undecidable_outcome_emits_its_event() {
 
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.one", Tainted::trusted(json!({})))
+        .start("demo.one", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -377,7 +379,8 @@ async fn abandoning_a_quarantined_run_emits_its_event() {
 
     let _ambient = crate::ambient_subscriber();
     let out = rt
-        .run("demo.one", Tainted::trusted(json!({})))
+        .start("demo.one", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Quarantined(_)));
@@ -425,7 +428,8 @@ async fn a_budget_refusal_emits_its_event() {
 
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.two", Tainted::trusted(json!({})))
+        .start("demo.two", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -454,7 +458,8 @@ async fn a_budget_refusal_emits_its_event() {
 async fn a_replayed_effect_is_not_reported_as_a_real_call() {
     let (_s, rt) = runtime(healthy());
     let first = rt
-        .run("demo.one", Tainted::trusted(json!({})))
+        .start("demo.one", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -552,7 +557,8 @@ async fn concurrent_steps_do_not_capture_each_others_spans() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -639,7 +645,8 @@ async fn a_model_call_is_reported_as_a_gen_ai_chat() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.asks", Tainted::trusted(json!({})))
+        .start("demo.asks", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -736,7 +743,10 @@ async fn a_failed_attempt_names_the_class_of_fault() {
 
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
-    let _ = rt.run("demo.asks", Tainted::trusted(json!({}))).await;
+    let _ = rt
+        .start("demo.asks", Tainted::trusted(json!({})))
+        .run()
+        .await;
     drop(guard);
 
     let recorded = rec.recorded();
@@ -822,7 +832,8 @@ async fn an_erased_effect_reports_what_a_typed_one_does() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.boxes", Tainted::trusted(json!({})))
+        .start("demo.boxes", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -857,7 +868,8 @@ async fn an_ordinary_effect_carries_no_gen_ai_operation() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.one", Tainted::trusted(json!({})))
+        .start("demo.one", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -961,7 +973,8 @@ async fn a_failed_runs_event_carries_a_digest_not_the_reason() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.refuses", Tainted::trusted(json!({})))
+        .start("demo.refuses", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -1022,7 +1035,8 @@ async fn an_undecidable_effects_events_carry_no_provider_text() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.sends", Tainted::trusted(json!({})))
+        .start("demo.sends", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1132,7 +1146,8 @@ async fn a_failed_compensations_event_carries_no_error_text() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -1215,7 +1230,8 @@ async fn gen_ai_spans_carry_the_conventions_name_kind_and_provider() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let out = rt
-        .run("demo.via", Tainted::trusted(json!({})))
+        .start("demo.via", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -1250,7 +1266,8 @@ async fn a_spawned_run_is_a_child_of_the_callers_span() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(rec.clone());
     let run = rt
-        .spawn("demo.one", Tainted::trusted(json!({})))
+        .start("demo.one", Tainted::trusted(json!({})))
+        .spawn()
         .instrument(tracing::info_span!("embedder.task"))
         .await
         .unwrap();

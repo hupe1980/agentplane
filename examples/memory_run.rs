@@ -140,13 +140,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let learned = runtime
-        .run(
+        .start(
             "support.memory",
             Tainted::from_source(
                 json!({"action": "remember", "fact": "Customer prefers German"}),
                 SourceId::new("user:customer-7"),
             ),
         )
+        .run()
         .await?;
     assert_eq!(
         learned.output.as_ref().map(|o| o.peek().clone()),
@@ -155,10 +156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1. remembered      → \"Customer prefers German\"");
 
     let recalled = runtime
-        .run(
+        .start(
             "support.memory",
             Tainted::trusted(json!({"action": "recall"})),
         )
+        .run()
         .await?;
     assert_eq!(
         recalled.output.map(|o| o.peek().clone()),
@@ -236,7 +238,8 @@ async fn semantic_recall(
         .skill(SemanticMemory)
         .build();
     let ranked = semantic
-        .run("support.semantic-memory", Tainted::trusted(json!({})))
+        .start("support.semantic-memory", Tainted::trusted(json!({})))
+        .run()
         .await?;
     assert_eq!(
         ranked.output.map(|o| o.peek().clone()),

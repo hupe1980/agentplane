@@ -1058,10 +1058,16 @@ Details worth stating:
   400. `StrictSubset` holds each as an allow-list — OpenAI's as probed against
   its API, Anthropic's as documented, with its per-request budget of twenty
   strict tools — and names the keyword and path it refuses. A response schema
-  outside the subset is refused; a tool is sent non-strict. A caller's schema
-  is never rewritten, since the effect key would record one shape and the wire
-  carry another; a typed tool's generated schema is made strict-ready where it
-  is generated.
+  outside the subset is refused; a tool is sent non-strict, on Bedrock too,
+  which holds Converse tools to Anthropic's subset and budget. A caller's
+  schema is never rewritten, since the effect key would record one shape and
+  the wire carry another; a typed tool's generated schema is made strict-ready
+  where it is generated, and a server's is narrowed where its grant is drafted.
+* **One prompt reads the same on every driver.** Every driver accepts
+  `{ system, input }` — strings, or text parts built with `model::Prompt` —
+  beside its own wire's shape. A part's cache mark becomes `cache_control` on
+  Anthropic and a `cachePoint` on Bedrock, which marks tools the same way; the
+  other drivers' providers cache without marks, so they drop it.
 * **Provider enforcement is not blindly trusted.** Returned structured output is
   parsed and validated locally against the exact requested schema. External
   schema reference resolution is disabled, so validation cannot become hidden

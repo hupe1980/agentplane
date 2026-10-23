@@ -94,10 +94,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. The ceiling binds ───────────────────────────────────────────────
     let capped = plane(&store, &world, Budget::unlimited().effects(2));
     let out = capped
-        .run(
+        .start(
             "billing.settle",
             Tainted::trusted(json!({ "batch": "B-7" })),
         )
+        .run()
         .await?;
     println!("1. two effects of budget, three postings to make");
     println!("   run            → {:?}", out.status);

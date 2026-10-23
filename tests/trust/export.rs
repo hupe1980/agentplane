@@ -44,7 +44,8 @@ async fn one_run() -> (Arc<dyn JournalStore>, agentplane::core::RunId) {
         .skill(Trivial)
         .build();
     let out = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .run()
         .await
         .expect("run");
     (store as Arc<dyn JournalStore>, out.run_id)
@@ -590,12 +591,14 @@ async fn a_run_that_cannot_be_read_is_named_in_the_trailer() {
         .skill(Trivial)
         .build();
     let healthy = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .run()
         .await
         .expect("run")
         .run_id;
     let damaged = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 2 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 2 })))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -664,7 +667,8 @@ async fn a_faithful_export_verifies_from_the_file_alone() {
     let mut runs = Vec::new();
     for n in 0..3 {
         runs.push(
-            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+            rt.start("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .run()
                 .await
                 .expect("run")
                 .run_id,
@@ -716,7 +720,8 @@ async fn a_run_removed_from_the_middle_is_caught_by_the_rebuilt_root() {
     let mut runs = Vec::new();
     for n in 0..3 {
         runs.push(
-            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+            rt.start("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .run()
                 .await
                 .expect("run")
                 .run_id,
@@ -986,7 +991,8 @@ async fn a_restore_writes_only_into_the_tenant_it_was_pointed_at() {
         .skill(Trivial)
         .build();
     let run = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -1007,7 +1013,8 @@ async fn a_restore_writes_only_into_the_tenant_it_was_pointed_at() {
         .skill(Trivial)
         .build();
     let theirs = neighbour_rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 9 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 9 })))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -1081,14 +1088,17 @@ async fn a_restored_store_rebuilds_the_same_checkpoint() {
     // The first carries an admission key, so the index derived from it has
     // something to lose.
     runs.push(
-        rt.run_once("demo.trivial", Tainted::trusted(json!({ "n": 0 })), KEY)
+        rt.start("demo.trivial", Tainted::trusted(json!({ "n": 0 })))
+            .once(KEY)
+            .run()
             .await
             .expect("run")
             .run_id(),
     );
     for n in 1..3 {
         runs.push(
-            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+            rt.start("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .run()
                 .await
                 .expect("run")
                 .run_id,
@@ -1408,7 +1418,8 @@ async fn a_duplicated_log_position_is_named_rather_than_left_as_a_root_mismatch(
     let mut runs = Vec::new();
     for n in 0..2 {
         runs.push(
-            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+            rt.start("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .run()
                 .await
                 .expect("run")
                 .run_id,
@@ -1669,7 +1680,8 @@ async fn a_package_taken_while_runs_seal_verifies() {
     Runtime::builder(Arc::clone(&plane.journal))
         .skill(Trivial)
         .build()
-        .run("demo.trivial", Tainted::trusted(json!("sealed meanwhile")))
+        .start("demo.trivial", Tainted::trusted(json!("sealed meanwhile")))
+        .run()
         .await
         .expect("run");
     let racing: Arc<dyn JournalStore> = Arc::new(Doctored {
@@ -1706,12 +1718,15 @@ async fn a_package_refuses_a_concluded_run_it_cannot_place() {
         .cases(Arc::clone(&plane.cases))
         .skill(Trivial)
         .build()
-        .run_correlated(
+        .start(
             "demo.trivial",
             Tainted::trusted(json!("sealed after the checkpoint")),
+        )
+        .terms(agentplane::runtime::RunTerms::default().correlated(
             "matter",
             &[agentplane::core::CorrelationKey::new("document", "DOC-A")],
-        )
+        ))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -1898,7 +1913,8 @@ async fn a_run_sealed_after_the_checkpoint_exports_as_still_open() {
         .skill(Trivial)
         .build();
     let first = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -1907,7 +1923,8 @@ async fn a_run_sealed_after_the_checkpoint_exports_as_still_open() {
 
     // Sealed after the checkpoint was taken — the race, made deterministic.
     let late = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 2 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 2 })))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -1981,7 +1998,8 @@ async fn an_edited_record_in_an_open_run_is_not_sound() {
         .skill(Failing)
         .build();
     let out = rt
-        .run("demo.failing", Tainted::trusted(json!({ "n": 1 })))
+        .start("demo.failing", Tainted::trusted(json!({ "n": 1 })))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -2052,7 +2070,9 @@ async fn the_case_layer_survives_export_and_restore() {
         .build();
     let keys = [CorrelationKey::new("document", "DOC-77")];
     let out = rt
-        .run_correlated("demo.trivial", Tainted::trusted(json!(1)), "matter", &keys)
+        .start("demo.trivial", Tainted::trusted(json!(1)))
+        .terms(agentplane::runtime::RunTerms::default().correlated("matter", &keys))
+        .run()
         .await
         .expect("run");
     let case_id = (Arc::clone(&origin) as Arc<dyn CaseStore>)
@@ -2259,12 +2279,12 @@ async fn a_dropped_case_layer_is_a_finding_not_a_quiet_file() {
         .skill(Trivial)
         .build();
     let out = rt
-        .run_correlated(
-            "demo.trivial",
-            Tainted::trusted(json!(1)),
-            "matter",
-            &[CorrelationKey::new("document", "DOC-88")],
+        .start("demo.trivial", Tainted::trusted(json!(1)))
+        .terms(
+            agentplane::runtime::RunTerms::default()
+                .correlated("matter", &[CorrelationKey::new("document", "DOC-88")]),
         )
+        .run()
         .await
         .expect("run");
 
@@ -2336,7 +2356,8 @@ async fn a_sealed_journals_export_carries_no_plaintext() {
         .skill(Trivial)
         .build();
     let out = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": secret })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": secret })))
+        .run()
         .await
         .expect("run");
 
@@ -2401,7 +2422,8 @@ async fn a_restore_refuses_a_sealing_target_before_writing() {
         .skill(Trivial)
         .build();
     let out = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .run()
         .await
         .expect("run");
     let mut file = Vec::new();
@@ -2799,12 +2821,14 @@ async fn a_declared_unreadable_run_is_unchecked_not_a_tamper_finding() {
         .skill(Trivial)
         .build();
     let healthy = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 1 })))
+        .run()
         .await
         .expect("run")
         .run_id;
     let damaged = rt
-        .run("demo.trivial", Tainted::trusted(json!({ "n": 2 })))
+        .start("demo.trivial", Tainted::trusted(json!({ "n": 2 })))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -3126,7 +3150,8 @@ async fn an_export_with_a_rewritten_header_needs_an_outside_checkpoint() {
     let mut runs = Vec::new();
     for n in 0..3 {
         runs.push(
-            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+            rt.start("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .run()
                 .await
                 .expect("run")
                 .run_id,
@@ -3500,7 +3525,8 @@ async fn a_run_dropped_below_a_prefix_anchor_is_a_finding() {
     let mut earlier = None;
     for n in 0..10 {
         runs.push(
-            rt.run("demo.trivial", Tainted::trusted(json!({ "n": n })))
+            rt.start("demo.trivial", Tainted::trusted(json!({ "n": n })))
+                .run()
                 .await
                 .expect("run")
                 .run_id,

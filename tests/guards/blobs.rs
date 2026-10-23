@@ -395,7 +395,9 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
         .build();
 
     let first = rt
-        .run_correlated("records.file", Tainted::trusted(json!({})), "claim", &keys)
+        .start("records.file", Tainted::trusted(json!({})))
+        .terms(agentplane::runtime::RunTerms::default().correlated("claim", &keys))
+        .run()
         .await
         .expect("the first run");
     assert!(
@@ -446,7 +448,9 @@ async fn a_run_cannot_put_back_what_an_erasure_removed() {
         "an erased case was reopened, so its next run writes into the erased scope"
     );
     let again = rt
-        .run_correlated("records.file", Tainted::trusted(json!({})), "claim", &keys)
+        .start("records.file", Tainted::trusted(json!({})))
+        .terms(agentplane::runtime::RunTerms::default().correlated("claim", &keys))
+        .run()
         .await
         .expect("the second run is admitted");
     let reopened = cases
@@ -2309,10 +2313,11 @@ async fn read_blob(
         .skill(ReadsBlob { digest, swallow })
         .build();
     let out = rt
-        .run(
+        .start(
             "blob.read",
             agentplane::core::Tainted::trusted(serde_json::Value::Null),
         )
+        .run()
         .await
         .expect("admitted");
     (rt, out)

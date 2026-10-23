@@ -26,7 +26,7 @@ use agentplane::core::{
     SkillDescriptor, SkillError, StepError, Tainted, TaskSpec,
 };
 use agentplane::journal::{Append, JournalStore, RecordKind};
-use agentplane::runtime::{Runtime, StepCtx};
+use agentplane::runtime::{RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -205,12 +205,12 @@ impl Fixture {
     async fn pending_task(&self) -> String {
         let out = self
             .rt
-            .run_correlated(
-                "demo.refund",
-                Tainted::trusted(json!({})),
-                "dispute",
-                &[CorrelationKey::new("document", "INV-1")],
+            .start("demo.refund", Tainted::trusted(json!({})))
+            .terms(
+                RunTerms::default()
+                    .correlated("dispute", &[CorrelationKey::new("document", "INV-1")]),
             )
+            .run()
             .await
             .unwrap();
         assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -640,14 +640,13 @@ async fn a_truncated_worklist_says_it_was_truncated() {
     // Three tasks, one per run — see `two_runs_of_one_plan_do_not_share_one_task`
     // in tests/tasks.rs for why that is not a given.
     for doc in ["INV-1", "INV-2", "INV-3"] {
-        f.rt.run_correlated(
-            "demo.refund",
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[CorrelationKey::new("document", doc)],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.refund", Tainted::trusted(json!({})))
+            .terms(
+                RunTerms::default().correlated("dispute", &[CorrelationKey::new("document", doc)]),
+            )
+            .run()
+            .await
+            .unwrap();
     }
 
     let router = Api::new(f.rt.clone(), Arc::new(HeaderAuth))
@@ -1693,7 +1692,8 @@ async fn a_failed_runs_view_carries_the_reason_the_seal_records() {
         .skill(Refuses)
         .build();
     let out = rt
-        .run("demo.refusal", Tainted::trusted(json!({})))
+        .start("demo.refusal", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
@@ -1742,7 +1742,8 @@ async fn a_failed_run_resumed_to_the_same_failure_still_reads_as_failed() {
         .skill(Refuses)
         .build();
     let out = rt
-        .run("demo.refusal", Tainted::trusted(json!({})))
+        .start("demo.refusal", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     for _ in 0..2 {
@@ -1787,7 +1788,8 @@ async fn an_exhausted_runs_view_carries_the_typed_ceiling() {
         .skill(Exhausts)
         .build();
     let out = rt
-        .run("demo.exhausts", Tainted::trusted(json!({})))
+        .start("demo.exhausts", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let router = Api::new(rt, Arc::new(HeaderAuth)).unwrap().router();
@@ -2743,12 +2745,11 @@ async fn a_caller_cannot_read_another_tenants_run() {
 
     // A real run in acme, whose id globex will present.
     let theirs = acme_plane
-        .run_correlated(
-            "demo.refund",
-            Tainted::trusted(json!({})),
-            "dispute",
-            &[CorrelationKey::new("document", "INV-7")],
+        .start("demo.refund", Tainted::trusted(json!({})))
+        .terms(
+            RunTerms::default().correlated("dispute", &[CorrelationKey::new("document", "INV-7")]),
         )
+        .run()
         .await
         .unwrap()
         .run_id
@@ -3126,7 +3127,8 @@ async fn open_concluded_run() -> (
         .skill(Fails)
         .build();
     let out = rt
-        .run("demo.fails", Tainted::trusted(json!({})))
+        .start("demo.fails", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     (store, rt, out.run_id)
@@ -3757,7 +3759,8 @@ async fn a_cancel_is_refused_in_the_status_its_cause_calls_for() {
         .skill(Finishes)
         .build();
     let sealed = rt
-        .run("demo.finish", Tainted::trusted(json!({})))
+        .start("demo.finish", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("a run that finishes")
         .run_id;

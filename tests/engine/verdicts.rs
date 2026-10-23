@@ -59,10 +59,11 @@ async fn record(
         .agent(Agent::new(&manifest(yaml)))
         .build();
     let out = rt
-        .run(
+        .start(
             "support.summarise",
             Tainted::trusted(json!({ "ticket": "printer on fire" })),
         )
+        .run()
         .await
         .expect("the run completes");
     (store, out.run_id)
@@ -369,7 +370,8 @@ async fn a_tool_calling_run_replays_with_no_transport_and_no_credentials() {
         .agent(Agent::new(&manifest(TELLER)))
         .build();
     let out = rt
-        .run("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .start("ledger.ask", Tainted::trusted(json!({ "q": "AC-1?" })))
+        .run()
         .await
         .expect("the run completes");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");

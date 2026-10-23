@@ -204,9 +204,9 @@ pub enum BuildError {
         "agent '{agent}' declares {declared}, so a run must be able to open a \
          task and suspend until somebody decides it — but this plane has no \
          {missing}. Wire it with `RuntimeBuilder::{remedy}(..)`, or drop the \
-         oversight declaration. A run admitted through plain `run(..)` also has \
-         no case, so give it correlation keys with `run_correlated(..)` or name \
-         one with `run_in_case(..)`"
+         oversight declaration. A run started without terms also has no case, \
+         so give it correlation keys with `RunTerms::correlated(..)` or name one \
+         with `RunTerms::in_case(..)`"
     )]
     OversightUnreachable {
         agent: String,
@@ -314,7 +314,7 @@ pub enum BuildError {
     #[error(
         "agent '{agent}' files memories under '{subject}', which resolves from the run's \
          case — and this plane has no case store, so nothing could ever resolve it. Wire \
-         one with `RuntimeBuilder::cases(..)` and admit runs with `run_correlated(..)`, or \
+         one with `RuntimeBuilder::cases(..)` and start runs with `RunTerms::correlated(..)`, or \
          declare a literal subject and accept that every subject's facts share one key"
     )]
     MemorySubjectUnbindable { agent: String, subject: String },

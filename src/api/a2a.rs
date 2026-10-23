@@ -2751,24 +2751,37 @@ async fn run_a2a(
     server: &A2aServer,
     skill: &str,
     input: Tainted<Value>,
-    terms: crate::runtime::RunTerms,
+    (key, terms): (String, crate::runtime::RunTerms),
 ) -> Result<crate::runtime::Admission, crate::core::RuntimeError> {
-    server.runtime.run_under(skill, input, terms).await
+    server
+        .runtime
+        .start(skill, input)
+        .terms(terms)
+        .once(key)
+        .run()
+        .await
 }
 
 async fn spawn_a2a(
     server: &A2aServer,
     skill: &str,
     input: Tainted<Value>,
-    terms: crate::runtime::RunTerms,
+    (key, terms): (String, crate::runtime::RunTerms),
 ) -> Result<RunId, crate::core::RuntimeError> {
     // Producer-scoped and deduplicating, for the reasons `run_terms` states.
     // A duplicate answers with the run the key already admitted, which is
     // exactly what a retrying caller needs back.
-    Ok(server.runtime.spawn_under(skill, input, terms).await?.run)
+    Ok(server
+        .runtime
+        .start(skill, input)
+        .terms(terms)
+        .once(key)
+        .spawn()
+        .await?
+        .run)
 }
 
-/// The terms every A2A admission runs under: keyed by the producer-scoped
+/// The key and terms every A2A admission runs under: keyed by the producer-scoped
 /// message id, inside the case the caller named or a fresh one, and **acting
 /// as the caller** — under the chain its credential carried, or under none.
 ///
@@ -2793,15 +2806,16 @@ async fn spawn_a2a(
 /// caller that presented no chain acts under **none**: the plane's chain
 /// bounds what it may be admitted for, and lends it none of its authority —
 /// the fallback would make the operator's authority ambient.
-fn run_terms(message: &A2aMessage, caller: &Caller) -> Result<crate::runtime::RunTerms, RpcError> {
+fn run_terms(
+    message: &A2aMessage,
+    caller: &Caller,
+) -> Result<(String, crate::runtime::RunTerms), RpcError> {
     let keyed = crate::core::origin_key(&admission_source(&caller.actor), &message.message_id);
     // The authenticated peer, never a body field: the four-eyes exclusion
     // reads it, and a caller who could name it could name somebody else.
-    let terms = crate::runtime::RunTerms::default()
-        .once(&keyed)
-        .served(caller.acting_as.clone())
-        .admitted_by(&caller.actor);
-    Ok(match message.context_id.as_deref() {
+    let terms =
+        crate::runtime::RunTerms::served(caller.acting_as.clone()).admitted_by(&caller.actor);
+    let terms = match message.context_id.as_deref() {
         Some(context) => {
             // `check_context` has already refused this, in the same words; the
             // parse is repeated because the terms need the typed id.
@@ -2821,7 +2835,8 @@ fn run_terms(message: &A2aMessage, caller: &Caller) -> Result<crate::runtime::Ru
                 &keyed,
             )],
         ),
-    })
+    };
+    Ok((keyed, terms))
 }
 
 /// The `source` half of every A2A admission key: this surface, then the

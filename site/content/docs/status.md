@@ -38,7 +38,7 @@ pressure is, grouped by
 | **Store traits** | stable seam, growing contract | the conformance battery is the contract; it gains cases faster than the traits gain methods |
 | **`testkit`** | stable, additive | it is how embedders test their own stores and skills, so churn here costs more than it saves |
 | **`Skill`, `StepCtx` core methods** | stable in shape, additive | new capabilities arrive as new methods; existing ones are not expected to change signature |
-| **`Runtime` admission methods** | settled | every door takes `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. `run_in_case` means *this exact case*; correlating is `run_correlated` |
+| **`Runtime` admission** | settled | one door, `Runtime::start`, taking `Tainted<Value>` — wrap an operator's own literal in `Tainted::trusted(..)`. The answer's type follows `.once(..)`; `RunTerms::in_case` means *this exact case*, correlating is `RunTerms::correlated` |
 | **`Tool` / `ToolFailure`** | settled | `Tool::call` returns `ToolFailure`, named by disposition rather than transport; references are `tool://server/name` |
 | **Effect keys** | **will change** | any change to a descriptor's arguments moves every key for that effect kind. A reference names a server and a tool, never a transport, so the key does not move when the transport does |
 | **Store schemas — SQL, redb, and what a blob store writes** | **will change without migration** | there is no migration tooling: recreate rather than migrate. Widening a redb table fails at open rather than at read, and a tombstone carries a version a later build refuses rather than guesses at |

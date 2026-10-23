@@ -276,6 +276,7 @@ impl RedbStore {
             super::redb_tasks::create_tables(&w)?;
             super::redb_timers::create_tables(&w)?;
             super::redb_batches::create_tables(&w)?;
+            lapse_every_lease(&w)?;
         }
         w.commit().map_err(|e| be(&e))?;
         Ok(Self {
@@ -757,6 +758,41 @@ pub(super) fn decoded<T>(what: &str, raw: &str, parsed: Option<T>) -> Result<T, 
         seq: 0,
         detail: format!("unknown {what} '{raw}'"),
     })
+}
+
+/// Lapse every lease still running, keeping its holder and epoch.
+///
+/// A database file has one opener at a time — a second gets
+/// [`StoreError::InUse`] — so a lease alive at open was taken under an open
+/// that has ended, by a process that crashed or was killed. Its holder can
+/// write nothing more, and waiting out its TTL would only keep a crashed run
+/// from resuming: a CLI that restarts after a kill would find its own run
+/// held for the rest of the lease. Lapsed rather than released: the next
+/// claim still takes the epoch above it, and the run is listed by
+/// `abandoned_runs`, which a released lease is not.
+fn lapse_every_lease(w: &redb::WriteTransaction) -> Result<(), StoreError> {
+    let now = now_secs();
+    let mut leases = w.open_table(RUN_LEASE).map_err(table_error)?;
+    let live: Vec<(String, String, u64)> = leases
+        .iter()
+        .map_err(|e| be(&e))?
+        .filter_map(|entry| {
+            entry
+                .map(|(key, value)| {
+                    let (owner, epoch, expires_at) = value.value();
+                    (!owner.is_empty() && expires_at > now)
+                        .then(|| (key.value().to_owned(), owner.to_owned(), epoch))
+                })
+                .transpose()
+        })
+        .collect::<Result<_, _>>()
+        .map_err(|e| be(&e))?;
+    for (key, owner, epoch) in live {
+        leases
+            .insert(key.as_str(), (owner.as_str(), epoch, now))
+            .map_err(|e| be(&e))?;
+    }
+    Ok(())
 }
 
 /// Wall-clock read for lease expiry.

@@ -171,10 +171,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── 1. Live run ─────────────────────────────────────────────────────────
     let out = rt
-        .run(
+        .start(
             "desk.notify",
             Tainted::trusted(json!({ "customer": "AC-1" })),
         )
+        .run()
         .await?;
     println!("1. planned run  → {:?}", out.status);
     println!(
@@ -214,10 +215,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "answer": "sent"
     })));
     let hijacked = rt
-        .run(
+        .start(
             "desk.notify",
             Tainted::trusted(json!({ "customer": "AC-1" })),
         )
+        .run()
         .await?;
     println!("\n3. hijacked plan → {:?}", hijacked.status);
     assert!(

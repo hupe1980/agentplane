@@ -1998,7 +1998,16 @@ fn every_runtime_future_survives_a_spawn(
 ) {
     fn spawnable<F: std::future::Future + Send>(_f: F) {}
 
-    spawnable(rt.run("target", Tainted::trusted(serde_json::Value::Null)));
+    let input = || Tainted::trusted(serde_json::Value::Null);
+    spawnable(rt.start("target", input()).run());
+    spawnable(rt.start("target", input()).spawn());
+    spawnable(rt.start("target", input()).once("k").run());
+    spawnable(rt.start("target", input()).once("k").settle());
+    spawnable(
+        rt.start(agentplane::core::PlanIR::new(Vec::new()), input())
+            .once("k")
+            .spawn(),
+    );
     spawnable(rt.replay(run, agentplane::runtime::Mode::Strict));
     spawnable(rt.deliver(event));
     spawnable(rt.decide_task(task, decision, &[]));

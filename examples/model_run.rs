@@ -116,7 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ticket = json!({ "id": "T-4711", "body": "checkout returns 500 for EU cards" });
     let live = rt
-        .run("support.triage", Tainted::trusted(ticket.clone()))
+        .start("support.triage", Tainted::trusted(ticket.clone()))
+        .run()
         .await?;
     println!("1. live run       → {:?}", live.status);
     println!("   provider calls: {}", provider.calls());
@@ -169,7 +170,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build();
 
-    let burned = rt.run("support.triage", Tainted::trusted(ticket)).await?;
+    let burned = rt
+        .start("support.triage", Tainted::trusted(ticket))
+        .run()
+        .await?;
     println!("\n3. metered failure → {:?}", burned.status);
     println!(
         "   provider calls: {} — the reworded retry never went out",

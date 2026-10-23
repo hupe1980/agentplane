@@ -435,7 +435,8 @@ fn harness(untrusted: &[&'static str]) -> Harness {
 async fn a_multi_step_plan_executes_in_dependency_order() {
     let h = harness(&[]);
     let out =
-        h.rt.run_plan(ok_plan(), Tainted::trusted(json!({ "id": 1 })))
+        h.rt.start(ok_plan(), Tainted::trusted(json!({ "id": 1 })))
+            .run()
             .await
             .unwrap();
 
@@ -457,7 +458,8 @@ async fn a_multi_step_plan_executes_in_dependency_order() {
 async fn every_step_is_journaled_separately() {
     let h = harness(&[]);
     let out =
-        h.rt.run_plan(ok_plan(), Tainted::trusted(json!({})))
+        h.rt.start(ok_plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -478,7 +480,8 @@ async fn the_frozen_plan_is_journaled() {
     let h = harness(&[]);
     let plan = ok_plan();
     let out =
-        h.rt.run_plan(plan.clone(), Tainted::trusted(json!({})))
+        h.rt.start(plan.clone(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -627,7 +630,8 @@ fn every_identity_bearing_field_of_a_plan_changes_its_digest() {
 #[tokio::test]
 async fn arguments_are_assembled_from_their_declared_sources() {
     let h = harness(&[]);
-    h.rt.run_plan(ok_plan(), Tainted::trusted(json!({ "id": 7 })))
+    h.rt.start(ok_plan(), Tainted::trusted(json!({ "id": 7 })))
+        .run()
         .await
         .unwrap();
 
@@ -688,7 +692,8 @@ async fn untrust_propagates_downstream() {
         .build();
 
     let out = rt
-        .run_plan(ok_plan(), Tainted::trusted(json!({})))
+        .start(ok_plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -709,7 +714,8 @@ async fn an_invalid_plan_is_rejected_before_anything_runs() {
     ]);
 
     let err =
-        h.rt.run_plan(bad, Tainted::trusted(json!({})))
+        h.rt.start(bad, Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap_err();
     assert!(err.to_string().contains("cycle"), "got: {err}");
@@ -725,7 +731,8 @@ async fn an_invalid_plan_is_rejected_before_anything_runs() {
 async fn a_multi_step_run_replays_strictly() {
     let h = harness(&[]);
     let first =
-        h.rt.run_plan(ok_plan(), Tainted::trusted(json!({ "id": 3 })))
+        h.rt.start(ok_plan(), Tainted::trusted(json!({ "id": 3 })))
+            .run()
             .await
             .unwrap();
     let before = h.calls.load(Ordering::SeqCst);
@@ -750,7 +757,8 @@ async fn a_multi_step_run_replays_strictly() {
 async fn a_bare_target_compiles_to_a_single_node_plan() {
     let h = harness(&[]);
     let out =
-        h.rt.run("fetch", Tainted::trusted(json!({ "x": 1 })))
+        h.rt.start("fetch", Tainted::trusted(json!({ "x": 1 })))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -771,7 +779,8 @@ async fn a_diamond_plan_runs_both_branches_then_joins() {
     ]);
 
     let out =
-        h.rt.run_plan(plan, Tainted::trusted(json!({})))
+        h.rt.start(plan, Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -794,7 +803,8 @@ async fn a_field_selector_narrows_an_upstream_output() {
             .terminal(),
     ]);
 
-    h.rt.run_plan(plan, Tainted::trusted(json!({})))
+    h.rt.start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let seen = h.seen.lock().unwrap();
@@ -835,7 +845,8 @@ async fn a_constant_argument_is_trusted() {
             .terminal(),
     ]);
     assert_eq!(
-        rt.run_plan(plan, Tainted::trusted(json!({})))
+        rt.start(plan, Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap()
             .status,
@@ -908,7 +919,7 @@ async fn sibling_steps_in_the_ready_set_run_concurrently() {
 
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        rt.run_plan(plan, Tainted::trusted(json!({}))),
+        rt.start(plan, Tainted::trusted(json!({}))).run(),
     )
     .await
     .expect("sequential dispatch would deadlock here")
@@ -987,7 +998,8 @@ async fn a_concurrently_dispatched_run_replays_strictly() {
     };
 
     let out = rt
-        .run_plan(plan(), Tainted::trusted(json!({})))
+        .start(plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -1260,10 +1272,11 @@ async fn fan_out_dispatches_every_branch_concurrently_within_one_run() {
 
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        rt.run_plan(
+        rt.start(
             plan,
             Tainted::trusted(json!({ "doc": "de.billing.rechnung.erstellt" })),
-        ),
+        )
+        .run(),
     )
     .await
     .expect("sequential dispatch would deadlock on the rendezvous")
@@ -1283,4 +1296,49 @@ async fn fan_out_dispatches_every_branch_concurrently_within_one_run() {
 #[should_panic(expected = "at least one branch")]
 fn a_fan_out_with_no_branches_is_refused() {
     let _ = PlanIR::fan_out(Vec::<Capability>::new(), "billing.decide");
+}
+
+/// **A spawned plan is admitted before `spawn` returns**, as a spawned
+/// capability is: a plan the contract refuses is an error rather than a run
+/// that never appears, an admitted one is readable the moment its id comes
+/// back, and a keyed one admits once.
+#[tokio::test]
+async fn a_spawned_plan_is_admitted_before_spawn_returns() {
+    let h = harness(&[]);
+    let refused =
+        h.rt.start(PlanIR::new(Vec::new()), Tainted::trusted(json!({})))
+            .spawn()
+            .await;
+    assert!(
+        matches!(refused, Err(agentplane::RuntimeError::PlanContract(_))),
+        "{refused:?}"
+    );
+
+    let run =
+        h.rt.start(ok_plan(), Tainted::trusted(json!({ "id": 2 })))
+            .spawn()
+            .await
+            .expect("spawned");
+    let records = h.store.read(run, 1).await.unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|r| matches!(r.kind(), RecordKind::RunAdmitted { .. })),
+        "spawn returned before the plan was admitted"
+    );
+
+    let first =
+        h.rt.start(ok_plan(), Tainted::trusted(json!({ "id": 3 })))
+            .once("urn:test:plans/P-3")
+            .spawn()
+            .await
+            .expect("spawned");
+    let again =
+        h.rt.start(ok_plan(), Tainted::trusted(json!({ "id": 3 })))
+            .once("urn:test:plans/P-3")
+            .spawn()
+            .await
+            .expect("answered");
+    assert!(first.fresh && !again.fresh);
+    assert_eq!(again.run, first.run);
 }

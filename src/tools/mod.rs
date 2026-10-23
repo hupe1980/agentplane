@@ -44,6 +44,7 @@ pub mod serve;
 pub mod serve_http;
 // Not gated on a transport: a typed tool is a tool this process implements, and
 // needs no wire at all.
+mod schema;
 mod typed;
 
 #[cfg(feature = "mcp")]
@@ -57,7 +58,8 @@ pub use mcp::{
 /// a direct dependency would have to be re-unified by hand on every upgrade.
 #[cfg(feature = "mcp")]
 pub use rmcp;
-pub use typed::{Tool, ToolBox, ToolFailure, strict_schema};
+pub use schema::{closed_schema, strict_schema};
+pub use typed::{Tool, ToolBox, ToolFailure};
 
 /// The MCP revision this plane serves and offers.
 ///

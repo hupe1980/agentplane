@@ -31,7 +31,7 @@ use agentplane::core::{
 };
 use agentplane::journal::JournalStore;
 use agentplane::policy::{CedarEngine, CedarError};
-use agentplane::runtime::{RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -829,7 +829,8 @@ async fn cedar_governs_a_run_and_the_digest_lands_in_the_journal() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -888,7 +889,8 @@ async fn cedar_can_key_on_the_delegation_chain() {
             world: Arc::clone(&world),
         })
         .build()
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1234,10 +1236,11 @@ spec:
         .build();
 
     let outcome = rt
-        .run(
+        .start(
             "support.summarise",
             Tainted::trusted(json!({"ticket": "printer on fire"})),
         )
+        .run()
         .await;
     assert!(
         matches!(
@@ -1807,18 +1810,18 @@ async fn a_cedar_context_label_carries_no_subject_references() {
         .policy(Arc::clone(&recording) as Arc<dyn PolicyEngine>)
         .skill(Forwards)
         .build();
-        let terms = subject.map_or_else(agentplane::runtime::RunTerms::default, |s| {
-            agentplane::runtime::RunTerms::default().subject(s)
-        });
+        let terms = subject.map_or_else(RunTerms::default, |s| RunTerms::default().subject(s));
         let input = Tainted::from_source(
             json!({ "name": "Ada" }),
             agentplane::core::SourceId::new("sender:acme"),
         );
-        let admission = runtime.run_under("forward", input, terms).await.unwrap();
-        assert_eq!(
-            admission.outcome().expect("fresh").status,
-            RunStatus::Succeeded
-        );
+        let admission = runtime
+            .start("forward", input)
+            .terms(terms)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(admission.status, RunStatus::Succeeded);
         let seen = recording.0.lock().unwrap().clone();
         let label = seen
             .iter()
@@ -1899,7 +1902,7 @@ async fn a_cedar_context_args_label_carries_no_subject_references() {
             .policy(Arc::clone(&recording) as Arc<dyn PolicyEngine>)
             .skill(Triage)
             .build();
-        let terms = agentplane::runtime::RunTerms::default().correlated(
+        let terms = RunTerms::default().correlated(
             "review",
             &[agentplane::core::CorrelationKey::new("document", "D-1")],
         );
@@ -1911,11 +1914,13 @@ async fn a_cedar_context_args_label_carries_no_subject_references() {
             json!({ "name": "Ada" }),
             agentplane::core::SourceId::new("sender:acme"),
         );
-        let admission = runtime.run_under("triage", input, terms).await.unwrap();
-        assert_eq!(
-            admission.outcome().expect("fresh").status,
-            RunStatus::Succeeded
-        );
+        let admission = runtime
+            .start("triage", input)
+            .terms(terms)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(admission.status, RunStatus::Succeeded);
         let seen = recording.0.lock().unwrap().clone();
         let context = seen.first().expect("task.open was asked").clone();
         args.push(context["args"].clone());

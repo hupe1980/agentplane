@@ -212,15 +212,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Scope::of(["desk.*", "audit.*"]),
     ));
     let out = desk
-        .run_under(
+        .start(
             "desk.answer",
             Tainted::trusted(json!({ "invoice": "INV-9" })),
-            RunTerms::default().acting_as(alice),
         )
-        .await?
-        .outcome()
-        .cloned()
-        .expect("a fresh admission");
+        .terms(RunTerms::acting_as(alice))
+        .run()
+        .await?;
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
     let answer = out.output.as_ref().expect("an answer");
     // The peer answers with an A2A task; its artifact carries the verdict.

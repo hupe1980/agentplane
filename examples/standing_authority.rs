@@ -87,10 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. The ceiling is cumulative across *runs*. Two separate runs, one
     //    envelope — which is the thing a per-run budget cannot express.
     let first = runtime
-        .run(
+        .start(
             "procurement.purchase",
             Tainted::trusted(json!({"cents": 30_000})),
         )
+        .run()
         .await?;
     assert_eq!(
         first.output.as_ref().unwrap().peek()["remaining"],
@@ -100,10 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   first run drew  → 30000, remaining 20000");
 
     let second = runtime
-        .run(
+        .start(
             "procurement.purchase",
             Tainted::trusted(json!({"cents": 15_000})),
         )
+        .run()
         .await?;
     assert_eq!(
         second.output.as_ref().unwrap().peek()["remaining"],
@@ -115,10 +117,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Over the ceiling is `Exhausted`, and a refused draw consumes nothing —
     //    otherwise a caller probing the remainder would drain it.
     let over = runtime
-        .run(
+        .start(
             "procurement.purchase",
             Tainted::trusted(json!({"cents": 10_000})),
         )
+        .run()
         .await?;
     let message = over.output.as_ref().unwrap().peek()["refused"]
         .as_str()
@@ -159,10 +162,11 @@ async fn revocation(
         .await?;
 
     let after = runtime
-        .run(
+        .start(
             "procurement.purchase",
             Tainted::trusted(json!({"cents": 1_000})),
         )
+        .run()
         .await?;
     let message = after.output.as_ref().unwrap().peek()["refused"]
         .as_str()

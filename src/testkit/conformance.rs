@@ -2253,11 +2253,8 @@ async fn a_lease_starts_past_every_epoch_the_history_records(fresh: Factory<'_>,
 
 /// A released lease is available immediately, without waiting out the TTL.
 ///
-/// The counterpart to expiry, and the reason an owner can afford to be unique
-/// per process. Without a release, a restart waits out the lease — and the
-/// tempting fix is a constant owner string so the replacement "renews" instead,
-/// which silently disables fencing, because two live instances then read each
-/// other's lease as their own.
+/// The counterpart to expiry: without a release, every handover waits out the
+/// lease.
 async fn a_released_lease_is_free_at_once(fresh: Factory<'_>, r: &mut Report) {
     r.checked += 1;
     let store = fresh().await;
@@ -2294,8 +2291,7 @@ async fn a_released_lease_is_free_at_once(fresh: Factory<'_>, r: &mut Report) {
         Err(e) => r.record(
             "fencing",
             format!(
-                "a released lease was still held ({e}) — every restart then waits out the \
-                 TTL, which is the pressure that makes deployments alias their owner strings"
+                "a released lease was still held ({e}) — every handover then waits out the TTL"
             ),
         ),
     }

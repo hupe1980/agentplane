@@ -160,7 +160,8 @@ async fn a_drain_does_not_refuse_the_commission_of_a_run_it_is_waiting_for() {
         .build();
 
     let run = runtime
-        .spawn("demo.chief", Tainted::trusted(json!({})))
+        .start("demo.chief", Tainted::trusted(json!({})))
+        .spawn()
         .await
         .expect("admitted");
     let _ = started.acquire().await.expect("the run to start");
@@ -195,7 +196,8 @@ async fn a_draining_instance_admits_nothing_and_writes_nothing() {
 
     let blocking = f
         .runtime
-        .run("demo.instant", Tainted::trusted(json!({})))
+        .start("demo.instant", Tainted::trusted(json!({})))
+        .run()
         .await;
     assert!(
         matches!(blocking, Err(RuntimeError::Draining)),
@@ -203,7 +205,8 @@ async fn a_draining_instance_admits_nothing_and_writes_nothing() {
     );
     let background = f
         .runtime
-        .spawn("demo.instant", Tainted::trusted(json!({})))
+        .start("demo.instant", Tainted::trusted(json!({})))
+        .spawn()
         .await;
     assert!(
         matches!(background, Err(RuntimeError::Draining)),
@@ -228,7 +231,8 @@ async fn a_drain_waits_for_a_background_run_to_reach_its_conclusion() {
     let f = fixture();
     let run = f
         .runtime
-        .spawn("demo.held", Tainted::trusted(json!({})))
+        .start("demo.held", Tainted::trusted(json!({})))
+        .spawn()
         .await
         .expect("admitted");
     let _ = f.started.acquire().await.expect("the run to start");
@@ -270,7 +274,8 @@ async fn a_run_the_grace_period_did_not_cover_is_named_and_keeps_its_lease() {
     let f = fixture();
     let run = f
         .runtime
-        .spawn("demo.held", Tainted::trusted(json!({})))
+        .start("demo.held", Tainted::trusted(json!({})))
+        .spawn()
         .await
         .expect("admitted");
     let _ = f.started.acquire().await.expect("the run to start");

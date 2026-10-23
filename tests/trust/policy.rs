@@ -31,7 +31,7 @@ use agentplane::core::{
     Tainted,
 };
 use agentplane::journal::{Append, JournalStore, RecordKind};
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -256,7 +256,8 @@ async fn policy_can_refuse_a_release_before_the_label_is_improved() {
         .build();
 
     let out = runtime
-        .run("release", Tainted::trusted(json!({})))
+        .start("release", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -300,7 +301,8 @@ async fn an_ungoverned_plane_refuses_a_release() {
     let out = Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
         .skill(ReleasesWithBasis("nobody decided this"))
         .build()
-        .run("release-with-basis", Tainted::trusted(json!({})))
+        .start("release-with-basis", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -361,7 +363,8 @@ async fn changing_release_evidence_is_replay_divergence() {
         .policy(std::sync::Arc::new(PermitsReleases))
         .skill(ReleasesWithBasis("matched settlement revision 1"))
         .build()
-        .run("release-with-basis", Tainted::trusted(json!({})))
+        .start("release-with-basis", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -395,7 +398,8 @@ async fn a_denied_effect_is_refused_before_it_is_performed() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -418,7 +422,8 @@ async fn a_denial_carries_a_reason_someone_can_act_on() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -442,7 +447,8 @@ async fn a_run_the_policy_refuses_to_admit_never_starts() {
     let world: World = Arc::default();
 
     let err = runtime(&store, &world, Some(Arc::new(Refuses("pay"))))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("admission must be refused");
 
@@ -459,7 +465,8 @@ async fn a_denial_is_journaled_like_a_budget_refusal() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -490,7 +497,8 @@ async fn a_permit_writes_no_record_of_its_own() {
     let engine = Arc::new(Counting::default());
 
     let out = runtime(&store, &world, Some(engine.clone()))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -518,7 +526,8 @@ async fn the_admission_record_names_the_policy_set() {
     let expected = engine.bundle();
 
     let out = runtime(&store, &world, Some(engine))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -549,7 +558,8 @@ async fn a_run_with_no_policy_layer_says_so_on_the_record() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, None)
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -578,7 +588,8 @@ async fn strict_replay_never_asks_the_policy_engine() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Counting::default())))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(world.lock().unwrap().len(), 2);
@@ -679,7 +690,8 @@ async fn a_recorded_denial_replays_even_if_the_policy_would_now_permit() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -712,7 +724,8 @@ async fn resuming_a_denied_run_does_not_perform_the_denied_effect() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -744,7 +757,8 @@ async fn authorization_is_checked_before_the_budget_is_charged() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, Some(Arc::new(Refuses("ledger.transfer"))))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -781,7 +795,8 @@ async fn the_default_engine_denies_and_explains_itself() {
         &world,
         Some(Arc::new(agentplane::core::DenyAll) as Arc<dyn PolicyEngine>),
     )
-    .run("pay", Tainted::trusted(json!({})))
+    .start("pay", Tainted::trusted(json!({})))
+    .run()
     .await
     .expect_err("DenyAll must refuse admission");
 
@@ -813,7 +828,8 @@ async fn the_request_carries_what_a_rule_needs() {
     let world: World = Arc::default();
     let engine = Arc::new(Capturing::default());
     runtime(&store, &world, Some(engine.clone()))
-        .run("pay", Tainted::trusted(json!({})))
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -879,7 +895,8 @@ async fn a_release_is_asked_under_the_listed_action() {
         .policy(engine.clone())
         .skill(Releases)
         .build()
-        .run("release", Tainted::trusted(json!({})))
+        .start("release", Tainted::trusted(json!({})))
+        .run()
         .await
         .ok();
 
@@ -915,7 +932,8 @@ async fn the_principal_is_stable_across_runs() {
     let engine = Arc::new(Principals::default());
     for _ in 0..2 {
         runtime(&store, &world, Some(engine.clone()))
-            .run("pay", Tainted::trusted(json!({})))
+            .start("pay", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     }
@@ -964,16 +982,11 @@ async fn admission_and_effects_are_asked_under_the_same_principal() {
     // The plane has no chain of its own; the run carries its caller's.
     let rita = Delegation::root(Principal::new("user:rita", Scope::of(["pay"])));
     let out = runtime(&store, &world, Some(engine.clone()))
-        .run_under(
-            "pay",
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(rita),
-        )
+        .start("pay", Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(rita))
+        .run()
         .await
-        .expect("admitted")
-        .outcome()
-        .cloned()
-        .expect("fresh");
+        .expect("admitted");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
 
     let seen = engine.0.lock().unwrap().clone();
@@ -1010,7 +1023,7 @@ async fn a_subject_rule_does_not_match_a_capability_of_the_same_name() {
     let world: World = Arc::default();
     let rt = runtime(&store, &world, Some(Arc::clone(&engine)));
 
-    let chainless = rt.run("pay", Tainted::trusted(json!({}))).await;
+    let chainless = rt.start("pay", Tainted::trusted(json!({}))).run().await;
     assert!(
         chainless.is_err(),
         "a capability named `pay` was admitted by a rule for the subject `pay`"
@@ -1018,16 +1031,11 @@ async fn a_subject_rule_does_not_match_a_capability_of_the_same_name() {
 
     let subject = Delegation::root(Principal::new("pay", Scope::of(["pay"])));
     let chained = rt
-        .run_under(
-            "pay",
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(subject),
-        )
+        .start("pay", Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(subject))
+        .run()
         .await
-        .expect("the subject the rule names is admitted")
-        .outcome()
-        .cloned()
-        .expect("fresh");
+        .expect("the subject the rule names is admitted");
     assert!(
         matches!(chained.status, RunStatus::Succeeded),
         "{chained:?}"
@@ -1154,7 +1162,8 @@ async fn a_run_that_keeps_being_refused_stops_learning() {
         .budget(Budget::unlimited().denials(CEILING))
         .skill(Probes)
         .build()
-        .run("demo.probe", Tainted::trusted(json!({})))
+        .start("demo.probe", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1299,7 +1308,8 @@ async fn a_rule_can_refuse_an_effect_for_where_its_arguments_came_from() {
         .build();
 
     let out = rt
-        .run("demo.post", Tainted::trusted(json!({})))
+        .start("demo.post", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let RunStatus::Failed(why) = &out.status else {
@@ -1327,7 +1337,8 @@ async fn the_same_rule_permits_the_same_effect_when_the_value_is_trusted() {
         .build();
 
     let out = rt
-        .run("demo.post", Tainted::trusted(json!({})))
+        .start("demo.post", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
@@ -1357,7 +1368,8 @@ async fn the_label_authorization_consulted_is_journaled() {
         .build();
 
     let out = rt
-        .run("demo.post", Tainted::trusted(json!({})))
+        .start("demo.post", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded, "got {:?}", out.status);
@@ -1469,12 +1481,9 @@ async fn policy_sees_a_case_read_as_a_read_and_a_case_write_as_a_mutation() {
         .policy(Arc::clone(&watching) as Arc<dyn PolicyEngine>)
         .skill(TouchesCase)
         .build()
-        .run_correlated(
-            "demo.touch",
-            Tainted::trusted(json!({})),
-            "demo",
-            &[CorrelationKey::new("doc", "C-1")],
-        )
+        .start("demo.touch", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("demo", &[CorrelationKey::new("doc", "C-1")]))
+        .run()
         .await
         .expect("run");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -1625,7 +1634,11 @@ async fn the_runtime_never_sends_a_null_to_policy() {
     // A run with a real effect in it, so the perform context is exercised and
     // not only admission — the two are built in different places and only one
     // of them had the defect.
-    let outcome = rt.run("pay", Tainted::trusted(json!({}))).await.unwrap();
+    let outcome = rt
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     assert!(
         matches!(outcome.status, RunStatus::Succeeded),
         "{outcome:?}"
@@ -1686,10 +1699,11 @@ spec:
         .agent(Agent::new(&manifest))
         .build();
     let outcome = rt
-        .run(
+        .start(
             "support.summarise",
             Tainted::trusted(json!({"ticket": "printer on fire"})),
         )
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1847,7 +1861,8 @@ spec:
         .agent(Agent::new(&manifest))
         .build();
     let outcome = rt
-        .run("support.summarise", Tainted::trusted(json!({"t": "x"})))
+        .start("support.summarise", Tainted::trusted(json!({"t": "x"})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1886,7 +1901,11 @@ async fn an_ungoverned_effect_names_no_revision() {
             world: Arc::new(Mutex::new(Vec::new())),
         })
         .build();
-    let outcome = rt.run("pay", Tainted::trusted(json!({}))).await.unwrap();
+    let outcome = rt
+        .start("pay", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     assert!(
         matches!(outcome.status, RunStatus::Succeeded),
         "{outcome:?}"
@@ -2017,7 +2036,8 @@ async fn a_compensation_the_policy_refuses_quarantines_instead_of_running() {
             .terminal(),
     ]);
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 

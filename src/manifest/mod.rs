@@ -1163,8 +1163,8 @@ fn role(r: &ModelRef) -> crate::model::ModelRole {
 /// The shape a caller must send.
 ///
 /// The mirror of [`Output`], for the caller a result contract never had to
-/// consider: **a model composing the arguments.** An embedder calling
-/// `run_under` holds the shape in its own code on both sides and an A2A peer's
+/// consider: **a model composing the arguments.** An embedder starting a run
+/// holds the shape in its own code on both sides and an A2A peer's
 /// message is the sender's problem — neither is true once an agent is offered
 /// as a tool to somebody else's model.
 ///
@@ -1513,7 +1513,10 @@ impl ToolGrant {
     /// A grant drafted from what a server says its tool is, for review.
     ///
     /// It carries the server's description and argument schema, so the text a
-    /// model will read is in the reviewed document and under its digest. It
+    /// model will read is in the reviewed document and under its digest. The
+    /// schema is the server's narrowed by
+    /// [`closed_schema`](crate::tools::closed_schema), so the form reviewed is
+    /// the form a provider's strict mode can hold a model to. It
     /// **mutates whatever the server's annotations claim**, since a server
     /// that marks its own tool read-only chooses the one condition under which
     /// this runtime retries it, and it has no field rules: who may author
@@ -1523,7 +1526,7 @@ impl ToolGrant {
     pub fn drafted_from(discovered: &crate::tools::Discovered) -> Self {
         Self {
             description: Some(discovered.description.clone()),
-            arguments: Some(discovered.input_schema.clone()),
+            arguments: Some(crate::tools::closed_schema(&discovered.input_schema)),
             ..Self::new(discovered.id.reference())
         }
     }
@@ -1532,7 +1535,8 @@ impl ToolGrant {
 impl crate::tools::Discovered {
     /// Where the server has moved away from `grant` since it was reviewed:
     /// the description, the argument schema, or both. A half the grant does
-    /// not state is not compared, since nothing was reviewed there.
+    /// not state is not compared, since nothing was reviewed there. The schema
+    /// is compared in the form [`ToolGrant::drafted_from`] drafts it.
     #[must_use]
     pub fn drift(&self, grant: &ToolGrant) -> Vec<crate::tools::Drift> {
         let mut drift = Vec::new();
@@ -1546,7 +1550,7 @@ impl crate::tools::Discovered {
         if grant
             .arguments
             .as_ref()
-            .is_some_and(|reviewed| *reviewed != self.input_schema)
+            .is_some_and(|reviewed| *reviewed != crate::tools::closed_schema(&self.input_schema))
         {
             drift.push(crate::tools::Drift::Arguments);
         }
@@ -3670,6 +3674,55 @@ impl ManifestBuilder {
     #[must_use]
     pub fn configure(mut self, configure: impl FnOnce(&mut Spec)) -> Self {
         configure(&mut self.spec);
+        self
+    }
+
+    /// Declare a capability this agent answers — `spec.capabilities.provides`.
+    #[must_use]
+    pub fn provides(mut self, capability: impl Into<String>) -> Self {
+        self.spec.capabilities.provides.push(capability.into());
+        self
+    }
+
+    /// Grant a tool — one entry of `spec.tools`.
+    #[must_use]
+    pub fn tool(mut self, grant: ToolGrant) -> Self {
+        self.spec.tools.push(grant);
+        self
+    }
+
+    /// The model `cx.complete` calls — `spec.models.privileged`.
+    #[must_use]
+    pub fn privileged_model(mut self, model: ModelRef) -> Self {
+        self.spec
+            .models
+            .get_or_insert_with(Models::default)
+            .privileged = Some(model);
+        self
+    }
+
+    /// The model that reads untrusted content — `spec.models.quarantined`.
+    #[must_use]
+    pub fn quarantined_model(mut self, model: ModelRef) -> Self {
+        self.spec
+            .models
+            .get_or_insert_with(Models::default)
+            .quarantined = Some(model);
+        self
+    }
+
+    /// What one run may consume — `spec.budgets`.
+    #[must_use]
+    pub fn budgets(mut self, budgets: Budgets) -> Self {
+        self.spec.budgets = Some(budgets);
+        self
+    }
+
+    /// The most sensitive data this agent may send anywhere —
+    /// `spec.security.max_sensitivity_egress`.
+    #[must_use]
+    pub fn egress_ceiling(mut self, ceiling: Sensitivity) -> Self {
+        self.spec.security.max_sensitivity_egress = Some(ceiling);
         self
     }
 

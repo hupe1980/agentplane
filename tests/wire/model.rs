@@ -116,7 +116,8 @@ async fn live_model_stream_is_labelled_and_strict_replay_is_silent() {
         .skill(Streams(Arc::clone(&capture)))
         .build();
     let live = runtime
-        .run("streams-model", Tainted::trusted(json!("hi")))
+        .start("streams-model", Tainted::trusted(json!("hi")))
+        .run()
         .await
         .unwrap();
     {
@@ -175,7 +176,8 @@ async fn the_fake_provider_streams_deltas_that_reassemble_exactly() {
         .build();
 
     let live = runtime
-        .run("streams-fake", Tainted::trusted(json!("when?")))
+        .start("streams-fake", Tainted::trusted(json!("when?")))
+        .run()
         .await
         .unwrap();
 
@@ -394,7 +396,8 @@ async fn a_failed_completion_is_journaled_with_its_cost() {
             provider: Arc::clone(&provider),
         })
         .build()
-        .run("ask", Tainted::trusted(json!({})))
+        .start("ask", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -507,7 +510,8 @@ async fn a_failed_completion_spends_the_budget_that_stops_the_next_one() {
             provider: Arc::clone(&provider),
         })
         .build()
-        .run("ask", Tainted::trusted(json!({})))
+        .start("ask", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -549,7 +553,8 @@ async fn replay_charges_a_failed_completion_the_same_as_the_live_run() {
             .build()
     };
     let out = build()
-        .run("ask", Tainted::trusted(json!({})))
+        .start("ask", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let live_calls = provider.calls();
@@ -652,7 +657,8 @@ async fn a_model_prompt_above_its_sensitivity_ceiling_never_leaves() {
             provider: Arc::clone(&provider),
         })
         .build()
-        .run("secret-prompt", Tainted::trusted(json!({})))
+        .start("secret-prompt", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -931,7 +937,8 @@ async fn strict_replay_does_not_read_media_blobs_or_call_the_model() {
     };
 
     let live = build()
-        .run("describe-media", Tainted::trusted(json!({})))
+        .start("describe-media", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -973,7 +980,8 @@ async fn rewritten_governed_media_quarantines_and_verifies() {
         .build();
 
     let live = rt
-        .run("describe-media", Tainted::trusted(json!({})))
+        .start("describe-media", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1072,7 +1080,8 @@ async fn an_untrusted_instruction_is_refused_before_the_model_sees_it() {
             .build();
 
         let out = rt
-            .run("demo.obeys", Tainted::trusted(json!({})))
+            .start("demo.obeys", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -1182,7 +1191,8 @@ async fn run_against(provider_answer: Option<Value>) -> agentplane::runtime::Run
         .skill(AsksForAnObject(provider_answer))
         .build();
     runtime
-        .run("asks-object", Tainted::trusted(json!({})))
+        .start("asks-object", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap()
 }
@@ -1309,7 +1319,8 @@ async fn two_identical_calls_in_one_step_are_two_effects() {
         .build();
 
     let out = rt
-        .run("asks-twice", Tainted::trusted(json!("q")))
+        .start("asks-twice", Tainted::trusted(json!("q")))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded, "{:?}", out.status);
@@ -1435,10 +1446,11 @@ spec:
         .observe_model_streams(Arc::clone(&seen) as Arc<dyn agentplane::runtime::RunStreamObserver>)
         .build();
     let out = rt
-        .run(
+        .start(
             "support.summarise",
             Tainted::trusted(serde_json::json!({ "q": "x" })),
         )
+        .run()
         .await
         .unwrap();
     let text: String = seen

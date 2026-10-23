@@ -1968,10 +1968,11 @@ async fn a_task_belongs_to_the_peer_that_admitted_it() {
 
     // A run the embedder started is nobody's task, including A's.
     let embedded = rt
-        .run(
+        .start(
             "settlement.check",
             Tainted::trusted(json!({"text": "internal"})),
         )
+        .run()
         .await
         .expect("in-process run");
     let (_, hidden) = send(
@@ -2366,7 +2367,8 @@ async fn a_listing_past_its_scan_budget_is_refused_naming_the_lever() {
 async fn a_peers_listing_is_not_charged_for_runs_it_did_not_admit() {
     let f = fixture();
     for _ in 0..3 {
-        f.rt.run("settlement.check", Tainted::trusted(json!({})))
+        f.rt.start("settlement.check", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("an embedder's run");
     }
@@ -6173,7 +6175,8 @@ async fn a_listing_reads_only_the_callers_runs() {
     let (f, counted) = counted_fixture();
     let router = counted_router(&f);
     for _ in 0..3 {
-        f.rt.run("settlement.check", Tainted::trusted(json!({})))
+        f.rt.start("settlement.check", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("an embedder's run");
     }

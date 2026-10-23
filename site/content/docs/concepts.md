@@ -145,7 +145,11 @@ A run admitted with an **admission key** claims it in the same transaction that
 writes the run's first record:
 
 ```rust
-rt.run_correlated_once(cap, input, "claim", &keys, &event.dedup_key()).await?
+rt.start(cap, input)
+    .terms(RunTerms::default().correlated("claim", &keys))
+    .once(event.dedup_key())
+    .run()
+    .await?
 ```
 
 So the key is taken at the instant the run becomes real, and a redelivery is
@@ -311,7 +315,7 @@ aggregator keyed by the capability that produced each result.
 use agentplane::core::PlanIR;
 
 let plan = PlanIR::fan_out(["risk.score", "fraud.check"], "decide");
-let out = rt.run_plan(plan, Tainted::trusted(input)).await?;
+let out = rt.start(plan, Tainted::trusted(input)).run().await?;
 ```
 
 `PlanIR` lives in `agentplane::core`, not `agentplane::plan` — the `plan` module
@@ -324,8 +328,8 @@ absent is `race` — first-wins-cancel-the-rest would abandon an announced effec
 with no terminal record, which is the unknown outcome the effect protocol exists
 to prevent.
 
-`run_plan` is the entry point; `Contract` validates the graph before the first
-step runs.
+`Runtime::start` takes a plan where it takes a capability; `Contract` validates
+the graph before the first step runs.
 
 ---
 

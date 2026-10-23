@@ -588,7 +588,10 @@ let runtime = Runtime::builder(Arc::clone(&store))
     .skill(Greet)
     .build();
 
-let outcome = runtime.run("greet", Tainted::trusted(json!({ "name": "world" }))).await?;
+let outcome = runtime
+    .start("greet", Tainted::trusted(json!({ "name": "world" })))
+    .run()
+    .await?;
 println!("{:?} → {:?}", outcome.status, outcome.output);
 
 // Re-executes the logic, reads every effect back. Nothing is performed again.

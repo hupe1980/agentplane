@@ -151,7 +151,8 @@ fn fixture(n: usize, tokens: u64, budget: Budget) -> Fixture {
 async fn an_unlimited_budget_does_not_interfere() {
     let f = fixture(20, 1_000_000, Budget::unlimited());
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -163,7 +164,8 @@ async fn an_unlimited_budget_does_not_interfere() {
 async fn an_effect_count_limit_stops_a_runaway_loop_exactly() {
     let f = fixture(100, 0, Budget::default().effects(5));
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -186,7 +188,8 @@ async fn an_effect_count_limit_stops_a_runaway_loop_exactly() {
 async fn a_token_limit_reports_where_it_stood() {
     let f = fixture(100, 40, Budget::default().tokens(100));
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -216,7 +219,8 @@ async fn a_cost_limit_is_enforced_in_minor_units() {
         .build();
 
     let out = rt
-        .run("demo.spend", Tainted::trusted(json!({})))
+        .start("demo.spend", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
@@ -245,7 +249,8 @@ async fn a_step_limit_stops_the_plan_between_steps() {
     ]);
 
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     match &out.status {
@@ -267,7 +272,8 @@ async fn a_step_limit_stops_the_plan_between_steps() {
 async fn a_metered_budget_overshoots_by_at_most_one_operation() {
     let f = fixture(10, 60, Budget::default().tokens(100));
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -290,7 +296,8 @@ async fn a_metered_budget_overshoots_by_at_most_one_operation() {
 async fn spend_is_journaled_so_replay_bills_identically() {
     let f = fixture(3, 25, Budget::default().tokens(1000));
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -335,7 +342,8 @@ async fn an_exhausted_run_replays_as_exhausted() {
         .build();
 
     let out = rt
-        .run("demo.spend", Tainted::trusted(json!({})))
+        .start("demo.spend", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
@@ -373,7 +381,8 @@ async fn an_exhausted_run_replays_as_exhausted() {
 async fn free_operations_still_count() {
     let f = fixture(50, 0, Budget::default().effects(4));
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
@@ -387,7 +396,8 @@ async fn free_operations_still_count() {
 async fn exhaustion_is_distinguishable_from_failure() {
     let f = fixture(100, 0, Budget::default().effects(1));
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -405,7 +415,8 @@ async fn exhaustion_is_distinguishable_from_failure() {
 async fn exhaustion_is_journaled() {
     let f = fixture(100, 0, Budget::default().effects(2));
     let out =
-        f.rt.run("demo.spend", Tainted::trusted(json!({})))
+        f.rt.start("demo.spend", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -443,7 +454,8 @@ async fn a_step_limited_run_replays_as_exhausted() {
     ]);
 
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -492,10 +504,11 @@ async fn a_ready_wave_cannot_outrun_the_step_ceiling() {
         .build();
 
     let out = rt
-        .run_plan(
+        .start(
             PlanIR::fan_out(["a", "b", "c"], "join"),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
 
@@ -563,10 +576,11 @@ async fn the_ready_set_is_dispatched_no_wider_than_declared() {
         }
         let rt = b.build();
         let out = rt
-            .run_plan(
+            .start(
                 PlanIR::fan_out(["a", "b", "c", "d"], "join"),
                 Tainted::trusted(json!({})),
             )
+            .run()
             .await
             .unwrap();
         assert_eq!(out.status, RunStatus::Succeeded);
@@ -679,7 +693,8 @@ async fn a_recorded_failure_costs_the_one_slot_it_cost_live() {
         .build();
 
     let crashed = rt
-        .run("demo.flaky", Tainted::trusted(json!({})))
+        .start("demo.flaky", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(crashed.status, RunStatus::Failed(_)));
@@ -727,7 +742,8 @@ async fn a_strict_replay_reaches_the_same_tally() {
         .build();
 
     let live = rt
-        .run("demo.flaky", Tainted::trusted(json!({})))
+        .start("demo.flaky", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -835,10 +851,11 @@ async fn the_last_effect_slot_is_taken_by_one_step_not_by_every_step_that_asks()
     let rt = b.build();
 
     let out = rt
-        .run_plan(
+        .start(
             PlanIR::fan_out(["a", "b", "c"], "join"),
             Tainted::trusted(json!({})),
         )
+        .run()
         .await
         .unwrap();
 
@@ -906,7 +923,8 @@ async fn a_wall_clock_ceiling_stops_the_run() {
     ]);
 
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({})))
+        .start(plan, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1031,7 +1049,11 @@ async fn a_sink_refusal_counts_against_the_denial_ceiling() {
         .budget(Budget::unlimited().denials(2))
         .skill(Probes(Arc::clone(&refused)))
         .build();
-    let out = rt.run("probe", Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .start("probe", Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
 
     assert!(
         matches!(out.status, RunStatus::Exhausted(_)),
@@ -1193,7 +1215,8 @@ async fn an_egress_ceiling_refuses_the_call_that_would_cross_it() {
         .build();
 
     let out = rt
-        .run("demo.export", Tainted::trusted(json!({})))
+        .start("demo.export", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1240,7 +1263,8 @@ async fn a_zero_egress_ceiling_still_permits_a_read() {
         .build();
 
     let out = rt
-        .run("demo.spend", Tainted::trusted(json!({})))
+        .start("demo.spend", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1335,7 +1359,8 @@ async fn a_model_calls_tool_results_count_against_the_egress_ceiling() {
         .build();
 
     let out = rt
-        .run("demo.continue", Tainted::trusted(json!({})))
+        .start("demo.continue", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(
@@ -1376,7 +1401,8 @@ async fn a_strict_replay_reaches_the_same_egress_tally() {
         .build();
 
     let live = rt
-        .run("demo.export", Tainted::trusted(json!({})))
+        .start("demo.export", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(live.consumed.egress_bytes, each * 3);

@@ -180,7 +180,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let live = runtime
-        .run("media.describe", Tainted::trusted(json!({})))
+        .start("media.describe", Tainted::trusted(json!({})))
+        .run()
         .await?;
     assert_eq!(provider.calls(), 1);
     assert_eq!(blobs.reads(), 1);

@@ -1944,7 +1944,8 @@ spec:
         let plane = Arc::clone(&planes[n % 2]);
         runs.spawn(async move {
             plane
-                .run("refund", Tainted::trusted(json!({ "order": n })))
+                .start("refund", Tainted::trusted(json!({ "order": n })))
+                .run()
                 .await
                 .expect("admitted")
                 .status
@@ -2534,16 +2535,16 @@ mod recovery_fixtures {
             .build();
 
         let sealed = plane
-            .run_once(
-                "demo.file",
-                Tainted::trusted(json!({ "doc": 7 })),
-                "DR-IDEM",
-            )
+            .start("demo.file", Tainted::trusted(json!({ "doc": 7 })))
+            .once("DR-IDEM")
+            .run()
             .await
             .expect("a run concludes")
             .run_id();
         let waiting = plane
-            .run_correlated("demo.await", Tainted::trusted(json!({})), "matter", &keys)
+            .start("demo.await", Tainted::trusted(json!({})))
+            .terms(agentplane::runtime::RunTerms::default().correlated("matter", &keys))
+            .run()
             .await
             .expect("a run suspends");
         assert!(
@@ -2603,7 +2604,8 @@ mod recovery_fixtures {
             .tenant(TenantId::new("dr-bystander").expect("a legal tenant id"))
             .skill(Files)
             .build()
-            .run("demo.file", Tainted::trusted(json!({ "doc": "theirs" })))
+            .start("demo.file", Tainted::trusted(json!({ "doc": "theirs" })))
+            .run()
             .await
             .expect("the bystander runs")
             .run_id
@@ -2987,7 +2989,8 @@ async fn the_restored_plane_serves(
 
     // New work, admitted after the restore and sealing into the rebuilt log.
     let after = serving
-        .run("demo.file", Tainted::trusted(json!({ "doc": "after" })))
+        .start("demo.file", Tainted::trusted(json!({ "doc": "after" })))
+        .run()
         .await
         .expect("the restored plane admits new work")
         .run_id;

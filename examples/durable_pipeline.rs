@@ -120,10 +120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = runtime(&store, &stages, &crash_at, &world);
 
     let first = rt
-        .run(
+        .start(
             "billing.settle",
             Tainted::trusted(json!({ "invoice": "INV-4711" })),
         )
+        .run()
         .await?;
     println!("1. live run      → {:?}", first.status);
     println!("   external calls: {}", world.touched());
@@ -152,10 +153,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = runtime(&store, &stages, &crash_at, &world);
 
     let crashed = rt
-        .run(
+        .start(
             "billing.settle",
             Tainted::trusted(json!({ "invoice": "INV-4712" })),
         )
+        .run()
         .await?;
     println!("\n3. run crashed   → {:?}", crashed.status);
     println!("   external calls: {}", world.touched());
@@ -179,10 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let world = World::default();
     let rt = runtime(&store, &stages, &crash_at, &world);
     let recorded = rt
-        .run(
+        .start(
             "billing.settle",
             Tainted::trusted(json!({ "invoice": "INV-4713" })),
         )
+        .run()
         .await?;
 
     // Ship a change: one extra stage.

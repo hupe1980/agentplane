@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use agentplane::core::ProtectedField;
-use agentplane::manifest::{Budgets, Manifest, ModelRef, Models, ToolGrant};
+use agentplane::manifest::{Budgets, Manifest, ModelRef, ToolGrant};
 use agentplane::model::fake::FakeProvider;
 use agentplane::model::{ModelProvider, ToolDeclaration, Transcript};
 use agentplane::prelude::*;
@@ -133,30 +133,25 @@ impl Skill for Tidy {
 
 fn declaration() -> Result<Manifest, agentplane::manifest::ManifestError> {
     Manifest::builder("tidier", "1.0.0")
-        .configure(|spec| {
-            spec.capabilities.provides.push("code.tidy".to_owned());
-            spec.models = Some(Models {
-                privileged: Some(ModelRef::new("fake", "coder-1")),
-                ..Models::default()
-            });
-            spec.security.max_sensitivity_egress = Some(Sensitivity::Internal);
-            spec.tools.push(ToolGrant {
-                description: Some("Read a file.".to_owned()),
-                mutates: false,
-                max_sensitivity: Some(Sensitivity::Internal),
-                ..ToolGrant::new("tool://fs/read")
-            });
-            // An argument-less mutating tool: the whole value, and only `{}`.
-            spec.tools.push(ToolGrant {
-                description: Some("Format the working tree.".to_owned()),
-                max_sensitivity: Some(Sensitivity::Internal),
-                protected_fields: vec![ProtectedField::one_of("", [json!({})])],
-                ..ToolGrant::new("tool://repo/format")
-            });
-            spec.budgets = Some(Budgets {
-                max_tokens: Some(100_000),
-                ..Budgets::default()
-            });
+        .provides("code.tidy")
+        .privileged_model(ModelRef::new("fake", "coder-1"))
+        .egress_ceiling(Sensitivity::Internal)
+        .tool(ToolGrant {
+            description: Some("Read a file.".to_owned()),
+            mutates: false,
+            max_sensitivity: Some(Sensitivity::Internal),
+            ..ToolGrant::new("tool://fs/read")
+        })
+        // An argument-less mutating tool: the whole value, and only `{}`.
+        .tool(ToolGrant {
+            description: Some("Format the working tree.".to_owned()),
+            max_sensitivity: Some(Sensitivity::Internal),
+            protected_fields: vec![ProtectedField::one_of("", [json!({})])],
+            ..ToolGrant::new("tool://repo/format")
+        })
+        .budgets(Budgets {
+            max_tokens: Some(100_000),
+            ..Budgets::default()
         })
         .build()
 }
@@ -189,7 +184,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
 
     let run = rt
-        .run("code.tidy", Tainted::trusted(json!("tidy up")))
+        .start("code.tidy", Tainted::trusted(json!("tidy up")))
+        .run()
         .await?;
     println!("run      → {}", run.status.as_str());
     assert!(

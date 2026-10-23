@@ -381,7 +381,8 @@ async fn a_plan_outside_the_chain_s_authority_never_starts() {
         .unwrap();
 
     let err = runtime(&store, &world, Some(chain))
-        .run_plan(plan("billing.transfer"), Tainted::trusted(json!({})))
+        .start(plan("billing.transfer"), Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("out of scope");
 
@@ -404,7 +405,8 @@ async fn a_plan_within_authority_runs() {
         .unwrap();
 
     let out = runtime(&store, &world, Some(chain))
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -424,7 +426,8 @@ async fn the_chain_is_journaled_at_admission() {
         .unwrap();
 
     let out = runtime(&store, &world, Some(chain))
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -450,7 +453,8 @@ async fn a_run_with_no_chain_records_none() {
     let world: World = Arc::default();
 
     let out = runtime(&store, &world, None)
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -478,7 +482,8 @@ async fn replay_uses_the_recorded_chain_not_the_configured_one() {
         .unwrap();
 
     let out = runtime(&store, &world, Some(chain))
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -540,7 +545,8 @@ async fn the_policy_request_carries_the_owner_and_the_depth() {
             world: Arc::clone(&world),
         })
         .build()
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -672,7 +678,8 @@ async fn an_expired_chain_is_refused_at_admission() {
         .unwrap();
 
     let err = runtime(&store, &world, Some(expired))
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("a chain past its validity admits nothing");
     assert!(
@@ -700,7 +707,8 @@ async fn a_chain_bound_to_another_plane_is_refused_at_admission() {
         .unwrap();
 
     let err = runtime(&store, &world, Some(elsewhere))
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .expect_err("the plane is not the audience");
     assert!(
@@ -720,7 +728,8 @@ async fn a_chain_bound_to_another_plane_is_refused_at_admission() {
         )
         .unwrap();
     let out = runtime(&store, &world, Some(here))
-        .run_plan(plan("audit.check"), Tainted::trusted(json!({})))
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("bound to this plane");
     assert!(matches!(out.status, RunStatus::Succeeded));
@@ -737,26 +746,20 @@ async fn a_run_acts_under_the_terms_chain_not_the_planes() {
     let alice = Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])));
 
     let err = rt
-        .run_plan_under(
-            plan("billing.transfer"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(alice.clone()),
-        )
+        .start(plan("billing.transfer"), Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(alice.clone()))
+        .run()
         .await
         .expect_err("outside the caller's scope, inside the plane's");
     assert!(err.to_string().contains("billing.transfer"), "{err}");
     assert!(world.lock().unwrap().is_empty());
 
     let out = rt
-        .run_plan_under(
-            plan("audit.check"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(alice),
-        )
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(alice))
+        .run()
         .await
-        .expect("inside the caller's scope")
-        .into_outcome()
-        .expect("the run rested");
+        .expect("inside the caller's scope");
     let records = store.read(out.run_id, 1).await.unwrap();
     let bound = records
         .iter()
@@ -828,15 +831,11 @@ async fn a_steps_policy_context_names_the_runs_chain_live_and_on_replay() {
             world: Arc::clone(&world),
         })
         .build()
-        .run_plan_under(
-            plan("audit.check"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(alice),
-        )
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(alice))
+        .run()
         .await
-        .unwrap()
-        .into_outcome()
-        .expect("the run rested");
+        .unwrap();
     assert_eq!(
         subjects_of(&live),
         vec!["user:alice"],
@@ -911,15 +910,11 @@ async fn a_commissioned_run_acts_under_the_orderers_chain_plus_one_link() {
         .build();
 
     let out = rt
-        .run_plan_under(
-            plan("audit.order"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(alice),
-        )
+        .start(plan("audit.order"), Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(alice))
+        .run()
         .await
-        .unwrap()
-        .into_outcome()
-        .expect("the run rested");
+        .unwrap();
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
 
     let chains: Vec<Vec<String>> = {
@@ -957,7 +952,7 @@ async fn a_commission_keeps_whether_the_run_acts_as_the_plane() {
         (true, RunTerms::default()),
         (
             false,
-            RunTerms::default().acting_as(Delegation::root(Principal::new(
+            RunTerms::acting_as(Delegation::root(Principal::new(
                 "user:alice",
                 Scope::of(["audit.*"]),
             ))),
@@ -977,11 +972,11 @@ async fn a_commission_keeps_whether_the_run_acts_as_the_plane() {
             })
             .build();
         let out = rt
-            .run_plan_under(plan("audit.order"), Tainted::trusted(json!({})), terms)
+            .start(plan("audit.order"), Tainted::trusted(json!({})))
+            .terms(terms)
+            .run()
             .await
-            .unwrap()
-            .into_outcome()
-            .expect("the run rested");
+            .unwrap();
         assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
         for (run, _) in store.recent_runs(None, 10).await.unwrap() {
             let records = store.read(run, 1).await.unwrap();
@@ -1034,15 +1029,11 @@ async fn a_replayed_step_reads_the_recorded_chain_not_the_configured_one() {
     };
 
     let out = plane(owner())
-        .run_plan_under(
-            plan("audit.whoami"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().acting_as(alice),
-        )
+        .start(plan("audit.whoami"), Tainted::trusted(json!({})))
+        .terms(RunTerms::acting_as(alice))
+        .run()
         .await
-        .unwrap()
-        .into_outcome()
-        .expect("the run rested");
+        .unwrap();
     assert_eq!(
         out.output.as_ref().map(|o| o.peek()["subject"].clone()),
         Some(json!("user:alice")),
@@ -1078,29 +1069,26 @@ async fn a_keyed_plan_admission_is_validated_and_answered_by_its_holder() {
     let rt = runtime(&store, &world, Some(owner()));
 
     let refused = rt
-        .run_plan_under(
-            plan("audit.check"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().once(""),
-        )
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .terms(RunTerms::default())
+        .once("")
+        .run()
         .await;
     assert!(refused.is_err(), "an empty key was claimed");
 
     let first = rt
-        .run_plan_under(
-            plan("audit.check"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().once("delivery-7"),
-        )
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .terms(RunTerms::default())
+        .once("delivery-7")
+        .run()
         .await
         .expect("admitted");
     assert!(first.is_fresh());
     let again = rt
-        .run_plan_under(
-            plan("audit.check"),
-            Tainted::trusted(json!({})),
-            RunTerms::default().once("delivery-7"),
-        )
+        .start(plan("audit.check"), Tainted::trusted(json!({})))
+        .terms(RunTerms::default())
+        .once("delivery-7")
+        .run()
         .await
         .expect("a redelivery is answered, not refused");
     assert!(!again.is_fresh(), "the redelivery admitted a second run");

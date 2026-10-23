@@ -29,7 +29,7 @@ use agentplane::core::{
     Timestamp,
 };
 use agentplane::journal::JournalStore;
-use agentplane::runtime::{Runtime, StepCtx, metrics};
+use agentplane::runtime::{RunTerms, Runtime, StepCtx, metrics};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 use tracing::{Event, Metadata, Subscriber, span};
@@ -241,7 +241,8 @@ async fn a_run_reports_its_outcome_and_its_effects() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(meter.clone());
     runtime(&db)
-        .run("ping", Tainted::trusted(json!({})))
+        .start("ping", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     drop(guard);
@@ -269,7 +270,8 @@ async fn a_run_reports_its_outcome_and_its_effects() {
 async fn a_replayed_effect_is_counted_separately_from_a_performed_one() {
     let db = store();
     let out = runtime(&db)
-        .run("ping", Tainted::trusted(json!({})))
+        .start("ping", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -386,12 +388,9 @@ async fn the_census_reports_humans_the_plane_is_waiting_on() {
     assert_eq!(rt.census(t(1_000)).await.unwrap().open_tasks, 0);
 
     let out = rt
-        .run_correlated(
-            "approve",
-            Tainted::trusted(json!({})),
-            "approval",
-            &[CorrelationKey::new("req", "1")],
-        )
+        .start("approve", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("approval", &[CorrelationKey::new("req", "1")]))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -456,7 +455,8 @@ async fn every_sample_matches_its_declaration() {
     let _ambient = crate::ambient_subscriber();
     let guard = tracing::subscriber::set_default(meter.clone());
     runtime(&db)
-        .run("ping", Tainted::trusted(json!({})))
+        .start("ping", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     runtime(&db)
@@ -519,7 +519,8 @@ async fn metrics_carry_no_tenant_unless_asked() {
             .tenant_label(TenantLabel::Omitted)
             .skill(Pinger)
             .build();
-        rt.run("ping", Tainted::trusted(json!({})))
+        rt.start("ping", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         meter.samples()
@@ -557,7 +558,8 @@ async fn the_tenant_label_reaches_the_run_span_too() {
             .tenant_label(TenantLabel::Name)
             .skill(Pinger)
             .build();
-        rt.run("ping", Tainted::trusted(json!({})))
+        rt.start("ping", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         recorder.span_fields()
@@ -595,7 +597,8 @@ async fn an_asked_for_tenant_label_is_the_planes_own() {
             .tenant_label(TenantLabel::Name)
             .skill(Pinger)
             .build();
-        rt.run("ping", Tainted::trusted(json!({})))
+        rt.start("ping", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("run");
         meter.samples()
@@ -680,7 +683,8 @@ async fn the_quarantine_backlog_is_reported_as_a_level_not_only_as_a_rate() {
 
     for _ in 0..3 {
         let out = rt
-            .run("demo.undecidable", Tainted::trusted(json!({})))
+            .start("demo.undecidable", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
         assert!(matches!(
@@ -711,7 +715,8 @@ async fn the_quarantine_level_is_not_bounded_by_a_page_size() {
         .build();
 
     for _ in 0..250 {
-        rt.run("demo.undecidable", Tainted::trusted(json!({})))
+        rt.start("demo.undecidable", Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     }

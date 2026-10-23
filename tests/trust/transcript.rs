@@ -121,7 +121,8 @@ async fn turn(
             ceiling,
         }))
         .build()
-        .run("work.do", Tainted::trusted(json!({})))
+        .start("work.do", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("the run completes");
     Turn {

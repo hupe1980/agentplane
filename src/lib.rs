@@ -74,7 +74,8 @@
 //! // With the default features, `agentplane::store::RedbStore` is one.
 //! let runtime = Runtime::builder(store).skill(Greet).build();
 //! // Runs are asked for by capability — what the skill `provides`.
-//! let outcome = runtime.run("demo.greet", Tainted::trusted(serde_json::json!({"name": "world"}))).await?;
+//! let input = Tainted::trusted(serde_json::json!({ "name": "world" }));
+//! let outcome = runtime.start("demo.greet", input).run().await?;
 //! assert!(matches!(outcome.status, RunStatus::Succeeded), "{:?}", outcome.status);
 //!
 //! // Replaying re-executes the deterministic zone and reads every effect back

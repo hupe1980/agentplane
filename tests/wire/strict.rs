@@ -188,3 +188,104 @@ fn a_rust_number_type_does_not_cost_a_tool_its_strictness() {
     assert_eq!(ranged["properties"]["pages"]["minimum"], 1, "{ranged}");
     assert_eq!(ranged["properties"]["pages"]["maximum"], 10, "{ranged}");
 }
+
+/// **An argument-less tool is strict-ready for both providers.** Both refuse an
+/// object with no `properties`, which is what `schemars` writes for a struct
+/// with no fields — whether it is the tool's own type or a field's.
+#[test]
+fn an_argument_less_tool_does_not_cost_its_strictness() {
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct GitStatus {}
+    #[derive(schemars::JsonSchema)]
+    #[allow(dead_code)]
+    struct Holds {
+        nothing: GitStatus,
+    }
+
+    for schema in [
+        agentplane::tools::strict_schema::<GitStatus>(),
+        agentplane::tools::strict_schema::<Holds>(),
+    ] {
+        for subset in StrictSubset::ALL {
+            assert_eq!(subset.problem(&schema), None, "{subset:?}: {schema}");
+        }
+    }
+    let foreign = agentplane::tools::closed_schema(&json!({
+        "type": "object",
+        "additionalProperties": false,
+    }));
+    for subset in StrictSubset::ALL {
+        assert_eq!(subset.problem(&foreign), None, "{subset:?}: {foreign}");
+    }
+}
+
+/// **A schema somebody else wrote is only narrowed.** Making an optional
+/// property nullable sends `null` where the server expected nothing, and
+/// dropping a declared bound lets a model send what the server never
+/// re-checks: both are `serde`'s to allow, so only a typed tool's schema gets
+/// them. A free-form object stays free-form.
+#[test]
+fn a_foreign_schema_is_narrowed_and_never_rewritten() {
+    let declared = json!({
+        "type": "object",
+        "properties": {
+            "note": { "type": ["string", "null"] },
+            "pages": { "type": "integer", "format": "uint8", "minimum": 0, "maximum": 255 },
+            "labels": { "type": "object" },
+            "target": {
+                "type": "object",
+                "properties": { "account": { "type": "string" } },
+                "required": ["account"],
+            },
+        },
+        "required": ["pages", "labels", "target"],
+    });
+    let closed = agentplane::tools::closed_schema(&declared);
+
+    assert_eq!(closed["additionalProperties"], false, "{closed}");
+    assert_eq!(
+        closed["properties"]["target"]["additionalProperties"],
+        false
+    );
+    assert_eq!(
+        closed["required"], declared["required"],
+        "an optional became required"
+    );
+    assert_eq!(
+        closed["properties"]["pages"],
+        declared["properties"]["pages"]
+    );
+    assert_eq!(
+        closed["properties"]["labels"], declared["properties"]["labels"],
+        "a free-form object was closed to an empty one"
+    );
+}
+
+/// **A composed schema is left as written.** Under `oneOf`, a branch closed
+/// into no longer matching a value can leave another branch matching it
+/// alone — admitting a value the schema refused. A property merely *named*
+/// after a composing keyword is a name, not a composition.
+#[test]
+fn closing_never_widens_a_composed_schema() {
+    let composed = json!({
+        "type": "object",
+        "properties": {
+            "to": { "oneOf": [
+                { "type": "object", "properties": { "iban": { "type": "string" } } },
+                { "type": "object", "properties": { "email": { "type": "string" } } },
+            ] },
+        },
+    });
+    assert_eq!(agentplane::tools::closed_schema(&composed), composed);
+
+    let named = json!({
+        "type": "object",
+        "properties": { "not": { "type": "string" } },
+        "required": ["not"],
+    });
+    assert_eq!(
+        agentplane::tools::closed_schema(&named)["additionalProperties"],
+        false
+    );
+}

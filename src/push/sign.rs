@@ -367,9 +367,8 @@ pub struct VerifiedDelivery {
     /// the verifier returning `Ok(())`: a verified signature says the bytes are
     /// genuine, not that they have not already been acted on.
     ///
-    /// Hand it to
-    /// [`Runtime::run_correlated_once`](crate::runtime::Runtime::run_correlated_once)
-    /// and the duplicate is refused by the store rather than by a map in this
+    /// Hand it to [`RunRequest::once`](crate::runtime::RunRequest::once) and
+    /// the duplicate is refused by the store rather than by a map in this
     /// process — deduplicating across a fleet rather than until the next
     /// restart.
     pub id: String,

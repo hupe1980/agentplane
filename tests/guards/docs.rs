@@ -1844,6 +1844,121 @@ fn every_documented_step_ctx_method_exists() {
     );
 }
 
+/// The public methods of `Runtime`. Not the request `start` returns: its
+/// `run` and `spawn` share names with methods `Runtime` no longer has, and a
+/// chained call is never written with a plane's receiver.
+fn runtime_methods(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut real = std::collections::BTreeSet::new();
+    for file in walk(&root.join("src/runtime")) {
+        if file.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&file).expect("a readable module");
+        let mut inside = false;
+        for line in source.lines() {
+            if line.starts_with("impl") {
+                inside = line.contains("Runtime {");
+            }
+            if !inside {
+                continue;
+            }
+            let Some(rest) = line.trim_start().strip_prefix("pub ") else {
+                continue;
+            };
+            let rest = rest.strip_prefix("async ").unwrap_or(rest);
+            let rest = rest.strip_prefix("const ").unwrap_or(rest);
+            if let Some(name) = rest.strip_prefix("fn ") {
+                let name: String = name
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    real.insert(name);
+                }
+            }
+        }
+    }
+    real
+}
+
+/// Every `rt.method(...)` a page publishes names a method that exists.
+///
+/// The run door was twelve methods and became one; a page still calling a
+/// removed one compiles nowhere and fails nothing, since doc tests do not run
+/// the site. The same check as the `StepCtx` guard above, for the receivers
+/// pages give a plane.
+#[test]
+fn every_documented_runtime_method_exists() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let real = runtime_methods(root);
+    assert!(
+        real.len() > 30,
+        "only {} Runtime methods were found — the impl blocks moved and this \
+         guard is now inert",
+        real.len()
+    );
+
+    let mut pages = 0usize;
+    let mut cited = 0usize;
+    let mut bad: Vec<String> = Vec::new();
+    let mut files: Vec<std::path::PathBuf> = vec![root.join("README.md")];
+    files.extend(walk(&root.join("site/content")));
+    // The landing page's sample is the first code a visitor copies.
+    files.push(root.join("site/templates/index.html"));
+    for file in &files {
+        if file.extension().is_none_or(|e| e != "md" && e != "html") {
+            continue;
+        }
+        pages += 1;
+        let text = std::fs::read_to_string(file).expect("a readable page");
+        for (n, line) in text.lines().enumerate() {
+            for marker in ["rt.", "runtime.", "plane.", "Runtime::"] {
+                let mut from = 0usize;
+                while let Some(at) = line[from..].find(marker) {
+                    let begin = from + at;
+                    let start = begin + marker.len();
+                    from = start;
+                    // `start.` is not `rt.`: the marker begins a word.
+                    if line[..begin]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    {
+                        continue;
+                    }
+                    let name: String = line[start..]
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if name.is_empty() || !line[start + name.len()..].starts_with('(') {
+                        continue;
+                    }
+                    cited += 1;
+                    if !real.contains(&name) {
+                        bad.push(format!(
+                            "{}:{}: `{marker}{name}` is not a Runtime method",
+                            file.strip_prefix(root).unwrap_or(file).display(),
+                            n + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        pages > 5 && cited > 10,
+        "the walk found {pages} pages and {cited} citations — the site moved \
+         and this guard is now inert"
+    );
+    assert!(
+        bad.is_empty(),
+        "a page publishes a Runtime method that does not exist, so a reader \
+         copying it gets a compile error:\n  {}",
+        bad.join("\n  ")
+    );
+}
+
 /// Every field the manifest reference tabulates is a field the parser knows.
 ///
 /// The YAML-block guards above run published *examples* through the real

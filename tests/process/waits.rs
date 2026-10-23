@@ -19,7 +19,7 @@ use agentplane::core::{
     SkillDescriptor, SkillError, Tainted, Timestamp,
 };
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -103,14 +103,11 @@ async fn a_run_suspends_on_a_wait_and_resumes_on_delivery() {
     let f = fixture("D-1");
 
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-1")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-1")]))
+            .run()
+            .await
+            .unwrap();
 
     assert!(out.status.is_suspended(), "got {:?}", out.status);
     assert_eq!(
@@ -171,14 +168,11 @@ async fn an_event_arriving_before_the_wait_is_not_lost() {
     // Now the run starts and reaches the wait. It should find the reply already
     // waiting for it and never suspend at all.
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-2")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-2")]))
+            .run()
+            .await
+            .unwrap();
 
     assert_eq!(
         out.status,
@@ -197,14 +191,11 @@ async fn an_event_arriving_before_the_wait_is_not_lost() {
 #[tokio::test]
 async fn duplicate_delivery_is_a_no_op() {
     let f = fixture("D-3");
-    f.rt.run_correlated(
-        "demo.request",
-        Tainted::trusted(json!({})),
-        "matter",
-        &[key("D-3")],
-    )
-    .await
-    .unwrap();
+    f.rt.start("demo.request", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-3")]))
+        .run()
+        .await
+        .unwrap();
 
     let first = f.rt.deliver(&reply("EV-3", "D-3", json!(1))).await.unwrap();
     assert!(matches!(first, Delivery::Resumed { .. }));
@@ -224,14 +215,11 @@ async fn a_retried_delivery_offers_a_message_a_crash_left_unmatched() {
 
     let f = fixture("D-31");
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-31")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-31")]))
+            .run()
+            .await
+            .unwrap();
     assert!(out.status.is_suspended());
 
     // The first delivery's buffer write landed; its match never ran.
@@ -256,14 +244,11 @@ async fn a_retried_delivery_offers_a_message_a_crash_left_unmatched() {
 async fn events_are_matched_by_correlation_not_by_kind_alone() {
     let f = fixture("D-4");
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-4")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-4")]))
+            .run()
+            .await
+            .unwrap();
     assert!(out.status.is_suspended());
 
     // Right kind, wrong document.
@@ -296,21 +281,15 @@ async fn an_event_is_delivered_to_exactly_one_waiter() {
 
     // Two runs, same correlation key, both waiting.
     let a = rt
-        .run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-5")],
-        )
+        .start("demo.request", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-5")]))
+        .run()
         .await
         .unwrap();
     let b = rt
-        .run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-5")],
-        )
+        .start("demo.request", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-5")]))
+        .run()
         .await
         .unwrap();
     assert!(a.status.is_suspended() && b.status.is_suspended());
@@ -477,14 +456,11 @@ async fn a_grace_window_past_the_calendar_retires_nothing() {
 #[tokio::test]
 async fn the_sweep_leaves_claimed_events_alone() {
     let f = fixture("D-7");
-    f.rt.run_correlated(
-        "demo.request",
-        Tainted::trusted(json!({})),
-        "matter",
-        &[key("D-7")],
-    )
-    .await
-    .unwrap();
+    f.rt.start("demo.request", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-7")]))
+        .run()
+        .await
+        .unwrap();
     f.rt.deliver(&reply("EV-7", "D-7", json!(1))).await.unwrap();
 
     let retired = f.rt.sweep_events(std::time::Duration::ZERO).await.unwrap();
@@ -499,14 +475,11 @@ async fn the_sweep_leaves_claimed_events_alone() {
 async fn a_suspended_run_is_not_sealed_and_records_why() {
     let f = fixture("D-8");
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-8")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-8")]))
+            .run()
+            .await
+            .unwrap();
 
     let records = f.store.read(out.run_id, 1).await.unwrap();
     let suspended = records
@@ -528,14 +501,11 @@ async fn a_suspended_run_is_not_sealed_and_records_why() {
 async fn a_resumed_run_replays_strictly() {
     let f = fixture("D-9");
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-9")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-9")]))
+            .run()
+            .await
+            .unwrap();
     f.rt.deliver(&reply("EV-9", "D-9", json!({ "ok": true })))
         .await
         .unwrap();
@@ -587,14 +557,11 @@ async fn a_delivered_event_is_untrusted() {
         .skill(Inspects)
         .build();
 
-    rt.run_correlated(
-        "demo.inspect",
-        Tainted::trusted(json!({})),
-        "matter",
-        &[key("D-10")],
-    )
-    .await
-    .unwrap();
+    rt.start("demo.inspect", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-10")]))
+        .run()
+        .await
+        .unwrap();
     let out = rt
         .deliver(&reply("EV-10", "D-10", json!("payload")))
         .await
@@ -635,12 +602,9 @@ async fn a_wait_without_a_registered_deadline_is_refused() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "demo.unbounded",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-11")],
-        )
+        .start("demo.unbounded", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-11")]))
+        .run()
         .await
         .unwrap();
 
@@ -735,12 +699,9 @@ async fn waiting_without_an_event_store_is_refused() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "demo.waits",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-14")],
-        )
+        .start("demo.waits", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-14")]))
+        .run()
         .await
         .unwrap();
 
@@ -780,12 +741,9 @@ async fn cases_do_not_require_an_event_store() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "demo.nowait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-15")],
-        )
+        .start("demo.nowait", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-15")]))
+        .run()
         .await
         .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -847,12 +805,9 @@ async fn a_wait_in_a_later_step_resumes_and_completes() {
     ]);
 
     let out = rt
-        .run_plan_correlated(
-            plan,
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-LATE")],
-        )
+        .start(plan, Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-LATE")]))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -920,12 +875,9 @@ async fn an_awaited_events_sender_is_in_its_provenance_and_survives_replay() {
         .build();
 
     let out = rt
-        .run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "clearing",
-            &[key("DOC-77")],
-        )
+        .start("demo.request", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("clearing", &[key("DOC-77")]))
+        .run()
         .await
         .expect("run");
     rt.deliver(&reply("EV-77", "DOC-77", json!({ "status": "ok" })))
@@ -989,14 +941,11 @@ async fn a_delivery_racing_a_live_owner_is_finished_by_the_sweep() {
     let f = fixture("D-9");
 
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-9")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-9")]))
+            .run()
+            .await
+            .unwrap();
     assert!(out.status.is_suspended());
 
     // Another instance holds the run — the concluding-owner window, stretched
@@ -1114,14 +1063,11 @@ fn waiting_fixture(doc: &'static str) -> Fixture {
 async fn a_cancelled_runs_wait_is_retired_and_the_live_waiter_gets_the_event() {
     let f = waiting_fixture("D-K");
     let a =
-        f.rt.run_correlated(
-            "demo.wait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-K")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.wait", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-K")]))
+            .run()
+            .await
+            .unwrap();
     assert!(a.status.is_suspended(), "{:?}", a.status);
     f.rt.request_cancel(a.run_id, &ops(), "withdrawn by the requester")
         .await
@@ -1143,14 +1089,11 @@ async fn a_cancelled_runs_wait_is_retired_and_the_live_waiter_gets_the_event() {
     );
 
     let b =
-        f.rt.run_correlated(
-            "demo.wait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-K")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.wait", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-K")]))
+            .run()
+            .await
+            .unwrap();
     assert!(b.status.is_suspended(), "{:?}", b.status);
     let delivery =
         f.rt.deliver(&reply("EV-K", "D-K", json!({ "status": "accepted" })))
@@ -1169,14 +1112,11 @@ async fn a_cancelled_runs_wait_is_retired_and_the_live_waiter_gets_the_event() {
 async fn a_sealed_runs_leftover_wait_does_not_take_the_event() {
     let f = waiting_fixture("D-L");
     let a =
-        f.rt.run_correlated(
-            "demo.wait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-L")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.wait", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-L")]))
+            .run()
+            .await
+            .unwrap();
     assert!(a.status.is_suspended(), "{:?}", a.status);
     let leftover = f.store.waiting(64).await.unwrap();
     assert_eq!(leftover.len(), 1);
@@ -1185,14 +1125,11 @@ async fn a_sealed_runs_leftover_wait_does_not_take_the_event() {
         .unwrap();
 
     let b =
-        f.rt.run_correlated(
-            "demo.wait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-L")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.wait", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-L")]))
+            .run()
+            .await
+            .unwrap();
     // The crash's leftover, registered before the live wait.
     let long_ago = Timestamp::from_unix_timestamp(1_000_000_000).unwrap();
     f.store.subscribe(&leftover[0], long_ago).await.unwrap();
@@ -1248,14 +1185,11 @@ async fn a_parked_delivery_behind_a_page_of_long_waits_is_redelivered() {
     }
 
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-P")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-P")]))
+            .run()
+            .await
+            .unwrap();
     assert!(out.status.is_suspended());
 
     // Another owner holds the run through the delivery's whole retry window.
@@ -1311,14 +1245,11 @@ async fn a_parked_delivery_behind_a_page_of_long_waits_is_redelivered() {
 async fn a_repaired_seal_retires_the_runs_waits() {
     let f = fixture("D-REPAIR");
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-REPAIR")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-REPAIR")]))
+            .run()
+            .await
+            .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
     assert_eq!(f.store.waiting(10).await.unwrap().len(), 1);
 
@@ -1378,14 +1309,11 @@ async fn a_repaired_seal_retires_the_runs_waits() {
 async fn a_message_for_a_concluded_run_goes_to_the_live_waiter_behind_it() {
     let f = fixture("D-HAND");
     let closed =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-HAND")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-HAND")]))
+            .run()
+            .await
+            .unwrap();
     assert!(closed.status.is_suspended());
     let lease = f
         .store
@@ -1419,14 +1347,11 @@ async fn a_message_for_a_concluded_run_goes_to_the_live_waiter_behind_it() {
         .unwrap();
 
     let live =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-HAND")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-HAND")]))
+            .run()
+            .await
+            .unwrap();
     assert!(live.status.is_suspended());
 
     tokio::time::timeout(
@@ -1484,14 +1409,11 @@ async fn a_message_for_a_concluded_run_goes_to_the_live_waiter_behind_it() {
 async fn a_message_erased_after_its_claim_is_not_delivered_as_null() {
     let f = fixture("D-ERASED");
     let out =
-        f.rt.run_correlated(
-            "demo.request",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-ERASED")],
-        )
-        .await
-        .unwrap();
+        f.rt.start("demo.request", Tainted::trusted(json!({})))
+            .terms(RunTerms::default().correlated("matter", &[key("D-ERASED")]))
+            .run()
+            .await
+            .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
 
     // The crashed delivery: buffered, claimed and parked, never resumed.
@@ -1593,22 +1515,16 @@ async fn a_second_run_shares_the_obligation_its_matter_already_owes() {
         .build();
 
     let first = rt
-        .run_correlated(
-            "demo.wait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-S")],
-        )
+        .start("demo.wait", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-S")]))
+        .run()
         .await
         .unwrap();
     assert!(first.status.is_suspended(), "{:?}", first.status);
     let second = rt
-        .run_correlated(
-            "demo.wait.longer",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[key("D-S")],
-        )
+        .start("demo.wait.longer", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[key("D-S")]))
+        .run()
         .await
         .unwrap();
     assert!(

@@ -12,7 +12,7 @@ use agentplane::authority::{ApprovalRule, AuthorityStore, Holder, Matcher, Stand
 use agentplane::case::{CaseStore, EventStore, TaskStore};
 use agentplane::core::{CorrelationKey, Operator, Tainted, Timestamp};
 use agentplane::journal::{JournalStore, RecordKind};
-use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
+use agentplane::runtime::{Agent, Mode, RunStatus, RunTerms, Runtime};
 use agentplane::store::RedbStore;
 use agentplane::testkit::FakeProvider;
 use agentplane::tools::{Tool, ToolBox, ToolFailure};
@@ -124,12 +124,14 @@ const MODEL_AUTHORED: &str =
 async fn pay(plane: &Plane, invoice: &str) -> agentplane::runtime::RunOutcome {
     plane
         .rt
-        .run_correlated(
+        .start(
             "desk.pay",
             Tainted::trusted(json!({ "instruction": format!("pay {invoice}") })),
-            "payment",
-            &[CorrelationKey::new("invoice", invoice)],
         )
+        .terms(
+            RunTerms::default().correlated("payment", &[CorrelationKey::new("invoice", invoice)]),
+        )
+        .run()
         .await
         .expect("the run is admitted")
 }

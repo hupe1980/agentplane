@@ -25,7 +25,7 @@ use std::sync::Arc;
 use agentplane::authority::{AuthorityError, AuthorityId, AuthorityStore, StandingAuthority};
 use agentplane::core::{Outcome, Skill, SkillDescriptor, SkillError, Spend, Tainted, Timestamp};
 use agentplane::journal::JournalStore;
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -342,13 +342,14 @@ async fn an_authority_id_from_untrusted_data_is_refused() {
         .build();
 
     let outcome = runtime
-        .run(
+        .start(
             "commerce.buy_named",
             Tainted::from_source(
                 json!({ "authority": "mandate-42" }),
                 agentplane::core::SourceId::new("peer:x"),
             ),
         )
+        .run()
         .await
         .expect("run");
     assert!(
@@ -365,10 +366,11 @@ async fn an_authority_id_from_untrusted_data_is_refused() {
 
     // The same id, chosen by the operator, draws.
     let outcome = runtime
-        .run(
+        .start(
             "commerce.buy_named",
             Tainted::trusted(json!({ "authority": "mandate-42" })),
         )
+        .run()
         .await
         .expect("run");
     assert_eq!(outcome.status, RunStatus::Succeeded);
@@ -401,7 +403,8 @@ async fn a_run_acting_for_someone_else_cannot_draw() {
     };
 
     let bob = acting_for("user:bob")
-        .run("commerce.buy", Tainted::trusted(json!({})))
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -417,7 +420,8 @@ async fn a_run_acting_for_someone_else_cannot_draw() {
     assert_eq!(state.drawn, Spend::default());
 
     let alice = acting_for("user:alice")
-        .run("commerce.buy", Tainted::trusted(json!({})))
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(alice.status, RunStatus::Succeeded, "the holder may draw");
@@ -454,7 +458,8 @@ async fn a_tenant_mandate_is_drawn_only_by_the_planes_own_runs() {
         "tenant:default",
         Scope::root(),
     ))))
-    .run("commerce.buy", Tainted::trusted(json!({})))
+    .start("commerce.buy", Tainted::trusted(json!({})))
+    .run()
     .await
     .expect("run");
     assert!(
@@ -465,16 +470,11 @@ async fn a_tenant_mandate_is_drawn_only_by_the_planes_own_runs() {
 
     // A served caller with no chain holds nothing.
     let served = plane(None)
-        .run_under(
-            "commerce.buy",
-            Tainted::trusted(json!({})),
-            agentplane::runtime::RunTerms::default().served(None),
-        )
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .terms(RunTerms::served(None))
+        .run()
         .await
         .expect("admitted");
-    let agentplane::runtime::Admission::Fresh(served) = served else {
-        panic!("a fresh admission");
-    };
     assert!(
         matches!(served.status, RunStatus::Failed(_)),
         "a chainless served caller drew the tenant's mandate: {:?}",
@@ -484,7 +484,8 @@ async fn a_tenant_mandate_is_drawn_only_by_the_planes_own_runs() {
 
     // The plane's own run, with no chain, does.
     let own = plane(None)
-        .run("commerce.buy", Tainted::trusted(json!({})))
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(own.status, RunStatus::Succeeded);
@@ -529,7 +530,8 @@ async fn a_planes_own_commission_draws_as_the_plane() {
         .skill(DelegatesBuying)
         .build();
     let out = plane
-        .run("commerce.delegate", Tainted::trusted(json!({})))
+        .start("commerce.delegate", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(
@@ -569,16 +571,11 @@ async fn a_planes_own_commission_draws_as_the_plane() {
     // The other half: a chainless *served* caller's commission holds nothing,
     // so its sub-run cannot draw what its parent could not.
     let served = plane
-        .run_under(
-            "commerce.delegate",
-            Tainted::trusted(json!({})),
-            agentplane::runtime::RunTerms::default().served(None),
-        )
+        .start("commerce.delegate", Tainted::trusted(json!({})))
+        .terms(RunTerms::served(None))
+        .run()
         .await
         .expect("admitted");
-    let agentplane::runtime::Admission::Fresh(served) = served else {
-        panic!("a fresh admission");
-    };
     assert!(
         matches!(served.status, RunStatus::Failed(_)),
         "a chainless served caller drew the tenant's mandate through a commission: {:?}",
@@ -609,7 +606,8 @@ async fn strict_replay_reads_the_receipt_and_does_not_draw_again() {
         .build();
 
     let live = runtime
-        .run("commerce.buy", Tainted::trusted(json!({})))
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -662,7 +660,8 @@ async fn a_run_that_cannot_draw_does_not_succeed() {
         .build();
 
     let outcome = runtime
-        .run("commerce.buy", Tainted::trusted(json!({})))
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -692,7 +691,8 @@ async fn drawing_without_a_store_refuses_rather_than_proceeding() {
         .build();
 
     let outcome = runtime
-        .run("commerce.buy", Tainted::trusted(json!({})))
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     assert!(
@@ -758,7 +758,8 @@ async fn a_revoked_draw_is_answered_once_and_never_retried() {
         .build();
 
     let outcome = runtime
-        .run("commerce.buy", Tainted::trusted(json!({})))
+        .start("commerce.buy", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("run");
     match &outcome.status {

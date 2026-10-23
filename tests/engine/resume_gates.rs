@@ -35,7 +35,7 @@ use agentplane::core::{
 };
 use agentplane::journal::{Append, JournalStore, RecordKind};
 use agentplane::runtime::effects::Recorded;
-use agentplane::runtime::{Mode, RunStatus, Runtime, StepCtx};
+use agentplane::runtime::{Mode, RunStatus, RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -156,7 +156,8 @@ async fn an_edited_declaration_is_refused_before_the_resume_replays() {
     };
 
     let crashed = plane(LEAKY, &crash)
-        .run("demo.leak", Tainted::trusted(json!({})))
+        .start("demo.leak", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(crashed.status, RunStatus::Failed(_)));
@@ -234,7 +235,8 @@ async fn the_egress_ceiling_holds_on_the_live_tail_of_a_resume() {
     // verdict about it — the resume below meets the ceiling at the frontier,
     // as a live decision, or not at all.
     let crashed = rt
-        .run("demo.leak", Tainted::trusted(json!({})))
+        .start("demo.leak", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -360,7 +362,8 @@ async fn a_resumed_run_past_the_frontier_still_meets_max_steps() {
     // The run crashes inside step 0, before the ceiling was ever consulted
     // about step 1.
     let crashed = rt
-        .run_plan(two_step_plan(), Tainted::trusted(json!({})))
+        .start(two_step_plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(crashed.status, RunStatus::Failed(_)));
@@ -478,7 +481,8 @@ async fn the_delegation_ceiling_holds_on_the_live_tail_of_a_resume() {
         .build();
 
     let crashed = rt
-        .run("demo.chief", Tainted::trusted(json!({})))
+        .start("demo.chief", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(crashed.status, RunStatus::Failed(_)));
@@ -544,17 +548,12 @@ spec:
         })
         .build();
 
-    let admitted = rt
-        .run_under(
-            "demo.chief",
-            Tainted::trusted(json!({})),
-            agentplane::runtime::RunTerms::default().served(None),
-        )
+    let out = rt
+        .start("demo.chief", Tainted::trusted(json!({})))
+        .terms(RunTerms::served(None))
+        .run()
         .await
         .expect("admitted");
-    let agentplane::runtime::Admission::Fresh(out) = admitted else {
-        panic!("a fresh admission");
-    };
     assert!(
         matches!(out.status, RunStatus::Failed(_)),
         "a chainless run delegated past the plane's depth: {:?}",
@@ -634,7 +633,8 @@ async fn a_mutating_effect_that_ends_in_doubt_quarantines() {
         .skill(CallsQuiet { mutates: true })
         .build();
     let out = rt
-        .run("demo.quiet", Tainted::trusted(json!({})))
+        .start("demo.quiet", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -653,7 +653,8 @@ async fn a_non_mutating_effect_that_ends_in_doubt_fails_normally() {
         .skill(CallsQuiet { mutates: false })
         .build();
     let out = rt
-        .run("demo.quiet", Tainted::trusted(json!({})))
+        .start("demo.quiet", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -935,7 +936,8 @@ async fn an_exhausted_run_resumes_under_a_raised_ceiling_and_not_under_the_same_
     // Two steps of budget for a three-step plan.
     let capped = staged_plane(&store, Budget::default().steps(2), &counters);
     let out = capped
-        .run_plan(three_step_plan(), Tainted::trusted(json!({})))
+        .start(three_step_plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Exhausted(_)));
@@ -1080,7 +1082,8 @@ async fn an_effect_limited_run_resumes_under_a_raised_ceiling_and_not_under_the_
     // Two effects of budget for a three-effect step.
     let capped = three_calls_plane(&store, Budget::default().effects(2), &performed);
     let out = capped
-        .run("demo.three", Tainted::trusted(json!({})))
+        .start("demo.three", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1222,7 +1225,8 @@ async fn a_run_that_compensated_is_refused_a_resume() {
         .build();
 
     let out = rt
-        .run_plan(two_step_plan(), Tainted::trusted(json!({})))
+        .start(two_step_plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -1307,7 +1311,8 @@ async fn a_resume_does_not_duplicate_a_replayed_steps_ending() {
 
     // Step 0 completes; step 1 crashes.
     let crashed = rt
-        .run_plan(two_step_plan(), Tainted::trusted(json!({})))
+        .start(two_step_plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(crashed.status, RunStatus::Failed(_)));
@@ -1377,14 +1382,17 @@ async fn a_failed_admission_leaks_no_slot_and_no_abandoned_run() {
     // names a case that does not exist.
     let ghost = agentplane::core::CaseId::generate();
     let refused = rt
-        .run_in_case("demo.first", Tainted::trusted(json!({})), ghost)
+        .start("demo.first", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().in_case(ghost))
+        .run()
         .await;
     assert!(refused.is_err(), "admission into a missing case must fail");
 
     // The slot came back: with one concurrent run allowed, the next admission
     // only succeeds if the failed one released its reservation.
     let ok = rt
-        .run("demo.first", Tainted::trusted(json!({})))
+        .start("demo.first", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(
@@ -1486,7 +1494,8 @@ async fn a_failed_unwind_refuses_to_compensate_around_recorded_doubt() {
         .build();
 
     let out = rt
-        .run_plan(two_step_plan(), Tainted::trusted(json!({})))
+        .start(two_step_plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1528,7 +1537,8 @@ async fn a_failure_with_doubt_but_nothing_to_unwind_stays_failed_and_resumable()
         .build();
 
     let out = rt
-        .run("demo.second", Tainted::trusted(json!({})))
+        .start("demo.second", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -1619,7 +1629,8 @@ async fn a_repeated_conclusion_is_not_re_sealed_but_a_new_one_is() {
         .build();
 
     let out = rt
-        .run("demo.flaky", Tainted::trusted(json!({})))
+        .start("demo.flaky", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));
@@ -1772,12 +1783,9 @@ fn waiter_plane(store: &Arc<RedbStore>, on_event: bool, moved: Option<Moved>) ->
 #[cfg(feature = "manifest")]
 async fn suspended_waiter(store: &Arc<RedbStore>, on_event: bool) -> RunId {
     let out = waiter_plane(store, on_event, None)
-        .run_correlated(
-            "demo.wait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-1")],
-        )
+        .start("demo.wait", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[CorrelationKey::new("matter", "M-1")]))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -2049,12 +2057,9 @@ async fn a_resume_that_fails_mid_flight_is_left_for_recovery() {
     let flaky = plane(faulty.clone() as Arc<dyn JournalStore>);
 
     let out = flaky
-        .run_correlated(
-            "demo.wait",
-            Tainted::trusted(json!({})),
-            "matter",
-            &[CorrelationKey::new("matter", "M-1")],
-        )
+        .start("demo.wait", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("matter", &[CorrelationKey::new("matter", "M-1")]))
+        .run()
         .await
         .unwrap();
     assert!(out.status.is_suspended(), "got {:?}", out.status);
@@ -2123,12 +2128,12 @@ async fn a_case_bound_run_is_refused_a_resume_on_a_plane_with_no_case_store() {
         })
         .build();
     let out = with_cases
-        .run_correlated(
-            "demo.flaky",
-            Tainted::trusted(json!({})),
+        .start("demo.flaky", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated(
             "matter",
             &[agentplane::core::CorrelationKey::new("matter", "M-1")],
-        )
+        ))
+        .run()
         .await
         .unwrap();
     assert!(
@@ -2188,7 +2193,8 @@ async fn an_unreadable_successor_plan_refuses_the_resume() {
         })
         .build();
     let out = rt
-        .run("demo.flaky", Tainted::trusted(json!({})))
+        .start("demo.flaky", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(out.status, RunStatus::Failed(_)));

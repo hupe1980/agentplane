@@ -167,7 +167,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ticket = json!({ "id": "T-4711", "body": "checkout returns 500 for EU cards" });
     let live = rt
-        .run("support.triage", Tainted::trusted(ticket.clone()))
+        .start("support.triage", Tainted::trusted(ticket.clone()))
+        .run()
         .await?;
     println!("\n1. live run       → {:?}", live.status);
     assert_eq!(
@@ -223,7 +224,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let provider = FakeProvider::new();
     let rt = runtime_for(&store, &tight, &provider);
-    let capped = rt.run("support.triage", Tainted::trusted(ticket)).await?;
+    let capped = rt
+        .start("support.triage", Tainted::trusted(ticket))
+        .run()
+        .await?;
     println!("\n2. one-token ceiling → {:?}", capped.status);
     println!("   spend:          {} tokens", capped.spend().tokens);
     println!(

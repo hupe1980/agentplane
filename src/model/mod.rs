@@ -133,6 +133,7 @@ mod gemini_stream;
 pub mod openai;
 #[cfg(feature = "providers")]
 mod openai_stream;
+mod prompt;
 #[cfg(feature = "providers")]
 mod sse;
 #[cfg(any(
@@ -144,7 +145,7 @@ mod sse;
 mod strict;
 #[cfg(feature = "providers")]
 pub(crate) mod wire;
-#[cfg(feature = "providers")]
+#[cfg(any(feature = "providers", feature = "bedrock"))]
 pub(crate) use strict::AnthropicBudget;
 #[cfg(any(
     feature = "providers",
@@ -153,6 +154,8 @@ pub(crate) use strict::AnthropicBudget;
     feature = "manifest"
 ))]
 pub use strict::{StrictSubset, strict_schema_problem};
+
+pub use prompt::Prompt;
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -1292,10 +1295,10 @@ pub struct ToolDeclaration {
     pub parameters: Value,
     /// Cache everything up to and including this declaration, for this long.
     ///
-    /// Tools render first in Anthropic's cache order (tools, system, messages),
-    /// so a breakpoint on the last declaration caches the whole tool prefix.
-    /// Drivers whose provider caches without being asked ignore it, which is
-    /// what lets one declaration serve every provider.
+    /// Tools come first in the cache order (tools, system, messages), so a
+    /// breakpoint on the last declaration caches the whole tool prefix.
+    /// Anthropic and Bedrock honour it; drivers whose provider caches without
+    /// being asked ignore it, which lets one declaration serve every provider.
     pub cache: Option<CacheTtl>,
 }
 

@@ -16,6 +16,68 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.52.0] — 2026-10-23
+
+### Added
+
+- **`RunRequest::settle`**: a keyed request answered with the value of the
+  run its key admitted, whoever admitted it — resumed if its holder is gone,
+  followed on the journal if not. A process killed mid-run recovers by sending
+  the same request again; drop hand-written `Admission` arms, `LeaseHeld`
+  polling and strict replays.
+- **`model::Prompt`**: an instruction and a question as labelled text parts,
+  any of which may close a cached prefix, sent the same way by every driver.
+  Anthropic spells the mark `cache_control` and Bedrock a `cachePoint`;
+  Responses, Gemini and Chat Completions drop it. Drop your per-provider prompt
+  layouts and `cache_control` blocks for it.
+- **`tools::closed_schema`**: a schema somebody else wrote — an MCP server's —
+  narrowed for strict decoding. It closes objects that list `properties` and
+  makes nothing nullable and drops no bound; a schema with `oneOf`, `allOf` or
+  `not` is returned as written.
+- **Typed steps on `ManifestBuilder`**: `provides`, `tool`, `privileged_model`,
+  `quarantined_model`, `budgets` and `egress_ceiling`, beside `configure`.
+
+### Changed
+
+- **BREAKING: one way to start a run.** Every `Runtime::run*` and `spawn*`
+  method is gone, and so is `Admission::into_outcome`. Write
+  `rt.start(capability_or_plan, input)`, optionally `.terms(..)` and
+  `.once(key)`, then `.run()` or `.spawn()`. Unkeyed, they answer `RunOutcome`
+  and `RunId`; keyed, `Admission` and `Spawned`. A plan can now be spawned.
+- **BREAKING: `RunTerms` chooses its authority by constructor.**
+  `RunTerms::acting_as(chain)` and `RunTerms::served(chain)` replace the setters
+  of those names, and `RunTerms::once` is gone — the key is `RunRequest::once`.
+- **BREAKING: `Mode` is `Resume` or `Strict`.** `replay(run, Mode::Live)` no
+  longer compiles; a run is started live with `start`.
+- **`ToolGrant::drafted_from` drafts the narrowed schema**, so a reviewed MCP
+  tool is sent strict where the provider allows, and `Discovered::drift`
+  compares in that form. A grant drafted before this release reports argument
+  drift once; redraft it.
+- **Opening a redb store lapses every lease still running**, so a process
+  killed mid-run resumes at once instead of after the TTL. Drop any shortened
+  lease TTL or `LeaseHeld` polling you added for this.
+
+### Fixed
+
+- **An argument-less tool was never strict.** `tools::strict_schema` and
+  `ToolBox::with` wrote `struct X {}` as an object with no `properties`, which
+  both strict subsets refuse, so the tool was sent non-strict silently.
+- **`{ system, input }` asked Anthropic and Gemini a JSON object.** Those two
+  drivers sent `{"input": ..}` as the user text, while the others sent the
+  question. Every driver now reads `input` as the question.
+- **Responses was sent an object `input` verbatim**, which the API refuses; a
+  value that is neither text nor parts is now sent as its JSON text.
+- **Bedrock sent every tool `strict: true`**, so a schema outside the subset
+  failed the whole request. It is now held to Anthropic's subset and budget,
+  and goes non-strict otherwise, as on the other drivers.
+- **Bedrock dropped every cache breakpoint** — tools included — although
+  Converse caches nothing unasked, and **billed one-hour cache writes at the
+  five-minute rate**; it now writes `cachePoint` blocks and reads the per-tier
+  split.
+- **The owner-string docs warned of a fencing hazard that does not exist.** A
+  shared owner string costs an operator the answer to *which process holds
+  this run*, not safety.
+
 ## [0.51.0] — 2026-10-23
 
 ### Added

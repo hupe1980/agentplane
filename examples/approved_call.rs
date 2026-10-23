@@ -49,7 +49,7 @@ use agentplane::manifest::Manifest;
 use agentplane::model::ModelProvider;
 use agentplane::model::fake::FakeProvider;
 use agentplane::prelude::*;
-use agentplane::runtime::Agent;
+use agentplane::runtime::{Agent, RunTerms};
 use agentplane::tools::{Tool, ToolBox, ToolFailure};
 use serde_json::{Value, json};
 
@@ -150,12 +150,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (rt, store) = plane(&provider);
 
     let run = rt
-        .run_correlated(
+        .start(
             "desk.pay",
             Tainted::trusted(json!({ "instruction": "pay invoice INV-7 from AC-9" })),
+        )
+        .terms(RunTerms::default().correlated(
             "payment",
             &[agentplane::core::CorrelationKey::new("invoice", "INV-7")],
-        )
+        ))
+        .run()
         .await?;
     println!("1. the model asks to move money");
     println!("   run          → {}", run.status.as_str());
@@ -241,12 +244,15 @@ async fn an_amendment_is_the_call() -> Result<(), Box<dyn std::error::Error>> {
     let (rt, store) = plane(&provider);
 
     let run = rt
-        .run_correlated(
+        .start(
             "desk.pay",
             Tainted::trusted(json!({ "instruction": "pay 900000 to AC-13" })),
+        )
+        .terms(RunTerms::default().correlated(
             "payment",
             &[agentplane::core::CorrelationKey::new("invoice", "INV-9")],
-        )
+        ))
+        .run()
         .await?;
     let task = store
         .queue(&officer(), 10)
@@ -303,12 +309,15 @@ async fn refusal_is_not_an_incident() -> Result<(), Box<dyn std::error::Error>> 
     let (rt, store) = plane(&provider);
 
     let refused = rt
-        .run_correlated(
+        .start(
             "desk.pay",
             Tainted::trusted(json!({ "instruction": "pay 900000 to AC-13" })),
+        )
+        .terms(RunTerms::default().correlated(
             "payment",
             &[agentplane::core::CorrelationKey::new("invoice", "INV-8")],
-        )
+        ))
+        .run()
         .await?;
     let task = store
         .queue(&officer(), 10)

@@ -364,47 +364,25 @@ impl ApiResponse {
 
 /// The caller's prompt as chat messages.
 ///
-/// The same vocabulary every driver accepts: a bare string is the user turn;
-/// an object may carry `system` (the instruction) and `input` (the content).
-/// Whatever the shape, it is part of the effect key — a changed prompt is a
-/// changed effect.
+/// The wire's own `messages`, or the shared prompt every driver reads (see
+/// [`Prompt`](super::Prompt)) with its parts joined: an OpenAI-compatible
+/// server caches by itself or not at all, so a breakpoint is dropped. Whatever
+/// the shape, it is part of the effect key — a changed prompt is a changed
+/// effect.
 fn messages(prompt: &Value) -> Vec<Value> {
-    // An array is the wire's own turn list and passes through verbatim, as
-    // every other driver passes its native transcript — stringified, a whole
-    // conversation would arrive as one quoted user string, silently.
-    if let Value::Array(turns) = prompt {
-        return turns.clone();
-    }
     let mut out = Vec::new();
-    if let Some(system) = prompt.get("system").filter(|s| !s.is_null()) {
-        let content = match system {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        out.push(json!({ "role": "system", "content": content }));
+    if let Some(system) = super::prompt::system_text(prompt) {
+        out.push(json!({ "role": "system", "content": system }));
     }
-    // `messages` beside `system`: the wire's turn list with the instruction
-    // kept in the one vocabulary every driver shares.
-    if let Some(Value::Array(turns)) = crate::model::prompt_envelope(prompt, "messages") {
-        out.extend(turns.iter().cloned());
-        return out;
+    match super::prompt::turns(prompt, &["messages"]) {
+        // The wire's own turn list passes through verbatim, as every other
+        // driver passes its native transcript — stringified, a whole
+        // conversation would arrive as one quoted user string, silently.
+        super::prompt::Turns::Native(turns) => out.extend(turns.iter().cloned()),
+        super::prompt::Turns::Parts(parts) => {
+            out.push(json!({ "role": "user", "content": super::prompt::joined(&parts) }));
+        }
     }
-    let user = match prompt {
-        Value::String(s) => s.clone(),
-        other => match crate::model::prompt_envelope(other, "input") {
-            Some(Value::String(s)) => s.clone(),
-            Some(other) => other.to_string(),
-            None => {
-                // `system` is an instruction about the content, not content.
-                let mut rest = other.clone();
-                if let Some(map) = rest.as_object_mut() {
-                    map.remove("system");
-                }
-                rest.to_string()
-            }
-        },
-    };
-    out.push(json!({ "role": "user", "content": user }));
     out
 }
 
@@ -1021,5 +999,31 @@ impl ModelProvider for ChatCompletions {
         }
         accumulate_continuation(&mut completion, continuation, exchanges);
         Ok(completion)
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use serde_json::json;
+
+    use crate::core::Tainted;
+    use crate::model::{CacheTtl, Prompt};
+
+    /// **The shared prompt's parts are joined for a wire that takes text**,
+    /// and a breakpoint is dropped.
+    #[test]
+    fn prompt_parts_are_joined() {
+        let prompt = Prompt::new()
+            .system_cached(Tainted::trusted("policy".to_owned()), CacheTtl::OneHour)
+            .system(Tainted::trusted("plan".to_owned()))
+            .input(Tainted::trusted("task".to_owned()))
+            .build();
+        assert_eq!(
+            super::messages(prompt.peek()),
+            [
+                json!({ "role": "system", "content": "policy\n\nplan" }),
+                json!({ "role": "user", "content": "task" }),
+            ]
+        );
     }
 }

@@ -25,7 +25,7 @@ use agentplane::journal::JournalStore;
 use agentplane::manifest::Manifest;
 use agentplane::memory::{MemoryStore, Recall};
 use agentplane::model::ModelProvider;
-use agentplane::runtime::{Agent, Mode, RunStatus, Runtime};
+use agentplane::runtime::{Agent, Mode, RunStatus, RunTerms, Runtime};
 use agentplane::store::RedbStore;
 use serde_json::json;
 
@@ -106,14 +106,11 @@ async fn a_correlation_binding_files_each_party_under_its_own_subject() {
     );
 
     let out =
-        p.rt.run_correlated(
-            "watch.deadline",
-            Tainted::trusted(json!({ "q": "x" })),
-            "clearing",
-            &[malo("DE-1111")],
-        )
-        .await
-        .expect("the run completes");
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
+            .await
+            .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
 
     let filed = p
@@ -187,7 +184,8 @@ spec:
     );
 
     let out =
-        p.rt.run("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .run()
             .await
             .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -262,7 +260,8 @@ spec:
     );
 
     let out =
-        p.rt.run("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .run()
             .await
             .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -299,15 +298,12 @@ async fn an_unresolvable_binding_fails_the_run() {
     );
 
     let out =
-        p.rt.run_correlated(
-            "watch.deadline",
-            Tainted::trusted(json!({ "q": "x" })),
-            "clearing",
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
             // Keyed by `malo`, and the declaration asks for `meter`.
-            &[malo("DE-1111")],
-        )
-        .await
-        .expect("the run reaches a verdict");
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
+            .await
+            .expect("the run reaches a verdict");
     let RunStatus::Failed(why) = out.status else {
         panic!("a run that cannot resolve its memory scope must fail: {out:?}");
     };
@@ -339,7 +335,9 @@ async fn an_untrusted_input_may_not_choose_the_subject() {
         ),
     )]);
     let out =
-        p.rt.run_correlated("watch.deadline", untrusted, "clearing", &[malo("DE-1111")])
+        p.rt.start("watch.deadline", untrusted)
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
             .await
             .expect("the run reaches a verdict");
     let RunStatus::Failed(why) = out.status else {
@@ -355,12 +353,12 @@ async fn an_untrusted_input_may_not_choose_the_subject() {
         json!({ "deadline_status": "OK", "days_left": 9 }),
     );
     let out =
-        p.rt.run_correlated(
+        p.rt.start(
             "watch.deadline",
             Tainted::trusted(json!({ "malo": "DE-9999" })),
-            "clearing",
-            &[malo("DE-1111")],
         )
+        .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+        .run()
         .await
         .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -389,14 +387,11 @@ async fn a_replay_resolves_the_subject_the_live_run_resolved() {
     );
 
     let out =
-        p.rt.run_correlated(
-            "watch.deadline",
-            Tainted::trusted(json!({ "q": "x" })),
-            "clearing",
-            &[malo("DE-1111")],
-        )
-        .await
-        .expect("the run completes");
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
+            .await
+            .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
 
     // Strict replay performs nothing and reads every effect back. A subject
@@ -452,14 +447,11 @@ async fn a_skill_can_scope_its_own_recall_to_the_runs_correlation() {
         &manifest,
         json!({ "deadline_status": "OK", "days_left": 9 }),
     );
-    p.rt.run_correlated(
-        "watch.deadline",
-        Tainted::trusted(json!({ "q": "x" })),
-        "clearing",
-        &[malo("DE-1111")],
-    )
-    .await
-    .expect("the run completes");
+    p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+        .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+        .run()
+        .await
+        .expect("the run completes");
 
     let rt = Runtime::builder(Arc::clone(&p.store) as Arc<dyn JournalStore>)
         .memory(Arc::clone(&p.store) as Arc<dyn MemoryStore>)
@@ -468,12 +460,9 @@ async fn a_skill_can_scope_its_own_recall_to_the_runs_correlation() {
         .try_build()
         .expect("a coherent plane");
     let out = rt
-        .run_correlated(
-            "watch.read",
-            Tainted::trusted(json!({})),
-            "clearing",
-            &[malo("DE-1111")],
-        )
+        .start("watch.read", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+        .run()
         .await
         .expect("the run completes");
     assert_eq!(out.output.as_ref().map(Tainted::peek), Some(&json!(1)));
@@ -509,14 +498,11 @@ async fn a_matching_answer_returns_and_opens_a_task_beside_it() {
     );
 
     let out =
-        p.rt.run_correlated(
-            "watch.deadline",
-            Tainted::trusted(json!({ "q": "x" })),
-            "clearing",
-            &[malo("DE-1111")],
-        )
-        .await
-        .expect("the run completes");
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
+            .await
+            .expect("the run completes");
     assert_eq!(
         out.status,
         RunStatus::Succeeded,
@@ -561,14 +547,11 @@ async fn a_quiet_answer_opens_no_task() {
     );
 
     let out =
-        p.rt.run_correlated(
-            "watch.deadline",
-            Tainted::trusted(json!({ "q": "x" })),
-            "clearing",
-            &[malo("DE-1111")],
-        )
-        .await
-        .expect("the run completes");
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
+            .await
+            .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(
         p.store
@@ -594,14 +577,11 @@ async fn a_replay_does_not_open_the_task_again() {
     );
 
     let out =
-        p.rt.run_correlated(
-            "watch.deadline",
-            Tainted::trusted(json!({ "q": "x" })),
-            "clearing",
-            &[malo("DE-1111")],
-        )
-        .await
-        .expect("the run completes");
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
+            .await
+            .expect("the run completes");
     p.rt.replay(out.run_id, Mode::Strict)
         .await
         .expect("the run replays");
@@ -636,14 +616,11 @@ async fn an_untrusted_finding_still_reaches_the_worklist() {
     );
 
     let out =
-        p.rt.run_correlated(
-            "watch.deadline",
-            Tainted::trusted(json!({ "q": "x" })),
-            "clearing",
-            &[malo("DE-1111")],
-        )
-        .await
-        .expect("the run completes");
+        p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+            .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+            .run()
+            .await
+            .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(
         out.output.as_ref().map(Tainted::label).map(|l| l.trust),
@@ -689,7 +666,8 @@ async fn a_run_with_no_case_has_no_correlation() {
         .expect("a coherent plane");
 
     let plain = rt
-        .run("peek", Tainted::trusted(json!({})))
+        .start("peek", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("the run completes");
     assert_eq!(
@@ -698,12 +676,9 @@ async fn a_run_with_no_case_has_no_correlation() {
     );
 
     let correlated = rt
-        .run_correlated(
-            "peek",
-            Tainted::trusted(json!({})),
-            "clearing",
-            &[malo("DE-1111")],
-        )
+        .start("peek", Tainted::trusted(json!({})))
+        .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+        .run()
         .await
         .expect("the run completes");
     assert_eq!(
@@ -725,12 +700,12 @@ async fn an_input_binding_resolves_against_the_runs_input() {
         json!({ "deadline_status": "OK", "days_left": 9 }),
     );
     let out =
-        p.rt.run_correlated(
+        p.rt.start(
             "watch.deadline",
             Tainted::trusted(json!({ "party": { "id": "DE-7777" } })),
-            "clearing",
-            &[malo("DE-1111")],
         )
+        .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+        .run()
         .await
         .expect("the run completes");
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -756,14 +731,11 @@ async fn a_scoped_memory_is_still_untrusted() {
         &manifest,
         json!({ "deadline_status": "OK", "days_left": 9 }),
     );
-    p.rt.run_correlated(
-        "watch.deadline",
-        Tainted::trusted(json!({ "q": "x" })),
-        "clearing",
-        &[malo("DE-1111")],
-    )
-    .await
-    .expect("the run completes");
+    p.rt.start("watch.deadline", Tainted::trusted(json!({ "q": "x" })))
+        .terms(RunTerms::default().correlated("clearing", &[malo("DE-1111")]))
+        .run()
+        .await
+        .expect("the run completes");
 
     let filed = p
         .store

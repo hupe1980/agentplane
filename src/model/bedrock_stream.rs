@@ -137,16 +137,7 @@ impl Accumulator {
             ConverseStreamOutput::Metadata(event) => {
                 // The same beside-the-input fold as the buffered path — the
                 // cache counters are not inside `inputTokens` on this wire.
-                self.usage = event.usage().map(|usage| {
-                    Usage::with_cache_beside_input(
-                        u64::try_from(usage.input_tokens()).unwrap_or_default(),
-                        u64::try_from(usage.output_tokens()).unwrap_or_default(),
-                        u64::try_from(usage.cache_write_input_tokens().unwrap_or_default())
-                            .unwrap_or_default(),
-                        u64::try_from(usage.cache_read_input_tokens().unwrap_or_default())
-                            .unwrap_or_default(),
-                    )
-                });
+                self.usage = event.usage().map(super::bedrock::usage_from);
             }
             _ => {}
         }

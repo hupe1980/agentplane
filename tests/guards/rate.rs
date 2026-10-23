@@ -223,7 +223,8 @@ fn plane(
 }
 
 async fn refund(rt: &Runtime, n: u32) -> agentplane::runtime::RunOutcome {
-    rt.run("refund", Tainted::trusted(json!({ "order": n })))
+    rt.start("refund", Tainted::trusted(json!({ "order": n })))
+        .run()
         .await
         .expect("admitted")
 }
@@ -542,7 +543,8 @@ async fn an_unreachable_rate_counter_refuses() {
         false,
     );
     let out = rt
-        .run("refund", Tainted::trusted(json!({ "order": 1 })))
+        .start("refund", Tainted::trusted(json!({ "order": 1 })))
+        .run()
         .await;
     assert!(
         out.as_ref().is_err() || !matches!(out.as_ref().unwrap().status, RunStatus::Succeeded),
@@ -680,16 +682,11 @@ spec:
     let mut statuses = Vec::new();
     for n in 0..2 {
         let out = rt
-            .run_under(
-                "audit.review",
-                Tainted::trusted(json!({ "invoice": n })),
-                RunTerms::default().acting_as(alice()),
-            )
+            .start("audit.review", Tainted::trusted(json!({ "invoice": n })))
+            .terms(RunTerms::acting_as(alice()))
+            .run()
             .await
-            .expect("admitted")
-            .outcome()
-            .cloned()
-            .expect("fresh");
+            .expect("admitted");
         statuses.push(out.status);
     }
     assert!(matches!(statuses[0], RunStatus::Succeeded), "{statuses:?}");
@@ -744,7 +741,8 @@ spec:
             .terminal(),
     ]);
     let out = rt
-        .run_plan(plan, Tainted::trusted(json!({ "order": 1 })))
+        .start(plan, Tainted::trusted(json!({ "order": 1 })))
+        .run()
         .await
         .expect("admitted");
     assert!(matches!(out.status, RunStatus::Failed(_)), "{out:?}");
@@ -818,7 +816,8 @@ async fn a_dispatch_recovered_after_its_reservation_reserves_once() {
         false,
     );
     let first = crashed
-        .run("refund", Tainted::trusted(json!({ "order": 1 })))
+        .start("refund", Tainted::trusted(json!({ "order": 1 })))
+        .run()
         .await;
     assert_eq!(
         payments.calls.load(Ordering::SeqCst),

@@ -556,16 +556,11 @@ async fn run_for(
     capability: &str,
     chain: Delegation,
 ) -> agentplane::runtime::RunOutcome {
-    rt.run_under(
-        capability,
-        Tainted::trusted(json!({ "invoice": "INV-1" })),
-        RunTerms::default().acting_as(chain),
-    )
-    .await
-    .expect("admitted")
-    .outcome()
-    .cloned()
-    .expect("fresh")
+    rt.start(capability, Tainted::trusted(json!({ "invoice": "INV-1" })))
+        .terms(RunTerms::acting_as(chain))
+        .run()
+        .await
+        .expect("admitted")
 }
 
 /// What each hop's announcement recorded about its credential.
@@ -868,16 +863,11 @@ async fn a_chainless_served_run_is_refused_a_subject_bound_peer() {
     let issuer = Issuer::new(None);
     let rt = wired(subject_bound(&issuer), &spy, AsksThenPolls);
     let out = rt
-        .run_under(
-            "audit.poll",
-            Tainted::trusted(json!({})),
-            RunTerms::default().served(None),
-        )
+        .start("audit.poll", Tainted::trusted(json!({})))
+        .terms(RunTerms::served(None))
+        .run()
         .await
-        .expect("admitted")
-        .outcome()
-        .cloned()
-        .expect("fresh");
+        .expect("admitted");
     assert!(
         matches!(&out.status, RunStatus::Failed(reason) if reason.contains("acts for nobody")),
         "{out:?}"
@@ -898,7 +888,8 @@ async fn a_run_admitted_as_the_plane_presents_no_subject_bound_credential() {
     let issuer = Issuer::new(None);
     let rt = wired(subject_bound(&issuer), &spy, AsksReviewer);
     let out = rt
-        .run("audit.review", Tainted::trusted(json!({})))
+        .start("audit.review", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
@@ -926,7 +917,8 @@ async fn a_run_admitted_as_the_plane_presents_no_subject_bound_credential() {
         AsksReviewer,
     );
     let refused = rt
-        .run("audit.review", Tainted::trusted(json!({})))
+        .start("audit.review", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     assert!(
@@ -1111,7 +1103,8 @@ async fn a_remote_task_poll_is_journaled_and_replay_does_not_poll_again() {
         .build();
 
     let live = runtime
-        .run("peer.poll", Tainted::trusted(json!({})))
+        .start("peer.poll", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(live.status, RunStatus::Succeeded);
@@ -1365,16 +1358,14 @@ async fn a_skill_calls_a_peer_under_the_runs_chain_and_replay_calls_nobody() {
     let alice = Delegation::root(Principal::new("user:alice", Scope::of(["audit.*"])));
 
     let out = rt
-        .run_under(
+        .start(
             "audit.review",
             Tainted::trusted(json!({ "invoice": "INV-9" })),
-            RunTerms::default().acting_as(alice),
         )
+        .terms(RunTerms::acting_as(alice))
+        .run()
         .await
-        .expect("admitted")
-        .outcome()
-        .cloned()
-        .expect("fresh");
+        .expect("admitted");
     assert!(matches!(out.status, RunStatus::Succeeded), "{out:?}");
     assert_eq!(
         spy.chains.lock().unwrap().as_slice(),
@@ -1412,7 +1403,8 @@ async fn a_peer_call_without_a_chain_is_refused() {
         .skill(AsksReviewer)
         .build();
     let out = rt
-        .run("audit.review", Tainted::trusted(json!({})))
+        .start("audit.review", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     assert!(
@@ -1510,10 +1502,11 @@ spec:
         provider.will_say("The reviewer approved INV-9.");
 
         let out = rt
-            .run(
+            .start(
                 "desk.answer",
                 Tainted::trusted(json!({ "invoice": "INV-9" })),
             )
+            .run()
             .await
             .expect("run");
         assert!(
@@ -1583,10 +1576,11 @@ spec:
         provider.will_say("Could not consult the reviewer.");
 
         let _ = rt
-            .run(
+            .start(
                 "desk.answer",
                 Tainted::trusted(json!({ "invoice": "INV-9" })),
             )
+            .run()
             .await
             .expect("run");
         assert!(
@@ -1616,10 +1610,11 @@ spec:
         provider.will_say("I could not reach the reviewer.");
 
         let out = rt
-            .run(
+            .start(
                 "desk.answer",
                 Tainted::trusted(json!({ "invoice": "INV-9" })),
             )
+            .run()
             .await
             .expect("run");
         assert!(
@@ -1675,10 +1670,11 @@ spec:
             .agent(Agent::new(&manifest).skill(AsksReviewer))
             .build();
         let out = rt
-            .run(
+            .start(
                 "audit.review",
                 Tainted::trusted(json!({ "invoice": "INV-9" })),
             )
+            .run()
             .await
             .expect("admitted");
         assert!(
@@ -1818,7 +1814,8 @@ async fn the_peer_task_wrappers_refuse_a_plane_with_no_peers() {
             .skill(UsesTheWrappers { cancel })
             .build();
         let out = rt
-            .run("peer.wrappers", Tainted::trusted(json!({})))
+            .start("peer.wrappers", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("the run is admitted; the refusal is inside the step");
         assert!(
@@ -1851,7 +1848,8 @@ async fn the_peer_task_wrappers_dispatch_through_the_registry() {
         .build();
 
     let out = rt
-        .run("peer.wrappers", Tainted::trusted(json!({})))
+        .start("peer.wrappers", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     assert_eq!(
@@ -1877,7 +1875,8 @@ async fn the_peer_task_wrappers_dispatch_through_the_registry() {
         .skill(UsesTheWrappers { cancel: true })
         .build();
     let out = rt
-        .run("peer.wrappers", Tainted::trusted(json!({})))
+        .start("peer.wrappers", Tainted::trusted(json!({})))
+        .run()
         .await
         .expect("admitted");
     let RunStatus::Failed(reason) = &out.status else {
@@ -1931,7 +1930,8 @@ spec:
             .agent(Agent::new(&manifest).skill(UsesTheWrappers { cancel }))
             .build();
         let out = rt
-            .run("peer.wrappers", Tainted::trusted(json!({})))
+            .start("peer.wrappers", Tainted::trusted(json!({})))
+            .run()
             .await
             .expect("admitted");
         assert!(

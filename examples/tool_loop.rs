@@ -191,7 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (rt, store) = plane(&provider);
 
     println!("1. the model chooses a tool");
-    let first = rt.run("ledger.ask", ask("what is in AC-1?")).await?;
+    let first = rt
+        .start("ledger.ask", ask("what is in AC-1?"))
+        .run()
+        .await?;
     let out = &first;
     assert_eq!(out.status, RunStatus::Succeeded);
     assert_eq!(READS.load(Ordering::Relaxed), 1);
@@ -230,7 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     provider.will_say("I could not do that, so here is the balance instead.");
     let (rt, _) = plane(&provider);
 
-    let out = rt.run("ledger.ask", ask("empty AC-1")).await?;
+    let out = rt.start("ledger.ask", ask("empty AC-1")).run().await?;
     println!("\n2. the model asks for a tool nobody granted");
     assert_eq!(
         READS.load(Ordering::Relaxed),
@@ -258,7 +261,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     provider.will_say("I was not able to post that.");
     let (rt, _) = plane(&provider);
 
-    let out = rt.run("ledger.ask", ask("put a million in AC-1")).await?;
+    let out = rt
+        .start("ledger.ask", ask("put a million in AC-1"))
+        .run()
+        .await?;
     println!("\n3. the model asks to *change* something");
     assert_eq!(
         POSTS.load(Ordering::Relaxed),
@@ -288,7 +294,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Printed before the run: the reads below are *this* scenario's turns, and
     // a header printed after them would file them under the previous one.
     println!("\n4. the model never stops asking");
-    let out = rt.run("ledger.ask", ask("loop")).await?;
+    let out = rt.start("ledger.ask", ask("loop")).run().await?;
     match &out.status {
         RunStatus::Failed(why) => println!("   → {why}"),
         other => panic!("an unbounded loop was allowed to finish: {other:?}"),

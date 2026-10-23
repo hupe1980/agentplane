@@ -193,10 +193,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .try_build()?;
 
     let trusted = runtime
-        .run(
+        .start(
             "ledger.transfer",
             Tainted::trusted(json!({ "scenario": "trusted" })),
         )
+        .run()
         .await?;
     println!(
         "1. trusted recipient + untrusted memo → {:?}",
@@ -206,10 +207,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(ledger.calls.lock().unwrap().len(), 1);
 
     let refused = runtime
-        .run(
+        .start(
             "ledger.transfer",
             Tainted::trusted(json!({ "scenario": "untrusted" })),
         )
+        .run()
         .await?;
     println!(
         "2. untrusted recipient                → {:?}",
@@ -223,10 +225,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let released = runtime
-        .run(
+        .start(
             "ledger.transfer",
             Tainted::trusted(json!({ "scenario": "released" })),
         )
+        .run()
         .await?;
     println!(
         "3. field release with evidence        → {:?}",

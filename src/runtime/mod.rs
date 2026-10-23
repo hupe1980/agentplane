@@ -43,10 +43,10 @@ pub(crate) use executor::every_status;
 /// copy that disagrees the day a record kind arrives.
 pub(crate) use executor::observed_status;
 pub use executor::{
-    Admission, ControlLifted, FullBackend, HALT_LIFTED_OUTCOME, HOLD_RELEASED_OUTCOME, LEASE_TTL,
-    LiveRun, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, OBSERVED_OUTCOME, OUTCOMES_OF_RECORD,
-    RunFailure, RunOutcome, RunStatus, RunStreamObserver, RunTerms, Runtime, RuntimeBuilder,
-    SEALED_OUTCOMES, Spawned, Stores,
+    Admission, ControlLifted, FullBackend, HALT_LIFTED_OUTCOME, HOLD_RELEASED_OUTCOME, Keyed,
+    LEASE_TTL, LiveRun, MAX_ADMISSION_KEY_BYTES, MIN_LEASE_TTL, OBSERVED_OUTCOME,
+    OUTCOMES_OF_RECORD, RunFailure, RunOutcome, RunRequest, RunStatus, RunStreamObserver, RunTerms,
+    Runtime, RuntimeBuilder, SEALED_OUTCOMES, Spawned, Stores, Target, Unkeyed,
 };
 pub use group::{EffectGroup, Invariant};
 pub use verdict::{CannotReplay, Finding, Verdict};

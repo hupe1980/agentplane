@@ -117,7 +117,8 @@ async fn a_resumed_run_continues_instead_of_restarting() {
 
     // The run gets through stage 0, then the process dies.
     let first = rt
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
@@ -164,7 +165,8 @@ async fn a_failed_run_is_findable_open_and_moves_on_resume() {
         .build();
 
     let first = rt
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
@@ -227,7 +229,8 @@ async fn an_unrecognised_recorded_outcome_refuses_resume() {
     // A real journal whose run is still open (failure does not seal), with an
     // ending appended that this build has no rule for.
     let first = rt
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
@@ -275,7 +278,8 @@ async fn a_resumed_run_extends_the_existing_chain() {
         .build();
 
     let first = rt
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let before = store.read(first.run_id, 1).await.unwrap().len();
@@ -303,7 +307,8 @@ async fn resuming_is_idempotent() {
         .build();
 
     let first = rt
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     crash_at.store(NO_CRASH, Ordering::SeqCst);
@@ -379,7 +384,8 @@ async fn resume_handles_a_crash_before_a_trailing_effect() {
         .build();
 
     let crashed = rt
-        .run("trailer", Tainted::trusted(json!({})))
+        .start("trailer", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(crashed.status, RunStatus::Failed(_)));
@@ -435,7 +441,8 @@ async fn resume_refuses_a_journal_written_by_different_code() {
         .build();
 
     let recorded = rt
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -768,7 +775,8 @@ async fn crashed_mid_post() -> (Arc<RedbStore>, agentplane::core::RunId) {
         })
         .build();
     let done = rt
-        .run_plan(prepare_then_post(), Tainted::trusted(json!({})))
+        .start(prepare_then_post(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert_eq!(done.status, RunStatus::Succeeded, "the fixture run works");
@@ -944,7 +952,8 @@ async fn resuming_a_finished_run_does_not_re_execute_it() {
         .build();
 
     let done = rt
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     let records_before = store.read(done.run_id, 1).await.unwrap().len();
@@ -1152,7 +1161,8 @@ async fn a_long_run_keeps_its_lease() {
         })
         .build();
 
-    let running = tokio::spawn(async move { rt.run("slow", Tainted::trusted(json!({}))).await });
+    let running =
+        tokio::spawn(async move { rt.start("slow", Tainted::trusted(json!({}))).run().await });
 
     // Wait until the skill is in flight and its lease has had time to lapse,
     // then do what a recovering instance does: try to take the run over.
@@ -1321,7 +1331,11 @@ async fn a_failed_renewal_does_not_abandon_a_running_run() {
     );
     let running = {
         let rt = Arc::clone(&rt);
-        tokio::spawn(async move { rt.run("slow.work", Tainted::trusted(json!({}))).await })
+        tokio::spawn(async move {
+            rt.start("slow.work", Tainted::trusted(json!({})))
+                .run()
+                .await
+        })
     };
     // Past the TTL, with the step still running: the lease must still be held.
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -1390,7 +1404,8 @@ async fn the_sweep_recovers_a_run_its_owner_died_holding() {
     let first = Runtime::builder(origin.clone())
         .skill(pipeline(&crash_at, &calls))
         .build()
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     // The run dies after stage 0, before concluding, and its owner vanishes
@@ -1471,7 +1486,8 @@ async fn a_takeover_whose_note_cannot_be_written_is_not_taken() {
     let first = Runtime::builder(origin.clone())
         .skill(pipeline(&crash_at, &calls))
         .build()
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     crashed_before_concluding(&origin, &inner, first.run_id, Duration::from_secs(2)).await;
@@ -1553,7 +1569,8 @@ async fn a_recovery_that_loses_the_race_is_not_a_failure() {
     let first = Runtime::builder(inner.clone() as Arc<dyn JournalStore>)
         .skill(pipeline(&crash_at, &calls))
         .build()
-        .run("pipeline", Tainted::trusted(json!({})))
+        .start("pipeline", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(matches!(first.status, RunStatus::Failed(_)));
@@ -1867,7 +1884,8 @@ async fn recovery_hands_back_a_concluded_run_rather_than_resuming_it() {
         })
         .build();
     let out = rt
-        .run_plan(prepare_then_post(), Tainted::trusted(json!({})))
+        .start(prepare_then_post(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     assert!(

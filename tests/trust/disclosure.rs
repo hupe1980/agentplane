@@ -12,7 +12,7 @@ use agentplane::core::{
 };
 use agentplane::export::{Selection, VerifyReport};
 use agentplane::journal::{Anchor, Checkpoint, JournalStore};
-use agentplane::runtime::{Runtime, StepCtx};
+use agentplane::runtime::{RunTerms, Runtime, StepCtx};
 use agentplane::store::RedbStore;
 use serde_json::{Value, json};
 
@@ -57,26 +57,21 @@ pub(crate) async fn two_matters() -> Plane {
     let mut a_runs = Vec::new();
     for n in 0..2 {
         let out = rt
-            .run_correlated(
-                "demo.trivial",
-                Tainted::trusted(json!(n)),
-                "matter",
-                &a_keys,
-            )
+            .start("demo.trivial", Tainted::trusted(json!(n)))
+            .terms(RunTerms::default().correlated("matter", &a_keys))
+            .run()
             .await
             .expect("run");
         a_runs.push(out.run_id);
-        rt.run_correlated(
-            "demo.trivial",
-            Tainted::trusted(json!(n)),
-            "matter",
-            &b_keys,
-        )
-        .await
-        .expect("run");
+        rt.start("demo.trivial", Tainted::trusted(json!(n)))
+            .terms(RunTerms::default().correlated("matter", &b_keys))
+            .run()
+            .await
+            .expect("run");
     }
     let loose = rt
-        .run("demo.trivial", Tainted::trusted(json!("loose")))
+        .start("demo.trivial", Tainted::trusted(json!("loose")))
+        .run()
         .await
         .expect("run")
         .run_id;
@@ -305,7 +300,8 @@ async fn an_anchor_of_another_size_is_reported_not_compared() {
     Runtime::builder(Arc::clone(&plane.journal))
         .skill(Trivial)
         .build()
-        .run("demo.trivial", Tainted::trusted(json!("later")))
+        .start("demo.trivial", Tainted::trusted(json!("later")))
+        .run()
         .await
         .expect("run");
     let bytes = package(&plane, &of_case(plane.a)).await;
@@ -709,12 +705,9 @@ async fn an_erasure_names_the_disclosure_of_what_it_erased() {
         .keyring(Arc::clone(&ring) as Arc<dyn KeyRing>)
         .skill(Trivial)
         .build()
-        .run_correlated(
-            "demo.trivial",
-            Tainted::trusted(json!({"name": "Ada"})),
-            "matter",
-            &keys,
-        )
+        .start("demo.trivial", Tainted::trusted(json!({"name": "Ada"})))
+        .terms(RunTerms::default().correlated("matter", &keys))
+        .run()
         .await
         .expect("run");
     let case = cases

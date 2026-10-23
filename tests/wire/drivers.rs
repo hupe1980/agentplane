@@ -2760,7 +2760,8 @@ data: {{\"type\":\"message_stop\"}}
     let out = Runtime::builder(store as Arc<dyn JournalStore>)
         .skill(Asks(provider))
         .build()
-        .run("asks", Tainted::trusted(json!({})))
+        .start("asks", Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 

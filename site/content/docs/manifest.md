@@ -370,7 +370,7 @@ at parse, naming the rule.
 
 | Field | Notes |
 |---|---|
-| `provides` | The capability names this agent answers to. `Runtime::run(capability, input)` dispatches on these, and a plane **refuses to build** if two agents claim one capability. A declarative agent that omits it provides `[metadata.name]`, resolved before the digest, so spelling the default out does not change the digest. |
+| `provides` | The capability names this agent answers to. `Runtime::start(capability, input)` dispatches on these, and a plane **refuses to build** if two agents claim one capability. A declarative agent that omits it provides `[metadata.name]`, resolved before the digest, so spelling the default out does not change the digest. |
 
 A coded agent may provide several capabilities — each has its own skill
 behind it, and the build refuses a declared capability no registered skill
@@ -780,7 +780,7 @@ because two artifacts stating one decision must agree.
 | `schema` | JSON Schema, digest-covered. The shape a **caller** must send. Optional, except for `execution.kind: call`, where it is the call's arguments, must be closed (`additionalProperties: false` on every object), and every input is validated against it; `schema: {}` is refused for the same reason it is on `spec.output` — it permits anything while looking answered. |
 
 The mirror of `spec.output`, for a caller the result contract never had to
-consider: **a model composing the arguments.** Calling `run_under` from your own
+consider: **a model composing the arguments.** Starting the run from your own
 Rust, you hold the shape on both sides; an A2A peer's message is the sender's
 problem. Neither stays true once the agent is offered as a tool to somebody
 else's model — an MCP catalogue, an Agent Card's skill declaration — because
@@ -811,10 +811,11 @@ The rest of the constrained-decoding subset is each provider's, and the
 drivers apply it: a response schema outside it is refused before sending, and a
 tool is sent non-strict ([model providers](@/docs/interop.md#model-providers-providers-bedrock)).
 `agentplane::model::strict_schema_problem` names every rule a schema breaks, on
-every provider. A schema you generate yourself is made ready the way a typed
-tool's is with `agentplane::tools::strict_schema::<T>()`: objects closed,
-nullable optionals required, and the bounds a Rust number type implies dropped,
-because `serde` enforces them.
+every provider. `agentplane::tools::strict_schema::<T>()` makes a schema you
+generate ready as a typed tool's is, rewriting only what `serde` enforces.
+`agentplane::tools::closed_schema` makes somebody else's — an MCP server's —
+ready by narrowing alone: objects closed, nothing made nullable, no bound
+dropped. A grant drafted from discovery carries that form.
 
 ## `spec.oversight`
 

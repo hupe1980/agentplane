@@ -178,7 +178,8 @@ async fn a_run_can_change_its_plan_and_finish_on_the_new_one() {
     let f = fixture(planner(), false, Budget::default().replans(2));
 
     let out =
-        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+        f.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(out.status, RunStatus::Succeeded);
@@ -200,7 +201,8 @@ async fn a_run_can_change_its_plan_and_finish_on_the_new_one() {
 async fn both_plan_versions_are_journaled_and_the_successor_names_its_parent() {
     let f = fixture(planner(), false, Budget::default().replans(2));
     let out =
-        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+        f.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
 
@@ -266,7 +268,11 @@ async fn replanning_is_refused_once_untrusted_data_is_in_working_memory() {
             .terminal(),
     ]);
 
-    let out = rt.run_plan(p, Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .start(p, Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Failed(m) => {
             assert!(m.contains("untrusted"), "the refusal must say why: {m}");
@@ -338,7 +344,8 @@ async fn the_replan_budget_bounds_thrashing() {
         .build();
 
     let out = rt
-        .run_plan(plan(), Tainted::trusted(json!({})))
+        .start(plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     match &out.status {
@@ -359,7 +366,8 @@ async fn asking_to_replan_without_a_planner_names_the_missing_piece() {
         .build();
 
     let out = rt
-        .run_plan(plan(), Tainted::trusted(json!({})))
+        .start(plan(), Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
     match &out.status {
@@ -381,7 +389,8 @@ async fn a_planner_that_declines_stops_the_run_with_its_reason() {
     );
 
     let out =
-        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+        f.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     match &out.status {
@@ -404,7 +413,8 @@ async fn a_successor_without_lineage_is_rejected() {
     );
 
     let out =
-        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+        f.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     match &out.status {
@@ -431,7 +441,8 @@ async fn a_successor_without_a_reason_is_rejected() {
     );
 
     let out =
-        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+        f.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     match &out.status {
@@ -452,7 +463,8 @@ async fn replay_reads_the_successor_back_instead_of_asking_again() {
     let f = fixture(planner(), false, Budget::default().replans(2));
 
     let first =
-        f.rt.run_plan(plan(), Tainted::trusted(json!({})))
+        f.rt.start(plan(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
     assert_eq!(first.status, RunStatus::Succeeded);
@@ -789,7 +801,8 @@ mod unwinding {
         let rt = runtime(Arc::new(Swaps), &log);
 
         let out = rt
-            .run_plan(v1(), Tainted::trusted(json!({})))
+            .start(v1(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
         match &out.status {
@@ -822,7 +835,8 @@ mod unwinding {
         let rt = runtime(Arc::new(Extends), &log);
 
         let out = rt
-            .run_plan(v1(), Tainted::trusted(json!({})))
+            .start(v1(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
         assert!(
@@ -852,7 +866,8 @@ mod unwinding {
         let rt = runtime(Arc::new(Drops), &log);
 
         let out = rt
-            .run_plan(v1(), Tainted::trusted(json!({})))
+            .start(v1(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
         assert!(
@@ -882,7 +897,8 @@ mod unwinding {
         let rt = runtime(Arc::new(DropsCharge), &log);
 
         let out = rt
-            .run_plan(charging(), Tainted::trusted(json!({})))
+            .start(charging(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
         assert!(
@@ -918,7 +934,8 @@ mod unwinding {
         let rt = runtime(Arc::new(ReusesCharge), &log);
 
         let out = rt
-            .run_plan(charging(), Tainted::trusted(json!({})))
+            .start(charging(), Tainted::trusted(json!({})))
+            .run()
             .await
             .unwrap();
         match &out.status {
@@ -974,7 +991,8 @@ async fn a_required_verifier_binds_the_successor_a_replanner_proposes() {
     ]);
 
     let out = rt
-        .run_plan(with_verifier, Tainted::trusted(json!({})))
+        .start(with_verifier, Tainted::trusted(json!({})))
+        .run()
         .await
         .unwrap();
 
@@ -1043,7 +1061,11 @@ async fn a_successor_may_not_redeclare_a_completed_step() {
             .arg("x", ArgSource::node(StepId(1)))
             .terminal(),
     ]);
-    let out = rt.run_plan(v1, Tainted::trusted(json!({}))).await.unwrap();
+    let out = rt
+        .start(v1, Tainted::trusted(json!({})))
+        .run()
+        .await
+        .unwrap();
     match &out.status {
         RunStatus::Failed(m) => assert!(
             m.contains("step s1") && m.contains("redeclares"),

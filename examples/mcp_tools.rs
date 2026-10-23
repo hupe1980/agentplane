@@ -237,10 +237,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n2. the model uses both, and neither knows about the other");
     let out = rt
-        .run(
+        .start(
             "desk.ask",
             Tainted::trusted(json!({ "question": "AC-1 balance and ticket 7?" })),
         )
+        .run()
         .await?;
     assert_eq!(out.status, RunStatus::Succeeded);
     println!("   answered: {}", out.output.as_ref().unwrap().peek());

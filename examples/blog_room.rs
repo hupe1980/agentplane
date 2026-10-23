@@ -166,7 +166,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── 1. The room writes a post ──────────────────────────────────────────
     let brief = json!({ "topic": "why durable execution beats a retry loop" });
     let post = plane
-        .run("blog.commission", Tainted::trusted(brief.clone()))
+        .start("blog.commission", Tainted::trusted(brief.clone()))
+        .run()
         .await?;
     println!("\n1. commissioned    → {:?}", post.status);
     println!(
@@ -282,7 +283,10 @@ async fn yaml_room(
     provider.will_say("Final: a retry loop forgets; a journal remembers.");
 
     let before = provider.calls();
-    let desked = plane.run("blog.desk", Tainted::trusted(brief)).await?;
+    let desked = plane
+        .start("blog.desk", Tainted::trusted(brief))
+        .run()
+        .await?;
     println!("\n5. the YAML room   → {:?}", desked.status);
     println!(
         "   provider calls: {} — three desk turns and two specialists",
