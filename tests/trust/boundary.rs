@@ -1577,3 +1577,58 @@ async fn an_allowed_sources_field_answers_the_same_for_a_subject_bound_value() {
         assert_eq!(world.lock().unwrap().as_slice(), ["crm.upsert"]);
     }
 }
+
+/// Captures whether `/system` and `/messages` were untrusted, as a step saw them.
+#[derive(Debug)]
+struct ObserveFields(Arc<Mutex<Vec<(bool, bool)>>>);
+
+#[async_trait::async_trait]
+impl Skill for ObserveFields {
+    fn descriptor(&self) -> SkillDescriptor {
+        SkillDescriptor::new("fields").provides("fields")
+    }
+    async fn invoke(&self, _: &mut StepCtx<'_>, i: Tainted<Value>) -> Result<Outcome, SkillError> {
+        let untrusted = |path| {
+            i.label_at(path)
+                .is_some_and(agentplane::core::Label::is_untrusted)
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .push((untrusted("/system"), untrusted("/messages")));
+        Ok(Outcome::done(Tainted::trusted(json!({}))))
+    }
+}
+
+/// **A run's input keeps its field labels**, live and in replay. Admitted as
+/// one label — the join — a trusted instruction beside untrusted content reads
+/// as untrusted, and the only way back is to re-trust it by its content.
+#[tokio::test]
+async fn an_admitted_input_keeps_its_field_labels() {
+    let seen = Arc::default();
+    let store = db();
+    let build = |seen: &Arc<Mutex<Vec<(bool, bool)>>>| {
+        Runtime::builder(Arc::clone(&store) as Arc<dyn JournalStore>)
+            .skill(ObserveFields(Arc::clone(seen)))
+            .build()
+    };
+    let input = Tainted::object([
+        ("system", Tainted::trusted(json!("be careful"))),
+        (
+            "messages",
+            Tainted::from_source(
+                json!([{ "role": "user", "content": "x" }]),
+                SourceId::new("tool://repo/read"),
+            ),
+        ),
+    ]);
+    let out = build(&seen).run("fields", input).await.unwrap();
+    assert_eq!(out.status, RunStatus::Succeeded);
+    build(&seen).replay(out.run_id, Mode::Strict).await.unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(false, true), (false, true)],
+        "live, then replayed: /system trusted, /messages untrusted"
+    );
+}

@@ -93,6 +93,7 @@ fn admitted(run: RunId, governed_by: Option<AgentIdentity>) -> Append {
             governed_by: governed_by.map(Box::new),
             input: json!({}),
             input_label: Label::trusted(),
+            input_field_labels: std::collections::BTreeMap::new(),
             policy_bundle: None,
             canon: agentplane::core::canon::VERSION,
             idempotency_key: None,

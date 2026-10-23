@@ -54,8 +54,9 @@ pub struct Accumulator {
     generated: bool,
     /// The provider's id for this response, from `response.created`.
     id: Option<String>,
-    /// A transport-level `error` event inside a 200 response.
-    error: Option<String>,
+    /// A transport-level `error` event inside a 200 response: the error
+    /// object itself, wherever the event put it.
+    error: Option<Value>,
 }
 
 /// Which terminal event ended the stream.
@@ -97,9 +98,11 @@ impl Accumulator {
         self.id.as_deref()
     }
 
+    /// The `error` event's object: `code`, `message`, and whatever else the
+    /// provider put beside them.
     #[must_use]
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+    pub const fn error(&self) -> Option<&Value> {
+        self.error.as_ref()
     }
 
     /// Absorb one event, returning the visible text it carried — so a live
@@ -158,14 +161,12 @@ impl Accumulator {
             "response.completed" => self.finish(&value, Outcome::Completed),
             "response.incomplete" => self.finish(&value, Outcome::Incomplete),
             "response.failed" => self.finish(&value, Outcome::Failed),
+            // Two shapes reach this arm: the API reference puts `code` and
+            // `message` on the event itself, and the API also nests them
+            // under `error`.
             "error" => {
-                self.error = Some(
-                    value
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("the provider sent an error event")
-                        .to_owned(),
-                );
+                let nested = value.get("error").filter(|e| e.is_object());
+                self.error = Some(nested.unwrap_or(&value).clone());
             }
             _ => {}
         }
@@ -306,10 +307,17 @@ mod tests {
     }
 
     #[test]
-    fn an_error_event_is_captured() {
-        let mut acc = Accumulator::new();
-        acc.event("error", r#"{"type":"error","message":"upstream exploded"}"#);
-        assert_eq!(acc.error(), Some("upstream exploded"));
+    fn an_error_event_is_captured_in_either_shape() {
+        for data in [
+            r#"{"type":"error","code":"server_error","message":"upstream exploded"}"#,
+            r#"{"type":"error","error":{"code":"server_error","message":"upstream exploded"}}"#,
+        ] {
+            let mut acc = Accumulator::new();
+            acc.event("error", data);
+            let error = acc.error().expect("captured");
+            assert_eq!(error["message"], "upstream exploded", "{data}");
+            assert_eq!(error["code"], "server_error", "{data}");
+        }
     }
 
     #[test]

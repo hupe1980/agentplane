@@ -966,10 +966,8 @@ impl OpenAi {
                     ));
                 }
             }
-            if let Some(message) = acc.error() {
-                // An `error` event inside a 200. If output had already been
-                // seen, the call was billed and must not be retried for free.
-                return Err(severed(model, &acc, message));
+            if let Some(error) = acc.error() {
+                return Err(stream_error(model, &acc, error));
             }
             if acc.outcome().is_some() {
                 break;
@@ -1001,6 +999,26 @@ impl OpenAi {
         }
         Ok(completion)
     }
+}
+
+/// An `error` event inside a 200.
+///
+/// After output was seen the call was billed, and it is a severed answer
+/// whatever the event says. Before, the error's own `code` decides, as a
+/// status would have: an exhausted quota is a refusal, a throttle a rate
+/// limit, anything else an outage.
+fn stream_error(model: &ModelId, acc: &openai_stream::Accumulator, error: &Value) -> ModelError {
+    let named = |key: &str| error.get(key).and_then(Value::as_str).unwrap_or_default();
+    let (kind, code) = (named("type"), named("code"));
+    let detail = match (code, named("message")) {
+        ("", "") => format!("the provider sent an error event: {error}"),
+        ("", message) => message.to_owned(),
+        (code, message) => format!("{code}: {message}"),
+    };
+    if acc.generated() {
+        return severed(model, acc, &detail);
+    }
+    super::wire::classify_named(model, &format!("{kind} {code}"), detail)
 }
 
 /// A stream that stopped before its terminal event.

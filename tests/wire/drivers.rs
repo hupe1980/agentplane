@@ -2624,6 +2624,20 @@ async fn an_in_stream_overload_before_generating_is_rate_limiting() {
     assert_eq!(err.usage().spend().tokens, 0);
 }
 
+/// A billing fault inside a 200 is a refusal: no retry pays the bill.
+#[tokio::test]
+async fn an_in_stream_billing_error_is_a_refusal() {
+    let body = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"billing_error\",\
+                \"message\":\"Your credit balance is too low\"}}\n\n";
+    let (url, _) = serve_sse(body, false).await;
+    let provider = Anthropic::new("k").unwrap().base(url);
+    let err = provider
+        .complete(ask(&model(), &json!("hi")))
+        .await
+        .expect_err("billing");
+    assert!(matches!(err, ModelError::Refused { .. }), "{err}");
+}
+
 /// The same error *after* generating is billed, not a free retry.
 #[tokio::test]
 async fn an_in_stream_error_after_generating_is_billed() {
@@ -2945,6 +2959,48 @@ async fn an_openai_stream_severed_before_output_did_not_happen() {
         "an id and an in_progress status are not evidence of generation: {err}"
     );
     assert_eq!(err.disposition(), Disposition::DidNotHappen);
+}
+
+/// **An `error` event's text reaches the caller, in either shape**, and its
+/// code decides the class: the reference puts `code` and `message` on the
+/// event, the API also nests them under `error`. An exhausted quota is a
+/// refusal — no wait ends it — and a throttle is a rate limit.
+#[tokio::test]
+async fn an_openai_error_event_says_what_the_provider_said() {
+    for (data, quota) in [
+        (
+            r#"{"type":"error","error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            true,
+        ),
+        (
+            r#"{"type":"error","code":"insufficient_quota","message":"You exceeded your current quota"}"#,
+            true,
+        ),
+        (
+            r#"{"type":"error","error":{"code":"rate_limit_exceeded","message":"You exceeded your current quota"}}"#,
+            false,
+        ),
+    ] {
+        let body = format!("event: error\ndata: {data}\n\n");
+        let (url, _) = serve_sse(&body, false).await;
+        let provider = OpenAi::new("k").unwrap().base(url);
+        let err = provider
+            .complete(ask(&gpt(), &json!("hi")))
+            .await
+            .expect_err("an error event");
+        assert!(
+            err.to_string().contains("You exceeded your current quota"),
+            "the provider's message was lost: {err}"
+        );
+        if quota {
+            assert!(matches!(err, ModelError::Refused { .. }), "{data}: {err}");
+        } else {
+            assert!(
+                matches!(err, ModelError::RateLimited { .. }),
+                "{data}: {err}"
+            );
+        }
+    }
 }
 
 /// A streamed `incomplete` still returns an answer, and says it is cut short.
@@ -4284,6 +4340,31 @@ async fn gemini_asks_for_a_native_response_schema() {
         "application/json"
     );
     assert_eq!(body["generationConfig"]["responseJsonSchema"], schema);
+}
+
+/// **An exhausted quota is not a throttle.** `OpenAI` sends it as a 429, and
+/// read as a rate limit it spends every retry waiting for a window that only a
+/// payment opens.
+#[tokio::test]
+async fn a_429_naming_an_exhausted_quota_is_a_refusal() {
+    let (c, _) = canned(
+        429,
+        json!({ "error": {
+            "message": "You exceeded your current quota, please check your plan and billing details.",
+            "type": "insufficient_quota",
+            "code": "insufficient_quota",
+        } }),
+    );
+    let provider = OpenAi::new("k").unwrap().base(serve(c).await).buffered();
+    let err = provider
+        .complete(ask(&gpt(), &json!("x")))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ModelError::Refused { .. }), "{err}");
+    assert!(
+        err.to_string().contains("check your plan and billing"),
+        "{err}"
+    );
 }
 
 /// Google's retry window rides in the 429 body, and it reaches the retry loop.

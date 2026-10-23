@@ -1060,6 +1060,7 @@ async fn sealed_run(store: &agentplane::store::RedbStore) -> agentplane::RunId {
                     capability: "witnessed".into(),
                     governed_by: None,
                     input_label: agentplane::core::Label::trusted(),
+                    input_field_labels: std::collections::BTreeMap::new(),
                     input: serde_json::Value::Null,
                     policy_bundle: None,
                     canon: agentplane::core::canon::VERSION,

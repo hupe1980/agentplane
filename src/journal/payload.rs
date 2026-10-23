@@ -155,6 +155,9 @@ pub(crate) fn payloads(kind: &mut super::RecordKind) -> Vec<SealedField<'_>> {
             capability: _,
             governed_by: _,
             input_label: _,
+            // Clear, like `Released.field_labels`: labels are what the gates
+            // read on every replay.
+            input_field_labels: _,
             policy_bundle: _,
             canon: _,
             idempotency_key: _,

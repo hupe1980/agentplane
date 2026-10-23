@@ -16,6 +16,27 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.50.0] — 2026-10-23
+
+### Changed
+
+- **An exhausted quota is a refusal, not a rate limit.** A 429 naming
+  `insufficient_quota`, and an in-stream quota or billing error, are
+  `ModelError::Refused`: no retry is spent on them. The chat-completions driver
+  read an in-stream `insufficient_quota` as `RateLimited`.
+
+### Fixed
+
+- **An `OpenAI` stream error lost its text.** An `error` event that nests
+  `code` and `message` under `error` reached the caller as "the provider sent
+  an error event". Both shapes are read, and the code classifies the failure
+  where every in-stream error was `Unavailable`.
+- **A run's input lost its field labels at admission.** An input built with
+  `Tainted::object` read back with the join on every field, live and in
+  replay. `RunAdmitted.input_field_labels` journals them, absent when empty
+  (a 0.49 build refuses a record that carries it), and a plan argument
+  reading the run input projects them.
+
 ## [0.49.0] — 2026-10-22
 
 ### Added

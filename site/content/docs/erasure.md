@@ -43,6 +43,7 @@ one builder call:
 | Blob bytes — `cx.store_blob`, fetched media | blob store | **yes** — expiry leaves a tombstone, in the live store only | unreadable everywhere, backups included |
 | Correlation keys, deadline names, task summaries, statuses | case / task store | no, and deliberately — they are what the store is asked questions *about* | unchanged: still readable |
 | Admission keys — a message's `source`/`id` | journal — `RunAdmitted.idempotency_key` — **and** the `run_admission` index | no, and deliberately: the index is looked up by a value the caller holds in the clear, and sealing it would leave a store that cannot refuse a redelivery | unchanged: still readable |
+| Labels, and the JSON Pointers of field labels | journal — `RunAdmitted.input_label` and `input_field_labels`, `Released.field_labels`, `EffectStarted.outbound_label` | no, and deliberately: every gate reads them on replay | unchanged: still readable — so an object key is a field *name*, never personal data |
 | Blob digest and classification | journal | no — a digest hides a high-entropy value, not a guessable one ([below](#a-digest-is-not-erasure)) | unchanged |
 
 Read the first column as the floor and the second as what one call buys. Both

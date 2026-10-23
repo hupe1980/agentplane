@@ -1078,8 +1078,10 @@ fn stream_error(
         },
         "invalid_request_error"
         | "authentication_error"
+        | "billing_error"
         | "permission_error"
-        | "not_found_error" => ModelError::Refused {
+        | "not_found_error"
+        | "request_too_large" => ModelError::Refused {
             model: model.clone(),
             detail,
         },

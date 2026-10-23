@@ -1004,6 +1004,7 @@ async fn history_under_an_older_canonicalization_rule_is_unverifiable_not_diverg
                     governed_by: None,
                     input: json!({}),
                     input_label: agentplane::core::Label::trusted(),
+                    input_field_labels: std::collections::BTreeMap::new(),
                     policy_bundle: None,
                     canon: 999,
                     idempotency_key: None,

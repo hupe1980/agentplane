@@ -619,6 +619,7 @@ async fn an_open_run_refuses_to_resume_under_a_different_policy_bundle() {
                         governed_by: None,
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
+                        input_field_labels: std::collections::BTreeMap::new(),
                         policy_bundle: Some(Box::new(admitted)),
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,

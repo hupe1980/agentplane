@@ -96,6 +96,17 @@ pub enum RecordKind {
         /// Required rather than defaulted: a missing label read as *trusted* is
         /// the failure this field exists to remove.
         input_label: crate::core::Label,
+        /// The input's field labels at admission, by JSON Pointer: what
+        /// [`Tainted::object`](crate::core::Tainted::object) assembled.
+        ///
+        /// Journaled for the reason the root label is: a trusted `/system`
+        /// admitted beside an untrusted `/messages` must read back trusted,
+        /// live and in replay. Clear, as `Released.field_labels` is.
+        ///
+        /// Absent when the input carried none. Absence fails closed: every
+        /// field inherits the root label, which is the join of them all.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        input_field_labels: BTreeMap<String, Label>,
         /// Which complete policy bundle governed this run, if any.
         ///
         /// `None` means no engine was configured — a fact worth recording,
@@ -1773,6 +1784,7 @@ mod tests {
                     governed_by: None,
                     input: json!(null),
                     input_label: crate::core::Label::trusted(),
+                    input_field_labels: BTreeMap::new(),
                     policy_bundle: None,
                     canon: crate::core::canon::VERSION,
                     idempotency_key: None,
@@ -1811,6 +1823,7 @@ mod tests {
                     governed_by: None,
                     input: json!({ "ticket": "printer on fire" }),
                     input_label: crate::core::Label::trusted(),
+                    input_field_labels: BTreeMap::new(),
                     policy_bundle: None,
                     canon: crate::core::canon::VERSION,
                     idempotency_key: None,
@@ -1844,6 +1857,7 @@ mod tests {
                 governed_by: None,
                 input,
                 input_label: crate::core::Label::trusted(),
+                input_field_labels: BTreeMap::new(),
                 policy_bundle: None,
                 canon: crate::core::canon::VERSION,
                 idempotency_key: None,

@@ -3819,6 +3819,7 @@ async fn a_sealed_run(
             capability: "conformance".into(),
             governed_by: None,
             input_label: crate::core::Label::trusted(),
+            input_field_labels: std::collections::BTreeMap::new(),
             input: serde_json::Value::Null,
             policy_bundle: None,
             canon: crate::core::canon::VERSION,

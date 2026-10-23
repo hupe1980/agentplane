@@ -1113,6 +1113,23 @@ impl Tainted<serde_json::Value> {
         }
     }
 
+    /// A value read back with the field labels it was journaled with — the
+    /// counterpart to [`field_labels`](Self::field_labels). A field may be
+    /// cleaner than the whole, exactly as [`object`](Self::object) built it;
+    /// the whole is the join.
+    pub(crate) const fn with_field_labels(
+        value: serde_json::Value,
+        label: Label,
+        fields: BTreeMap<String, Label>,
+    ) -> Self {
+        Self {
+            value,
+            label,
+            fields,
+            releases: BTreeSet::new(),
+        }
+    }
+
     /// Every explicitly tracked field label in stable pointer order.
     pub fn field_labels(&self) -> impl Iterator<Item = (&str, &Label)> {
         self.fields

@@ -754,6 +754,7 @@ async fn cancellation_refuses_to_unwind_through_a_recorded_in_doubt_mutation() {
                         governed_by: None,
                         input: json!({}),
                         input_label: Label::trusted(),
+                        input_field_labels: std::collections::BTreeMap::new(),
                         policy_bundle: None,
                         canon: canon::VERSION,
                         idempotency_key: None,

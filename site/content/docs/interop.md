@@ -47,6 +47,10 @@ A refusal *before* generation — bad request, unknown model, rate limit — is
 `DidNotHappen` and costs nothing. Rate limiting is the one case in this crate
 where retrying is unambiguously safe, and the only one where the peer tells you
 *when* — see [when the peer names the window](@/docs/plans-cases.md#when-the-peer-names-the-window).
+An **exhausted quota or a billing fault is a refusal, not a rate limit**, even
+when `OpenAI` sends it as a 429: no wait ends it, so no retry is spent on it.
+The same holds for an error the provider sends *inside* a stream, and its code
+and message reach the caller in the error text.
 
 ## Calling other agents
 

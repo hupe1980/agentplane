@@ -80,6 +80,7 @@ fn admitted(run: RunId) -> Append {
             governed_by: None,
             input: json!({}),
             input_label: Label::trusted(),
+            input_field_labels: std::collections::BTreeMap::new(),
             policy_bundle: None,
             canon: agentplane::core::canon::VERSION,
             idempotency_key: None,

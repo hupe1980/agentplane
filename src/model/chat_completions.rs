@@ -55,7 +55,7 @@ use serde_json::{Value, json};
 
 use crate::core::Secret;
 
-use super::wire::{RESPOND_TOOL, classify_status, classify_transport, structured};
+use super::wire::{RESPOND_TOOL, classify_named, classify_status, classify_transport, structured};
 use super::{
     Completion, ModelError, ModelId, ModelProvider, Request, SchemaMode, Usage,
     chat_completions_stream, sse,
@@ -877,37 +877,15 @@ fn stream_error(
             model,
             status,
             &reqwest::header::HeaderMap::new(),
-            &error.to_string(),
+            &json!({ "error": error }).to_string(),
         );
     }
     let named = |key: &str| error.get(key).and_then(Value::as_str).unwrap_or_default();
-    let kind = format!("{} {}", named("type"), named("code"));
-    if kind.contains("rate_limit") || kind.contains("insufficient_quota") {
-        ModelError::RateLimited {
-            model: model.clone(),
-            detail,
-            retry_after: None,
-        }
-    } else if [
-        "invalid_request",
-        "authentication",
-        "permission",
-        "not_found",
-        "context_length",
-    ]
-    .iter()
-    .any(|name| kind.contains(name))
-    {
-        ModelError::Refused {
-            model: model.clone(),
-            detail,
-        }
-    } else {
-        ModelError::Unavailable {
-            model: model.clone(),
-            detail,
-        }
-    }
+    classify_named(
+        model,
+        &format!("{} {}", named("type"), named("code")),
+        detail,
+    )
 }
 
 /// Extend the provider transcript after a successful tool-calling response.

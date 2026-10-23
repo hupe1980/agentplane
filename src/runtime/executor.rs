@@ -4472,6 +4472,10 @@ impl Runtime {
             governed_by: governed_by.map(Box::new),
             input: input.peek().clone(),
             input_label: input.label().clone(),
+            input_field_labels: input
+                .field_labels()
+                .map(|(path, label)| (path.to_owned(), label.clone()))
+                .collect(),
             policy_bundle: self.policy.as_ref().map(|p| Box::new(p.bundle())),
             canon: crate::core::canon::VERSION,
             idempotency_key,
@@ -8586,8 +8590,15 @@ fn recorded_subjects(run: RunId, records: &[Record]) -> BTreeSet<crate::core::Su
 fn recorded_input(r: &Record) -> Option<Tainted<Value>> {
     match r.kind() {
         RecordKind::RunAdmitted {
-            input, input_label, ..
-        } => Some(Tainted::with_label(input.clone(), input_label.clone())),
+            input,
+            input_label,
+            input_field_labels,
+            ..
+        } => Some(Tainted::with_field_labels(
+            input.clone(),
+            input_label.clone(),
+            input_field_labels.clone(),
+        )),
         _ => None,
     }
 }
@@ -8704,17 +8715,11 @@ fn resolve_arg(
     run_input: &Tainted<Value>,
     outputs: &BTreeMap<StepId, Tainted<Value>>,
 ) -> Result<Tainted<Value>, RuntimeError> {
-    let pick = |v: &Value, field: &Option<String>| match field {
-        Some(f) => v.get(f).cloned().unwrap_or(Value::Null),
-        None => v.clone(),
-    };
-
     Ok(match source {
-        // Picking a field inherits the whole value's label: the parts of an
-        // untrusted document are untrusted.
-        ArgSource::RunInput { field } => {
-            Tainted::with_label(pick(run_input.peek(), field), run_input.label().clone())
-        }
+        // Projected as a step's output is: a field keeps the label it was
+        // admitted with, and one admitted without its own inherits the whole
+        // value's — the parts of an untrusted document are untrusted.
+        ArgSource::RunInput { field } => project(run_input, field.as_deref()),
         ArgSource::Const { value } => Tainted::trusted(value.clone()),
         ArgSource::Node { step, field } => {
             // The contract already proved this is upstream, so a miss here means
@@ -8726,14 +8731,20 @@ fn resolve_arg(
                     node.id
                 ))
             })?;
-            match field {
-                Some(field) => upstream
-                    .project_field(field)
-                    .unwrap_or_else(|| Tainted::with_label(Value::Null, upstream.label().clone())),
-                None => upstream.clone(),
-            }
+            project(upstream, field.as_deref())
         }
     })
+}
+
+/// A value, or one of its top-level fields with its descendants' labels; an
+/// absent field is a null under the whole value's label.
+fn project(value: &Tainted<Value>, field: Option<&str>) -> Tainted<Value> {
+    match field {
+        Some(field) => value
+            .project_field(field)
+            .unwrap_or_else(|| Tainted::with_label(Value::Null, value.label().clone())),
+        None => value.clone(),
+    }
 }
 
 /// A step that read a blob rewritten under its address ends unreproducible,

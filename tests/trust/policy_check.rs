@@ -611,6 +611,7 @@ fn admitted(run: RunId, input: Value) -> Append {
             governed_by: None,
             input,
             input_label: Label::trusted(),
+            input_field_labels: std::collections::BTreeMap::new(),
             policy_bundle: Some(Box::new(Refuses(&[]).bundle())),
             canon: agentplane::core::canon::VERSION,
             idempotency_key: None,

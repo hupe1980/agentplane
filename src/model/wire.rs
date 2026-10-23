@@ -23,7 +23,9 @@ use super::{ModelError, ModelId};
 ///   because the response is different: this one is worth retrying, and it is
 ///   the one case where retrying is unambiguously safe *and* free. The
 ///   provider's `Retry-After` rides along, because it is the only number that
-///   makes the retry useful — see [`ModelError::RateLimited`].
+///   makes the retry useful — see [`ModelError::RateLimited`]. A 429 whose
+///   body names an **exhausted quota** is the exception: `OpenAI` sends its
+///   billing refusal with the throttle's status, and no wait ends it.
 /// * **408 and 425** are the transient 4xx: a request the *server* timed out
 ///   or declined to process early, not one it judged wrong. Classed with the
 ///   retryable failures, because `Refused` means *repeating is pointless* and
@@ -53,6 +55,10 @@ pub fn classify_status(
 ) -> ModelError {
     let detail = format!("HTTP {status}: {}", trim(body));
     match status {
+        429 if names_exhausted_quota(body) => ModelError::Refused {
+            model: model.clone(),
+            detail,
+        },
         429 | 529 => ModelError::RateLimited {
             model: model.clone(),
             detail,
@@ -90,6 +96,60 @@ pub fn classify_status(
             detail,
         },
     }
+}
+
+/// Classify an error a provider named in its body rather than by status.
+///
+/// The in-stream twin of [`classify_status`]: an `error` event arrives inside
+/// a 200, so its status is gone and the error's own `type` and `code` are all
+/// there is. `kind` is both, joined; the vocabulary is the one the
+/// `OpenAI`-shaped wires share. Only for a call that has not generated — one
+/// that has is billed whatever the error says.
+///
+/// An exhausted quota or a billing fault is a refusal, not a throttle: it ends
+/// when somebody pays, so a retry spends the ladder learning nothing.
+pub fn classify_named(model: &ModelId, kind: &str, detail: String) -> ModelError {
+    const REFUSED: [&str; 8] = [
+        "insufficient_quota",
+        "billing",
+        "invalid_request",
+        "invalid_api_key",
+        "authentication",
+        "permission",
+        "not_found",
+        "context_length",
+    ];
+    if REFUSED.iter().any(|name| kind.contains(name)) {
+        ModelError::Refused {
+            model: model.clone(),
+            detail,
+        }
+    } else if kind.contains("rate_limit") {
+        ModelError::RateLimited {
+            model: model.clone(),
+            detail,
+            // Inside a 200 whose headers were accepted before the first byte
+            // of the body: there is no `Retry-After`, and no window is invented.
+            retry_after: None,
+        }
+    } else {
+        ModelError::Unavailable {
+            model: model.clone(),
+            detail,
+        }
+    }
+}
+
+/// Whether an error body names an exhausted quota (`OpenAI`'s
+/// `insufficient_quota`, in `error.code` or `error.type`).
+fn names_exhausted_quota(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let error = &value["error"];
+    ["code", "type"]
+        .iter()
+        .any(|key| error[*key].as_str() == Some("insufficient_quota"))
 }
 
 /// The provider's `Retry-After`, in seconds, when it named one.

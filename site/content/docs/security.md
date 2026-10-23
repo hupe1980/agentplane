@@ -57,7 +57,10 @@ the call.
 `Tainted<T>` exposes `peek()` (reading is fine — the enforcement point is at
 *sinks*, not at reads) but no public unwrap. Structured JSON can additionally
 carry labels at RFC 6901 paths. `Tainted::object` and `Tainted::array` preserve
-that hierarchy; plan field selection projects it rather than flattening it.
+that hierarchy; plan field selection projects it rather than flattening it. A
+run's input keeps its field labels too: `RunAdmitted` journals them, so a
+trusted instruction admitted beside untrusted content is still trusted when a
+step reads it, live and in replay.
 Arbitrary `map` and `zip` operations retain the conservative whole-value label
 but discard field paths, because the runtime cannot prove how an arbitrary
 closure reshaped them.

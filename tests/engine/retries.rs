@@ -761,6 +761,7 @@ async fn resume_continues_a_retry_the_crashed_run_never_started() {
                         governed_by: None,
                         input: json!({}),
                         input_label: agentplane::core::Label::trusted(),
+                        input_field_labels: std::collections::BTreeMap::new(),
                         policy_bundle: None,
                         canon: agentplane::core::canon::VERSION,
                         idempotency_key: None,

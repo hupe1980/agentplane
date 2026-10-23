@@ -423,6 +423,7 @@ async fn a_run_under_another_canonicalization_rule_cannot_be_replayed() {
                     governed_by: None,
                     input: json!({}),
                     input_label: agentplane::core::Label::trusted(),
+                    input_field_labels: std::collections::BTreeMap::new(),
                     policy_bundle: None,
                     canon: 999,
                     idempotency_key: None,
