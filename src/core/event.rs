@@ -344,6 +344,29 @@ impl SuspendReason {
             Self::AwaitingEvent { until, .. } | Self::AwaitingTime { until } => *until,
         }
     }
+
+    /// The task a person must decide, when this is a run waiting on one.
+    ///
+    /// Read from the event kind a decision arrives as and the `task`
+    /// correlation key derived from the task id — both, because a run may
+    /// correlate its own events under a `task` namespace of its choosing, and
+    /// only the decision kind says the wait is the worklist's.
+    #[must_use]
+    pub fn awaited_task(&self) -> Option<crate::core::TaskId> {
+        let Self::AwaitingEvent {
+            kind, correlation, ..
+        } = self
+        else {
+            return None;
+        };
+        if kind != crate::core::TASK_DECIDED {
+            return None;
+        }
+        correlation
+            .iter()
+            .find(|key| key.namespace == "task")
+            .and_then(|key| crate::core::TaskId::parse(&key.value).ok())
+    }
 }
 
 impl std::fmt::Display for SuspendReason {
@@ -413,6 +436,40 @@ pub struct DeadLetter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worklist wait names its task; a run's own `task` correlation under
+    /// another event kind does not, whatever value it carries.
+    #[test]
+    fn only_a_decision_wait_names_a_task() {
+        let task = crate::core::TaskId::derive(
+            RunId::generate(),
+            EffectKey::derive(
+                crate::core::StepId(0),
+                crate::core::Phase::Forward,
+                0,
+                1,
+                "task.open",
+                b"",
+            ),
+        );
+        let waiting = |kind: &str| SuspendReason::AwaitingEvent {
+            kind: kind.to_owned(),
+            correlation: vec![CorrelationKey::new("task", task.to_hex())],
+            until: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        assert_eq!(
+            waiting(crate::core::TASK_DECIDED).awaited_task(),
+            Some(task)
+        );
+        assert_eq!(waiting("feature.done").awaited_task(), None);
+        assert_eq!(
+            SuspendReason::AwaitingTime {
+                until: time::OffsetDateTime::UNIX_EPOCH
+            }
+            .awaited_task(),
+            None
+        );
+    }
 
     /// `resumed_run` names the run only when one actually resumed.
     ///

@@ -96,6 +96,7 @@ pub use policy::{
 pub use retry::{RetryPolicy, retry_after_seconds};
 pub use secret::Secret;
 pub use skill::{Capability, Compensation, Outcome, Skill, SkillDescriptor};
+pub(crate) use task::TASK_DECIDED;
 pub use task::{
     ClaimError, Decided, Decision, DeclaredReach, Expiry, Justification, MixedScript, OnExpiry,
     Priority, Reach, ReachGrant, Rendering, Task, TaskId, TaskSpec, TaskState, Withheld,

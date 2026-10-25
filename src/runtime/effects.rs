@@ -251,10 +251,10 @@ impl Effect for ResolveDeadline {
 ///
 /// **A journaled effect, and it has to be.** Case state is mutable storage
 /// shared by every run correlated to the case; reading it is exactly as
-/// non-deterministic as reading a clock. Before this was an effect, a strict
-/// replay re-read the *current* state and the run's own logic reached a
-/// different answer from the same journal — the divergence the whole design
-/// exists to make impossible.
+/// non-deterministic as reading a clock. Read directly, a strict replay would
+/// see the *current* state and the run's own logic reach a different answer
+/// from the same journal — the divergence the whole design exists to make
+/// impossible.
 #[derive(Debug, Clone)]
 pub struct ReadCaseState {
     pub(crate) cases: std::sync::Arc<dyn crate::case::CaseStore>,

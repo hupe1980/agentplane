@@ -1300,6 +1300,7 @@ impl agentplane::model::ModelProvider for CountingModel {
             truncated: false,
             structured: None,
             continuation: None,
+            reasoning: None,
         })
     }
 }

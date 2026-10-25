@@ -462,6 +462,23 @@ impl ApiResponse {
             .and_then(|part| part.get("refusal").and_then(Value::as_str))
     }
 
+    /// The reasoning items' summary text, or `None` when they summarised
+    /// nothing. The encrypted content beside it is never read.
+    fn reasoning(&self) -> Option<String> {
+        let summary = self
+            .output
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+            .filter_map(|item| item.get("summary").and_then(Value::as_array))
+            .flatten()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("summary_text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!summary.is_empty()).then_some(summary)
+    }
+
     /// Every output item exactly as the next Responses request needs it.
     fn continuation(&self) -> Value {
         Value::Array(self.output.clone())
@@ -601,6 +618,7 @@ impl OpenAi {
             prompt,
             ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             None,
+            false,
             schema,
             tools,
             exchanges,
@@ -615,6 +633,7 @@ impl OpenAi {
         prompt: &Value,
         max_output_tokens: u32,
         reasoning_effort: Option<super::ReasoningEffort>,
+        reasoning_summary: bool,
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
@@ -628,7 +647,8 @@ impl OpenAi {
                 detail: "the continuation was not an OpenAI output-item array".to_owned(),
             });
         }
-        if reasoning_effort.is_some() && !exchanges.is_empty() && continuation.is_none() {
+        let reasons = reasoning_effort.is_some() || reasoning_summary;
+        if reasons && !exchanges.is_empty() && continuation.is_none() {
             return Err(ModelError::Refused {
                 model: model.clone(),
                 detail: "reasoning-enabled tool continuation requires the complete opaque \
@@ -670,6 +690,12 @@ impl OpenAi {
                 });
             }
             body["reasoning"] = json!({ "effort": effort.as_str() });
+        }
+        if reasoning_summary {
+            // `auto` is the most detailed summary the model offers; the other
+            // levels exist only on some models, so naming one would be a 400
+            // on the rest.
+            body["reasoning"]["summary"] = json!("auto");
         }
         if let Some(system) = instructions(prompt) {
             body["instructions"] = system;
@@ -812,14 +838,9 @@ impl OpenAi {
         // **A tool call is not an empty answer.** Responses returns a
         // `function_call` item and no text whenever the model calls a tool —
         // both when this crate forces one to emulate structured output, and when
-        // the model picks a declared tool of its own accord. Only the first was
-        // exempted here, so an ordinary tool call came back as `Unusable` and
-        // every declared-tool loop against `OpenAI` failed on a response that
-        // had worked perfectly.
-        //
-        // It survived because a stubbed provider always returns text: nothing in
-        // the suite could produce the shape a real model produces. A live test
-        // found it on its first run.
+        // the model picks a declared tool of its own accord. Exempting only the
+        // first returns an ordinary tool call as `Unusable`, and every
+        // declared-tool loop against `OpenAI` fails on a response that worked.
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
         let calls = parsed.tool_calls().map_err(|detail| ModelError::Unusable {
             model: model.clone(),
@@ -861,6 +882,7 @@ impl OpenAi {
         let continuation = (!calls.is_empty())
             .then(|| super::ProviderContinuation::new("openai", parsed.continuation()));
         Ok(Completion {
+            reasoning: parsed.reasoning(),
             structured: structured_value,
             tool_calls: calls,
             text,
@@ -956,13 +978,10 @@ impl OpenAi {
                 // Fed from the accumulator's own parse, so the live text and
                 // the assembled outcome are one stream by construction.
                 let delta = acc.event(&event.name, &event.data);
-                if let Some(text) = delta
+                if let Some(delta) = delta
                     && let Some((observer, label)) = observer
                 {
-                    observer.event(crate::core::Tainted::with_label(
-                        super::ModelStreamEvent::TextDelta(text),
-                        label.clone(),
-                    ));
+                    observer.event(crate::core::Tainted::with_label(delta, label.clone()));
                 }
             }
             if let Some(error) = acc.error() {
@@ -1070,6 +1089,7 @@ impl ModelProvider for OpenAi {
             prompt,
             max_output_tokens,
             reasoning_effort,
+            reasoning_summary,
             schema,
             tools,
             exchanges,
@@ -1092,6 +1112,7 @@ impl ModelProvider for OpenAi {
                 prompt,
                 max_output_tokens,
                 reasoning_effort,
+                reasoning_summary,
                 schema,
                 tools,
                 exchanges,
@@ -1621,6 +1642,7 @@ mod continuation_tests {
                 &json!({"input": "balance?"}),
                 4096,
                 Some(ReasoningEffort::High),
+                false,
                 None,
                 &[],
                 &[ToolExchange::ok(
@@ -1672,6 +1694,7 @@ mod continuation_tests {
                 "openai",
                 json!([{"type": "function_call", "call_id": "call_2"}]),
             )),
+            reasoning: None,
         };
         accumulate_continuation(&mut completion, Some(&prior), &[exchange]);
         let state = completion.continuation.unwrap().state;

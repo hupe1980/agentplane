@@ -80,6 +80,8 @@ pub struct Ask {
     pub prompt: Value,
     pub max_output_tokens: u32,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether the call asked for a reasoning summary.
+    pub reasoning_summary: bool,
     pub schema: Option<Value>,
     /// The exact tool surface the model was offered this turn.
     pub tools: Vec<crate::model::ToolDeclaration>,
@@ -196,6 +198,32 @@ impl FakeProvider {
             truncated: false,
             structured: None,
             continuation: None,
+            reasoning: None,
+        })
+    }
+
+    /// Queue a plain text answer with the model's account of its reasoning.
+    ///
+    /// Returned, and streamed before the text, only to a call that asked
+    /// [`with_reasoning_summary`](crate::model::ModelCall::with_reasoning_summary),
+    /// as a real provider does.
+    pub fn will_say_with_reasoning(
+        &self,
+        text: impl Into<String>,
+        reasoning: impl Into<String>,
+    ) -> &Self {
+        let text = text.into();
+        let usage = usage_for(&json!(&text));
+        self.will_answer(Completion {
+            tool_calls: Vec::new(),
+            text,
+            model: None,
+            usage,
+            stop_reason: Some("end_turn".to_owned()),
+            truncated: false,
+            structured: None,
+            continuation: None,
+            reasoning: Some(reasoning.into()),
         })
     }
 
@@ -219,6 +247,7 @@ impl FakeProvider {
             truncated: false,
             structured: Some(value),
             continuation: None,
+            reasoning: None,
         })
     }
 
@@ -245,6 +274,7 @@ impl FakeProvider {
             truncated: false,
             structured: None,
             continuation: None,
+            reasoning: None,
         })
     }
 
@@ -391,6 +421,7 @@ fn echo(request: &Request<'_>) -> Completion {
             truncated,
             structured: None,
             continuation: None,
+            reasoning: None,
         };
     }
     let stop_reason = Some(if truncated { "max_tokens" } else { "end_turn" }.to_owned());
@@ -410,6 +441,7 @@ fn echo(request: &Request<'_>) -> Completion {
                 truncated,
                 structured: Some(value),
                 continuation: None,
+                reasoning: None,
             }
         }
         None => Completion {
@@ -421,6 +453,7 @@ fn echo(request: &Request<'_>) -> Completion {
             truncated,
             structured: None,
             continuation: None,
+            reasoning: None,
         },
     }
 }
@@ -464,6 +497,7 @@ impl ModelProvider for FakeProvider {
             prompt: request.prompt.clone(),
             max_output_tokens: request.max_output_tokens,
             reasoning_effort: request.reasoning_effort,
+            reasoning_summary: request.reasoning_summary,
             schema: request.schema.cloned(),
             tools: request.tools.to_vec(),
             exchanges: request.exchanges.to_vec(),
@@ -512,7 +546,13 @@ impl ModelProvider for FakeProvider {
         let answer = scripted
             .unwrap_or_else(|| Ok(echo(&request)))
             .and_then(|completion| honour_schema(completion, request.schema, request.model))
-            .map(|completion| name_the_server(completion, request.model));
+            .map(|completion| name_the_server(completion, request.model))
+            .map(|mut completion| {
+                if !request.reasoning_summary {
+                    completion.reasoning = None;
+                }
+                completion
+            });
 
         // Deltas first, then the whole answer — the order a real driver
         // produces, so an observer that assumes it is exercised rather than
@@ -521,6 +561,16 @@ impl ModelProvider for FakeProvider {
         if *self.streaming.lock().expect("fake")
             && let (Ok(completion), Some((observer, label))) = (&answer, request.stream)
         {
+            for delta in completion
+                .reasoning
+                .iter()
+                .flat_map(|r| split_for_stream(r))
+            {
+                observer.event(crate::core::Tainted::with_label(
+                    ModelStreamEvent::ReasoningDelta(delta),
+                    label.clone(),
+                ));
+            }
             for delta in split_for_stream(&completion.text) {
                 observer.event(crate::core::Tainted::with_label(
                     ModelStreamEvent::TextDelta(delta),
@@ -630,6 +680,7 @@ mod tests {
             prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             reasoning_effort: None,
+            reasoning_summary: false,
             schema: schema.map(|s| &*Box::leak(Box::new(s.clone()))),
             tools: &[],
             exchanges: &[],
@@ -724,6 +775,7 @@ mod tests {
                 prompt: leaked,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
                 reasoning_effort: None,
+                reasoning_summary: false,
                 schema: None,
                 tools: &[],
                 exchanges: &[],
@@ -754,6 +806,7 @@ mod tests {
             prompt: inline,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             reasoning_effort: None,
+            reasoning_summary: false,
             schema: None,
             tools: &[],
             exchanges: &[],
@@ -803,6 +856,7 @@ mod tests {
                 prompt: short,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
                 reasoning_effort: None,
+                reasoning_summary: false,
                 schema: None,
                 tools: &[],
                 exchanges: &[],
@@ -817,6 +871,7 @@ mod tests {
                 prompt: long,
                 max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
                 reasoning_effort: None,
+                reasoning_summary: false,
                 schema: None,
                 tools: &[],
                 exchanges: &[],

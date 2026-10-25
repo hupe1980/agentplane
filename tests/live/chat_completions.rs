@@ -107,6 +107,7 @@ fn ask<'a>(
         prompt,
         max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
         reasoning_effort: None,
+        reasoning_summary: false,
         schema,
         tools,
         exchanges: &[],

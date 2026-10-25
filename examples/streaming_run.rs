@@ -67,8 +67,6 @@ impl ModelStreamObserver for Printer {
         assert_eq!(event.label().trust, Trust::Untrusted);
 
         match event.peek() {
-            // A retry starts its answer over; a terminal would clear the line.
-            ModelStreamEvent::Started => {}
             ModelStreamEvent::TextDelta(delta) => {
                 print!("{delta}");
                 // Flushed per delta: line buffering would hold the whole answer
@@ -77,12 +75,17 @@ impl ModelStreamObserver for Printer {
                 let _ = std::io::stdout().flush();
                 self.buffered.lock().expect("not poisoned").push_str(delta);
             }
+            // Only on a call that asked `with_reasoning_summary`.
+            ModelStreamEvent::ReasoningDelta(delta) => print!("[{delta}]"),
             ModelStreamEvent::Usage(usage) => {
                 println!(
                     "\n     [usage: {} in, {} out]",
                     usage.input_tokens, usage.output_tokens
                 );
             }
+            // `Started` — a retry starts its answer over, which a terminal would
+            // show by clearing the line — and whatever kinds the set gains.
+            _ => {}
         }
     }
 }

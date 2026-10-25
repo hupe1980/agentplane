@@ -102,6 +102,7 @@ who has never run this crate.
 
 **Refused** will not arrive: something in the design forecloses it, and the
 entry says what. **Deferred** names what it is waiting on.
+
 ### Refused
 
 | Refused | What forecloses it |

@@ -3018,7 +3018,9 @@ fn every_recipe_ci_runs_is_in_the_local_gate() {
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
                 .collect();
-            if stem.is_empty() {
+            // `just --evaluate NAME` reads a variable and runs no recipe: the
+            // release reads `FULL_FEATURES` so a binary and an image share one set.
+            if stem.is_empty() || stem == "--evaluate" {
                 continue;
             }
             // `just test-${{ matrix.seam }}` is five recipes, and taking the

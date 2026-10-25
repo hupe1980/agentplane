@@ -407,8 +407,11 @@ a reviewed allowlist rather than something a tier selects from.
 
 Both are `{ provider, model }` plus three optional per-role ceilings —
 `max_tokens`, a per-call output ceiling; `max_input_tokens`, a per-call input
-ceiling; and `reasoning_effort`, an explicit reasoning depth — and an optional
-`pricing`, what the role's tokens cost. The ceilings are enforced on **every**
+ceiling; and `reasoning_effort`, an explicit reasoning depth — an optional
+`pricing`, what the role's tokens cost, and `reasoning_summary: true`, which
+asks for the model's account of its reasoning beside each answer
+([which drivers can ask](@/docs/interop.md#model-providers-providers-bedrock)).
+The ceilings are enforced on **every**
 call the role serves, the quarantined role's included, so a memory-formation
 extraction or a `parse` step runs under the reviewed bounds rather than the
 driver's defaults. `provider` is the name a driver was registered under. The

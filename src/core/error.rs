@@ -18,18 +18,16 @@ use crate::core::{Digest, EffectKey, Sensitivity, Seq};
 /// `Display` — that is what `std`'s `Termination` impl does, and it is the shape
 /// every getting-started program in every Rust project uses. So a derived
 /// `Debug` throws away the entire error taxonomy at exactly the moment a
-/// newcomer meets it. Before this, the first failure anyone hit read:
+/// newcomer meets it, and the first failure would read:
 ///
 /// ```text
 /// Error: NoProvider("demo.greet")
 /// ```
 ///
 /// while the message written for that variant — *no skill provides capability
-/// 'demo.greet'* — was never shown to anybody. Every carefully-worded refusal in
-/// this crate was invisible on the one path that matters most, and the
-/// build-time diagnostics being excellent made the contrast worse rather than
-/// better: the same person got a paragraph of guidance from `build()` and a
-/// tuple from `run()`.
+/// 'demo.greet'* — is shown to nobody: every worded refusal in this crate
+/// invisible on the one path that matters most, a paragraph of guidance from
+/// `build()` and a tuple from `run()`.
 ///
 /// The same applies to `unwrap()`/`expect()` on a `Result`, which also print
 /// `Debug`, and to `assert!(matches!(..), "{err:?}")` in a user's own tests.

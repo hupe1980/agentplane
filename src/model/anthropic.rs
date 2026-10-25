@@ -664,6 +664,7 @@ fn interpret(
         (text, parsed_schema)
     };
 
+    let reasoning = thinking_text(&continuation);
     let continuation = (!tool_calls.is_empty()).then(|| {
         super::ProviderContinuation::new(
             "anthropic",
@@ -671,6 +672,7 @@ fn interpret(
         )
     });
     Ok(Completion {
+        reasoning,
         structured: structured_value,
         tool_calls,
         text,
@@ -680,6 +682,22 @@ fn interpret(
         stop_reason,
         continuation,
     })
+}
+
+/// The text of the turn's `thinking` blocks: a summary when one was asked
+/// for, empty under the omitted display. A signature and a redacted block
+/// are never read.
+fn thinking_text(blocks: &Value) -> Option<String> {
+    let text = blocks
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+        .filter_map(|block| block.get("thinking").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.is_empty()).then_some(text)
 }
 
 impl Anthropic {
@@ -698,6 +716,7 @@ impl Anthropic {
             prompt,
             ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             None,
+            false,
             schema,
             tools,
             exchanges,
@@ -713,6 +732,7 @@ impl Anthropic {
         prompt: &Value,
         max_output_tokens: u32,
         reasoning_effort: Option<super::ReasoningEffort>,
+        reasoning_summary: bool,
         schema: Option<&Value>,
         tools: &[super::ToolDeclaration],
         exchanges: &[super::ToolExchange],
@@ -726,7 +746,11 @@ impl Anthropic {
                 detail: "the continuation was not an Anthropic assistant-content array".to_owned(),
             });
         }
-        if reasoning_effort.is_some() && !exchanges.is_empty() && continuation.is_none() {
+        // A summary is asked for through adaptive thinking, so either one
+        // makes this call think — and a thinking turn's tool results must
+        // follow its signed blocks.
+        let thinks = reasoning_effort.is_some() || reasoning_summary;
+        if thinks && !exchanges.is_empty() && continuation.is_none() {
             return Err(ModelError::Refused {
                 model: model.clone(),
                 detail: "reasoning-enabled tool continuation requires the signed thinking \
@@ -760,6 +784,11 @@ impl Anthropic {
             }
             body["thinking"] = json!({ "type": "adaptive" });
             body["output_config"]["effort"] = json!(effort.as_str());
+        }
+        if reasoning_summary {
+            // Current models omit thinking text unless told otherwise. On a
+            // model that thinks only when told to, this is what tells it.
+            body["thinking"] = json!({ "type": "adaptive", "display": "summarized" });
         }
         if let Some(system) = system(prompt) {
             body["system"] = system;
@@ -826,17 +855,20 @@ impl Anthropic {
                     // `tool_choice`: the provider answers 400. Refused before
                     // dispatch, so the declared effort is neither sent to be
                     // rejected nor dropped to make the call go through.
-                    if let Some(effort) = reasoning_effort {
+                    if thinks {
+                        let asked = reasoning_effort.map_or_else(
+                            || "a reasoning summary".to_owned(),
+                            |effort| format!("reasoning effort '{}'", effort.as_str()),
+                        );
                         return Err(ModelError::Refused {
                             model: model.clone(),
                             detail: format!(
                                 "model '{}' has no native structured output here, so a declared \
                                  response schema is obtained by forcing a tool — and Anthropic \
-                                 does not allow thinking with a forced tool choice, so reasoning \
-                                 effort '{}' cannot be honoured. Use a model with native \
-                                 structured output, or drop the reasoning effort",
+                                 does not allow thinking with a forced tool choice, so {asked} \
+                                 cannot be honoured. Use a model with native structured output, \
+                                 or drop the reasoning request",
                                 model.model,
-                                effort.as_str()
                             ),
                         });
                     }
@@ -980,13 +1012,10 @@ impl Anthropic {
                 // journal's text and the live text are then one stream by
                 // construction, whatever spelling the wire used.
                 let delta = acc.event(&event.name, &event.data);
-                if let Some(text) = delta
+                if let Some(delta) = delta
                     && let Some((observer, label)) = observer
                 {
-                    observer.event(crate::core::Tainted::with_label(
-                        super::ModelStreamEvent::TextDelta(text),
-                        label.clone(),
-                    ));
+                    observer.event(crate::core::Tainted::with_label(delta, label.clone()));
                 }
             }
             // An `error` event inside a 200. Handled as soon as it lands rather
@@ -1131,6 +1160,7 @@ impl ModelProvider for Anthropic {
             prompt,
             max_output_tokens,
             reasoning_effort,
+            reasoning_summary,
             schema,
             tools,
             exchanges,
@@ -1156,6 +1186,7 @@ impl ModelProvider for Anthropic {
                 prompt,
                 max_output_tokens,
                 reasoning_effort,
+                reasoning_summary,
                 schema,
                 tools,
                 exchanges,
@@ -1843,6 +1874,7 @@ mod continuation_tests {
                 &json!({"messages": [{"role": "user", "content": "balance?"}]}),
                 4096,
                 Some(ReasoningEffort::High),
+                false,
                 None,
                 &[],
                 &[exchange(false)],
@@ -1876,6 +1908,7 @@ mod continuation_tests {
                 "anthropic",
                 json!([{ "role": "assistant", "content": [{"type": "tool_use", "id": "toolu_02"}] }]),
             )),
+            reasoning: None,
         };
         accumulate_continuation(&mut completion, Some(&prior), &[exchange(false)]);
         let state = completion.continuation.unwrap().state;

@@ -516,6 +516,7 @@ impl Gemini {
             prompt,
             max_output_tokens,
             reasoning_effort,
+            reasoning_summary,
             schema,
             tools,
             exchanges,
@@ -529,6 +530,10 @@ impl Gemini {
         let mut generation_config = json!({ "maxOutputTokens": max_output_tokens });
         if let Some(effort) = reasoning_effort {
             generation_config["thinkingConfig"] = Self::thinking_config(model, *effort)?;
+        }
+        if *reasoning_summary {
+            // Without it a thought part carries a signature and no text.
+            generation_config["thinkingConfig"]["includeThoughts"] = json!(true);
         }
 
         let mut body = json!({ "contents": contents });
@@ -785,6 +790,13 @@ impl Gemini {
             calls,
             forced,
         } = Self::scan(&parts);
+        // Joined without a separator, as the stream delivered it: a streamed
+        // summary arrives as one thought part per chunk.
+        let reasoning = parts
+            .iter()
+            .filter(|part| part.get("thought").and_then(Value::as_bool) == Some(true))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>();
 
         let emulating = schema.is_some() && self.mode_for(model) == SchemaMode::ForcedTool;
         if text.is_empty() && calls.is_empty() && forced.is_none() && !truncated {
@@ -822,6 +834,7 @@ impl Gemini {
             .then(|| super::ProviderContinuation::new(PROVIDER, json!([content.clone()])));
 
         Ok(Completion {
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
             structured: structured_value,
             tool_calls: calls,
             text,
@@ -945,13 +958,16 @@ impl Gemini {
                 .push(&chunk)
                 .map_err(|error| severed(model, &acc, &error.to_string()))?;
             for event in events {
-                if let Some(delta) = acc.push(&event.data)
-                    && let Some((observer, label)) = observer
-                {
-                    observer.event(crate::core::Tainted::with_label(
-                        super::ModelStreamEvent::TextDelta(delta),
-                        label.clone(),
-                    ));
+                let text = acc.push(&event.data);
+                let thought = acc.take_thought();
+                if let Some((observer, label)) = observer {
+                    let deltas = thought
+                        .map(super::ModelStreamEvent::ReasoningDelta)
+                        .into_iter()
+                        .chain(text.map(super::ModelStreamEvent::TextDelta));
+                    for delta in deltas {
+                        observer.event(crate::core::Tainted::with_label(delta, label.clone()));
+                    }
                 }
             }
         }
@@ -1001,9 +1017,10 @@ impl Gemini {
         let mut calls = Vec::new();
         let mut forced: Option<Value> = None;
         for (index, part) in parts.iter().enumerate() {
-            // A part marked `thought` is opaque reasoning. It stays in the
-            // continuation and never becomes the answer: exposing it would make
-            // the model's internal deliberation read as its conclusion.
+            // A part marked `thought` is reasoning: a signature, and a summary
+            // when one was asked for. It stays in the continuation and never
+            // becomes the answer — the deliberation would read as the
+            // conclusion.
             if part.get("thought").and_then(Value::as_bool) == Some(true) {
                 continue;
             }

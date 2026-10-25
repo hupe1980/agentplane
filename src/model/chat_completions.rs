@@ -706,6 +706,7 @@ impl ChatCompletions {
             stop_reason: choice.finish_reason.clone(),
             truncated,
             continuation,
+            reasoning: None,
         })
     }
 
@@ -922,6 +923,10 @@ impl ModelProvider for ChatCompletions {
             prompt,
             max_output_tokens,
             reasoning_effort,
+            // No spelling asks for one, and servers that volunteer reasoning
+            // name it two ways (`reasoning_content`, `reasoning`): kept
+            // verbatim in the continuation, never read as a summary.
+            reasoning_summary: _,
             schema,
             tools,
             exchanges,

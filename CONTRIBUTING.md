@@ -147,6 +147,11 @@ rather than shipped one at a time. Every **BREAKING** entry in `CHANGELOG.md`
 says what a dependent has to do. Until the format freezes, a hard cut is allowed
 and preferred to a compatibility shim.
 
+A `v<version>` tag on a gated commit cuts one: the crate, the GitHub release
+with prebuilt binaries for macOS and Linux, the formula in
+`hupe1980/homebrew-tap` and the signed images. `.github/workflows/release.yml`
+names the one-time owner setup beside the job that needs it.
+
 ## 🚫 Things that will be pushed back on
 
 **Reading the clock, RNG, or generating an id directly.** These are denied

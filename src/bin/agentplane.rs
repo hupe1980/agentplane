@@ -4139,8 +4139,8 @@ impl Backend {
     /// its own, and **they are two halves of one decision**: a plane running as
     /// the default against a store scoped to `acme` writes runs into one
     /// keyspace while naming the other in every policy request and every
-    /// erasure. `try_build` refuses that, which is how this was found — so the
-    /// tenant travels with the backend rather than being passed twice.
+    /// erasure. `try_build` refuses that, and the tenant travels with the
+    /// backend rather than being passed twice.
     fn tenant(&self) -> agentplane::core::TenantId {
         match self {
             Self::Embedded(_, t) => t.clone(),
@@ -7076,14 +7076,8 @@ fn suspended(
         shell_quote(at.manifest)
     );
     match reason {
-        SuspendReason::AwaitingEvent {
-            kind, correlation, ..
-        } => {
-            let task = correlation
-                .iter()
-                .find(|k| k.namespace == "task")
-                .and_then(|k| agentplane::core::TaskId::parse(&k.value).ok());
-            if let Some(task) = task {
+        SuspendReason::AwaitingEvent { kind, .. } => {
+            if let Some(task) = reason.awaited_task() {
                 eprintln!("run {run} is waiting for a person to decide {task}");
                 eprintln!("next:");
                 eprintln!("  agentplane tasks --show {task}{store}");

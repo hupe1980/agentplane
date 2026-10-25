@@ -95,6 +95,13 @@ pub enum ClaimError {
 #[serde(transparent)]
 pub struct TaskId(Digest);
 
+/// The event kind a decision arrives as.
+///
+/// Human tasks reuse the durable-wait machinery wholesale: completing a task
+/// delivers an event of this kind correlated to the task id, and the waiting run
+/// resumes exactly as it would for any other message.
+pub(crate) const TASK_DECIDED: &str = "agentplane.task.decided";
+
 impl TaskId {
     /// Derive from the run and the awaiting effect.
     ///

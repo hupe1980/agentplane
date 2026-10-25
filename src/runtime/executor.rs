@@ -10360,14 +10360,11 @@ impl RuntimeBuilder {
 
     /// Wrap every store a key ring can seal, at **build** time.
     ///
-    /// One call, one guarantee. Before this, `keyring` sealed blob payloads
-    /// and nothing else — which was honest when blobs were the only sealable
-    /// surface and became a trap the moment they were not: a deployer who
-    /// configured a key ring would reasonably read it as *this plane is
-    /// encrypted* while the journal, the case store, the worklist and the
-    /// event buffer stayed in the clear. Five independent wrapping calls is a
-    /// control that can be forgotten four times, and forgetting looks exactly
-    /// like remembering.
+    /// One call, one guarantee. A deployer who configures a key ring reads it
+    /// as *this plane is encrypted*, so the journal, the case store, the
+    /// worklist, the event buffer and the blobs are sealed together. Five
+    /// independent wrapping calls would be a control that can be forgotten
+    /// four times, and forgetting looks exactly like remembering.
     ///
     /// Wrapped here rather than inside `keyring()` for the reason the tool
     /// catalogue is checked here: a wrap applied when the ring is supplied

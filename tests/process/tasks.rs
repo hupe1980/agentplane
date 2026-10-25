@@ -2556,6 +2556,7 @@ spec:
         stop_reason: Some("end_turn".to_owned()),
         truncated: false,
         continuation: None,
+        reasoning: None,
     });
 
     let store = Arc::new(RedbStore::open_in_memory().unwrap());

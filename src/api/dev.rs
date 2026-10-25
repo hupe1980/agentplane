@@ -180,6 +180,9 @@ impl crate::runtime::RunStreamObserver for StreamHub {
             crate::model::ModelStreamEvent::TextDelta(text) => {
                 json!({ "type": "text_delta", "value": crate::core::visible::escape(&text).0, "trust": trust })
             }
+            crate::model::ModelStreamEvent::ReasoningDelta(text) => {
+                json!({ "type": "reasoning_delta", "value": crate::core::visible::escape(&text).0, "trust": trust })
+            }
             crate::model::ModelStreamEvent::Usage(usage) => {
                 json!({ "type": "usage", "value": usage, "trust": trust })
             }

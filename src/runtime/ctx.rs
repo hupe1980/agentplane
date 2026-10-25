@@ -19,12 +19,7 @@ use crate::core::{
     TaskState, Timestamp, canon,
 };
 
-/// The event kind a decision arrives as.
-///
-/// Human tasks reuse the durable-wait machinery wholesale: completing a task
-/// delivers an event of this kind correlated to the task id, and the waiting run
-/// resumes exactly as it would for any other message.
-pub(crate) const TASK_DECIDED: &str = "agentplane.task.decided";
+pub(crate) use crate::core::TASK_DECIDED;
 use crate::journal::{Append, EffectReplay, JournalStore, RecordKind, StepCursor};
 
 use super::effects::{Clock, ResolveDeadline};

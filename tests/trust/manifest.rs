@@ -3385,6 +3385,7 @@ spec:
         truncated: false,
         structured: None,
         continuation: None,
+        reasoning: None,
     });
     provider.will_say("this turn must not run");
     let tool = Arc::new(Counts::default());
@@ -4156,6 +4157,7 @@ spec:
         stop_reason: Some("end_turn".to_owned()),
         truncated: false,
         continuation: None,
+        reasoning: None,
     });
     let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)
@@ -4516,6 +4518,7 @@ spec:
         stop_reason: Some("end_turn".to_owned()),
         truncated: false,
         continuation: None,
+        reasoning: None,
     });
     let store = Arc::new(agentplane::store::RedbStore::open_in_memory().unwrap());
     let rt = Runtime::builder(Arc::clone(&store) as Arc<dyn agentplane::journal::JournalStore>)

@@ -24,10 +24,11 @@ lives there. This page is the slower, file-first walk.
 ## 1. Install the CLI
 
 ```sh
-cargo install agentplane --features cli
+brew install hupe1980/tap/agentplane
 ```
 
-Or with no Rust toolchain at all:
+Or from source, `cargo install agentplane --features cli`. Or with no install
+at all:
 
 ```sh
 docker run --rm -v "$PWD:/work" ghcr.io/hupe1980/agentplane validate /work/triage.yaml

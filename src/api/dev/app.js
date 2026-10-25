@@ -638,12 +638,14 @@ async function sendEvent(event) {
 function renderLive() {
   const panel = byId('live-output');
   const live = state.run ? state.live.get(state.run) : null;
-  if (!live || (!live.text && !live.usage)) {
+  if (!live || (!live.text && !live.reasoning && !live.usage)) {
     panel.hidden = true;
     return;
   }
   panel.hidden = false;
   byId('live-text').textContent = live.text;
+  byId('live-reasoning-box').hidden = !live.reasoning;
+  byId('live-reasoning').textContent = live.reasoning;
   const usage = live.usage;
   byId('live-usage').textContent =
     (usage ? usage.input_tokens + ' in · ' + usage.output_tokens + ' out' : '') + (live.lagged ? ' · some output was missed' : '');
@@ -662,15 +664,18 @@ function onStreamEvent(event) {
   }
   if (typeof event.run !== 'string') return;
   const run = event.run;
-  if (!state.live.has(run)) state.live.set(run, { text: '', usage: null, lagged: false, ended: false });
+  if (!state.live.has(run)) state.live.set(run, { text: '', reasoning: '', usage: null, lagged: false, ended: false });
   const live = state.live.get(run);
   if (event.type === 'started') {
     // An attempt began: what streamed before it is not this answer.
     live.text = '';
+    live.reasoning = '';
     live.usage = null;
     live.ended = false;
   } else if (event.type === 'text_delta') {
     live.text = (live.text + event.value).slice(-LIVE_LIMIT);
+  } else if (event.type === 'reasoning_delta') {
+    live.reasoning = (live.reasoning + event.value).slice(-LIVE_LIMIT);
   } else if (event.type === 'usage') {
     live.usage = event.value;
     live.ended = true;

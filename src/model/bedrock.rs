@@ -1005,6 +1005,7 @@ impl Bedrock {
             truncated,
             structured,
             continuation,
+            reasoning: None,
         })
     }
 }
@@ -1050,6 +1051,9 @@ impl ModelProvider for Bedrock {
             prompt,
             max_output_tokens,
             reasoning_effort,
+            // Converse has no field that asks for one, and Nova 2 returns its
+            // reasoning as `[REDACTED]`.
+            reasoning_summary: _,
             schema,
             tools,
             exchanges,

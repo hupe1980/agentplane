@@ -90,7 +90,7 @@ spec:
 ```
 
 ```sh
-cargo install agentplane --features cli
+brew install hupe1980/tap/agentplane    # or: cargo install agentplane --features cli
 
 agentplane init agent.yaml              # or start from a starter that validates
 agentplane validate summariser.yaml

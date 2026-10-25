@@ -1154,12 +1154,10 @@ fn read_trailer(value: &serde_json::Value, report: &mut VerifyReport, claims: &m
 
 /// Hold the trailer's own accounting to what was actually read.
 ///
-/// Before this settlement existed, only the trailer's `cases` count was ever
-/// consulted — `runs_requested`, `runs_exported`, `records` and `unreadable`
-/// were fields the writer stamped and no reader read, so deleting an open
-/// run's tail records while keeping the trailer verified clean: an open run
-/// has no leaf to pin its tail, a chain prefix verifies, and the only witness
-/// left is the count.
+/// `runs_requested`, `runs_exported`, `records` and `unreadable` are each
+/// checked, not only `cases`: an open run has no leaf to pin its tail and a
+/// chain prefix verifies, so deleting its tail records while keeping the
+/// trailer is caught by the count or not at all.
 ///
 /// The empty blocks are adjudicated here too, and the trailer is what decides
 /// which way each one goes. A run the export *declares* unreadable is

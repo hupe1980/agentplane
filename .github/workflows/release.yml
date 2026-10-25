@@ -2,7 +2,8 @@ name: Release
 
 # Tag-triggered. The tag points at a commit CI has already gated, so this does
 # not re-run the assurance ladder — it checks the two things a tag can get
-# wrong, then publishes.
+# wrong, then publishes: the crate, the GitHub release with prebuilt binaries
+# and the Homebrew formula, and the container images.
 on:
   push:
     tags: ["v*"]
@@ -48,6 +49,144 @@ jobs:
       - run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
+
+  # Prebuilt binaries, for the Homebrew tap. Built with `just`'s
+  # FULL_FEATURES — the `:full` image's set — so `brew install` gives the CLI
+  # the full image carries, and the guard holding `dev` out of every shipped
+  # feature set covers it. Each target builds and runs on a native runner.
+  binaries:
+    needs: release
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: extractions/setup-just@v2
+      - name: Build
+        run: cargo build --release --locked --bin agentplane --target "$TARGET" --features "$(just --evaluate FULL_FEATURES)"
+      - name: Archive
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          name="agentplane-$version-$TARGET"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/agentplane" LICENSE-APACHE LICENSE-MIT README.md CHANGELOG.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          rm -rf "dist/$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: The binary says what it is
+        run: |
+          out="$("target/$TARGET/release/agentplane" --version | head -n1)"
+          [ "$out" = "agentplane ${GITHUB_REF_NAME#v}" ] || { echo "::error::--version said: $out"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  # The archives on the release, with one checksum file and SLSA provenance.
+  assets:
+    needs: binaries
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: (cd dist && cat ./*.sha256 > SHA256SUMS && shasum -a 256 -c SHA256SUMS)
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+      - run: gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: dist/SHA256SUMS
+
+  # The formula in hupe1980/homebrew-tap, written by a GitHub App installed on
+  # that repository only. Owner setup, once: environment `release` holding
+  # HOMEBREW_APP_ID and HOMEBREW_APP_PRIVATE_KEY, the App granted contents
+  # read and write — the same App and secrets speccoder's release uses.
+  # Skipped for a pre-release (a `-` in the version), which no formula follows.
+  tap:
+    needs: assets
+    if: ${{ !contains(github.ref_name, '-') }}
+    environment: release
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+          path: dist
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: hupe1980
+          repositories: homebrew-tap
+          permission-contents: write
+      - uses: actions/checkout@v4
+        with:
+          repository: hupe1980/homebrew-tap
+          token: ${{ steps.app-token.outputs.token }}
+          path: tap
+      - name: Update the formula
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          mkdir -p tap/Formula
+          tools/release/formula.sh "$version" dist/SHA256SUMS > tap/Formula/agentplane.rb
+          cd tap
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "agentplane release"
+            git config user.email "agentplane-release@users.noreply.github.com"
+            git add Formula/agentplane.rb
+            git commit -m "agentplane $version"
+            git push
+          fi
+
+  # Installed the way a user installs it, on each platform the formula serves.
+  brew:
+    needs: tap
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - if: runner.os == 'Linux'
+        run: echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      - run: brew install hupe1980/tap/agentplane
+      - run: brew test agentplane
 
   # The container image, so a YAML agent needs no Rust toolchain.
   #

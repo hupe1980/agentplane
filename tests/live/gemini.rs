@@ -78,6 +78,7 @@ fn request<'a>(
         prompt,
         max_output_tokens: 2048,
         reasoning_effort: effort,
+        reasoning_summary: false,
         schema,
         tools,
         exchanges,

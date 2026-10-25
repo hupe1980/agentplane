@@ -1086,6 +1086,13 @@ pub struct ModelRef {
     /// Explicit reasoning depth. Omitted uses the selected model's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<crate::model::ReasoningEffort>,
+    /// Ask for a readable summary of the model's reasoning beside each answer.
+    ///
+    /// Shown on the completion and in the live stream; never the provider's
+    /// signed or encrypted reasoning. A driver whose wire cannot ask —
+    /// `chat-completions`, `bedrock` — sends nothing and returns none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reasoning_summary: bool,
     /// What this model's tokens cost, in minor units per million tokens.
     ///
     /// Required on every declared role when `budgets.max_minor_units` is set:
@@ -1107,6 +1114,7 @@ impl ModelRef {
             max_tokens: None,
             max_input_tokens: None,
             reasoning_effort: None,
+            reasoning_summary: false,
             pricing: None,
         }
     }
@@ -1152,6 +1160,7 @@ impl ModelRef {
 /// A declared [`ModelRef`] in the model layer's vocabulary.
 fn role(r: &ModelRef) -> crate::model::ModelRole {
     crate::model::ModelRole {
+        reasoning_summary: r.reasoning_summary,
         model: crate::model::ModelId::new(&r.provider, &r.model),
         max_output_tokens: r.max_tokens,
         max_input_tokens: r.max_input_tokens,
@@ -2666,12 +2675,10 @@ impl Manifest {
         }
         // And the mode's claim is about the calls that change the world, so a
         // mutating grant it does not gate is the claim broken where it counts.
-        // Before this check, `tools-only` was runtime-identical to `none` the
-        // moment one grant asked: the file read as "a person sees this agent's
-        // actions" while the transfer beside the gated call ran unattended —
-        // a declared control enforced only where somebody remembered to also
-        // write `requires_approval`, which is no mode at all. Read-only grants
-        // stay ungated: the mode never claimed a person reviews reads.
+        // Without it the file reads as "a person sees this agent's actions"
+        // while the transfer beside the gated call runs unattended — a mode
+        // enforced only where somebody also wrote `requires_approval`. Read-only
+        // grants stay ungated: the mode never claimed a person reviews reads.
         if o.approval == Approval::ToolsOnly
             && let Some(silent) = self
                 .spec

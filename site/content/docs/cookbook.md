@@ -3338,7 +3338,11 @@ for.
 
 Attach an `Arc<dyn ModelStreamObserver>` with
 `ModelCall::streaming_to(observer)` to expose live visible text while retaining
-one canonical journaled completion. Events are labelled untrusted at the call's
+one canonical journaled completion. Add `.with_reasoning_summary()` to show the
+model's account of its reasoning beside it: `ReasoningDelta` events live, and
+`Completion::reasoning` once the call ends. `model::turns(&history)` reads every
+answered call back from a run's records, for the same view after the fact.
+Events are labelled untrusted at the call's
 output sensitivity; opaque reasoning is never emitted and strict replay emits
 nothing live. Observers should enqueue quickly and enforce network backpressure
 outside the provider callback. To follow every model call a plane makes —

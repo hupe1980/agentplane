@@ -16,6 +16,46 @@ Breaking entries are marked **BREAKING**.
 
 Entries for `0.1.0`–`0.9.0` are reconstructed from tags and commit history.
 
+## [0.53.0] — 2026-10-26
+
+### Added
+
+- **The model's account of its reasoning.** `ModelCall::with_reasoning_summary`,
+  or `reasoning_summary: true` on a manifest model role, asks the provider for
+  a readable summary: `Completion::reasoning`, journaled and labelled with the
+  answer, and `ModelStreamEvent::ReasoningDelta` live. Anthropic, OpenAI
+  Responses and Gemini ask; Chat Completions and Bedrock have no spelling and
+  return `None`. On Anthropic it turns adaptive thinking on.
+- **`FakeProvider::will_say_with_reasoning`**: a scripted answer with a
+  summary, returned only to a call that asked.
+- **`model::turns`**: every answered model call in a run's records, with its
+  requested model and decoded `Completion`. Replaces pairing `EffectStarted`
+  and `EffectDone` by hand and reading `output["text"]`.
+- **`SuspendReason::awaited_task`**: the task a run waits on a person to
+  decide. Replaces finding the `task` correlation key and parsing it.
+- **`Usage::plus`** and `Sum for Usage`: every count added, saturating.
+  Replaces summing usage through JSON.
+- The dev page shows a requested reasoning summary beside the live text.
+- **`brew install hupe1980/tap/agentplane`.** A release attaches prebuilt
+  binaries for macOS and Linux, arm64 and x86-64, built with the `:full`
+  image's features, with `SHA256SUMS` and build provenance, and updates the
+  formula in `hupe1980/homebrew-tap`.
+
+### Changed
+
+- **BREAKING: new fields.** `Completion::reasoning`; `reasoning_summary` on
+  `Request`, `ModelRole`, `manifest::ModelRef` and `fake::Ask`. A literal adds
+  `reasoning: None` or `reasoning_summary: false`; a provider destructuring
+  `Request` names the field.
+- **BREAKING: `ModelStreamEvent` is non-exhaustive.** An observer's `match`
+  needs a `_` arm.
+
+### Known
+
+- **RUSTSEC-2026-0387 is admitted** in `.cargo/audit.toml`: `crypto-bigint`
+  0.5 arrives through `aws-config`'s `credentials-login` (`aws login`
+  profiles), and no `aws-config` release has moved off it yet.
+
 ## [0.52.0] — 2026-10-23
 
 ### Added

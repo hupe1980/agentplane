@@ -1854,6 +1854,7 @@ impl agentplane::model::ModelProvider for Summarises {
             stop_reason: Some("stop".to_owned()),
             truncated: false,
             continuation: None,
+            reasoning: None,
         })
     }
 }

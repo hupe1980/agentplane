@@ -105,13 +105,14 @@ impl Accumulator {
         self.error.as_ref()
     }
 
-    /// Absorb one event, returning the visible text it carried — so a live
-    /// observer is fed from the same parse the outcome is read from.
+    /// Absorb one event, returning the answer or reasoning-summary text it
+    /// carried — so a live observer is fed from the same parse the outcome is
+    /// read from.
     ///
     /// Unknown types are ignored: `OpenAI` adds event types for new tool
     /// families regularly, and a driver that rejected them would break on a
     /// release that changed nothing it uses.
-    pub fn event(&mut self, name: &str, data: &str) -> Option<String> {
+    pub fn event(&mut self, name: &str, data: &str) -> Option<super::ModelStreamEvent> {
         let Ok(value) = serde_json::from_str::<Value>(data) else {
             return None;
         };
@@ -145,17 +146,17 @@ impl Accumulator {
             // terminal event, which cannot disagree with its own usage.
             "response.output_text.delta" => {
                 self.generated = true;
-                return value
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                return delta(&value).map(super::ModelStreamEvent::TextDelta);
+            }
+            "response.reasoning_summary_text.delta" => {
+                self.generated = true;
+                return delta(&value).map(super::ModelStreamEvent::ReasoningDelta);
             }
             // A reasoning item opening (`output_item.added`) is generation
             // too: with summaries disabled a reasoning model can burn
             // thousands of billed tokens and emit none of the delta kinds,
             // and a stream cut there must not read as safe to repeat.
             "response.refusal.delta"
-            | "response.reasoning_summary_text.delta"
             | "response.function_call_arguments.delta"
             | "response.output_item.added" => self.generated = true,
             "response.completed" => self.finish(&value, Outcome::Completed),
@@ -179,6 +180,15 @@ impl Accumulator {
             self.terminal = Some(r.clone());
         }
     }
+}
+
+/// A delta event's text, when it carried any.
+fn delta(value: &Value) -> Option<String> {
+    value
+        .get("delta")
+        .and_then(Value::as_str)
+        .filter(|delta| !delta.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]

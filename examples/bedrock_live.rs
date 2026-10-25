@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             prompt: &prompt,
             max_output_tokens: ModelCall::DEFAULT_MAX_OUTPUT_TOKENS,
             reasoning_effort: None,
+            reasoning_summary: false,
             schema: None,
             tools: &[],
             exchanges: &[],

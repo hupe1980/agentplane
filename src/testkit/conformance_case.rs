@@ -4747,8 +4747,8 @@ pub async fn check_batches(store: &Arc<dyn BatchStore>, r: &mut Report) {
     }
 
     // A record for an item nobody reserved is a refusal, not a silent no-op:
-    // both backends once returned `Ok` while writing nothing, telling the
-    // caller *recorded* over an outcome that vanished.
+    // `Ok` while writing nothing tells the caller *recorded* over an outcome
+    // that vanished.
     if store
         .record(
             id,

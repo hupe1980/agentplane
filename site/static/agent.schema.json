@@ -808,6 +808,10 @@
             }
           ],
           "description": "Explicit reasoning depth. Omitted uses the selected model's default."
+        },
+        "reasoning_summary": {
+          "description": "Ask for a readable summary of the model's reasoning beside each answer.",
+          "type": "boolean"
         }
       },
       "required": [

@@ -143,6 +143,7 @@ mod sse;
     feature = "manifest"
 ))]
 mod strict;
+mod turns;
 #[cfg(feature = "providers")]
 pub(crate) mod wire;
 #[cfg(any(feature = "providers", feature = "bedrock"))]
@@ -156,6 +157,7 @@ pub(crate) use strict::AnthropicBudget;
 pub use strict::{StrictSubset, strict_schema_problem};
 
 pub use prompt::Prompt;
+pub use turns::{ModelTurn, turns};
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -648,12 +650,46 @@ impl Usage {
         }
     }
 
+    /// Two usages together — a turn's calls, a run's turns — every field
+    /// added, saturating for the reason [`spend`](Self::spend) is.
+    ///
+    /// Destructured rather than spelled per field, so a count added to this
+    /// type cannot be dropped from the sum: a tally that loses the one-hour
+    /// cache writes or the money bills a run below what it was charged.
+    #[must_use]
+    pub const fn plus(self, other: Self) -> Self {
+        let Self {
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cache_read_tokens,
+            cache_write_1h_tokens,
+            minor_units,
+        } = other;
+        Self {
+            input_tokens: self.input_tokens.saturating_add(input_tokens),
+            output_tokens: self.output_tokens.saturating_add(output_tokens),
+            cache_write_tokens: self.cache_write_tokens.saturating_add(cache_write_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(cache_read_tokens),
+            cache_write_1h_tokens: self
+                .cache_write_1h_tokens
+                .saturating_add(cache_write_1h_tokens),
+            minor_units: self.minor_units.saturating_add(minor_units),
+        }
+    }
+
     /// Input tokens that were neither written to nor read from a cache.
     #[must_use]
     pub const fn uncached_input_tokens(&self) -> u64 {
         self.input_tokens
             .saturating_sub(self.cache_write_tokens)
             .saturating_sub(self.cache_read_tokens)
+    }
+}
+
+impl std::iter::Sum for Usage {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), Self::plus)
     }
 }
 
@@ -820,6 +856,20 @@ pub struct Completion {
     /// provider-side conversation state and reproducible on replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<ProviderContinuation>,
+    /// The provider's readable summary of how the model reasoned, when the call
+    /// [asked for one](ModelCall::with_reasoning_summary) and the provider gave
+    /// one.
+    ///
+    /// The model's own account, and only that: never the signed, encrypted or
+    /// redacted reasoning the [`continuation`](Self::continuation) carries,
+    /// which stays the provider's to read. It is part of the answer, so it is
+    /// journaled and replayed with it and carries its label — a summary of
+    /// reasoning over hostile input is as untrusted as the text beside it.
+    ///
+    /// `None` when the call did not ask, and when it asked and the provider
+    /// summarised nothing this turn — a short answer often has no summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Opaque, self-contained provider state for one continuation turn.
@@ -832,17 +882,40 @@ pub struct ProviderContinuation {
 }
 
 /// A live, non-durable model-stream event.
+///
+/// Non-exhaustive: the stream gains event kinds as providers do, and an
+/// observer ignores the ones it does not show.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type", content = "value")]
+#[non_exhaustive]
 pub enum ModelStreamEvent {
     /// An attempt at the call began. Text streamed before it is not this
     /// attempt's: it belongs to an earlier call, or to an attempt that failed
     /// and is being retried.
     Started,
-    /// Visible answer text only. Opaque reasoning is never exposed here.
+    /// Visible answer text only. Reasoning is never exposed here.
     TextDelta(String),
+    /// Reasoning summary text, on a call that asked for one: what
+    /// [`Completion::reasoning`] will hold, as it arrives. Never the provider's
+    /// opaque reasoning.
+    ReasoningDelta(String),
     /// The latest provider-reported usage snapshot.
     Usage(Usage),
+}
+
+/// An observer that sees reasoning deltas only when the call asked for them.
+#[derive(Debug)]
+struct WithoutReasoning<'a> {
+    observer: &'a dyn ModelStreamObserver,
+    asked: bool,
+}
+
+impl ModelStreamObserver for WithoutReasoning<'_> {
+    fn event(&self, event: crate::core::Tainted<ModelStreamEvent>) {
+        if self.asked || !matches!(event.peek(), ModelStreamEvent::ReasoningDelta(_)) {
+            self.observer.event(event);
+        }
+    }
 }
 
 /// Receives live model progress while one terminal completion remains canonical.
@@ -1046,6 +1119,8 @@ pub struct ModelRole {
     pub max_input_tokens: Option<u32>,
     /// Requested reasoning depth, when the declaration set one.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Whether this role's calls ask for a reasoning summary.
+    pub reasoning_summary: bool,
     /// What this role's tokens cost, when the declaration stated it.
     pub pricing: Option<Pricing>,
 }
@@ -1059,6 +1134,7 @@ impl ModelRole {
             max_output_tokens: None,
             max_input_tokens: None,
             reasoning_effort: None,
+            reasoning_summary: false,
             pricing: None,
         }
     }
@@ -1078,6 +1154,9 @@ impl ModelRole {
         }
         if let Some(effort) = self.reasoning_effort {
             call = call.with_reasoning_effort(effort);
+        }
+        if self.reasoning_summary {
+            call = call.with_reasoning_summary();
         }
         if let Some(pricing) = self.pricing {
             call = call.with_pricing(pricing);
@@ -1104,6 +1183,10 @@ pub struct Request<'a> {
     pub max_output_tokens: u32,
     /// How much internal reasoning to request, when explicitly configured.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Ask for a readable summary of the reasoning, returned as
+    /// [`Completion::reasoning`]. A driver whose wire has no way to ask sends
+    /// nothing and returns none: unlike an effort, a summary governs nothing.
+    pub reasoning_summary: bool,
     /// A JSON Schema the answer must conform to, if one was declared.
     ///
     /// Passed straight through to the provider's own structured-output mode —
@@ -1155,6 +1238,42 @@ impl ReasoningEffort {
             Self::XHigh => "xhigh",
             Self::Max => "max",
         }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::Usage;
+
+    /// Every count is summed, the one-hour writes and the money included, and
+    /// a provider's astronomical figure saturates rather than wrapping.
+    #[test]
+    fn usages_sum_every_field_and_saturate() {
+        let one = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_write_tokens: 4,
+            cache_read_tokens: 3,
+            cache_write_1h_tokens: 2,
+            minor_units: 7,
+        };
+        let total: Usage = [one, one].into_iter().sum();
+        assert_eq!(
+            total,
+            Usage {
+                input_tokens: 20,
+                output_tokens: 10,
+                cache_write_tokens: 8,
+                cache_read_tokens: 6,
+                cache_write_1h_tokens: 4,
+                minor_units: 14,
+            }
+        );
+        let huge = Usage {
+            input_tokens: u64::MAX,
+            ..Usage::default()
+        };
+        assert_eq!(huge.plus(one).input_tokens, u64::MAX);
     }
 }
 
@@ -1521,6 +1640,7 @@ pub struct ModelCall {
     /// provider's reported usage, since input cannot be bounded before it.
     max_input_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
+    reasoning_summary: bool,
     pricing: Option<Pricing>,
     provider: Arc<dyn ModelProvider>,
     max_sensitivity: Sensitivity,
@@ -1566,6 +1686,7 @@ impl ModelCall {
             max_output_tokens: Self::DEFAULT_MAX_OUTPUT_TOKENS,
             max_input_tokens: None,
             reasoning_effort: None,
+            reasoning_summary: false,
             pricing: None,
             provider,
             max_sensitivity: Sensitivity::Public,
@@ -1691,6 +1812,18 @@ impl ModelCall {
     #[must_use]
     pub const fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = Some(effort);
+        self
+    }
+
+    /// Ask the provider for a readable summary of the model's reasoning.
+    ///
+    /// It arrives as [`Completion::reasoning`] and, live, as
+    /// [`ModelStreamEvent::ReasoningDelta`]. On Anthropic it turns adaptive
+    /// thinking on for a model that would not otherwise think. Part of the
+    /// effect key: the provider is asked something else.
+    #[must_use]
+    pub const fn with_reasoning_summary(mut self) -> Self {
+        self.reasoning_summary = true;
         self
     }
 
@@ -1821,9 +1954,7 @@ impl Effect for ModelCall {
         // offered tool, or continuation transcript is a changed effect, so an
         // edit shows up on replay as divergence rather than reading an answer
         // produced for a request nobody made this time.
-        EffectDescriptor::new(
-            "model.complete",
-            serde_json::json!({
+        let mut args = serde_json::json!({
                 "provider": self.model.provider,
                 "model": self.model.model,
                 "provider_profile": self.provider.request_profile(&self.model),
@@ -1865,8 +1996,13 @@ impl Effect for ModelCall {
                     "failed": exchange.failed,
                 })).collect::<Vec<_>>(),
                 "continuation": self.continuation,
-            }),
-        )
+        });
+        // Provider-visible, so in the key — but only when asked, so a call
+        // that does not ask keys as it always has.
+        if self.reasoning_summary {
+            args["reasoning_summary"] = serde_json::json!(true);
+        }
+        EffectDescriptor::new("model.complete", args)
     }
 
     /// A completion does not change the world.
@@ -2045,7 +2181,7 @@ impl Effect for ModelCall {
         // Raised, never assigned: the untrusted label already carries the
         // `Internal` floor every model answer has, and the terminal completion
         // is floored the same way at the effect boundary. A plain `=` here
-        // once *lowered* the stream below that — the same bytes left the
+        // would *lower* the stream below that — the same bytes leaving the
         // plane twice, once labelled and once laundered, differing only in
         // whether the caller read them live.
         stream_label.sensitivity = stream_label.sensitivity.max(self.declared_output_floor());
@@ -2055,6 +2191,14 @@ impl Effect for ModelCall {
                 stream_label.clone(),
             ));
         }
+        // Asked or not, a provider may volunteer its reasoning — Anthropic's
+        // older models summarise by default, and the trait is public. The
+        // completion and the stream carry it only when this call asked, so
+        // what the journal holds is what the effect key says was requested.
+        let observer = self.stream.as_deref().map(|observer| WithoutReasoning {
+            observer,
+            asked: self.reasoning_summary,
+        });
         let answered = self
             .provider
             .complete(Request {
@@ -2062,16 +2206,22 @@ impl Effect for ModelCall {
                 prompt: &prompt,
                 max_output_tokens: self.max_output_tokens,
                 reasoning_effort: self.reasoning_effort,
+                reasoning_summary: self.reasoning_summary,
                 schema: self.schema.as_ref(),
                 tools: &self.tools,
                 exchanges: &self.exchanges,
                 continuation: self.continuation.as_ref(),
-                stream: self
-                    .stream
-                    .as_deref()
-                    .map(|observer| (observer, &stream_label)),
+                stream: observer
+                    .as_ref()
+                    .map(|observer| (observer as &dyn ModelStreamObserver, &stream_label)),
             })
-            .await;
+            .await
+            .map(|mut completion| {
+                if !self.reasoning_summary {
+                    completion.reasoning = None;
+                }
+                completion
+            });
 
         // The declared schema is a contract on the *answer*, and the runtime
         // relies on it: `structured` is indexed into rather than re-checked.
@@ -2612,6 +2762,7 @@ mod tests {
                 truncated: false,
                 structured: None,
                 continuation: None,
+                reasoning: None,
             })
         }
     }
@@ -2807,6 +2958,7 @@ mod tests {
                 truncated: false,
                 structured: None,
                 continuation: None,
+                reasoning: None,
             })
         }
     }

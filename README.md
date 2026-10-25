@@ -87,7 +87,7 @@ packaging convention. Each document keeps its own digest — the file is
 packaging, not identity — and a run starts at the room's declared orchestrator:
 
 ```sh
-cargo install agentplane --features cli
+brew install hupe1980/tap/agentplane     # or: cargo install agentplane --features cli
 agentplane run examples/summariser.yaml --input '{"ticket": "printer on fire"}'
 agentplane run examples/room.yaml       --input '{"topic": "durable execution"}'
 ```
@@ -225,20 +225,11 @@ New here? → **[docs/getting-started.md](https://hupe1980.github.io/agentplane/
 | 🔑 | **Erasure that reaches the backups** — payload bytes are sealed under a per-case key the crate never holds, so erasing a case destroys the key and last hour's backup with it. The chain commits to the **ciphertext**, so an auditor with no keys still verifies the run — and a legal hold refuses the sweep for a matter you must preserve → [erasure and keys](https://hupe1980.github.io/agentplane/docs/erasure/) |
 | 📄 | **An agent that is only a file** — `agentplane run agent.yaml`. No Rust, no `main`, no skill. The digest covers the agent *in its entirety*, and the run is journaled and deterministically replayable — under an edited file too: `replay --strict` names the first effect the edit changes and both digests, from a store or an export, with no provider credential → [replaying an edited declaration](https://hupe1980.github.io/agentplane/docs/operations/#strict-replay) |
 
-A selection, not the inventory. The full surface — the export/audit/restore
-toolchain, `policy check` re-deriving an export's policy verdicts offline and
-measuring a candidate bundle against them, `subject` saying where one memory
-subject's data went, `grants` naming the tool grants no run used, `bind` tying
-an outside grader's verdict to the records it judged, a durable manifest registry with an enumerable inventory, typed
-release, standing authorities, effect groups that commit with the journal,
-batch runs over 10⁵ items with per-item journals and an item-granular resume,
-the scoped emergency stop, the audited sweeper, a scheduled recovery drill, a
-retention pass that says what it could not reach and the legal holds that stop
-one, model drivers and streaming, MCP and A2A on both sides, signed Agent Cards,
-a tamper-evident record beside an agent this plane does *not* run, governed
-media and memory, multi-tenancy, quotas, witnessing, break-glass, and why there
-is no `AllowAll` anywhere — is documented mechanism by mechanism on
-the site:
+A selection, not the inventory. The export, audit and restore toolchain, an
+offline `policy check`, the manifest registry, batch runs with an item-granular
+resume, the scoped emergency stop, retention and legal holds, model drivers and
+streaming, MCP and A2A on both sides, memory, multi-tenancy, witnessing and
+break-glass are documented mechanism by mechanism:
 **[what you get, in full](https://hupe1980.github.io/agentplane/docs/)**.
 
 What is deliberately **not** built, and what will move →

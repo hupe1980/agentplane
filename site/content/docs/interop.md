@@ -1031,11 +1031,33 @@ Details worth stating:
   the model id, in the request profile so switching it is divergence, and
   refusing the levels Nova has no counterpart for rather than collapsing them.
 
+* **The model's account of its reasoning is asked for, never parsed out.**
+  `ModelCall::with_reasoning_summary` — or `reasoning_summary: true` on a
+  manifest role — asks the provider for a readable summary. It comes back as
+  `Completion::reasoning`, journaled and labelled with the answer, and live as
+  `ModelStreamEvent::ReasoningDelta`:
+
+  | Driver | Asked as | Read from |
+  |---|---|---|
+  | Anthropic | `thinking: {type: adaptive, display: summarized}` | `thinking` blocks' text |
+  | OpenAI Responses | `reasoning.summary: auto` | `summary_text` of `reasoning` items |
+  | Gemini | `thinkingConfig.includeThoughts` | text of parts marked `thought` |
+  | Chat Completions, Bedrock | nothing: the wire has no spelling | — |
+
+  On Anthropic, asking turns adaptive thinking on for a model that would not
+  otherwise think, so it is refused beside the forced-tool schema mode as an
+  effort is. A wire that cannot ask is not refused, because the summary
+  governs nothing; the completion carries none. Signed, encrypted and redacted
+  reasoning stays in the continuation, and a call that did not ask never
+  carries a summary, whatever its provider volunteered.
+
 * **Live deltas are labelled projections, not replay truth.** An optional
-  `ModelStreamObserver` receives visible text and terminal usage while the
-  provider still produces one canonical completion. Events inherit untrusted
-  trust and the call's output sensitivity; opaque reasoning is never exposed.
-  Observer delivery is advisory and strict replay emits no live events.
+  `ModelStreamObserver` receives answer text, a requested reasoning summary
+  and terminal usage while the provider still produces one canonical
+  completion. Events inherit untrusted trust and the call's output
+  sensitivity; opaque reasoning is never exposed. Observer delivery is advisory
+  and strict replay emits no live events. `ModelStreamEvent` is
+  non-exhaustive: an observer ignores the kinds it does not show.
 
 * **Structured output has two modes, because native support is not universal.**
   `SchemaMode::Native` uses the provider's constrained decoding, where a

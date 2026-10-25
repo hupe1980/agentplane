@@ -49,6 +49,9 @@ pub(super) struct Accumulator {
     /// `modelVersion`, as the chunks report it. Gemini repeats it on every
     /// chunk, so the last one wins for the reason `usage` does.
     model_version: Option<String>,
+    /// Thought-summary text the last chunk carried, not yet handed to the
+    /// observer. The parts themselves stay in `parts`, verbatim.
+    thought: String,
 }
 
 impl Accumulator {
@@ -58,10 +61,11 @@ impl Accumulator {
 
     /// Absorb one SSE event's data, returning any visible text it added.
     ///
-    /// The returned text is what an observer may be shown live. Opaque
-    /// reasoning is never returned: a part marked `thought` is the model's
-    /// internal reasoning, which this crate does not expose to callers on any
-    /// provider — it is kept for the continuation and nothing else.
+    /// The returned text is what an observer may be shown live as the
+    /// answer. A part marked `thought` is never returned here: its text, a
+    /// summary when one was asked for, is held for
+    /// [`take_thought`](Self::take_thought), and the part itself is kept for
+    /// the continuation.
     pub(super) fn push(&mut self, data: &str) -> Option<String> {
         let chunk: Value = serde_json::from_str(data).ok()?;
         // Read before requiring a candidate: the chunk that carries only
@@ -97,6 +101,11 @@ impl Accumulator {
             .flatten()
         {
             self.generated = true;
+            if part.get("thought").and_then(Value::as_bool) == Some(true)
+                && let Some(text) = part.get("text").and_then(Value::as_str)
+            {
+                self.thought.push_str(text);
+            }
             if is_plain_text(part) {
                 let text = part.get("text").and_then(Value::as_str).unwrap_or_default();
                 visible.push_str(text);
@@ -124,6 +133,11 @@ impl Accumulator {
             }
         }
         (!visible.is_empty()).then_some(visible)
+    }
+
+    /// The thought-summary text the chunks since the last call carried.
+    pub(super) fn take_thought(&mut self) -> Option<String> {
+        (!self.thought.is_empty()).then(|| std::mem::take(&mut self.thought))
     }
 
     /// Whether the model said why it stopped.

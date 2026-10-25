@@ -692,8 +692,7 @@ mod tests {
 
     /// A size that changes the tree's *shape* is rejected.
     ///
-    /// Note what this does **not** claim, because the first version of this test
-    /// claimed it and was wrong. A size that leaves the path shape unchanged —
+    /// Note what this does **not** claim. A size that leaves the path shape unchanged —
     /// 7 versus 8, for a leaf in the left subtree — verifies identically, because
     /// every sibling on the path is supplied by the prover and the arithmetic
     /// cannot tell the two trees apart.

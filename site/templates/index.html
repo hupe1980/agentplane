@@ -139,7 +139,7 @@
   <dl class="stats">
     <div><dt>14</dt><dd>TLA+ specifications, model-checked on every push</dd></div>
     <div><dt>78</dt><dd>deliberately broken specs; each must trip its own check</dd></div>
-    <div><dt>1560</dt><dd>code mutations, each naming the one test that must fail</dd></div>
+    <div><dt>1576</dt><dd>code mutations, each naming the one test that must fail</dd></div>
     <div><dt>0</dt><dd>unsafe blocks — <code>forbid(unsafe_code)</code></dd></div>
   </dl>
   <p class="fine">
@@ -153,7 +153,8 @@
 <section class="quickstart">
   <h2>Thirty seconds</h2>
 
-  <pre class="code"><code>cargo add agentplane</code></pre>
+  <pre class="code"><code>cargo add agentplane                   <span class="c"># the library</span>
+brew install hupe1980/tap/agentplane   <span class="c"># the CLI</span></code></pre>
 
   <pre class="code"><code>let store: Arc&lt;dyn JournalStore&gt; = Arc::new(RedbStore::open_in_memory()?);
 
